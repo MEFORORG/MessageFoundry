@@ -14,16 +14,15 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import adr0075_batch_harness as h
 import pytest
 
 from messagefoundry.config.settings import PipelineSettings
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.postgres import PostgresStore
-from messagefoundry.store.store import MessageStore
 from messagefoundry.store.sqlserver import SqlServerStore
-
-import adr0075_batch_harness as h
+from messagefoundry.store.store import MessageStore
 
 
 @pytest.fixture(autouse=True)

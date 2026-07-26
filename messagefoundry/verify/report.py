@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 from collections import Counter
-from typing import Sequence
+from collections.abc import Sequence
 
 from messagefoundry.verify.model import FAILING, CheckResult, Status
 

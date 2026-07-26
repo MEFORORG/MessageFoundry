@@ -1,18 +1,29 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""Operator attachment read/download surface (#149, ADR 0105 Phase 3b).
+"""Operator attachment read/download surface (#149, ADR 0105 Phase 3b) + its ASVS 1.3.4 serve-time
+neutralization.
 
 The store read method (``attachments_for``), the ``MessageDetail.attachments`` metadata list, and the
 audited, PHI-gated ``GET /messages/{message_id}/attachments/{attachment_id}`` download endpoint. Covers
 the byte round-trip, the RBAC gate (Viewer → 403), the channel-scope + linkage 404s (the security
 crux: never pull a shared content-addressed blob unlinked to an in-scope message), the audit chain
 (``record_view`` + ``attachment_download`` with NO bytes), and the Content-Type / Content-Disposition.
+
+**ASVS 1.3.4 (browser-active downgrade + sandbox CSP).** The stored ``content_type`` is a verbatim,
+attacker-influenced OBX-5.2 label. The serve-time control is *neutralize at serve*, never a sanitizing
+rewrite of the stored clinical bytes (ADR 0105 Approach B keeps the OBX-5.5 value verbatim): a
+browser-active label is downgraded to ``application/octet-stream`` — case-folded, so ``Image/SVG+XML``
+is treated exactly like ``image/svg+xml`` — which also keeps a ``.svg``/``.html`` extension out of the
+download name, and every download response carries ``Content-Security-Policy: default-src 'none';
+sandbox``, **including the console's ``/ui`` delegate**, where two ``/ui``-scoped middlewares would
+otherwise overwrite a route-level CSP with a console policy that has no ``sandbox``.
 """
 
 from __future__ import annotations
 
 import base64
 import logging
+import mimetypes
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -20,6 +31,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.api.app import _ATTACHMENT_CSP
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
@@ -32,6 +44,43 @@ ADT = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE
 # value into the attachment substrate. The download must decode this back to DOC byte-for-byte.
 DOC = b"%PDF-1.4\nsynthetic document body \x00\x01\x02 not real PHI\n%%EOF\n"
 DOC_B64 = base64.b64encode(DOC).decode("ascii")
+
+#: Labels a browser may EXECUTE or render as markup — every one of them must serve as the inert binary
+#: type. Beyond the four subtypes and the ``+xml`` family the assessor named, this pins the vectors an
+#: exact-subtype / suffix test misses: ``application/x-javascript`` (browsers honour it as script),
+#: ``image/svg`` (no ``+xml``), ``application/xml-dtd``, ``multipart/x-mixed-replace`` (browser-rendered)
+#: and ``text/x-html`` — plus the MIXED-CASE vectors, which the token grammar admits verbatim today and
+#: which ``mimetypes`` still resolves to ``.svg``/``.html``.
+_BROWSER_ACTIVE_LABELS = (
+    "image/svg+xml",
+    "text/html",
+    "Image/SVG+XML",
+    "TEXT/HTML",
+    "text/HtMl",
+    "application/xhtml+xml",
+    "text/xml",
+    "application/xml",
+    "application/javascript",
+    "text/javascript",
+    "application/ecmascript",
+    "application/x-javascript",
+    "application/rss+xml",
+    "image/svg",
+    "application/xml-dtd",
+    "multipart/x-mixed-replace",
+    "text/x-html",
+)
+
+#: Inert labels that must keep passing through under their own type — the operator still gets a usable
+#: download hint, and browser PDF/image viewers are themselves sandboxed.
+_PASS_THROUGH_LABELS = ("application/pdf", "image/png", "application/dicom", "text/plain")
+#: Leading magic so a CORRECTLY-labelled inert attachment agrees with its declared MIME (ASVS 5.2.2):
+#: the download-side MIME-vs-magic check downgrades a sniffable label whose bytes contradict it.
+#: dicom/text carry no leading signature, so they need none.
+_PASS_THROUGH_MAGIC: dict[str, bytes] = {
+    "application/pdf": b"%PDF-",
+    "image/png": bytes.fromhex("89504e470d0a1a0a"),  # PNG signature
+}
 
 
 @pytest.fixture
@@ -58,6 +107,29 @@ async def _seed_streaming(
         channel_id=channel_id, raw=ADT, control_id="MSG1", attachment_refs=[ref]
     )
     return mid, ref
+
+
+async def _seed_labelled(
+    engine: Engine, content_type: str, marker: str, *, prefix: bytes = b""
+) -> tuple[str, str]:
+    """Seed one document carrying ``content_type``, with bytes UNIQUE to ``marker``.
+
+    Attachments are content-addressed and deduplicated: ``put_attachment`` on bytes that already exist
+    returns the existing ref and writes nothing, so the FIRST writer's ``content_type`` governs every
+    later linkage of the same body. A per-MIME table that reused one document would therefore collapse
+    onto the first label and assert nothing — every case must seed its own bytes."""
+    doc = base64.b64encode(prefix + f"synthetic document {marker} not real PHI".encode()).decode(
+        "ascii"
+    )
+    ref = await engine.store.put_attachment([doc], content_type)
+    mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
+    return mid, ref
+
+
+def _base_media_type(response: httpx.Response) -> str:
+    """The served media type without parameters — Starlette appends ``; charset=utf-8`` to any
+    ``text/*``, so an equality assertion has to compare the type alone."""
+    return response.headers["content-type"].split(";")[0].strip()
 
 
 # --- store: attachments_for --------------------------------------------------
@@ -111,9 +183,13 @@ async def test_download_round_trips_to_original_bytes(
     # The decoded download is byte-for-byte the original document (the security invariant (f)).
     assert r.content == DOC
     assert r.headers["content-type"].startswith("application/pdf")
-    disp = r.headers["content-disposition"]
-    assert disp.startswith("attachment; filename=")
-    assert ref[:16] in disp  # header-safe filename derived from the sha256 content address
+    # 5.4.1 re-score: pin the FULL served Content-Disposition, not just a substring — the fixed
+    # 'attachment; filename="attachment-' prefix + the sha256 content address cut to 16 hex + a
+    # mimetypes extension hint, quoted; no user/attacker text reaches the header
+    # (api/app.py:_attachment_filename). Seeded straight through the store, so this holds WITHOUT
+    # enabling the opt-in stream_threshold_bytes. Compute ext the same way the endpoint does.
+    ext = mimetypes.guess_extension("application/pdf") or ""
+    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
 
 
 async def test_download_audits_view_and_download_before_returning(
@@ -154,8 +230,169 @@ async def test_download_content_type_defaults_when_not_clean_mime(
     mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
     r = await client.get(f"/messages/{mid}/attachments/{ref}")
     assert r.status_code == 200
+    # 5.4.2 re-score: a non-allowlisted / injection-bearing MIME is served as the generic binary
+    # type, never the attacker value verbatim (_safe_attachment_content_type), and no injected
+    # header survives.
     assert r.headers["content-type"] == "application/octet-stream"
     assert "X-Evil" not in r.headers
+    # The served-filename control still holds on a rejected MIME: the extension hint then derives
+    # from the octet-stream default, never the attacker text.
+    ext = mimetypes.guess_extension("application/octet-stream") or ""
+    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+
+
+async def test_download_downgrades_mislabelled_active_mime_to_octet_stream(
+    engine: Engine, client: httpx.AsyncClient
+) -> None:
+    # ASVS 1.3.4/5.2.2: even a TOKEN-CLEAN stored MIME is sender-influenced (OBX-5.2). If it names a
+    # sniffable family (image/png) whose magic the reconstructed bytes contradict (DOC leads with %PDF),
+    # the download is served as the generic octet-stream so a mislabelled active-content payload can't be
+    # rendered as its claimed inert type. The bytes still round-trip byte-for-byte (only the MIME shifts).
+    ref = await engine.store.put_attachment([DOC_B64], "image/png")
+    mid = await engine.store.enqueue_ingress(channel_id="ch1", raw=ADT, attachment_refs=[ref])
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "application/octet-stream"
+    assert r.content == DOC  # bytes unchanged; only the served MIME is downgraded
+
+
+# --- ASVS 1.3.4: browser-active downgrade + sandbox CSP ----------------------
+
+
+@pytest.mark.parametrize("label", _BROWSER_ACTIVE_LABELS)
+async def test_browser_active_label_is_downgraded_to_octet_stream(
+    engine: Engine, client: httpx.AsyncClient, label: str
+) -> None:
+    """A label a browser would execute or render as markup is NEVER served verbatim.
+
+    Mechanically: the served ``Content-Type`` is exactly ``application/octet-stream``, and the served
+    filename is exactly the one derived from that inert type — so no ``.svg``/``.html``/``.js`` name is
+    produced either. Mixed-case vectors are in the table because the token grammar admits uppercase and
+    ``mimetypes`` lower-cases internally, so ``Image/SVG+XML`` yielded a ``.svg`` name before the fix."""
+    mid, ref = await _seed_labelled(engine, label, marker=label)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert _base_media_type(r) == "application/octet-stream"
+    # Compute the extension the way the endpoint does (mimetypes is machine-local — never pin a
+    # literal): the served name must be the octet-stream one, never a scriptable extension.
+    ext = mimetypes.guess_extension("application/octet-stream") or ""
+    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+    assert not r.headers["content-disposition"].rstrip('"').endswith((".svg", ".html", ".xml"))
+
+
+@pytest.mark.parametrize("label", _PASS_THROUGH_LABELS)
+async def test_inert_label_passes_through_unchanged(
+    engine: Engine, client: httpx.AsyncClient, label: str
+) -> None:
+    """The downgrade is targeted, not a blanket octet-stream: a correctly-labelled inert type still
+    serves as itself (and still supplies the download-name extension), so operators keep a usable hint.
+    Sniffable families (pdf/png) are seeded with matching magic so the 5.2.2 MIME-vs-magic check agrees."""
+    mid, ref = await _seed_labelled(
+        engine, label, marker=label, prefix=_PASS_THROUGH_MAGIC.get(label, b"")
+    )
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert _base_media_type(r) == label
+    ext = mimetypes.guess_extension(label) or ""
+    assert r.headers["content-disposition"] == f'attachment; filename="attachment-{ref[:16]}{ext}"'
+
+
+async def test_overlong_label_is_downgraded(engine: Engine, client: httpx.AsyncClient) -> None:
+    """The token grammar is unbounded and the stored column has no length check, so an arbitrarily long
+    attacker label would otherwise be echoed into a response header."""
+    mid, ref = await _seed_labelled(engine, "application/" + "a" * 300, marker="overlong")
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert _base_media_type(r) == "application/octet-stream"
+
+
+async def test_download_carries_sandbox_csp(engine: Engine, client: httpx.AsyncClient) -> None:
+    """Every attachment download response carries ``default-src 'none'; sandbox`` — the clause the
+    assessor scored as "no CSP on that response". ``sandbox`` with no ``allow-*`` token puts the
+    response in a unique opaque origin, so nothing it contains can execute in the application origin."""
+    mid, ref = await _seed_streaming(engine)
+    r = await client.get(f"/messages/{mid}/attachments/{ref}")
+    assert r.status_code == 200
+    assert r.headers["content-security-policy"] == "default-src 'none'; sandbox"
+    assert (
+        _ATTACHMENT_CSP == "default-src 'none'; sandbox"
+    )  # the constant the product actually ships
+    # The pre-existing layers are unchanged — the CSP is the fourth, not a replacement.
+    assert r.headers["content-disposition"].startswith("attachment;")
+    assert r.headers["x-content-type-options"] == "nosniff"
+
+
+@pytest.mark.parametrize("loopback", [False, True])
+async def test_ui_delegate_serves_the_sandbox_csp_not_the_console_csp(
+    engine: Engine, loopback: bool
+) -> None:
+    """THE ORDERING GUARD. The console's ``GET /ui/messages/{id}/attachments/{id}`` re-serves the very
+    same ``Response`` object, but two ``/ui``-scoped middlewares ASSIGN a ``Content-Security-Policy`` on
+    any non-static ``/ui`` path — the engine's ``ui_csp`` overlay and (on a secure context, which
+    ``loopback=True`` engages per ADR 0143) the console's per-response nonce CSP. Neither contains
+    ``sandbox``, so a route-level header alone is silently overwritten here.
+
+    Mechanically asserts the SERVED header on the delegate is exactly the attachment CSP — the assertion
+    fails the moment a middleware re-ordering puts a /ui CSP writer back on top."""
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    uid = await service.create_local_user(
+        username="op",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.OPERATOR.value],
+        actor="test",
+    )
+    user = await service.store.get_user(uid)
+    assert user is not None and user.password_hash is not None
+    await service.store.set_password(
+        uid, password_hash=user.password_hash, must_change_password=False
+    )
+    mid, ref = await _seed_streaming(engine)
+    app = create_app(engine, auth=service, serve_ui=True, loopback=loopback)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        assert (
+            await c.post("/ui/login", data={"username": "op", "password": PW})
+        ).status_code == 303
+        r = await c.get(f"/ui/messages/{mid}/attachments/{ref}")
+        assert r.status_code == 200
+        assert r.content == DOC
+        assert r.headers["content-security-policy"] == _ATTACHMENT_CSP
+        assert "sandbox" in r.headers["content-security-policy"]
+        # Proof the guard is not vacuous: a sibling /ui page on the SAME app does get a console CSP,
+        # so the assertion above is discriminating between two live writers, not observing a no-op.
+        # Under loopback the writer is the console's per-response nonce CSP (ADR 0143), the OUTERMOST
+        # of the two — pinning the nonce proves the outer writer really is engaged on this app.
+        page = await c.get("/ui/messages")
+        assert page.status_code == 200
+        assert "sandbox" not in page.headers["content-security-policy"]
+        assert ("nonce-" in page.headers["content-security-policy"]) is loopback
+
+
+async def test_runbook_documents_the_shipped_download_safety_mechanism() -> None:
+    """Doc-drift guard for the off-loopback runbook's attachment-safety block (the 5.1.1 ↔ 1.3.4
+    rider): it describes HOW downloads are made safe, so it must name every shipped layer. The tokens
+    below ARE the pinned mechanism — a lane rewriting that block keeps them or this fails."""
+    doc = (
+        Path(__file__).resolve().parent.parent / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
+    )
+    heading = "## Served-attachment filename + Content-Type safety on the streaming-detach path"
+    text = doc.read_text(encoding="utf-8")
+    start = text.find(heading)
+    assert start != -1, f"runbook section {heading!r} missing from {doc.name}"
+    nxt = text.find("\n## ", start + len(heading))
+    section = text[start:] if nxt == -1 else text[start:nxt]
+    for token in (
+        "_safe_attachment_content_type",  # the octet-stream forcing helper
+        "browser-active",  # the downgrade rule this lane shipped
+        "application/octet-stream",
+        "Content-Disposition: attachment",
+        "nosniff",
+        _ATTACHMENT_CSP,  # default-src 'none'; sandbox
+    ):
+        assert token in section, f"runbook attachment section no longer documents {token!r}"
 
 
 async def test_download_unknown_message_is_404(client: httpx.AsyncClient) -> None:

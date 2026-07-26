@@ -178,16 +178,17 @@ spec:
             # loopback-bound, or front them with a TLS-terminating TCP proxy.
           env:
             # --- exposure (Topology A — in-process TLS) ---
-            - { name: MEFOR_API_HOST, value: "0.0.0.0" }
+            - { name: MEFOR_SECURITY_LOCAL_ACCESS_ONLY, value: "false" }
+            - { name: MEFOR_SECURITY_LISTEN_ADDRESS, value: "0.0.0.0" }
             - { name: MEFOR_API_PORT, value: "8443" }
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # each MLLP() must set tls=True (exposure gate)
             # --- production guardrails (refuses to start off-loopback without these) ---
-            - { name: MEFOR_AUTH_ENABLED, value: "true" }
-            - { name: MEFOR_AUTH_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
+            - { name: MEFOR_SECURITY_REQUIRE_SIGN_IN, value: "true" }
+            - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
             - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }
-            - { name: MEFOR_EGRESS_DENY_BY_DEFAULT, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
+            - { name: MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
             # --- HA: external Postgres store + active-passive cluster ---
             - { name: MEFOR_STORE_BACKEND, value: "postgres" }      # SQLite is REFUSED under [cluster] (validator)
             - { name: MEFOR_STORE_SERVER, value: "REPLACE.rds.amazonaws.com" }  # managed Postgres endpoint (RDS / Cloud SQL / Azure DB)

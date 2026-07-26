@@ -18,9 +18,9 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Validation
-from messagefoundry.config.state import activated as state_activated
-from messagefoundry.config.state import set_active, reset, state_get
 from messagefoundry.config.settings import RetentionSettings
+from messagefoundry.config.state import activated as state_activated
+from messagefoundry.config.state import reset, set_active, state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     InboundConnection,
@@ -445,13 +445,13 @@ def test_send_only_handler_yields_empty_state_ops() -> None:
         return Send("out", msg)
 
     reg = _registry_with_handler(handle)
-    deliveries, state_ops, _meta = transform_one(reg, "h", RAW)
+    deliveries, state_ops, _meta, _ = transform_one(reg, "h", RAW)
     assert len(deliveries) == 1 and state_ops == []
 
 
 def test_handler_returning_none_yields_no_deliveries_no_state() -> None:
     reg = _registry_with_handler(lambda m: None)
-    deliveries, state_ops, _meta = transform_one(reg, "h", RAW)
+    deliveries, state_ops, _meta, _ = transform_one(reg, "h", RAW)
     assert deliveries == [] and state_ops == []
 
 
@@ -460,7 +460,7 @@ def test_mixed_send_and_setstate_list_is_partitioned() -> None:
         return [Send("out", msg), SetState("ns", "k", "v")]
 
     reg = _registry_with_handler(handle)
-    deliveries, state_ops, _meta = transform_one(reg, "h", RAW)
+    deliveries, state_ops, _meta, _ = transform_one(reg, "h", RAW)
     assert len(deliveries) == 1
     assert len(state_ops) == 1 and state_ops[0].namespace == "ns"
 

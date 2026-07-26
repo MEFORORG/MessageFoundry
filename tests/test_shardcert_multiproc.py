@@ -165,6 +165,9 @@ async def test_sink_binds_chunk_and_handshakes(
         "lane_inversions",
         "lane_repeats",
         "lanes_observed",
+        # The lane-key SET, not just its size: the coordinator unions these across sinks, because a sink only
+        # sees the lanes whose DESTINATION lies in its own port chunk. Synthetic labels, never bodies.
+        "lane_keys",
         "ports",
     }
     assert report.ports == (48002, 48003)
@@ -292,6 +295,7 @@ async def test_worker_owns_slice_arms_waits_go_and_drives(
             "dests": 3,
             "handlers": 3,
             "delivering": 3,
+            "routing": "broadcast",
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 3,
@@ -323,7 +327,25 @@ async def test_worker_owns_slice_arms_waits_go_and_drives(
     assert rec["drives"][0] == {"conns": 2, "rate": 20.0, "hold": 0.1}
     done = coord.read(f"{DRIVER_DONE}.0")
     assert done is not None and done["bands"] == [0, 1] and done["driver_index"] == 0
-    assert set(done) == {"driver_index", "sent", "acked", "ack_p50_ms", "ack_p99_ms", "bands"}
+    # EXACT key set, deliberately — this is the METADATA-ONLY guard on the coord drop (counts + latency +
+    # band topology; NEVER control-ids or message bodies). Kept as equality, not widened to a subset: a
+    # subset check would wave through exactly the leak it exists to catch.
+    #
+    # v2 adds the two DEFERRAL CAUSE counters. They are aggregate ints, so the metadata-only property holds
+    # — and they are load-bearing: the coordinator SUMS them across workers, and the fidelity gate reads
+    # that sum to tell an ENGINE backpressure bind (`sent` suppressed because the engine stopped reading its
+    # socket) from a RIG shortfall. Omit them from the drop and the gate falls back to `sent` alone, which
+    # is ENGINE-PACED and so cannot name a culprit.
+    assert set(done) == {
+        "driver_index",
+        "sent",
+        "acked",
+        "deferred_backpressure",
+        "deferred_schedule",
+        "ack_p50_ms",
+        "ack_p99_ms",
+        "bands",
+    }
     assert report.bands == (0, 1) and report.driver_count == 2
 
 
@@ -344,6 +366,7 @@ async def test_worker_fails_loud_on_empty_slice(
             "dests": 2,
             "handlers": 2,
             "delivering": 2,
+            "routing": "broadcast",
             "api_ports": [9001],
         },
     )
@@ -367,7 +390,7 @@ def _drive_report(**over: Any) -> sc.ShardCertDriveReport:
     a ceiling. The poller fields (engine_done/engine_dead/in_pipeline_final/drained) are ADVISORY only —
     the gated verdict keys off the SINK count (S) alone; they are set here to healthy values so tests can
     prove the verdict is INDEPENDENT of them by overriding them to unhealthy values."""
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         shards=("a", "b"),
         dests=2,
         # #209: H = D = dests reproduces the pre-split report exactly (routed == delivered). The fan-out is
@@ -385,6 +408,7 @@ def _drive_report(**over: Any) -> sc.ShardCertDriveReport:
         lane_inversions=0,
         lane_repeats=0,
         lanes_observed=2,
+        routing="broadcast",
         ack_p50_ms=1.5,
         ack_p99_ms=3.0,
         engine_done=300,  # == A*dests
@@ -561,7 +585,17 @@ def _install_coordinator_fakes(
         if f["_sub"] == "shardcert-sink":
             i = int(f["--sink-index"])
             child.post(f"{SINK_BOUND}.{i}", {"sink_index": i, "ports": [int(f["--sink-base"]) + i]})
-            child.post(f"{SINK_DONE}.{i}", {"sink_index": i, **sink_tally[i]})
+            tally = dict(sink_tally[i])
+            # The coordinator now UNIONS the sinks' lane-key SETS rather than taking a MAX of their counts.
+            # Synthesize keys matching each fake's declared `lanes_observed`, namespaced by the sink index —
+            # which is the REAL invariant, not a convenience: a lane key carries the DESTINATION, and
+            # _partition_band gives every destination exactly one owning sink, so the per-sink key sets are
+            # disjoint by construction. A test may override `lane_keys` to model a COLLAPSED key (the
+            # unstamped-MSH-6 vacuity), which is the one case where they are NOT disjoint.
+            tally.setdefault(
+                "lane_keys", [f"s{i}_{k:02d}" for k in range(int(tally["lanes_observed"]))]
+            )
+            child.post(f"{SINK_DONE}.{i}", {"sink_index": i, **tally})
         elif f["_sub"] == "shardcert-driver-worker":
             j = int(f["--driver-index"])
             child.post(f"{DRIVER_ARMED}.{j}", {"driver_index": j, "bands": [j]})
@@ -595,12 +629,206 @@ def _install_coordinator_fakes(
     return spawned
 
 
+async def _drive_with_sinks(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    sink_tally: dict[int, dict[str, Any]],
+    run_id: str,
+    dests: int,
+    routing: str = "broadcast",
+) -> sc.ShardCertDriveReport:
+    """Run the coordinator against faked sinks with an ARBITRARY per-sink lane-key set, so the
+    lanes_observed aggregation can be exercised directly."""
+    import types
+
+    acked = 100
+    worker_tally = {
+        0: {"sent": acked, "acked": acked, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+    }
+    _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally=sink_tally,
+        worker_tally=worker_tally,
+        engine_final=types.SimpleNamespace(done=acked, dead=0, in_pipeline=0),
+    )
+    coord = FileDropCoord(tmp_path, run_id=run_id)
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": dests,
+            "handlers": 1,
+            "delivering": 1,
+            "routing": routing,
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": dests,
+            "sink_port": 3700,
+        },
+    )
+    return await sc.run_shardcert_drive(
+        engine_host="10.0.0.5",
+        aggregate_rate=40.0,
+        hold_seconds=3.0,
+        driver_count=1,
+        sink_count=len(sink_tally),
+        sink_host="10.0.0.9",
+        coord=coord,
+    )
+
+
+async def test_lanes_observed_unions_disjoint_sinks_but_not_a_collapsed_key(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """⭐ THE AGGREGATION BLOCKER. `lanes_observed` was a MAX over the sinks' COUNTS, justified by a
+    BROADCAST-only reading ("every lane fans to every delivered dest, so a sink sees EVERY lane"). Under
+    PARTITIONED a message goes to exactly ONE destination, and `sink_count` defaults to `min(8, sink_ports)`
+    with `sink_ports = dests` — so at dests <= 8 each sink owns ONE destination and sees only the lanes
+    feeding it. MAX then reads a per-sink FRACTION, and at one feeding shard per dest it reads 1: the
+    `lanes_observed >= 2` non-vacuity bar FAILS a perfectly healthy, lossless, in-order rung.
+
+    The keys are DISJOINT by construction (a lane key carries the DESTINATION; _partition_band gives every
+    destination exactly one owning sink), so the UNION is the run's lane count. A bare SUM would agree there
+    — but NOT in the one case the bar exists for: an unstamped MSH-6 collapses every delivery onto the key ""
+    in EVERY sink at once, where SUM reads `sink_count` and FALSE-PASSES. The union is right in both."""
+    # (a) Two sinks, ONE distinct lane each (the partitioned dests<=8 shape). MAX == 1 ⇒ would FAIL the >= 2
+    #     bar on a healthy rung. The union is 2 ⇒ PASSES, and the FIFO check really did cover two real lanes.
+    two_real_lanes: dict[int, dict[str, Any]] = {
+        0: {
+            "sink_received": 50,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 1,
+            "lane_keys": ["a_00"],
+            "ports": [3700],
+        },
+        1: {
+            "sink_received": 50,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 1,
+            "lane_keys": ["a_01"],
+            "ports": [3701],
+        },
+    }
+    report = await _drive_with_sinks(
+        monkeypatch,
+        tmp_path,
+        sink_tally=two_real_lanes,
+        run_id="u1",
+        dests=2,
+        routing="partitioned",
+    )
+    assert (
+        max(t["lanes_observed"] for t in two_real_lanes.values()) == 1
+    )  # what MAX would have said
+    assert report.lanes_observed == 2  # the UNION — two genuinely distinct lanes
+    assert report.no_loss is True and report.ok is True  # the healthy rung now certifies
+
+    # (b) The COLLAPSED key (unstamped MSH-6): both sinks report 1 lane, but it is the SAME lane key "". The
+    #     FIFO check is VACUOUS and must NOT certify. A bare SUM would read 2 here and false-pass.
+    collapsed: dict[int, dict[str, Any]] = {
+        0: {
+            "sink_received": 50,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 1,
+            "lane_keys": [""],
+            "ports": [3700],
+        },
+        1: {
+            "sink_received": 50,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 1,
+            "lane_keys": [""],
+            "ports": [3701],
+        },
+    }
+    report = await _drive_with_sinks(
+        monkeypatch, tmp_path, sink_tally=collapsed, run_id="u2", dests=2, routing="partitioned"
+    )
+    assert (
+        sum(t["lanes_observed"] for t in collapsed.values()) == 2
+    )  # what a bare SUM would have said
+    assert report.lanes_observed == 1  # the UNION of {""} and {""} is ONE lane
+    assert report.no_loss is True  # ...the counts balance...
+    assert report.ok is False  # ...but the FIFO evidence is vacuous ⇒ NO certification.
+
+
+async def test_drive_reads_routing_from_shards_ready_and_reports_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """`routing` is a REQUIRED read (like handlers/delivering): the derived (H, D) = (1, 1) a partitioned run
+    reports is a pair a LEGAL broadcast run can also produce, so without the mode the banked artifact cannot
+    say which shape produced the number. A missing key means the two boxes run different code ⇒ KeyError."""
+    tally = {
+        0: {
+            "sink_received": 100,
+            "lane_inversions": 0,
+            "lane_repeats": 0,
+            "lanes_observed": 2,
+            "ports": [3700],
+        }
+    }
+    report = await _drive_with_sinks(
+        monkeypatch, tmp_path, sink_tally=tally, run_id="r1", dests=1, routing="partitioned"
+    )
+    assert report.routing == "partitioned"
+    topo = report.to_json_dict()["topology"]
+    assert isinstance(topo, dict)
+    assert topo["routing"] == "partitioned"
+    assert "routing=partitioned" in report.render()
+
+    # And it is REQUIRED — an engine box that never posted it must fail loud, not default to broadcast.
+    import types
+
+    _install_coordinator_fakes(
+        monkeypatch,
+        sink_tally=tally,
+        worker_tally={
+            0: {"sent": 100, "acked": 100, "ack_p50_ms": 1.0, "ack_p99_ms": 2.0, "bands": [0]}
+        },
+        engine_final=types.SimpleNamespace(done=100, dead=0, in_pipeline=0),
+    )
+    coord = FileDropCoord(tmp_path, run_id="r2")
+    coord.post(
+        SHARDS_READY,
+        {
+            "shards": ["a"],
+            "inbound_base": 3600,
+            "lanes": 1,
+            "dests": 1,
+            "handlers": 1,
+            "delivering": 1,
+            # no "routing"
+            "api_ports": [9001],
+            "sink_base": 3700,
+            "sink_ports": 1,
+            "sink_port": 3700,
+        },
+    )
+    with pytest.raises(KeyError):
+        await sc.run_shardcert_drive(
+            engine_host="10.0.0.5",
+            aggregate_rate=40.0,
+            hold_seconds=3.0,
+            driver_count=1,
+            sink_count=1,
+            sink_host="10.0.0.9",
+            coord=coord,
+        )
+
+
 async def test_coordinator_round_trip_aggregates_sum_of_fakes(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     """The coordinator spawns K sender-workers + M sinks (faked), runs the full handshake
     (DRIVE_START + DRIVE_GO → DRIVER_DONE → drain → DRIVE_COMPLETE → SINK_DONE), and its aggregate is the
-    SUM of the workers' intake / the sinks' deliveries (lanes_observed by MAX, ack p50/p99 by max)."""
+    SUM of the workers' intake / the sinks' deliveries (lanes_observed by lane-key UNION, ack p50/p99 by max)."""
     import types
 
     worker_tally = {
@@ -641,6 +869,7 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
             "dests": 2,
             "handlers": 2,
             "delivering": 2,
+            "routing": "broadcast",
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 2,
@@ -661,7 +890,10 @@ async def test_coordinator_round_trip_aggregates_sum_of_fakes(
     assert report.acked == 150 and report.sent == 150  # Σ worker intake
     assert report.sink_received == 300  # Σ sink deliveries == A*dests
     assert report.ack_p50_ms == 1.5 and report.ack_p99_ms == 3.0  # MAX over workers
-    assert report.lanes_observed == 2  # MAX over sinks, non-vacuous
+    # UNION of the sinks' lane-key sets: 2 distinct keys each, disjoint by destination => 4. NOT the MAX
+    # (which reads 2 and under-reports the run's lane count), and not a blind SUM of the counts — see
+    # test_lanes_observed_unions_disjoint_sinks_but_not_a_collapsed_key.
+    assert report.lanes_observed == 4
     assert report.engine_done == 300 and report.engine_dead == 0 and report.in_pipeline_final == 0
     assert report.drained is True
     assert report.no_loss is True and report.ok is True and report.ceiling is False
@@ -712,6 +944,7 @@ async def test_coordinator_fails_loud_on_shards_ready_without_the_shape(
         "dests": 2,
         "handlers": 2,
         "delivering": 2,
+        "routing": "broadcast",
         "api_ports": [9001],
         "sink_base": 3700,
         "sink_ports": 2,
@@ -769,6 +1002,7 @@ async def test_coordinator_threads_derived_drive_complete_timeout_to_sinks(
             "dests": 1,
             "handlers": 1,
             "delivering": 1,
+            "routing": "broadcast",
             "api_ports": [9001],
             "sink_base": 3700,
             "sink_ports": 1,
@@ -831,6 +1065,7 @@ async def test_coordinator_threads_allow_insecure_to_remote_poller(
         "dests": 1,
         "handlers": 1,
         "delivering": 1,
+        "routing": "broadcast",
         "api_ports": [9001],
         "sink_base": 3700,
         "sink_ports": 1,
@@ -879,6 +1114,7 @@ async def test_coordinator_fails_loud_on_oversized_sink_count(
             "dests": 2,
             "handlers": 2,
             "delivering": 2,
+            "routing": "broadcast",
             "api_ports": [9001, 9002],
             "sink_base": 3700,
             "sink_ports": 2,
@@ -912,6 +1148,7 @@ async def test_coordinator_fails_loud_on_oversized_driver_count(
             "dests": 2,
             "handlers": 2,
             "delivering": 2,
+            "routing": "broadcast",
             "api_ports": [9001],
             "sink_base": 3700,
             "sink_ports": 2,

@@ -16,7 +16,7 @@ from enum import Enum
 from messagefoundry.auth.permissions import Permission, Role, permissions_for_roles
 
 
-class AuthProvider(str, Enum):
+class AuthProvider(str, Enum):  # noqa: UP042
     """How a user authenticates. ``local`` users carry a password hash; ``ad`` users bind to AD."""
 
     LOCAL = "local"

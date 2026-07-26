@@ -134,6 +134,18 @@ class FailoverTracker:
         tests assert this is ≥ 2 so the per-lane FIFO verdict can never silently certify nothing."""
         return len(self._lane_seen)
 
+    @property
+    def lane_keys(self) -> tuple[str, ...]:
+        """The DISTINCT lane keys this tracker observed (sorted, so it serializes stably).
+
+        Exists for the MULTI-PROCESS sink tier, where each sink process tracks only the lanes whose
+        destination falls in its own port chunk: the run's true lane count is the UNION of the sinks' key
+        sets, which cannot be recovered from their COUNTS alone (summing is right only while the sets are
+        disjoint — and the one case where they are not is precisely the collapsed-key vacuity the
+        ``lanes_observed >= 2`` bar exists to catch). Labels only — the shardcert stamps
+        ``(shard, [lane,] dest)`` here, never anything message-derived beyond that (PHI rule)."""
+        return tuple(sorted(self._lane_seen))
+
     def acked_not_delivered(self) -> int:
         """Acknowledged messages that never reached the sink — the headline loss number (must be 0)."""
         return len(self._acked - self._delivered)

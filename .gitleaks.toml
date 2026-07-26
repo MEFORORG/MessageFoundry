@@ -14,4 +14,12 @@ regexes = [
   # Frozen keyless audit-chain byte-identity fixture (tests/test_audit_integrity.py, #190): the
   # SHA-256 digest of a fixed SYNTHETIC audit row — a hash pinned to detect drift, not a secret.
   '''f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e''',
+  # SOAP body-secret PLACEHOLDER tokens (ADR 0015 amendment / #236). By design these are NOT secrets:
+  # the Handler emits the token in the <Body> and the transport swaps in the real env() credential at
+  # send time, so an `MF_IIS_<ROLE>_<hex>` token is public (it lives in committed sample/test source).
+  # Their high entropy is deliberate (collision-resistance), which is what trips generic-api-key.
+  '''MF_IIS_[A-Z]+_[0-9a-f]{12,}''',
+  # Fake test-fixture lease key (ADR 0114 claim-proc live test, tests/test_adr0114_claim_proc_live.py):
+  # a hardcoded literal string naming the test scenario, not a credential — trips generic-api-key on entropy.
+  '''adr0114-fence-test''',
 ]

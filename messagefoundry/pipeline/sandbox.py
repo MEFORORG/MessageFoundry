@@ -53,10 +53,10 @@ import struct
 import subprocess
 import sys
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from messagefoundry.config.run_context import RunContext
 
@@ -95,7 +95,7 @@ DEFAULT_FORBIDDEN_MODULES: tuple[str, ...] = (
 )
 
 
-class SandboxMode(str, enum.Enum):
+class SandboxMode(str, enum.Enum):  # noqa: UP042
     """How a Router/Handler is executed relative to the engine process."""
 
     OFF = "off"  # in-process, byte-identical, zero overhead (default)
@@ -268,11 +268,11 @@ class SandboxSession:
     def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
             return
-        try:
+        try:  # noqa: SIM105
             proc.kill()
         except OSError:
             pass
-        try:
+        try:  # noqa: SIM105
             proc.wait(timeout=5)
         except (subprocess.TimeoutExpired, OSError):
             pass

@@ -131,6 +131,64 @@ async def test_sqlite_counters_start_at_zero(tmp_path: Path) -> None:
         await store.close()
 
 
+# --- #207: weld the harness report's MEASURED txn/msg to the LIVE store counter --------------------
+
+
+@pytest.mark.parametrize(("handlers", "destinations"), SHAPES)
+async def test_report_measured_txn_per_message_from_live_sqlite_counter(
+    tmp_path: Path, handlers: int, destinations: int
+) -> None:
+    """End-to-end: drive real messages through the SQLite pipeline, then feed the store's live
+    ``committed_txns`` delta into harness ``report.py`` exactly as a load run does (poller final −
+    base) and assert the rendered MEASURED txn/msg equals the store-measured ``3 + 2H + 2N`` model.
+
+    Closes the loop the static gate cannot: real store counter → poller sample → report
+    self-difference → per-message division. A wrong divisor (or a dropped shard's txns) breaks this.
+    """
+    from harness.load.enginepoll import EnginePoller, EngineSample
+    from harness.load.report import _engine_summary
+
+    store = await MessageStore.open(tmp_path / "report.db")
+    try:
+        base_txns = store.committed_txns
+        msgs = 4
+        for _ in range(msgs):
+            await _drive_lifecycle(store, handlers=handlers, destinations=destinations)
+        delta = store.committed_txns - base_txns
+        assert delta == msgs * _expected_txns(handlers, destinations)
+
+        # The harness reads this delta as (final − base) across two poller samples; message_count is
+        # the run's Counters.acked. The measured figure must land back on the per-message model.
+        poller = EnginePoller("http://x", None, origin=0.0)
+        sample_base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "wal", "normal", 1.0)
+        sample_final = EngineSample(
+            1.0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "wal",
+            "normal",
+            2.0,
+            committed_txns=delta,
+        )
+        poller._samples.extend([sample_base, sample_final])
+        summary = _engine_summary(poller, None, "sqlite", msgs)
+
+        assert summary.committed_txns == delta
+        assert summary.txn_per_message_measured == pytest.approx(
+            float(_expected_txns(handlers, destinations))
+        )
+    finally:
+        await store.close()
+
+
 # --- SQL Server: offline recording harness ---------------------------------------------------------
 
 

@@ -40,15 +40,17 @@ from __future__ import annotations
 import abc
 import asyncio
 import ftplib  # nosec B402 — plain FTP is gated: cleartext credentials are refused (see _validate_common); FTPS/SFTP are the encrypted defaults
+import hashlib
 import io
 import logging
 import posixpath
 import ssl
 import uuid
-from collections.abc import Mapping
-from typing import Any, Callable, TypeVar
+from collections import OrderedDict
+from collections.abc import Callable, Mapping
+from typing import Any, TypeVar
 
-from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     insecure_tls_allowed,
@@ -68,13 +70,15 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    SourceStartupError,
     register_destination,
     register_source,
 )
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
+    LEAVE_SEEN_CACHE_MAX,
     ScanRejected,
-    _looks_like_hl7,
+    _content_matches_declared,
     render_filename,
     scan_inbound_file,
 )
@@ -299,7 +303,7 @@ class _FtpClient(_RemoteClient):
 
     def ensure_dir(self, remote_dir: str) -> None:
         def run(ftp: ftplib.FTP) -> None:
-            try:
+            try:  # noqa: SIM105
                 ftp.mkd(remote_dir)
             except ftplib.error_perm:
                 pass  # already exists (or no permission) — best-effort, like File's mkdir(exist_ok)
@@ -444,7 +448,7 @@ class _SftpClient(_RemoteClient):
             try:
                 sftp.stat(remote_dir)
             except FileNotFoundError:
-                try:
+                try:  # noqa: SIM105
                     sftp.mkdir(remote_dir)
                 except OSError:
                     pass  # racing creator / no permission — best-effort
@@ -673,7 +677,19 @@ class RemoteFileSource(SourceConnector):
         self._remote_dir = str(s["remote_dir"])
         self._pattern: str = s.get("pattern", "*.hl7")
         self._poll_seconds: float = float(s.get("poll_seconds", 5.0))
-        self._after_read: str = s.get("after_read", "move")  # "move" | "delete"
+        self._after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
+        if self._after_read not in ("move", "delete", "leave"):
+            raise ValueError(
+                f"REMOTEFILE after_read must be 'move', 'delete', or 'leave', got {self._after_read!r}"
+            )
+        # #142 leave-in-place: HASHED file_keys this connection ingested — a BOUNDED LRU fast-path (cap
+        # LEAVE_SEEN_CACHE_MAX) in front of the authoritative durable ledger, so it can't outgrow the
+        # ledger's own count cap. A miss falls through to ledger.is_processed(); eviction never causes a
+        # false re-ingest. Never a cleartext filename; never logged at INFO+.
+        self._processed_seen: OrderedDict[str, None] = OrderedDict()
+        # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
+        # run-time deferral (an unreachable remote dir is logged-and-retried each poll, never fails start).
+        self._validate_directory: bool = bool(s.get("validate_directory", False))
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self._max_file_bytes: int | None = int(mfb) if mfb else None
         self._processed_dir = posixpath.join(
@@ -720,6 +736,22 @@ class RemoteFileSource(SourceConnector):
                 ) from exc
             raise DeliveryError(str(exc)) from exc
 
+    async def validate_startup(self) -> None:
+        """Opt-in at-start directory validation (#114). No-op unless ``validate_directory`` is set; then
+        the remote poll dir must be reachable and listable now — a listing failure (no-such-dir,
+        connect/auth) raises :class:`SourceStartupError` so the runner isolates the connection as
+        ADR-0031 ``failed`` rather than logging-and-retrying every poll. Listing is the read-only probe
+        the source does anyway; it never creates the directory."""
+        if not self._validate_directory:
+            return
+        try:
+            await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+        except _RemoteError as exc:
+            raise SourceStartupError(
+                f"REMOTEFILE source directory {_redact(self._host, self._remote_dir)} failed startup "
+                f"validation: {exc}"
+            ) from exc
+
     async def _run(self) -> None:
         while not self._stop.is_set():
             try:
@@ -735,9 +767,9 @@ class RemoteFileSource(SourceConnector):
                     "REMOTEFILE source poll failed for %s; retrying next interval",
                     _redact(self._host, self._remote_dir),
                 )
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # poll interval elapsed; poll again
 
     def _may_poll(self) -> bool:
@@ -770,12 +802,19 @@ class RemoteFileSource(SourceConnector):
         await asyncio.to_thread(self._client.ensure_dir, self._processed_dir)
         await asyncio.to_thread(self._client.ensure_dir, self._error_dir)
         entries = await asyncio.to_thread(self._client.list_dir, self._remote_dir)
+        newly_recorded = 0  # #142: files marked processed THIS poll — gates one end-of-poll prune
         for name, size in sorted(entries):
             if self._stop.is_set():
                 break  # shutting down — leave the rest for the next start (at-least-once)
             if not fnmatch.fnmatch(name, self._pattern):
                 continue
             path = posixpath.join(self._remote_dir, name)
+            # #142 leave-in-place dedup: skip a file this connection already ingested (in-process set,
+            # then the durable ledger). Keyed on a HASHED id (name+size — a remote listing carries no
+            # mtime) — never a cleartext filename, never logged at INFO+.
+            file_key = self._file_key(name, size) if self._after_read == "leave" else None
+            if file_key is not None and await self._leave_already_ingested(file_key):
+                continue
             if self._max_file_bytes is not None and size > self._max_file_bytes:
                 # Transport-level reject *before* any bytes are read — parallels the File source's
                 # oversize guard. It never became a "received message", so there's no store
@@ -796,19 +835,22 @@ class RemoteFileSource(SourceConnector):
                     "REMOTEFILE could not retrieve %s (will retry next poll): %s", name, exc
                 )
                 continue
-            # Content sniff (ASVS 5.2.2), gated to hl7v2 drops. The remote dir is a less-trusted source,
-            # so a binary/non-HL7 file that merely matches the *.hl7 pattern is quarantined before its
-            # bytes reach the pipeline — mirroring the local File source's _looks_like_hl7 guard. Unlike
-            # the local source (which sniffs unconditionally), this is gated on the inbound's declared
-            # content_type: a legitimate X12/DICOM/binary drop (any non-hl7v2 type) must NOT be rejected
-            # for lacking an MSH/FHS/BHS header. content_type is None only for a direct caller/test that
-            # never had it injected — treated as "unknown", so gating off leaves that path byte-identical.
-            if self.content_type is ContentType.HL7V2 and not _looks_like_hl7(raw):
+            # Content-vs-type magic-byte check (ASVS 5.2.2), mirroring the local File source's
+            # _content_matches_declared dispatch (hl7v2→MSH/FHS/BHS, x12→ISA, dicom→preamble+DICM,
+            # json/fhir→{/[, xml→<; binary/text unchecked). The remote dir is a less-trusted source, so a
+            # drop whose leading bytes contradict its declared content_type is quarantined before its bytes
+            # reach the pipeline. The former None-skips-sniff carve-out was REMOVED (ASVS 5.2.2): the check
+            # now ALWAYS runs, converging onto the local source's semantics — the helper's None arm already
+            # means hl7v2, so a content_type=None drop is sniffed as HL7 (a binary drop is quarantined to
+            # .error, not delivered raw).
+            if not _content_matches_declared(self.content_type, raw):
                 # Like the oversize / scan-reject cases it never became a "received message", so there
                 # is no store disposition; preserve it in .error and log it (never a silent drop).
                 logger.warning(
-                    "REMOTEFILE file %s is not HL7 (no MSH/FHS/BHS header); routing to error dir",
+                    "REMOTEFILE file %s does not match its declared content type %r "
+                    "(no matching magic bytes); routing to error dir",
                     name,
+                    (self.content_type or ContentType.HL7V2).value,
                 )
                 await self._move(path, self._error_dir, name)
                 continue
@@ -851,6 +893,59 @@ class RemoteFileSource(SourceConnector):
                 )
                 continue
             await self._after_processing(path, name)
+            if file_key is not None:
+                # Record AFTER emit success (the FILE — not each split message — is the dedup unit).
+                await self._leave_record(file_key)
+                newly_recorded += 1
+        if newly_recorded and self.processed_ledger is not None:
+            await (
+                self.processed_ledger.prune()
+            )  # bound growth (age + count), only when something new
+
+    def _file_key(self, name: str, size: int) -> str:
+        """A stable, HASHED identity for a remote source file, for the leave-in-place dedup ledger
+        (#142). SHA-256 over the file's FULL REMOTE PATH (``remote_dir``/``name``) + size — folding the
+        full path, not just the basename, keeps two same-named files that live under different bases (or
+        a re-pointed ``remote_dir``) DISTINCT so both are ingested (never one silently deduped away — the
+        count-and-log invariant). A remote directory listing carries no reliable mtime, so size is the
+        change signal (a same-path file whose SIZE changes is re-ingested); on a read-only share (the
+        target use case) files are stable. The path — which, like a filename, can embed an MRN — is never
+        stored or logged in the clear (the ledger holds this derived id only; never log the path)."""
+        full = posixpath.join(self._remote_dir, name)
+        return hashlib.sha256(f"{full}\x00{size}".encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _seen_touch(self, file_key: str) -> bool:
+        """True if ``file_key`` is in the bounded in-memory fast-path (and refresh its LRU recency)."""
+        if file_key in self._processed_seen:
+            self._processed_seen.move_to_end(file_key)
+            return True
+        return False
+
+    def _seen_add(self, file_key: str) -> None:
+        """Add ``file_key`` to the bounded LRU, evicting the oldest on overflow. Eviction is safe: a
+        later miss falls through to the authoritative durable ``ledger.is_processed()`` read."""
+        self._processed_seen[file_key] = None
+        self._processed_seen.move_to_end(file_key)
+        while len(self._processed_seen) > LEAVE_SEEN_CACHE_MAX:
+            self._processed_seen.popitem(last=False)
+
+    async def _leave_already_ingested(self, file_key: str) -> bool:
+        """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
+        I/O), then, on a miss, the AUTHORITATIVE durable ledger (covers a restart / a fresh process / a
+        cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest."""
+        if self._seen_touch(file_key):
+            return True
+        ledger = self.processed_ledger
+        if ledger is not None and await ledger.is_processed(file_key):
+            self._seen_add(file_key)
+            return True
+        return False
+
+    async def _leave_record(self, file_key: str) -> None:
+        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key) + the bounded cache."""
+        self._seen_add(file_key)
+        if self.processed_ledger is not None:
+            await self.processed_ledger.mark_processed(file_key)
 
     async def _after_processing(self, path: str, name: str) -> None:
         if self._after_read == "delete":
@@ -859,6 +954,10 @@ class RemoteFileSource(SourceConnector):
             except _RemoteError as exc:
                 # A processed file we can't delete will be re-read (a duplicate); surface it.
                 logger.warning("REMOTEFILE could not delete processed file %s: %s", name, exc)
+        elif self._after_read == "leave":
+            # #142 process-in-place: never move/delete — the durable dedup ledger (recorded by
+            # _poll_once AFTER this returns) is what stops it being re-ingested next poll.
+            return
         else:
             await self._move(path, self._processed_dir, name)
 

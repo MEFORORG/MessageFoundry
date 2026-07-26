@@ -20,7 +20,6 @@ from __future__ import annotations
 import os
 
 import pytest
-
 from _failover_load_support import (
     assert_failover_ok,
     dump_queue_breakdown,

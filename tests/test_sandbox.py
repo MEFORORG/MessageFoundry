@@ -91,7 +91,7 @@ def graph(tmp_path: Path) -> tuple[Registry, str]:
 
 
 def _deliveries(registry: Registry, hname: str, **kw: object) -> list[tuple[str, str]]:
-    ds, _, _ = transform_one(registry, hname, RAW, **kw)  # type: ignore[arg-type]
+    ds, _, _, _ = transform_one(registry, hname, RAW, **kw)  # type: ignore[arg-type]
     return [(d.to, d.payload) for d in ds]
 
 

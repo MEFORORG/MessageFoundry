@@ -8,8 +8,9 @@
   AES-GCM at rest + key-rotation coverage, read-through cache + `reference_view()`), the
   `ReferenceSyncRunner` (supervised loop + startup sync), the `Reference(...)` / `FileRef(...)` author
   surface, the `[reference]` settings, and reference activation in the router/transform workers +
-  dry-run. SQLite-only snapshot store (SQL Server has an inert stub, like state). **Increment 2 also
-  built:** the **`DatabaseRef`** source — the engine queries SQL directly on the refresh cadence
+  dry-run. Snapshot store on **all three backends** — SQLite, PostgreSQL, and SQL Server (the last
+  ported by BACKLOG #235; see the [2026-07-16 amendment](#amendment-2026-07-16--reference-sets-implemented-on-sql-server-backlog-235)) — see
+  [Backend support](#backend-support). **Increment 2 also built:** the **`DatabaseRef`** source — the engine queries SQL directly on the refresh cadence
   (reusing `transports/database.py` for the DSN/pool, gated by the fail-closed `[egress].allowed_db`
   allowlist), production / supported like the DB connector (faked-driver unit tests + a gated CI round-trip). **Tier 2** (resolve-at-ingress
   per-message lookups) stays deferred to its own ADR.
@@ -166,6 +167,43 @@ ADR-0005 **`state`** stays exactly as-is for **cross-message write-once correlat
 anonymized-id mapping, order↔result) — it is safe *because* its use is write-once, **not** a mutating
 cache. This ADR is its read-side complement, not a change to it.
 
+## Backend support
+
+*(Amendment, 2026-07-14. The original text called the snapshot store "SQLite-only" and the SQL Server
+side "an inert stub". Both were wrong: Postgres is fully ported, and the SQL Server stub is not inert —
+it **raises**.)*
+
+| Backend | Reference-set snapshot store | Notes |
+|---|---|---|
+| **SQLite** | ✅ implemented | The reference implementation: the `reference` / `reference_version` tables, build-new-then-atomic-flip, encrypted at rest, read-through cache. |
+| **PostgreSQL** | ✅ implemented | Ported, not stubbed — same tables + flip contract, plus the real multi-node follower read-through (`converge_reference_cache`). |
+| **SQL Server** | ✅ implemented | Ported at SQLite/Postgres parity by [BACKLOG #235](../BACKLOG.md) — see the [2026-07-16 amendment](#amendment-2026-07-16--reference-sets-implemented-on-sql-server-backlog-235) for this port's two recorded divergences (the UTF-16 sizing guard and the BIN2 collation). |
+
+This is advertised as the **`supports_reference_sets`** capability flag on the `QueueStore` protocol
+(`store/base.py`) — **allow-list semantics**: `False` by default, so a future backend that hasn't ported
+the snapshot store is caught by the same gate. (Since the 2026-07-16 amendment all three shipped
+backends declare `True`.)
+
+**A graph declaring ≥1 `Reference(...)` on a non-supporting backend is REFUSED, fail-closed**, at all
+three config-application points: `messagefoundry check` (the `reference-backend` required check, keyed on
+the declared `[store] backend`), **engine start** (before the startup sync, before any listener binds), and
+**reload/promote** (a `WiringError` → 422 from `RegistryRunner.build_check`, so the running graph is left
+untouched).
+
+**Engine-refusal, not an [ADR 0031](0031-startup-connection-fault-isolation.md) lane degrade.** A reference set
+is registry-**global**, and the read is a runtime-only `reference(name)` call inside a Handler body — there
+is no sound static handler→refset edge to scope a degrade to (`config/reachability.py`'s is a self-declared
+heuristic and cannot see a computed name), so *any* handler on *any* inbound may read the set. Nor is it
+analogous to a capture-incapable lane, which still retries its rows and drops nothing. The gate keys on
+**declaration**, so it fires even when the sync is deferred — the set still never materializes.
+
+**What this replaces.** Previously such a graph started clean, the `ReferenceSyncRunner` swallowed the
+`NotImplementedError` as a generic source failure and logged `reference set 'x' sync failed (keeping
+last-good): NotImplementedError` **every refresh interval, forever** — a line that lies twice (the source
+is fine; there is no last-good and never can be) — and every `reference(...)` read raised `ReferenceError`,
+per message, **after the ACK**. The runner now reports a permanent backend incapability **once**, at ERROR,
+and never retries it (defense-in-depth: the start gate makes it unreachable in a served engine).
+
 ## Consequences
 
 **Positive**
@@ -191,8 +229,12 @@ cache. This ADR is its read-side complement, not a change to it.
   failing sync serves stale data until the staleness alert fires.
 - The **SQL-Server source sync** needs the `[sqlserver]` extra + ODBC Driver 18 and is exercised by the
   CI SQL Server service-container leg, like the DATABASE connector (now production). The reference
-  **snapshot store** remains **SQLite-only** — `write_reference_snapshot` raises on the SQL Server
-  backend. The **read path** is backend-agnostic (the snapshot lives in the SQLite store like state).
+  **snapshot store** is implemented on **all three backends** — SQLite, PostgreSQL, and (since the
+  [2026-07-16 amendment](#amendment-2026-07-16--reference-sets-implemented-on-sql-server-backlog-235))
+  SQL Server — advertised by the `supports_reference_sets` capability flag; the fail-closed gate stays
+  for any future backend that leaves the allow-list default — see
+  [Backend support](#backend-support). (The **read path** itself is backend-agnostic: it reads whatever
+  store the engine opened, which is where the snapshot lives.)
 
 ## Alternatives considered (scored by the design panel)
 
@@ -206,3 +248,63 @@ cache. This ADR is its read-side complement, not a change to it.
 The two-tier split is the synthesis: **Tier 1** delivers the majority of reference-shaped lookups at
 low risk and ships first; **Tier 2** covers live-current + write-back correlation later, with
 **per-message-immutable keying** as the rule both tiers — and any future design — must obey.
+
+## Amendment (2026-07-16) — reference sets implemented on SQL Server (BACKLOG #235)
+
+The reference-set snapshot store is now **ported to SQL Server at SQLite/Postgres parity**
+([`store/sqlserver.py`](../../messagefoundry/store/sqlserver.py)): the `reference` /
+`reference_version` tables, `write_reference_snapshot` (build-new-then-atomic-flip in one
+transaction), `_load_reference_cache` / `reference_view()`, and the multi-node follower read-through
+`converge_reference_cache()`. `supports_reference_sets` is `True` on all three shipped backends;
+**the fail-closed capability gate itself stays** (allow-list, `False` on the base protocol), so a
+future backend that never ports the snapshot store is still refused at `messagefoundry check`, at
+engine start, and on reload/promote — SQL Server's row simply moves out of the refusal table.
+
+Landed across three Plan-12 sessions, in fail-closed order: the T-SQL port with the flag held
+`False` (`store-235-port`, PR #1075) → the real-server proof battery (`store-235-ci-tests`,
+PR #1078) → this flip. **The flip was gated on PR #1078's sqlserver-store (2022 + 2025 image matrix)
+and postgres-store CI legs going green** — the only authoritative T-SQL proof (local pytest silently
+skips without a live server) — covering the UTF-16 guard boundary trio, the BIN2 collation
+round-trip, the no-key→key reopen migration, the follower converge + writer `== []` pin, and the
+first-ever reference-row key-rotation tests on all three backends.
+
+**Decisions this port records:**
+
+- **Schema.** `reference (name NVARCHAR(256), version NVARCHAR(64), [key] NVARCHAR(450),
+  value NVARCHAR(MAX))` with `PRIMARY KEY NONCLUSTERED (name, version, [key])`, plus the
+  `reference_version` pointer table — the donors' tables, width-bounded. **450 was *chosen* so the
+  worst-case composite index key (256 + 64 + 450 code units = 1,540 bytes) can never hit SQL Server's
+  1,700-byte nonclustered-index key cap** — the cap is a sizing input, not the runtime failure mode.
+  **The runtime rejector for an over-long key is the `NVARCHAR(450)` column width itself
+  (truncation)**, which is why the guard below exists. The PK is NONCLUSTERED deliberately: a
+  clustered PK (900-byte cap) would declare-with-warning and fail only on actual over-900-byte rows —
+  a data-dependent landmine instead of a declared bound.
+- **Fail-closed sizing guard (divergence 1 from the donors).** SQLite/Postgres store keys as
+  unbounded TEXT and have no equivalent limit. Here, an over-long `name` (> 256) or `key` (> 450) —
+  measured in **UTF-16 code units**, what `NVARCHAR` actually counts — raises **before** the snapshot
+  transaction, so the sync runner's source-failure handling keeps the last-good snapshot live and
+  alerts. The error **never embeds the raw key** (reference keys may be PHI for patient-keyed sets):
+  it carries the set name plus the key's length, ordinal, and a truncated SHA-256 only.
+- **Binary collation (divergence 2).** `COLLATE Latin1_General_100_BIN2` on `name` / `version` /
+  `[key]` (both tables), so key equality is a **byte comparison** like SQLite/Postgres. Under a
+  case-insensitive database default (SQL Server's norm), externally-sourced keys differing only by
+  case — or by a trailing space, per ANSI padding on index keys — would collide into a PK duplicate
+  mid-transaction, turning a valid snapshot into a perpetual per-interval sync failure.
+- **Encryption at rest.** Values are `cipher.encrypt(json.dumps(v))` (`mfenc`), covered by **both**
+  `reencrypt_to_active` (key rotation) **and** `_encrypt_existing_rows` (the no-key→key migration
+  pass). The migration pass is required because "born encrypted" is false: under a no-key deployment
+  `IdentityCipher` writes plaintext JSON, and the no-key→key transition is exactly what that method
+  exists to migrate — omitting `reference` would leave snapshot PHI plaintext at rest after a key is
+  introduced.
+- **Convergence.** Multi-node read-through per the donor contract (`reference_version` LEFT JOIN
+  `reference`, swap only sets whose active version advanced). The leader's own
+  `write_reference_snapshot` updates **both** the read cache and the versions map post-commit, so
+  `converge_reference_cache()` returns `[]` on the node that just wrote — no self-refresh.
+- **Upsert idiom.** The `reference_version` pointer flip uses `MERGE WITH (HOLDLOCK)` — the
+  established `SqlServerCoordinator` idiom
+  ([`pipeline/cluster_sqlserver.py`](../../messagefoundry/pipeline/cluster_sqlserver.py), the SQL
+  Server store Phase 4 active-passive HA) — rather than a novel upsert shape.
+
+Operational note: the first post-upgrade open of an existing production DB re-runs the full guarded
+DDL batch once under the schema applock with the timeout exemption (the content-addressed `_SCHEMA`
+changed) — by design, benign.

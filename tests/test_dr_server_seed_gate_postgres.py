@@ -13,8 +13,11 @@ Run pytest FROM the worktree (CWD shadows the editable install)."""
 
 from __future__ import annotations
 
+import json
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -123,3 +126,106 @@ async def test_restored_db_attested_passes(store: Any, monkeypatch: pytest.Monke
     result = await coord.activate(dba_attests_restored=True, actor="alice")
     assert result.active and coord.active and state["active"]
     assert result.verify_status == "PASS"
+
+
+# --- DR-27: restore-token vintage-floor cross-check on a REAL server DB (BACKLOG #223, ADR 0102) --------
+#
+# The #102 gate's branch (c) (DrCoordinator._verify_restore_token + _latest_backup_archive) round-trips
+# the live store's list_audit(action="dr_backup") + detail-JSON parse. The unit tests cover it against a
+# SQLite store with .backend monkeypatched — this drives it against the REAL asyncpg Record row type
+# (row.keys()/row["detail"]) that _latest_backup_archive relies on. Active only when [dr].restore_token
+# is set.
+
+_ANCHOR = "mefor-backup-20260101T000000Z.mfbak"
+
+
+async def _clear_audit(store: Any) -> None:
+    async with store._pool.acquire() as conn:
+        await conn.execute("DELETE FROM audit_log")
+
+
+async def _actions(store: Any) -> list[str]:
+    return [r["action"] for r in await store.list_audit(limit=50)]
+
+
+def _write_token(tmp_path: Path, expected_archive: str) -> str:
+    token = tmp_path / "restore.token"
+    token.write_text(json.dumps({"expected_backup_archive": expected_archive}), encoding="utf-8")
+    return str(token)
+
+
+async def test_restore_token_matches_passes(
+    store: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # AC: the token's expected anchor MATCHES the restored DB's latest SUCCESSFUL dr_backup archive read
+    # back through the real list_audit round-trip → the vintage floor is satisfied and activation proceeds.
+    _stub_verify_pass(monkeypatch)
+    await _clear_audit(store)
+    await store.record_audit(
+        "dr_backup", actor="system", detail=json.dumps({"archive": _ANCHOR}), now=1.0
+    )
+    token = _write_token(tmp_path, _ANCHOR)
+    coord, state = _coord(store, restore_token=token)
+    result = await coord.activate(dba_attests_restored=True, actor="alice")
+    assert result.active and coord.active and state["active"]
+    assert "dr_activation_aborted" not in await _actions(store)
+
+
+async def test_restore_token_mismatch_refused(
+    store: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # The token names a DIFFERENT archive than the restored DB's latest dr_backup anchor (a stale/wrong
+    # native restore) → fail closed, kind seed, dr_activation_aborted recorded, never active.
+    _stub_verify_pass(monkeypatch)
+    await _clear_audit(store)
+    await store.record_audit(
+        "dr_backup", actor="system", detail=json.dumps({"archive": _ANCHOR}), now=1.0
+    )
+    token = _write_token(tmp_path, "mefor-backup-19990101T000000Z.mfbak")
+    coord, state = _coord(store, restore_token=token)
+    with pytest.raises(DrActivationError) as exc:
+        await coord.activate(dba_attests_restored=True, actor="alice")
+    assert exc.value.kind == "seed"
+    assert not coord.active and not state["active"]
+    assert "dr_activation_aborted" in await _actions(store)
+
+
+async def test_restore_token_no_successful_anchor_refused(
+    store: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A dr_backup row exists (so has_prior_backup_history passes branch b), but it is a FAILURE row with no
+    # 'archive' in detail → _latest_backup_archive returns None → no vintage to floor against → refused.
+    _stub_verify_pass(monkeypatch)
+    await _clear_audit(store)
+    await store.record_audit(
+        "dr_backup", actor="system", detail=json.dumps({"outcome": "error"}), now=1.0
+    )
+    assert await store.has_prior_backup_history() is True  # branch (b) passes...
+    token = _write_token(tmp_path, _ANCHOR)
+    coord, state = _coord(store, restore_token=token)
+    with pytest.raises(DrActivationError) as exc:
+        await coord.activate(dba_attests_restored=True, actor="alice")
+    assert exc.value.kind == "seed"  # ...but branch (c) has no successful anchor → refused
+    assert not coord.active and not state["active"]
+    assert "dr_activation_aborted" in await _actions(store)
+
+
+async def test_restore_token_skips_failure_row(
+    store: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # A later dr_backup ERROR row (higher id, no 'archive') must NOT shadow the earlier SUCCESS archive:
+    # _latest_backup_archive scans id-DESC and skips the failure row, matching the token against the
+    # success anchor → passes.
+    _stub_verify_pass(monkeypatch)
+    await _clear_audit(store)
+    await store.record_audit(
+        "dr_backup", actor="system", detail=json.dumps({"archive": _ANCHOR}), now=1.0
+    )
+    await store.record_audit(
+        "dr_backup", actor="system", detail=json.dumps({"outcome": "error"}), now=2.0
+    )
+    token = _write_token(tmp_path, _ANCHOR)
+    coord, state = _coord(store, restore_token=token)
+    result = await coord.activate(dba_attests_restored=True, actor="alice")
+    assert result.active and coord.active and state["active"]
+    assert "dr_activation_aborted" not in await _actions(store)

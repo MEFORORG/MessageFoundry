@@ -24,7 +24,6 @@ from messagefoundry.verify.model import CheckResult, Status
 from messagefoundry.verify.report import exit_code, render_console, render_json, render_markdown
 from messagefoundry.verify.runner import ALL_SECTIONS, run_verify
 
-
 # ---- host checks ------------------------------------------------------------------------------
 
 
@@ -130,6 +129,65 @@ def test_self_smoke_routes_synthetic_adt() -> None:
 def test_synthetic_message_is_hl7() -> None:
     msg = smoke.synthetic_message()
     assert msg.startswith("MSH|")
+
+
+# ---- self smoke: snapshot_on_send thread-through (#241 F3) -------------------------------------
+
+
+def test_smoke_self_threads_snapshot_on_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    # smoke_self must pass its snapshot_on_send straight into dry_run (not silently drop to the
+    # library default), so the self-smoke previews the engine's real copy-on-Send posture (ADR 0104).
+    import messagefoundry.pipeline.dryrun as dryrun_mod
+    from messagefoundry.pipeline.dryrun import DryRunResult
+
+    real = dryrun_mod.dry_run
+    seen: list[bool] = []
+
+    def _spy(*args: object, **kwargs: object) -> DryRunResult:
+        seen.append(bool(kwargs.get("snapshot_on_send")))
+        return real(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(dryrun_mod, "dry_run", _spy)
+    r = smoke.smoke_self("samples/config", inbound="IB_ACME_ADT", snapshot_on_send=True)
+    assert r.status is Status.PASS, r.detail
+    assert seen == [True]
+
+
+def test_run_verify_self_smoke_threads_resolved_setting(monkeypatch: pytest.MonkeyPatch) -> None:
+    # run_verify must feed smoke_self the RESOLVED [pipeline].snapshot_on_send — True on a default
+    # engine (PipelineSettings default), the configured value otherwise — and keep the dry_run library
+    # default (False) when no service settings load (#241 F3, #230 CLI parity).
+    from messagefoundry.config.settings import PipelineSettings, ServiceSettings
+    from messagefoundry.verify import runner as runner_mod
+
+    seen: list[bool] = []
+
+    def _spy_smoke_self(
+        config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
+    ) -> CheckResult:
+        seen.append(snapshot_on_send)
+        return CheckResult("smoke.self", "spy", Status.PASS, "spy")
+
+    monkeypatch.setattr(runner_mod, "smoke_self", _spy_smoke_self)
+
+    # settings present, snapshot ON (the default-engine posture) -> threaded True.
+    monkeypatch.setattr(runner_mod, "_load_settings", lambda _c: (ServiceSettings(), None))
+    run_verify(sections=["smoke"], smoke_mode="self")
+    assert seen[-1] is True
+
+    # settings present, snapshot OFF -> threaded False (proves it's the resolved value, not a constant).
+    monkeypatch.setattr(
+        runner_mod,
+        "_load_settings",
+        lambda _c: (ServiceSettings(pipeline=PipelineSettings(snapshot_on_send=False)), None),
+    )
+    run_verify(sections=["smoke"], smoke_mode="self")
+    assert seen[-1] is False
+
+    # no service settings -> keep the dry_run library default (False), never the ON engine default.
+    monkeypatch.setattr(runner_mod, "_load_settings", lambda _c: (None, "boom"))
+    run_verify(sections=["smoke"], smoke_mode="self")
+    assert seen[-1] is False
 
 
 # ---- live smoke (ACK parsing + a fake MLLP server) --------------------------------------------
@@ -257,7 +315,7 @@ def test_cli_verify_rejects_unknown_section(capsys: pytest.CaptureFixture[str]) 
 
 
 def test_all_sections_constant() -> None:
-    assert set(ALL_SECTIONS) == {"host", "store", "smoke", "manual"}
+    assert set(ALL_SECTIONS) == {"host", "store", "smoke", "manual", "federation"}
 
 
 # ---- disposition (--check-disposition) --------------------------------------------------------
@@ -329,3 +387,65 @@ def test_run_verify_check_disposition_skips_without_settings() -> None:
     )
     disp = [r for r in results if r.id == "smoke.disposition"]
     assert disp and disp[0].status is Status.SKIP
+
+
+# ---- settings-load failures are reported, not disguised as "no settings" -----------------------
+
+
+def test_absent_config_resolves_defaults_and_adds_no_row(tmp_path: Path) -> None:
+    """A box with NO messagefoundry.toml is not an error: load_settings returns defaults. The run
+    must therefore be byte-unchanged — no config.load row, no exit-code change."""
+    from messagefoundry.verify.runner import _load_settings
+
+    settings, error = _load_settings(None)
+    assert settings is not None and error is None
+
+    results = run_verify(sections=["store"], smoke_mode="none")
+    assert not [r for r in results if r.id == "config.load"]
+
+
+def test_a_config_that_exists_but_is_invalid_fails_with_the_reason(tmp_path: Path) -> None:
+    """The defect this fixes: `settings is None` NEVER meant "absent" (absent yields defaults), yet
+    every dependent row said "no service settings — pass --service-config", sending an operator to
+    look for a file that is present and broken. It must FAIL, naming the cause."""
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(
+        "[api]" + chr(10) + 'public_origin = "https://ops.example"' + chr(10),
+        encoding="utf-8",
+    )
+
+    results = run_verify(sections=["store"], smoke_mode="none", service_config=str(cfg))
+    load = [r for r in results if r.id == "config.load"]
+    assert load and load[0].status is Status.FAIL
+    assert "public_origin" in load[0].detail  # the actual cause, not a generic message
+    assert exit_code(results) == 1  # a broken config must not pass an acceptance run
+
+    store = [r for r in results if r.id == "store.connect"]
+    assert store and store[0].status is Status.SKIP
+    assert "config.load" in store[0].detail  # points at the row carrying the reason
+
+
+def test_a_missing_explicit_config_path_fails_rather_than_skipping(tmp_path: Path) -> None:
+    results = run_verify(
+        sections=["store"], smoke_mode="none", service_config=str(tmp_path / "nope.toml")
+    )
+    load = [r for r in results if r.id == "config.load"]
+    assert load and load[0].status is Status.FAIL
+    assert exit_code(results) == 1
+
+
+def test_settings_error_never_echoes_a_configured_value(tmp_path: Path) -> None:
+    """A verify report is written to disk and pasted into tickets, so a pydantic ValidationError must
+    contribute loc+msg only — never `input`, which for a password or DSN would be a credential."""
+    secret = "SUPERSECRET-do-not-print-me"
+    cfg = tmp_path / "messagefoundry.toml"
+    cfg.write_text(
+        "[api]" + chr(10) + 'port = "' + secret + '"' + chr(10),
+        encoding="utf-8",
+    )
+
+    results = run_verify(sections=["store"], smoke_mode="none", service_config=str(cfg))
+    rendered = render_json(results) + render_markdown(results) + render_console(results)
+    assert secret not in rendered
+    load = [r for r in results if r.id == "config.load"]
+    assert load and "api.port" in load[0].detail  # the FIELD is named; the value is not

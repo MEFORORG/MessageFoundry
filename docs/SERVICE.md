@@ -128,6 +128,10 @@ If `nssm` isn't on `PATH`, it's the auto-downloaded copy at `<DataDir>\bin\nssm.
 (e.g. `C:\ProgramData\MessageFoundry\bin\nssm.exe`). You can also use the built-in
 `sc.exe` / Services.msc once installed.
 
+For a one-click desktop alternative to these commands — engine status at a glance plus
+start/stop/restart, the console, and the log from the notification area — run the
+**[Windows tray service-manager](TRAY.md)** (`messagefoundry-tray` — shipped in the wheel, on every install).
+
 ## Security hardening (recommended)
 
 ### Run as a least-privilege account (DEPLOY-1)
@@ -273,6 +277,53 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
 - `/config/reload` only loads from the startup `--config` directory and any directories listed in
   `[api].config_reload_roots` (see [CONFIGURATION.md](CONFIGURATION.md)); an arbitrary path is
   rejected. Keep those roots admin-owned too.
+
+### Suppress Windows crash dumps of the engine (ADR 0152 Phase 0)
+
+A Windows Error Reporting crash dump of the engine is a **full PHI disclosure written to disk**:
+in-flight HL7 bodies, the plaintext the store cipher just produced, and the unwrapped DEK all live in
+process memory, and a dump copies that memory into a file that is **not** the store — not encrypted,
+not covered by the store's ACLs, and never touched by the retention sweep.
+
+The engine applies the **process-local** half of the fix on every `serve`, unconditionally and with no
+configuration: `SetErrorMode` (ORed into the inherited mode, so it can never clear a protection you set
+upstream) plus `WerSetFlags(NOHEAP | NO_UI | DISABLE_SNAPSHOT_CRASH | DISABLE_SNAPSHOT_HANG)`. It
+persists nothing and needs no privilege — a `serve` invocation never silently rewrites machine state.
+
+The other half is **machine policy and no process can reach it**: `HKLM\…\Windows Error
+Reporting\LocalDumps` is evaluated independently of the WER exclusion list and of every flag a process
+can set, so a LocalDumps-configured host still dumps a process that suppressed everything available to
+it. Close it at install time:
+
+```powershell
+.\install-service.ps1 -Environment prod -SuppressCrashDumps
+```
+
+It is **opt-in** because it writes `HKLM` keys **by image name**, which affects every process of that
+name on the host — an explicit operator decision, not a side effect of installing. It registers both
+`messagefoundry.exe` and the venv `python.exe`: a pip console-script launcher starts the interpreter as
+a **child process**, so the process holding the PHI heap (and the one WER would dump) is `python.exe`,
+and naming only the launcher would produce a policy that looks applied and protects nothing.
+
+**`LocalDumps` is only ever narrowed, never switched on.** WER local dump collection is **opt-in**: if
+the `LocalDumps` key does not exist, no local dumps are collected for anything on the host. Creating
+`LocalDumps\<image>` where the parent key was absent would therefore *configure* per-image dump
+collection where there was none — a `-SuppressCrashDumps` switch that plausibly **enables** PHI dumps is
+worse than no switch at all. So the installer writes the per-image override **only when a `LocalDumps`
+configuration already exists**, and reports which of the two it did. Where it does write it, the override
+is `DumpType=0` + `CustomDumpFlags=0` (`MiniDumpNormal` — **no heap**, which is the PHI-relevant part) so
+a host configured for full dumps stops writing the engine's heap. Note that Microsoft documents
+`DumpCount` as *the maximum number of dump files in the folder*, **not** as a disable switch, so treat
+the override as a **reduction, not an elimination**: a `MiniDumpNormal` still carries thread stacks. To
+eliminate local dumps entirely, remove the host's `LocalDumps` configuration.
+
+**Residuals, stated plainly.** A postmortem debugger registered under `AeDebug` attaches ahead of WER
+entirely and is outside both halves. The keys **persist after `uninstall-service.ps1`** (deliberately —
+silently re-enabling PHI dumps on uninstall would be the more surprising default); remove them by hand
+under that registry path to restore the host's original behaviour. Neither half has been verified by
+forcing an actual crash with PHI resident and inspecting the dump directory — the Win32 calls were
+confirmed to succeed, the registry writes were not executed. And none of this bears on ASVS 11.7.1:
+memory **hygiene** is not memory **encryption**.
 
 ## Verify it's running
 

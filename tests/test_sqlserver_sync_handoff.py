@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -117,7 +118,7 @@ async def test_sync_pool_discards_broken_connection(store: Any) -> None:
     pool = store.open_sync_handoff_pool("routed", 1)
     try:
         broken_conn = None
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError):  # noqa: SIM117
             with pool.acquire(timeout=5) as conn:
                 broken_conn = conn
                 conn.close()  # simulate a mid-handoff connection death (blip / restart / killed session)
@@ -285,7 +286,7 @@ async def test_transform_handoff_sync_merges_setmeta(store: Any) -> None:
 async def test_route_handoff_sync_idempotent_on_rerun(store: Any) -> None:
     mid, ing = await _ingress_and_claim(store, "IB", RAW, now=100.0)
     pool = store.open_sync_handoff_pool("routed", 2)
-    kw = dict(
+    kw = dict(  # noqa: C408
         ingress_id=ing.id,
         message_id=mid,
         channel_id="IB",
@@ -314,7 +315,7 @@ async def test_transform_handoff_sync_idempotent_on_rerun(store: Any) -> None:
     )
     rtd = await store.claim_next_fifo("IB", stage=Stage.ROUTED.value, now=100.0)
     pool = store.open_sync_handoff_pool("outbound", 2)
-    tkw = dict(routed_id=rtd.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "b")])
+    tkw = dict(routed_id=rtd.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "b")])  # noqa: C408
     with pool.acquire(timeout=5) as c1:
         ok, applied = store.transform_handoff_sync(c1, now=100.0, **tkw)
         assert ok is True and applied == []

@@ -148,7 +148,7 @@ async def test_warm_releases_everything_when_cancelled_mid_flight() -> None:
     assert pool.max_concurrent == 2
 
     task.cancel()
-    try:
+    try:  # noqa: SIM105
         await task
     except asyncio.CancelledError:
         pass
@@ -172,7 +172,7 @@ async def test_warm_releases_everything_when_cancelled_during_the_release_loop()
 
     task.cancel()  # cancel WHILE suspended mid-release
     gate.set()  # let the (shielded) releases proceed
-    try:
+    try:  # noqa: SIM105
         await task
     except asyncio.CancelledError:
         pass

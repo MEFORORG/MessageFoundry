@@ -15,18 +15,25 @@ transform-state writes, and cross-stage stale-inflight recovery.
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import json
 import os
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
+from uuid import uuid4
 
 import pytest
 
-from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.models import ContentType, RetryPolicy, Validation
+from messagefoundry.config.wiring import ConnectionSpec, ConnectorType, InboundConnection, Registry
+from messagefoundry.parsing.binary import chunk_b64, is_doc_ref, parse_doc_ref
+from messagefoundry.parsing.message import Message
+from messagefoundry.parsing.peek import Peek
+from messagefoundry.pipeline import wiring_runner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store import MessageStatus, OutboxStatus, Stage
 from messagefoundry.store.content_search import make_spec
-from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
-from messagefoundry.config.wiring import ConnectionSpec, ConnectorType, InboundConnection, Registry
-from messagefoundry.parsing.peek import Peek
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
+from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 
 # A synthetic ADT carrying a (fake) MRN + name in PID — never real PHI.
 _ADT_SEARCH = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||MRN9001^^^H^MR||DOE^JANE\r"
@@ -38,10 +45,19 @@ pytestmark = pytest.mark.skipif(
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
 
+# The AA acknowledgement MessageFoundry returns to RAW's inbound sender (ADR 0021 "Response Sent") — a
+# synthetic ACK frame, never real PHI. Used to exercise record_ack_sent's at-rest PHI fail-safe.
+_ACK_AA = "MSH|^~\\&|C|D|A|B|20260101||ACK^A01|MSG1|P|2.5.1\rMSA|AA|MSG1\r"
+
 # Tables cleaned between tests (FK order: children before parents).
 _TABLES = (
     "message_events",
     "audit_log",
+    "audit_chain_meta",  # #190 audit-chain keying watermark — a keying test (CLI-23) sets it; leaving it
+    #                      would fail-close a later keyless record_audit (poison across tests)
+    "cipher_meta",  # ASVS 11.3.4 per-key GCM invocation counters (no FK)
+    "connection_event",  # #46 lifecycle log (no FK) — ciphered `reason` rows else leak across runs
+    #                      and break the key-rotation reencrypt scan (persistent contamination)
     "cluster_config",
     "message_attachment",  # #149 attachment linkage (no FK)
     "attachment_chunk",  # #149 attachment chunks (no FK)
@@ -49,6 +65,11 @@ _TABLES = (
     "queue",
     "response",
     "delivered_keys",
+    "resend_log",  # ADR 0090 idempotency ledger (no FK) — STOREF-8/9 reuse keys across tests
+    "alert_instance",  # #56 operator alert-state (no FK) — ALERT-19 lists ALL active rows
+    "search_presets",  # ADR 0136 saved searches (no FK, so CASCADE never reaches it) — the ciphered
+    #                    `criteria` is in the key-rotation reencrypt scan, and this suite asserts EXACT
+    #                    rotate counts, so a preset left by one test miscounts an unrelated one
     "messages",
     "state",
     "state_version",
@@ -79,6 +100,9 @@ async def store() -> AsyncIterator[object]:
     # caches (e.g. _state_versions) and leak across tests (Track B Step 6b).
     await s._load_state_cache()
     await s._load_reference_cache()
+    # audit_chain_meta was truncated above; sync the in-memory keying watermark so this keyless fixture
+    # handle never carries a stale watermark that would fail-close a later keyless record_audit (#190).
+    s._audit_keyed_from = None
     yield s
     await s.close()
 
@@ -230,6 +254,123 @@ async def test_complete_with_response_parity(store) -> None:
     await store.complete_with_response(item2.id, body="MSA|AA|2", outcome="accepted", now=600.0)
     caps2 = await store.correlate_response(mid)
     assert [(c.response_seq, c.body) for c in caps2] == [(1, "MSA|AA"), (2, "MSA|AA|2")]
+
+
+# --- ADR 0021 "Response Sent" inbound ACK capture parity (MLLP-20) -----------------------------
+# record_ack_sent's PHI fail-safe on the SERVER store — mirrors tests/test_ack_sent_store.py (SQLite):
+# an AA body is stored ONLY when the store is encrypted and is ciphertext at rest; a NAK never stores a
+# body; the ack_sent row surfaces under a sentinel destination without disturbing outbound reply order.
+
+
+async def test_record_ack_sent_aa_body_encrypted_at_rest_pg(store) -> None:
+    # (1) An AA ack_body is persisted only on an ENCRYPTED store, and on disk it is ciphertext: it
+    # carries the v1 marker, is not the plaintext AA frame, and decrypts back to exactly it. A second,
+    # ciphered handle is needed because the fixture store is the identity cipher (unencrypted) — mirrors
+    # the existing at-rest encryption tests in this file.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import PREFIX
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    cipher = make_cipher(generate_key())  # held so we can assert the decrypt round-trip below
+    s = await PostgresStore.open(settings, cipher=cipher)
+    try:
+        mid = await s.enqueue_message(channel_id="IB_X", raw=RAW, deliveries=[("d", "p")])
+        await s.record_ack_sent(
+            message_id=mid,
+            inbound_name="IB_X",
+            ack_body=_ACK_AA,
+            ack_code="AA",
+            ack_phase="ingest",
+            outcome="accepted",
+        )
+        # correlate_response surfaces the ack_sent row and decrypts its body at the read boundary.
+        ack = next(r for r in await s.correlate_response(mid) if r.kind == "ack_sent")
+        assert ack.ack_code == "AA" and ack.ack_phase == "ingest"
+        assert ack.body == _ACK_AA  # decrypted round-trip
+        # Raw column read (the ciphered handle's _fetchone does NOT decrypt) → ciphertext on disk. Assert
+        # the deterministic decrypt round-trip, NOT `"MSA" not in <b64>` (base64 can contain that run).
+        disk = (
+            await s._fetchone(
+                "SELECT body FROM response WHERE message_id=$1 AND kind='ack_sent'", mid
+            )
+        )["body"]
+        assert disk.startswith(PREFIX)  # stored under the encrypted marker, not in the clear
+        assert disk != _ACK_AA
+        assert cipher.decrypt(disk) == _ACK_AA  # and it genuinely encrypts the AA frame
+    finally:
+        await s.close()
+
+
+async def test_record_ack_sent_nak_stores_no_body_pg(store) -> None:
+    # (2) PHI fail-safe: a NAK passes ack_body=None → body is always NULL on disk (even on an ENCRYPTED
+    # store), and the offending field value lives only in the safe_text-scrubbed detail. The ciphered
+    # handle proves the NULL is the fail-safe itself, not merely the unencrypted-store behaviour.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    s = await PostgresStore.open(settings, cipher=make_cipher(generate_key()))
+    try:
+        mid = await s.enqueue_message(channel_id="IB_X", raw=RAW, deliveries=[("d", "p")])
+        await s.record_ack_sent(
+            message_id=mid,
+            inbound_name="IB_X",
+            ack_body=None,
+            ack_code="AR",
+            ack_phase="parse",
+            outcome="rejected",
+            detail=f"bad PID: {_ADT_SEARCH}",
+        )
+        ack = next(r for r in await s.correlate_response(mid) if r.kind == "ack_sent")
+        assert ack.ack_code == "AR" and ack.body is None  # metadata captured, body never stored
+        assert ack.detail is not None and "DOE" not in ack.detail  # safe_text-scrubbed (#120)
+        # NULL at rest even though the store is encrypted (the encrypt-only-AA gate is body-specific).
+        disk = (
+            await s._fetchone(
+                "SELECT body FROM response WHERE message_id=$1 AND kind='ack_sent'", mid
+            )
+        )["body"]
+        assert disk is None
+    finally:
+        await s.close()
+
+
+async def test_record_ack_sent_sentinel_disjoint_from_outbound_pg(store) -> None:
+    # (3) The ack_sent row sorts under a sentinel destination (\x1fack:<inbound>) disjoint from every
+    # real destination, so an outbound reply's per-destination ordering is untouched and the seqs are
+    # kind-scoped. Runs on the default (unencrypted) fixture handle, which ALSO exercises the fail-safe
+    # that an AA body is not stored in the clear on an unencrypted store.
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=RAW, deliveries=[("OB1", "p")], now=100.0
+    )
+    item = (await store.claim_ready(now=200.0))[0]
+    await store.complete_with_response(item.id, body="PARTNER-REPLY", outcome="accepted", now=300.0)
+    await store.record_ack_sent(
+        message_id=mid,
+        inbound_name="IB",
+        ack_body=_ACK_AA,
+        ack_code="AA",
+        ack_phase="ingest",
+        outcome="accepted",
+    )
+    by_kind = {r.kind: r for r in await store.correlate_response(mid)}
+    assert by_kind["response"].destination_name == "OB1"
+    assert by_kind["response"].response_seq == 1  # outbound reply unaffected by the ack row
+    assert by_kind["ack_sent"].destination_name.startswith("\x1fack:")
+    assert by_kind["ack_sent"].response_seq == 1  # its own kind-scoped sequence
+    assert by_kind["ack_sent"].body is None  # unencrypted store → AA body not stored in the clear
+    # A second ack for the same message increments only the ack lane.
+    await store.record_ack_sent(
+        message_id=mid,
+        inbound_name="IB",
+        ack_body=None,
+        ack_code="AA",
+        ack_phase="ingest",
+        outcome="accepted",
+    )
+    acks = [r for r in await store.correlate_response(mid) if r.kind == "ack_sent"]
+    assert sorted(r.response_seq for r in acks) == [1, 2]
 
 
 async def test_ingress_handoff_parity(store) -> None:
@@ -573,6 +714,17 @@ async def test_record_audit_tees_off_box_redacted(store) -> None:
     assert rec["event"] == "audit" and rec["action"] == "message.error" and rec["actor"] == "svc"
 
 
+async def test_startup_attestation_tamper_evidence_chains_and_tees(
+    store, tmp_path, monkeypatch
+) -> None:
+    # RBAC-16: engine tampering must fail-close AND land a hash-chained, off-box-teed startup_integrity
+    # row (actor=None) on the REAL Postgres backend — proving the NULL-actor tamper row persists +
+    # chain-verifies + tees here, not just on SQLite. Reuses the single-source contract from the D3 suite.
+    from tests.test_startup_attestation import _assert_startup_attestation_tamper_evidence
+
+    await _assert_startup_attestation_tamper_evidence(store, tmp_path, monkeypatch)
+
+
 async def test_security_events_for_user_scopes_to_actor(store) -> None:
     # The /me/security-events source on the real backend: only the target actor's auth.* rows,
     # newest-first, honoring limit; other actors' rows and non-auth.* rows excluded.
@@ -684,6 +836,16 @@ async def test_mark_session_reauthed_reanchors_client(store) -> None:
     await store.delete_user("u2")
 
 
+async def test_http_grant_deny_audit_precision(store) -> None:
+    """RBAC-4 (ASVS 16.3.2) on the real Postgres backend: the HTTP ``require()`` grant/deny audit set is
+    EXACT and the ``method != "GET"`` guard REFUSES to audit a sensitive-permission READ. Reuses the
+    single source-of-truth helper from the SQLite suite so this live-server leg proves the deny/grant
+    row is actually written by ``record_audit`` / read by ``list_audit`` on Postgres — not just SQLite."""
+    from tests.test_auth_hardening import _assert_http_grant_deny_precision
+
+    await _assert_http_grant_deny_precision(store)
+
+
 # --- staged-pipeline tests (Postgres-only; the full ingress→routed→outbound flow) ---
 
 
@@ -739,6 +901,66 @@ async def test_routed_to_filtered_collapse(store) -> None:
         routed_id=routed_item.id, message_id=mid, channel_id="IB", deliveries=[], now=140.0
     )
     assert (await store.get_message(mid))["status"] == MessageStatus.FILTERED.value
+
+
+async def test_all_declined_finalizes_not_deployed(store) -> None:
+    """#233 (ADR 0111) parity: a routed message whose only handler declined every Send (each to a
+    present-but-not-deployed target) finalizes NOT_DEPLOYED — not FILTERED — carries a ``not_deployed``
+    event naming the connection, and queues ZERO outbound rows. The decline is persisted in the SAME
+    handoff txn, so the finalizer distinguishes it from an intentional filter (spec §3.3)."""
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    ingress = await store.claim_next_fifo("IB", now=110.0, stage=Stage.INGRESS.value)
+    await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id="IB",
+        handlers=[("H1", RAW)],
+        disposition=MessageStatus.ROUTED,
+        now=120.0,
+    )
+    routed_item = await store.claim_next_fifo("IB", now=130.0, stage=Stage.ROUTED.value)
+    await store.transform_handoff(
+        routed_id=routed_item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[],
+        declined=["OB_OFF"],
+        now=140.0,
+    )
+    assert (await store.get_message(mid))["status"] == MessageStatus.NOT_DEPLOYED.value
+    nd = [e["destination"] for e in await store.events_for(mid) if e["event"] == "not_deployed"]
+    assert nd == ["OB_OFF"]
+    assert await store.outbox_for(mid) == []  # AC-2: not one row in the outbound stage
+
+
+async def test_declined_sibling_still_processed_event_retained(store) -> None:
+    """#233 mixed parity: one deployed delivery + one declined leg → the message finalizes PROCESSED
+    once the deployed leg delivers (it DID deliver somewhere — not NOT_DEPLOYED), and the
+    ``not_deployed`` event for the skipped leg is still recorded."""
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    ingress = await store.claim_next_fifo("IB", now=110.0, stage=Stage.INGRESS.value)
+    await store.route_handoff(
+        ingress_id=ingress.id,
+        message_id=mid,
+        channel_id="IB",
+        handlers=[("H1", RAW)],
+        disposition=MessageStatus.ROUTED,
+        now=120.0,
+    )
+    routed_item = await store.claim_next_fifo("IB", now=130.0, stage=Stage.ROUTED.value)
+    await store.transform_handoff(
+        routed_id=routed_item.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[("OB1", "body")],
+        declined=["OB_OFF"],
+        now=140.0,
+    )
+    out = await store.claim_next_fifo("OB1", now=150.0)
+    await store.mark_done(out.id, now=160.0)
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    nd = [e["destination"] for e in await store.events_for(mid) if e["event"] == "not_deployed"]
+    assert nd == ["OB_OFF"]
 
 
 async def test_unrouted_when_no_handler(store) -> None:
@@ -873,6 +1095,67 @@ async def test_converge_reference_cache_follower_read_through(store) -> None:
         await follower.close()
 
 
+async def test_reference_rows_rotate_on_reencrypt_to_active(store) -> None:
+    """Key rotation (reencrypt_to_active) must rotate reference.value too (BACKLOG #235) — without
+    the reference pass, a later retired-key drop silently loses every synced snapshot. Self-contained:
+    the fixture's clean slate + only-reference writes make the rotation count exactly this snapshot's
+    2 rows."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k1, k2 = generate_key(), generate_key()
+    # Entry cleanliness: the exact == 2 below assumes the fixture's clean slate held.
+    assert await store._fetchall("SELECT name FROM reference") == []
+    try:
+        s1 = await PostgresStore.open(settings, cipher=make_cipher(k1))
+        try:
+            await s1.write_reference_snapshot(
+                name="codes", version="v1", rows={"P1": {"mrn": "M-SECRET-1"}, "P2": "plain"}
+            )
+        finally:
+            await s1.close()
+
+        c2 = make_cipher(k2, [k1])
+        assert isinstance(c2, AesGcmCipher)
+        s2 = await PostgresStore.open(settings, cipher=c2)
+        try:
+            assert await s2.reencrypt_to_active() == 2  # exactly the two reference rows
+            rows = await s2._fetchall("SELECT value FROM reference")
+            assert len(rows) == 2
+            for r in rows:
+                # under the ACTIVE key now (mfenc:v1:<k2-fingerprint>:...), no plaintext PHI visible
+                assert r["value"].startswith(c2.active_marker_prefix)
+                assert "M-SECRET-1" not in r["value"]
+            assert s2.reference_view()["codes"]["P1"] == {"mrn": "M-SECRET-1"}  # still decrypts
+            assert await s2.reencrypt_to_active() == 0  # idempotent
+        finally:
+            await s2.close()
+
+        # Proof the rows were actually rewritten: a handle with ONLY k2 (retired dropped) reads them.
+        s3 = await PostgresStore.open(settings, cipher=make_cipher(k2))
+        try:
+            assert s3.reference_view()["codes"] == {"P1": {"mrn": "M-SECRET-1"}, "P2": "plain"}
+        finally:
+            await s3.close()
+    finally:
+        # Shared-DB hygiene (even on assertion failure): the CI suites share ONE database, and the
+        # `store` fixture OPENS the store BEFORE its clean-slate TRUNCATE — reference rows left
+        # encrypted under this test's own keys would crash the next (keyless) fixture open inside
+        # _load_reference_cache (IdentityCipher passthrough -> json.loads of an mfenc blob),
+        # cascading setup ERRORs across the rest of the run. Purge with a handle carrying BOTH keys
+        # (rows sit under k1 or k2 depending on where a failure struck), raw DELETEs like the
+        # fixture's TRUNCATE idiom.
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k2, [k1]))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                await conn.execute("DELETE FROM reference")
+                await conn.execute("DELETE FROM reference_version")
+        finally:
+            await cleanup.close()
+
+
 async def _route_and_claim_routed(store, channel_id: str, now: float):
     """Drive a message through ingress→routed and return its (message_id, routed_item) so a test can call
     transform_handoff with state_ops. Mirrors the ingress→routed steps in test_transform_state_write_and_view."""
@@ -888,6 +1171,85 @@ async def _route_and_claim_routed(store, channel_id: str, now: float):
     )
     routed_item = await store.claim_next_fifo(channel_id, now=now + 3, stage=Stage.ROUTED.value)
     return mid, routed_item
+
+
+async def test_keyless_open_of_encrypted_reference_fails_closed(store) -> None:
+    """#241 F2: a keyless open of a store carrying key-encrypted ``reference`` rows must fail closed
+    with the operator-facing StoreKeylessError (naming the table + remedy), not a raw JSONDecodeError
+    from an ``mfenc:`` blob reaching ``json.loads`` in ``_read_active_reference_snapshots``. The CI
+    Postgres-store leg is the authoritative proof of this read seam."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    try:
+        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            await keyed.write_reference_snapshot(
+                name="providers", version="v1", rows={"P1": {"mrn": "M-SECRET-REF"}}
+            )
+        finally:
+            await keyed.close()
+
+        with pytest.raises(StoreKeylessError) as ei:
+            await PostgresStore.open(settings)  # keyless open of an encrypted store — fail closed
+        assert "reference" in str(ei.value) and "MEFOR_STORE_ENCRYPTION_KEY" in str(ei.value)
+    finally:
+        # Shared-DB hygiene (even on assertion failure): purge the encrypted reference rows so the next
+        # keyless fixture open does not itself fail-close inside _read_active_reference_snapshots.
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                await conn.execute("DELETE FROM reference")
+                await conn.execute("DELETE FROM reference_version")
+        finally:
+            await cleanup.close()
+
+
+async def test_keyless_open_of_encrypted_state_fails_closed(store) -> None:
+    """#241 F2: a keyless open of a store carrying key-encrypted ``state`` rows must fail closed with
+    StoreKeylessError, not a raw JSONDecodeError nor a silent skip — a PHI hard rule. The CI
+    Postgres-store leg is the authoritative proof of this read seam."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import StoreKeylessError
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    try:
+        keyed = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            mid, routed = await _route_and_claim_routed(keyed, "IB", now=100.0)
+            await keyed.transform_handoff(
+                routed_id=routed.id,
+                message_id=mid,
+                channel_id="IB",
+                deliveries=[("OB1", "x")],
+                state_ops=[("ns", "k", {"mrn": "M-SECRET-STATE"})],
+                now=110.0,
+            )
+            sealed = await keyed._fetchall("SELECT value FROM state")
+            assert sealed and sealed[0]["value"].startswith(MARKER_PREFIX)  # ciphertext at rest
+        finally:
+            await keyed.close()
+
+        with pytest.raises(StoreKeylessError) as ei:
+            await PostgresStore.open(settings)  # keyless open — fail closed, not a silent skip
+        assert "state" in str(ei.value) and "MEFOR_STORE_ENCRYPTION_KEY" in str(ei.value)
+    finally:
+        # Purge the encrypted state (+ the ingress message/queue rows) with a keyed handle so the next
+        # keyless fixture open does not fail-close inside _load_state_cache.
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                # NB: Postgres has no physical `outbox` table (the outbound stage lives in `queue`,
+                # unlike SQL Server which does carry a real `outbox` table) — do not DELETE FROM outbox here.
+                for table in ("message_events", "state", "response", "queue", "messages"):
+                    await conn.execute(f"DELETE FROM {table}")
+        finally:
+            await cleanup.close()
 
 
 async def test_converge_state_cache_follower_read_through(store) -> None:
@@ -1718,6 +2080,60 @@ async def test_db_coordinator_config_version_bump_and_round_trip(store) -> None:
     assert len(rows) == 1 and rows[0]["id"] == 1 and rows[0]["config_version"] == 2
 
 
+async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
+    """HA-16 clause 2 (sibling reload propagation) over a REAL coordinator: a ConfigConvergenceRunner
+    on node B converges when a SECOND coordinator A bumps the shared ``cluster_config`` token in the DB
+    and B's cache is refreshed by an actual DB round-trip (the maintenance-tick path, cluster.py:786).
+
+    The unit test in tests/test_cluster.py scripts ``config_version_cached`` on a fake coordinator; this
+    exercises the full live chain the fake can't — A bumps the DB row → B refreshes its cache from the
+    real DB → B's convergence runner reloads once and advances its applied version."""
+    from messagefoundry.pipeline.cluster import DbCoordinator
+    from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
+
+    a = DbCoordinator(store._pool, "node-A")
+    b = DbCoordinator(store._pool, "node-B")
+    # Seed both from the real DB: a fresh cluster_config initializes to 0, so neither node is behind.
+    assert await a.config_version() == 0
+    assert await b.config_version() == 0
+
+    applied = {"v": 0}
+    reloads: list[int] = []
+
+    async def reload() -> None:
+        # Convergence re-reads THIS node's own config dir; here we record the version B converged to.
+        reloads.append(b.config_version_cached())
+
+    runner = ConfigConvergenceRunner(
+        b,
+        applied_version=lambda: applied["v"],
+        set_applied_version=lambda v: applied.__setitem__("v", v),
+        reload=reload,
+        interval_seconds=10.0,
+    )
+    # Caught up (0 == 0): no reload.
+    assert await runner.converge_once() is False
+    assert reloads == []
+
+    # A real operator reload on node A bumps the shared token in the DB.
+    assert await a.bump_config_version() == 1
+    # B has NOT yet refreshed its cache from the DB, so its convergence poll still reads 0 → no reload.
+    # (The cached poll is what gates convergence, so the DB bump alone does nothing until B's tick.)
+    assert b.config_version_cached() == 0
+    assert await runner.converge_once() is False
+    assert reloads == []
+
+    # B's maintenance tick refreshes the cached version from the REAL DB (the config_version() step).
+    assert await b.config_version() == 1
+    assert b.config_version_cached() == 1
+    # Now B is behind → it reloads ONCE and advances applied to 1.
+    assert await runner.converge_once() is True
+    assert reloads == [1] and applied["v"] == 1
+    # Caught up again → no second reload (idempotent, no feedback loop).
+    assert await runner.converge_once() is False
+    assert reloads == [1]
+
+
 # --- EF-3: summary + metadata (MRN + patient name) encrypted at rest ---------
 
 
@@ -2464,3 +2880,1093 @@ async def test_mllp_post_ingress_failure_errors_without_nak(store) -> None:
     outcome = await runner._process_ingress_item("IB_MLLP", item)
     assert (await store.get_message(item.message_id))["status"] == MessageStatus.ERROR.value
     assert outcome[0] is _ItemOutcome.PROCESSED  # lane advanced; no NAK back to the sender
+
+
+# =====================================================================================================
+# P1 batch 2 — cross-backend store-method parity (mirrors tests/test_sqlserver_store.py twins).
+# STOREF-8 (resend_to), STOREF-9 (reingress + edit-and-resend), RBAC-8 (summary_access census),
+# ALERT-19 (alert_instance CRUD). Synthetic HL7 only; every assertion is deterministic (no sleeps).
+# =====================================================================================================
+
+# Synthetic ADT + a distinct transformed/edited body — never real PHI (ADR 0090 resend/edit matrix).
+_RS_ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
+_RS_TRANSFORMED = "MSH|^~\\&|MEFOR|RF|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rZXF|sent\r"
+_RS_EDITED = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||200^^^H^MR||DOE^JOHN\r"
+
+
+async def _rs_seed(
+    store, *, channel: str = "in1", deliveries: list[tuple[str, str]] | None = None
+) -> str:
+    """Shared STOREF-8/9 seed: a logged message with retained transformed outbound bodies."""
+    return await store.enqueue_message(
+        channel_id=channel,
+        raw=_RS_ADT,
+        deliveries=deliveries if deliveries is not None else [("OB1", _RS_TRANSFORMED)],
+        control_id="MSG1",
+        source_type="file",
+    )
+
+
+async def _pg_force_error(store, mid: str, error: str) -> None:
+    """Force a seeded origin to a terminal ERROR (ciphered at rest) — proves the direct edit-resend
+    never reopens/overwrites it (mirrors test_edit_resend.py::_seed_error)."""
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET status=$1, error=$2 WHERE id=$3",
+            MessageStatus.ERROR.value,
+            store._enc(error, aad=cell_aad("messages", "error", mid)),
+            mid,
+        )
+
+
+# --- ASVS 14.2.7: messages.metadata rides the body window (parity with SQLite + SQL Server) ---------
+
+
+async def _pg_set_meta(store, message_id: str, bag: dict) -> None:
+    """Attach a metadata bag the way transform_handoff does (encrypted, cell-AAD bound)."""
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE messages SET metadata=$1 WHERE id=$2",
+            store._enc(json.dumps(bag), aad=cell_aad("messages", "metadata", message_id)),
+            message_id,
+        )
+
+
+async def _pg_terminal(store) -> str:
+    """A message whose every queue row is DONE — i.e. body-purge eligible."""
+    mid = await _rs_seed(store)
+    for r in await store.outbox_for(mid):
+        await store.mark_done(str(r["id"]))
+    return mid
+
+
+async def test_purge_nulls_metadata_with_the_body_pg(store) -> None:
+    """ASVS 14.2.7 parity on Postgres — metadata is NULLed by the same widened statement."""
+    mid = await _pg_terminal(store)
+    await _pg_set_meta(store, mid, {"user": {"mrn": "MRN001"}})
+    assert await store.message_metadata_json(mid) is not None
+
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) == 1
+
+    assert await store.message_metadata_json(mid) is None
+
+
+async def test_purge_sweeps_pre_upgrade_metadata_pg(store) -> None:
+    """The upgrade case — and the real check on asyncpg placeholder ORDER.
+
+    The widened statement keeps the `*lead` binds (cutoff params, then the inflight array) leading the
+    eligible-set subquery. A mis-numbered `$n` passes on SQLite (which uses positional `?`) and fails
+    ONLY here, so this test is the one that actually verifies the Postgres bind order.
+    """
+    mid = await _pg_terminal(store)
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) == 1  # pre-upgrade purge
+    await _pg_set_meta(store, mid, {"user": {"mrn": "MRN001"}})
+    assert (await store.get_message(mid))["raw"] == ""
+
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) == 1  # counted → audited
+
+    assert await store.message_metadata_json(mid) is None
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) == 0  # idempotent
+
+
+async def test_purge_metadata_respects_the_inflight_guard_pg(store) -> None:
+    """The `metadata IS NOT NULL` disjunct is OR-ed INSIDE the eligible set, never around it —
+    verified through Postgres's `= ANY($n::text[])` inflight bind, which has no SQLite analogue."""
+    mid = await _rs_seed(store)  # left PENDING — never claimed, never done
+    await _pg_set_meta(store, mid, {"user": {"mrn": "MRN001"}})
+
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) == 0
+
+    assert await store.message_metadata_json(mid) is not None
+
+
+async def test_purge_search_presets_pg(store) -> None:
+    """ASVS 14.2.7 Tier 2 parity on Postgres: old presets purged, new kept, second pass a no-op.
+
+    Cleans up after itself even on failure — `search_presets` rides the key-rotation reencrypt scan and
+    this suite asserts EXACT rotate counts, so a leaked row would red an unrelated test.
+    """
+    try:
+        await store.upsert_search_preset(
+            preset_id="pg-stale", owner="alice", name="stale", criteria="{}", now=0.0
+        )
+        await store.upsert_search_preset(
+            preset_id="pg-fresh", owner="alice", name="fresh", criteria="{}", now=40 * DAY
+        )
+
+        assert await store.purge_search_presets(older_than=30 * DAY) == 1
+
+        assert {r["name"] for r in await store.list_search_presets("alice")} == {"fresh"}
+        assert await store.purge_search_presets(older_than=30 * DAY) == 0  # idempotent
+    finally:
+        async with store._pool.acquire() as conn:
+            await conn.execute("DELETE FROM search_presets")
+
+
+async def test_search_preset_retention_keys_on_last_used_pg(store) -> None:
+    """#306 parity on Postgres: a RECALLED-but-unedited preset survives; a NULL `last_used_at` still ages.
+
+    Pins the `GREATEST(updated_at, COALESCE(last_used_at, updated_at))` idiom end-to-end — including
+    the migration case, where a row written before the column existed carries NULL and must fall back
+    to `updated_at` alone. Cleans up after itself (the exact-rotate-count reason above).
+    """
+    try:
+        for pid, name in (("pg-used", "used"), ("pg-idle", "idle"), ("pg-legacy", "legacy")):
+            await store.upsert_search_preset(
+                preset_id=pid, owner="alice", name=name, criteria="{}", now=0.0
+            )
+        # The recall stamps last_used_at past the cutoff...
+        got = await store.get_search_preset(preset_id="pg-used", owner="alice", now=40 * DAY)
+        assert got is not None and got["last_used_at"] is None  # PRE-stamp snapshot
+        async with store._pool.acquire() as conn:
+            stamped = await conn.fetchval(
+                "SELECT last_used_at FROM search_presets WHERE id='pg-used'"
+            )
+            assert stamped == 40 * DAY
+            # ...while the migration row is explicitly NULL (the post-ALTER state).
+            await conn.execute("UPDATE search_presets SET last_used_at=NULL WHERE id='pg-legacy'")
+
+        assert await store.purge_search_presets(older_than=30 * DAY) == 2  # idle + legacy
+
+        assert {r["name"] for r in await store.list_search_presets("alice")} == {"used"}
+    finally:
+        async with store._pool.acquire() as conn:
+            await conn.execute("DELETE FROM search_presets")
+
+
+# --- STOREF-8: resend_to plain-parity matrix (mirrors tests/test_resend.py, on real Postgres) --------
+
+
+async def test_resend_plain_parity_pg(store) -> None:
+    from messagefoundry.store.base import (
+        ResendKeyConflict,
+        ResendSourceAmbiguous,
+        ResendSourceEmpty,
+        ResendSourceNotFound,
+    )
+
+    # at-least-once: a genuine NEW pending tail row shipping the retained TRANSFORMED body.
+    mid = await _rs_seed(store)
+    before = {r["id"] for r in await store.outbox_for(mid)}
+    out = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    assert out.status == "resent" and out.to_destination == "OB2" and out.from_destination == "OB1"
+    ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]
+    assert len(ob2) == 1 and ob2[0]["id"] not in before and ob2[0]["id"] == out.outbox_id
+    assert ob2[0]["status"] == OutboxStatus.PENDING.value
+    payloads = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(mid)}
+    assert payloads["OB2"] == _RS_TRANSFORMED  # ships the TRANSFORMED body, decrypted at rest
+    # TAIL: the resend row has the greatest seq (BIGSERIAL) of the lane, so FIFO orders it last.
+    async with store._pool.acquire() as conn:
+        seqs = {
+            r["id"]: r["seq"]
+            for r in await conn.fetch("SELECT id, seq FROM queue WHERE message_id=$1", mid)
+        }
+    assert seqs[ob2[0]["id"]] == max(seqs.values())
+
+    # same-key duplicate -> exactly one row, reports the prior outcome.
+    dup = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    assert dup.status == "duplicate" and dup.outbox_id == out.outbox_id
+    assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 1
+    # new key -> a genuine second resend (source pinned; OB2 is now ambiguous).
+    out2 = await store.resend_to(message_id=mid, to="OB2", idempotency_key="k2", from_="OB1")
+    assert out2.status == "resent"
+    assert len([r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"]) == 2
+
+    # key reused across a DIFFERENT message -> conflict (409), never a silent drop.
+    m2 = await _rs_seed(store)
+    with pytest.raises(ResendKeyConflict):
+        await store.resend_to(message_id=m2, to="OB2", idempotency_key="k1")
+    assert [r for r in await store.outbox_for(m2) if r["destination_name"] == "OB2"] == []
+    # key reused for a DIFFERENT target -> conflict.
+    with pytest.raises(ResendKeyConflict):
+        await store.resend_to(message_id=mid, to="OB3", idempotency_key="k1")
+
+    # retention-nulled source -> ResendSourceEmpty (never a zero-length PROCESSED body).
+    m3 = await _rs_seed(store)
+    for r in await store.outbox_for(m3):
+        await store.mark_done(str(r["id"]))
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
+    with pytest.raises(ResendSourceEmpty):
+        await store.resend_to(message_id=m3, to="OB2", idempotency_key="k3")
+
+    # no delivered body (ERROR-only) -> ResendSourceNotFound.
+    eid = await store.record_received(
+        channel_id="in1", raw=_RS_ADT, status=MessageStatus.ERROR, error="parse boom"
+    )
+    with pytest.raises(ResendSourceNotFound):
+        await store.resend_to(message_id=eid, to="OB2", idempotency_key="k4")
+
+    # a dead-lettered source is an eligible source (divert-to-standby, ADR 0090 §1).
+    m4 = await _rs_seed(store)
+    src = [r for r in await store.outbox_for(m4) if r["destination_name"] == "OB1"][0]
+    await store.mark_failed(str(src["id"]), "permanent AR", RetryPolicy(max_attempts=0))
+    out4 = await store.resend_to(message_id=m4, to="OB2", idempotency_key="k5")
+    assert out4.status == "resent" and out4.from_destination == "OB1"
+
+    # ambiguous multi-destination source requires from_; naming it ships THAT source's body.
+    m5 = await _rs_seed(
+        store, deliveries=[("OB1", _RS_TRANSFORMED), ("OB3", _RS_TRANSFORMED + "X")]
+    )
+    with pytest.raises(ResendSourceAmbiguous):
+        await store.resend_to(message_id=m5, to="OB2", idempotency_key="k6")
+    out5 = await store.resend_to(message_id=m5, to="OB2", idempotency_key="k7", from_="OB3")
+    assert out5.status == "resent" and out5.from_destination == "OB3"
+    p5 = {p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(m5)}
+    assert p5["OB2"] == _RS_TRANSFORMED + "X"
+
+    # the resend event records the lane hop but never the PHI body.
+    details = [str(e["detail"] or "") for e in await store.events_for(mid)]
+    assert any("OB1->OB2" in d for d in details)
+    assert all("ZXF|" not in d and "PID|" not in d for d in details)
+
+
+async def test_resend_reopens_processed_to_routed_pg(store) -> None:
+    # The ROUTED write is the replay re-queue exception; the finalizer stays terminal-authority.
+    mid = await _rs_seed(store)
+    for r in await store.outbox_for(mid):
+        await store.mark_done(str(r["id"]))
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+    await store.resend_to(message_id=mid, to="OB2", idempotency_key="k1")
+    assert (await store.get_message(mid))["status"] == MessageStatus.ROUTED.value
+    ob2 = [r for r in await store.outbox_for(mid) if r["destination_name"] == "OB2"][0]
+    await store.mark_done(str(ob2["id"]))
+    assert (await store.get_message(mid))["status"] == MessageStatus.PROCESSED.value
+
+
+async def test_resend_funnels_behind_uncommitted_producer_pg(store) -> None:
+    # ADR 0090 §3 PG divergence (contrast to SQL Server): resend_to takes the per-lane advisory
+    # write-funnel (_lock_outbound_lanes), so it BLOCKS behind a producer holding the same OB2 lane
+    # lock and can't commit ahead of it — commit-order == seq-order, closing the SKIP-LOCKED/MVCC
+    # inversion a second writer would open. DETERMINISTIC: the block is a genuine lock wait (a false
+    # pass would require the advisory lock NOT to block, which is impossible while the producer txn
+    # is held) — observed via wait_for(shield(task)) raising TimeoutError, never a sleep-race.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    mid = await store.enqueue_message(
+        channel_id="IB", raw=_RS_ADT, deliveries=[("OB1", "SRC")], now=100.0
+    )
+    pmid = await store.enqueue_message(
+        channel_id="IB", raw=_RS_ADT, deliveries=[], now=100.0
+    )  # FK parent for the manual OB2 producer row
+    other = await PostgresStore.open(load_settings(environ=os.environ).store)
+    conn = await store._pool.acquire()
+    try:
+        tx = conn.transaction()
+        await tx.start()
+        # Hold the OB2 lane lock + an uncommitted producer row (seq N) open across the probe.
+        await store._lock_outbound_lanes(conn, ("OB2",))
+        await store._insert_outbound_row(conn, pmid, "IB", "OB2", "PRODUCER", 101.0)
+        task = asyncio.create_task(
+            other.resend_to(message_id=mid, to="OB2", idempotency_key="k1", from_="OB1", now=102.0)
+        )
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                asyncio.shield(task), timeout=2.0
+            )  # funnels behind the held lock
+        await (
+            tx.commit()
+        )  # producer commits at seq N; the resend can now take the lane lock (seq N+1)
+        out = await asyncio.wait_for(task, timeout=10.0)
+        assert out.status == "resent"
+        # ORDER: the resend lands at the lane TAIL, never ahead of the older producer.
+        async with store._pool.acquire() as c2:
+            lane = await c2.fetch(
+                "SELECT id, payload FROM queue WHERE stage=$1 AND destination_name=$2 ORDER BY seq",
+                Stage.OUTBOUND.value,
+                "OB2",
+            )
+        assert [
+            store._dec(r["payload"], aad=cell_aad("queue", "payload", r["id"])) for r in lane
+        ] == ["PRODUCER", "SRC"]
+    finally:
+        await store._pool.release(conn)
+        await other.close()
+
+
+# --- STOREF-9: reingress (RE-ROUTE) + resend_to(body_override=) (DIRECT edit), on real Postgres ------
+
+
+async def test_reingress_parity_pg(store) -> None:
+    from messagefoundry.store.base import ReingressOriginMissing, ResendKeyConflict
+    from messagefoundry.store.store import REINGRESS_TARGET_PREFIX
+
+    origin = await _rs_seed(store)
+    before = await store.get_message(origin)
+    out = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    assert out.status == "resubmitted" and out.message_id == origin and out.new_message_id != origin
+    assert out.channel_id == "in1"
+
+    child = await store.get_message(out.new_message_id)
+    assert child is not None and child["raw"] == _RS_EDITED  # the EDITED body, decrypted at rest
+    assert child["status"] == MessageStatus.RECEIVED.value and child["channel_id"] == "in1"
+    meta = json.loads(child["metadata"])
+    assert meta["correlation_id"] == origin and meta["correlation_root_id"] == origin
+    assert meta["edited_from"] == origin
+    # the child carries exactly one pending INGRESS row; the origin owns none of its own.
+    async with store._pool.acquire() as conn:
+        crows = await conn.fetch(
+            "SELECT status FROM queue WHERE message_id=$1 AND stage=$2",
+            out.new_message_id,
+            Stage.INGRESS.value,
+        )
+        orows = await conn.fetch(
+            "SELECT status FROM queue WHERE message_id=$1 AND stage=$2", origin, Stage.INGRESS.value
+        )
+    assert len(crows) == 1 and crows[0]["status"] == OutboxStatus.PENDING.value
+    assert list(orows) == []
+
+    # origin byte-identical (never opened for write).
+    after = await store.get_message(origin)
+    assert after["raw"] == before["raw"] == _RS_ADT
+    assert after["status"] == before["status"] and after["metadata"] == before["metadata"]
+
+    # same key -> duplicate, same child, still exactly one child + one ingress row (no double-inject).
+    dup = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k1")
+    assert dup.status == "duplicate" and dup.new_message_id == out.new_message_id
+    async with store._pool.acquire() as conn:
+        n = await conn.fetchval("SELECT COUNT(*) FROM messages WHERE id=$1", out.new_message_id)
+        ing = await conn.fetch(
+            "SELECT status FROM queue WHERE message_id=$1 AND stage=$2",
+            out.new_message_id,
+            Stage.INGRESS.value,
+        )
+    assert n == 1 and len(ing) == 1
+    # new key -> a distinct second child.
+    out2 = await store.reingress(origin_message_id=origin, raw=_RS_EDITED, idempotency_key="k2")
+    assert out2.status == "resubmitted" and out2.new_message_id != out.new_message_id
+    # key reused across a DIFFERENT message -> conflict.
+    other = await _rs_seed(store)
+    with pytest.raises(ResendKeyConflict):
+        await store.reingress(origin_message_id=other, raw=_RS_EDITED, idempotency_key="k1")
+    # missing origin -> ReingressOriginMissing.
+    with pytest.raises(ReingressOriginMissing):
+        await store.reingress(origin_message_id="nope", raw=_RS_EDITED, idempotency_key="k9")
+    # the re-ingress records its DISJOINT target key (@reingress:<channel>).
+    async with store._pool.acquire() as conn:
+        td = await conn.fetchval("SELECT to_destination FROM resend_log WHERE resend_key=$1", "k1")
+    assert td == f"{REINGRESS_TARGET_PREFIX}in1"
+
+
+async def test_direct_edit_parity_pg(store) -> None:
+    from messagefoundry.store.base import ResendSourceEmpty
+
+    origin = await _rs_seed(store)
+    await _pg_force_error(store, origin, "connection refused: partner down")
+    before = await store.get_message(origin)
+    assert before["status"] == MessageStatus.ERROR.value
+
+    out = await store.resend_to(
+        message_id=origin, to="OB2", idempotency_key="k1", body_override=_RS_EDITED
+    )
+    assert out.status == "resent" and out.to_destination == "OB2" and out.message_id == origin
+
+    # ORIGIN byte-identical — raw + status + ERROR text + metadata all preserved (read, never written).
+    after = await store.get_message(origin)
+    assert after["raw"] == before["raw"] == _RS_ADT
+    assert after["status"] == before["status"] == MessageStatus.ERROR.value
+    assert after["error"] == before["error"] == "connection refused: partner down"
+    assert after["metadata"] == before["metadata"]
+    origin_payloads = {
+        p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(origin)
+    }
+    assert origin_payloads == {"OB1": _RS_TRANSFORMED}  # origin outbox untouched
+
+    # the edited OB2 delivery hangs off a NEW correlated child, never the origin.
+    async with store._pool.acquire() as conn:
+        crows = await conn.fetch(
+            "SELECT id, message_id FROM queue WHERE stage=$1 AND destination_name=$2",
+            Stage.OUTBOUND.value,
+            "OB2",
+        )
+    assert len(crows) == 1 and crows[0]["id"] == out.outbox_id
+    child_id = crows[0]["message_id"]
+    assert child_id != origin
+    child = await store.get_message(child_id)
+    assert child["raw"] == _RS_EDITED and child["status"] == MessageStatus.ROUTED.value
+    cmeta = json.loads(child["metadata"])
+    assert cmeta["correlation_id"] == origin and cmeta["edited_from"] == origin
+    child_payloads = {
+        p["destination_name"]: p["payload"] for p in await store.outbox_payloads_for(child_id)
+    }
+    assert child_payloads == {"OB2": _RS_EDITED}
+
+    # empty edited body -> ResendSourceEmpty, with NO partial mutation (no OB2E row, no child).
+    m2 = await _rs_seed(store)
+    with pytest.raises(ResendSourceEmpty):
+        await store.resend_to(message_id=m2, to="OB2E", idempotency_key="k2", body_override="")
+    async with store._pool.acquire() as conn:
+        ne = await conn.fetch(
+            "SELECT id FROM queue WHERE stage=$1 AND destination_name=$2",
+            Stage.OUTBOUND.value,
+            "OB2E",
+        )
+    assert list(ne) == []
+
+    # idempotent: same key/body -> duplicate, exactly one OB3 delivery on one child.
+    first = await store.resend_to(
+        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+    )
+    second = await store.resend_to(
+        message_id=m2, to="OB3", idempotency_key="k3", body_override=_RS_EDITED
+    )
+    assert first.status == "resent" and second.status == "duplicate"
+    async with store._pool.acquire() as conn:
+        ob3 = await conn.fetch(
+            "SELECT id FROM queue WHERE stage=$1 AND destination_name=$2",
+            Stage.OUTBOUND.value,
+            "OB3",
+        )
+    assert len(ob3) == 1 and ob3[0]["id"] == first.outbox_id
+
+
+# --- RBAC-8: server-side summary_access census (record_audit + list_audit), on real Postgres --------
+
+
+async def test_summary_access_census_survives_and_coalesces_pg(store) -> None:
+    # Drive the REAL backend-agnostic coalescer end-to-end so the census JSON detail + NULL/scope
+    # keying persist through record_audit and read back via list_audit on the real backend (the piece
+    # that today rides SQLite only). Fixed `now` values make the hour bucketing deterministic.
+    from messagefoundry.api.app import _SummaryAuditCoalescer
+
+    c = _SummaryAuditCoalescer()
+    await c.note(store, "alice", "ch1", 3, 0.0)  # hour 0
+    await c.note(store, "alice", "ch1", 2, 60.0)  # same hour -> accumulate, no emit
+    assert [r for r in await store.list_audit() if r["action"] == "summary_access"] == []
+    await c.note(store, "alice", "ch1", 1, 3600.0)  # hour 1 -> flush hour-0 window (count 5)
+    rows = [r for r in await store.list_audit() if r["action"] == "summary_access"]
+    assert len(rows) == 1
+    assert json.loads(rows[0]["detail"]) == {"count": 5, "window_start": 0}
+    assert rows[0]["actor"] == "alice" and rows[0]["channel_id"] == "ch1"
+
+    await c.note(store, "bob", "", 4, 3600.0)  # hour 1, scope "" -> channel_id NULL
+    await c.flush(store)  # emit alice hour-1 (count 1) + bob (count 4)
+    rows = [r for r in await store.list_audit() if r["action"] == "summary_access"]
+    assert len(rows) == 3
+    got = sorted((r["actor"], r["channel_id"], json.loads(r["detail"])["count"]) for r in rows)
+    assert got == [("alice", "ch1", 1), ("alice", "ch1", 5), ("bob", None, 4)]
+    assert any(
+        r["actor"] == "bob" and r["channel_id"] is None for r in rows
+    )  # scope "" -> SQL NULL
+    # the #170 list_audit filters resolve summary_access rows on the real backend.
+    af = await store.list_audit(action="summary_access", actor="alice")
+    assert len(af) == 2 and all(
+        r["action"] == "summary_access" and r["actor"] == "alice" for r in af
+    )
+    ok, _ = await store.verify_audit_chain()
+    assert ok is True  # the census rows didn't fork the audit chain
+
+
+# --- ALERT-19: alert_instance CRUD lifecycle + reason cipher-at-rest, on real Postgres --------------
+
+
+async def test_alert_instance_lifecycle_pg(store) -> None:
+    # first fire opens one `open` instance (count 1, first_seen==last_seen).
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="critical", now=100.0
+    )
+    (a,) = await store.list_active_alert_instances()
+    assert a.status == "open" and a.count == 1 and a.first_seen == 100.0 and a.last_seen == 100.0
+    assert a.severity == "critical"
+
+    # re-fire folds into the live instance (PG's native ON CONFLICT path): same id, count++, last wins.
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="warning", now=150.0
+    )
+    (a2,) = await store.list_active_alert_instances()
+    assert a2.id == a.id and a2.count == 2 and a2.last_seen == 150.0 and a2.severity == "warning"
+    # a DIFFERENT key opens a distinct instance.
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_Y", severity="critical", now=160.0
+    )
+    assert len(await store.list_active_alert_instances()) == 2
+
+    # ack -> acknowledged + acked_by/at, excluded from the open count; unknown id -> False.
+    assert await store.ack_alert_instance(a.id, actor="scott", now=200.0) is True
+    got = await store.get_alert_instance(a.id)
+    assert got is not None and got.status == "acknowledged"
+    assert got.acked_by == "scott" and got.acked_at == 200.0
+    assert await store.ack_alert_instance(999999, actor="scott") is False
+    assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+    # an acknowledged re-fire folds in (count++) but does NOT pop back to open.
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="critical", now=210.0
+    )
+    got = await store.get_alert_instance(a.id)
+    assert got.status == "acknowledged" and got.count == 3
+    assert await store.count_open_alerts_by_connection() == {"OB_Y": 1}
+
+    # resolve closes it; the same key re-opens a FRESH distinct instance (partial index frees it).
+    assert await store.resolve_alert_instance(a.id, now=300.0) is True
+    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert await store.resolve_alert_instance(a.id) is False
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="warning", now=310.0
+    )
+    (reopened,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_X"]
+    assert reopened.id != a.id and reopened.status == "open" and reopened.count == 1
+
+    # inverse-signal resolver closes only the matching key; a no-match is a no-op (0).
+    assert (
+        await store.resolve_alert_instances_for(
+            event_type="connection_error", connection="OB_X", now=320.0
+        )
+        == 1
+    )
+    assert {r.connection for r in await store.list_active_alert_instances()} == {"OB_Y"}
+    assert (
+        await store.resolve_alert_instances_for(event_type="connection_error", connection="NOPE")
+        == 0
+    )
+
+    # purge: only RESOLVED rows older than the cutoff are pruned (open/ack survive).
+    (y,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_Y"]
+    await store.resolve_alert_instance(y.id, now=100.0)  # resolved at 100.0 -> purgeable
+    assert await store.purge_alert_instances(older_than=200.0) == 1
+    await store.upsert_alert_instance(
+        event_type="queue_buildup", connection="OB_R", severity="warning", now=500.0
+    )
+    (rr,) = [r for r in await store.list_active_alert_instances() if r.connection == "OB_R"]
+    await store.resolve_alert_instance(rr.id, now=500.0)  # too recent for older_than=200.0
+    assert await store.purge_alert_instances(older_than=200.0) == 0
+
+    # side-observer: an alert write creates NO message/queue row (invisible to the finalizer).
+    before = await store.stats()
+    await store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_Z", severity="critical", now=600.0
+    )
+    assert await store.stats() == before
+
+
+async def test_alert_reason_encrypted_at_rest_pg(store) -> None:
+    # Metadata-only + the scrubbed reason is encrypted at rest through a keyed handle (PG TEXT cipher
+    # pass) — decrypted at the read boundary, ciphertext on disk.
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    s2 = await PostgresStore.open(settings, cipher=make_cipher(generate_key()))
+    try:
+        await s2.upsert_alert_instance(
+            event_type="connection_error",
+            connection="OB_ENC",
+            severity="critical",
+            reason="connect refused to 10.0.0.9",
+            now=100.0,
+        )
+        (a,) = [r for r in await s2.list_active_alert_instances() if r.connection == "OB_ENC"]
+        assert a.reason == "connect refused to 10.0.0.9"  # decrypted at the boundary
+    finally:
+        await s2.close()
+    async with store._pool.acquire() as conn:  # read the RAW column (fixture handle: no cipher)
+        raw = await conn.fetchval("SELECT reason FROM alert_instance WHERE connection=$1", "OB_ENC")
+    assert isinstance(raw, str) and raw.startswith(MARKER_PREFIX)  # ciphertext on disk
+    assert "refused" not in raw
+
+
+# --- BATCH-3 cross-backend guards: store-once-inert + rotate/audit CLI on a live Postgres ------
+
+
+async def test_store_once_deliver_many_body_ref_inert(store) -> None:
+    """STOREF-17 (Postgres mirror): store-once-deliver-many dedup is SQLite-only this increment
+    (ADR 0099); on Postgres it is INERT — the schema carries ``shared_body`` + ``queue.body_ref``
+    (parity comments postgres.py:229-234/677-678/873-874), but ``transform_handoff`` writes each fan-out
+    delivery inline (``_insert_outbound_row`` omits ``body_ref`` → NULL), never a shared copy. The SAME
+    input that dedups on SQLite (test_store_once_deliver_many.py:88) must here create ZERO ``shared_body``
+    rows and leave every outbound ``body_ref`` NULL — and delivery parity must still hold: each
+    independent inline ciphertext decrypts to the identical plaintext (the LEFT-JOIN read falls through
+    to the inline payload when ``body_ref`` IS NULL, byte-identical to the pre-dedup path)."""
+    # A transformed body fanned out to ≥2 destinations — the exact shape that triggers the SQLite dedup;
+    # kept distinct from RAW (the routed handler body) as the SQLite reference test does.
+    body = "MSH|^~\\&|XFORM|||||20260101||ADT^A01|OUT1|P|2.5.1\r"
+    dests = ["OB_A", "OB_B", "OB_C"]
+    mid = await store.enqueue_ingress(channel_id="IB", raw=RAW, now=100.0)
+    ing = await store.claim_next_fifo("IB", now=100.0, stage=Stage.INGRESS.value)
+    assert ing is not None
+    await store.route_handoff(
+        ingress_id=ing.id,
+        message_id=mid,
+        channel_id="IB",
+        handlers=[("H1", RAW)],
+        disposition=MessageStatus.ROUTED,
+        now=100.0,
+    )
+    rtd = await store.claim_next_fifo("IB", now=100.0, stage=Stage.ROUTED.value)
+    assert rtd is not None
+    await store.transform_handoff(
+        routed_id=rtd.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[(d, body) for d in dests],
+        now=100.0,
+    )
+    # (1) No shared copy was ever created — dedup is inert on this backend.
+    n = await store._fetchone("SELECT COUNT(*) AS n FROM shared_body")
+    assert n is not None and int(n["n"]) == 0
+    # (2) Every fan-out outbound row stores the body inline (body_ref NULL) — N independent copies.
+    rows = await store._fetchall(
+        "SELECT body_ref FROM queue WHERE message_id=$1 AND stage=$2", mid, Stage.OUTBOUND.value
+    )
+    assert len(rows) == len(dests) and all(r["body_ref"] is None for r in rows)
+    # (3) Delivery parity: each destination's inline ciphertext decrypts to the identical plaintext.
+    for d in dests:
+        item = await store.claim_next_fifo(d, now=100.0, stage=Stage.OUTBOUND.value)
+        assert item is not None and item.payload == body
+
+
+async def test_audit_verify_cli_server(store, capsys) -> None:
+    """CLI-22 (Postgres mirror): the ``audit-verify`` CLI wrapper reaches the live Postgres store via
+    ``MEFOR_STORE_*`` env (no ``--db``; the M-31 missing-DB guard is SQLite-only, so it's inert and the
+    CLI goes straight to ``open_store`` on the env-configured backend). Seed a keyless audit chain
+    through the fixture handle (``record_audit`` commits per row, so the CLI's separate connection sees
+    it), then run the CLI OFF the event loop — ``_audit_verify`` calls ``asyncio.run`` internally, which
+    raises inside a running loop, so ``asyncio.to_thread`` gives it a fresh loop + its own pool."""
+    from messagefoundry.__main__ import main
+
+    await store.record_audit("message_view", actor="alice", detail="v1")
+    await store.record_audit("export", actor="bob", detail="e1")
+    rc = await asyncio.to_thread(main, ["audit-verify"])  # backend from env; NO --db
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "OK:" in out and "verified 2" in out
+
+
+async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
+    """CLI-23 (Postgres mirror): the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing
+    keyless chain (#190-D). It reaches the live Postgres store purely via ``MEFOR_STORE_*`` env (no
+    ``--db``), needs a DEK to key, and writes ``audit_chain_meta.keyed_from_id = MAX(audit_log.id)+1`` via
+    PG's ``INSERT ... ON CONFLICT`` upsert under the advisory lock. Seed keyless (the fixture handle
+    opened without a DEK), compute the watermark at RUNTIME (the fixture TRUNCATE ... RESTART IDENTITY
+    reseeds the serial, but computing MAX(id)+1 is correct on either reseed behaviour), then drive the
+    CLI off the event loop (its internal ``asyncio.run`` would raise in a running loop)."""
+    from messagefoundry.__main__ import main
+
+    await store.record_audit("legacy1", actor="x")
+    await store.record_audit("legacy2", actor="x")
+    row = await store._fetchone("SELECT MAX(id) + 1 AS wm FROM audit_log")
+    assert row is not None
+    wm = int(row["wm"])
+    # Give the CLI a DEK (set AFTER the keyless fixture opened, so the seeded chain stays keyless).
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
+    rc = await asyncio.to_thread(main, ["rekey-audit"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "OK:" in out and f"keyed from id={wm}" in out
+    # Idempotent: the watermark is set → a second run is a no-op, never a second move.
+    rc2 = await asyncio.to_thread(main, ["rekey-audit"])
+    assert rc2 == 0
+    assert "already keyed" in capsys.readouterr().out
+
+
+async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch, tmp_path) -> None:
+    """CLI-24 (Postgres mirror): the ``rotate-key`` CLI wrapper (resolve_active_key + keyring from env +
+    open_store dispatch + reencrypt_to_active) has only ever run against SQLite ``--db``; the underlying
+    method is covered on PG for attachment chunks only, and the CLI wiring not at all. Drive
+    ``main(["rotate-key"])`` against the live Postgres store: the backend + retired/active keyring come
+    purely from ``MEFOR_STORE_*`` env (no ``--db``). The ``store`` fixture truncated every table, so
+    rotation sees ONLY this test's key_a rows (no foreign-key leftover → no CipherError). After rotation
+    every ciphertext carries the new active key's fingerprint and the message decrypts under key_b ALONE
+    (retired key dropped) — end-to-end proof."""
+    from messagefoundry.__main__ import main
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    monkeypatch.chdir(
+        tmp_path
+    )  # isolate from any stray ./messagefoundry.toml (env wins, but be safe)
+    settings = load_settings(environ=os.environ).store
+    key_a, key_b = generate_key(), generate_key()
+    active_id_b = make_cipher(key_b).active_key_id
+
+    seed = await PostgresStore.open(settings, cipher=make_cipher(key_a))
+    try:
+        mid = await seed.enqueue_message(channel_id="ch", raw=RAW, deliveries=[("d", RAW)])
+    finally:
+        await seed.close()
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", key_b)  # new active
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEYS_RETIRED", key_a)  # old, decrypt-only bridge
+    rc = await asyncio.to_thread(main, ["rotate-key"])  # asyncio.run inside → off the loop
+    assert rc == 0
+    assert "re-encrypted" in capsys.readouterr().out
+
+    verify = await PostgresStore.open(
+        settings, cipher=make_cipher(key_b)
+    )  # key_b alone, no retired
+    try:
+        assert len(await verify.list_messages()) == 1
+        assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
+        blobs = await verify._fetchall(
+            "SELECT raw AS v FROM messages UNION ALL SELECT payload AS v FROM queue WHERE payload <> ''"
+        )
+        assert blobs  # at least messages.raw + the one outbound payload
+        for r in blobs:
+            assert r["v"].startswith(MARKER_PREFIX)
+            assert r["v"].split(":", 3)[2] == active_id_b  # mfenc:v1:<active_id>:<blob>
+    finally:
+        await verify.close()
+
+
+# =====================================================================================================
+# P1 batch 4 — STOREF-11: the ingress document-detach PIPELINE on real PostgreSQL (#149, ADR 0105
+# Phase 1a). Postgres advertises supports_streaming_attachments=True and implements put_attachment /
+# read_attachment / sweep_orphan_attachments + enqueue_ingress(attachment_refs=) (the two-object commit),
+# so the SAME over-threshold OBX-5 ED detach that tests/test_ingress_document_detach.py exercises on
+# SQLite runs identically here. Those SQLite tests, plus the store-level two-object-commit tests already
+# in this file, cover the pieces separately; this block drives the runner end-to-end
+# (RegistryRunner._handle_inbound / _detach_documents) against the LIVE server store — the piece the
+# server legs were missing. Every assertion is deterministic (no sleeps, no kills); synthetic HL7 only.
+# =====================================================================================================
+
+
+def _big_b64(nbytes: int) -> str:
+    """A big UNBROKEN base64 string standing in for a base64 PDF sitting in OBX-5.5 (synthetic)."""
+    return base64.b64encode(b"P" * nbytes).decode("ascii")
+
+
+def _hl7_with_doc(b64: str) -> str:
+    """A minimal MDM^T02 carrying one OBX-5 ED Base64 document (``^Application^PDF^Base64^<b64>``)."""
+    return (
+        "MSH|^~\\&|APP|FAC|RCV|RCVF|20260101120000||MDM^T02|MSGID001|P|2.5\r"
+        "EVN|T02|20260101120000\r"
+        "PID|1||MRN123^^^FAC||DOE^JOHN\r"
+        f"OBX|1|ED|PDF^Report||^Application^PDF^Base64^{b64}||||||F\r"
+    )
+
+
+def _stream_ack_code(ack: str | None) -> str | None:
+    """The MSA-1 acknowledgement code (AA/AE/AR) from a framed HL7 ACK string, or None."""
+    if ack is None:
+        return None
+    for seg in ack.replace("\n", "\r").split("\r"):
+        if seg.startswith("MSA|"):
+            return seg.split("|")[1]
+    return None
+
+
+def _streaming_ic(
+    *, threshold: int | None = 500, max_message_bytes: int | None = None, strict: bool = False
+) -> InboundConnection:
+    return InboundConnection(
+        name="IB_STREAM",
+        spec=ConnectionSpec(ConnectorType.MLLP, {"host": "127.0.0.1", "port": 0}),
+        router="r",
+        content_type=ContentType.HL7V2,
+        validation=Validation(strict=strict),
+        stream_threshold_bytes=threshold,
+        max_message_bytes=max_message_bytes,
+    )
+
+
+def _streaming_registry(ic: InboundConnection) -> Registry:
+    reg = Registry()
+    reg.add_inbound(ic)
+    reg.add_router("r", lambda m: [])  # no-op router; ingress never routes in these tests
+    return reg
+
+
+async def _only_message(store) -> dict:
+    """The single ``messages`` row (the fixture truncates, and each test drives one inbound)."""
+    rows = await store._fetchall("SELECT status, raw, error FROM messages")
+    assert len(rows) == 1
+    return dict(rows[0])
+
+
+async def _attachment_count(store) -> int:
+    row = await store._fetchone("SELECT COUNT(*) AS n FROM attachment")
+    return int(row["n"])
+
+
+async def test_over_threshold_detaches_verbatim_pg(store) -> None:
+    b64 = _big_b64(2000)  # ~2668 base64 chars, well over the 500-byte message threshold
+    raw = _hl7_with_doc(b64)
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+
+    assert _stream_ack_code(ack) == "AA"
+    row = await _only_message(store)
+    assert row["status"] == MessageStatus.RECEIVED.value
+    skeleton = row["raw"]
+    # The skeleton is SMALL (the bulky base64 is gone) and the other segments are intact.
+    assert len(skeleton) < len(raw)
+    assert "DOE^JOHN" in skeleton and "EVN|T02" in skeleton
+    assert b64 not in skeleton  # the document was lifted out
+    # OBX-5.5 now holds a live ref handle whose content address is the sha256 of the verbatim base64.
+    obx5_5 = Message.parse(skeleton).field("OBX-5.5")
+    assert obx5_5 is not None and is_doc_ref(obx5_5)
+    ref, content_type = parse_doc_ref(obx5_5)
+    assert ref == _hashlib.sha256(b64.encode("utf-8")).hexdigest()
+    assert content_type == "Application"
+    # The attachment holds the EXACT base64 bytes on the server store, increffed once by the ingress commit.
+    assert await _a_refcount(store, ref) == 1
+    assert "".join(await _a_read(store, ref)) == b64
+    assert await _a_chunks(store, ref) == len(list(chunk_b64(b64)))
+
+
+async def test_below_threshold_byte_identical_pg(store) -> None:
+    b64 = _big_b64(50)  # small; the whole message stays under the 5000-byte threshold
+    raw = _hl7_with_doc(b64)
+    assert len(raw) < 5000
+    ic = _streaming_ic(threshold=5000)
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+
+    assert _stream_ack_code(ack) == "AA"
+    row = await _only_message(store)
+    assert row["status"] == MessageStatus.RECEIVED.value
+    assert row["raw"] == raw  # BYTE-IDENTICAL: no detach, no re-encode
+    assert await _attachment_count(store) == 0  # no attachment row
+
+
+async def test_over_max_message_bytes_naks_ar_pg(store) -> None:
+    b64 = _big_b64(4000)
+    raw = _hl7_with_doc(b64)
+    # Cap below the body but at/above the threshold: admitted past the threshold gate, then rejected by the
+    # total cap (Peek.parse) → NAK AR + ERROR, before any detach.
+    ic = _streaming_ic(threshold=500, max_message_bytes=1000)
+    assert len(raw) > 1000
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+
+    assert _stream_ack_code(ack) == "AR"
+    row = await _only_message(store)
+    assert row["status"] == MessageStatus.ERROR.value
+    assert "exceeds max size" in row["error"]
+    assert await _attachment_count(store) == 0
+
+
+async def test_stream_inflight_budget_naks_ae_pg(store) -> None:
+    b64 = _big_b64(2000)
+    raw = _hl7_with_doc(b64)
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_streaming_registry(ic), store, stream_inflight_budget_bytes=10)
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+
+    assert _stream_ack_code(ack) == "AE"  # detach refused (backpressure) → NAK AE
+    row = await _only_message(store)
+    assert row["status"] == MessageStatus.ERROR.value
+    assert "streaming detach failed" in row["error"]
+    assert (
+        await _attachment_count(store) == 0
+    )  # nothing written (budget checked before put_attachment)
+    assert runner._stream_inflight_bytes == 0  # counter released in the finally
+
+
+async def test_ack_fires_after_skeleton_and_incref_commit_pg(store) -> None:
+    # When _handle_inbound returns AA, the RECEIVED skeleton row AND the attachment incref are already
+    # durable (the two-object commit) — count-and-log holds on the server store.
+    b64 = _big_b64(1500)
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
+    assert _stream_ack_code(ack) == "AA"
+
+    row = await _only_message(store)
+    assert row["status"] == MessageStatus.RECEIVED.value
+    ref, _ = parse_doc_ref(Message.parse(row["raw"]).field("OBX-5.5"))
+    assert await _a_refcount(store, ref) == 1  # incref durable at the moment AA is available
+
+
+async def test_crash_orphan_sweep_and_rerun_dedups_pg(store) -> None:
+    # Simulate a crash AFTER put_attachment (refcount 0) but BEFORE the skeleton commit: _detach_documents
+    # stores the attachment, then the process dies before enqueue_ingress. No ACK was sent.
+    b64 = _big_b64(1500)
+    raw = _hl7_with_doc(b64)
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    skeleton, refs = await runner._detach_documents(ic, raw)
+    assert len(refs) == 1
+    ref = refs[0]
+    assert await _a_refcount(store, ref) == 0  # orphan: stored, never increffed (no commit, no ACK)
+
+    # The Phase-0 startup sweep reclaims the refcount-0 orphan so no PHI chunk is left at rest.
+    assert await store.sweep_orphan_attachments() == 1
+    assert await _a_refcount(store, ref) is None
+
+    # The sender resends (no ACK) → a full re-run re-derives identically: same ref (dedup on sha256), one
+    # attachment at refcount 1, verbatim bytes recovered, RECEIVED.
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+    assert _stream_ack_code(ack) == "AA"
+    assert await _a_refcount(store, ref) == 1
+    assert "".join(await _a_read(store, ref)) == b64
+
+
+async def test_strict_downgraded_to_header_only_over_threshold_pg(store, monkeypatch) -> None:
+    # Over the streaming threshold, whole-body hl7apy validation is NOT invoked (header-only downgrade) —
+    # the detached document is opaque, so the header parse Peek already did is the validation seam.
+    def _boom(text, *, expected_version=None):  # type: ignore[no-untyped-def]
+        raise AssertionError("whole-body validate must not run over the streaming threshold")
+
+    monkeypatch.setattr(wiring_runner, "validate", _boom)
+    b64 = _big_b64(2000)
+    ic = _streaming_ic(threshold=500, strict=True)
+    runner = RegistryRunner(_streaming_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, _hl7_with_doc(b64).encode("utf-8"))
+    assert _stream_ack_code(ack) == "AA"  # RECEIVED, not blocked by (skipped) strict validation
+    assert (await _only_message(store))["status"] == MessageStatus.RECEIVED.value
+
+
+# --- ADR 0150: the client address column + its migration, on real Postgres --------------------------
+
+
+async def test_audit_client_recorded_and_chained(store) -> None:
+    """The address round-trips through record_audit/list_audit on the real backend, a `system` write
+    stays NULL rather than inheriting it, and the chain verifies across both row shapes."""
+    await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+    await store.record_audit("retention.purge", actor="system")  # engine-internal: no client
+    rows = [dict(r) for r in await store.list_audit(limit=2)]
+    assert rows[0]["action"] == "retention.purge" and rows[0]["client"] is None
+    assert rows[1]["client"] == "10.4.2.9"
+    ok, message = await store.verify_audit_chain()
+    assert ok, message
+
+
+async def test_audit_client_migration_on_a_preexisting_table(store) -> None:
+    """The real upgrade path on Postgres: a DB whose ``audit_log`` predates ``client`` gets the column
+    ALTERed in, its legacy rows keep their ORIGINAL hashes, and the chain still verifies — then a new
+    address-bearing row chains cleanly onto them.
+
+    The DDL batch is skipped when the ADR 0064 ``schema_meta`` marker matches, so this clears the marker
+    to reproduce what a genuine upgrade does: adding statements to ``_SCHEMA`` changes ``_schema_hash()``,
+    which forces exactly this one full (idempotent) re-run."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import audit_row_hash
+
+    async with store._pool.acquire() as conn:
+        await conn.execute("ALTER TABLE audit_log DROP COLUMN IF EXISTS client")
+        await conn.execute("DELETE FROM schema_meta")
+        prev = ""
+        for i in range(3):
+            prev = audit_row_hash(
+                prev, ts=float(i), actor="u", action="legacy", channel_id=None, detail=None
+            )
+            await conn.execute(
+                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
+                " VALUES ($1,$2,$3,$4,$5,$6)",
+                float(i),
+                "u",
+                "legacy",
+                None,
+                None,
+                prev,
+            )
+    legacy_head = prev
+
+    upgraded = await PostgresStore.open(load_settings(environ=os.environ).store)
+    try:
+        rows = await upgraded._fetchall("SELECT client, row_hash FROM audit_log ORDER BY id")
+        assert [r["client"] for r in rows] == [None, None, None]
+        assert rows[-1]["row_hash"] == legacy_head  # legacy hashes NOT rewritten
+        ok, message = await upgraded.verify_audit_chain()
+        assert ok, message
+        await upgraded.record_audit("messages.export", actor="alice", client="10.4.2.9")
+        ok, message = await upgraded.verify_audit_chain()
+        assert ok, message  # one chain over old-format + new-format rows
+        assert "4" in (message or "")
+    finally:
+        await upgraded.close()
+
+
+# --- ASVS 11.3.4: the persisted per-key AES-GCM invocation bound -------------
+# These exercise the BACKEND-SPECIFIC upsert SQL (the only place it runs at all). The offline unit
+# suite in tests/test_asvs_gcm_invocation_bound.py covers the arithmetic on SQLite; nothing but this
+# gated leg proves the Postgres statement is even syntactically valid, so a skip here is a real
+# coverage hole, not a formality.
+
+
+async def test_cipher_invocations_upsert_is_atomic_and_additive(store) -> None:
+    key_id = f"testkey-{uuid4().hex[:12]}"
+    assert await store.cipher_invocations(key_id) == 0  # an unknown key reads as zero, never raises
+
+    assert await store.add_cipher_invocations(key_id, 100) == 100  # INSERT arm
+    assert await store.add_cipher_invocations(key_id, 50) == 150  # UPDATE arm accumulates
+    assert await store.cipher_invocations(key_id) == 150
+
+    # Concurrent adds against one row: the whole point of the atomic upsert is that N processes on the
+    # one unified store aggregate rather than clobber. A last-write-wins upsert would land on 151.
+    await asyncio.gather(*(store.add_cipher_invocations(key_id, 1) for _ in range(20)))
+    assert await store.cipher_invocations(key_id) == 170
+
+
+async def test_cipher_invocations_are_keyed_per_key_id(store) -> None:
+    a = f"testkey-{uuid4().hex[:12]}"
+    b = f"testkey-{uuid4().hex[:12]}"
+    await store.add_cipher_invocations(a, 7)
+    await store.add_cipher_invocations(b, 3)
+    # Rotation semantics: a new key_id is an independent row, and the old one is untouched.
+    assert await store.cipher_invocations(a) == 7
+    assert await store.cipher_invocations(b) == 3
+
+
+async def test_checkpoint_is_a_noop_without_a_bounded_cipher(store) -> None:
+    # The gated fixtures open with the default (identity) cipher, so there is no birthday budget to
+    # bound and the checkpoint must return None rather than writing a row.
+    assert await store.checkpoint_cipher_invocations() is None
+
+
+async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
+    """The bound END TO END on this backend, not just the upsert primitive.
+
+    The fixture above opens with the IDENTITY cipher, so it exercises none of the enable-and-reserve
+    inside ``PostgresStore.open``, the close-time settlement, or the persistence across a reopen. A
+    keyed handle is the only way those run here at all."""
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.gcm_bound import GCM_RESERVE_BLOCK
+    from messagefoundry.store.postgres import PostgresStore
+
+    settings = load_settings(environ=os.environ).store
+    k = generate_key()
+    cipher = make_cipher(k)
+    key_id = cipher.active_key_id
+    try:
+        keyed = await PostgresStore.open(settings, cipher=cipher)
+        try:
+            assert cipher.invocation_bound_enabled, (
+                "open() must enable + reserve BEFORE the first write"
+            )
+            assert await keyed.cipher_invocations(key_id) >= GCM_RESERVE_BLOCK
+            for _ in range(5):
+                await keyed.enqueue_ingress(channel_id="IB", raw=RAW)
+            spent = cipher.cumulative_invocations()
+            assert 0 < spent < GCM_RESERVE_BLOCK
+        finally:
+            await keyed.close()  # settles to the exact spend
+
+        reopened_cipher = make_cipher(k)
+        reopened = await PostgresStore.open(settings, cipher=reopened_cipher)
+        try:
+            # The requirement: the KEY's lifetime figure survives the process, on this backend.
+            assert reopened_cipher.cumulative_invocations() == spent
+            await reopened.enqueue_ingress(channel_id="IB", raw=RAW)
+            assert reopened_cipher.cumulative_invocations() > spent
+        finally:
+            await reopened.close()
+    finally:
+        # Shared-DB hygiene: drop this test's encrypted rows + counter row (the fixture truncates on
+        # entry, but a later keyless open must never meet ciphertext it cannot read).
+        cleanup = await PostgresStore.open(settings, cipher=make_cipher(k))
+        try:
+            async with cleanup._pool.acquire() as conn:
+                for table in ("message_events", "queue", "response", "messages"):
+                    await conn.execute(f"DELETE FROM {table}")  # FK order: children first
+                await conn.execute("DELETE FROM cipher_meta WHERE key_id = $1", key_id)
+        finally:
+            await cleanup.close()
+
+
+async def test_session_rotation_contract(store) -> None:
+    """ASVS 7.2.4: rotate_session is a pure re-key — old hash dead, every other column carried
+    forward, replay and revoked rows refused. Extra-free shared contract, so this leg actually runs
+    it rather than importorskip-skipping."""
+    from tests._session_rotation_contract import assert_session_rotation_contract
+
+    await assert_session_rotation_contract(store)

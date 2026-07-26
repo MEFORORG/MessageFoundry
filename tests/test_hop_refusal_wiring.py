@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.config.ai_policy import AiMode, DataClass
+from messagefoundry.config.ai_policy import AiMode, DataClass, SecurityEnforcement
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     AiSettings,
@@ -24,24 +24,24 @@ from messagefoundry.config.wiring import (
 )
 
 
-# --- decision 2: the escape clamp (MEFOR_ALLOW_INSECURE_TLS downgrades REFUSE->WARN, non-prod only) ---
-def test_escape_clamp_non_prod_downgrades_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
+# --- decision 2: the escape clamp (MEFOR_ALLOW_INSECURE_TLS downgrades REFUSE->WARN, non-enforcing) ---
+def test_escape_clamp_non_enforcing_downgrades_when_set(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     assert insecure_tls_allowed() is True
-    assert hop_insecure_escape_downgrades(production=False) is True  # non-prod: may downgrade
+    assert hop_insecure_escape_downgrades(enforcing=False) is True  # warn dial: may downgrade
 
 
-def test_escape_clamp_is_inert_on_production(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The behaviour change: on production the escape can NEVER satisfy a prod-PHI hop.
+def test_escape_clamp_is_inert_under_enforce(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The behaviour change: under ENFORCE the escape can NEVER satisfy an enforcing PHI hop.
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     assert insecure_tls_allowed() is True
-    assert hop_insecure_escape_downgrades(production=True) is False
+    assert hop_insecure_escape_downgrades(enforcing=True) is False
 
 
 def test_escape_clamp_false_when_unset(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    assert hop_insecure_escape_downgrades(production=False) is False
-    assert hop_insecure_escape_downgrades(production=True) is False
+    assert hop_insecure_escape_downgrades(enforcing=False) is False
+    assert hop_insecure_escape_downgrades(enforcing=True) is False
 
 
 # --- decision 3: the per-connection attestation model field, load-validated --------------------
@@ -91,25 +91,49 @@ def test_source_attestation_field() -> None:
         Source(type=ConnectorType.REMOTEFILE, settings={}, tls_hop_attested_reason="x")
 
 
-# --- decision 7: the [ai]->HopPosture mapping (declared posture, fail-closed on unknown) --------
-def test_hop_posture_from_ai_builtin_names() -> None:
+# --- decision 7: the [ai]->HopPosture mapping (is_phi from data_class; enforcing from [security]) --
+_ENFORCE = SecurityEnforcement.ENFORCE
+_WARN = SecurityEnforcement.WARN
+
+
+def test_hop_posture_from_ai_builtin_names_is_phi_mapping() -> None:
+    # is_phi keys on data_class (GIVEN 1, ADR 0148: dev/staging/prod all derive phi now); enforcing
+    # keys on the enforcement level, DECOUPLED from the tier — at the ENFORCE default all carry
+    # enforcing=True.
     dev = AiSettings(mode=AiMode.BYO, environment="dev")
-    assert hop_posture_from_ai(dev) == HopPosture(is_phi=False, production=False)
+    assert hop_posture_from_ai(dev, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
     staging = AiSettings(mode=AiMode.BYO, environment="staging")
-    assert hop_posture_from_ai(staging) == HopPosture(is_phi=True, production=False)
+    assert hop_posture_from_ai(staging, enforcement=_ENFORCE) == HopPosture(
+        is_phi=True, enforcing=True
+    )
     prod = AiSettings(mode=AiMode.BYO, environment="prod")
-    assert hop_posture_from_ai(prod) == HopPosture(is_phi=True, production=True)
+    assert hop_posture_from_ai(prod, enforcement=_ENFORCE) == HopPosture(
+        is_phi=True, enforcing=True
+    )
+
+
+def test_hop_posture_from_ai_enforcement_drives_enforcing() -> None:
+    # enforcement=warn reproduces the historical non-production dial (enforcing=False) on every tier;
+    # is_phi is unchanged. This is the dial DECOUPLING: the tier no longer sets the refuse/warn bit.
+    for env, is_phi in (("dev", True), ("staging", True), ("prod", True)):
+        ai = AiSettings(mode=AiMode.BYO, environment=env)
+        assert hop_posture_from_ai(ai, enforcement=_WARN) == HopPosture(
+            is_phi=is_phi, enforcing=False
+        )
+        assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(
+            is_phi=is_phi, enforcing=True
+        )
 
 
 def test_hop_posture_from_ai_explicit_posture_overrides_name() -> None:
     ai = AiSettings(mode=AiMode.BYO, environment="poc", data_class=DataClass.PHI, production=True)
-    assert hop_posture_from_ai(ai) == HopPosture(is_phi=True, production=True)
+    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
 
 
 def test_hop_posture_from_ai_custom_unresolved_fails_closed() -> None:
-    # A custom env with no explicit posture -> both dimensions unknown -> strictest (fail-closed).
+    # A custom env with no explicit data_class -> is_phi unknown -> strictest (fail-closed True).
     ai = AiSettings(mode=AiMode.BYO, environment="poc")
-    assert hop_posture_from_ai(ai) == HopPosture(is_phi=True, production=True)
+    assert hop_posture_from_ai(ai, enforcement=_ENFORCE) == HopPosture(is_phi=True, enforcing=True)
 
 
 # --- decision 7 wiring: build_check_registry stamps the posture during connector construction ---
@@ -129,7 +153,7 @@ def test_build_check_registry_stamps_posture(monkeypatch: pytest.MonkeyPatch) ->
     reg = Registry()
     reg.add_outbound(build_outbound_connection("OB", File(directory=".")))
 
-    posture = HopPosture(is_phi=True, production=True)
+    posture = HopPosture(is_phi=True, enforcing=True)
     wr.build_check_registry(
         reg,
         inbound_bind_host="127.0.0.1",

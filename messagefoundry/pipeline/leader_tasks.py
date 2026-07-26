@@ -99,7 +99,7 @@ class LeaderMaintenanceRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            try:  # noqa: SIM105
                 await task
             except asyncio.CancelledError:
                 pass
@@ -118,9 +118,9 @@ class LeaderMaintenanceRunner:
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     # --- one pass ------------------------------------------------------------

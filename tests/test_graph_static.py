@@ -190,6 +190,36 @@ def test_send_target_advisory_skips_clean_config(cfg: Path) -> None:
     assert res.ok is True and res.required is False and res.skipped is True
 
 
+def test_graph_json_marks_deployed_distinguishing_not_deployed_from_stopped(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # AC-3 (#233, ADR 0111): graph --json emits `deployed` for every inbound + outbound, so tooling can
+    # tell a not-deployed connection (deployed=false) from a merely stopped one. The static graph
+    # carries no lifecycle state otherwise; auto_start=False is a DISTINCT concept (deployed, just not up
+    # now) and is not what this field reports — this field is the config-present-but-not-deployed flag.
+    d = tmp_path / "config"
+    d.mkdir()
+    (d / "feed.py").write_text(
+        "from messagefoundry import File, handler, inbound, outbound, router\n"
+        "inbound('IB_ON', File(directory='in_on'), router='r')\n"
+        "inbound('IB_OFF', File(directory='in_off'), router='r', deployed=False)\n"
+        "outbound('OB_ON', File(directory='out_on'))\n"
+        "outbound('OB_OFF', File(directory='out_off'), deployed=False)\n"
+        "@router('r')\n"
+        "def r(msg):\n"
+        "    return []\n",
+        encoding="utf-8",
+    )
+    assert main(["graph", "--config", str(d), "--json"]) == 0
+    data = json.loads(capsys.readouterr().out)
+    inbound = {i["name"]: i for i in data["inbound"]}
+    outbound = {o["name"]: o for o in data["outbound"]}
+    assert inbound["IB_ON"]["deployed"] is True
+    assert inbound["IB_OFF"]["deployed"] is False
+    assert outbound["OB_ON"]["deployed"] is True
+    assert outbound["OB_OFF"]["deployed"] is False
+
+
 # ---------------------------------------------------------------------------
 # Function-local dataflow (conservative may-route union) — resolves the common accumulation
 # idioms as LITERAL, and poisons anything it cannot replay back to dynamic.

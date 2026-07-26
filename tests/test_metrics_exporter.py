@@ -165,7 +165,7 @@ async def test_delivery_latency_histogram_cumulative_counts(engine: Engine) -> N
 
     # bucket_counts are CUMULATIVE (rows with latency <= buckets[i]).
     assert len(h.bucket_counts) == len(DEFAULT_LATENCY_BUCKETS)
-    for boundary, cum in zip(DEFAULT_LATENCY_BUCKETS, h.bucket_counts):
+    for boundary, cum in zip(DEFAULT_LATENCY_BUCKETS, h.bucket_counts):  # noqa: B905
         expected = sum(1 for lat in (0.1, 1.0, 3.0) if lat <= boundary)
         assert cum == expected, f"le={boundary}: expected {expected}, got {cum}"
     # Sanity on the ladder ends: le=0.05 catches none; le=300 catches all three.
@@ -287,7 +287,7 @@ async def test_store_cost_counters_always_emit_and_pool_absent_on_sqlite(
 
 
 async def _auth_service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

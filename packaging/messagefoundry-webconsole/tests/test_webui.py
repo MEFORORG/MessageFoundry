@@ -7,12 +7,12 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-
+import time
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from types import SimpleNamespace
-from urllib.parse import quote, urlencode
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qsl, quote, urlencode, urlsplit
 
 import httpx
 import pytest
@@ -20,8 +20,8 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role
 from messagefoundry.auth.identity import AuthProvider
-from messagefoundry.auth.tokens import hash_token
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.settings import ApprovalsSettings, AuthSettings
 from messagefoundry.config.wiring import (
@@ -80,6 +80,19 @@ async def _add(service: AuthService, username: str, *roles: Role) -> None:
 async def _cookie_login(c: httpx.AsyncClient, username: str) -> httpx.Response:
     """Sign in via the browser cookie flow (urlencoded form; the client keeps the Set-Cookie)."""
     return await c.post("/ui/login", data={"username": username, "password": PW})
+
+
+async def _mint_action(
+    c: httpx.AsyncClient, next_path: str, *, code: str | None = None
+) -> httpx.Response:
+    """7.5.1 (ADR 0077): POST /ui/reauth to mint the single-use ACTION grant bound to ``next_path``;
+    the caller then re-POSTs the action to consume it. The login window no longer unlocks a /ui factor
+    bind, so every factor lane needs its own fresh grant. Pass ``code`` for a full-step-up (enrolled)
+    reauth (e.g. disable-MFA on an enrolled session)."""
+    data = {"next": next_path, "password": PW}
+    if code is not None:
+        data["code"] = code
+    return await c.post("/ui/reauth", data=data, headers={"Sec-Fetch-Site": "same-origin"})
 
 
 async def _seed(engine: Engine, raw: str = ADT, control_id: str = "MSG1") -> str:
@@ -335,8 +348,13 @@ def test_serve_ui_offloopback_requires_tls(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic — this reaches the stricter /ui
+    # exposure gate (the subject) instead of the PHI cleartext-bind clamp / egress refusals.
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\nserve_ui = true\n', encoding="utf-8"
+        "security.handles_real_patient_data = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.serve_web_console = true\n",
+        encoding="utf-8",
     )
     # --allow-insecure-bind clears the JSON-API cleartext gate, but the stricter /ui gate still refuses.
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--allow-insecure-bind"])
@@ -471,6 +489,229 @@ async def test_reauth_rejects_cross_site_post(engine: Engine) -> None:
         assert r.status_code == 403
 
 
+# --- UI-12: message edit & resubmit -------------------------------------------
+#
+# The engine JSON route + the STORE invariants (byte-identical origin, correlated child, idempotent
+# once-only, direct OB2 rows, the PHI-safe 422 no-echo) are covered engine-side in
+# tests/test_edit_resend.py. What is exercised HERE is the DISTINCT /ui glue that is otherwise
+# uncovered: the GET editor PAGE markup (a COPY textarea + Modified badge + Revert + data-original),
+# the form-POST mode routing (reroute → 303 to the child, direct → 303 back to the origin), the
+# stale-step-up reauth_next that points a body-carrying POST at the /edit FORM (never the POST path),
+# the MESSAGES_EDIT gate, same-origin CSRF defense, cookie-confinement, and the generic 400 reject
+# that never leaks pydantic's structured echo. The /ui routes mount on the real engine app
+# (create_app(serve_ui=True)) and call the shared "core" handlers in-process over an ASGI transport.
+
+# An EDITED body distinct from ADT (a different MRN/name) — stands in for the operator's client-side
+# edit. Never real PHI (synthetic HL7 only).
+EDITED = "MSH|^~\\&|S|F|R|RF|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||200^^^H^MR||DOE^JOHN\r"
+
+
+async def test_message_edit_page_renders_copy_editor(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")  # a fresh login counts as a recent step-up
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 200
+        body = r.text
+        # The editable COPY textarea + its pristine-copy attribute (for the client-side Revert).
+        assert 'id="edit-raw"' in body
+        assert "data-original=" in body
+        # The "Modified" badge (revealed by app.js once the copy diverges) starts hidden.
+        assert 'id="edit-modified" class="badge-modified" hidden' in body
+        assert "Modified" in body
+        # Revert starts disabled (nothing to revert on a pristine copy).
+        assert 'id="edit-revert" disabled' in body
+        # The banner states this is a COPY — the original log entry is never mutated.
+        assert "You are editing a COPY" in body
+        # The form POSTs the edit to the resubmit route and carries a per-open idempotency token.
+        assert f'action="/ui/messages/{mid}/edit-resend"' in body
+        assert 'name="idempotency_key"' in body
+
+
+async def test_message_edit_page_escapes_xss(engine: Engine) -> None:
+    # The textarea body + data-original attribute are attacker-influenced HL7 — they must render as
+    # escaped text, never live markup.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine, raw=XSS_RAW, control_id="X1")
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 200
+        assert "<script>alert(1)</script>" not in r.text
+        assert "&lt;script&gt;alert(1)&lt;/script&gt;" in r.text
+
+
+async def test_message_edit_requires_edit_permission(engine: Engine) -> None:
+    # A viewer holds MESSAGES_READ but not MESSAGES_EDIT — the editor is refused before any step-up.
+    service = await _service(engine)
+    await _add(service, "viewer", Role.VIEWER)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "viewer")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 403
+
+
+async def test_edit_resend_reroute_redirects_to_child(engine: Engine) -> None:
+    # Re-route re-ingresses the EDITED body as a fresh correlated child on the origin channel; the /ui
+    # route lands the operator on the NEW child's detail. Store-level reingress needs no started
+    # pipeline.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        child = r.headers["location"].removeprefix("/ui/messages/")
+        assert child and child != mid
+    origin = await engine.store.get_message(mid)
+    assert origin is not None and origin["raw"] == ADT  # the ORIGINAL is byte-identical
+    child_row = await engine.store.get_message(child)
+    assert child_row is not None and child_row["raw"] == EDITED  # the child carries the edited body
+    assert json.loads(child_row["metadata"])["edited_from"] == mid  # correlated to the origin
+
+
+async def test_edit_resend_direct_redirects_to_origin(engine: Engine, tmp_path: Path) -> None:
+    # The DIRECT power-path delivers the edited body straight to a registered/running alternate
+    # outbound and lands back on the ORIGIN (which now carries the new outbound row). The shared engine
+    # handler validates `to` against the registry + running state, so this path needs a started
+    # pipeline with OB2 registered.
+    for d in ("in", "o2"):
+        (tmp_path / d).mkdir(exist_ok=True)
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in1",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": str(tmp_path / "in"), "pattern": "*.hl7", "poll_seconds": 0.05},
+            ),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection(
+            "OB2", ConnectionSpec(ConnectorType.FILE, {"directory": str(tmp_path / "o2")})
+        )
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", lambda m: Send("OB2", m))
+    engine.add_registry(reg)
+    await engine.start()
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": "OB2"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == f"/ui/messages/{mid}"  # back to the ORIGIN
+    rec = [a for a in await engine.store.list_audit() if a["action"] == "message_edit_resend"]
+    assert len(rec) == 1
+    detail = str(rec[0]["detail"] or "")
+    assert '"mode": "direct"' in detail
+    assert EDITED not in detail and "DOE^JOHN" not in detail  # the edited body is NEVER audited
+
+
+async def test_edit_resend_direct_missing_to_rejects_generic(engine: Engine) -> None:
+    # A direct send with no chosen outbound is rejected with a generic prompt — and the operator's
+    # mode choice (direct) survives so the form doesn't silently reset to re-route (review #153-4).
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "direct", "to": ""},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400
+        assert "choose an outbound connection" in r.text
+        assert 'value="direct" checked' in r.text  # the direct radio stays selected
+        assert '"input"' not in r.text  # never a pydantic structured echo
+
+
+async def test_edit_resend_phi_safe_reject_no_pydantic_echo(engine: Engine) -> None:
+    # An empty edited body fails EditResendRequest(min_length=1). The webconsole re-renders a GENERIC
+    # error — never pydantic's structured echo (which for a body-carrying route would surface the
+    # offending value). The 422 no-echo is covered engine-side; this is the webconsole 400 analogue.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": "", "idempotency_key": "k1", "mode": "reroute"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 400
+        assert "invalid input" in r.text
+        # The operator's own edited raw IS re-shown (raw_value=), so assert on the ABSENCE of the
+        # pydantic error STRUCTURE, not a blanket substring check of the whole page.
+        assert '"type":' not in r.text
+        assert '"input":' not in r.text
+        assert "string_too_long" not in r.text
+        assert "string_too_short" not in r.text
+
+
+async def test_edit_stale_stepup_redirects_get_and_post_to_edit_form(engine: Engine) -> None:
+    # With an expired step-up window BOTH the GET editor and the body-carrying POST bounce to
+    # /ui/reauth pointing at the /edit FORM page — never at the POST path (a re-POST across re-auth
+    # would drop the edited body). No child is minted from the bounced request.
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 303
+        assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": EDITED, "idempotency_key": "k1", "mode": "reroute"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 303
+        # The reauth_next maps the POST to the /edit FORM, never the /edit-resend POST path.
+        assert r.headers["location"] == f"/ui/reauth?next=/ui/messages/{mid}/edit"
+    # The body never outlived the bounced request — only the origin exists.
+    assert await engine.store.count_messages() == 1
+
+
+async def test_edit_resend_cross_site_and_cookie_on_json(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        # (a) A cross-site POST to the /ui route is rejected by the same-origin CSRF defense.
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend", headers={"Sec-Fetch-Site": "cross-site"}
+        )
+        assert r.status_code == 403
+        # (b) The /ui cookie is not accepted on the JSON engine route (header-only auth there).
+        r = await c.post(
+            f"/messages/{mid}/edit-resend",
+            json={"raw": EDITED, "idempotency_key": "k1"},
+        )
+        assert r.status_code == 401
+
+
 # --- M3: dead-letter bulk replay (per-channel, step-up + approval-gated) ------
 
 
@@ -555,8 +796,8 @@ async def _token(engine: Engine, service: AuthService, user: str) -> tuple[objec
 
 
 async def test_ws_cookie_auth_same_origin_ok(engine: Engine) -> None:
-    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -568,8 +809,8 @@ async def test_ws_cookie_auth_same_origin_ok(engine: Engine) -> None:
 
 async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
     # CSWSH gate: a cross-origin handshake is rejected even with a valid cookie value.
-    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -580,8 +821,8 @@ async def test_ws_cookie_auth_rejects_cross_origin(engine: Engine) -> None:
 
 
 async def test_ws_cookie_auth_requires_cookie_and_origin(engine: Engine) -> None:
-    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -1036,8 +1277,8 @@ async def test_csrf_honors_public_origin(engine: Engine) -> None:
 
 
 async def test_ws_cookie_auth_honors_public_origin(engine: Engine) -> None:
-    from messagefoundry_webconsole import authorize_ui_ws
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import authorize_ui_ws
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
@@ -1059,8 +1300,8 @@ def test_public_origin_matching_is_case_insensitive() -> None:
     # Scheme + host are case-insensitive (RFC 3986 §3.2.2): the validator lowercases the configured
     # origin, and _origin_matches canonicalizes the incoming Origin — so a case variant is not a false
     # reject (and can never be a bypass; it fails closed).
-    from messagefoundry_webconsole._auth import _origin_matches
     from messagefoundry.config.settings import ApiSettings
+    from messagefoundry_webconsole._auth import _origin_matches
 
     assert (
         ApiSettings(public_origin="https://OPS.Example.COM").public_origin
@@ -1298,9 +1539,9 @@ def test_register_ui_action_extends_the_stepup_allowlist() -> None:
     # A write-page lane extends the auto-retry allow-list by REGISTERING its action — never by editing
     # is_safe_ui_action. The migrated replay actions still resolve (behavior-preserving); a freshly
     # registered action becomes auto-retryable; the ".." reject still holds; registration is idempotent.
+    from messagefoundry.auth import Permission
     from messagefoundry_webconsole import is_safe_ui_action, register_ui_action
     from messagefoundry_webconsole._auth import _UI_WRITE_ACTIONS
-    from messagefoundry.auth import Permission
 
     # Migrated phase-0 replay actions are still allowed.
     assert is_safe_ui_action("/ui/messages/M1/replay")
@@ -1644,12 +1885,12 @@ _UNLOCK_PAT = r"^/ui/testunlock/[^/?#]+$"  # a synthetic unlock form path, names
 def test_is_unlock_action_gate() -> None:
     # is_unlock_action is the GET-form analogue of is_safe_ui_action: it matches ONLY registered
     # ``unlock`` entries, is ``..``-guarded, and is disjoint from the auto-retry (POST) allow-list.
+    from messagefoundry.auth import Permission
     from messagefoundry_webconsole import (
         is_safe_ui_action,
         is_unlock_action,
         register_ui_action,
     )
-    from messagefoundry.auth import Permission
 
     assert not is_unlock_action("/ui/testunlock/new")  # not yet registered
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
@@ -1668,9 +1909,9 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
     # continuation branches on exactly these flags, so an action that is both is a mis-registration.
     import re
 
+    from messagefoundry.auth import Permission
     from messagefoundry_webconsole import register_ui_action
     from messagefoundry_webconsole._auth import UiWriteAction
-    from messagefoundry.auth import Permission
 
     with pytest.raises(ValueError):
         register_ui_action(r"^/ui/bad$", Permission.USERS_MANAGE, auto_retry=True, unlock=True)
@@ -1680,8 +1921,8 @@ def test_register_ui_action_rejects_auto_retry_and_unlock() -> None:
 
 async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
     # The re-auth form accepts an ``unlock`` next (a GET admin form), exactly as it accepts a replay next.
-    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import register_ui_action
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
@@ -1697,8 +1938,8 @@ async def test_reauth_form_renders_for_unlock_next(engine: Engine) -> None:
 async def test_reauth_get_unlock_redirects_after_stepup(engine: Engine) -> None:
     # THE primitive: a successful step-up whose next is an ``unlock`` form 303-GET-redirects BACK to the
     # form (so it re-opens fresh) — it does NOT render the POST auto-submit page. No body is carried.
-    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import register_ui_action
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
@@ -1736,8 +1977,8 @@ async def test_reauth_post_rejects_unregistered_next(engine: Engine) -> None:
 async def test_reauth_failed_stepup_rerenders_form_not_redirect(engine: Engine) -> None:
     # A WRONG password on an unlock next must re-render the reauth form (with the hidden next), never
     # 303 to the unlock target — the GET-redirect happens only after a successful re-verification.
-    from messagefoundry_webconsole import register_ui_action
     from messagefoundry.auth import Permission
+    from messagefoundry_webconsole import register_ui_action
 
     register_ui_action(_UNLOCK_PAT, Permission.USERS_MANAGE, auto_retry=False, unlock=True)
     service = await _service(engine)
@@ -2339,6 +2580,11 @@ async def test_all_admin_posts_reject_cross_site(engine: Engine) -> None:
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         boss_id = await _uid(service, "boss")
+        # 7.5.1: the two action-bound webauthn POSTs (enroll, delete) need a fresh grant to reach their
+        # in-body assert_same_origin — mint them so the cross-site sweep still exercises the 403 (a
+        # missing assert_same_origin on those routes must fail loudly, not hide behind a no-grant 303).
+        await _mint_action(c, "/ui/account/webauthn/enroll")
+        await _mint_action(c, "/ui/account/webauthn/abc123/delete")
         posts = [
             "/ui/users",
             f"/ui/users/{boss_id}/update",
@@ -2554,12 +2800,16 @@ async def test_must_change_account_is_confined_to_rotation(engine: Engine) -> No
 
 
 async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
-    from messagefoundry.auth import totp as totp_mod
 
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        # 7.5.1: the login window no longer unlocks a factor bind — enroll needs a fresh action grant.
+        assert (
+            await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        ).status_code == 303
+        await _mint_action(c, "/ui/account/mfa/enroll")
         # Enroll: stages a secret, renders it once with the confirm form.
         r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 200
@@ -2568,10 +2818,11 @@ async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
         assert secret and secret in r.text  # the staged secret is what the page shows
-        # Confirm with a live code → recovery codes shown once; MFA active.
+        # Confirm with a live code → recovery codes shown once; MFA active. Needs the MFA_CONFIRM grant.
+        await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
-            data={"code": totp_mod.totp(secret)},
+            data={"code": _totp_not_near_a_step_boundary(secret)},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 200
@@ -2581,8 +2832,12 @@ async def test_mfa_enroll_confirm_disable_lifecycle(engine: Engine) -> None:
         assert user is not None and user.totp_enabled
         r = await c.get("/ui/account")
         assert "Enabled" in r.text and "recovery code(s) remaining" in r.text
-        # Disable: step-up-gated — confirm_mfa_enrollment marked THIS session MFA-verified, and the
-        # fresh login is a recent password step-up, so the gate passes without a reauth bounce.
+        # Disable: full step-up bound to MFA_DISABLE. The session is MFA-verified (confirm marked it),
+        # so the reauth is password-only (no code demand, core.py:610), then the grant lets it through.
+        assert (
+            await c.post("/ui/account/mfa/disable", headers={"Sec-Fetch-Site": "same-origin"})
+        ).status_code == 303
+        await _mint_action(c, "/ui/account/mfa/disable")
         r = await c.post("/ui/account/mfa/disable", headers={"Sec-Fetch-Site": "same-origin"})
         assert r.status_code == 303 and r.headers["location"] == "/ui/account?m=mfa_off"
         user = await service.store.get_user(uid)
@@ -2595,7 +2850,9 @@ async def test_mfa_verify_wrong_code_and_no_enrollment(engine: Engine) -> None:
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        # No enrollment staged yet → back to the account page with the service's message.
+        # No enrollment staged yet → back to the account page with the service's message (mint the
+        # MFA_CONFIRM grant first, else the verify bounces to reauth before reaching its body).
+        await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": "123456"},
@@ -2603,7 +2860,9 @@ async def test_mfa_verify_wrong_code_and_no_enrollment(engine: Engine) -> None:
         )
         assert r.status_code == 400 and "no enrollment in progress" in r.text
         # Stage one, then a wrong (non-numeric) code re-renders the confirm form; MFA stays off.
+        await _mint_action(c, "/ui/account/mfa/enroll")
         await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
             data={"code": "badcod"},
@@ -2632,6 +2891,7 @@ async def test_mfa_confirm_form_is_unlock_reentry(engine: Engine) -> None:
     assert not is_unlock_action("/ui/account/password")
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
         await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
         uid = await _uid(service, "op")
         secret = await service.store.get_totp_secret(uid)
@@ -2698,7 +2958,6 @@ async def test_require_mfa_unenrolled_can_enroll_end_to_end(engine: Engine) -> N
     # deliberately gets NO step-up freshness from login (WP-14: a stolen pre-MFA token must not bind
     # an attacker's authenticator), so browser enrollment goes login → enroll → reauth (password
     # ONLY, no impossible code demand) → auto-retried enroll → confirm — completing end-to-end.
-    from messagefoundry.auth import totp as totp_mod
 
     service = AuthService(engine.store, AuthSettings(require_mfa=True))
     await service.initialize()
@@ -2724,9 +2983,13 @@ async def test_require_mfa_unenrolled_can_enroll_end_to_end(engine: Engine) -> N
         uid = await _uid(service, "boss")
         secret = await service.store.get_totp_secret(uid)
         assert secret is not None
+        # Confirm needs its OWN grant (MFA_CONFIRM) — a second password re-proof, the exact enroll→
+        # confirm two-reauth friction ADR 0077 accepts. The staged-but-unconfirmed secret keeps
+        # mfa.enabled False, so this reauth stays password-only (no impossible code demand).
+        await _mint_action(c, "/ui/account/mfa/confirm")
         r = await c.post(
             "/ui/account/mfa/verify",
-            data={"code": totp_mod.totp(secret)},
+            data={"code": _totp_not_near_a_step_boundary(secret)},
             headers={"Sec-Fetch-Site": "same-origin"},
         )
         assert r.status_code == 200 and "shown once" in r.text
@@ -2734,24 +2997,82 @@ async def test_require_mfa_unenrolled_can_enroll_end_to_end(engine: Engine) -> N
         assert user is not None and user.totp_enabled
 
 
+async def test_ui_factor_bind_is_single_use(engine: Engine) -> None:
+    # 7.5.1: a /ui factor-action grant is single-use — after one enroll bind consumes it, a second
+    # enroll POST re-prompts (303 to reauth) rather than riding the login window.
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        await _mint_action(c, "/ui/account/mfa/enroll")
+        assert (
+            await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        ).status_code == 200  # consumes the grant
+        # The grant is spent → a second enroll bounces to reauth (the login window never unlocks it).
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/mfa/enroll"
+
+
+async def test_ui_factor_bind_opt_out_uses_window(engine: Engine) -> None:
+    # 7.5.1 opt-out: with [auth].require_action_step_up=False the /ui twins fall back to the session
+    # window, so a fresh login unlocks the enroll bind directly (byte-identical to pre-amendment /ui).
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, require_action_step_up=False)
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+        assert r.status_code == 200 and "Secret:" in r.text
+
+
 # --- L4b review-driven regressions (adversarial review: 2 behavior bugs + coverage gaps) -----------
 
 
 async def _enroll_mfa(c: httpx.AsyncClient, service: AuthService, username: str) -> str:
-    """Enroll + confirm TOTP for `username` via the /ui flow; return the secret (for later codes)."""
-    from messagefoundry.auth import totp as totp_mod
+    """Enroll + confirm TOTP for `username` via the /ui flow; return the secret (for later codes).
 
-    await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+    7.5.1 (ADR 0077): each factor bind now needs its own single-use action grant — mint MFA_ENROLL
+    before enroll and MFA_CONFIRM before verify (the login window no longer unlocks factor binding)."""
+
+    await _mint_action(c, "/ui/account/mfa/enroll")
+    r = await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
+    assert r.status_code == 200, r.text
     uid = await _uid(service, username)
     secret = await service.store.get_totp_secret(uid)
     assert secret is not None
+    await _mint_action(c, "/ui/account/mfa/confirm")
     r = await c.post(
         "/ui/account/mfa/verify",
-        data={"code": totp_mod.totp(secret)},
+        data={"code": _totp_not_near_a_step_boundary(secret)},
         headers={"Sec-Fetch-Site": "same-origin"},
     )
-    assert r.status_code == 200
+    assert r.status_code == 200, r.text
     return secret
+
+
+def _totp_not_near_a_step_boundary(secret: str, *, margin: float = 3.0) -> str:
+    """A TOTP code with enough of its step left to survive the round trip.
+
+    ``[auth].totp_skew_steps`` defaults to **0** — strict current-step only, deliberately, so that
+    tolerating a fast-clock code cannot advance the single-use high-water mark (SEC-014). That makes
+    every ``totp(secret)`` computed near a step boundary a race: the code is minted in step N and
+    verified in step N+1, and the server correctly rejects it (400). It is not a product defect, but
+    it makes any test that enrolls MFA fail a few percent of the time — which is how it blocked PRs
+    that touch nothing near auth.
+
+    Waiting out the remaining sliver of the step (never more than ``margin`` seconds) makes the helper
+    deterministic without widening the product's replay window.
+    """
+    from messagefoundry.auth import totp as _totp_mod
+
+    period = _totp_mod.DEFAULT_PERIOD
+    remaining = period - (time.time() % period)
+    if remaining < margin:
+        time.sleep(remaining + 0.05)
+    return _totp_mod.totp(secret)
 
 
 async def test_reauth_confines_must_change_session(engine: Engine) -> None:
@@ -2846,11 +3167,15 @@ async def test_mfa_posts_reject_cross_site(engine: Engine) -> None:
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        for path in (
-            "/ui/account/mfa/enroll",
-            "/ui/account/mfa/verify",
-            "/ui/account/mfa/disable",
+        # 7.5.1 consume-before-CSRF (ADR 0077): even WITH a fresh action grant, a cross-site POST is
+        # rejected by the in-body assert_same_origin (403) — the grant is consumed harmlessly, never a
+        # bypass. Minting the grant first keeps this a real assert_same_origin test (not a no-grant 303).
+        for path, mint_next in (
+            ("/ui/account/mfa/enroll", "/ui/account/mfa/enroll"),
+            ("/ui/account/mfa/verify", "/ui/account/mfa/confirm"),
+            ("/ui/account/mfa/disable", "/ui/account/mfa/disable"),
         ):
+            await _mint_action(c, mint_next)
             r = await c.post(path, headers={"Sec-Fetch-Site": "cross-site"})
             assert r.status_code == 403, path
         uid = await _uid(service, "op")
@@ -2890,13 +3215,18 @@ async def test_l4b_rate_limit_paths(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
 
-    def _deny(_client: str | None) -> bool:
+    def _deny(_actor: str) -> bool:
         return False
 
     async with _client(engine, service) as c:
         await _cookie_login(c, "op")
-        await c.post("/ui/account/mfa/enroll", headers={"Sec-Fetch-Site": "same-origin"})
-        service.allow_login_attempt = _deny  # type: ignore[method-assign]
+        # 7.5.1: mint the MFA_CONFIRM grant BEFORE denying (the mint itself consults the ceremony
+        # limiter) so the throttled verify reaches its in-body rate-limit check instead of bouncing
+        # to reauth.
+        await _mint_action(c, "/ui/account/mfa/confirm")
+        # These are POST-session ceremonies: they draw on the per-ACTOR budget, NOT the shared
+        # unauthenticated sign-in budget (allow_login_attempt) they used to consume.
+        service.allow_reauth_attempt = _deny  # type: ignore[method-assign]
         r = await c.post(
             "/ui/account/password",
             data={"current_password": PW, "new_password": NEW_PW, "new_password2": NEW_PW},
@@ -2993,7 +3323,7 @@ async def test_search_registered_as_unlock_action(engine: Engine) -> None:
 
 
 async def test_search_stale_stepup_bounces_to_reauth(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1, require_mfa=False))
     await service.initialize()
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
@@ -3083,10 +3413,12 @@ def _data_attr(text: str, attr: str) -> dict:
 
 async def _browser_enroll(c: httpx.AsyncClient, *, label: str) -> object:
     """Run the full browser registration ceremony; returns the enrolled soft authenticator."""
+    from _soft_webauthn import SoftAuthenticator
     from webauthn.helpers import base64url_to_bytes
 
-    from _soft_webauthn import SoftAuthenticator
-
+    await _mint_action(
+        c, "/ui/account/webauthn/enroll"
+    )  # 7.5.1: enroll is action-bound (single-use)
     r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
     assert r.status_code == 200, r.text
     options = _data_attr(r.text, "data-mf-webauthn-create")
@@ -3227,6 +3559,10 @@ async def test_webauthn_cross_site_posts_rejected(engine: Engine) -> None:
     # AC-9: every new /ui POST joins the cross-site sweep (403 via assert_same_origin).
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
+        # 7.5.1: mint the action grants for the two action-bound webauthn POSTs so the cross-site
+        # sweep still reaches (and 403s at) their in-body assert_same_origin (see the admin sweep note).
+        await _mint_action(c, "/ui/account/webauthn/enroll")
+        await _mint_action(c, "/ui/account/webauthn/abc123/delete")
         for path in (
             "/ui/account/webauthn/enroll",
             "/ui/account/webauthn/verify",
@@ -3249,6 +3585,7 @@ async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
         await _cookie_login(c, "boss")
         r = await c.get("/ui/account")
         assert "public_origin is not set" in r.text
+        await _mint_action(c, "/ui/account/webauthn/enroll")  # 7.5.1: enroll is action-bound
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
         assert r.status_code == 409 and "public_origin is not set" in r.text
         r = await c.post("/ui/reauth/webauthn", json={"response": {}}, headers=_SFS)
@@ -3275,6 +3612,7 @@ async def test_webauthn_malformed_ceremony_responses_are_400_not_500(engine: Eng
     service = await _service(engine)
     async with _boss_client(engine, service) as c:
         # Registration leg: stage a real ceremony, then post structurally-broken responses.
+        await _mint_action(c, "/ui/account/webauthn/enroll")  # 7.5.1: enroll is action-bound
         r = await c.post("/ui/account/webauthn/enroll", headers=_SFS)
         assert r.status_code == 200
         for bad in ({}, "just a string", {"rawId": "AQID"}):
@@ -3861,6 +4199,73 @@ async def test_sessions_posts_reject_cross_site(engine: Engine) -> None:
         for path in ("/ui/account/sessions/x/revoke", "/ui/account/sessions/revoke-others"):
             r = await c.post(path, headers={"Sec-Fetch-Site": "cross-site"})
             assert r.status_code == 403, path
+
+
+# --- 7.5.2: /ui terminate now requires a password re-proof (require_ui_reauth_only) --------------
+
+
+async def test_revoke_one_stale_bounces_to_reauth(engine: Engine) -> None:
+    # A stale window 303s the terminate POST to /ui/reauth carrying its OWN path as next, and
+    # nothing is revoked until the retry actually runs (the registration makes the continuation work).
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    other = await service.login("op", PW)  # the target 2nd session
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        op_id = await _uid(service, "op")
+        other_id = hash_token(other.token or "")
+        r = await c.post(
+            f"/ui/account/sessions/{other_id}/revoke", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == f"/ui/reauth?next=/ui/account/sessions/{other_id}/revoke"
+        remaining = {s.token_hash for s in await service.store.list_sessions(op_id)}
+        assert other_id in remaining  # nothing revoked yet
+
+
+async def test_revoke_others_stale_bounces_to_reauth(engine: Engine) -> None:
+    service = AuthService(engine.store, AuthSettings(step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    await service.login("op", PW)  # a 2nd session
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        op_id = await _uid(service, "op")
+        r = await c.post(
+            "/ui/account/sessions/revoke-others", headers={"Sec-Fetch-Site": "same-origin"}
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/reauth?next=/ui/account/sessions/revoke-others"
+        assert len(await service.store.list_sessions(op_id)) == 2  # both still present
+
+
+def test_session_terminate_actions_registered_password_only() -> None:
+    # Both terminate POSTs are registered auto_retry continuations (so /ui/reauth can re-POST them),
+    # step_up=False (password-only) so a no-factor session is never deadlocked out of revoking.
+    from messagefoundry_webconsole import is_safe_ui_action, lookup_ui_action
+
+    assert is_safe_ui_action("/ui/account/sessions/revoke-others") is True
+    assert is_safe_ui_action("/ui/account/sessions/S1/revoke") is True
+    a1 = lookup_ui_action("/ui/account/sessions/revoke-others")
+    a2 = lookup_ui_action("/ui/account/sessions/S1/revoke")
+    assert a1 is not None and a1.step_up is False
+    assert a2 is not None and a2.step_up is False
+    assert is_safe_ui_action("/ui/account/sessions/../revoke") is False  # traversal rejected
+    assert is_safe_ui_action("/ui/account/sessions/revoke-others/extra") is False  # extra segment
+
+
+async def test_revoke_reauth_only_no_mfa_deadlock(engine: Engine) -> None:
+    # A require_mfa but UNENROLLED cookie session under a stale window: GET /ui/reauth?next=<terminate>
+    # renders the PASSWORD reauth form (200), NOT the enroll_first divert — the step_up=False
+    # registration keeps a no-factor user out of the enroll-loop so they can still revoke.
+    service = AuthService(engine.store, AuthSettings(require_mfa=True, step_up_max_age_seconds=-1))
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        r = await c.get("/ui/reauth", params={"next": "/ui/account/sessions/revoke-others"})
+        assert r.status_code == 200 and 'name="code"' not in r.text
 
 
 # Gap 4 — replay ALL dead letters (every channel) --------------------------------------------------
@@ -4627,3 +5032,358 @@ async def test_purge_bulk_escapes_markup_dest(engine: Engine) -> None:
         assert r.status_code == 200
         assert "<script>x</script>" not in r.text
         assert "&lt;script&gt;" in r.text
+
+
+# --- W4-5 (ADR 0142): the browser federated-login legs ---------------------------------------------
+# Mock-seam coverage only, and a DEEPER mock stack than the Kerberos block above (fake IdP + fake JWKS
+# + fake LDAP): no real IdP exists in test infra. Real-IdP evidence is lab runbook cells L6a-L18.
+
+
+def _oidc_settings(**over: object) -> AuthSettings:
+    base: dict[str, object] = {
+        "ad_enabled": True,
+        "ad_server": "ldaps://x",
+        "ad_user_search_base": "DC=x",
+        "ad_bind_dn": "CN=svc,DC=x",
+        "ad_bind_password": "x",
+        "ad_domain": "corp.example",
+        "oidc_enabled": True,
+        "oidc_issuer": "https://idp.example",
+        "oidc_client_id": "mefor-console",
+        "oidc_client_secret": "shhh",
+        "oidc_authorization_endpoint": "https://idp.example/authorize",
+        "oidc_token_endpoint": "https://idp.example/token",
+        "oidc_jwks_uri": "https://idp.example/jwks",
+        "oidc_allowed_endpoints": ["idp.example"],
+    }
+    base.update(over)
+    return AuthSettings(**base)  # type: ignore[arg-type]
+
+
+def _oidc_service(engine: Engine, **over: object) -> AuthService:
+    from messagefoundry.auth.ldap import AdPrincipal
+
+    principal = AdPrincipal(
+        username="jdoe",
+        display_name="J Doe",
+        email="j@x",
+        dn="CN=jdoe,DC=x",
+        groups=frozenset({"cn=mf-admins,dc=x"}),
+    )
+
+    class _FakeLdap:
+        def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+            return principal if username == "jdoe" else None
+
+        def resolve_principal(self, username: str) -> AdPrincipal | None:
+            return principal if username == "jdoe" else None
+
+    return AuthService(engine.store, _oidc_settings(**over), ldap=_FakeLdap())  # type: ignore[arg-type]
+
+
+def _oidc_client(engine: Engine, service: AuthService) -> httpx.AsyncClient:
+    # public_origin is required: the redirect_uri derives from it, never from the Host header.
+    app = create_app(engine, auth=service, serve_ui=True, public_origin="https://ops.example")
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+
+async def _oidc_audits(engine: Engine) -> list[str]:
+    audit = await engine.store.list_audit()
+    needle = '"mech": "oidc"'
+    return [str(a["detail"]) for a in audit if a["detail"] and needle in str(a["detail"])]
+
+
+async def test_oidc_routes_absent_when_disabled(engine: Engine) -> None:
+    """AC-1: with federation off the legs are not registered AT ALL - not merely disabled. The
+    unchanged tests/golden/ui_routes.txt is the other half of this proof."""
+    service = await _service(engine)
+    async with _client(engine, service) as c:
+        for path in ("/ui/oidc/start", "/ui/oidc/callback"):
+            assert (await c.get(path)).status_code == 404
+        assert "/ui/oidc/start" not in (await c.get("/ui/login")).text
+
+
+async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        assert "/ui/oidc/start" in (await c.get("/ui/login")).text
+        # Non-sticky: a known-down IdP hides the LINK, but the route stays registered so the start
+        # leg can still attempt per-request and recover without a restart (AC-8).
+        service.mark_oidc_unavailable("boom")
+        assert "/ui/oidc/start" not in (await c.get("/ui/login")).text
+        # BOTH outcomes are 303, so the status alone cannot tell AC-8 compliance from the exact
+        # regression this guards. Assert the DESTINATION: the start leg must still reach the IdP
+        # while the advisory flag is set, not bounce to ?e=oidc_unavailable.
+        r = await c.get("/ui/oidc/start", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"].startswith("https://idp.example/authorize?")
+
+
+async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: Engine) -> None:
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        r = await c.get("/ui/oidc/start", follow_redirects=False)
+        assert r.status_code == 303
+        location = r.headers["location"]
+        assert location.startswith("https://idp.example/authorize?")
+        assert "code_challenge_method=S256" in location
+        assert "response_type=code" in location
+        # The redirect_uri is built from public_origin, NOT the request Host.
+        assert quote("https://ops.example/ui/oidc/callback", safe="") in location
+        cookie = r.headers.get("set-cookie", "")
+        assert "mf_oidc_flow=" in cookie
+        # SameSite=Lax, NOT Strict: Lax is what survives the IdP top-level cross-site GET return.
+        assert "samesite=lax" in cookie.lower()
+        assert "httponly" in cookie.lower()
+
+
+async def test_oidc_callback_without_the_flow_cookie_is_refused(engine: Engine) -> None:
+    """AC-7: a valid (state, code) pair with no browser binding must not mint a session - otherwise
+    whoever presents the pair gets the session minted into THEIR browser."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        r = await c.get("/ui/oidc/callback?code=abc&state=xyz", follow_redirects=False)
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
+        assert "mf_session" not in r.headers.get("set-cookie", "")
+        assert any("flow_binding_missing" in d for d in await _oidc_audits(engine))
+
+
+async def test_oidc_callback_survives_a_cross_site_navigation(engine: Engine) -> None:
+    """The IdP redirect back is LEGITIMATELY Sec-Fetch-Site: cross-site. If a same-origin assertion
+    were added here every real login would 403 while every hermetic test still passed."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        r = await c.get(
+            "/ui/oidc/callback?code=abc&state=xyz",
+            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            follow_redirects=False,
+        )
+        # Refused for the MISSING COOKIE, not for being cross-site (403 would mean the wrong gate).
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=flow_binding_missing"
+
+
+async def test_oidc_callback_never_reflects_idp_error_text(engine: Engine) -> None:
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        c.cookies.set("mf_oidc_flow", "someflow")
+        r = await c.get(
+            "/ui/oidc/callback?error=" + quote("<script>alert(1)</script>"),
+            follow_redirects=False,
+        )
+        assert r.status_code == 303
+        assert r.headers["location"] == "/ui/login?e=oidc_failed"
+        assert "script" not in r.headers["location"]
+
+
+async def test_oidc_rate_limit_writes_no_audit_rows(engine: Engine) -> None:
+    """Both legs are unauthenticated, so an attacker looping them must not be an unbounded audit-write
+    amplifier. Mirrors the Kerberos anti-flood invariant."""
+    service = _oidc_service(engine)
+    await service.initialize()
+    async with _oidc_client(engine, service) as c:
+        seen_limit = False
+        for _ in range(40):
+            r = await c.get("/ui/oidc/callback?code=a&state=b", follow_redirects=False)
+            if r.headers.get("location") == "/ui/login?e=rate_limited":
+                seen_limit = True
+                break
+        assert seen_limit, "expected the shared login limiter to engage"
+        before = len(await _oidc_audits(engine))
+        for _ in range(20):
+            await c.get("/ui/oidc/callback?code=a&state=b", follow_redirects=False)
+        assert len(await _oidc_audits(engine)) == before  # throttled attempts write ZERO rows
+
+
+async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Start -> IdP -> callback, with the token endpoint and JWKS faked. The callback must be 200 HTML
+    with a meta refresh, NOT a 303: the session cookie is SameSite=Strict and would be withheld on a
+    follow-up navigation the browser still considers cross-site-initiated."""
+    import json as _json
+    import time as _time
+
+    from cryptography.hazmat.primitives import serialization as _ser
+    from cryptography.hazmat.primitives.asymmetric import rsa as _rsa
+
+    from messagefoundry.auth import oidc as _oidc
+    from messagefoundry.config.models import SignatureAlgorithm as _Alg
+    from messagefoundry.transports.signing import CompactJwtSigner as _Signer
+
+    key = _rsa.generate_private_key(public_exponent=65537, key_size=2048)
+
+    def _b64u_uint(v: int) -> str:
+        import base64 as _b64
+
+        raw = v.to_bytes((v.bit_length() + 7) // 8, "big")
+        return _b64.urlsafe_b64encode(raw).rstrip(b"=").decode("ascii")
+
+    nums = key.public_key().public_numbers()
+    jwk = {
+        "kty": "RSA",
+        "kid": "k1",
+        "use": "sig",
+        "alg": "RS256",
+        "n": _b64u_uint(nums.n),
+        "e": _b64u_uint(nums.e),
+    }
+    jwks = _json.dumps({"keys": [jwk]}).encode()
+
+    service = _oidc_service(engine)
+    service._oidc_jwks = _oidc.JwksCache(lambda: jwks)
+    await service.initialize()
+    await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
+
+    async with _oidc_client(engine, service) as c:
+        start = await c.get("/ui/oidc/start", follow_redirects=False)
+        assert start.status_code == 303
+        params = dict(parse_qsl(urlsplit(start.headers["location"]).query))
+        flow_id = c.cookies.get("mf_oidc_flow")
+        assert flow_id
+
+        pem = key.private_bytes(
+            encoding=_ser.Encoding.PEM,
+            format=_ser.PrivateFormat.PKCS8,
+            encryption_algorithm=_ser.NoEncryption(),
+        ).decode("ascii")
+        now = _time.time()
+        id_token = _Signer(private_key=pem, algorithm=_Alg.RS256, key_id="k1").sign(
+            {
+                "iss": "https://idp.example",
+                "aud": "mefor-console",
+                "sub": "S-1-5-21-fed",
+                "exp": now + 600,
+                "iat": now,
+                "nonce": params["nonce"],
+                "preferred_username": "jdoe@corp.example",
+                "amr": ["pwd", "mfa"],
+            }
+        )
+        monkeypatch.setattr(_oidc, "exchange_code", lambda **kw: {"id_token": id_token})
+
+        r = await c.get(
+            "/ui/oidc/callback?code=authcode&state=" + quote(params["state"]),
+            headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"},
+            follow_redirects=False,
+        )
+        assert r.status_code == 200, r.text
+        head = r.text.split("</head>")[0]
+        assert 'http-equiv="refresh"' in head and "0;url=/ui" in head
+        assert "<script>" not in r.text  # CSP-compatible: no inline JS in the landing hop
+        set_cookie = r.headers.get("set-cookie", "")
+        assert "mf_session=" in set_cookie
+        assert "samesite=strict" in set_cookie.lower()  # the SESSION cookie stays Strict
+
+        # The flow is single-use SERVER-side. Re-presenting the original flow cookie by hand is
+        # what proves that: the success response cleared the cookie, so a plain replay would be
+        # refused by the missing-cookie branch and would pass even if the cache were replayable.
+        replay = await c.get(
+            "/ui/oidc/callback?code=authcode&state=" + quote(params["state"]),
+            headers={"Cookie": "mf_oidc_flow=" + flow_id},
+            follow_redirects=False,
+        )
+        assert replay.status_code == 303
+        assert replay.headers["location"] == "/ui/login?e=flow_binding_missing"
+        assert "mf_session=" not in replay.headers.get("set-cookie", "")
+        assert any("state_unknown" in d for d in await _oidc_audits(engine))
+
+
+def _managed_oidc_app(tmp_path: object, *, oidc_enabled: bool) -> object:
+    """Build the app the way `messagefoundry serve` does — via create_managed_app.
+
+    This is NOT the same construction path as `_oidc_client` above. create_managed_app attaches the
+    AuthService inside the LIFESPAN, after mount_ui has already fixed the route table, whereas
+    create_app(auth=...) sets app.state.auth before mounting. A registrar that gated on
+    app.state.auth therefore registered nothing under `serve` while passing every other test here.
+    """
+    from messagefoundry.api import create_managed_app
+
+    extra: dict[str, object] = {}
+    if oidc_enabled:
+        extra = {
+            "oidc_issuer": "https://idp.example",
+            "oidc_client_id": "mefor-console",
+            "oidc_client_secret": "shhh",
+            "oidc_authorization_endpoint": "https://idp.example/authorize",
+            "oidc_token_endpoint": "https://idp.example/token",
+            "oidc_jwks_uri": "https://idp.example/jwks",
+            "oidc_allowed_endpoints": ["idp.example"],
+        }
+    settings = AuthSettings(
+        enabled=True,
+        ad_enabled=True,
+        ad_server="ldaps://x",
+        ad_user_search_base="DC=x",
+        ad_bind_dn="CN=svc,DC=x",
+        ad_bind_password="x",
+        ad_domain="corp.example",
+        oidc_enabled=oidc_enabled,
+        **extra,  # type: ignore[arg-type]
+    )
+    return create_managed_app(
+        db_path=str(tmp_path / "prod.db"),  # type: ignore[operator]
+        auth_settings=settings,
+        serve_ui=True,
+        public_origin="https://ops.example",
+    )
+
+
+def test_oidc_routes_register_on_the_production_serve_path(tmp_path: Path) -> None:
+    """REGRESSION (found by review, not by the suite): the registrar must gate on injected CONFIG,
+    never on app.state.auth. Under create_managed_app the AuthService is attached in the lifespan,
+    long after mount_ui fixes the route table, so an app.state.auth gate silently registers nothing
+    in production while /ui/login still advertises the link and /auth/providers still reports true."""
+    app = _managed_oidc_app(tmp_path, oidc_enabled=True)
+    paths = {r.path for r in app.routes if "oidc" in getattr(r, "path", "")}  # type: ignore[attr-defined]
+    assert paths == {"/ui/oidc/start", "/ui/oidc/callback"}
+
+
+def test_oidc_routes_absent_on_the_production_path_when_disabled(tmp_path: Path) -> None:
+    """The other half: default-off must still mean NOT REGISTERED on the production path (AC-1)."""
+    app = _managed_oidc_app(tmp_path, oidc_enabled=False)
+    paths = {r.path for r in app.routes if "oidc" in getattr(r, "path", "")}  # type: ignore[attr-defined]
+    assert paths == set()
+
+
+# --- ADR 0150: console-originated actions carry the BROWSER's address --------------------------
+
+
+async def test_console_action_audits_the_browser_address(engine: Engine) -> None:
+    """A /ui action must attribute its audit row to the operator's host.
+
+    The console is mounted IN-PROCESS on the engine's own FastAPI app (ADR 0065 / ``mount_ui``), so a
+    /ui route's ``Request`` IS the browser's — there is no second hop to collapse the address onto the
+    engine. This pins that: were the console ever re-fronted by a proxy, or were a synthetic Request
+    substituted at the seam, every console action would silently start attributing to the engine host
+    and this fails.
+    """
+    service = await _service(engine)
+    await _add(service, "boss", Role.ADMINISTRATOR)
+    app = create_app(engine, auth=service, serve_ui=True)
+    transport = httpx.ASGITransport(app=app, client=("10.7.7.7", 44321))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _cookie_login(c, "boss")
+        r = await c.post(
+            "/ui/statistics/reset",
+            headers={
+                "Sec-Fetch-Site": "same-origin",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        assert r.status_code == 303
+
+    rows = [dict(x) for x in await engine.store.list_audit(limit=50, action="stats_reset")]
+    assert rows, "the console reset did not produce a stats_reset audit row"
+    assert rows[0]["client"] == "10.7.7.7"  # the BROWSER, not the engine/loopback
+    # The cookie login that preceded it is attributed to the same host.
+    logins = [dict(x) for x in await engine.store.list_audit(limit=50, action="auth.login_success")]
+    assert logins and logins[0]["client"] == "10.7.7.7"
+    ok, message = await engine.store.verify_audit_chain()
+    assert ok, message

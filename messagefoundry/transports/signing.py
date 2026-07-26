@@ -65,7 +65,12 @@ __all__ = [
     "CompactJwtSigner",
     "MessageSigner",
     "SigningError",
+    "b64u_decode",
+    "b64u_encode",
+    "require_public_key_for_alg",
     "signer_from_destination",
+    "unverified_jws_header",
+    "verify_compact_jws",
     "verify_detached_jws",
     "with_signing",
 ]
@@ -96,6 +101,13 @@ def _b64u_encode(raw: bytes) -> str:
 def _b64u_decode(text: str) -> bytes:
     """Inverse of :func:`_b64u_encode` (re-pads before decoding)."""
     return base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
+
+
+# Public aliases: an OIDC relying party (ADR 0142) rebuilds public keys from JWK `n`/`e`/`x`/`y`, which
+# are base64url — the same codec, and it must be the SAME implementation rather than a second one that
+# could disagree about padding. Aliases, not renames, so every existing call site stays untouched.
+b64u_encode = _b64u_encode
+b64u_decode = _b64u_decode
 
 
 def _read_key_material(private_key: str) -> bytes:
@@ -158,6 +170,24 @@ def _require_key_for_alg(key: _PrivateKey, alg: SignatureAlgorithm) -> None:
     else:  # RS256 / RS384 / PS256 — RSA
         if not isinstance(key, rsa.RSAPrivateKey):
             raise SigningError(f"{alg.value} requires an RSA private key, got {type(key).__name__}")
+
+
+def require_public_key_for_alg(key: _PublicKey, alg: SignatureAlgorithm) -> None:
+    """Reject a **public** key that cannot verify ``alg`` — the verify-path mirror of
+    :func:`_require_key_for_alg` (ADR 0142). ``_verify`` already refuses a wrong key *type* and a
+    wrong signature *length*, but an EC key on the wrong curve for the pinned ``alg`` (e.g. a P-384
+    key presented for ES256) should be refused explicitly at key-selection time, before any signature
+    math. Raises :class:`SigningError`."""
+    if alg in _EC_PARAMS:
+        curve_name, friendly, _, _ = _EC_PARAMS[alg]
+        if not isinstance(key, ec.EllipticCurvePublicKey):
+            raise SigningError(f"{alg.value} requires an EC public key, got {type(key).__name__}")
+        if key.curve.name != curve_name:
+            raise SigningError(
+                f"{alg.value} requires a {friendly} ({curve_name}) key, got curve {key.curve.name!r}"
+            )
+    elif not isinstance(key, rsa.RSAPublicKey):
+        raise SigningError(f"{alg.value} requires an RSA public key, got {type(key).__name__}")
 
 
 def _sign(key: _PrivateKey, alg: SignatureAlgorithm, data: bytes) -> bytes:
@@ -337,6 +367,91 @@ def verify_detached_jws(
             )
     signing_input = f"{protected_b64}.{_b64u_encode(payload)}".encode("ascii")
     _verify(public_key, alg, signing_input, _b64u_decode(signature_b64))
+
+
+def unverified_jws_header(jws: str) -> dict[str, Any]:
+    """The protected header of a compact JWS, **without verifying anything** (RFC 7515 §4).
+
+    Named for the danger. A relying party must read ``kid`` *before* it can select a key, so this step
+    is unavoidable — but nothing it returns is trustworthy. Use it to pick a key and for nothing else;
+    every value that matters (``alg`` included) is re-read from the verified header inside
+    :func:`verify_compact_jws`."""
+    parts = jws.split(".")
+    if len(parts) != 3:
+        raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")
+    try:
+        header = json.loads(_b64u_decode(parts[0]))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SigningError("compact JWS protected header is not valid base64url JSON") from exc
+    if not isinstance(header, dict):
+        raise SigningError("compact JWS protected header must be a JSON object")
+    return header
+
+
+def verify_compact_jws(
+    jws: str,
+    public_key: _PublicKey,
+    *,
+    allowed_algorithms: Iterable[SignatureAlgorithm | str],
+) -> dict[str, Any]:
+    """Verify an **attached** compact JWS (``header.payload.signature``) and RETURN ITS CLAIMS.
+
+    The verify counterpart for a token *we did not mint* — an OIDC ``id_token`` (ADR 0142). It cannot
+    reuse :func:`verify_detached_jws`, which rejects any populated payload segment by design.
+
+    **It returns the claims deliberately.** Handing back the verified payload is what stops a caller
+    from parsing its own copy of the token: a verify that returns ``None`` invites
+    ``verify(tok); claims = json.loads(...)``, and the moment those two reads can differ you have the
+    signature-wrapping bug class this codebase already carries on the XML path. There is exactly one
+    parse, and it happens after the signature checks out.
+
+    ``allowed_algorithms`` is **required**, unlike the detached variant's optional pin. This function
+    consumes attacker-reachable input, so "the caller forgot to pin" must not be expressible. Note the
+    two classic JWT attacks are foreclosed one level up regardless: ``SignatureAlgorithm`` is a closed
+    enum with **no** ``none`` and **no** ``HS*`` member, so ``{"alg":"none"}`` and an RS256→HS256
+    confusion both fail to coerce before any key is touched.
+
+    Raises :class:`SigningError` on a malformed JWS, an unsupported/unpinned ``alg``, or a payload that
+    is not a JSON object; :class:`cryptography.exceptions.InvalidSignature` on a signature mismatch.
+    Returns the decoded claims on success. **It verifies the SIGNATURE only** — ``iss``, ``aud``,
+    ``exp``, ``nonce`` and friends are the caller's ladder.
+    """
+    parts = jws.split(".")
+    if len(parts) != 3:
+        raise SigningError("compact JWS must be 'header.payload.signature' (three segments)")
+    protected_b64, payload_b64, signature_b64 = parts
+    if not protected_b64 or not payload_b64 or not signature_b64:
+        raise SigningError("compact JWS segments must all be non-empty")
+
+    header = unverified_jws_header(jws)
+    try:
+        alg = SignatureAlgorithm(header.get("alg"))
+    except ValueError as exc:
+        raise SigningError(f"unsupported or missing JWS alg {header.get('alg')!r}") from exc
+    allowed = {SignatureAlgorithm(a) for a in allowed_algorithms}
+    if not allowed:
+        raise SigningError("allowed_algorithms must not be empty (a pin that permits nothing)")
+    if alg not in allowed:
+        raise SigningError(
+            f"JWS alg {alg.value} is not in the allowed set {sorted(a.value for a in allowed)}"
+        )
+
+    # Verify over the EXACT received segments — never a re-encoding of the decoded payload, which
+    # would let a non-canonical base64url variant validate against different bytes than we parse.
+    signing_input = f"{protected_b64}.{payload_b64}".encode("ascii")
+    try:
+        signature = _b64u_decode(signature_b64)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SigningError("compact JWS signature segment is not valid base64url") from exc
+    _verify(public_key, alg, signing_input, signature)
+
+    try:
+        claims = json.loads(_b64u_decode(payload_b64))
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise SigningError("compact JWS payload is not valid base64url JSON") from exc
+    if not isinstance(claims, dict):
+        raise SigningError("compact JWS payload must be a JSON object")
+    return claims
 
 
 def signer_from_destination(config: Destination) -> MessageSigner | None:

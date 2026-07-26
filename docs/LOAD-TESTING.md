@@ -52,7 +52,7 @@ python -m harness --load fanout-baseline --engine http://127.0.0.1:8765 --token 
 
 `python -m harness --list-profiles` lists the built-ins. `--load` accepts a built-in name **or** a
 path to a `.toml`. (If the engine enforces auth, pass `--token`; or serve with
-`MEFOR_AUTH_ENABLED=false` on a trusted dev box.)
+`MEFOR_SECURITY_REQUIRE_SIGN_IN=false` on a trusted dev box.)
 
 ### Engine load-config knobs (env, read at serve time)
 
@@ -226,6 +226,54 @@ The `[load.failover]` table (parsed by [`profile.py`](../harness/load/profile.py
 the lease timings (`heartbeat_seconds < leader_fence_timeout_seconds < leader_lease_ttl_seconds`, passed to
 both nodes), `recovery_ttl_multiple`, and `max_dup_rate`. The profile must declare exactly one
 `[[load.target]]` (single-stream ordering) and exactly one (last) measured phase.
+
+## Estate demo shape (`--estate`)
+
+The steady-state runner meters a small target pool by message *type*; the connection-scale sweep
+(`--connscale`) spins many *identical* connections. Neither drives the **estate demo shape**: a
+*heterogeneous* estate — a majority of **simple** 1-in-1-out pass-through feeds plus a minority of
+**fan-out hubs** — held at a calibrated per-connection *event* rate so the aggregate converges on a
+target total events/sec. That is what `--estate` (#216) does. It reuses the connscale scaffolding (the
+owned engine subprocess, the correlation sink, the engine poller, the CPU/FD probe, the no-loss
+reconcile).
+
+```bash
+# CI smoke: N=50 (~72% simple / ~28% hub, fan-out 3) on SQLite, hermetic + fast.
+python -m harness --estate estate-smoke --report-json out/load/estate-smoke.json
+
+# The 1,500-connection demo at the 45M/day target (~520.5 ev/s). Its inbound block is [3000, 4499],
+# so the default --sink-port 2700 does not collide; keep any --sink-port you pass outside that band.
+python -m harness --estate estate-demo --report-json out/load/estate.json
+```
+
+**How the calibration works** ([`harness/load/estate/driver.py`](../harness/load/estate/driver.py)).
+Each connection's message rate is weighted by its served fan-out so every connection emits the **same
+event rate**:
+
+```
+per_conn_event_rate  =  events/sec every connection should contribute (e.g. 0.347)
+msg_rate_i           =  per_conn_event_rate / events_per_msg(class_i)   # simple → /2, hub → /(1+F)
+```
+
+A simple feed (2 events/message) is driven at `budget/2` msg/s; a hub (`1+F` events/message) at
+`budget/(1+F)` msg/s. So each connection contributes `per_conn_event_rate` **events**/sec and the
+aggregate converges on `per_conn_event_rate × count` total events/sec — 1500 × 0.347 ≈ **520.5 ev/s**,
+the 45M-messages/day capability target (in + out). A *uniform* driver (the connscale round-robin) would
+give hubs and simples equal msg/s, so hubs would over-contribute events and the total would silently
+overshoot — the miscalibration the driver's unit test (`tests/test_estate_driver.py`) fails on, by
+asserting the realized **event** rate (submissions × the graph's fan-out) against the spec target, not
+the message rate. Scheduling stays "one token bucket, not N timers": one aggregate bucket at the derived
+total message rate, each emission assigned by a two-class virtual-time merge (O(1) per emission).
+
+**The two calibration constants are shape, not tuning — owner sign-off required.**
+`simple_fraction` (0.72) and `hub_fanout` (F = 3) describe the *shape* of the estate and must come from
+the estate recon (the ported feed set), **not a guess**. The profile's parser only proves the numbers
+are internally *consistent* (the `total_event_rate = per_conn_event_rate × count` identity, the
+fraction/fanout bounds); it can never prove the real-world shape. Confirm both constants and record
+their provenance in the profile before running the demo — the shipped `estate-demo.toml` marks them
+`OWNER-CONFIRM`. The report ([`report.py`](../harness/load/estate/report.py)) prints the achieved total
+ev/s + per-connection ev/s and the realized simple/hub split against the spec, plus a **CPU-per-event**
+headroom denominator (in + out events, not messages). Exit codes match `--load`.
 
 ## CI
 

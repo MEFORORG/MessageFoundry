@@ -20,10 +20,9 @@ import pytest
 
 from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store import MessageStatus
-from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store import sqlserver as ss
+from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import SqlServerStore, SyncHandoffUnavailable
-
 
 # --- fakes: record every (sql, params) and drive the shared control flow deterministically --------
 
@@ -46,7 +45,7 @@ def _fetchall_for(sql: str) -> Any:
     if sql == ss._SQL_FINALIZE_COUNT:
         return [("outbound", "done", 1)]  # -> PROCESSED -> the finalizer UPDATE fires
     if sql == ss._SQL_SELECT_MESSAGE_STATUS:
-        return [("routed",)]
+        return [("routed", 0)]  # (status, #233 not_deployed flag); this harness never hits FILTERED
     return []
 
 
@@ -167,7 +166,7 @@ async def _record_async(
 async def test_golden_route_handoff_sql_param_identity(monkeypatch: pytest.MonkeyPatch) -> None:
     det = _DetUUID()
     monkeypatch.setattr(ss, "uuid4", det)
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         ingress_id="ing-1",
         message_id="m-1",
         channel_id="IB",
@@ -200,7 +199,7 @@ async def test_golden_transform_handoff_sql_param_identity(
 ) -> None:
     det = _DetUUID()
     monkeypatch.setattr(ss, "uuid4", det)
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-1",
         message_id="m-1",
         channel_id="IB",
@@ -245,7 +244,7 @@ async def test_golden_transform_handoff_multi_item_unsorted_identity(
     between async ``transform_handoff`` and ``transform_handoff_sync``."""
     det = _DetUUID()
     monkeypatch.setattr(ss, "uuid4", det)
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-2",
         message_id="m-2",
         channel_id="IB",
@@ -294,7 +293,7 @@ async def test_golden_route_handoff_idempotent_noop_identity(
     # When the guard-DELETE finds nothing (already consumed), BOTH twins must roll back and return
     # False after emitting ONLY the guard DELETE (identical no-op sequence).
     monkeypatch.setattr(ss, "uuid4", _DetUUID())
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         ingress_id="ing-x",
         message_id="m-x",
         channel_id="IB",
@@ -327,9 +326,9 @@ async def test_golden_route_handoff_idempotent_noop_identity(
 
 
 def test_capability_flag_true_only_on_sqlserver() -> None:
-    from messagefoundry.store.store import MessageStore
-    from messagefoundry.store.postgres import PostgresStore
     from messagefoundry.store.base import QueueStore
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import MessageStore
 
     assert SqlServerStore.supports_fused_sync_handoff is True
     assert MessageStore.supports_fused_sync_handoff is False
@@ -339,8 +338,8 @@ def test_capability_flag_true_only_on_sqlserver() -> None:
 
 
 def test_sync_handoff_surface_only_on_sqlserver() -> None:
-    from messagefoundry.store.store import MessageStore
     from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.store import MessageStore
 
     for attr in (
         "route_handoff_sync",

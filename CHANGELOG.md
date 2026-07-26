@@ -6,6 +6,88 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Security
+- **BREAKING — multi-factor authentication is now an ACCESS gate, not only a step-up gate**
+  (ASVS 6.3.3). An MFA-pending session is refused on **every** authorized route with `403` +
+  `X-MFA-Required: 1`; a browser session is confined to the new `/ui/mfa` page until it verifies.
+  Previously the second factor was demanded only at the step-up (sensitive-action) boundary, so a
+  password-only session could read the whole estate.
+  **`[security].require_mfa_scope`** (new, default **`every_local_account`**) widens who must enrol
+  from the Administrator role to every local account; set it to `administrators` to keep the previous
+  posture. It is reported as a loosening on `GET /security/posture` but never refuses to boot.
+  **Who is affected on upgrade:**
+  - **Existing sessions are unaffected until they expire** — they were minted MFA-satisfied and the
+    stamp is honoured. The change bites at the next sign-in.
+  - **Every un-enrolled local account must now enrol a factor before it can do anything else.** The
+    escape path is reachable from the pending session itself (`/me/reauth` → `/me/mfa/enroll` →
+    `/me/mfa/confirm`, or `/ui/account` in the browser), and confirming satisfies that same session.
+    Note the consequence: for an un-enrolled account, whoever holds the password can self-enrol the
+    second factor. The out-of-band `MFA_ENABLED` notification is the compensating control.
+  - **Non-interactive local service accounts using bearer tokens will start failing** with
+    `X-MFA-Required` and cannot enrol unattended. Move them to mTLS (`require_service_cert` is exempt
+    by design) or to AD, or set `require_mfa_scope = "administrators"`.
+  - **The PySide6 test harness** needs an enrolled account or `require_mfa_scope = "administrators"`:
+    its API client only retries an `X-MFA-Required` refusal when an MFA handler is registered, and
+    none is wired today.
+  - **Caveat on factor strength:** a WebAuthn passkey is asserted at `user_verification=preferred`,
+    so for a passkey-only account the second factor may be **device possession alone**. This is the
+    owner-signed L3 relaxation, recorded in `docs/SECURITY.md`, not an oversight.
+- **BREAKING (federated deployments only) — a directory session is no longer minted MFA-satisfied
+  unconditionally** (ASVS 6.3.4). `_complete_ad_login` now takes the grant per mechanism: AD
+  simple-bind and Kerberos still pass it under the owner-signed **delegated-directory-MFA
+  relaxation** (the engine learns nothing about directory-side strength from a bind or a ticket),
+  while the **federated (OIDC) leg passes `[auth].oidc_require_mfa_claim`** — the one directory
+  signal the engine actually verifies. With the claim gate on (the default) nothing changes: a token
+  carrying no configured `amr`/`acr` was already refused at claims validation. **With
+  `oidc_require_mfa_claim = false`, federated sessions are now minted un-verified and refused** —
+  turn the claim gate on, move those users to AD, or set `[security].require_mfa = false`, which
+  remains the global off-switch.
+  Also fail-closed: the directory exemption is now an **allow-list** (`provider == "ad"`) rather than
+  a denylist (`!= "local"`), so an unrecognized provider value requires a second factor instead of
+  silently skipping one.
+- **New `auth.mfa_denied` audit event.** The MFA gate sits above the permission loop, so
+  `auth.permission_denied` never fires for a pending session; without its own row a stolen
+  password-only token could enumerate the entire authenticated surface leaving no trace.
+- `ENGINE_UI_SEAM` 13 → 14 — `api.security.require()` gained an `mfa_gate` keyword, and the console
+  imports it directly. A console wheel older than this engine refuses to mount, as designed.
+- **In-use data protection for PHI is now declared and reported** ([ADR 0152](docs/adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md),
+  ASVS 11.7.1). An **exposed** PHI instance (a non-loopback bind **or** a declared
+  `[api].tls_terminated_upstream`, which includes the recommended loopback-behind-proxy topology) that has
+  not set **`[security].memory_encryption_operator_declared = true`** — the operator's declaration that the
+  host provides hardware memory encryption (AMD SEV-SNP / Intel TDX) — now **warns at every start**.
+  **Not a breaking change: nothing that boots today stops booting.** The refusal is opt-in via the new
+  `[security].require_memory_encryption_declaration` (default `false`), because this is a **host**
+  property that no operator can satisfy on Windows (where the platform read-out is always `null`) — the
+  same scoping rule as `[security].allowed_client_networks`' companion refusal (ADR 0151). Loopback and
+  synthetic instances are byte-identical. See
+  [OFF-LOOPBACK-DEPLOYMENT.md](docs/security/OFF-LOOPBACK-DEPLOYMENT.md) ladder row 12 and
+  [SYSTEM-REQUIREMENTS.md](docs/SYSTEM-REQUIREMENTS.md).
+- **Report-only platform memory-encryption read-out on `GET /security/posture`** (ADR 0152 rung 1;
+  `ENGINE_UI_SEAM` 12 → 13) — `memory_encryption_self_reported_capability` / `..._self_reported_active` /
+  `..._self_reported_mechanism` / `memory_encryption_readout_source`, plus
+  `memory_encryption_operator_declared`, the tri-state
+  `memory_encryption_readout_contradicts_declaration` (`null` = nothing was measured that could
+  contradict anything) and `memory_encryption_note`, the disclaimer carried **in the response body** so it
+  travels with any copy of the artifact. Linux reads `/proc/cpuinfo` flags (capability) and
+  `/dev/sev-guest` / `/dev/tdx_guest` **character devices** (activation) as **separate** facts; everywhere
+  else every field is `null`. **No value of any of these satisfies ASVS 11.7.1** — they are what the host
+  says about itself, and cryptographic attestation (rung 3) is **not built**. The read-out is never
+  accepted as a substitute for the declaration, in either direction.
+- **Windows crash dumps of the engine process are suppressed** — a WER dump is a full PHI disclosure
+  written to disk. `serve` applies the process-local half itself (`SetErrorMode` OR-ed into the inherited
+  mode, `WerSetFlags(NOHEAP | NO_UI | DISABLE_SNAPSHOT_*)`); the machine-policy half no process can reach
+  is opt-in via `install-service.ps1 -SuppressCrashDumps` (WER `ExcludedApplications`, registered for both
+  `messagefoundry.exe` and the venv `python.exe`, plus a **narrowing-only** `LocalDumps` override that is
+  written only where LocalDumps is already configured — creating that key would switch dump collection
+  ON). Residuals in [SERVICE.md](docs/SERVICE.md).
+
+### Fixed
+- **Two config blocks in the off-loopback runbook aborted at load** — `[diagnostics].audit_all_authz` and
+  `[ai].data_class` had been relocated by ADR 0118, so an operator copy-pasting either block got an
+  immediate start failure. Corrected to `[security].audit_all_authorization_decisions` and
+  `[security].handles_real_patient_data`, and every fenced `toml` block in that runbook is now pinned by a
+  test that loads it and fails on a silently-ignored key.
+
 ## [0.3.0] — 2026-07-13 — Early Access
 
 Highlights since 0.2.15 — streaming attachments end-to-end, a copy-on-Send message model, richer

@@ -28,8 +28,7 @@ from messagefoundry.config.models import ConnectorType, Source  # noqa: E402
 from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import DicomPeek  # noqa: E402
 from messagefoundry.transports.dicom import DicomScpSource, _server_ssl_context  # noqa: E402
-
-from tests._dicom_sample import make_sr_part10  # noqa: E402
+from tests._dicom_sample import make_deflated_bomb_stream, make_sr_part10  # noqa: E402
 
 _SCP_AE = "MEFOR_SCP"
 
@@ -140,6 +139,63 @@ async def test_scp_rejects_oversized_object() -> None:
         await scp.stop()
 
 
+class _FakeRequestor:
+    address = "127.0.0.1"
+    ae_title = "MODALITY1"
+
+
+class _FakeAssoc:
+    requestor = _FakeRequestor()
+
+
+class _FakeContext:
+    def __init__(self, transfer_syntax: str) -> None:
+        self.transfer_syntax = transfer_syntax
+
+
+class _FakeRequest:
+    def __init__(self, data_set: bytes) -> None:
+        self.DataSet = BytesIO(data_set)
+
+
+class _FakeStoreEvent:
+    """A minimal EVT_C_STORE stand-in exposing only what ``_on_c_store`` reads before decode. Touching
+    ``dataset`` / ``file_meta`` fails the test — the ASVS 5.2.3 guard MUST short-circuit a deflate bomb
+    BEFORE pynetdicom inflates ``event.dataset``."""
+
+    def __init__(self, *, transfer_syntax: str, data_set: bytes) -> None:
+        self.assoc = _FakeAssoc()
+        self.context = _FakeContext(transfer_syntax)
+        self.request = _FakeRequest(data_set)
+
+    @property
+    def dataset(self) -> object:
+        raise AssertionError(
+            "event.dataset must not be touched for a deflate bomb (unbounded inflate)"
+        )
+
+    @property
+    def file_meta(self) -> object:
+        raise AssertionError("event.file_meta must not be touched for a deflate bomb")
+
+
+def test_scp_rejects_deflated_decompression_bomb_before_decode() -> None:
+    # ASVS 5.2.3 (SCP, binding): a negotiated Deflated Explicit VR LE context whose raw Data Set inflates
+    # past the object cap is a DIMSE failure returned BEFORE event.dataset is ever decoded — nothing is
+    # committed, and the guard runs in bounded memory (the fixture inflates to 64 MiB from a few KiB).
+    captured: list[bytes] = []
+    scp = _build_scp(
+        captured, max_object_bytes=8 * 1024 * 1024
+    )  # 8 MiB < the bomb's 64 MiB inflate
+    bomb = make_deflated_bomb_stream(inflated_bytes=64 * 1024 * 1024)
+    event = _FakeStoreEvent(transfer_syntax="1.2.840.10008.1.2.1.99", data_set=bomb)
+    status = scp._on_c_store(event)
+    assert (
+        status == 0xA700
+    )  # Refused: Out of Resources — over the inflate cap, before any decode/commit
+    assert captured == []  # never committed
+
+
 async def test_scp_commit_failure_returns_dimse_failure_not_success() -> None:
     # A failing ingress commit must surface as a DIMSE failure (the SCU re-sends), never a false Success.
     async def failing_handler(data: bytes) -> None:
@@ -180,6 +236,85 @@ async def test_scp_stop_is_idempotent() -> None:
     await scp.stop()  # second stop must not raise
 
 
+async def test_scp_stop_runs_off_loop_and_lets_in_flight_cstore_finish() -> None:
+    # DICOM-14 (ADR 0025 §3, the 4-step teardown): stop() must (1) stop accepting new associations,
+    # (2) let an in-flight C-STORE that has begun its commit still finish, and (4) join the off-loop
+    # server thread — all with its blocking pynetdicom AE.shutdown()/join run OFF the event loop
+    # (asyncio.to_thread), so shutting one SCP down never stalls other listeners/workers/API calls.
+    #
+    # This drives all three at once. A gated handler blocks mid-commit (the SCU's send_c_store is
+    # parked waiting for the reply, which only lands once the commit returns Success). We then start
+    # stop() CONCURRENTLY: its off-loop shutdown blocks in server_close()'s join of the in-flight
+    # request thread — but because that join runs off the loop, the loop stays live to (a) advance a
+    # concurrent ticker and (b) run the still-parked commit coroutine to completion once released.
+    # If stop() blocked the loop instead, the commit coroutine could never run, its future.result()
+    # would time out, and the SCU would see a failure — so the in-flight Success IS the off-loop proof.
+    captured: list[bytes] = []
+    commit_begun = asyncio.Event()
+    release_commit = asyncio.Event()
+
+    async def gated_handler(data: bytes) -> None:
+        captured.append(data)  # commit "begun" — the durable write is under way
+        commit_begun.set()
+        await release_commit.wait()  # park mid-commit until the test releases it
+        return None
+
+    scp = _build_scp(captured)
+    await scp.start(gated_handler)
+    try:
+        # Fire the SCU C-STORE off-thread; it parks inside send_c_store awaiting the reply.
+        cstore = asyncio.create_task(asyncio.to_thread(_scu_cstore, scp.sockport, make_sr_part10()))
+        await asyncio.wait_for(commit_begun.wait(), timeout=15)
+        assert len(captured) == 1, "the in-flight commit must have begun before we stop"
+
+        # Begin teardown while the C-STORE is still parked mid-commit.
+        stop_task = asyncio.create_task(scp.stop())
+        await asyncio.sleep(0)  # let stop() reach its off-loop to_thread(server.shutdown)
+        assert not stop_task.done(), "stop() must still be joining the in-flight request thread"
+
+        # The loop is free during the blocking off-loop shutdown: a concurrent task keeps progressing.
+        ticks = 0
+        for _ in range(20):
+            await asyncio.sleep(0.005)
+            ticks += 1
+        assert ticks == 20, "the event loop must keep running while stop() blocks off-loop"
+        assert not stop_task.done(), "stop() is still blocked on the parked in-flight commit"
+
+        # Release the in-flight commit: it must finish with Success (step 2), then stop() joins + returns.
+        release_commit.set()
+        established, status = await asyncio.wait_for(cstore, timeout=15)
+        await asyncio.wait_for(stop_task, timeout=15)
+        assert established is True
+        assert status == 0x0000, (
+            "an in-flight C-STORE mid-commit must still finish Success during stop"
+        )
+        assert scp._server is None, "teardown released the server handle"
+    finally:
+        await scp.stop()  # idempotent belt-and-braces if an assertion above fired early
+
+
+async def test_scp_is_restartable_across_stop_start_cycles() -> None:
+    # DICOM-14: the off-loop 4-step teardown must leave the source REUSABLE — a second start()/stop()
+    # cycle rebinds (port 0 → fresh ephemeral port) and receives again. This pins that stop() fully
+    # releases the AE/server (no half-torn-down state that would break a restart), the analog of the
+    # MLLP listen-source's restartability the SCP is modelled on (ADR 0025 §3).
+    captured: list[bytes] = []
+    scp = _build_scp(captured)
+    handler = await _capture_handler_factory(captured)
+    for cycle in range(2):
+        await scp.start(handler)
+        try:
+            established, status = await asyncio.to_thread(
+                _scu_cstore, scp.sockport, make_sr_part10()
+            )
+            assert established is True, f"cycle {cycle}: association must establish after restart"
+            assert status == 0x0000, f"cycle {cycle}: C-STORE must succeed after restart"
+        finally:
+            await scp.stop()
+        assert scp._server is None, f"cycle {cycle}: stop() must release the server each cycle"
+    assert len(captured) == 2, "both start/stop cycles committed their object"
+
+
 # --- S12 audit anchors (ADDED-2): SCP server-side DICOM-over-TLS floor ---------
 # test_dicom_wiring.py already pins the SCU *client* TLS floor; the SCP *server* context — the surface
 # that RECEIVES PHI objects from modalities/PACS — had no dedicated floor test. The S12 audit verdict is
@@ -197,8 +332,8 @@ def _server_cert(tmp_path: Path) -> tuple[str, str]:
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
         .add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,

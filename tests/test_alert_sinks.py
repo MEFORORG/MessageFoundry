@@ -5,17 +5,19 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import AlertsSettings, load_settings
+from messagefoundry.config.settings import AlertRule, AlertsSettings, load_settings
 from messagefoundry.pipeline.alert_sinks import (
     EmailTransport,
     NotifierAlertSink,
     WebhookTransport,
     notifier_from_settings,
 )
+from messagefoundry.pipeline.alerts import LoggingAlertSink
 
 
 class _RecordingTransport:
@@ -26,7 +28,7 @@ class _RecordingTransport:
         self.fail = fail
         self.events: list[dict[str, Any]] = []
 
-    async def send(self, event: dict[str, Any]) -> None:
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
         if self.fail:
             raise RuntimeError("transport down")
         self.events.append(event)
@@ -67,6 +69,88 @@ async def test_realert_throttle_suppresses_repeats() -> None:
     await _drain(sink)
     keys = [(e["connection"], e["depth"]) for e in t.events]
     assert keys == [("OB_X", 1), ("OB_Y", 1)]
+
+
+async def test_bootstrap_admin_expiring_emits_phi_free() -> None:
+    # ASVS 6.4.5 arm 2: the reminder rides the standard fan-out; its payload is the ISO deadline + whole
+    # hours remaining only — never the password or any secret.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t])
+    sink.bootstrap_admin_expiring(
+        "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
+    )
+    await _drain(sink)
+    assert len(t.events) == 1
+    ev = t.events[0]
+    assert ev["type"] == "bootstrap_admin_expiring"
+    assert ev["connection"] == "bootstrap-admin"
+    assert ev["expires_at"] == "2026-07-27T12:00:00+00:00"
+    assert ev["hours_remaining"] == 24
+    # no credential material ever rides the payload
+    assert not any(k in ev for k in ("password", "secret", "token"))
+
+
+def test_bootstrap_admin_expiring_logging_sink_states_deadline_not_password(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The fallback LoggingAlertSink surfaces the deadline + hours at WARNING (so an operator sees it with
+    # no notifier wired) and never a secret — there is no secret in the signature to leak.
+    import logging
+
+    with caplog.at_level(logging.WARNING):
+        LoggingAlertSink().bootstrap_admin_expiring(
+            "bootstrap-admin", expires_at="2026-07-27T12:00:00+00:00", hours_remaining=24
+        )
+    assert "bootstrap_admin_expiring" in caplog.text
+    assert "2026-07-27T12:00:00+00:00" in caplog.text
+    assert "24 hour" in caplog.text
+
+
+async def test_suspend_gate_mutes_notification() -> None:
+    # #143: a suspended (type, connection) is muted at the notification enqueue while the window is
+    # active; a different, un-suspended key still delivers. NOTIFICATION-only.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t], realert_seconds=0.0)
+    sink.suspend("connection_stopped", "OB_X", until=time.time() + 1000.0)
+    sink.connection_stopped("OB_X", detail="boom")  # muted for the window
+    sink.connection_stopped("OB_Y", detail="boom")  # not suspended → delivered
+    await _drain(sink)
+    assert [e["connection"] for e in t.events] == ["OB_Y"]
+
+
+async def test_resume_re_enables_notification() -> None:
+    # #143: resume clears the window so a subsequent fire notifies again.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t], realert_seconds=0.0)
+    sink.suspend("connection_stopped", "OB_X", until=time.time() + 1000.0)
+    sink.connection_stopped("OB_X", detail="boom")  # muted
+    sink.resume("connection_stopped", "OB_X")
+    sink.connection_stopped("OB_X", detail="boom")  # resumed → delivered
+    await _drain(sink)
+    assert [e["connection"] for e in t.events] == ["OB_X"]
+
+
+async def test_suspend_window_expiry_notifies_without_a_timer() -> None:
+    # #143: an already-elapsed window (until in the past) falls through and notifies — expiry needs no
+    # timer/sweep — and the stale cache entry is dropped.
+    t = _RecordingTransport("t")
+    sink = NotifierAlertSink([t], realert_seconds=0.0)
+    sink.suspend("connection_stopped", "OB_X", until=time.time() - 1.0)  # already expired
+    sink.connection_stopped("OB_X", detail="boom")
+    await _drain(sink)
+    assert [e["connection"] for e in t.events] == ["OB_X"]
+    assert "connection_stopped:OB_X" not in sink._suspended
+
+
+async def test_per_rule_mute_suppresses_notification() -> None:
+    # #143: a rule with mute=True suppresses the notification (like transports=[]) for matching events.
+    t = _RecordingTransport("t")
+    rule = AlertRule(event_type="connection_stopped", connection="*", mute=True)
+    sink = NotifierAlertSink([t], rules=[rule])
+    sink.connection_stopped("OB_X", detail="boom")  # muted by the rule
+    sink.queue_buildup("OB_X", depth=1, oldest_age_seconds=1.0)  # unmatched rule → delivered
+    await _drain(sink)
+    assert [e["type"] for e in t.events] == ["queue_buildup"]
 
 
 async def test_events_carry_no_message_body_only_queue_shape() -> None:
@@ -119,7 +203,7 @@ def test_webhook_transport_posts_json(monkeypatch: pytest.MonkeyPatch) -> None:
     captured: dict[str, Any] = {}
 
     class _Resp:
-        def __enter__(self) -> "_Resp":
+        def __enter__(self) -> _Resp:
             return self
 
         def __exit__(self, *a: object) -> None:
@@ -154,7 +238,7 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
             sent["host"] = host
             sent["port"] = port
 
-        def __enter__(self) -> "_FakeSMTP":
+        def __enter__(self) -> _FakeSMTP:
             return self
 
         def __exit__(self, *a: object) -> None:

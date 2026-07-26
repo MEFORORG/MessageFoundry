@@ -35,6 +35,42 @@ def _interchange(*body: str) -> str:
     return _ISA + _GS + "".join(body) + _GE + _IEA
 
 
+# A fully IG-conformant 270 eligibility inquiry (004010X092A1) — its map ships in the pyx12 wheel, and
+# it is simple enough to hand-build to zero-violation conformance (the 5010 X279 map is not bundled).
+# ISA11 is the 4010 repetition separator 'U'; ISA12/GS08 select the 004010X092A1 implementation guide.
+_ISA_270 = (
+    "ISA*00*          *00*          *ZZ*SENDER         *ZZ*RECEIVER       "
+    "*060501*1200*U*00401*000000001*0*P*:~"
+)
+_GS_270 = "GS*HS*SENDERAPP*RECVAPP*20060501*1200*1*X*004010X092A1~"
+
+
+def test_valid_conformant_interchange_validates_true() -> None:
+    # A conformant 270 must validate with valid=True and zero surfaced errors (the positive case the
+    # existing suite lacked). The negative-ack side is exercised by the conformance-error test above.
+    msg = (
+        _ISA_270 + _GS_270 + "ST*270*0001~"
+        "BHT*0022*13*10001234*20060501*1319~"
+        "HL*1**20*1~"
+        "NM1*PR*2*ABC COMPANY*****PI*842610001~"
+        "HL*2*1*21*1~"
+        "NM1*1P*1*JONES*MARCUS****SV*0202034~"
+        "HL*3*2*22*0~"
+        "TRN*1*93175-012547*9877281234~"
+        "NM1*IL*1*SMITH*ROBERT****MI*11122333301~"
+        "DMG*D8*19430519*M~"
+        "DTP*307*D8*20060101~"
+        "EQ*30~"
+        "SE*13*0001~"
+        "GE*1*1~"
+        "IEA*1*000000001~"
+    )
+    result = validate(msg)
+    assert isinstance(result, X12ValidationResult)
+    assert result.valid is True
+    assert result.errors == ()
+
+
 def test_validate_reports_conformance_errors_and_emits_999() -> None:
     # An 837 stub missing mandatory loops + a wrong SE count — pyx12 finds real violations.
     msg = _interchange(
@@ -106,5 +142,5 @@ def test_validation_silences_the_value_bearing_pyx12_logger(
 
 def test_segment_error_is_frozen_dataclass() -> None:
     err = X12SegmentError(code="3", message="segment NM1: error 3", segment_id="NM1")
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         err.code = "9"  # type: ignore[misc]

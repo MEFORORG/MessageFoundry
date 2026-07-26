@@ -37,7 +37,6 @@ from harness.load.shardcert import (
     _derive_engine_drained_timeout,
 )
 from harness.load.shardcert_ladder import RungVerdict
-
 from tests.test_shardcert_ladder_two_box import _honest_rung
 
 # The operating range the CLI actually admits. `hold` spans a climb rung (60 s) to a long soak (1800 s);

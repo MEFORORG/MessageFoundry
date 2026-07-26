@@ -18,7 +18,6 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 from pydantic import ValidationError
-
 from starlette.requests import Request
 
 from messagefoundry.__main__ import main
@@ -38,7 +37,7 @@ from messagefoundry.api.tls_client_cert import (
 )
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.service import AuthService
-from messagefoundry.config.settings import ApiSettings, AuthSettings
+from messagefoundry.config.settings import ApiSettings, AuthSettings, CertMonitorSettings
 from messagefoundry.config.tls_policy import validate_proxy_tls_posture
 from messagefoundry.pipeline import Engine
 
@@ -55,8 +54,8 @@ def _self_signed(tmp_path: Path, *, password: str | None = None) -> tuple[Path, 
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
         .sign(key, hashes.SHA256())
     )
     cert_path, key_path = tmp_path / "cert.pem", tmp_path / "key.pem"
@@ -154,8 +153,12 @@ def test_serve_allows_non_loopback_bind_with_tls(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")  # ADR 0078 opt-out
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet — the
+    # TLS bind-guard is the subject here.
     (tmp_path / "messagefoundry.toml").write_text(
-        f'[api]\nhost = "0.0.0.0"\ntls_cert_file = "{cert.as_posix()}"\n'
+        f"security.handles_real_patient_data = false\n"
+        f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\n',
         encoding="utf-8",
     )
@@ -179,8 +182,11 @@ def test_serve_mtls_with_cert_map_swaps_in_shim_protocol(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")  # ADR 0078 opt-out (off-loopback TLS)
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the mTLS shim wiring is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f'[api]\nhost = "0.0.0.0"\ntls_cert_file = "{cert.as_posix()}"\n'
+        f"security.handles_real_patient_data = false\n"
+        f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n'
         'tls_client_cert_identities = { "CN:svc" = "svc" }\n',
         encoding="utf-8",
@@ -204,8 +210,11 @@ def test_serve_mtls_without_cert_map_keeps_stock_protocol(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the stock-protocol path is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        f'[api]\nhost = "0.0.0.0"\ntls_cert_file = "{cert.as_posix()}"\n'
+        f"security.handles_real_patient_data = false\n"
+        f'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        f'[api]\ntls_cert_file = "{cert.as_posix()}"\n'
         f'tls_key_file = "{key.as_posix()}"\ntls_client_ca_file = "{cert.as_posix()}"\n',
         encoding="utf-8",
     )
@@ -222,7 +231,10 @@ def test_serve_loopback_without_tls_passes_no_ssl_factory(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        encoding="utf-8",
+    )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "ssl_context_factory" not in captured  # plaintext loopback: no TLS wiring
 
@@ -233,6 +245,43 @@ def test_serve_loopback_without_tls_passes_no_ssl_factory(
 def test_tls_terminated_upstream_requires_trusted_proxies() -> None:
     with pytest.raises(ValidationError, match="trusted_proxies"):
         ApiSettings(tls_terminated_upstream=True)  # no proxy declared → unverifiable claim
+
+
+def test_trusted_proxies_rejects_wildcard() -> None:
+    # "*" makes uvicorn trust EVERY peer and echo back the client-authored leftmost X-Forwarded-For,
+    # so any client can declare its own source address. It also satisfied the pairing check above.
+    with pytest.raises(ValidationError, match="trusts the X-Forwarded-For header from EVERY peer"):
+        ApiSettings(tls_terminated_upstream=True, trusted_proxies=["*"])
+
+
+@pytest.mark.parametrize(
+    # All non-routable/reserved forms on purpose: the repo's customer/PHI leak guard rejects a routable
+    # literal even in test data, and a private-range host:port proves the same parse failure. RFC 1918
+    # over RFC 5737 TEST-NET here: 10.x is unambiguously private, so a future tightening of the guard's
+    # "looks routable" heuristic can't reach it.
+    "entry",
+    ["10.0.0.", "proxy.example.org", "10.0.0.1/33", "", "10.0.0.1:8080"],
+)
+def test_trusted_proxies_rejects_unparseable_entry(entry: str) -> None:
+    # uvicorn degrades a malformed entry to a "trusted literal" that never matches — the pairing check
+    # passes while nothing is actually trusted, silently collapsing every client to the proxy address.
+    with pytest.raises(ValidationError, match="not a valid IP address or CIDR network"):
+        ApiSettings(trusted_proxies=[entry])
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [],  # the shipped default — trust nothing
+        ["127.0.0.1"],
+        ["10.0.0.1", "10.0.0.2"],
+        ["10.0.0.0/24"],
+        ["::1"],
+        ["2001:db8::/64"],
+    ],
+)
+def test_trusted_proxies_accepts_valid_addresses_and_networks(entries: list[str]) -> None:
+    assert ApiSettings(trusted_proxies=entries).trusted_proxies == entries
 
 
 def test_exposure_protected_property() -> None:
@@ -255,8 +304,12 @@ def test_serve_allows_non_loopback_with_upstream_tls(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet — the upstream-TLS exposed-gate
+    # is the subject here.
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
+        "security.handles_real_patient_data = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -274,7 +327,10 @@ def test_serve_forwarded_allow_ips_empty_when_no_proxy(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: captured.update(k))
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        encoding="utf-8",
+    )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     # Trust nothing by default (override uvicorn's loopback default), so XFF can't spoof the source IP.
     assert captured["forwarded_allow_ips"] == []
@@ -334,27 +390,51 @@ def test_cert_identity_map_requires_client_ca() -> None:
 # require_mfa posture exactly. create_managed_app + uvicorn are mocked so no socket is opened. The keyless
 # gate is pre-satisfied with an encryption key so only the Posture-B posture decides prod refusals.
 
-_SECURE_RETENTION = "[retention]\nmessages_days = 30\ndead_letter_days = 30\n"
 _SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
 
 
-def _posture_b_toml(tmp_path: Path, *, intra: str = "none", floor: str | None = None) -> None:
+def _posture_b_toml(
+    tmp_path: Path,
+    *,
+    intra: str = "none",
+    floor: str | None = None,
+    enforcement: str | None = None,
+    synthetic: bool = False,
+    loopback: bool = False,
+) -> None:
     """A non-loopback Posture-B bind (declared proxy) with every NON-Posture-B exposure gate satisfied
     (egress deny-by-default + secure retention + SMTP alerts), so only the intra-service-auth + KEX-floor
     attestations are under test. ``intra``/``floor`` toggle the two Posture-B knobs."""
     lines = [
         "[api]",
-        'host = "0.0.0.0"',
         "tls_terminated_upstream = true",
         'trusted_proxies = ["10.0.0.9"]',
         f'proxy_intra_service_auth = "{intra}"',
     ]
     if floor is not None:
         lines.append(f'proxy_tls_min_version = "{floor}"')
+    # [security] posture switches lead (document root); non-security [api] plumbing follows.
+    # enforcement=warn reproduces the historical non-production dial (the Posture-B gate WARNS + starts).
+    # loopback=True is the topology OFF-LOOPBACK-DEPLOYMENT.md RECOMMENDS: the engine stays on
+    # 127.0.0.1 and the proxy on the same host faces the network. The bind-keyed gates never fire
+    # there, which is exactly why the attestation gate had to move onto the declaration.
     body = (
-        "\n".join(lines)
-        + "\n[egress]\ndeny_by_default = true\n"
-        + _SECURE_RETENTION
+        (f'security.enforcement = "{enforcement}"\n' if enforcement else "")
+        + ("security.handles_real_patient_data = false\n" if synthetic else "")
+        + (
+            ""
+            if loopback
+            else 'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        )
+        + "security.block_unlisted_outbound = true\n"
+        "security.delete_message_bodies_after_days = 30\n"
+        # ADR 0152 rung 2: a declared TLS terminator counts as EXPOSED, so a PHI instance here also
+        # warns without an in-use data-protection declaration. Declared with the rest of the
+        # non-Posture-B plumbing so these cases keep testing the two Posture-B attestations and not
+        # the last rung in the ladder.
+        "security.memory_encryption_operator_declared = true\n"
+        + "\n".join(lines)
+        + "\n[retention]\ndead_letter_days = 30\n"
         + _SECURE_ALERTS
     )
     (tmp_path / "messagefoundry.toml").write_text(body, encoding="utf-8")
@@ -398,8 +478,9 @@ def test_serve_refuses_posture_b_prod_without_kex_floor(
 def test_serve_warns_posture_b_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Non-production PHI (staging) only WARNS and still starts — the fail-closed refuse is prod-only.
-    _posture_b_toml(tmp_path, intra="none", floor=None)
+    # enforcement=warn reproduces the historical non-production dial: the Posture-B gate WARNS + starts
+    # (the security dial is decoupled from the production tier — staging under default enforce refuses).
+    _posture_b_toml(tmp_path, intra="none", floor=None, enforcement="warn")
     assert _run_posture_b(tmp_path, monkeypatch, env="staging") == 0
     err = capsys.readouterr().err
     assert "proxy_intra_service_auth" in err and "refusing to serve" not in err
@@ -415,12 +496,48 @@ def test_serve_posture_b_prod_with_attestations_starts(
     assert "refusing to serve on a production PHI" not in capsys.readouterr().err
 
 
+def test_serve_warns_not_refuses_posture_b_on_loopback_behind_declared_proxy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The gate used to require `not is_loopback`, so the RECOMMENDED topology (engine on 127.0.0.1,
+    # proxy on the same host facing the network) never consulted it at all — the discouraged direct
+    # NIC bind got the check and the recommended one did not. Now the DECLARATION triggers it, but the
+    # loopback arm WARNS and still starts: refusing would hard-stop working deployments on upgrade.
+    _posture_b_toml(tmp_path, intra="none", floor=None, loopback=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 0
+    err = capsys.readouterr().err
+    assert "proxy_intra_service_auth" in err and "proxy_tls_min_version" in err
+    assert "refusing to serve" not in err
+    assert "recommended loopback-behind-proxy topology" in err
+
+
+def test_serve_still_refuses_posture_b_off_loopback_after_the_loopback_widening(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Regression pin: widening the gate onto the declaration must be ADDITIVE. The off-loopback
+    # production-PHI arm keeps refusing exactly as before — a warning was added, never a refusal removed.
+    _posture_b_toml(tmp_path, intra="none", floor=None, loopback=False)
+    assert _run_posture_b(tmp_path, monkeypatch, env="prod") == 2
+    assert "refusing to serve on a production PHI" in capsys.readouterr().err
+
+
+def test_serve_posture_b_loopback_synthetic_is_quiet(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The widening must not make a synthetic loopback dev box noisy — byte-identical, as for the
+    # keyless/MFA gates.
+    _posture_b_toml(tmp_path, intra="none", floor=None, synthetic=True, loopback=True)
+    assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
+    assert "proxy_intra_service_auth" not in capsys.readouterr().err
+
+
 def test_serve_posture_b_synthetic_is_quiet(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A synthetic instance (dev) stays quiet on the Posture-B posture (byte-identical — parity with the
-    # keyless / MFA gates), even with both attestations undeclared.
-    _posture_b_toml(tmp_path, intra="none", floor=None)
+    # keyless / MFA gates), even with both attestations undeclared. GIVEN 1 (ADR 0148): dev derives PHI
+    # now, so declare the synthetic opt-out explicitly.
+    _posture_b_toml(tmp_path, intra="none", floor=None, synthetic=True)
     assert _run_posture_b(tmp_path, monkeypatch, env="dev", key=False) == 0
     assert "proxy_intra_service_auth" not in capsys.readouterr().err
 
@@ -434,7 +551,10 @@ def test_serve_loopback_emits_no_new_stderr(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        encoding="utf-8",
+    )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert capsys.readouterr().err == ""  # nothing new on the loopback path
 
@@ -467,6 +587,24 @@ def test_client_cert_principal_denies_unmapped_and_empty() -> None:
     # No cert, or an empty map, also deny.
     assert client_cert_principal(None, cert_map) is None
     assert client_cert_principal(_peercert("svc.internal"), {}) is None
+
+
+def test_client_cert_principal_cn_cannot_collide_with_pinned_san() -> None:
+    # AUTHN-18 CELL A: the CN/SAN namespaces are DISJOINT (_cert_name_candidates yields "CN:<v>" vs
+    # "SAN:DNS:<v>"), so a spoofed commonName can never collide with a pinned DNS SAN — the cross-
+    # namespace impersonation the deny-by-default chain must refuse.
+    # A bare CN whose string EQUALS a pinned SAN value resolves to NO principal (it is a CN:, not SAN:DNS:).
+    assert (
+        client_cert_principal(_peercert("api.internal"), {"SAN:DNS:api.internal": "api-user"})
+        is None
+    )
+    # Mirror: a SAN DNS value equal to a pinned CN is likewise denied (SAN:DNS: never matches a CN: key).
+    assert (
+        client_cert_principal(
+            _peercert("x", ("DNS", "svc.internal")), {"CN:svc.internal": "svc-user"}
+        )
+        is None
+    )
 
 
 def test_peer_cert_from_request_none_under_stock_scope() -> None:
@@ -530,6 +668,231 @@ async def test_resolve_client_cert_identity_positive_and_negative(tmp_path: Path
         assert neg is None
         # Negative: no client cert presented (empty getpeercert()) → denied.
         assert await resolve_client_cert_identity(_cert_request(app, {})) is None
+    finally:
+        await engine.stop()
+
+
+async def test_disabled_mapped_account_denied_via_cert_path(tmp_path: Path) -> None:
+    # AUTHN-18 CELL B: identity_for_username's disabled branch (service.py:807) fails CLOSED through the
+    # cert plane. A VALID, MAPPED, verified cert whose backing account was DISABLED is still denied — a
+    # pinned cert map can never keep a deactivated service account alive.
+    engine = await Engine.create(tmp_path / "mtls_disabled.db", poll_interval=0.02)
+    try:
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
+        await service.initialize()
+        uid = await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.OPERATOR.value],
+            actor="test",
+        )
+        assert uid
+        # Deactivate the account AFTER creating + mapping it — the cert map still points at "svc".
+        await service.update_user(uid, display_name=None, email=None, disabled=True, actor="test")
+        app = create_app(
+            engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"}
+        )
+        # Resolver: a verified, MAPPED cert for the now-disabled account resolves to no identity.
+        assert (
+            await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+            is None
+        )
+        # Route: the /service/identity route denies the same disabled principal → 401 (deny-by-default).
+        transport = httpx.ASGITransport(app=_wrap_with_cert(app, _peercert("svc.internal")))
+        async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+            assert (await c.get("/service/identity")).status_code == 401
+    finally:
+        await engine.stop()
+
+
+# --- ASVS 6.4.5 arm 3: a service caller's client cert is watched at the mTLS handshake -------------
+
+
+class _RecordingCertSink:
+    """Captures cert_expiry alerts (an AlertSink stand-in — only the one method is exercised)."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.fail = fail
+        self.events: list[dict[str, Any]] = []
+
+    def cert_expiry(self, name: str, *, path: str, not_after: str, days_remaining: int) -> None:
+        if self.fail:
+            raise RuntimeError("sink down")
+        self.events.append(
+            {
+                "name": name,
+                "path": path,
+                "not_after": not_after,
+                "days_remaining": days_remaining,
+            }
+        )
+
+
+def _expiring_peercert(cn: str, *, in_days: float) -> dict[str, object]:
+    """A verified peer cert for ``cn`` whose notAfter is ``in_days`` out, in OpenSSL's textual form."""
+    when = datetime.datetime.now(datetime.UTC) + datetime.timedelta(days=in_days)
+    cert = _peercert(cn)
+    cert["notAfter"] = when.strftime("%b %d %H:%M:%S %Y GMT")
+    return cert
+
+
+async def _cert_app(engine: Engine, **state: Any) -> Any:
+    """An app with the cert map wired, plus whatever app.state the monitor arm reads."""
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    await service.initialize()
+    # Idempotent: some cases build two apps over one store (the user then already exists).
+    if await engine.store.get_user_by_username("svc") is None:
+        assert await service.create_local_user(
+            username="svc",
+            password="Correct-horse-battery-9",
+            display_name=None,
+            email=None,
+            roles=[Role.OPERATOR.value],
+            actor="test",
+        )
+    app = create_app(engine, auth=service, tls_client_cert_identities={"CN:svc.internal": "svc"})
+    for key, value in state.items():
+        setattr(app.state, key, value)
+    return app
+
+
+async def test_service_cert_inside_warn_window_raises_cert_expiry(tmp_path: Path) -> None:
+    # The residual's acceptance test: a service-cert handshake inside the warn window raises cert_expiry
+    # with the caller's label. The engine never holds this cert as a FILE — the handshake is the only
+    # place its expiry is observable — so without this arm a service caller's cert expires unannounced.
+    engine = await Engine.create(tmp_path / "certwarn.db", poll_interval=0.02)
+    try:
+        sink = _RecordingCertSink()
+        app = await _cert_app(
+            engine, notifier=sink, cert_monitor_settings=CertMonitorSettings(warn_days=30)
+        )
+        ident = await resolve_client_cert_identity(
+            _cert_request(app, _expiring_peercert("svc.internal", in_days=10))
+        )
+        # Advisory: the alert never gates the resolution — the caller still authenticates.
+        assert ident is not None and ident.username == "svc"
+        assert len(sink.events) == 1
+        event = sink.events[0]
+        assert event["name"] == "api-client:svc"  # the caller's label, namespaced
+        assert event["days_remaining"] == 9  # floor of just-under-10 days
+        assert "handshake" in event["path"]  # honest provenance: there is no local PEM file
+    finally:
+        await engine.stop()
+
+
+async def test_service_cert_outside_warn_window_is_silent(tmp_path: Path) -> None:
+    engine = await Engine.create(tmp_path / "certok.db", poll_interval=0.02)
+    try:
+        sink = _RecordingCertSink()
+        app = await _cert_app(
+            engine, notifier=sink, cert_monitor_settings=CertMonitorSettings(warn_days=30)
+        )
+        ident = await resolve_client_cert_identity(
+            _cert_request(app, _expiring_peercert("svc.internal", in_days=400))
+        )
+        assert ident is not None
+        assert sink.events == []  # comfortably valid → nothing to say
+    finally:
+        await engine.stop()
+
+
+async def test_client_cert_expiry_alert_is_throttled_per_cert(tmp_path: Path) -> None:
+    # This runs on a PER-REQUEST path: without the throttle a chatty caller would drive an
+    # alert_instance upsert per request (durable alert-state is written BEFORE the sink's own
+    # notification throttle). A renewed cert (new notAfter) must still alert immediately.
+    engine = await Engine.create(tmp_path / "certthrottle.db", poll_interval=0.02)
+    try:
+        sink = _RecordingCertSink()
+        app = await _cert_app(
+            engine, notifier=sink, cert_monitor_settings=CertMonitorSettings(warn_days=30)
+        )
+        cert = _expiring_peercert("svc.internal", in_days=10)
+        for _ in range(5):
+            assert await resolve_client_cert_identity(_cert_request(app, cert)) is not None
+        assert len(sink.events) == 1  # five requests, one alert
+        # A DIFFERENT notAfter is a different cert — it is not muted by the replaced cert's cooldown.
+        renewed = _expiring_peercert("svc.internal", in_days=20)
+        assert await resolve_client_cert_identity(_cert_request(app, renewed)) is not None
+        assert len(sink.events) == 2
+    finally:
+        await engine.stop()
+
+
+async def test_client_cert_expiry_silent_when_monitor_off_or_unwired(tmp_path: Path) -> None:
+    # warn_days=0 disables the monitor; an app with no [cert_monitor] on state (the direct create_app /
+    # embedding path) is likewise inert — deny-by-default for a monitoring signal.
+    engine = await Engine.create(tmp_path / "certoff.db", poll_interval=0.02)
+    try:
+        off = _RecordingCertSink()
+        app_off = await _cert_app(
+            engine, notifier=off, cert_monitor_settings=CertMonitorSettings(warn_days=0)
+        )
+        assert await resolve_client_cert_identity(
+            _cert_request(app_off, _expiring_peercert("svc.internal", in_days=1))
+        )
+        assert off.events == []
+
+        unwired = _RecordingCertSink()
+        app_unwired = await _cert_app(engine, notifier=unwired)  # no cert_monitor_settings at all
+        assert await resolve_client_cert_identity(
+            _cert_request(app_unwired, _expiring_peercert("svc.internal", in_days=1))
+        )
+        assert unwired.events == []
+    finally:
+        await engine.stop()
+
+
+async def test_unmapped_cert_never_raises_an_expiry_alert(tmp_path: Path) -> None:
+    # The alert label space must stay bounded by the operator's OWN allow-list: an unmapped/spoofed cert
+    # is denied before the check, so a stranger cannot drive alert volume or grow the throttle dict.
+    engine = await Engine.create(tmp_path / "certunmapped.db", poll_interval=0.02)
+    try:
+        sink = _RecordingCertSink()
+        app = await _cert_app(
+            engine, notifier=sink, cert_monitor_settings=CertMonitorSettings(warn_days=30)
+        )
+        assert (
+            await resolve_client_cert_identity(
+                _cert_request(app, _expiring_peercert("attacker.evil", in_days=1))
+            )
+            is None
+        )
+        assert sink.events == []
+    finally:
+        await engine.stop()
+
+
+async def test_client_cert_expiry_check_never_breaks_authentication(tmp_path: Path) -> None:
+    # A monitoring signal hangs off an AUTH path: a sink that raises must degrade to "no alert", never
+    # to a failed authentication.
+    engine = await Engine.create(tmp_path / "certraise.db", poll_interval=0.02)
+    try:
+        app = await _cert_app(
+            engine,
+            notifier=_RecordingCertSink(fail=True),
+            cert_monitor_settings=CertMonitorSettings(warn_days=30),
+        )
+        ident = await resolve_client_cert_identity(
+            _cert_request(app, _expiring_peercert("svc.internal", in_days=1))
+        )
+        assert ident is not None and ident.username == "svc"
+    finally:
+        await engine.stop()
+
+
+async def test_cert_without_notafter_still_authenticates(tmp_path: Path) -> None:
+    # A peer cert dict carrying no parseable notAfter simply yields no alert (the pre-6.4.5 shape).
+    engine = await Engine.create(tmp_path / "certnona.db", poll_interval=0.02)
+    try:
+        sink = _RecordingCertSink()
+        app = await _cert_app(
+            engine, notifier=sink, cert_monitor_settings=CertMonitorSettings(warn_days=30)
+        )
+        ident = await resolve_client_cert_identity(_cert_request(app, _peercert("svc.internal")))
+        assert ident is not None and ident.username == "svc"
+        assert sink.events == []
     finally:
         await engine.stop()
 
@@ -777,7 +1140,7 @@ def _handshake(
         except OSError:
             pass
         finally:
-            try:
+            try:  # noqa: SIM105
                 ss.close()
             except OSError:
                 pass
@@ -787,7 +1150,7 @@ def _handshake(
     client_cipher: str | None = None
     client_err: BaseException | None = None
     try:
-        with socket.create_connection((host, port), timeout=5) as raw:
+        with socket.create_connection((host, port), timeout=5) as raw:  # noqa: SIM117
             with client_ctx.wrap_socket(raw, server_hostname="localhost") as cs:
                 cipher = cs.cipher()
                 client_cipher = cipher[0] if cipher else None
@@ -819,8 +1182,8 @@ def _strict_ca_and_leaf(tmp_path: Path) -> tuple[Path, Path, Path]:
     shared trust anchor for both directions."""
     ca_key = ec.generate_private_key(ec.SECP256R1())
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "MEFOR Test CA")])
-    nb = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
-    na = datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc)
+    nb = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+    na = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)
     ca_cert = (
         x509.CertificateBuilder()
         .subject_name(ca_name)

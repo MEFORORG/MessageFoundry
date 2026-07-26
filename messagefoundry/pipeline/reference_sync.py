@@ -155,7 +155,7 @@ async def _load_database_source(
         raise ReferenceSyncError(f"key_column {key_col!r} not in the statement's result columns")
     out: dict[str, Any] = {}
     for row in rows:
-        record = dict(zip(columns, row))
+        record = dict(zip(columns, row))  # noqa: B905
         key = str(record[key_col])
         if value_col is not None:
             out[key] = _cell(record.get(value_col))
@@ -199,6 +199,10 @@ class ReferenceSyncRunner:
         self._task: asyncio.Task[None] | None = None
         # Per-set last successful sync time (single-task state) — drives per-spec refresh cadence.
         self._last_sync: dict[str, float] = {}
+        # Sets this backend can NEVER materialize (write_reference_snapshot raises NotImplementedError —
+        # e.g. a backend with no `reference` tables). A permanent incapability, not a transient source
+        # failure: retrying is guaranteed-futile, so a set lands here once and is skipped thereafter.
+        self._unsupported: set[str] = set()
 
     @property
     def enabled(self) -> bool:
@@ -225,7 +229,7 @@ class ReferenceSyncRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            try:  # noqa: SIM105
                 await task
             except asyncio.CancelledError:
                 pass
@@ -246,9 +250,9 @@ class ReferenceSyncRunner:
         """Sleep up to ``delay``, waking immediately on stop."""
         if delay <= 0:
             delay = 3600.0
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     async def sync_all(self, now: float | None = None) -> _SyncPass:
@@ -264,7 +268,10 @@ class ReferenceSyncRunner:
         in a cluster the source is read once. A follower skips (1). :class:`NullCoordinator` is always
         leader, so single-node materializes from source every pass exactly as before. A set's source
         failure is isolated: logged + alerted and the last-good snapshot kept (the write is simply not
-        attempted), so one bad source never blocks the others.
+        attempted), so one bad source never blocks the others. A store that cannot materialize snapshots
+        AT ALL (``write_reference_snapshot`` raises ``NotImplementedError``) is a different animal — a
+        permanent backend incapability, reported ONCE at ERROR and then never retried, rather than
+        mis-reported as a transient source failure every interval forever.
 
         Step (2) calls :meth:`~messagefoundry.store.base.QueueStore.converge_reference_cache` so a
         follower picks up the leader's just-written snapshot into its own in-process read cache (the
@@ -277,6 +284,8 @@ class ReferenceSyncRunner:
             # LEADER (or single-node): re-read the external source for the due sets and write the
             # shared snapshot. A follower skips this entirely so the source is read once per cluster.
             for spec in self._specs():
+                if spec.name in self._unsupported:
+                    continue  # backend can never materialize it — already reported once, don't re-spam
                 last = self._last_sync.get(spec.name)  # None = never synced -> always due
                 if not force and last is not None and (now - last) < spec.refresh_seconds:
                     continue
@@ -284,6 +293,27 @@ class ReferenceSyncRunner:
                     await self._sync_one(spec)
                     self._last_sync[spec.name] = now
                     synced += 1
+                except NotImplementedError:
+                    # PERMANENT BACKEND INCAPABILITY, not a flaky source — the store has no reference-
+                    # snapshot table to write into (ADR 0006 "Backend support"). Retrying can never
+                    # succeed, and reporting it as a source failure would be an outright lie twice over:
+                    # the source is fine, and there is no "last-good" snapshot to keep (there never was
+                    # one and there never can be). So: report ONCE at ERROR, naming the incapability, and
+                    # never retry. With the start-time gate (check_reference_backend_supported) this is
+                    # unreachable in a served engine — it is defense-in-depth for an embedding that
+                    # constructs the runner directly, and it must never again present a permanent defect
+                    # as a transient one. Exception text is deliberately not logged (see below).
+                    failed += 1
+                    self._unsupported.add(spec.name)
+                    log.error(
+                        "reference set %r cannot be materialized: the store backend does not implement "
+                        "reference snapshots (ADR 0006 'Backend support') — NOT retrying; the set will "
+                        "never load and reference(%r) will raise in a Handler",
+                        spec.name,
+                        spec.name,
+                    )
+                    self._alert(spec.name, "backend does not support reference sets (not retrying)")
+                    continue
                 except Exception as exc:  # source failure → keep last-good, alert, continue
                     failed += 1
                     # Log/alert the set name + error CLASS only — never str(exc): a source error (e.g. a

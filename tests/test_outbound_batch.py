@@ -10,9 +10,12 @@ delivery body through a minimal ``RegistryRunner`` + a recording connector, on *
 
 from __future__ import annotations
 
+import asyncio
 import os
+import time
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -28,6 +31,21 @@ DEST = "OB_ADT"
 
 def _msg(n: int) -> str:
     return f"MSH|^~\\&|A|B|C|D|2026010100000{n}||ADT^A0{n}|MSG{n}|P|2.5.1\rPID|1||{n}00||DOE^P{n}\r"
+
+
+# claim_fifo_heads' SQL Server path can transiently yield EMPTY-all (both by_lane and rearm empty) on
+# the SET LOCK_TIMEOUT 0 never-block path (ADR 0066 §9) — contract-legal (the pooled caller self-heals
+# on retry) but flaky for a single-shot assertion. Re-issue past a transient EMPTY-all; a genuinely
+# unclaimable head stays empty every pass and still fails after the cap (masks no real regression).
+# No-op on SQLite/Postgres, which never yield here. Mirrors _claim_heads in test_claim_fifo_heads.py.
+async def _claim_heads(store: Any, *args: Any, **kwargs: Any) -> Any:
+    res = await store.claim_fifo_heads(*args, **kwargs)
+    for _ in range(16):
+        if res.by_lane or res.rearm:
+            break
+        await asyncio.sleep(0.01)
+        res = await store.claim_fifo_heads(*args, **kwargs)
+    return res
 
 
 # --- store fixture: SQLite always, SQL Server when MEFOR_TEST_SQLSERVER is set --------------------
@@ -46,12 +64,34 @@ async def _open_sqlserver() -> Any:
     return store
 
 
-@pytest.fixture(params=["sqlite", "sqlserver"])
+async def _open_postgres() -> Any:
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    # Canonical Postgres clean-slate (test_postgres_store.py): one TRUNCATE ... CASCADE, then reload the
+    # read-through caches from the empty tables. Postgres has no separate `outbox` table (the SS list's
+    # `outbox` is a SQL Server artifact) — the staged queue is the unified `queue` table.
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "TRUNCATE message_events, state, queue, response, delivered_keys, messages"
+            " RESTART IDENTITY CASCADE"
+        )
+    await store._load_state_cache()
+    await store._load_reference_cache()
+    return store
+
+
+@pytest.fixture(params=["sqlite", "sqlserver", "postgres"])
 async def store(request: Any, tmp_path: Path) -> AsyncIterator[Any]:
     if request.param == "sqlserver":
         if not os.getenv("MEFOR_TEST_SQLSERVER"):
             pytest.skip("set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env) for the SQL Server leg")
         s = await _open_sqlserver()
+    elif request.param == "postgres":
+        if not os.getenv("MEFOR_TEST_POSTGRES"):
+            pytest.skip("set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env) for the Postgres leg")
+        s = await _open_postgres()
     else:
         s = await MessageStore.open(tmp_path / "batch.db")
     yield s
@@ -250,7 +290,7 @@ async def test_pooled_claim_projects_created_at(store: Any) -> None:
     # The pooled dispatcher claims the batch head via claim_fifo_heads; it MUST carry created_at, else a
     # pooled-mode batch on SQL Server frames an empty BHS-7 and measures the window from claim-time.
     await _enqueue(store, 1, now0=700.0)
-    result = await store.claim_fifo_heads(Stage.OUTBOUND.value, [DEST], per_lane_limit=1)
+    result = await _claim_heads(store, Stage.OUTBOUND.value, [DEST], per_lane_limit=1)
     items = result.by_lane[DEST]
     assert len(items) == 1
     assert items[0].created_at == 701.0  # the enqueue ingest time, not None / not claim-time
@@ -307,3 +347,53 @@ async def test_max_count_caps_the_batch(store: Any) -> None:
     assert "BTS|2" in rec.sent[0]
     depth, _ = await store.pending_depth(DEST)
     assert depth == 3
+
+
+# --- BACKLOG #82: the BATCH send seam honors send pacing (the key remainder proof) ---------------
+
+
+async def test_batch_seam_is_paced(store: Any) -> None:
+    # The pacing gate sits BEFORE the batch body in the delivery seam (_dispatch_delivery pooled /
+    # _delivery_worker per_lane), so a whole BHS…BTS batch counts as ONE send interval. Prove it through
+    # _dispatch_delivery (the directly-callable pooled seam): the SECOND batch delivery is held ~interval
+    # after the first one began. This is the remainder that closes #82's unpaced-batch defect.
+    await _enqueue(store, 6)
+    runner = _runner(store, claim_mode="pooled")
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=3, max_wait_ms=1))
+    interval = 0.05
+    runner._send_pace[DEST] = interval  # as _resolve_send_pace sets it from the connection settings
+
+    head1 = await store.claim_next_fifo(DEST)
+    await runner._dispatch_delivery(DEST, head1)  # first batch: no prior send → not paced
+    assert "BTS|3" in rec.sent[0]
+
+    head2 = await store.claim_next_fifo(DEST)
+    t0 = time.monotonic()
+    await runner._dispatch_delivery(DEST, head2)  # second batch: held ~interval before its send
+    elapsed = time.monotonic() - t0
+    assert "BTS|3" in rec.sent[1]
+    assert (
+        elapsed >= interval * 0.8
+    )  # the batch seam WAS paced (generous lower bound, no early return)
+    depth, _ = await store.pending_depth(DEST)
+    assert (
+        depth == 0
+    )  # both batches delivered; FIFO order preserved (pacing delays, never reorders)
+
+
+async def test_batch_seam_unpaced_is_byte_identical(store: Any) -> None:
+    # send_min_interval_seconds unset (0.0) → NO delay, delivery byte-identical: two back-to-back batch
+    # deliveries complete with no pacing wait (the default path is untouched).
+    await _enqueue(store, 6)
+    runner = _runner(store, claim_mode="pooled")
+    rec = _Recorder()
+    _wire_batch(runner, rec, BatchConfig(max_count=3, max_wait_ms=1))
+    # _send_pace unset for DEST → _pace_outbound returns immediately, clock never stamped.
+    for _ in range(2):
+        head = await store.claim_next_fifo(DEST)
+        await runner._dispatch_delivery(DEST, head)
+    assert len(rec.sent) == 2 and all("BTS|3" in e for e in rec.sent)
+    assert DEST not in runner._send_pace_at  # no pacing → the clock dict was never touched
+    depth, _ = await store.pending_depth(DEST)
+    assert depth == 0

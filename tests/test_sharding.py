@@ -9,17 +9,18 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.settings import StoreBackend
 from messagefoundry.config.wiring import (
     MLLP,
     FhirLookupSpec,
     File,
+    Loopback,
     Registry,
     WiringError,
     build_inbound_connection,
     build_outbound_connection,
+    load_config,
 )
-from messagefoundry.config.settings import StoreBackend
-from messagefoundry.config.wiring import load_config
 from messagefoundry.pipeline.sharding import (
     DEFAULT_SHARD,
     filter_registry_for_shard,
@@ -260,6 +261,52 @@ async def test_engine_reload_reapplies_shard_filter(tmp_path: Path) -> None:
         await eng.stop()
 
 
+_REINGRESS_SHARD_CFG = textwrap.dedent(
+    """
+    from messagefoundry import inbound, outbound, router, handler, Send, File, Loopback, MLLP
+
+    inbound('IB_LOOP', Loopback(), router='r', shard='a')
+    inbound('IB_B', File(directory={inbox!r}, pattern='*.hl7', poll_seconds=0.02),
+            router='r', shard='b')
+    outbound('OB', MLLP(host='127.0.0.1', port=1, reingress_to='IB_LOOP'))
+
+    @router('r')
+    def route(msg):
+        return ['h']
+
+    @handler('h')
+    def handle(msg):
+        return Send('OB', msg)
+    """
+)
+
+
+async def test_engine_reload_accepts_reingress_to_a_foreign_shards_loopback(tmp_path: Path) -> None:
+    # The user-visible symptom of the cross-shard reingress_to bug: shard b (which does NOT own the
+    # loopback) 422'd on every reload / IDE promote, because build_check resolved reingress_to against
+    # the FILTERED inbound map. No message is ever sent here, so the MLLP outbound never connects.
+    from messagefoundry.pipeline import Engine
+
+    inbox, cfg = tmp_path / "in", tmp_path / "cfg"
+    inbox.mkdir()
+    cfg.mkdir()
+    (cfg / "c.py").write_text(_REINGRESS_SHARD_CFG.format(inbox=str(inbox)), encoding="utf-8")
+
+    def only_b(reg: Registry) -> Registry:
+        return filter_registry_for_shard(reg, "b")
+
+    eng = await Engine.create(tmp_path / "e.db", poll_interval=0.02, registry_filter=only_b)
+    try:
+        eng.add_registry(only_b(load_config(cfg)))
+        await eng.start()
+        assert eng.registry_runner is not None
+        assert set(eng.registry_runner.registry.inbound) == {"IB_B"}
+        await eng.reload(cfg)  # used to raise WiringError("unknown/non-loopback inbound 'IB_LOOP'")
+        assert set(eng.registry_runner.registry.inbound) == {"IB_B"}
+    finally:
+        await eng.stop()
+
+
 # --- outbound-lane ownership (owner_shard_of_destination, ADR 0073) ----------
 
 
@@ -383,6 +430,28 @@ def test_filter_single_shard_config_attaches_no_identity() -> None:
     untagged.add_inbound(_inb("ib3", 2577))
     d = filter_registry_for_shard(untagged, DEFAULT_SHARD)
     assert d.shard_id is None and d.all_shard_ids is None
+
+
+def test_filter_pins_unfiltered_loopback_inbounds() -> None:
+    # The whole config's Loopback inbounds ride the filtered registry beside the shard identity: the
+    # ADR 0013 reingress_to rule is a fact about the CONFIG, so a shard that does not OWN the loopback
+    # must still be able to resolve it (see test_sharded_reingress_to_validates_against_the_unfiltered_graph).
+    reg = _registry()
+    reg.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r", shard="a"))
+    b = filter_registry_for_shard(reg, "b")
+    assert "IB_LOOP" not in b.inbound  # shard b does NOT own it — the inbound map stays filtered...
+    assert b.all_loopback_inbound == frozenset({"IB_LOOP"})  # ...but the NAME is pinned
+    assert b.loopback_inbound_names() == frozenset({"IB_LOOP"})
+    assert reg.all_loopback_inbound is None  # the filter never mutates the source
+
+    # Single-shard: nothing is pinned, and the accessor derives the graph's own loopbacks — byte-
+    # identical to plain `serve`, where `inbound` already IS the whole config.
+    single = Registry()
+    single.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r"))
+    single.add_inbound(_inb("ib1", 2575))
+    f = filter_registry_for_shard(single, DEFAULT_SHARD)
+    assert f.all_loopback_inbound is None
+    assert f.loopback_inbound_names() == frozenset({"IB_LOOP"})
 
 
 def test_source_registry_identity_defaults_none_and_is_untouched() -> None:

@@ -12,8 +12,8 @@
 | **Applies to** | Any project developed under the [Secure Development Standards](Secure_Development_Standards.md) using an AI coding assistant. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
-| **Version** | 0.4 |
-| **Date** | June 26, 2026 |
+| **Version** | 0.5 |
+| **Date** | July 13, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on **any material change to the AI toolchain or threat model** (a new agent framework, MCP server, Claude Code version, or a new probed attack class). |
 | **Aligns to** | NIST SP 800-218 (SSDF): PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to [Secure Development Standards](Secure_Development_Standards.md). **Deliberately omits any certification framework** — see §8. |
@@ -327,6 +327,8 @@ python -m messagefoundry check   # exit-coded validate + dryrun, reused by git-h
 
 > **Fail-closed default + an explicit, audited escape — then validate the control in the real environment.** A security control **fails closed by default**; any dev/test relaxation is an **explicit, named, audited env escape that is never set in production** (e.g. `MEFOR_ALLOW_INSECURE_TLS`, `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE`). An **AI-added control must be exercised against real dev / CI / production conditions**, not only the unit test the AI wrote beside it: an over-strict guard that passes its own test can still brick CI and ordinary developer workflows (the 2026-06 Windows config-source guard refused the *default* user-writable checkout until the audited escape was added).
 
+> **Quality gates vs. security gates.** The gates above are *security / correctness* gates. The separate **code-quality** measurement gates — mutation-on-diff, clone-detection, diff-coverage, advisory complexity triage, lint breadth — are specified in the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) §5 (all *designed-but-deferred*, §9). Its **anti-metric rule** binds here too: never certify quality on line-coverage % or raw complexity alone.
+
 *Maps to:* Principle 4 (verification as hard gates) · SSDF **PW.7, PW.8** · ASVS V14 (config), V15 (secure coding), V16 (logging).
 
 ### 6.6 Human review of every diff — the maintainer is the arbiter
@@ -444,6 +446,7 @@ The repo's tiered-honesty taxonomy, applied to the **dev-process tooling itself*
 - **A new-dependency-introduction check — *highest-priority deferred gate*.** `pip-audit` finds CVEs in *already-pinned* packages — it does **not** flag a freshly **hallucinated/typosquatted** name with no advisory. Verify-before-add (§6.4) is today enforced only by the human remembering — exactly the cheap deterministic gate that should stand in for the absent second reviewer. *Interim compensating control:* a manual verify-before-add line in the [PR template](../.github/PULL_REQUEST_TEMPLATE.md) (add if absent). *Build trigger (cheap — do this first):* a pytest/CI step diffing `pyproject` deps against the prior commit and requiring a recorded justification. *Design record:* Appendix A.6.
 - **A `Co-Authored-By` trailer-format CI check** (presence/format) **and** a **line/hunk-level** AI-authorship record. *Build trigger:* a commit-msg lint; a hunk-attribution mechanism. *Design record:* Appendix A.6.
 - **A retained-transcript provenance store** (PHI/secret-free, access-controlled).
+- **Code-quality measurement gates — specified by the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) §5.** Five *quality* (not security) gates, none built today, that measure the shallow-test and copy-instead-of-abstract slop modes (§3): **mutation testing on changed code** (the highest-leverage — it adversarially checks whether tests assert anything, the one control that most directly compensates for the solo-maintainer review deviation, [A.6](#a6-documented-deviations)), **clone-detection on the diff**, **diff-coverage visibility**, an **advisory `C901` complexity triage**, and an **expanded ruff ruleset** (`B`/`C4`/`SIM`/`UP`/`I`). *Build trigger (cheapest first):* expand ruff `select` + advisory `C901` (local + CI) → diff-coverage + clone-detection (CI) → mutation-on-diff (CI-first, advisory). *Anti-metric rule (binds here):* never gate on line-coverage % or raw complexity alone — measure structure/behavior, not a scoreboard. *Design record:* [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) §5 + Appendix A.3.
 
 **Aspirational / planned (no ADR yet):**
 
@@ -494,7 +497,7 @@ PHI data detail routes to [PHI.md](PHI.md); the **product** egress policy routes
 - SDD frameworks (**Spec Kit, Kiro, OpenSpec**) and **12-Factor Agents** — *practitioner, largely un-peer-reviewed; popularity ≠ quality; the field moves monthly.*
 - **GSD / Ralph Loop** — *cited as a supply-chain/governance **cautionary tale*** (governance moved to "open-gsd" after a trust incident).
 
-**Cross-links:** [Secure Development Standards](Secure_Development_Standards.md) · [AI.md](AI.md) · [PHI.md](PHI.md) · [`../CLAUDE.md`](../CLAUDE.md) · [WORKTREES.md](WORKTREES.md) · [security/RELEASE-GATE.md](security/RELEASE-GATE.md) · [docs/adr/README.md](adr/README.md).
+**Cross-links:** [Secure Development Standards](Secure_Development_Standards.md) · [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the code-outcome measurement rubric) · [AI.md](AI.md) · [PHI.md](PHI.md) · [`../CLAUDE.md`](../CLAUDE.md) · [WORKTREES.md](WORKTREES.md) · [security/RELEASE-GATE.md](security/RELEASE-GATE.md) · [docs/adr/README.md](adr/README.md).
 
 ---
 
@@ -591,6 +594,7 @@ The standard requires deviations be documented with a compensating control (SDS 
 
 | Version | Date | Change |
 |---|---|---|
+| 0.5 | July 13, 2026 | **Code-quality companion.** Recorded the five *code-quality measurement gates* (mutation-on-diff, clone-detection, diff-coverage, advisory `C901`, expanded ruff ruleset) in the §9 designed-but-deferred register, added a quality-vs-security-gates pointer (§6.5), and cross-linked the new [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the code-outcome rubric, ISO/IEC 25010). No change to the §4 spine, resolver, or deviations register (A.6). |
 | 0.4 | June 26, 2026 | **Audit-derived lessons.** Added **control parity** as a control-family dial (§5) + a review gate (§6.6) — the 2026-06 security audit found the residual-risk surface was *asymmetric controls*. Added the **scoped-green ≠ the gate** and **fail-closed-default + audited-escape / validate-AI-controls-in-CI** callouts (§6.5), **globally-unique-identifier coordination** across isolated sessions (§6.4), and **verify-outward-actions-against-ground-truth** (§6.6). Appendix upkeep: parity + config-source guards (A.2), two claims-register entries (A.4). No change to the §4 spine, the resolver, or the deviations register (A.6). |
 | 0.3 | June 24, 2026 | **Cross-reference hygiene.** Corrected the *Cross-references* note: the reciprocal back-links it listed as "stubs to add" are already in place (SDS §A.6 → this doc since SDS v1.5; AI.md scope callout + §4.5 analogue), and the two conditional stubs (ADR-README row, FEATURE-MAP entry) are N/A. No standard-body change. |
 | 0.2 | June 24, 2026 | **Freshness refresh.** Recorded the dependency-CVE fast-response machinery shipped after v0.1 as **Built** (SSDF RV.2): vuln-metrics, scoped Dependabot auto-merge + cooldown, auto lock-resync, the adopter vulnerable-pin tripwire, and the `CI gate` roll-up required check (§9, A.2). Noted the **Python 3.14-only** runtime (PR #515, A.5). No change to the spine (§4 matrix/resolver), the controls-as-dials (§5), or the deviations register (A.6). |

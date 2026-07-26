@@ -62,7 +62,12 @@ class ApprovalGate:
         return self._settings.enabled and operation in self._settings.operations
 
     async def guard(
-        self, operation: str, params: Mapping[str, Any], *, requester: str
+        self,
+        operation: str,
+        params: Mapping[str, Any],
+        *,
+        requester: str,
+        client: str | None = None,
     ) -> str | None:
         """Call at the start of a gated endpoint, **after** the requester's own permission/scope checks
         pass. If dual-control is active for ``operation``, persist a pending request, audit
@@ -87,6 +92,7 @@ class ApprovalGate:
             "approval.requested",
             actor=requester,
             detail=json.dumps({"approval_id": approval_id, "operation": operation}),
+            client=client,  # ADR 0150: the requester's own address
         )
         return approval_id
 
@@ -104,7 +110,9 @@ class ApprovalGate:
             for r in rows
         ]
 
-    async def approve(self, approval_id: str, *, approver: str) -> dict[str, Any]:
+    async def approve(
+        self, approval_id: str, *, approver: str, client: str | None = None
+    ) -> dict[str, Any]:
         """Release a pending request: the captured operation is re-executed and both identities are
         audited. Refuses self-approval (the requester is not a valid second approver)."""
         row = await self._require_pending(approval_id)
@@ -134,6 +142,10 @@ class ApprovalGate:
                     "result": result,
                 }
             ),
+            # ADR 0150: the APPROVER's address — matching this row's actor. The requester's own
+            # address is on their earlier approval.requested row, so dual control records both
+            # halves of the ceremony from two independently-attributed hosts.
+            client=client,
         )
         return {
             "operation": operation,
@@ -142,7 +154,9 @@ class ApprovalGate:
             "result": result,
         }
 
-    async def reject(self, approval_id: str, *, approver: str) -> dict[str, Any]:
+    async def reject(
+        self, approval_id: str, *, approver: str, client: str | None = None
+    ) -> dict[str, Any]:
         """Decline a pending request without executing it (audited). Any ``approvals:approve`` holder
         may reject — including the requester cancelling their own."""
         row = await self._require_pending(approval_id)
@@ -161,6 +175,7 @@ class ApprovalGate:
                     "requester": str(row["requester"]),
                 }
             ),
+            client=client,  # ADR 0150: the rejecting approver's address
         )
         return {
             "operation": operation,

@@ -50,7 +50,12 @@ from messagefoundry.transports.base import DeliveryError
 
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
 # do. rest.py imports this module's provider LAZILY (inside __init__) so there is no import cycle.
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, _redact_url
+from messagefoundry.transports.rest import (
+    _NO_REDIRECT_OPENER,
+    ProxyConfig,
+    _no_redirect_opener,
+    _redact_url,
+)
 from messagefoundry.transports.signing import CompactJwtSigner
 
 if TYPE_CHECKING:  # only for the with_smart_backend() annotation — avoid importing heavy wiring
@@ -104,6 +109,7 @@ class SmartBackendTokenProvider:
         private_key_password: str | None = None,
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
+        proxy: ProxyConfig | None = None,
     ) -> None:
         if not token_url:
             raise SmartAuthError("SMART Backend Services requires a 'smart_token_url' setting")
@@ -136,7 +142,19 @@ class SmartBackendTokenProvider:
             private_key_password=private_key_password,
             key_id=key_id,
         )
-        self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
+        # ADR 0126: route the token-endpoint POST through the connection's forward proxy — resolved for the
+        # TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener (byte-identical).
+        token_proxy = (
+            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
+        )
+        self._opener: urllib.request.OpenerDirector = (
+            _no_redirect_opener(*token_proxy.opener_handlers())
+            if token_proxy is not None
+            else _NO_REDIRECT_OPENER
+        )
+        self._proxy_auth: dict[str, str] = (
+            token_proxy.auth_headers() if token_proxy is not None else {}
+        )
         self._lock = threading.Lock()
         self._cached_token: str | None = None
         self._cached_expiry_monotonic = 0.0
@@ -191,6 +209,7 @@ class SmartBackendTokenProvider:
             headers={
                 "Content-Type": "application/x-www-form-urlencoded",
                 "Accept": "application/json",
+                **self._proxy_auth,  # ADR 0126: pre-emptive Proxy-Authorization when behind an auth proxy
             },
             method="POST",
         )
@@ -229,14 +248,17 @@ class SmartBackendTokenProvider:
         return token, ttl
 
 
-def token_provider_from_settings(s: Mapping[str, Any]) -> SmartBackendTokenProvider | None:
+def token_provider_from_settings(
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+) -> SmartBackendTokenProvider | None:
     """The :class:`SmartBackendTokenProvider` for an already-``env()``-resolved settings mapping, or
     ``None`` when SMART auth is off.
 
     SMART auth is OFF (``None``) unless ``smart_token_url`` is present (and ``smart_enabled`` is not
     ``False``), so any connection that didn't compose ``with_smart_backend`` is byte-identical. Shared by
     the FHIR/REST outbound (:func:`token_provider_from_destination`) and the ``FhirLookup`` read executor
-    (ADR 0043) — both inject the minted bearer per request off-loop past the queue boundary."""
+    (ADR 0043) — both inject the minted bearer per request off-loop past the queue boundary. ``proxy``
+    (ADR 0126) routes the token-endpoint POST through the connection's forward proxy."""
     if not s.get("smart_token_url"):
         return None
     if not s.get("smart_enabled", True):
@@ -254,16 +276,20 @@ def token_provider_from_settings(s: Mapping[str, Any]) -> SmartBackendTokenProvi
         ),
         expiry_skew_seconds=float(s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW)),
         timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
+        proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
     )
 
 
-def token_provider_from_destination(config: Destination) -> SmartBackendTokenProvider | None:
+def token_provider_from_destination(
+    config: Destination, *, proxy: ProxyConfig | None = None
+) -> SmartBackendTokenProvider | None:
     """The :class:`SmartBackendTokenProvider` for an outbound, or ``None`` when SMART auth is off.
 
     SMART auth is OFF (``None``) unless ``smart_token_url`` is present (and ``smart_enabled`` is not
     ``False``), so every existing outbound is byte-identical. Settings arrive already ``env()``-resolved
-    (the runner substitutes them before building the connector), exactly like the ``sign_*`` path."""
-    return token_provider_from_settings(config.settings)
+    (the runner substitutes them before building the connector), exactly like the ``sign_*`` path.
+    ``proxy`` (ADR 0126) routes the token-endpoint POST through the connection's forward proxy."""
+    return token_provider_from_settings(config.settings, proxy=proxy)
 
 
 def with_smart_backend(

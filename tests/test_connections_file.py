@@ -10,9 +10,18 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.connections_edit import (
+    _SCALAR_FIELDS,
+    _SUB_TABLES,
+    list_connections,
+    upsert_connection,
+)
+from messagefoundry.config.connections_file import _INBOUND_KEYS, _OUTBOUND_KEYS
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, OrderingMode
 from messagefoundry.config.wiring import (
     EnvRef,
+    InboundConnection,
+    OutboundConnection,
     WiringError,
     load_config,
     parse_env_setting,
@@ -475,6 +484,170 @@ def test_streaming_knobs_roundtrip_toml(tmp_path: Path) -> None:
     ib = reg.inbound["IB"]
     assert ib.stream_threshold_bytes == 8192
     assert ib.max_message_bytes == 134217728
+
+
+# --- lifecycle flags: deployed (#233, ADR 0111) + auto_start (#115) -----------
+#
+# Both are TOML keys as of #233 (auto_start was code-first-only before it, though the docs claimed
+# otherwise), both default TRUE, and both must survive the GUI/CLI write path (_SCALAR_FIELDS).
+# This commit adds the FLAG ONLY — enforcement (the engine declining to build/run/queue to a
+# not-deployed connection) is a later layer, so these tests assert the config surface, nothing else.
+
+_LIFECYCLE_TOML = """
+[[inbound]]
+name = "IB_OFF"
+transport = "mllp"
+router = "r"
+deployed = false
+auto_start = false
+  [inbound.settings]
+  port = 2600
+
+[[outbound]]
+name = "OB"
+transport = "mllp"
+deployed = false
+auto_start = false
+  [outbound.settings]
+  host = "partner.example"
+  port = 2700
+"""
+
+
+def test_lifecycle_flags_round_trip_toml(tmp_path: Path) -> None:
+    """AC-10 (read half): ``deployed``/``auto_start`` in a connections.toml table desugar through the
+    same build_* factories as code-first, on BOTH directions. Without the key in _INBOUND_KEYS /
+    _OUTBOUND_KEYS this file is a hard WiringError (unknown key), so this pins the schema too."""
+    reg = load_config(_config(tmp_path, _LIFECYCLE_TOML))
+    ib = reg.inbound["IB_OFF"]
+    ob = reg.outbound["OB"]
+    assert ib.deployed is False
+    assert ib.auto_start is False
+    assert ob.deployed is False
+    assert ob.auto_start is False
+
+
+def test_lifecycle_flags_default_true_and_leave_the_model_unchanged(tmp_path: Path) -> None:
+    """AC-9 / the byte-identical guarantee: a table carrying NEITHER flag builds exactly the connection
+    it built before #233. Asserted by full frozen-dataclass equality against an all-defaults model —
+    not just the two new fields — so a stray default change anywhere in the factory fails here."""
+    reg = load_config(
+        _config(
+            tmp_path,
+            """
+            [[inbound]]
+            name = "IB"
+            transport = "mllp"
+            router = "r"
+              [inbound.settings]
+              port = 2600
+
+            [[outbound]]
+            name = "OB"
+            transport = "mllp"
+              [outbound.settings]
+              host = "partner.example"
+              port = 2700
+            """,
+        )
+    )
+    ib = reg.inbound["IB"]
+    ob = reg.outbound["OB"]
+    assert (ib.deployed, ib.auto_start) == (True, True)
+    assert (ob.deployed, ob.auto_start) == (True, True)
+    assert ib == InboundConnection(
+        name="IB", spec=ib.spec, router="r", source_file=ib.source_file, source_line=None
+    )
+    assert ob == OutboundConnection(
+        name="OB", spec=ob.spec, source_file=ob.source_file, source_line=None
+    )
+
+
+@pytest.mark.parametrize("flag", ["deployed", "auto_start"])
+def test_lifecycle_flag_must_be_a_bool(tmp_path: Path, flag: str) -> None:
+    """A string "false" is the classic TOML footgun (it is truthy) — reject it at load, don't deploy a
+    connection the author believed was switched off."""
+    with pytest.raises(WiringError, match="must be true or false"):
+        load_config(
+            _config(
+                tmp_path,
+                f"""
+                [[outbound]]
+                name = "OB"
+                transport = "mllp"
+                {flag} = "false"
+                  [outbound.settings]
+                  host = "partner.example"
+                  port = 2700
+                """,
+            )
+        )
+
+
+def test_misspelled_lifecycle_flag_is_still_rejected(tmp_path: Path) -> None:
+    """The unknown-key gate must still fire on a near-miss: a typo'd ``deployd`` that was silently
+    ignored would deploy a connection the author believed was switched off — the worst failure mode
+    this feature has."""
+    with pytest.raises(WiringError, match="unknown key"):
+        load_config(
+            _config(
+                tmp_path,
+                """
+                [[outbound]]
+                name = "OB"
+                transport = "mllp"
+                deployd = false
+                  [outbound.settings]
+                  host = "partner.example"
+                  port = 2700
+                """,
+            )
+        )
+
+
+def test_gui_upsert_preserves_lifecycle_flags(tmp_path: Path) -> None:
+    """AC-10 (write half): the connections.toml editor (the VS Code GUI / ``connection upsert`` CLI)
+    round-trips both flags — they are in _SCALAR_FIELDS. A flag missing from that whitelist is silently
+    dropped on the next save, i.e. an operator editing an unrelated field would REDEPLOY a connection
+    that was deliberately not deployed. The re-saved file is then re-loaded to prove the write schema's
+    output is still accepted by the read schema."""
+    cfg = _config(tmp_path, _LIFECYCLE_TOML)
+    for name in ("IB_OFF", "OB"):
+        [obj] = [c for c in list_connections(cfg) if c["name"] == name]
+        assert obj["deployed"] is False
+        assert obj["auto_start"] is False
+        upsert_connection(cfg, obj, validate=lambda _p: None)  # a no-op GUI re-save
+
+    reg = load_config(cfg)  # the rewritten file still loads
+    assert reg.inbound["IB_OFF"].deployed is False
+    assert reg.inbound["IB_OFF"].auto_start is False
+    assert reg.outbound["OB"].deployed is False
+    assert reg.outbound["OB"].auto_start is False
+
+
+# --- #234: the write schema is derived-and-verified against the read schema ---
+
+
+def test_write_schema_matches_read_schema_per_direction() -> None:
+    """#234's drift guard OF RECORD: the writer's emittable set (scalar tuple ∪ sub-tables) must equal
+    the read schema exactly, per direction. A key added to _INBOUND_KEYS/_OUTBOUND_KEYS and not to the
+    write tuples fails HERE (naming the key) instead of being silently deleted by the next GUI/CLI
+    save — the root cause #234 closes. The module-level ``assert`` in connections_edit.py is
+    belt-and-braces only: ``python -O`` strips it, so THIS pytest test is the CI gate."""
+    write_union = set(_SCALAR_FIELDS) | set(_SUB_TABLES)
+    missing_in = sorted(_INBOUND_KEYS - write_union)
+    missing_out = sorted(_OUTBOUND_KEYS - write_union)
+    assert not missing_in, f"inbound read-schema keys the writer would DELETE on save: {missing_in}"
+    assert not missing_out, (
+        f"outbound read-schema keys the writer would DELETE on save: {missing_out}"
+    )
+    dead = sorted(write_union - (_INBOUND_KEYS | _OUTBOUND_KEYS))
+    assert not dead, f"write-schema keys no direction can read back: {dead}"
+    # `direction` is the [[inbound]]/[[outbound]] array-of-tables header, never a table key — the
+    # loader's _reject_unknown hard-fails a table carrying it, so it must never become writable.
+    assert "direction" not in write_union
+    # No duplicates within, and no overlap between, the scalar and sub-table emission passes.
+    assert len(_SCALAR_FIELDS) + len(_SUB_TABLES) == len(write_union)
 
 
 def test_streaming_threshold_hl7_only_toml(tmp_path: Path) -> None:

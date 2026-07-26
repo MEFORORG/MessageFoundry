@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-
 from fastapi import Depends, FastAPI
 from fastapi.responses import HTMLResponse
 

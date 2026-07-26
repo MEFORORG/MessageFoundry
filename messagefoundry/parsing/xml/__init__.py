@@ -23,6 +23,8 @@ rejection) — XXE, billion-laughs entity expansion, and external-DTD SSRF are r
 from __future__ import annotations
 
 from messagefoundry.parsing.xml.errors import (
+    WsdlError,
+    WsdlSecurityError,
     XmlError,
     XmlParseError,
     XmlPathError,
@@ -33,6 +35,12 @@ from messagefoundry.parsing.xml.harden import hardened_parser, parse_bytes
 from messagefoundry.parsing.xml.message import XmlMessage
 from messagefoundry.parsing.xml.schema import XmlSchemaResult, validate_against
 from messagefoundry.parsing.xml.signature import XmlSignatureResult, verify
+from messagefoundry.parsing.xml.wsdl import (
+    WsdlDefinition,
+    WsdlOperation,
+    WsdlPart,
+    parse_wsdl,
+)
 
 __all__ = [
     "XmlMessage",
@@ -47,4 +55,10 @@ __all__ = [
     "XmlPathError",
     "XmlValidationError",
     "XmlSecurityError",
+    "WsdlError",
+    "WsdlSecurityError",
+    "WsdlDefinition",
+    "WsdlOperation",
+    "WsdlPart",
+    "parse_wsdl",
 ]

@@ -12,10 +12,6 @@ import subprocess
 import sys
 
 import pytest
-
-from messagefoundry.parsing import FhirPeek, FhirPeekError
-from messagefoundry.parsing.fhir import FhirError, FhirValidationError
-
 from _fhir_fixtures import (
     BUNDLE_TRANSACTION,
     OPERATION_OUTCOME_ERROR,
@@ -23,6 +19,9 @@ from _fhir_fixtures import (
     PHI_CANARY,
     as_json,
 )
+
+from messagefoundry.parsing import FhirPeek, FhirPeekError
+from messagefoundry.parsing.fhir import FhirError, FhirValidationError
 
 # --- FhirPeek: the tolerant routing tier (no [fhir] extra needed) ------------
 

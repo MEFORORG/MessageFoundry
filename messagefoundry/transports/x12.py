@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Destination, Source
@@ -38,6 +39,7 @@ from messagefoundry.transports.base import (
     InboundHandler,
     NegativeAckError,
     SourceConnector,
+    encode_wire_body,
     peer_ip_allowed,
     probe_tcp_reachable,
     register_destination,
@@ -89,6 +91,25 @@ class X12Destination(DestinationConnector):
         self.ta1_required: bool = bool(s.get("ta1_required", False))
         mib = s.get("max_interchange_bytes", DEFAULT_MAX_INTERCHANGE_BYTES)
         self.max_interchange_bytes: int | None = int(mib) if mib else None
+        # ADR 0067 §9 (BACKLOG #97): persistent outbound connection — opt-in reuse of ONE lazily-
+        # established TCP connection across deliveries (default False = connect-per-send, byte-identical).
+        # Same knobs/semantics as MLLP (ADR 0067) minus TLS (X12-over-TCP has none). Key absent → off; the
+        # two freshness knobs follow the receive_timeout convention (present-but-falsy None/0 = disabled).
+        self.persistent: bool = bool(s.get("persistent", False))
+        it = s.get("idle_timeout_seconds", 60.0)
+        self.idle_timeout_seconds: float | None = float(it) if it else None
+        ma = s.get("max_connection_age_seconds")
+        self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        # Cached connection + freshness stamps (monotonic clock); cached only after a fully-successful
+        # transaction (including a TA1 — a complete request/response on a healthy transport).
+        self._conn: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+        self._last_used = 0.0
+        self._established_at = 0.0
+        # Fail-loud serial-send guard (no lock — a lock would mask the invariant violation).
+        self._sending = False
+        self._closed = False
+        #: Reconnects observed (stale-detect, post-error discard, desync guard) — log-only.
+        self.reconnects: int = 0
         # #200 (ADR 0092): X12-over-TCP has NO TLS at all, so every off-loopback egress is a cleartext PHI
         # hop. Refuse a production-PHI hop at the enforced construction gate; allow loopback / synthetic /
         # per-connection-attested hops (tls_hop_attested for a trusted-segment / proxy-terminated hop).
@@ -105,42 +126,188 @@ class X12Destination(DestinationConnector):
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
-        # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a reload
-        # routing PHI around the construction gate).
-        self._hop_guard.assert_send()
-        # Read the returned interchange when capturing it, when a TA1 is contractually required, or for
-        # the legacy expect_reply confirmation. Fire-and-forget (none set) is byte-identical to before.
-        need_reply = self.expect_reply or self.capture_response or self.ta1_required
+        # ADR 0067 §2.5 (via §9): the delivery worker is the lane's single serial sender — ASSERT it
+        # rather than trust it; a concurrent send() on one instance would interleave two interchanges.
+        if self._sending:
+            raise RuntimeError(
+                "X12Destination.send() called concurrently on one instance — the delivery worker "
+                "must be the lane's single serial sender (per-lane FIFO invariant, ADR 0067)"
+            )
+        self._sending = True
         try:
-            reader, writer = await asyncio.wait_for(
+            # Zero-I/O byte-crossing backstop (#200) before the first byte (defense in depth against a
+            # reload routing PHI around the construction gate).
+            self._hop_guard.assert_send()
+            if not self.persistent:
+                return await self._send_once(payload)
+            return await self._send_persistent(payload)
+        finally:
+            self._sending = False
+
+    async def _dial(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+        """One connection attempt — a charged :class:`DeliveryError` on failure. Exactly one dial per
+        send in every mode (no internal connect-retry loop; ADR 0067 §9)."""
+        try:
+            return await asyncio.wait_for(
                 asyncio.open_connection(self.host, self.port), self.connect_timeout
             )
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, OSError) as exc:
             raise DeliveryError(f"X12 connect to {self.host}:{self.port} failed: {exc}") from exc
+
+    async def _send_once(self, payload: str) -> DeliveryResponse | None:
+        """Connect-per-send (``persistent=false``) — byte-identical wire behavior to the pre-#97 code,
+        with the close now bounded (#55) and the fail-loud serial-``send()`` assert in :meth:`send`.
+        Reads the returned interchange when capturing it, when a TA1 is contractually required, or for
+        the legacy ``expect_reply`` confirmation; fire-and-forget (none set) is byte-identical."""
+        need_reply = self.expect_reply or self.capture_response or self.ta1_required
+        reader, writer = await self._dial()
         try:
-            writer.write(payload.encode(self.encoding))  # verbatim — the interchange is the frame
+            # verbatim — the interchange is the frame. encode_wire_body, not a bare .encode(): a
+            # UnicodeEncodeError is a ValueError, so the `except (TimeoutError, OSError)` below would
+            # miss it and the escaping exception names the offending character of the interchange.
+            writer.write(encode_wire_body(payload, self.encoding, transport="X12"))
             await asyncio.wait_for(writer.drain(), self.timeout)
             if need_reply:
                 interchange = await asyncio.wait_for(self._read_reply(reader), self.timeout)
-                # Classify only when capturing or a TA1 is required; a plain expect_reply stays a
-                # not-inspected confirmation (byte-identical legacy behavior). _check_ta1 returns the
-                # captured reply, raises on a TA1 reject/error, and returns None for a non-capturing
-                # accept (so a ta1_required-only outbound still fails fast on a reject).
+                # _check_ta1 returns the captured reply, raises on a TA1 reject/error, and returns None
+                # for a non-capturing accept (a ta1_required-only outbound still fails fast on a reject).
                 if self.capture_response or self.ta1_required:
                     response = self._check_ta1(interchange)
                     if self.capture_response:
                         return response
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             raise DeliveryError("X12 timed out") from exc
         except OSError as exc:
             raise DeliveryError(f"X12 I/O error: {exc}") from exc
         finally:
-            writer.close()
-            try:
-                await writer.wait_closed()
-            except OSError:
-                pass
+            await self._close_bounded(writer)
         return None
+
+    async def _send_persistent(self, payload: str) -> DeliveryResponse | None:
+        """One delivery over the cached connection (ADR 0067 §9): reuse-time liveness →
+        reconnect-before-first-byte (uncharged) → write/drain → (need_reply) read + classify → re-cache
+        on a fully-successful transaction unless the peer left extra bytes (desync guard). A TA1 (or a
+        business 271/277/278) reply is a **complete transaction on a healthy transport**, so the
+        connection stays cached and a TA1*R :class:`NegativeAckError` does NOT discard it (mirrors
+        MLLP's NAK-keeps-connection, AC-10)."""
+        if self._closed:
+            raise DeliveryError(
+                f"X12 destination {self.host}:{self.port} is closed (stop/reload); "
+                "delivery retries on the replacement connector"
+            )
+        need_reply = self.expect_reply or self.capture_response or self.ta1_required
+        conn = self._conn
+        if conn is not None:
+            reason = self._stale_reason(*conn)
+            if reason is not None:
+                self._conn = None
+                self.reconnects += 1
+                logger.info(
+                    "X12 %s:%d persistent connection not reused (%s); reconnecting",
+                    self.host,
+                    self.port,
+                    reason,
+                )
+                await self._close_bounded(conn[1])
+                conn = None
+        if conn is None:
+            conn = await self._dial()
+            self._established_at = time.monotonic()
+        reader, writer = conn
+        # Keep the in-flight connection visible so a concurrent aclose() (the reload race) closes it
+        # under us — this send then fails loud and is retried.
+        self._conn = conn
+        interchange: bytes | None = None
+        leftover = False
+        try:
+            try:
+                writer.write(encode_wire_body(payload, self.encoding, transport="X12"))
+                await asyncio.wait_for(writer.drain(), self.timeout)
+            except (TimeoutError, OSError) as exc:
+                raise DeliveryError(
+                    "X12 send failed in the drain phase (payload written — delivery "
+                    f"indeterminate): {exc}"
+                ) from exc
+            if need_reply:
+                try:
+                    interchange, leftover = await asyncio.wait_for(
+                        self._read_reply_reuse(reader), self.timeout
+                    )
+                except TimeoutError as exc:
+                    raise DeliveryError(
+                        "X12 timed out reading the reply (delivery indeterminate)"
+                    ) from exc
+                except OSError as exc:
+                    raise DeliveryError(
+                        f"X12 I/O error reading the reply (delivery indeterminate): {exc}"
+                    ) from exc
+        except DeliveryError:
+            self._conn = None
+            self.reconnects += 1
+            logger.warning(
+                "X12 %s:%d persistent connection discarded after delivery failure",
+                self.host,
+                self.port,
+            )
+            await self._close_bounded(writer)
+            raise
+        except BaseException:
+            self._conn = None
+            self.reconnects += 1
+            writer.close()
+            raise
+        # Reuse decision BEFORE _check_ta1 so a TA1*R NegativeAckError (a complete transaction on a
+        # healthy transport) cannot discard a good connection (mirrors MLLP's _send_persistent).
+        if leftover:
+            self._conn = None
+            self.reconnects += 1
+            logger.warning(
+                "X12 %s:%d peer sent extra bytes after its interchange; closing instead of reusing "
+                "(desync guard)",
+                self.host,
+                self.port,
+            )
+            await self._close_bounded(writer)
+        elif self._closed:
+            self._conn = None
+            await self._close_bounded(writer)
+        else:
+            self._last_used = time.monotonic()
+        if need_reply and interchange is not None and (self.capture_response or self.ta1_required):
+            response: DeliveryResponse | None = None
+            try:
+                response = self._check_ta1(interchange)
+            except NegativeAckError:
+                raise  # a complete transaction on a healthy transport — connection fate decided above
+            except DeliveryError:
+                # An unparseable interchange (non-capturing) means the transaction was NOT fully
+                # successful — discard the cached connection rather than trust a peer talking garbage.
+                await self._discard_after_bad_reply(conn, writer)
+                raise
+            if response is not None and response.outcome == "unparseable":
+                # capture turned the unparseable reply into a captured outcome — same wire garbage.
+                await self._discard_after_bad_reply(conn, writer)
+            if self.capture_response:
+                return response
+        return None
+
+    async def _discard_after_bad_reply(
+        self,
+        conn: tuple[asyncio.StreamReader, asyncio.StreamWriter],
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        """Discard the cached connection after a read-but-unparseable interchange (both the raising
+        non-capturing path and the captured ``outcome='unparseable'`` path). Mirrors MLLP's
+        ``_discard_unparseable``; fixed reason in the log (a parse error can embed a reply fragment)."""
+        if self._conn is conn:
+            self._conn = None
+            self.reconnects += 1
+            logger.warning(
+                "X12 %s:%d persistent connection discarded after delivery failure: unparseable reply",
+                self.host,
+                self.port,
+            )
+            await self._close_bounded(writer)
 
     async def test_connection(self) -> None:
         # Reachability only: open + close a connection (no interchange sent) so a test never delivers.
@@ -214,6 +381,65 @@ class X12Destination(DestinationConnector):
         if self.capture_response:
             return DeliveryResponse(body=text, outcome="accepted", detail="business response")
         return None
+
+    async def _read_reply_reuse(self, reader: asyncio.StreamReader) -> tuple[bytes, bool]:
+        """Read one returned interchange plus a ``leftover`` flag — ``True`` when the peer packed a
+        second interchange (or an opened partial one) past the reply (a desync that would corrupt the
+        next transaction, so the caller closes instead of reusing). ADR 0067 §9 / §2.2."""
+        decoder = X12FrameReader(max_interchange_bytes=self.max_interchange_bytes)
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                raise DeliveryError("X12 peer closed before returning an interchange")
+            try:
+                interchanges = list(decoder.feed(chunk))
+            except X12FrameError as exc:
+                raise DeliveryError(f"reply exceeded max interchange size: {exc}") from exc
+            if interchanges:
+                # A non-empty decoder buffer after the first interchange = bytes of a further one.
+                return interchanges[0], len(interchanges) > 1 or bool(decoder._buf)
+
+    def _stale_reason(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> str | None:
+        """Why the cached connection must not be reused, or ``None`` when it looks live — cheap, no I/O
+        round-trip (ADR 0067 §2.3; TLS-free variant)."""
+        if writer.is_closing():
+            return "socket is closing/closed"
+        if getattr(reader, "_buffer", b""):
+            return "unsolicited bytes received while idle"
+        if reader.at_eof():
+            return "peer closed while idle (EOF)"
+        now = time.monotonic()
+        if self.idle_timeout_seconds is not None:
+            idle = now - self._last_used
+            if idle > self.idle_timeout_seconds:
+                return f"idle {idle:.1f}s > idle_timeout_seconds={self.idle_timeout_seconds:g}"
+        if self.max_connection_age_seconds is not None:
+            age = now - self._established_at
+            if age > self.max_connection_age_seconds:
+                return f"age {age:.1f}s > max_connection_age_seconds={self.max_connection_age_seconds:g}"
+        return None
+
+    @staticmethod
+    async def _close_bounded(writer: asyncio.StreamWriter) -> None:
+        """Bounded close (#55): an unbounded Proactor ``wait_closed()`` can wedge the delivery worker
+        forever on a pending overlapped op. Abandoning after the grace is safe (the socket is closed)."""
+        writer.close()
+        try:  # noqa: SIM105
+            await asyncio.wait_for(writer.wait_closed(), _CLIENT_SHUTDOWN_GRACE)
+        except (TimeoutError, OSError):
+            pass
+
+    async def aclose(self) -> None:
+        """Close the cached persistent connection (engine stop / reload swap — the runner calls this for
+        every replaced/removed connector). Idempotent; bounded; safe concurrently with an in-flight send
+        (closing the socket under it makes that send fail loud → charged → retried)."""
+        self._closed = True
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            await self._close_bounded(conn[1])
 
 
 # --- source ------------------------------------------------------------------
@@ -289,7 +515,7 @@ class X12Source(SourceConnector):
         if self._server is not None:
             try:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("X12 server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
@@ -316,7 +542,7 @@ class X12Source(SourceConnector):
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             break  # idle past receive_timeout — close the connection
                     else:
                         chunk = await reader.read(4096)
@@ -353,11 +579,11 @@ class X12Source(SourceConnector):
             if task is not None:
                 self._client_tasks.discard(task)
             writer.close()
-            try:
+            try:  # noqa: SIM105
                 # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would never
                 # let the per-client task finish, so stop()'s grace never sees it done (#55).
                 await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 pass
 
 

@@ -147,10 +147,17 @@ def _install_fakes(monkeypatch: pytest.MonkeyPatch) -> types.SimpleNamespace:
     async def fake_reset_store(env: Mapping[str, str]) -> None:
         rec.resets.append(dict(env))
 
-    async def fake_queue_breakdown(env: Mapping[str, str]) -> tuple[int, int, str]:
+    async def fake_queue_breakdown(env: Mapping[str, str]) -> sc.QueueBreakdown:
         rec.queues.append(dict(env))
-        # (non-terminal, all-stage dead_total, summary) — clean store: nothing stranded, nothing dead.
-        return 0, 0, "QUEUE <empty>"
+        # A clean store: nothing stranded, nothing dead, at any stage (BACKLOG #229 per-stage split).
+        return sc.QueueBreakdown(
+            nonterminal=0,
+            dead_total=0,
+            ingress_stranded=0,
+            routed_stranded=0,
+            outbound_stranded=0,
+            summary="QUEUE <empty>",
+        )
 
     monkeypatch.setattr(sc, "ShardCertNode", FakeNode)
     monkeypatch.setattr(sc, "CorrelationSink", FakeSink)
@@ -262,7 +269,7 @@ def test_engine_ok_fails_on_ingress_or_routed_dead_letter() -> None:
     (outbound-only, so `engine_dead`) misses. Those rows were ACK-on-receipt'd, so a self-contained
     store-truth verdict has to catch them — the engine half can't lean on the driver half's sink-truth
     for its OWN exit code."""
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         shards=("a", "b"),
         owned={"a": ["OB_SHARED_01"], "b": ["OB_SHARED_02"]},
         killed_shard=None,

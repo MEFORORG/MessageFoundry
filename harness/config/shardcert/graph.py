@@ -104,13 +104,71 @@ def _make_filtering_handler() -> HandlerFn:
 
 
 def _make_router(handler_names: list[str]) -> RouterFn:
-    """A shard's router: fan every received message to that shard's FULL handler set — including the
-    self-filtering ones. Deliberately unconditional: the whole point of the H != D shape is that the router
-    SELECTS ``H`` handlers while only ``D`` of them deliver, so the ``2H`` cost is charged before any
-    handler runs (ADR 0051)."""
+    """BROADCAST: fan every received message to that shard's FULL handler set — including the self-filtering
+    ones. Deliberately unconditional: the whole point of the H != D shape is that the router SELECTS ``H``
+    handlers while only ``D`` of them deliver, so the ``2H`` cost is charged before any handler runs (ADR
+    0051).
+
+    This is ALSO the shape that caps the bench: every accepted message is delivered to EVERY destination, and
+    an outbound lane is strict-FIFO hard-1, so every lane must serve every message and the per-lane cycle
+    clamps INGRESS to one message per cycle (~16 msg/s) at ANY destination count. See ``partitioned``."""
 
     def route(msg: Message | RawMessage) -> list[str]:
         return handler_names
+
+    return route
+
+
+def _make_partitioned_router(handler_names: list[str], shape: ShardCertShape) -> RouterFn:
+    """PARTITIONED: select EXACTLY ONE handler — the one owning destination ``splitmix64(seq) % dests``,
+    where ``seq`` is the harness sequence number carried in MSH-10.
+
+    This is the whole mode. Delivery is UNCHANGED (the same ``dests`` lanes, the same strict-FIFO per-lane
+    cycle); what changes is that a message now occupies ONE lane instead of all of them, so the per-lane cycle
+    no longer clamps ingress — aggregate deliveries scale with the lane count, and ingress == aggregate
+    deliveries because each message IS exactly one delivery.
+
+    The selector MIXES the seq rather than taking it modulo ``dests`` directly, and that is not decoration:
+    the sender's connection round-robin is driven by the SAME counter, so a bare modulo would leave each
+    destination lane produced-into by exactly ONE shard — destroying the cross-shard lane overlap this whole
+    graph exists to certify (see the module docstring above and
+    :meth:`~harness.config.shardcert._shape.ShardCertShape.destination_index`).
+
+    ``handler_names[j]`` owns destination ``j`` (:meth:`ShardCertShape.delivers_to` returns ``j`` for every
+    created handler under PARTITIONED, and :func:`load_shape` pins ``H == D == dests``), so indexing the name
+    list by the destination index is exactly "route to the handler that owns this destination".
+
+    :meth:`~ShardCertShape.destination_index` RAISES on a message whose control id does not decode — the
+    router does not catch it. That is deliberate: a silent fallback to destination 0 would funnel every
+    message onto a single FIFO lane and fabricate the very ~16 msg/s plateau this mode exists to disprove,
+    while still reporting a clean PASS. Raising sends the message down the engine's error/dead-letter path,
+    which breaks the sink no-loss identity and voids the run LOUDLY."""
+
+    def route(msg: Message | RawMessage) -> list[str]:
+        return [handler_names[shape.destination_index(msg)]]
+
+    return route
+
+
+def _make_partitioned_fanout_router(handler_names: list[str], shape: ShardCertShape) -> RouterFn:
+    """PARTITIONED-FANOUT: select ``D`` (== ``fanout`` == ``delivering``) DISTINCT owner handlers — the ones
+    owning the D distinct destinations :meth:`ShardCertShape.destination_indices` draws from the MSH-10
+    sequence number.
+
+    Same high-ingress partition scaling as :func:`_make_partitioned_router` (a message still occupies only
+    D of the ``dests`` lanes, not all of them), but delivers D copies instead of 1 — the shape the D≈4
+    certification soak needs to drive ingress ~= dests/(D*cycle) at events/msg = 1 + D.
+
+    ``handler_names[j]`` owns destination ``j`` (:meth:`ShardCertShape.delivers_to` returns ``j`` for every
+    built handler under any partitioned mode; :func:`load_shape` pins ``H == dests``), so the D DISTINCT
+    dest indices map to D DISTINCT owner handlers → D deliveries, never the same lane twice.
+
+    :meth:`destination_indices` RAISES on an undecodable control id and the router does NOT catch it — a
+    silent dest-0 fallback would funnel traffic onto one lane and fabricate the ~16 msg/s plateau this mode
+    exists to disprove, while still reporting a clean PASS. Raising voids the run LOUDLY."""
+
+    def route(msg: Message | RawMessage) -> list[str]:
+        return [handler_names[i] for i in shape.destination_indices(msg)]
 
     return route
 
@@ -140,7 +198,16 @@ for _i, _shard in enumerate(_SHAPE.shards):
                 handler(_hname)(_make_handler(_SHAPE, _shard, _dest_index, _lane_index))
             _handler_names.append(_hname)
         _rname = f"route_{_shard}{_suffix}"
-        router(_rname)(_make_router(_handler_names))
+        # BROADCAST (default) selects every handler; PARTITIONED selects the ONE owning dest `seq % dests`;
+        # PARTITIONED-FANOUT selects the D DISTINCT owners of `destination_indices(seq)`. Under either
+        # partitioned mode load_shape pins H == dests, so `_handler_names` has exactly one owner per
+        # destination and NO self-filtering handler was built above (delivers_to returns j for every j).
+        if _SHAPE.partitioned_fanout:
+            router(_rname)(_make_partitioned_fanout_router(_handler_names, _SHAPE))
+        elif _SHAPE.partitioned:
+            router(_rname)(_make_partitioned_router(_handler_names, _SHAPE))
+        else:
+            router(_rname)(_make_router(_handler_names))
         inbound(
             f"IB_S_{_shard}{_suffix}",
             MLLP(port=_SHAPE.inbound_port(_i, _l)),

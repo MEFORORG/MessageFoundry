@@ -324,7 +324,7 @@ async def test_nul_dead_letter_does_not_log_or_persist_phi(
     runner = RegistryRunner(reg, store)
     body = (
         f"MSH|^~\\&|S|F|R|F|20260101||ADT^A01|MSG1|P|2.5\rPID|1||MRN1^^^H^MR||{_PHI_CANARY}\x00\r"
-    ).encode("utf-8")
+    ).encode()
 
     with caplog.at_level(logging.DEBUG):
         await runner._handle_inbound(reg.inbound["IB_HL7"], body)

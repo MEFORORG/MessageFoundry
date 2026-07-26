@@ -26,7 +26,8 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -333,6 +334,33 @@ async def _claim_heads_no_block(
         raise
 
 
+# claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0 (ADR 0066 §9 never-block), so a
+# transient lock can fail-close the WHOLE batch to EMPTY-all — by_lane AND rearm both empty, the claim
+# rolled back, nothing consumed. That yield is contract-legal (the pooled caller self-heals on retry)
+# but flakes a single-shot assertion. _claim_heads_until re-issues past a transient EMPTY-all while
+# keeping _claim_heads_no_block's segfault-safe shield, for the sites here that assert a NON-empty
+# outcome — an after-release head, or a sibling/committed-successor lane claimed while ANOTHER row is
+# locked. Masks nothing: EMPTY-all is a full roll-back (a retry cannot double-claim; a successful claim
+# never retries), and a GENUINELY unclaimable head stays EMPTY-all every pass and still fails after the
+# cap. A real BLOCK still raises TimeoutError through the shield (not a return), so it is never retried.
+# Sites that assert EMPTY-all itself (a locked head with no free sibling) keep calling
+# _claim_heads_no_block directly — that answer is already EMPTY-all and immune to the yield.
+_CLAIM_YIELD_RETRIES = 16
+_CLAIM_YIELD_BACKOFF = 0.01
+
+
+async def _claim_heads_until(store: Any, *args: Any, **kwargs: Any) -> Any:
+    """_claim_heads_no_block (same shield + timeout) re-issued past a transient EMPTY-all yield; see
+    the note above. Returns as soon as the claim did ANYTHING (a non-empty by_lane or rearm)."""
+    res = await _claim_heads_no_block(store, *args, **kwargs)
+    for _ in range(_CLAIM_YIELD_RETRIES):
+        if res.by_lane or res.rearm:
+            break
+        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
+        res = await _claim_heads_no_block(store, *args, **kwargs)
+    return res
+
+
 # --- 1a: true T6 — locked head => lane EMPTY, no lock-wait, N claimed first after
 
 
@@ -357,8 +385,8 @@ async def test_pooled_1a_pg_locked_head_lane_empty_never_blocks(pg_store: Any) -
     finally:
         await tx.rollback()
         await pg_store._pool.release(conn)
-    after = await pg_store.claim_fifo_heads(
-        Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
+    after = await _claim_heads_until(
+        pg_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids  # N first, whole prefix
 
@@ -383,8 +411,8 @@ async def test_pooled_1a_ss_locked_head_lane_empty_never_blocks(ss_store: Any) -
         await cur.execute("ROLLBACK TRAN")
         await cur.close()
         await ss_store._pool.release(conn)
-    after = await ss_store.claim_fifo_heads(
-        Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
+    after = await _claim_heads_until(
+        ss_store, Stage.INGRESS.value, [channel], now=201.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids
 
@@ -418,7 +446,7 @@ async def test_pooled_1b_pg_uncommitted_head_invisible_then_claimed(pg_store: An
         await tx.commit()
     finally:
         await pg_store._pool.release(conn)
-    res2 = await pg_store.claim_fifo_heads(Stage.INGRESS.value, [channel], now=201.0)
+    res2 = await _claim_heads_until(pg_store, Stage.INGRESS.value, [channel], now=201.0)
     assert [it.id for it in res2.by_lane[channel]] == ["q-p1b-pg"]
 
 
@@ -454,7 +482,7 @@ async def test_pooled_1b_ss_uncommitted_head_invisible_then_claimed(ss_store: An
     finally:
         await cur.close()
         await ss_store._pool.release(conn)
-    res2 = await ss_store.claim_fifo_heads(Stage.INGRESS.value, [channel], now=201.0)
+    res2 = await _claim_heads_until(ss_store, Stage.INGRESS.value, [channel], now=201.0)
     assert [it.id for it in res2.by_lane[channel]] == ["q-p1b-ss"]
 
 
@@ -486,14 +514,14 @@ async def test_pooled_1b_pg_fanin_committed_successor_claimable(pg_store: Any) -
         mid_b = await pg_store.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[(dest, "pb")], now=101.0
         )
-        res = await _claim_heads_no_block(pg_store, Stage.OUTBOUND.value, [dest], now=200.0)
+        res = await _claim_heads_until(pg_store, Stage.OUTBOUND.value, [dest], now=200.0)
         # The committed successor is the visible head — claimed while A's row is still invisible.
         assert [it.message_id for it in res.by_lane[dest]] == [mid_b]
         await tx.commit()
     finally:
         await pg_store._pool.release(conn)
     # A's now-committed row (lower seq, still pending) is claimed on the next pass.
-    res2 = await pg_store.claim_fifo_heads(Stage.OUTBOUND.value, [dest], now=201.0)
+    res2 = await _claim_heads_until(pg_store, Stage.OUTBOUND.value, [dest], now=201.0)
     assert [it.id for it in res2.by_lane[dest]] == ["q-p1bf-pg"]
 
 
@@ -527,7 +555,7 @@ async def test_pooled_1b_ss_fanin_committed_successor_claimable(ss_store: Any) -
         mid_b = await ss_store.enqueue_message(
             channel_id="IB", raw=RAW, deliveries=[(dest, "pb")], now=101.0
         )
-        res = await _claim_heads_no_block(ss_store, Stage.OUTBOUND.value, [dest], now=200.0)
+        res = await _claim_heads_until(ss_store, Stage.OUTBOUND.value, [dest], now=200.0)
         assert [it.message_id for it in res.by_lane[dest]] == [mid_b]
         # Driver-level commit (autocommit=False pool): a SQL `COMMIT TRAN` only decrements the
         # nested @@TRANCOUNT the implicit txn already opened, so A's row never durably commits and
@@ -536,7 +564,7 @@ async def test_pooled_1b_ss_fanin_committed_successor_claimable(ss_store: Any) -
     finally:
         await cur.close()
         await ss_store._pool.release(conn)
-    res2 = await ss_store.claim_fifo_heads(Stage.OUTBOUND.value, [dest], now=201.0)
+    res2 = await _claim_heads_until(ss_store, Stage.OUTBOUND.value, [dest], now=201.0)
     assert [it.id for it in res2.by_lane[dest]] == ["q-p1bf-ss"]
 
 
@@ -549,7 +577,7 @@ async def test_pooled_1c_pg_multilane_isolation(pg_store: Any) -> None:
     b = await _seed_ingress(pg_store, channel_b, [100.0])
     conn, tx = await _pg_hold_row_lock(pg_store, a[0], Stage.INGRESS.value)
     try:
-        res = await _claim_heads_no_block(
+        res = await _claim_heads_until(
             pg_store, Stage.INGRESS.value, [channel_a, channel_b], now=200.0, per_lane_limit=8
         )
         assert set(res.by_lane) == {channel_b}  # B drains; A is EMPTY, not [N+1]
@@ -567,7 +595,7 @@ async def test_pooled_1c_ss_multilane_isolation(ss_store: Any) -> None:
     b = await _seed_ingress(ss_store, channel_b, [100.0])
     conn, cur = await _ss_hold_row_lock(ss_store, a[0], Stage.INGRESS.value)
     try:
-        res = await _claim_heads_no_block(
+        res = await _claim_heads_until(
             ss_store, Stage.INGRESS.value, [channel_a, channel_b], now=200.0, per_lane_limit=8
         )
         assert set(res.by_lane) == {channel_b}
@@ -588,7 +616,7 @@ async def test_pooled_1e_pg_midprefix_gap_truncates_tail_untouched(pg_store: Any
     mids = await _seed_ingress(pg_store, channel, [100.0, 101.0, 102.0])
     conn, tx = await _pg_hold_row_lock(pg_store, mids[1], Stage.INGRESS.value)
     try:
-        res = await _claim_heads_no_block(
+        res = await _claim_heads_until(
             pg_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         # Only the contiguous head prefix [N]; the locked N+1 truncates; N+2 is NOT pulled forward.
@@ -613,7 +641,7 @@ async def test_pooled_1e_ss_midprefix_gap_truncates_tail_untouched(ss_store: Any
     mids = await _seed_ingress(ss_store, channel, [100.0, 101.0, 102.0])
     conn, cur = await _ss_hold_row_lock(ss_store, mids[1], Stage.INGRESS.value)
     try:
-        res = await _claim_heads_no_block(
+        res = await _claim_heads_until(
             ss_store, Stage.INGRESS.value, [channel], now=200.0, per_lane_limit=8
         )
         assert [it.message_id for it in res.by_lane[channel]] == [mids[0]]
@@ -652,8 +680,8 @@ async def test_pooled_1f_pg_wedged_head_attempts_neutral(pg_store: Any) -> None:
     finally:
         await tx.rollback()
         await pg_store._pool.release(conn)
-    after = await pg_store.claim_fifo_heads(
-        Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
+    after = await _claim_heads_until(
+        pg_store, Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids
     assert [it.attempts for it in after.by_lane[channel]] == [1, 1, 1]
@@ -675,8 +703,8 @@ async def test_pooled_1f_ss_wedged_head_attempts_neutral(ss_store: Any) -> None:
         await cur.execute("ROLLBACK TRAN")
         await cur.close()
         await ss_store._pool.release(conn)
-    after = await ss_store.claim_fifo_heads(
-        Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
+    after = await _claim_heads_until(
+        ss_store, Stage.INGRESS.value, [channel], now=300.0, per_lane_limit=8
     )
     assert [it.message_id for it in after.by_lane[channel]] == mids
     assert [it.attempts for it in after.by_lane[channel]] == [1, 1, 1]
@@ -702,8 +730,8 @@ async def test_pooled_t9_pg_lane_array_stranded_heads_reclaimed(pg_store: Any) -
                 Stage.INGRESS.value,
             )
             assert status == "UPDATE 1"  # the strand MUST hit exactly the head row
-    res = await pg_store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_P9A", "IB_P9B"], now=200.0, per_lane_limit=8
+    res = await _claim_heads_until(
+        pg_store, Stage.INGRESS.value, ["IB_P9A", "IB_P9B"], now=200.0, per_lane_limit=8
     )
     assert [it.message_id for it in res.by_lane["IB_P9A"]] == a  # recovered head FIRST
     assert [it.message_id for it in res.by_lane["IB_P9B"]] == b

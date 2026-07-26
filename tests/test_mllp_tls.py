@@ -38,8 +38,8 @@ def _cert(tmp_path: Path) -> tuple[str, str]:
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
         .add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,
@@ -248,8 +248,8 @@ def _encrypted_cert(tmp_path: Path, passphrase: str) -> tuple[str, str]:
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
         .add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,

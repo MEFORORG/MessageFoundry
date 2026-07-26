@@ -40,6 +40,7 @@ def test_sample_config_loads_and_routes() -> None:
         "acme_adt_router",
         "partner_x12_router",
         "immunization_router",
+        "bodycred_router",  # #236 SOAP body-secret submit (IB_IMMUNIZATION_BODYCRED_VXU.py)
         "rte_request_router",
         "rte_response_router",
         "fhir_router",
@@ -53,6 +54,7 @@ def test_sample_config_loads_and_routes() -> None:
         "acme_adt_handler",
         "partner_x12_handler",
         "immunization_submit_handler",
+        "bodycred_submit_handler",  # #236 SOAP body-secret submit (IB_IMMUNIZATION_BODYCRED_VXU.py)
         "rte_query_handler",
         "rte_result_handler",
         "fhir_handler",

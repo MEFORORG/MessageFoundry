@@ -42,10 +42,10 @@ _NO_CHECK_TIME = 0x200000
 
 # Windows (`str(...)` of an epoch-aware datetime) — a window that starts well before "now" so a valid
 # reference cert is unambiguously current, and a PAST window so the expired one is unambiguously lapsed.
-_PAST_NB = datetime.datetime(2021, 1, 1, tzinfo=datetime.timezone.utc)
-_PAST_NA = datetime.datetime(2022, 1, 1, tzinfo=datetime.timezone.utc)  # notAfter < now → EXPIRED
-_LONG_NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc)
-_LONG_NA = datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc)  # current
+_PAST_NB = datetime.datetime(2021, 1, 1, tzinfo=datetime.UTC)
+_PAST_NA = datetime.datetime(2022, 1, 1, tzinfo=datetime.UTC)  # notAfter < now → EXPIRED
+_LONG_NB = datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC)
+_LONG_NA = datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC)  # current
 
 
 def _ca(

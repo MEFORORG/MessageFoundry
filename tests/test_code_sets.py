@@ -149,7 +149,7 @@ def test_activated_publishes_and_restores() -> None:
 
 
 def test_code_set_missing_name_lists_available() -> None:
-    with activated({"a": CodeSet("a", {}), "b": CodeSet("b", {})}):
+    with activated({"a": CodeSet("a", {}), "b": CodeSet("b", {})}):  # noqa: SIM117
         with pytest.raises(CodeSetError, match="available: a, b"):
             code_set("c")
 

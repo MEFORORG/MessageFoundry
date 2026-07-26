@@ -44,6 +44,7 @@ import hashlib
 import json
 import os
 import struct
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import BinaryIO
@@ -129,12 +130,24 @@ def _aad(header_digest: bytes, frame_index: int, *, final: bool) -> bytes:
 
 
 def encrypt_stream(
-    src: BinaryIO, dst: BinaryIO, key: bytes, *, chunk_size: int | None = None
+    src: BinaryIO,
+    dst: BinaryIO,
+    key: bytes,
+    *,
+    chunk_size: int | None = None,
+    on_frames: Callable[[int], None] | None = None,
 ) -> str:
     """Encrypt the byte stream ``src`` into the ``.mfbak`` stream ``dst`` under ``key`` (the resolved
     32-byte store DEK), returning the key's ``key_id`` fingerprint (recorded in the manifest by the
     caller). Streaming: at most ``chunk_size`` plaintext bytes are in memory at once — never the whole
-    archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``)."""
+    archive. Synchronous; the BackupRunner calls it off the event loop (``asyncio.to_thread``).
+
+    ``on_frames`` receives the number of AES-GCM invocations this run performed — one per frame, each
+    drawing its own 96-bit nonce under the SAME DEK the store cipher uses. These MUST be charged to that
+    key's persisted invocation bound (ASVS 11.3.4): the codec builds its own ``AESGCM`` from the raw key
+    and never touches ``AesGcmCipher``, so counting only the store cipher would under-count the key's
+    birthday budget by every backup run — a bound that is provably wrong in the low direction. The
+    caller does the aggregate add after the run (this function is synchronous and holds no store)."""
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
     _validate_key(key)
@@ -157,19 +170,31 @@ def encrypt_stream(
     # Read one chunk AHEAD so we know which frame is the LAST one (its AAD carries final=1). An empty
     # source still emits exactly one final empty frame, so the terminator is always present + checked.
     frame_index = 0
+    # Counted separately from frame_index and incremented only AFTER a successful aes.encrypt, so the
+    # figure is the invocations actually performed rather than the frames intended.
+    performed = 0
     current = src.read(size)
-    while True:
-        nxt = src.read(size)
-        final = not nxt  # this is the last frame iff there is no more plaintext after it
-        nonce = os.urandom(_NONCE_BYTES)
-        ct = aes.encrypt(nonce, current, _aad(header_digest, frame_index, final=final))
-        dst.write(nonce)
-        dst.write(_U32.pack(len(ct)))
-        dst.write(ct)
-        if final:
-            break
-        current = nxt
-        frame_index += 1
+    try:
+        while True:
+            nxt = src.read(size)
+            final = not nxt  # this is the last frame iff there is no more plaintext after it
+            nonce = os.urandom(_NONCE_BYTES)
+            ct = aes.encrypt(nonce, current, _aad(header_digest, frame_index, final=final))
+            performed += 1
+            dst.write(nonce)
+            dst.write(_U32.pack(len(ct)))
+            dst.write(ct)
+            if final:
+                break
+            current = nxt
+            frame_index += 1
+    finally:
+        # In a `finally`, because a run that dies part-way (a full disk, a broken destination) has still
+        # SPENT every invocation it already made. Reporting only on success would charge zero for them
+        # and leave the key's persisted bound trailing what the DEK actually encrypted — the same
+        # under-count, in the same direction, that counting the store cipher alone would produce.
+        if on_frames is not None and performed:
+            on_frames(performed)
     return kid
 
 

@@ -1,11 +1,19 @@
 <#
 .SYNOPSIS
     Install (or remove) the worktree gate -- a PreToolUse hook that stops sessions BUILDING in the
-    shared primary checkout.
+    shared primary checkout, and hijacking a linked worktree onto another session's branch.
 
 .DESCRIPTION
-    Copies scripts\hooks\worktree_gate.ps1 to the USER scope (%USERPROFILE%\.claude\hooks\) and registers
-    it in %USERPROFILE%\.claude\settings.json.
+    Copies scripts\hooks\worktree_gate.ps1 to a shared USER-scope location (%USERPROFILE%\.claude\hooks\)
+    and registers it as a PreToolUse hook in the settings.json of EVERY Claude config dir this box uses:
+    ~/.claude (the Desktop app) AND each ~/.claude-account-N (the VS Code launchers that set
+    CLAUDE_CONFIG_DIR). Override the set with -ConfigDir.
+
+    WHY EVERY CONFIG DIR. The gate used to wire only ~/.claude, which left every ~/.claude-account-N
+    session UNGATED -- and those are where the parallel VS Code chats run. A session running under an
+    ungoverned account checked its own branch out inside another session's linked worktree (a hijack that
+    silently swapped that session's files mid-task); the gate that would have blocked it was simply not
+    installed there. This mirrors what install-selfheal.ps1 already does: wire all of them.
 
     WHY USER SCOPE, and why an installed COPY:
 
@@ -18,10 +26,11 @@
         on a detached HEAD or an old commit; a hook whose script path lives there vanishes on a checkout,
         and a hook whose script is missing exits non-zero-but-not-2 -- which means the tool call RUNS
         ANYWAY, silently. The gate would be off in every session and nothing would say so. So we install a
-        copy outside every tree and re-copy it on each install.
+        copy outside every tree (once, shared, referenced by absolute path from each account) and re-copy
+        it on each install.
 
     The gate only governs the checkouts listed in worktree-gate.repos.txt. That file IS the kill switch:
-    -Uninstall removes it (and the hook entries).
+    -Uninstall removes it (and the hook entries from every config dir).
 
     Run from a PLAIN TERMINAL, not from inside Claude Code -- a session that can install its own gate can
     uninstall it. The script refuses when $env:CLAUDECODE is set.
@@ -29,6 +38,7 @@
 .EXAMPLE
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Repo C:\Users\me\Code\Probe   # govern a test repo
+    pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -ConfigDir C:\Users\me\.claude-account-3
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall
     pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
 #>
@@ -39,7 +49,9 @@ param(
     [switch]$Uninstall,
     [switch]$Status,
     # Do not gate Task/Agent/Workflow dispatch from the primary (writes are still gated).
-    [switch]$NoDispatchGate
+    [switch]$NoDispatchGate,
+    # Config dirs to wire the hook into. Default: ~/.claude plus every existing ~/.claude-account-*.
+    [string[]]$ConfigDir
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,34 +60,46 @@ if ($env:CLAUDECODE -eq "1") {
     throw "Refusing to run inside Claude Code. A session that can install this gate can also remove it. Run from a plain pwsh terminal."
 }
 
-$RepoRoot  = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$ClaudeDir = Join-Path $env:USERPROFILE ".claude"
-$HooksDir  = Join-Path $ClaudeDir "hooks"
-$Settings  = Join-Path $ClaudeDir "settings.json"
+$RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+
+# The gate SCRIPT + its allowlist live ONCE, shared, under ~/.claude\hooks -- referenced by absolute path
+# from every config dir's settings.json, so a single copy (and a single kill switch) governs all accounts.
+$HooksDir  = Join-Path $env:USERPROFILE ".claude\hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 
 # Marker so we can find (and remove) exactly the entries we added, without disturbing other hooks.
 $Marker = "worktree_gate.ps1"
 
-function Read-Settings {
-    if (-not (Test-Path -LiteralPath $Settings)) { return [ordered]@{} }
-    $raw = Get-Content -LiteralPath $Settings -Raw
-    if ([string]::IsNullOrWhiteSpace($raw)) { return [ordered]@{} }
-    try { return ($raw | ConvertFrom-Json -AsHashtable) }
-    catch { throw "$Settings is not valid JSON -- fix it by hand before installing (it is live config for every session)." }
+# Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-* (the VS Code launchers).
+if (-not $ConfigDir -or $ConfigDir.Count -eq 0) {
+    $cands = @( (Join-Path $env:USERPROFILE ".claude") )
+    $cands += @(
+        Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
+            ForEach-Object { $_.FullName }
+    )
+    $ConfigDir = @($cands | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
 }
 
-function Write-Settings($Data) {
+function Read-Settings([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [ordered]@{} }
+    $raw = Get-Content -LiteralPath $Path -Raw
+    if ([string]::IsNullOrWhiteSpace($raw)) { return [ordered]@{} }
+    try { return ($raw | ConvertFrom-Json -AsHashtable) }
+    catch { throw "$Path is not valid JSON -- fix it by hand before installing (it is live config for every session)." }
+}
+
+function Write-Settings([string]$Path, $Data) {
     # Two sessions installing at once could interleave a read-modify-write and leave INVALID JSON, which
     # would break hooks in every session on the machine at once. Serialize to a temp file, parse it back
-    # to prove it is valid, keep a backup, then move it into place in one atomic operation.
+    # to prove it is valid, keep a backup, then move it into place in one atomic operation. Done PER FILE,
+    # so a failure wiring one config dir can never corrupt another.
     $json = $Data | ConvertTo-Json -Depth 20
     $null = $json | ConvertFrom-Json      # throws before we touch the real file
-    $tmp = "$Settings.tmp-$PID"
+    $tmp = "$Path.tmp-$PID"
     Set-Content -LiteralPath $tmp -Value $json -Encoding utf8
-    if (Test-Path -LiteralPath $Settings) { Copy-Item -LiteralPath $Settings "$Settings.bak" -Force }
-    Move-Item -LiteralPath $tmp -Destination $Settings -Force
+    if (Test-Path -LiteralPath $Path) { Copy-Item -LiteralPath $Path "$Path.bak" -Force }
+    Move-Item -LiteralPath $tmp -Destination $Path -Force
 }
 
 function Remove-GateHooks($Data) {
@@ -102,19 +126,25 @@ if ($Status) {
     } else {
         Write-Host "governing   : nothing (no allowlist -> gate is OFF)"
     }
-    $s = Read-Settings
-    $n = @($s.hooks.PreToolUse | Where-Object { @($_.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" } }).Count
-    Write-Host "hook entries: $n registered in $Settings"
+    foreach ($cd in $ConfigDir) {
+        $sp = Join-Path $cd "settings.json"
+        $s = Read-Settings $sp
+        $n = @($s.hooks.PreToolUse | Where-Object { @($_.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" } }).Count
+        Write-Host "hook entries: $n in $sp"
+    }
     return
 }
 
 # --------------------------------------------------------------------------------------- uninstall
 if ($Uninstall) {
-    $data = Remove-GateHooks (Read-Settings)
-    Write-Settings $data
+    foreach ($cd in $ConfigDir) {
+        $sp = Join-Path $cd "settings.json"
+        if (-not (Test-Path -LiteralPath $sp)) { continue }
+        Write-Settings $sp (Remove-GateHooks (Read-Settings $sp))
+    }
     Remove-Item -LiteralPath $ReposFile -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $GateDst   -Force -ErrorAction SilentlyContinue
-    Write-Host "Worktree gate REMOVED. Sessions are no longer gated (takes effect immediately)." -ForegroundColor Yellow
+    Write-Host "Worktree gate REMOVED from $($ConfigDir.Count) config dir(s). Sessions are no longer gated (takes effect immediately)." -ForegroundColor Yellow
     return
 }
 
@@ -140,23 +170,21 @@ Copy-Item -LiteralPath (Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1") -
 
 @(
     "# Primary checkouts governed by the worktree gate (scripts\hooks\worktree_gate.ps1)."
-    "# Writes INTO these trees are denied; writes into their linked worktrees are allowed."
+    "# Writes INTO these trees are denied; a linked worktree may not be switched onto an existing branch."
     "# Deleting this file turns the gate OFF everywhere, immediately."
     $resolved
 ) | Set-Content -LiteralPath $ReposFile -Encoding utf8
 
 $command = "pwsh -NoProfile -File `"$GateDst`""
-$data    = Remove-GateHooks (Read-Settings)      # idempotent: drop our old entries, then re-add
-if (-not $data.hooks)             { $data.hooks = [ordered]@{} }
-if (-not $data.hooks.PreToolUse)  { $data.hooks.PreToolUse = @() }
 
 # One matcher per rule in scripts/hooks/worktree_gate.ps1. A rule the hook implements but that is not
 # matched here NEVER FIRES -- the hook is simply not invoked for that tool, and nothing says so. Rule 3
 # shipped in exactly that state. tests/test_install_gate_wiring.py now asserts that every tool the script
-# branches on appears in this list, so the two cannot drift apart again.
+# branches on appears in this list, so the two cannot drift apart again. (Rule 3b -- worktree hijack --
+# rides the same Bash|PowerShell matcher as rule 3, so it needs no new tool here.)
 $matchers = @(
     "Write|Edit|MultiEdit|NotebookEdit"   # rule 1 -- writes INTO the primary's tree
-    "Bash|PowerShell"                     # rule 3 -- git verbs that swap the primary's tree
+    "Bash|PowerShell"                     # rules 3 + 3b -- git verbs that swap the primary / hijack a worktree
 )
 if (-not $NoDispatchGate) {
     $matchers += "Task|Agent|Workflow"    # rule 2 -- subagent dispatch FROM the primary
@@ -173,15 +201,25 @@ $entries = foreach ($m in $matchers) {
         })
     }
 }
-$data.hooks.PreToolUse = @($data.hooks.PreToolUse) + @($entries)
-Write-Settings $data
+
+# Wire (idempotently) into every target config dir. Each file is read-modified-written independently with
+# its own backup/validate/rollback, so a failure on one account cannot corrupt another.
+foreach ($cd in $ConfigDir) {
+    $sp = Join-Path $cd "settings.json"
+    $data = Remove-GateHooks (Read-Settings $sp)   # idempotent: drop our old entries, then re-add
+    if (-not $data.hooks)            { $data.hooks = [ordered]@{} }
+    if (-not $data.hooks.PreToolUse) { $data.hooks.PreToolUse = @() }
+    $data.hooks.PreToolUse = @($data.hooks.PreToolUse) + @($entries)
+    Write-Settings $sp $data
+    Write-Host "  wired : $sp"
+}
 
 Write-Host ""
-Write-Host "Worktree gate INSTALLED (user scope -- every session, every worktree, no restart)." -ForegroundColor Green
+Write-Host "Worktree gate INSTALLED into $($ConfigDir.Count) config dir(s) (every session, no restart)." -ForegroundColor Green
 Write-Host "  gate      : $GateDst"
 Write-Host "  allowlist : $ReposFile"
 $resolved | ForEach-Object { Write-Host "  governing : $_" }
 Write-Host "  matchers  : $($matchers -join '  +  ')"
 Write-Host ""
-Write-Host "Writes into a governed tree are DENIED; writes into its linked worktrees are allowed."
+Write-Host "Writes into a governed tree are DENIED; a linked worktree may not be switched onto an existing branch."
 Write-Host "To turn it off:  pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Uninstall"

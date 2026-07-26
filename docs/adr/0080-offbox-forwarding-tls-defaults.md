@@ -143,3 +143,52 @@ enforce it*, delegated where it cannot" line already drawn for TLS termination (
   the startup time-sync gate.
 - [`docs/security/ASVS-L3-ASSESSMENT.md`](../security/ASVS-L3-ASSESSMENT.md) — 16.4.3 / 16.2.4 /
   16.2.2 rows updated.
+
+## Amendment (2026-07-17) — TLS forwarding instructed at exposure (ASVS 16.4.3, ADR 0115 / WP #243)
+
+**Status:** Doc-only — no default changed. Off-box forwarding stays **off until a collector is
+named** (`forward_host = None`), and when named the secure transport (`forward_protocol = "tls"`,
+CA-anchored) stays an explicit operator choice over the plaintext `udp` default. This records the ADR
+0115 treatment of 16.4.3: a global `forward_enabled` flip would fail an unconfigured engine (the
+`forward_enabled ⇒ forward_host` rule), so 16.4.3 is **instructed, not flipped**.
+
+[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Off-box
+log/audit forwarding to your SIEM" now instructs setting `forward_host`, `forward_protocol = "tls"`
+(explicitly not the plaintext UDP default), `forward_port`, and the required `forward_tls_ca_file`
+(plus optional `forward_tls_client_cert` for mutual TLS). The secure-default machinery shipped in
+this ADR (native RFC 5425 TLS, default-on-when-configured, CA-anchored verification) is unchanged;
+WP #243 only adds the runbook instruction. ADR 0115 does not re-score.
+
+## Amendment (2026-07-22) — the forwarding hop joins the #200 posture gradient
+
+**Status:** Behaviour change — the plaintext default is now an *acknowledged* escape, not a silent one.
+
+The 2026-07-17 amendment above left 16.4.3 "instructed, not flipped": the runbook told operators to
+choose `forward_protocol = "tls"`, but nothing **enforced** it, and `udp` remained the default. That
+made the forwarder the one PHI-adjacent egress path in the engine with **no posture gate at all** —
+every transport-level cleartext hop had been brought under `insecure_hop_disposition` by #200 (ADR
+0092), while a `[logging].forward_host` pointed at an off-box collector shipped the log + `audit_log`
+evidence stream (PHI-**redacted**, but carrying usernames, connection names, message ids, client
+addresses, and the tamper-evident audit chain) over cleartext UDP with only the operator's diligence in
+the way.
+
+`serve` now decides the forwarding hop through the **same** shared authority the transports consume
+(`settings.forward_hop_disposition` → `tls_policy.insecure_hop_disposition`), **before**
+`configure_logging` installs the handler, so a refused hop never emits a record. A hop counts as secure
+only when it is TLS **with verification on**; plaintext `udp`/`tcp` and the `forward_tls_verify = false`
+opt-out both go to the gradient — loopback ALLOW, attested ALLOW, synthetic ALLOW, non-enforcing PHI
+WARN, enforcing PHI REFUSE.
+
+**No new escape mechanism was invented.** The opt-out is the existing per-hop attestation shape, named
+for its section: `[logging].forward_hop_attested` (+ `forward_hop_attested_reason`), validated by the
+same shared rule as a connection's `tls_hop_attested`. The chosen-in-this-ADR delegation path is
+explicitly preserved — a `udp`/`tcp` forward to `127.0.0.1` fronted by a local rsyslog/Vector agent is a
+loopback hop and is never gated, so the throughput-friendly deployment is byte-identical.
+
+**What this can break, and the migration.** An existing *enforcing PHI* instance forwarding plaintext to
+an off-box collector will now refuse to start. That is the bug being fixed — it is exactly the cleartext
+egress this ADR's decision 1 built native TLS to avoid — and the refusal names all three remedies:
+`forward_protocol = "tls"` (+ `forward_tls_ca_file`), a loopback local agent, or the attestation. A
+non-PHI / non-enforcing instance, a loopback collector, and an engine with no `forward_host` are all
+unchanged. The availability posture of decision 1 is untouched: this gate decides *config*, and a
+collector that is merely unreachable still degrades to "no forwarding + loud warning".

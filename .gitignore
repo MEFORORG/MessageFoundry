@@ -31,11 +31,24 @@ secrets/
 /docker/secrets.env
 /docker/tls/
 
-# Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt)
+# are never committed. Ignore every samples/ subdirectory by DEFAULT rather than naming the partner
+# here — fail-closed, so a new unlisted staging dir cannot reach a public repo just because nobody
+# remembered to add a rule. The shipped example dirs are re-included explicitly.
+/samples/*/
+!/samples/config/
+!/samples/consistency/
+!/samples/dicom/
+!/samples/ech-sidecar/
+!/samples/generators/
+!/samples/messages/
+!/samples/results_relay/
+# Generated, regenerable test corpus (build with: python -m messagefoundry.generators.adt). MUST come
+# after the un-ignores above, or the re-included parent would drag it back in.
 /samples/messages/adt/
-
 # Workflow agent self-verification temp dirs (an isolated copy of a ported migration module + codesets
+# + fixture for a check/dryrun). Customer-estate-derived — never commit. Delete after a porting batch.
 /_verify_*/
+# exports). Customer data — NEVER commit. `git archive` (the publish path) excludes it by
 # construction; this is the local-only working area.
 /migration-local/
 
@@ -79,3 +92,11 @@ TRANSCRIPTS.md
 *.db*
 .DS_Store
 Thumbs.db
+
+# Agent/web-fetch debris dropped in the repo ROOT (e.g. blog.html, contest.txt, free.html) — never
+# commit. Anchored to root (leading /) so tracked *.html/*.txt UNDER subdirs (docs/, samples/,
+# scripts/, packaging/, messagefoundry/auth/data/…) are unaffected; no *.html/*.txt is legitimately
+# tracked at the repo root, so an anchored catch-all is safe. Force-add (git add -f) if one ever is.
+/*.html
+/*.txt
+/*.yml

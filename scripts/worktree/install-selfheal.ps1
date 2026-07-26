@@ -17,7 +17,7 @@
     them, so only the wiring is per-dir. See worktree-selfheal.ps1 and AI memory mf-tengu-worktree-halffail.
 
 .EXAMPLE
-    pwsh -File scripts\worktree\install-selfheal.ps1 -ConfigDir C:\Users\Scott\.claude
+    pwsh -File scripts\worktree\install-selfheal.ps1 -ConfigDir C:\Users\<you>\.claude
 #>
 param(
     [Parameter(Mandatory)][string]$ConfigDir,

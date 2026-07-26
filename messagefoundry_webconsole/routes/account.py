@@ -16,20 +16,29 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.auth import Identity
 from messagefoundry.auth import webauthn as webauthn_mod
-from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.service import (
+    STEP_UP_ACTION_MFA_CONFIRM,
+    STEP_UP_ACTION_MFA_DISABLE,
+    STEP_UP_ACTION_MFA_ENROLL,
+    STEP_UP_ACTION_WEBAUTHN_DELETE,
+    STEP_UP_ACTION_WEBAUTHN_ENROLL,
+    AuthService,
+)
 from messagefoundry.auth.tokens import hash_token
 
 from .. import pages
 from .._auth import (
-    session_token,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
+    allow_reauth_attempt,
     assert_same_origin,
     clear_session_cookie,
     register_ui_action,
     require_ui,
     require_ui_reauth_only,
-    require_ui_step_up,
+    require_ui_reauth_only_action,
+    require_ui_step_up_action,
+    session_token,
     webauthn_rp,
 )
 from .._service import _service
@@ -42,12 +51,23 @@ from ._common import _client, _form_pairs, _rate_limited
 # so its standalone GET form registers as the unlock re-entry point. The change-password POST
 # is in NEITHER registry: it has no step-up gate (the current password in the body IS the
 # proof), so no re-auth continuation ever needs to reach it.
-# enroll + confirm are password-only (require_ui_reauth_only) — step_up=False so the /ui/reauth
+# enroll + confirm are password-only (require_ui_reauth_only_action) — step_up=False so the /ui/reauth
 # flow knows a required-but-unenrolled session CAN complete them (it is the enrollment path);
-# disable needs the full step-up (require_ui_step_up), so it keeps step_up=True (default).
-register_ui_action(r"^/ui/account/mfa/enroll$", None, step_up=False)
-register_ui_action(r"^/ui/account/mfa/disable$", None)
-register_ui_action(r"^/ui/account/mfa/confirm$", None, step_up=False, auto_retry=False, unlock=True)
+# disable needs the full step-up (require_ui_step_up_action), so it keeps step_up=True (default).
+# 7.5.1 (ADR 0077): each factor lane now carries an action= tag, so /ui/reauth mints the matching
+# single-use grant and each bind consumes exactly one fresh proof (closing the /ui window residual).
+register_ui_action(
+    r"^/ui/account/mfa/enroll$", None, step_up=False, action=STEP_UP_ACTION_MFA_ENROLL
+)
+register_ui_action(r"^/ui/account/mfa/disable$", None, action=STEP_UP_ACTION_MFA_DISABLE)
+register_ui_action(
+    r"^/ui/account/mfa/confirm$",
+    None,
+    step_up=False,
+    auto_retry=False,
+    unlock=True,
+    action=STEP_UP_ACTION_MFA_CONFIRM,
+)
 # --- L5a: WebAuthn passkeys (ADR 0068, WP-14b) -------------------------------
 # Self-scoped actions (permission=None — enforcement is each route's require_ui* dep).
 # enroll is the TOTP-enroll twin: a body-less POST returning HTML, gated on the password-
@@ -57,8 +77,21 @@ register_ui_action(r"^/ui/account/mfa/confirm$", None, step_up=False, auto_retry
 # auto-retry shape behind the FULL step-up. The verify route is a body-carrying JSON POST
 # — NEVER registered as a continuation (hard invariant); its require_ui_reauth_only maps a
 # stale-window 303 to the REGISTERED enroll action (the #745 ui_mfa_verify precedent).
-register_ui_action(r"^/ui/account/webauthn/enroll$", None, step_up=False)
-register_ui_action(r"^/ui/account/webauthn/[^/?#]+/delete$", None)
+register_ui_action(
+    r"^/ui/account/webauthn/enroll$", None, step_up=False, action=STEP_UP_ACTION_WEBAUTHN_ENROLL
+)
+register_ui_action(
+    r"^/ui/account/webauthn/[^/?#]+/delete$", None, action=STEP_UP_ACTION_WEBAUTHN_DELETE
+)
+# --- L6b: self-service session TERMINATE (ASVS 7.5.2) — password re-proof before revoke ---
+# Both terminate POSTs are body-less (all params in the PATH), so they register as auto_retry
+# continuations /ui/reauth may re-POST after a stale-window re-auth. step_up=False (password-
+# only, mirrors require_ui_reauth_only): a required-but-unenrolled MFA session must still be
+# able to revoke — require_ui_step_up would deadlock it (WP-14). permission=None (self-scoped).
+# The two patterns do not overlap: the per-session pattern requires two more segments after
+# sessions/ (<id>/revoke), so /ui/account/sessions/revoke-others (one segment) matches only itself.
+register_ui_action(r"^/ui/account/sessions/[^/?#]+/revoke$", None, step_up=False)
+register_ui_action(r"^/ui/account/sessions/revoke-others$", None, step_up=False)
 
 
 def register(app: FastAPI, deps: UiDeps) -> None:
@@ -122,7 +155,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_account(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui()),
+        identity: Identity = Depends(require_ui(allow_mfa_pending=True)),
         m: str | None = Query(None, max_length=32),
     ) -> HTMLResponse:
         return await _account_response(
@@ -131,7 +164,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/account/password", response_class=HTMLResponse)
     async def ui_account_password_form(
-        identity: Identity = Depends(require_ui(allow_must_change=True)),
+        identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
     ) -> HTMLResponse:
         # `forced` comes from the SERVER-side flag, never a query param (unspoofable).
         return HTMLResponse(pages.password_page(forced=identity.must_change_password))
@@ -140,9 +173,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_account_password(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui(allow_must_change=True)),
+        identity: Identity = Depends(require_ui(allow_must_change=True, allow_mfa_pending=True)),
     ) -> Response:
         assert_same_origin(request)
+        # No throttle call here on purpose: this route DELEGATES to the JSON handler
+        # (admin.change_password) below, which applies the per-actor ceremony budget and whose 429 is
+        # re-raised intact. Charging here too would spend two tokens per submission.
         form = dict(await _form_pairs(request))
         forced = identity.must_change_password
 
@@ -166,7 +202,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             if exc.status_code == status.HTTP_429_TOO_MANY_REQUESTS:
                 raise  # rate-limited — keep the Retry-After semantics
             return _retry(str(exc.detail), exc.status_code)
-        # Changed: the service revoked every session (incl. this cookie) — sign in again.
+        # Changed: the service revoked every session (incl. this cookie) — sign in again. This is the
+        # WIDEST termination the console offers (every session for this user, the one an operator
+        # reaches for after a suspected compromise), so it must drop the browser's cached PHI pages
+        # like any other: ``clear_session_cookie`` emits Clear-Site-Data with the deletion (ASVS
+        # 14.3.1), and ``pwchanged`` is an allow-listed Clear-Site-Data login code for the landing.
         resp = RedirectResponse("/ui/login?e=pwchanged", status_code=303)
         clear_session_cookie(resp, request)
         return resp
@@ -175,7 +215,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_mfa_enroll(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_reauth_only()),
+        identity: Identity = Depends(require_ui_reauth_only_action(STEP_UP_ACTION_MFA_ENROLL)),
     ) -> Response:
         assert_same_origin(request)
         try:
@@ -201,7 +241,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(
-            require_ui_reauth_only(reauth_next=lambda _r: "/ui/account/mfa/confirm")
+            require_ui_reauth_only_action(
+                STEP_UP_ACTION_MFA_CONFIRM, reauth_next=lambda _r: "/ui/account/mfa/confirm"
+            )
         ),
     ) -> Response:
         assert_same_origin(request)
@@ -210,7 +252,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # cookie-vs-header split ui_login/ui_reauth already handle. Semantics match the JSON
         # handler: rate-limited like login; wrong code changes nothing.
         client = _client(request)
-        if not service.allow_login_attempt(client):
+        if not allow_reauth_attempt(service, identity, client):  # per-ACTOR, not the sign-in budget
             raise _rate_limited(request, "mfa-confirm")
         token = session_token(request)
         if not token:  # pragma: no cover - require_ui already authenticated this cookie
@@ -233,19 +275,21 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_mfa_disable(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_step_up()),
+        identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_MFA_DISABLE)),
     ) -> Response:
         assert_same_origin(request)
         await admin.disable_my_mfa(request=request, service=service, identity=identity)
         return RedirectResponse("/ui/account?m=mfa_off", status_code=303)
 
     # --- L6b: self-service session management (#75 parity — desktop sessions.py twin) ---
-    # Managing one's OWN sessions is cookie-authenticated self-service (require_ui), no step-up:
-    # the caller is already authenticated and acting only on their own sessions. The JSON
-    # my_sessions/revoke_my_other_sessions handlers read the HEADER bearer to identify the
-    # current session, absent on a cookie request — so these drive the SERVICE directly with the
-    # cookie session token (the ui_mfa_verify cookie-vs-header pattern). No registry entry: these
-    # never route through /ui/reauth (not step-up actions).
+    # LISTING one's OWN sessions is plain cookie-authenticated self-service (require_ui). TERMINATING
+    # one (revoke one / revoke-others) additionally requires a fresh PASSWORD re-proof
+    # (require_ui_reauth_only — ASVS 7.5.2), NOT the full MFA step-up: a no-factor user must still be
+    # able to revoke, and require_ui_step_up would deadlock them (WP-14). A fresh login seeds the
+    # step-up window, so an immediate post-login revoke is unaffected; a stale window 303s to
+    # /ui/reauth?next=<this action> and auto-retries after re-verification (both terminate POSTs are
+    # registered auto_retry, step_up=False, above). The handlers read the HEADER/cookie session token
+    # to identify the current session and drive the SERVICE directly (the ui_mfa_verify pattern).
     _SESSION_NOTICES = {
         "revoked": "Session revoked.",
         "signed_out_others": "Signed out of your other sessions.",
@@ -278,7 +322,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         session_id: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui()),
+        identity: Identity = Depends(require_ui_reauth_only()),
     ) -> Response:
         assert_same_origin(request)
         # Ownership-checked in the service; an unknown/foreign id is a silent no-op (never
@@ -291,7 +335,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_revoke_other_sessions(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui()),
+        identity: Identity = Depends(require_ui_reauth_only()),
     ) -> Response:
         assert_same_origin(request)
         current = hash_token(session_token(request) or "")
@@ -304,7 +348,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_webauthn_enroll(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_reauth_only()),
+        identity: Identity = Depends(require_ui_reauth_only_action(STEP_UP_ACTION_WEBAUTHN_ENROLL)),
     ) -> Response:
         assert_same_origin(request)
         if not service.webauthn_available():
@@ -389,7 +433,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         credential_id_hash: str,
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_ui_step_up()),
+        identity: Identity = Depends(require_ui_step_up_action(STEP_UP_ACTION_WEBAUTHN_DELETE)),
     ) -> Response:
         assert_same_origin(request)
         try:

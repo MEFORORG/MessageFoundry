@@ -57,6 +57,32 @@ export interface LensRow {
   // A `return []` explicit filter (the store maps it to FILTERED) — an additive flag on a send row so it
   // renders as "Filter" without overloading empty `outbounds` (a dynamic-destination Send also has none).
   filtered?: boolean;
+  // ADR 0104 fan-out: a mid-body `sends.append(Send(...))` accumulator send (vs. a terminal
+  // `return Send(...)`). It is NOT a return, so insert-after is allowed and it is a normal reorderable
+  // step. Absent on every returned send + older contract (→ treated as a return, unchanged).
+  appended?: boolean;
+  // ADR 0104 fan-out: the accumulator's managed scaffold — `"collector_init"` on `sends = []`,
+  // `"return_collector"` on the bare `return sends` footer. A `code` row carrying this stays read-only
+  // (the kind is unchanged); the webview renders it muted, and the footer counts as a return (insert-after
+  // suppressed). Absent on every ordinary code row + older contract.
+  scaffold?: "collector_init" | "return_collector";
+}
+
+/**
+ * Whether a row is a terminal RETURN — a returned send (`return Send(...)` / `return [Send, ...]` /
+ * `return []`) or the accumulator's `return sends` footer (`scaffold === "return_collector"`). A mid-body
+ * `sends.append(Send(...))` (`appended === true`) is NOT a return. Insert-AFTER is suppressed on a return
+ * (a step after it is dead code); this keys that suppression on return-statement-ness, NOT on the `send`
+ * kind — so an append (a real middle-of-body step) allows insert-after. Orthogonal to read-only-ness,
+ * which keys on `scaffold`/`kind`. A row with neither flag (every estate return) reads as a return, so
+ * behaviour is unchanged. Accepts a minimal shape so DOM-derived contexts (RowDropContext) can call it.
+ */
+export function isReturnRow(row: {
+  kind: RowKind;
+  appended?: boolean;
+  scaffold?: string;
+}): boolean {
+  return (row.kind === "send" && row.appended !== true) || row.scaffold === "return_collector";
 }
 
 /** One `@handler`'s contract: its registered name, def line, and ordered rows. */
@@ -107,6 +133,15 @@ export interface RowViewModel {
   // {@link buildRowViewModel} always populates it.
   suite?: string;
   movable?: boolean;
+  // ADR 0104 fan-out — carried through so the DOM can stamp `data-appended`/`data-scaffold` (for the
+  // muted scaffold styling + the position mirror) and `data-is-return`. `isReturn` is precomputed
+  // ({@link isReturnRow}) so both the model and the CSP-isolated webview mirror agree on it.
+  appended?: boolean;
+  scaffold?: "collector_init" | "return_collector";
+  isReturn?: boolean;
+  // A `return []` filter send — carried so the per-row "+ dest" button is hidden on it (fanning out a
+  // "drop the message" step is not meaningful; use Add→Send). Absent on every other row.
+  filtered?: boolean;
   title: string;
   subtitle?: string;
   badge?: string; // e.g. "unrecognized" for a control whose test is outside the bounded grammar (§4)
@@ -268,6 +303,10 @@ function rowTitle(row: LensRow): string {
     case "diagnostic":
       return row.call ? (DIAGNOSTIC_LABELS[row.call] ?? humanizeIdentifier(row.call)) : "Diagnostic";
     case "code":
+      // ADR 0104 fan-out scaffold — the managed accumulator boundary reads as a muted, non-actionable
+      // step (still a read-only code row underneath).
+      if (row.scaffold === "collector_init") return "Fan-out";
+      if (row.scaffold === "return_collector") return "Deliver";
       return "Code";
   }
 }
@@ -292,6 +331,12 @@ function rowSubtitle(row: LensRow): string | undefined {
     const p = row.params ?? {};
     const text = p.template ?? p.label;
     return text !== undefined ? renderParamValue(text) : undefined;
+  }
+  if (row.scaffold === "collector_init") {
+    return "collect the fan-out sends";
+  }
+  if (row.scaffold === "return_collector") {
+    return "deliver the collected sends";
   }
   return undefined;
 }
@@ -376,6 +421,7 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
     lineStart: row.line_start,
     lineEnd: row.line_end,
     movable: isRowMovable(row),
+    isReturn: isReturnRow(row),
     title: rowTitle(row),
     params: rowParams(row),
     editableParams: editableParamNames(row),
@@ -392,6 +438,15 @@ export function buildRowViewModel(row: LensRow, index: number, lines: string[]):
   }
   if (row.suite !== undefined) {
     vm.suite = row.suite;
+  }
+  if (row.appended === true) {
+    vm.appended = true;
+  }
+  if (row.scaffold !== undefined) {
+    vm.scaffold = row.scaffold;
+  }
+  if (row.filtered === true) {
+    vm.filtered = true;
   }
   if (row.kind === "control" && row.control !== undefined) {
     vm.control = row.control;
@@ -769,15 +824,24 @@ export const TOOLBAR_INSERT_DEFAULTS: Record<string, Record<string, string>> = {
  * `expect_src` so the insertion is refused on a stale coordinate (F7). Reuses {@link buildInsertRequest}.
  */
 export function buildToolbarInsertRequest(
-  anchor: { handler: string; lineStart: number; lineEnd: number; expectSrc?: string; kind: RowKind },
+  anchor: {
+    handler: string;
+    lineStart: number;
+    lineEnd: number;
+    expectSrc?: string;
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+  },
   action: string,
   position?: "before" | "after",
 ): InsertRequest {
   const params = { ...(TOOLBAR_INSERT_DEFAULTS[action] ?? {}) };
   // An EXPLICIT position (the row context menu's "Insert before"/"Insert after") wins; otherwise DERIVE it
-  // from the anchor kind (the toolbar Add, which passes none) — a `send` row is the handler's return, so a
-  // new action must precede it. Both callers ride the same `insert_row` engine path (no second surface).
-  const pos: "before" | "after" = position ?? (anchor.kind === "send" ? "before" : "after");
+  // from whether the anchor is a terminal RETURN (the toolbar Add, which passes none) — a new action must
+  // precede a return/footer, but may FOLLOW a mid-body append send (ADR 0104). Both callers ride the same
+  // `insert_row` engine path (no second surface).
+  const pos: "before" | "after" = position ?? (isReturnRow(anchor) ? "before" : "after");
   return buildInsertRequest(anchor, action, params, pos);
 }
 
@@ -807,7 +871,7 @@ export interface AddMenuItem {
   id: string;
   label: string;
   group: AddMenuGroup;
-  op: "insert_row" | "template" | "insert_clause" | "insert_comment" | "insert_code_lookup";
+  op: "insert_row" | "template" | "insert_clause" | "insert_comment" | "insert_code_lookup" | "insert_send";
   action?: string; // op === "insert_row"
   template?: string; // op === "template"
   clause?: "elif" | "else"; // op === "insert_clause"
@@ -923,7 +987,10 @@ export const ADD_MENU_CATALOG: readonly AddMenuItem[] = [
     ],
   },
   {
-    id: "send", label: "Send", group: "Structure & flow", op: "template", template: "send",
+    // ADR 0104 fan-out: Add→Send authors the accumulator idiom (`sends.append(Send(dest, msg))` +
+    // managed `sends = []`/`return sends` scaffold), NOT a `return Send(...)`. The engine's `insert_send`
+    // op lays the scaffold in a fresh handler or appends into an existing accumulator.
+    id: "send", label: "Send", group: "Structure & flow", op: "insert_send",
     prompts: [{ field: "destination", label: "Destination", kind: "destination" }],
   },
   {
@@ -955,11 +1022,19 @@ export function addMenuGroups(): { group: AddMenuGroup; items: AddMenuItem[] }[]
  */
 export function buildAddMenuRequest(
   item: AddMenuItem,
-  anchor: { handler: string; lineStart: number; lineEnd: number; expectSrc?: string; kind: RowKind },
+  anchor: {
+    handler: string;
+    lineStart: number;
+    lineEnd: number;
+    expectSrc?: string;
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+  },
   values: Record<string, string>,
   position?: "before" | "after",
 ): StructuralRequest {
-  const pos: "before" | "after" = position ?? (anchor.kind === "send" ? "before" : "after");
+  const pos: "before" | "after" = position ?? (isReturnRow(anchor) ? "before" : "after");
   const base = { handler: anchor.handler, line_start: anchor.lineStart, line_end: anchor.lineEnd };
   const withExpect = <T extends { expect_src?: string }>(req: T): T => {
     if (anchor.expectSrc !== undefined) {
@@ -1028,7 +1103,49 @@ export function buildAddMenuRequest(
       if (values.default) req.default = values.default;
       return withExpect(req);
     }
+    case "insert_send": {
+      // ADR 0104 fan-out — an accumulator `sends.append(Send(dest, msg))`. Position follows the same
+      // return-aware rule (append after a mid-body step, before a terminal return/footer).
+      const req: InsertSendRequest = {
+        ...base,
+        op: "insert_send",
+        position: pos,
+        destination: values.destination ?? "",
+      };
+      return withExpect(req);
+    }
   }
+}
+
+/**
+ * Build the `add_destination` edit for the per-row "+ dest" button (pure; unit-testable). The anchor is
+ * the send row the user clicked; `destination` is the new outbound. The engine appends into an existing
+ * accumulator or converts a `return Send(...)` / `return [...]` up to the accumulator idiom (ADR 0104).
+ */
+export function buildAddDestinationRequest(
+  anchor: {
+    handler: string;
+    lineStart: number;
+    lineEnd: number;
+    expectSrc?: string;
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+  },
+  destination: string,
+): AddDestinationRequest {
+  const req: AddDestinationRequest = {
+    handler: anchor.handler,
+    line_start: anchor.lineStart,
+    line_end: anchor.lineEnd,
+    op: "add_destination",
+    position: isReturnRow(anchor) ? "before" : "after",
+    destination,
+  };
+  if (anchor.expectSrc !== undefined) {
+    req.expect_src = anchor.expectSrc;
+  }
+  return req;
 }
 
 // ---- row context menu (right-click, BACKLOG #222 follow-up to ADR 0100) ------------------------------
@@ -1046,6 +1163,8 @@ export interface ContextMenuEnablement {
   deleteRow: boolean;
   moveUp: boolean;
   moveDown: boolean;
+  // ADR 0104 fan-out: "Add destination" — only on a real send row (never the `return []` filter).
+  addDestination: boolean;
 }
 
 /**
@@ -1057,15 +1176,20 @@ export interface ContextMenuEnablement {
  * {@link walkMove} returning a destination, so a suite edge / non-movable / sole-child row greys them).
  */
 export function contextMenuEnablement(
-  kind: RowKind,
+  row: { kind: RowKind; appended?: boolean; scaffold?: string; filtered?: boolean },
   ctx: { canMoveUp: boolean; canMoveDown: boolean },
 ): ContextMenuEnablement {
   return {
     insertBefore: true,
-    insertAfter: kind !== "send",
-    deleteRow: isRowEditable(kind),
+    // Insert AFTER is suppressed on a terminal return (a returned send OR the `return sends` footer) — a
+    // step after it is dead code — but ALLOWED on a mid-body `sends.append(...)` (ADR 0104), which is a
+    // normal step, not a return.
+    insertAfter: !isReturnRow(row),
+    deleteRow: isRowEditable(row.kind),
     moveUp: ctx.canMoveUp,
     moveDown: ctx.canMoveDown,
+    // ADR 0104 fan-out: add another destination — on any real send (returned or appended), never the filter.
+    addDestination: row.kind === "send" && row.filtered !== true,
   };
 }
 
@@ -1209,6 +1333,32 @@ export interface PasteRequest {
   expect_src?: string;
 }
 
+/** The `lens rewrite` spec for an `insert_send` op (ADR 0104 fan-out — add an accumulator
+ * `sends.append(Send(dest, msg))`, laying `sends = []`/`return sends` scaffold in a fresh handler). The
+ * authored form is native Python the lens re-recognizes as an editable send row (#26-clean). */
+export interface InsertSendRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "insert_send";
+  position: "before" | "after";
+  destination: string;
+  expect_src?: string;
+}
+
+/** The `lens rewrite` spec for an `add_destination` op (ADR 0104 fan-out — the per-row "+ dest" button):
+ * add one more destination to a send, converting a `return Send(...)` / `return [...]` up to the
+ * accumulator idiom (preserving each existing Send verbatim) when the handler is not already one. */
+export interface AddDestinationRequest {
+  handler: string;
+  line_start: number;
+  line_end: number;
+  op: "add_destination";
+  position: "before" | "after";
+  destination: string;
+  expect_src?: string;
+}
+
 export type StructuralRequest =
   | DeleteRequest
   | MoveRequest
@@ -1217,7 +1367,9 @@ export type StructuralRequest =
   | TemplateRequest
   | InsertClauseRequest
   | InsertCommentRequest
-  | InsertCodeLookupRequest;
+  | InsertCodeLookupRequest
+  | InsertSendRequest
+  | AddDestinationRequest;
 
 /**
  * The lens ops that change LINE COUNTS — after any of them every row coordinate the webview held is
@@ -1234,6 +1386,9 @@ export const STRUCTURAL_OPS: ReadonlySet<string> = new Set([
   "insert_clause",
   "insert_comment",
   "insert_code_lookup",
+  // ADR 0104 fan-out inserts.
+  "insert_send",
+  "add_destination",
 ]);
 
 /** Whether an op invalidates every row coordinate (structural) and so forces a re-projection. */
@@ -1324,6 +1479,11 @@ export interface RowDropContext {
   suite: string;
   kind: RowKind;
   draggable: boolean;
+  // ADR 0104 fan-out flags (read from the DOM datasets) so {@link isReturnRow} distinguishes a mid-body
+  // append send (a two-zone drop target that emits an after-slot) from a terminal return / scaffold footer
+  // (clamps to before, no after-slot). Absent → treated as a return, unchanged.
+  appended?: boolean;
+  scaffold?: string;
   // A draggable if/for HEADER row (elif/else are neither draggable nor a target). It gets the tri-zone
   // hit-test (before-outer / into-body / after-outer); a leaf gets the two-zone before/after.
   isControlHeader: boolean;
@@ -1410,8 +1570,13 @@ export function resolveDrop(
       landingDepth: target.nesting + 1,
     };
   }
-  const toPosition: "before" | "after" =
-    target.kind === "send" ? "before" : pointerFraction > 0.5 ? "after" : "before";
+  // A terminal return / scaffold footer clamps to `before` (a block never lands after the return as dead
+  // code); a mid-body append send (ADR 0104) gets the normal two-zone before/after like any leaf.
+  const toPosition: "before" | "after" = isReturnRow(target)
+    ? "before"
+    : pointerFraction > 0.5
+      ? "after"
+      : "before";
   return {
     anchorLineStart: target.lineStart,
     anchorLineEnd: target.lineEnd,
@@ -1553,7 +1718,9 @@ function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {
           toSuite: suiteId,
           landingDepth: R.nesting,
         });
-      } else if (R.kind !== "send") {
+      } else if (!isReturnRow(R)) {
+        // A mid-body append send (ADR 0104) emits an after-slot like any leaf; a terminal return /
+        // scaffold footer does not (a block never lands after the return).
         slots.push({
           anchorLineStart: R.lineStart,
           anchorLineEnd: R.lineEnd,
@@ -1768,10 +1935,20 @@ export function buildInsertRequest(
  * used from the clipboard (the engine derives the indent from the block text, never from `clip.nesting`).
  */
 export function buildPasteRequest(
-  anchor: { handler: string; lineStart: number; lineEnd: number; expectSrc?: string; kind: RowKind },
+  anchor: {
+    handler: string;
+    lineStart: number;
+    lineEnd: number;
+    expectSrc?: string;
+    kind: RowKind;
+    appended?: boolean;
+    scaffold?: string;
+  },
   clip: ClipboardBlock,
 ): PasteRequest {
-  const position: "before" | "after" = anchor.kind === "send" ? "before" : "after";
+  // A terminal return / scaffold footer takes the block BEFORE it (no dead code); a mid-body append send
+  // (ADR 0104) takes it after.
+  const position: "before" | "after" = isReturnRow(anchor) ? "before" : "after";
   const req: PasteRequest = {
     handler: anchor.handler,
     line_start: anchor.lineStart,
@@ -2010,6 +2187,11 @@ function renderRowActionsHtml(row: RowViewModel, handlerName: string): string {
   if (isRowEditable(row.kind)) {
     buttons.push(btn("deleteRow", "&#128465;", "Delete this row"));
   }
+  // ADR 0104 fan-out: a per-row "＋ dest" on a real send (not the `return []` filter) adds another
+  // destination — appending into the accumulator, or converting a returned send up to it.
+  if (row.kind === "send" && !row.filtered) {
+    buttons.push(btn("addDestination", "&#65291;", "Add another destination (fan out)"));
+  }
   return `<span class="row-actions">${buttons.join("")}</span>`;
 }
 
@@ -2039,14 +2221,21 @@ export function renderRowHtml(row: RowViewModel, handlerName = ""): string {
   // can be intercepted and answered with "edit it in the code editor" — it stays read-only (the page script
   // cancels the drag on dragstart and never treats a code row as a drop target). See stepsView.ts.
   const draggable = handlerName && (row.movable || row.kind === "code") ? ` draggable="true"` : "";
+  // ADR 0104 fan-out: a `row-scaffold` class mutes the managed `sends = []` / `return sends` boundary.
+  const scaffoldClass = row.scaffold ? " row-scaffold" : "";
   // Every row carries its anchor coordinates + projection-time source + kind on the <li> so the webview's
   // ROW-SELECTION model (the toolbar Add's insert location) can read them; `tabindex` makes a selected row
-  // keyboard-focusable. `data-kind` lets the client derive the insert position (send → before, else after).
+  // keyboard-focusable. `data-is-return` (the precomputed isReturnRow) lets the client derive the insert
+  // position (a return / scaffold footer → before; a mid-body append → after) without duplicating the rule.
   return (
-    `<li class="row row-${escapeHtml(row.kind)}"${draggable} ${indent} tabindex="0" ` +
+    `<li class="row row-${escapeHtml(row.kind)}${scaffoldClass}"${draggable} ${indent} tabindex="0" ` +
     `data-handler="${escapeHtml(handlerName)}" data-line-start="${row.lineStart}" ` +
     `data-line-end="${row.lineEnd}" data-expect-src="${escapeHtml(row.expectSrc ?? "")}" ` +
     `data-kind="${escapeHtml(row.kind)}" data-nesting="${row.nesting}" data-suite="${escapeHtml(row.suite ?? "")}" ` +
+    // ADR 0104 fan-out flags for the CSP-isolated webview mirror: `data-appended` (a mid-body send),
+    // `data-scaffold` (the muted init/footer), `data-is-return` (the terminal-return test).
+    `data-appended="${row.appended ? "true" : ""}" data-scaffold="${escapeHtml(row.scaffold ?? "")}" ` +
+    `data-is-return="${row.isReturn ? "true" : ""}" data-filtered="${row.filtered ? "true" : ""}" ` +
     // data-control (control rows only) lets the DnD layer include an elif/else CONTINUATION when it walks a
     // dropped-after block's body to find its visual bottom (the insertion-bar anchor, insertionBarAnchor).
     `data-control="${escapeHtml(row.control ?? "")}">` +
@@ -2127,6 +2316,9 @@ export function renderStepsContextMenuHtml(): string {
     `<div id="stepsCtxMenu" class="ctx-menu ctx-root" role="menu" hidden>` +
     insertParent("before", "Insert before") +
     insertParent("after", "Insert after") +
+    // ADR 0104 fan-out: "Add destination" on a Send row (enabled by the webview only on a real, non-filter
+    // send) — the discoverable sibling of the per-row "＋ dest" button.
+    leaf("addDestination", "Add destination") +
     `<div class="ctx-sep" role="separator"></div>` +
     leaf("deleteRow", "Delete") +
     leaf("moveUp", "Move up") +

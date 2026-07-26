@@ -24,15 +24,15 @@ from messagefoundry.config.wiring import (
     DatabaseRef,
     FileRef,
     Reference,
-    Registry,
     ReferenceSpec,
+    Registry,
     Send,
     env,
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import route_message
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
-from messagefoundry.store.crypto import generate_key, make_cipher
+from messagefoundry.store.crypto import AesGcmCipher, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 REF = ReferenceSettings()  # defaults
@@ -66,9 +66,8 @@ def test_reference_resolves_get_and_missing_key() -> None:
 
 
 def test_reference_missing_set_raises() -> None:
-    with activated({"a": {}}):
-        with pytest.raises(ReferenceError, match="no such reference set 'b'"):
-            reference("b")
+    with activated({"a": {}}), pytest.raises(ReferenceError, match="no such reference set 'b'"):
+        reference("b")
 
 
 def test_activated_restores_prior_view() -> None:
@@ -172,6 +171,38 @@ async def test_snapshot_encrypted_at_rest(tmp_path: Path) -> None:
     # reopening with the same cipher decrypts back into the cache
     reopened = await MessageStore.open(db, cipher=cipher)
     assert reopened.reference_view()["codes"]["MRN"] == "SECRET999"
+    await reopened.close()
+
+
+async def test_reference_rows_rotate_on_reencrypt_to_active(tmp_path: Path) -> None:
+    """Key rotation (reencrypt_to_active) must rotate reference.value too (BACKLOG #235) — without
+    the reference pass, a later retired-key drop silently loses every synced snapshot."""
+    db = tmp_path / "rot.db"
+    k1, k2 = generate_key(), generate_key()
+    store = await MessageStore.open(db, cipher=make_cipher(k1))
+    await store.write_reference_snapshot(
+        name="codes", version="v1", rows={"P1": {"mrn": "M-SECRET-1"}, "P2": "plain"}
+    )
+    await store.close()
+
+    c2 = make_cipher(k2, [k1])
+    assert isinstance(c2, AesGcmCipher)
+    rotated = await MessageStore.open(db, cipher=c2)
+    assert await rotated.reencrypt_to_active() == 2  # exactly the two reference rows
+    cur = await rotated._db.execute("SELECT value FROM reference")
+    rows = list(await cur.fetchall())
+    assert len(rows) == 2
+    for r in rows:
+        # under the ACTIVE key now (mfenc:v1:<k2-fingerprint>:...), with no plaintext PHI visible
+        assert str(r["value"]).startswith(c2.active_marker_prefix)
+        assert "M-SECRET-1" not in str(r["value"])
+    assert rotated.reference_view()["codes"]["P1"] == {"mrn": "M-SECRET-1"}  # still decrypts
+    assert await rotated.reencrypt_to_active() == 0  # idempotent
+    await rotated.close()
+
+    # Proof the rows were actually rewritten: a handle with ONLY k2 (retired key dropped) reads them.
+    reopened = await MessageStore.open(db, cipher=make_cipher(k2))
+    assert reopened.reference_view()["codes"] == {"P1": {"mrn": "M-SECRET-1"}, "P2": "plain"}
     await reopened.close()
 
 
@@ -308,7 +339,7 @@ def _patch_pool(
 
 
 def _db_spec(**over: Any) -> ReferenceSpec:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         server="sql.example.com",
         database="Clarity",
         statement="SELECT provider_id, npi FROM providers",
@@ -536,3 +567,254 @@ def test_dryrun_resolves_file_reference(tmp_path: Path) -> None:
     outcome = route_message(reg, reg.inbound["IN"], raw)
     assert len(outcome.deliveries) == 1
     assert "9991" in outcome.deliveries[0].payload  # the looked-up NPI was stamped
+
+
+# --- backend capability gate (ADR 0006 "Backend support") --------------------
+#
+# The snapshot store ships on all three backends (SQLite reference impl, Postgres port, SQL Server port
+# — BACKLOG #235). The engine still ALLOW-LISTS reference sets to a backend whose
+# supports_reference_sets is True and REFUSES a graph declaring one anywhere else — at start, at
+# reload/promote, and at `messagefoundry check` — so on a future backend that never ports the snapshot
+# store a Handler's reference(...) read can never raise per message, post-ACK, forever. Refusal (not an
+# ADR-0031 lane degrade) because a set is registry-GLOBAL: the read is a runtime-only reference(name)
+# call with no sound static handler->refset edge, so there is no lane to scope a degrade to. These fake
+# the capability on a real SQLite store (no server stood up).
+
+
+def _ref_graph(csv: Path, *, with_reference: bool = True) -> Registry:
+    """A FILE-connector graph (no socket binds), optionally declaring one reference set."""
+    from messagefoundry.config.models import ConnectorType, Validation
+    from messagefoundry.config.wiring import (
+        ConnectionSpec,
+        InboundConnection,
+        OutboundConnection,
+    )
+
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "IB_REF",
+            ConnectionSpec(ConnectorType.FILE, {"directory": str(csv.parent), "pattern": "*.hl7"}),
+            router="r",
+            validation=Validation(strict=False, hl7_version="2.5.1"),
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection("OB_REF", ConnectionSpec(ConnectorType.FILE, {"directory": "."}))
+    )
+    reg.add_router("r", lambda _m: ["h"])
+    reg.add_handler("h", lambda m: [Send("OB_REF", m)])
+    if with_reference:
+        reg.add_reference(ReferenceSpec(name="provider_npi", source=FileRef(path=str(csv))))
+    return reg
+
+
+def test_supports_reference_sets_flags_per_backend() -> None:
+    # The capability manifest, read off the CLASSES (offline — no server, no driver: the store modules
+    # import driver-free because every backend defers aioodbc/asyncpg to .open()).
+    from messagefoundry.store.base import QueueStore
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    assert MessageStore.supports_reference_sets is True  # the reference implementation
+    assert PostgresStore.supports_reference_sets is True  # ported, not stubbed
+    assert SqlServerStore.supports_reference_sets is True  # ported at parity (BACKLOG #235)
+    # ALLOW-LIST: the protocol default is False, so a FUTURE backend that never ports the snapshot store
+    # is caught by the same gate rather than failing open.
+    assert QueueStore.supports_reference_sets is False
+
+
+def test_backend_supports_reference_sets_matches_the_class_flags() -> None:
+    # THE DRIFT GUARD. `check` gates on the DECLARED backend (it has no live store); the engine gates on
+    # the LIVE store. That is only sound because both resolve the SAME class flag — pin it.
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.store.base import backend_supports_reference_sets
+    from messagefoundry.store.postgres import PostgresStore
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    for backend, cls in (
+        (StoreBackend.SQLITE, MessageStore),
+        (StoreBackend.POSTGRES, PostgresStore),
+        (StoreBackend.SQLSERVER, SqlServerStore),
+    ):
+        assert backend_supports_reference_sets(backend) is bool(cls.supports_reference_sets)
+
+
+async def test_reference_backend_gate_refuses_declared_sets_on_unsupporting_backend(
+    tmp_path: Path,
+) -> None:
+    # A declared Reference(...) on a backend with no snapshot store is REFUSED, naming the set and the
+    # backend. (Fake the capability on a real SQLite store — no SQL Server required.)
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.pipeline.wiring_runner import check_reference_backend_supported
+
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "gate.db")
+    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+    store.supports_reference_sets = False  # type: ignore[assignment]
+    try:
+        with pytest.raises(WiringError) as exc:
+            check_reference_backend_supported(_ref_graph(csv), store)
+        msg = str(exc.value)
+        assert "'provider_npi'" in msg  # names the offending set
+        assert "sqlserver" in msg  # ...and the backend
+    finally:
+        await store.close()
+
+
+async def test_reference_backend_gate_is_a_noop_without_declared_sets(tmp_path: Path) -> None:
+    # The non-regression half of the allow-list: a graph declaring NO reference set passes on an
+    # unsupporting backend, so every existing SQL Server deployment that doesn't use them is untouched.
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.pipeline.wiring_runner import check_reference_backend_supported
+
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "gate.db")
+    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+    store.supports_reference_sets = False  # type: ignore[assignment]
+    try:
+        check_reference_backend_supported(_ref_graph(csv, with_reference=False), store)  # no raise
+    finally:
+        await store.close()
+
+
+async def test_engine_start_refuses_graph_with_reference_set_on_unsupporting_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Engine.start() REFUSES before _start_graph runs. The ordering is load-bearing: _start_graph ->
+    # _reconcile_reference_sync(startup=True) -> sync_all() -> write_reference_snapshot is the exact call
+    # chain that detonates today, so pin that sync_all was never even reached.
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.pipeline.engine import Engine
+
+    reached: list[str] = []
+
+    async def spy_sync_all(self: ReferenceSyncRunner, now: float | None = None) -> Any:
+        reached.append("sync_all")
+        raise AssertionError("sync_all must not be reached on a refused graph")
+
+    monkeypatch.setattr(ReferenceSyncRunner, "sync_all", spy_sync_all)
+
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "start.db")
+    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+    store.supports_reference_sets = False  # type: ignore[assignment]
+    engine = Engine(store)
+    engine.add_registry(_ref_graph(csv))
+    try:
+        with pytest.raises(WiringError) as exc:
+            await engine.start()
+        assert "'provider_npi'" in str(exc.value)
+        assert reached == []  # refused BEFORE the startup sync — nothing tried to write a snapshot
+    finally:
+        await engine.stop()
+        await store.close()
+
+
+async def test_reload_refuses_adding_a_reference_set_on_unsupporting_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The property that makes the gate safe for a LIVE engine, and the reason it lives in build_check and
+    # not only in Engine.start: a graph with no reference set starts clean on an unsupporting backend, and
+    # a reload that ADDS the first Reference(...) is rejected (WiringError -> 422) BEFORE the swap — the
+    # already-running graph is left untouched.
+    from messagefoundry.config.settings import StoreBackend
+    from messagefoundry.config.wiring import WiringError
+    from messagefoundry.pipeline.engine import Engine
+
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "reload.db")
+    store.backend = StoreBackend.SQLSERVER  # type: ignore[assignment]
+    store.supports_reference_sets = False  # type: ignore[assignment]
+    engine = Engine(store)
+    engine.add_registry(_ref_graph(csv, with_reference=False))
+    try:
+        await engine.start()  # no reference set -> starts clean on an unsupporting backend
+        assert engine.registry_runner is not None and engine.registry_runner.running
+        assert not engine.registry_runner.registry.references
+
+        monkeypatch.setattr(
+            "messagefoundry.pipeline.engine.load_config",
+            lambda _path: _ref_graph(csv),
+            raising=True,
+        )
+        with pytest.raises(WiringError) as exc:
+            await engine.reload(tmp_path)
+        assert "'provider_npi'" in str(exc.value)
+
+        # UNTOUCHED: still running, still no reference set (the new graph never went live).
+        assert engine.registry_runner.running
+        assert not engine.registry_runner.registry.references
+    finally:
+        await engine.stop()
+        await store.close()
+
+
+# --- sync: a permanent backend incapability is not a flaky source ------------
+
+
+async def test_sync_does_not_retry_a_backend_that_cannot_materialize(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A store that can NEVER materialize a snapshot (write_reference_snapshot raises NotImplementedError)
+    # must be reported ONCE, at ERROR, and never retried. Previously this was swallowed by the generic
+    # source-failure handler, which logged "sync failed (keeping last-good): NotImplementedError" every
+    # interval, forever — a line that lies twice: the source is fine, and there is no last-good (there
+    # never was one and there never can be one).
+    csv = _csv(tmp_path / "npi.csv", "key,value\nMED1,9991\n")
+    store = await MessageStore.open(tmp_path / "unsupported.db")
+
+    attempts: list[str] = []
+
+    async def raising_write(*, name: str, version: str, rows: Any) -> None:
+        attempts.append(name)
+        raise NotImplementedError("this backend has no reference tables")
+
+    store.write_reference_snapshot = raising_write  # type: ignore[assignment,method-assign]
+    alerts = _CapturingAlerts()
+    runner = ReferenceSyncRunner(
+        store, lambda: [_spec("provider_npi", csv)], REF, alert_sink=alerts
+    )
+    try:
+        with caplog.at_level("WARNING"):
+            first = await runner.sync_all()
+            second = (
+                await runner.sync_all()
+            )  # forced — yet the set must be SKIPPED, not re-attempted
+        assert first.failed == 1 and first.synced == 0
+        assert second.failed == 0 and second.synced == 0  # not re-attempted at all
+        assert attempts == ["provider_npi"]  # the write was tried exactly ONCE
+        assert len(alerts.details) == 1  # alerted once, not every pass
+        errors = [r for r in caplog.records if r.levelname == "ERROR"]
+        assert len(errors) == 1  # logged once, loudly
+        # ...and it must not repeat the two lies of the old transient-source path.
+        assert "keeping last-good" not in caplog.text
+        assert "source sync failed" not in caplog.text
+    finally:
+        await store.close()
+
+
+async def test_genuine_source_failure_still_retries_and_keeps_last_good(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The regression guard on the split: a GENUINE source failure (a missing CSV) is still treated as
+    # TRANSIENT — counted failed, last-good kept, retried next pass — and still logged with the PHI-safe
+    # class-name-only discipline. The NotImplementedError arm must not have hardened or swallowed this.
+    missing = tmp_path / "gone.csv"  # never written
+    store = await MessageStore.open(tmp_path / "flaky.db")
+    alerts = _CapturingAlerts()
+    runner = ReferenceSyncRunner(
+        store, lambda: [_spec("provider_npi", missing)], REF, alert_sink=alerts
+    )
+    try:
+        with caplog.at_level("WARNING"):
+            first = await runner.sync_all()
+            second = await runner.sync_all()  # RE-ATTEMPTED: a source can come back
+        assert first.failed == 1 and second.failed == 1
+        assert len(alerts.details) == 2  # alerted on both passes (still transient)
+        assert "keeping last-good" in caplog.text
+        assert not [r for r in caplog.records if r.levelname == "ERROR"]  # WARNING, not ERROR
+    finally:
+        await store.close()

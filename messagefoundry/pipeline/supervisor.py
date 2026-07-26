@@ -257,20 +257,20 @@ class Supervisor:
         """Terminate every live child, escalating to kill() after ``terminate_grace`` seconds."""
         live = [c for c in self._children.values() if c.process.returncode is None]
         for child in live:
-            try:
+            try:  # noqa: SIM105
                 child.process.terminate()
             except ProcessLookupError:
                 pass  # already gone
         for child in live:
             try:
                 await asyncio.wait_for(child.process.wait(), timeout=self.terminate_grace)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning(
                     "shard %r did not exit in %.0fs — killing",
                     child.spec.shard,
                     self.terminate_grace,
                 )
-                try:
+                try:  # noqa: SIM105
                     child.process.kill()
                 except ProcessLookupError:
                     pass
@@ -322,7 +322,7 @@ async def supervise(
     if install_signal_handlers:
         loop = asyncio.get_running_loop()
         for sig in _shutdown_signals():
-            try:
+            try:  # noqa: SIM105
                 loop.add_signal_handler(sig, runner.cancel)
             except (NotImplementedError, ValueError):
                 # add_signal_handler is unsupported on Windows event loops; KeyboardInterrupt below

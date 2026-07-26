@@ -7,6 +7,7 @@ the `resolve_active_key` precedence are exercised on every CI leg via monkeypatc
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -24,7 +25,6 @@ from messagefoundry.secrets_dpapi import (
 )
 from messagefoundry.store.base import resolve_active_key
 from messagefoundry.store.crypto import generate_key
-import logging
 
 windows_only = pytest.mark.skipif(sys.platform != "win32", reason="DPAPI is Windows-only")
 
@@ -117,9 +117,8 @@ def test_dpapi_unprotect_failure_leaks_no_key_material(
     protected = bytearray(dpapi_protect(key.encode("ascii")))
     protected[len(protected) // 2] ^= 0xFF  # tamper the DPAPI ciphertext → integrity check fails
 
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(DpapiError) as excinfo:
-            dpapi_unprotect(bytes(protected))
+    with caplog.at_level(logging.DEBUG), pytest.raises(DpapiError) as excinfo:
+        dpapi_unprotect(bytes(protected))
 
     for hay in (str(excinfo.value), caplog.text):
         assert key not in hay  # the base64 store key never surfaces on the failure path

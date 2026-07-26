@@ -48,7 +48,10 @@ from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
+    ProxyConfig,
+    _no_redirect_opener,
     _redact_url,
+    proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
 )
 from messagefoundry.transports.smart import token_provider_from_settings
@@ -63,6 +66,7 @@ __all__ = [
     "bearer_provider_from_settings",
     "digest_handler_from_settings",
     "oauth2_cc_provider_from_settings",
+    "proxy_auth_handler_from_settings",
     "with_http_digest",
     "with_oauth2_client_credentials",
 ]
@@ -121,6 +125,7 @@ class OAuth2ClientCredentialsProvider:
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
         attested: bool = False,
+        proxy: ProxyConfig | None = None,
     ) -> None:
         if not token_url:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_token_url' setting")
@@ -165,7 +170,20 @@ class OAuth2ClientCredentialsProvider:
         self.auth_style = auth_style
         self.expiry_skew_seconds = max(0.0, expiry_skew_seconds)
         self.timeout_seconds = timeout_seconds
-        self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
+        # ADR 0126: the token-endpoint POST must ALSO traverse the connection's forward proxy — resolve it
+        # for the TOKEN host (its own bypass decision, #128). None / bypassed → the shared opener + no
+        # Proxy-Authorization (byte-identical).
+        token_proxy = (
+            proxy.for_host(urllib.parse.urlsplit(token_url).hostname or "") if proxy else None
+        )
+        self._opener: urllib.request.OpenerDirector = (
+            _no_redirect_opener(*token_proxy.opener_handlers())
+            if token_proxy is not None
+            else _NO_REDIRECT_OPENER
+        )
+        self._proxy_auth: dict[str, str] = (
+            token_proxy.auth_headers() if token_proxy is not None else {}
+        )
         self._lock = threading.Lock()
         self._cached_token: str | None = None
         self._cached_expiry_monotonic = 0.0
@@ -202,6 +220,7 @@ class OAuth2ClientCredentialsProvider:
         headers = {
             "Content-Type": "application/x-www-form-urlencoded",
             "Accept": "application/json",
+            **self._proxy_auth,  # ADR 0126: pre-emptive Proxy-Authorization when behind an auth proxy
         }
         if self.auth_style == "basic":
             raw = f"{self.client_id}:{self._client_secret}".encode()
@@ -249,11 +268,12 @@ class OAuth2ClientCredentialsProvider:
 
 
 def oauth2_cc_provider_from_settings(
-    s: Mapping[str, Any],
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
 ) -> OAuth2ClientCredentialsProvider | None:
     """The :class:`OAuth2ClientCredentialsProvider` for an ``env()``-resolved settings mapping, or ``None``
     when symmetric OAuth2-CC auth is off (``oauth2_token_url`` absent, or ``oauth2_enabled`` is False) — so
-    any connection that didn't configure it is byte-identical."""
+    any connection that didn't configure it is byte-identical. ``proxy`` (ADR 0126) routes the
+    token-endpoint POST through the connection's forward proxy."""
     if not s.get("oauth2_token_url"):
         return None
     if not s.get("oauth2_enabled", True):
@@ -271,15 +291,19 @@ def oauth2_cc_provider_from_settings(
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.
         attested=bool(s.get("tls_hop_attested", False)),
+        proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
     )
 
 
-def bearer_provider_from_settings(s: Mapping[str, Any]) -> BearerTokenProvider | None:
+def bearer_provider_from_settings(
+    s: Mapping[str, Any], *, proxy: ProxyConfig | None = None
+) -> BearerTokenProvider | None:
     """The active bearer-token provider for an HTTP destination, or ``None`` when none is configured
     (byte-identical). Unifies the SMART Backend Services provider (ADR 0024, asymmetric JWT) and the
     OAuth2 client-credentials provider (#65, symmetric secret) behind the one bearer seam the connector
     drives. The two are **mutually exclusive** on one connection — configuring both is a loud
-    :class:`HttpAuthError` (a connection has exactly one identity)."""
+    :class:`HttpAuthError` (a connection has exactly one identity). ``proxy`` (ADR 0126) routes whichever
+    provider's token-endpoint call through the connection's forward proxy."""
     # Detect the conflict from settings PRESENCE before constructing either provider, so a "both
     # configured" mistake reports the mutual-exclusion error rather than whichever provider's own
     # validation happens to fire first on partial config.
@@ -290,7 +314,9 @@ def bearer_provider_from_settings(s: Mapping[str, Any]) -> BearerTokenProvider |
             "a connection cannot use BOTH SMART Backend Services and OAuth2 client-credentials auth "
             "(mutually exclusive — configure exactly one)"
         )
-    return token_provider_from_settings(s) or oauth2_cc_provider_from_settings(s)
+    return token_provider_from_settings(s, proxy=proxy) or oauth2_cc_provider_from_settings(
+        s, proxy=proxy
+    )
 
 
 def digest_handler_from_settings(

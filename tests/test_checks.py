@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -175,6 +176,31 @@ def test_check_dryrun_unmapped_fixture_runs_every_inbound(tmp_path: Path) -> Non
     assert "IB_HL7" in dr.detail  # the error names the inbound the unmapped fixture reached
 
 
+def test_check_dryrun_skips_a_not_deployed_inbound(tmp_path: Path) -> None:
+    # #233 (ADR 0111): an unmapped fixture cross-products every inbound — but must NOT be run against a
+    # feed nobody deployed. IB_HL7 is present-but-not-deployed here, so the malformed body (which would
+    # ERROR against it) only ever reaches IB_RAW and the gate passes. Without the filter, every unmapped
+    # fixture in the repo would be cross-producted against a feed the config says is not running.
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File, ContentType\n"
+        "inbound('IB_HL7', File(directory='in1'), router='r', deployed=False)\n"
+        "inbound('IB_RAW', File(directory='in2'), router='r', content_type=ContentType.TEXT)\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    msgs = tmp_path / "messages"
+    msgs.mkdir()
+    (msgs / "x.hl7").write_bytes(BAD_HL7)
+    dr = next(
+        r for r in run_checks(cfg, messages_dir=msgs, run_lint=False).results if r.name == "dryrun"
+    )
+    assert dr.ok and dr.required and not dr.skipped, dr.detail
+    assert "1 run(s) clean" in dr.detail  # IB_RAW only — not the 2 runs an all-×-all would do
+
+
 def test_check_dryrun_non_feed_subdir_falls_back_to_all(tmp_path: Path) -> None:
     # A subdir that names no inbound ('misc') is unmapped → all-×-all (not silently pinned to nothing),
     # so the malformed body still reaches IB_HL7 and errors. Also proves the recursive discovery (the
@@ -222,7 +248,7 @@ def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setattr(checks.shutil, "which", lambda _: None)
     report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
     by_name = {r.name: r for r in report.results}
-    for tool in ("ruff", "mypy"):
+    for tool in ("ruff", "mypy", "ruff-security"):
         assert by_name[tool].skipped is True and by_name[tool].required is False
     assert report.ok is True  # advisory skips never block
 
@@ -230,8 +256,20 @@ def test_run_checks_skips_lint_when_absent(monkeypatch: pytest.MonkeyPatch) -> N
 def test_run_checks_no_lint_excludes_tools() -> None:
     report = run_checks(SAMPLES_CONFIG, run_lint=False)
     names = {r.name for r in report.results}
-    assert "ruff" not in names and "mypy" not in names
+    assert {"ruff", "mypy", "ruff-security"}.isdisjoint(names)
     assert "validate" in names and "dryrun" in names
+
+
+@pytest.mark.skipif(shutil.which("ruff") is None, reason="ruff advisory pass is run-if-installed")
+def test_ruff_security_ignores_placeholder_token_fp() -> None:
+    # ADR 0144 Increment 3: full `S` over the shipped samples trips S105 on the ADR-0015 body_secrets
+    # placeholder token (_TOK_PASSWORD); the curated --ignore S105,S106,S107 suppresses that structural
+    # false positive so the advisory pass reports clean (was ok=False carrying S105 under full `S`).
+    report = run_checks(SAMPLES_CONFIG, messages_dir=None, run_lint=True)
+    rs = {r.name: r for r in report.results}["ruff-security"]
+    assert rs.required is False  # still advisory, never blocks
+    assert rs.skipped is False and rs.ok is True
+    assert "S105" not in rs.detail
 
 
 def test_accepts_candidate_flags_leading_guard_filter_and_is_advisory(tmp_path: Path) -> None:
@@ -442,7 +480,7 @@ def test_posture_fails_custom_env_without_posture(tmp_path: Path) -> None:
     report = run_checks(cfg, run_lint=False)
     posture = next(r for r in report.results if r.name == "posture")
     assert posture.required and not posture.ok and not posture.skipped
-    assert "data_class" in posture.detail and "production" in posture.detail
+    assert "handles_real_patient_data" in posture.detail and "production_instance" in posture.detail
     assert report.ok is False  # a required check failed -> the gate fails
 
 
@@ -458,7 +496,9 @@ def test_posture_ok_builtin_env(tmp_path: Path) -> None:
 def test_posture_ok_custom_env_with_explicit_posture(tmp_path: Path) -> None:
     # A custom name is fine once posture is set explicitly (decoupled from the name, ADR 0017).
     cfg = _config_repo(
-        tmp_path, '[ai]\nenvironment = "poc"\ndata_class = "synthetic"\nproduction = false\n'
+        tmp_path,
+        "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+        '[ai]\nenvironment = "poc"\n',
     )
     report = run_checks(cfg, run_lint=False)
     posture = next(r for r in report.results if r.name == "posture")
@@ -481,3 +521,219 @@ def test_posture_skips_without_service_toml(tmp_path: Path) -> None:
     posture = next(r for r in report.results if r.name == "posture")
     assert posture.required and posture.ok and posture.skipped
     assert report.ok is True  # a skip never blocks
+
+
+# --- reference-backend check (ADR 0006 "Backend support") -----------------------------------------
+#
+# The reference-set snapshot store ships on all three backends (SQL Server ported by BACKLOG #235). The
+# allow-list gate STAYS for any future backend that leaves the protocol default False: a config declaring
+# a Reference(...) against such a backend used to pass this whole gate and then raise on every
+# reference(...) read at run time — post-ACK, forever. The gate refuses the pairing here, keyed on the
+# DECLARED [store] backend, mirroring serve's start-time gate. The failing arm below monkeypatches the
+# SQL Server class flag back to False to STAND IN for that future backend (the lazy class-flag resolution
+# in store/base.py backend_supports_reference_sets makes the patch flow through).
+
+
+# StoreSettings._require_server_db_fields rejects a bare `backend = "sqlserver"` (a server-DB backend must
+# carry its connection essentials), so the check's fail-safe "settings did not load -> SKIP" arm would
+# swallow the gate. A sqlserver toml therefore has to be a COMPLETE one — dummy values, never dialed: the
+# check only reads the declared backend.
+_SQLSERVER_TOML = (
+    "[store]\n"
+    'backend = "sqlserver"\n'
+    'server = "db.example.invalid"\n'
+    'database = "mefor"\n'
+    'username = "mefor_svc"\n'
+)
+
+
+def _reference_repo(tmp_path: Path, toml_body: str, *, with_reference: bool) -> Path:
+    """A config repo (messagefoundry.toml at the root, modules under config/), optionally declaring a
+    reference set backed by a real CSV."""
+    repo = tmp_path / "repo"
+    cfg = repo / "config"
+    cfg.mkdir(parents=True)
+    csv = repo / "npi.csv"
+    csv.write_text("key,value\nMED1,9991\n", encoding="utf-8")
+    ref_line = (
+        f"Reference('provider_npi', source=FileRef(path={str(csv)!r}))\n" if with_reference else ""
+    )
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, router, File, Reference, FileRef\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        f"{ref_line}"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    (repo / "messagefoundry.toml").write_text(toml_body, encoding="utf-8")
+    return cfg
+
+
+def _reference_check(cfg: Path) -> tuple[checks.CheckReport, checks.CheckResult]:
+    report = run_checks(cfg, run_lint=False)
+    return report, next(r for r in report.results if r.name == "reference-backend")
+
+
+def test_check_fails_when_reference_set_declared_against_unsupporting_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # THE FAILING ARM, preserved past the #235 flip. SQL Server now supports reference sets, so fake the
+    # one shape left to guard — a backend whose class flag is the allow-list default False — by patching
+    # the SQL Server flag back off. Such a config must FAIL a required check, naming the set and the
+    # backend, instead of passing the gate and breaking every reading message at run time.
+    from messagefoundry.store.sqlserver import SqlServerStore
+
+    monkeypatch.setattr(SqlServerStore, "supports_reference_sets", False)
+    cfg = _reference_repo(tmp_path, _SQLSERVER_TOML, with_reference=True)
+    report, result = _reference_check(cfg)
+    assert result.required and not result.ok and not result.skipped
+    assert "provider_npi" in result.detail and "sqlserver" in result.detail
+    assert report.ok is False  # a required check failed -> the gate fails
+
+
+def test_check_passes_reference_set_against_sqlserver_backend(tmp_path: Path) -> None:
+    # THE #235 END STATE: the exact config that was this gate's headline bug — a Reference(...) against
+    # [store] backend = "sqlserver" — now PASSES the required check, because the SQL Server store
+    # implements the ADR 0006 snapshot store (reference/reference_version tables at SQLite/PG parity).
+    cfg = _reference_repo(tmp_path, _SQLSERVER_TOML, with_reference=True)
+    report, result = _reference_check(cfg)
+    assert result.required and result.ok and not result.skipped
+    assert "sqlserver" in result.detail  # the PASS detail names the declared backend
+    assert report.ok is True
+
+
+def test_reference_backend_check_skips_and_passes_appropriately(tmp_path: Path) -> None:
+    # The three fail-safe arms (the _check_build convention), so the new REQUIRED check can never block
+    # an existing green config.
+
+    # (a) no messagefoundry.toml -> SKIP: a bare config dir declares no backend, and the SQLITE default
+    # supports reference sets anyway.
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / "c.py").write_text(
+        "from messagefoundry import inbound, router, File\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "@router('r')\n"
+        "def r(m): return []\n",
+        encoding="utf-8",
+    )
+    _, result = _reference_check(bare)
+    assert result.required and result.ok and result.skipped
+
+    # (b) the default (SQLite) backend + a declared Reference(...) -> PASS (it ships the snapshot store).
+    report, result = _reference_check(
+        _reference_repo(tmp_path / "b", '[ai]\nenvironment = "dev"\n', with_reference=True)
+    )
+    assert result.required and result.ok and not result.skipped
+    assert report.ok is True
+
+    # (c) the sqlserver backend but NO Reference(...) -> PASS: the gate keys on DECLARATION, so an
+    # existing SQL Server deployment that doesn't use reference sets is unaffected.
+    report, result = _reference_check(
+        _reference_repo(tmp_path / "c", _SQLSERVER_TOML, with_reference=False)
+    )
+    assert result.required and result.ok and not result.skipped
+    assert report.ok is True
+
+
+# --- #230 P4 (ADR 0104): the dryrun sub-check previews the engine's copy-on-Send posture ----------
+#
+# The gate resolves [pipeline].snapshot_on_send from this instance's messagefoundry.toml (same
+# resolution as the posture check) and threads it into every dry_run; no resolvable settings -> the
+# Settings-model default (ON), never a silent OFF. Copy-on-Send changes delivered BYTES only, so the
+# sub-check's disposition expectations are unchanged by the threading.
+
+
+def _fanout_repo(tmp_path: Path, toml_body: str | None) -> Path:
+    """An ADR-0017-shaped repo whose handler is a divergent fan-out (mutate between two Sends)."""
+    repo = tmp_path / "repo"
+    cfg = repo / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "outbound('OB_A', File(directory='outa'))\n"
+        "outbound('OB_B', File(directory='outb'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m):\n"
+        "    m['MSH-5'] = 'SYS_A'\n"
+        "    first = Send('OB_A', m)\n"
+        "    m['MSH-5'] = 'SYS_B'\n"
+        "    return [first, Send('OB_B', m)]\n",
+        encoding="utf-8",
+    )
+    if toml_body is not None:
+        (repo / "messagefoundry.toml").write_text(toml_body, encoding="utf-8")
+    return cfg
+
+
+def _probe_repo(tmp_path: Path, toml_body: str | None) -> Path:
+    """A repo whose handler Sends ONLY under an active copy-on-Send run context — the probe makes the
+    setting's threading observable as a disposition (RECEIVED when ON, FILTERED when off). It pins the
+    resolution path, not a supported authoring pattern (a real handler never branches on the flag)."""
+    repo = tmp_path / "repo"
+    cfg = repo / "config"
+    cfg.mkdir(parents=True)
+    (cfg / "c.py").write_text(
+        "from messagefoundry import inbound, outbound, router, handler, File, Send\n"
+        "from messagefoundry.config.send_snapshot import snapshot_on_send_active\n"
+        "inbound('IB_X', File(directory='in'), router='r')\n"
+        "outbound('OB_A', File(directory='out'))\n"
+        "@router('r')\n"
+        "def r(m): return ['h']\n"
+        "@handler('h')\n"
+        "def h(m):\n"
+        "    return Send('OB_A', m) if snapshot_on_send_active() else None\n",
+        encoding="utf-8",
+    )
+    if toml_body is not None:
+        (repo / "messagefoundry.toml").write_text(toml_body, encoding="utf-8")
+    return cfg
+
+
+_SNAPSHOT_OFF_TOML = "[pipeline]\nsnapshot_on_send = false\n"
+
+
+def test_check_dryrun_disposition_identical_under_both_snapshot_postures(tmp_path: Path) -> None:
+    # A divergent fan-out delivers different BYTES per posture but the same disposition (RECEIVED) —
+    # threading the setting must leave the sub-check's expectations and summary line unchanged.
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "RECEIVED\n")
+    details: list[str] = []
+    for leg, toml_body in (("on", None), ("off", _SNAPSHOT_OFF_TOML)):
+        cfg = _fanout_repo(tmp_path / leg, toml_body)
+        dr = _run_dryrun(cfg, msgs)
+        assert dr.ok and dr.required and not dr.skipped, dr.detail
+        assert "expectation-checked" in dr.detail
+        details.append(dr.detail)
+    assert details[0] == details[1]
+
+
+def test_check_dryrun_threads_engine_snapshot_posture_into_the_preview(tmp_path: Path) -> None:
+    # The behavioral proof of the threading itself, via the probe handler's flag-keyed disposition.
+    # (a) no messagefoundry.toml anywhere in the walk -> the Settings-model default (ON) -> RECEIVED.
+    msgs_on = _feed_fixture(tmp_path / "on", ADT_A01.encode("utf-8"), "RECEIVED\n")
+    dr = _run_dryrun(_probe_repo(tmp_path / "on", None), msgs_on)
+    assert dr.ok and dr.required and not dr.skipped, dr.detail
+
+    # (b) [pipeline].snapshot_on_send = false, discovered by the legacy upward-walk from config/ ->
+    # the preview runs with the flag off -> the probe filters -> FILTERED.
+    msgs_off = _feed_fixture(tmp_path / "off", ADT_A01.encode("utf-8"), "FILTERED\n")
+    dr = _run_dryrun(_probe_repo(tmp_path / "off", _SNAPSHOT_OFF_TOML), msgs_off)
+    assert dr.ok and dr.required and not dr.skipped, dr.detail
+
+
+def test_check_dryrun_honors_explicit_service_config(tmp_path: Path) -> None:
+    # AC-6 shape: run_checks(service_config=...) reads THAT file (no upward-walk finds one here — the
+    # toml lives outside the config tree under a non-default name), so the off-posture must come from
+    # the explicit path alone.
+    cfg = _probe_repo(tmp_path, None)
+    toml = tmp_path / "elsewhere" / "svc.toml"
+    toml.parent.mkdir()
+    toml.write_text(_SNAPSHOT_OFF_TOML, encoding="utf-8")
+    msgs = _feed_fixture(tmp_path, ADT_A01.encode("utf-8"), "FILTERED\n")
+    results = run_checks(cfg, messages_dir=msgs, run_lint=False, service_config=toml).results
+    dr = next(r for r in results if r.name == "dryrun")
+    assert dr.ok and dr.required and not dr.skipped, dr.detail

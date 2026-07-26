@@ -8,6 +8,7 @@
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { openAlertEditor } from "./alertEditor";
+import { openSecurityEditor } from "./securityEditor";
 import { registerSteps } from "./stepsView";
 import { showAiPolicy } from "./aiPolicy";
 import { configDir, isExecGated, workspaceDir } from "./cli";
@@ -20,6 +21,8 @@ import { registerChat } from "./chat";
 import { registerConfigEditors } from "./configEditors";
 import { newConnectionWizard } from "./connectionQuickInput";
 import { registerEditorToolbar } from "./editorToolbar";
+import { disposeEngineLog } from "./engineLog";
+import { EngineSetupPanel } from "./engineSetup";
 import { registerEngineStatusBar } from "./statusBar";
 import { registerInsertElement } from "./insertElement";
 import { generateSamples } from "./generate";
@@ -86,6 +89,7 @@ export function activate(context: vscode.ExtensionContext): void {
       graphView.message = graph.statusMessage();
     },
     () => graph.getFilter(),
+    String(context.extension.packageJSON.version ?? ""),
   );
   context.subscriptions.push(
     vscode.window.registerWebviewViewProvider("messagefoundry.home", home),
@@ -104,8 +108,11 @@ export function activate(context: vscode.ExtensionContext): void {
   registerInsertElement(context);
   // Live-debug v1 (#92): status-bar toggle + on-save dryrun → CodeLens summaries (off by default).
   registerLiveDebug(context);
-  // Engine status bar (#221c): promote-target URL/environment + reachability poll. Distinct from the
-  // left-side live-debug toggles above — this reflects the real engine, not the offline dry-run loop.
+  // Engine status bar (#221c, then the engine-link doctor ADR): the promote target, an HONEST verdict on
+  // whether the IDE can actually USE it (a green check is earned against a protected route, never assumed
+  // from a 200), and the repairs. Distinct from the left-side live-debug toggles above — this reflects the
+  // real engine, not the offline dry-run loop. Owns the "MessageFoundry Engine" log channel.
+  context.subscriptions.push({ dispose: disposeEngineLog });
   registerEngineStatusBar(context);
   // Custom editors (#221b): connections.toml + codesets/*.csv open in the form/grid by default, with
   // "Reopen With → Text Editor" always available. Reuses the existing form rendering; the router names
@@ -117,6 +124,10 @@ export function activate(context: vscode.ExtensionContext): void {
   registerSteps(context);
   const testBench = new TestBench(context);
   const cookbook = new CookbookPanel(context);
+  // The guided engine-setup page (BACKLOG #238, ADR 0112 amendment): what the status pill leads with
+  // in a store-less workspace. Palette-visible on purpose (recorded in the amendment), which is why
+  // its dev-engine copy is context-honest rather than assuming the pill's !hasStore state.
+  const engineSetup = new EngineSetupPanel(context);
   // ADR 0091 D3: the read-only, focus-first Wiring Map panel — pulls the graph from (and re-renders
   // with) the CONNECTIONS provider.
   const wiringMap = new WiringMapPanel(context, graph);
@@ -124,6 +135,7 @@ export function activate(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     vscode.commands.registerCommand("messagefoundry.openTestBench", () => testBench.open()),
     vscode.commands.registerCommand("messagefoundry.openCookbook", () => cookbook.open()),
+    vscode.commands.registerCommand("messagefoundry.openEngineSetup", () => engineSetup.open()),
     vscode.commands.registerCommand("messagefoundry.validate", () => validator.run()),
     vscode.commands.registerCommand("messagefoundry.refreshGraph", () => graph.refresh()),
     vscode.commands.registerCommand("messagefoundry.filterConnections", async () => {
@@ -192,7 +204,13 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand(
       "messagefoundry.openSource",
       async (file: string, line: number) => {
-        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(file));
+        // The graph reports ABSOLUTE paths for code-authored (.py) elements but a WORKSPACE-RELATIVE
+        // one for data-authored (connections.toml) connections. Resolve the relative case against the
+        // workspace root; otherwise Uri.file() reads it against the filesystem root and toasts
+        // "cannot open file:///connections.toml" (the row-click on an outbound connection).
+        const root = workspaceDir();
+        const abs = path.isAbsolute(file) || !root ? file : path.join(root, file);
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(abs));
         const pos = new vscode.Position(Math.max(0, (line ?? 1) - 1), 0);
         await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos) });
       },
@@ -247,6 +265,15 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("messagefoundry.showInWiringMap", (node?: vscode.TreeItem) =>
       vscode.commands.executeCommand("messagefoundry.openWiringMap", node),
     ),
+    // Inline "View as Steps" on a Handler row — only Handlers render as Steps. Forwards the row's
+    // source file (its open-definition command carries [file, line]) to openSteps as a Uri. Hidden
+    // from the palette (package.json commandPalette when:false).
+    vscode.commands.registerCommand("messagefoundry.openStepsFromNode", (node?: vscode.TreeItem) => {
+      const file = node?.command?.arguments?.[0];
+      if (typeof file === "string") {
+        void vscode.commands.executeCommand("messagefoundry.openSteps", vscode.Uri.file(file));
+      }
+    }),
     // Gear action on a connection row. A connections.toml (data-authored) connection opens the
     // editor; a code-authored one jumps to its .py definition (it isn't GUI-editable — ADR 0007).
     vscode.commands.registerCommand("messagefoundry.openConnectionSettings", (node?: vscode.TreeItem) => {
@@ -362,6 +389,8 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("messagefoundry.setRepoStorage", () => setRepoStorage()),
     // Author a [[alerts.rules]] entry in the service-settings TOML (ADR 0014; webview shells the CLI).
     vscode.commands.registerCommand("messagefoundry.newAlert", () => openAlertEditor(context)),
+    // Edit the [security] posture in the service-settings TOML (ADR 0118; webview shells `security` CLI).
+    vscode.commands.registerCommand("messagefoundry.editSecurity", () => openSecurityEditor(context)),
     vscode.commands.registerCommand("messagefoundry.generateSamples", () => generateSamples()),
     vscode.commands.registerCommand("messagefoundry.promote", () => promote(context)),
     vscode.commands.registerCommand("messagefoundry.showAiPolicy", () => showAiPolicy(context)),

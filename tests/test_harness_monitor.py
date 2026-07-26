@@ -13,16 +13,17 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 import uvicorn
 
 pytest.importorskip("PySide6")
 
-from messagefoundry.api import create_managed_app  # noqa: E402
 from harness.monitor import MonitorPanel  # noqa: E402
+from messagefoundry.api import create_managed_app  # noqa: E402
 
 ADT = "MSH|^~\\&|APP|FAC|RAPP|RFAC|20260604||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 

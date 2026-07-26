@@ -46,9 +46,10 @@ rather than inventing a parallel one.
 Two [CLAUDE.md](../../CLAUDE.md) invariants bound the design and **must not** be relaxed:
 
 - **Count-and-log** (§2): "**every received message is persisted before the ACK** … nothing is
-  accepted-and-dropped." A purge therefore **NULLs the PHI *body* while keeping the metadata row** (counts,
+  accepted-and-dropped." A purge therefore **NULLs the PHI *body* while keeping the message row** (counts,
   disposition, audit intact — the Mirth Data-Pruner pattern, `purge_message_bodies`' existing contract); it
-  never deletes a `messages` row.
+  never deletes a `messages` row. See the [2026-07-23 amendment](#amendment-2026-07-23--metadata-rides-the-body-window-asvs-1427):
+  the *row* is kept, but its PHI *columns* — `messages.metadata` included — are not.
 - **Reliability / at-least-once** (§2, ADR 0001): a body still in flight is never purged
   (`purge_message_bodies` already guards `NOT EXISTS (… queue.status IN pending/inflight)`); a per-connection
   cutoff only changes *which age* is eligible, never that guard.
@@ -190,7 +191,49 @@ split pins it.
 `state_max_age_days` (per-*namespace* follow-up, not per-connection), `connection_event_retention_hours`
 (#46; already its own window), `max_db_mb` / `wal_checkpoint_seconds` / `vacuum_at` (govern the one store
 file, not a feed). Deleting metadata rows (vs nulling bodies) stays **declined** — count-and-log keeps the
-row forever.
+row forever. (Still true: see the amendment below — the *row* is kept; the `metadata` *column* is not.)
+
+## Amendment (2026-07-23) — `metadata` rides the body window (ASVS 14.2.7)
+
+**Nothing above is reversed. One phrase was imprecise and is corrected here.**
+
+This ADR repeatedly says a purge "NULLs the PHI body while keeping the metadata **row**". That was
+written to state the count-and-log guarantee — *the `messages` row is never DELETEd* — and it still
+holds. It was read by later work as though the `messages.metadata` **column** were also retained. It
+is not, and never should have been: `metadata` carries the operator-attached `SetMeta` bag (#150),
+classified **PL-2 PHI** in [PHI.md §2](../PHI.md#2-where-phi-lives--data-at-rest-inventory) and
+encrypted at rest alongside `messages.summary` — which already rode this window.
+
+As of lane #294, `purge_message_bodies` NULLs `messages.metadata` **in the same statement** as
+`raw`/`summary`/`error`, on all three backends. Operator-attached PHI can no longer outlive the body
+it annotates. The statement's guard is `raw <> '' OR metadata IS NOT NULL`, so messages purged by a
+pre-upgrade engine are swept — and counted, therefore audited — on the first pass after upgrade.
+
+**What stays declined:** deleting the `messages` row. Count-and-log is untouched; the row, its counts,
+its disposition and its audit trail all survive the purge exactly as before.
+
+**What this costs.** Three read paths degrade past the window — lineage re-bases on a purged origin,
+and a late `dead`-row replay loses both its `dynamic_headers` and its `response_view`. All three are
+accepted and pinned by regression tests; see
+[PHI.md §8](../PHI.md#what-nulling-messagesmetadata-costs--three-accepted-consequences). Retaining PHI
+past its retention window purely to serve a richer replay is the defect 14.2.7 exists to close.
+
+**Sibling scope note.** The same lane added `purge_search_presets` (`[retention].search_preset_days`),
+which *does* DELETE whole rows. That is not a reversal of the decline above: a saved-search preset is a
+user-authored artifact in its own table, backs no count and carries no disposition, so the
+count-and-log rationale does not reach it — the same reasoning that already permits `purge_state` and
+`purge_connection_events` to DELETE.
+
+**Amendment (2026-07-24, BACKLOG #306) — the preset window keys on last-USED.** As shipped,
+`purge_search_presets` compared the cutoff against `updated_at` alone, which only a *save* writes — so
+the window measured time-since-**edited** and a preset an operator ran daily but never re-saved still
+aged out. A `last_used_at` column (all three backends, stamped by `get_search_preset`) now carries the
+recall, and the purge keys on the **null-safe greater of `updated_at` and `last_used_at`**. The
+greatest-of-two is spelled per dialect (SQLite `max()` + `COALESCE`, Postgres `GREATEST` + `COALESCE`,
+T-SQL as the equivalent predicate pair — `GREATEST` is 2022+ and this backend's floor is 2016 SP1), and
+a row that predates the column (NULL) still ages out on `updated_at` alone, so the upgrade itself
+neither deletes nor reprieves anything. The keep-forever default is unchanged. See also
+[ADR 0136](0136-per-user-saved-and-layered-log-search-filter-presets-extends-the-adr-0046-search-seam.md) §1.
 
 ## To resolve on acceptance
 

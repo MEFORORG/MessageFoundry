@@ -3,10 +3,15 @@
 """Auth/session/account page builders for the /ui ops dashboard (ADR 0065): sign-in, step-up
 re-auth, and the L4b self-service account pages (change password, TOTP MFA lifecycle).
 
-The sign-in/re-auth pages are bare (nav-less); the account pages carry the normal chrome. Every
-dynamic value is placed through the escaping element builders in :mod:`.._html`. Secrets are handled
-once: a password is only ever an ``<input type=password>`` (never echoed back), and the TOTP secret /
-recovery codes render exactly once on their dedicated pages.
+The account pages carry the normal chrome. The UNAUTHENTICATED entry pages (sign-in, the Windows-SSO
+challenge) are bare — ``nav=Markup("")``. Every page that is reached WITH a live session but drops the
+full nav for focus/confinement (step-up re-auth, reauth-continue, the forced must-change-password
+page, passkey enrolment, the federated landing hop) renders ``nav=minimal_nav()`` instead: the
+wordmark plus the same one-click POST Sign-out form, so an authenticated page never leaves the
+operator without a way out (ASVS 7.4.4). Every dynamic value is placed through the escaping element
+builders in :mod:`.._html`. Secrets are handled once: a password is only ever an
+``<input type=password>`` (never echoed back), and the TOTP secret / recovery codes render exactly
+once on their dedicated pages.
 """
 
 from __future__ import annotations
@@ -16,13 +21,15 @@ from datetime import UTC, datetime
 
 from messagefoundry.api.auth_models import CurrentUser, MfaStatusResponse
 
-from .._html import Markup, el, page, register_nav, wordmark
+from .._html import Markup, el, minimal_nav, page, register_nav, wordmark
 
 __all__ = [
     "account_page",
     "login",
+    "oidc_landing",
     "mfa_confirm_page",
     "mfa_enroll_page",
+    "mfa_gate",
     "mfa_recovery_page",
     "password_page",
     "reauth",
@@ -40,7 +47,11 @@ def _when(ts: object) -> str:
 
 
 def login(
-    error: str | None = None, *, ad_enabled: bool = False, sso_enabled: bool = False
+    error: str | None = None,
+    *,
+    ad_enabled: bool = False,
+    sso_enabled: bool = False,
+    oidc_enabled: bool = False,
 ) -> Markup:
     """The sign-in form. Same-origin POST to /ui/login (form-action 'self').
 
@@ -51,11 +62,26 @@ def login(
         "must_change": "Password change required — sign in to rotate it.",
         "bad": "Invalid credentials.",
         "loggedout": "Signed out.",
+        # ASVS 14.3.1 — the client session watchdog's landing code: it blanks the page and navigates
+        # here when the server has ended the session (or can no longer confirm it), so the operator
+        # gets a reason instead of an unexplained login form.
+        "expired": "Your session ended — sign in again.",
         "pwchanged": "Password changed — sign in with the new password.",
         # L5c (ADR 0068 §9) — allow-listed SSO outcome codes, never reflected text.
         "sso_failed": "Windows SSO sign-in failed — sign in with a password instead.",
         "sso_unavailable": "Windows SSO is not available on this server.",
         "rate_limited": "Too many attempts — wait a moment and try again.",
+        # ADR 0142 — allow-listed FEDERATED outcome codes. The IdP's own `error` /
+        # `error_description` are never reflected: they are attacker/IdP-controlled text, and echoing
+        # them would put it in the URL, the referrer chain, and every proxy log.
+        "oidc_failed": "Federated sign-in failed — sign in with a password instead.",
+        "oidc_unavailable": "Federated sign-in is not available on this server.",
+        "flow_binding_missing": (
+            "Your sign-in session expired or did not return to this browser — start again."
+        ),
+        "sso_mfa_required": (
+            "Your identity provider did not confirm multi-factor authentication for this sign-in."
+        ),
     }
     banner = el("p", notes.get(error or "", ""), class_="banner") if error else Markup("")
     provider: Markup = Markup("")
@@ -93,9 +119,42 @@ def login(
         if sso_enabled
         else Markup("")
     )
-    body = el("div", el("h1", wordmark(tm=True)), banner, form, sso, class_="card")
+    federated = (
+        el("p", el("a", "Sign in with your organization", href="/ui/oidc/start"), class_="muted")
+        if oidc_enabled
+        else Markup("")
+    )
+    body = el("div", el("h1", wordmark(tm=True)), banner, form, sso, federated, class_="card")
     # A bare page (no nav) for the unauthenticated login screen.
     return page("Sign in", body, nav=Markup(""))
+
+
+def oidc_landing() -> Markup:
+    """The same-site landing hop after a successful federated sign-in (ADR 0142).
+
+    Returned as **200 HTML with a meta refresh**, deliberately NOT a 303. The session cookie is
+    ``SameSite=Strict``; a 303 issued in response to the IdP's cross-site redirect would leave the
+    browser's follow-up request to ``/ui`` still cross-site-initiated, so the Strict cookie would be
+    withheld and the operator would land back on the login page despite a successful login. Bouncing
+    through a document served from OUR origin makes the next navigation same-site, so the cookie is
+    unambiguously sent.
+
+    No JavaScript, so this works under the strict ``/ui`` CSP with no nonce and no ``script-src``
+    relaxation. The visible link is the fallback for a browser with meta refresh disabled.
+    """
+    body = el(
+        "div",
+        el("h1", wordmark(tm=True)),
+        el("p", "Signed in — continuing to the console…"),
+        el("p", el("a", "Continue", href="/ui"), class_="muted"),
+        class_="card",
+    )
+    return page(
+        "Signing in",
+        body,
+        nav=minimal_nav(),
+        head_extra=el("meta", **{"http-equiv": "refresh", "content": "0;url=/ui"}),
+    )
 
 
 def sso_challenge() -> Markup:
@@ -187,7 +246,82 @@ def reauth(
         form,
         class_="card",
     )
-    return page("Confirm", body, nav=Markup(""))
+    return page("Confirm", body, nav=minimal_nav())
+
+
+def mfa_gate(
+    *,
+    totp_enrolled: bool,
+    error: str | None = None,
+    webauthn_options: str | None = None,
+    webauthn_notice: str | None = None,
+) -> Markup:
+    """The ASVS 6.3.3 second-factor page a MFA-pending browser session is confined to. POSTs /ui/mfa.
+
+    Distinct from :func:`reauth`, which confirms a *sensitive action* and therefore always asks for
+    the password. This page completes SIGN-IN: the password was proven seconds ago, so asking for it
+    again would be noise. Only the second factor is collected.
+
+    Rendered on ``minimal_nav`` for the same reason the reauth page is — the app nav's status poll is
+    gated, so a full nav here would fire a request the pending session is not allowed to make.
+
+    Splits by factor exactly like :func:`reauth` (ADR 0068 decision 1(b)): the code field renders iff
+    TOTP is enrolled, the passkey button iff WebAuthn is. A user with only a passkey never sees an
+    unanswerable code box, and a user with only TOTP never sees a button they cannot use.
+    """
+    banner = el("p", error, class_="banner") if error else Markup("")
+    passkey: Markup
+    if webauthn_options is not None:
+        passkey = el(
+            "div",
+            el(
+                "button",
+                "Use passkey",
+                type="button",
+                data_mf_webauthn_get=webauthn_options,
+                # Tells app.js this assertion COMPLETES sign-in and should navigate, rather than
+                # unlocking a password field as it does on the reauth page (where the password is
+                # still owed). Without it a passkey-only user verifies and then sits on a dead page.
+                data_mf_webauthn_done="/ui",
+            ),
+            el("p", "", class_="muted", data_mf_webauthn_status=True),
+            class_="ctl",
+        )
+    elif webauthn_notice:
+        passkey = el("p", webauthn_notice, class_="muted")
+    else:
+        passkey = Markup("")
+    fields: list[object] = []
+    if totp_enrolled:
+        fields.append(
+            el(
+                "label",
+                "Authenticator code",
+                # No `value=`: never echo a submitted code back into the form. A TOTP or recovery
+                # code is a bearer credential, and a re-render is exactly where one leaks.
+                el("input", name="code", inputmode="numeric", autocomplete="one-time-code"),
+            )
+        )
+        fields.append(el("button", "Verify", type="submit"))
+    form = (
+        el("form", *fields, method="post", action="/ui/mfa", class_="login")
+        if fields
+        else Markup("")
+    )
+    body = el(
+        "div",
+        el("h1", "Second factor required"),
+        el(
+            "p",
+            "Your account requires a second factor. Confirm it to continue.",
+            class_="muted",
+        ),
+        banner,
+        passkey,
+        form,
+        class_="card",
+    )
+    return page("Second factor", body, nav=minimal_nav())
 
 
 def reauth_continue(next_path: str) -> Markup:
@@ -211,7 +345,7 @@ def reauth_continue(next_path: str) -> Markup:
         form,
         class_="card",
     )
-    return page("Verified", body, nav=Markup(""))
+    return page("Verified", body, nav=minimal_nav())
 
 
 # --- L4b: self-service account pages (change password + TOTP MFA lifecycle) ------------------------
@@ -486,7 +620,7 @@ def password_page(*, forced: bool = False, error: str | None = None) -> Markup:
     )
     body = el("div", el("h1", "Change password"), intro, banner, form, class_="card")
     if forced:
-        return page("Change password", body, nav=Markup(""))
+        return page("Change password", body, nav=minimal_nav())
     return page(
         "Change password",
         body,
@@ -573,7 +707,7 @@ def webauthn_enroll_page(options_json: str) -> Markup:
         el("p", el("a", "Back to my account", href="/ui/account"), class_="muted"),
         class_="card",
     )
-    return page("Add a passkey", body, nav=Markup(""))
+    return page("Add a passkey", body, nav=minimal_nav())
 
 
 def mfa_confirm_page(*, error: str | None = None) -> Markup:

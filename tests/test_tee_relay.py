@@ -31,7 +31,7 @@ class FakeMllpServer:
         self._conns = 0
         self._server: asyncio.Server | None = None
 
-    async def start(self) -> "FakeMllpServer":
+    async def start(self) -> FakeMllpServer:
         self._server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
         return self
 

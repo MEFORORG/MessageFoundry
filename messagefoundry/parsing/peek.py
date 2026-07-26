@@ -38,6 +38,7 @@ __all__ = [
     "DEFAULT_MAX_MESSAGE_BYTES",
     "DEFAULT_MAX_SEGMENTS",
     "enforce_size_limits",
+    "enforce_expansion_budget",
 ]
 
 # Pre-parse resource caps (DoS guards). A complete-but-pathological message — multi-MiB, or
@@ -69,6 +70,58 @@ def enforce_size_limits(
         segment_count = norm.count("\r") + 1
         if segment_count > max_segments:
             raise HL7PeekError(f"message exceeds max segments ({segment_count} > {max_segments})")
+
+
+def enforce_expansion_budget(norm: str) -> None:
+    """Raise :class:`HL7PeekError` if the message's HL7 escapes could expand past their budget.
+
+    The **aggregate** companion to :data:`~messagefoundry.parsing._builtin_hl7.MAX_ESCAPE_REPEAT`
+    (ASVS 1.3.3). That constant clamps ONE escape; *composition* was unbounded, so a body sitting
+    just under the raw size cap could still expand ~256x as its leaves were unescaped — ~4 GiB
+    allocated synchronously on the event loop, pre-ACK and unauthenticated. The budget is the **fixed**
+    :data:`DEFAULT_MAX_MESSAGE_BYTES` (16 MiB) of *growth*, so the invariant is:
+
+        total unescaped output <= the raw body + 16 MiB, **whatever** the connection's
+        ``max_message_bytes``
+
+    A fixed constant rather than one scaled to the body, deliberately: a connection that raises
+    ``max_message_bytes`` for streaming (the runbook's 256 MiB detach) must not thereby buy itself 256
+    MiB of escape expansion — that is the one inbound where the allowance matters most, and it is
+    unauthenticated. Nor does the constant over-reject those feeds: a streaming payload is base64 in
+    OBX-5.5 and the base64 alphabet contains no backslash, so its estimate is 0 no matter how large it
+    is. Growth, not total size, is what this bounds.
+
+    There is no cap parameter and no per-connection knob, so :meth:`Peek.parse` and
+    :meth:`Message.parse` — which both call this on the *same* normalized text — are incapable of
+    disagreeing. That matters because the pre-ACK streaming detach parses a body ``Peek.parse`` already
+    accepted, and a disagreement there would escape the listener's catches and drop the connection with
+    no disposition (a count-and-log break).
+
+    Called **before** the parse backends are dispatched, i.e. outside the ADR 0054 fallback guard, so
+    a breach is a *contract* error routed to the listener's existing NAK + ``ERROR`` path — never a
+    fallback into python-hl7's unbounded ``unescape``. The message text is numeric only (no field
+    value, no body fragment): it reaches the sender in MSA-3.
+
+    **The measurement is itself capped.** Measuring growth means reading each counted escape's count,
+    and that is Python-level work an attacker sizes: the cheapest hostile bodies (a zero-width or a
+    non-numeric count) add nothing to the running total, so the total's short-circuit never fires and
+    an uncapped scan burns 1-2 s on the event loop pre-ACK — then ACKs ``AA``, because the estimate is
+    0. That would trade this cell's memory blow-up for a CPU one on the same unauthenticated path. So
+    the scan is bounded by
+    :data:`~messagefoundry.parsing._builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS`, and a body it cannot
+    measure within that bound is **refused**, never accepted un-measured — a pre-parse resource cap in
+    the same family as :data:`DEFAULT_MAX_SEGMENTS`, surfacing through the identical NAK + ``ERROR``
+    path so the message is still counted and logged.
+    """
+    budget = DEFAULT_MAX_MESSAGE_BYTES
+    try:
+        estimate = _builtin_hl7.escape_expansion_estimate(norm, limit=budget)
+    except _builtin_hl7.EscapeScanLimitExceeded as exc:
+        raise HL7PeekError(
+            f"message exceeds max counted escapes (> {_builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS})"
+        ) from exc
+    if estimate > budget:
+        raise HL7PeekError(f"message escape expansion exceeds budget ({estimate} > {budget} chars)")
 
 
 # SEG-F[.C[.S]] — segment id, field, optional component, optional subcomponent.
@@ -131,16 +184,22 @@ class Peek:
         *,
         max_bytes: int | None = DEFAULT_MAX_MESSAGE_BYTES,
         max_segments: int | None = DEFAULT_MAX_SEGMENTS,
-    ) -> "Peek":
+    ) -> Peek:
         norm = normalize(raw)
         if not norm.strip():
             raise HL7PeekError("empty message")
         enforce_size_limits(norm, max_bytes=max_bytes, max_segments=max_segments)
         if not norm.lstrip().startswith("MSH"):
             raise HL7PeekError("message does not start with an MSH segment")
+        enforce_expansion_budget(norm)
         if _backend.use_builtin():
             try:
                 return cls(message=_builtin_hl7.parse(norm), raw=norm)
+            except HL7PeekError:
+                # A contract error is never fallen back from (the python-hl7 path would only be the
+                # *unbounded* one): re-raise so the ADR 0054 guard below stays an internal-fault
+                # guard, exactly as _backend.py documents.
+                raise
             except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
                 # The contract guards (empty/no-MSH) already ran above and raised HL7PeekError, so
                 # anything here is an *internal* built-ins fault. Fall back to the proven python-hl7

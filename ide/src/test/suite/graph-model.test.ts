@@ -106,6 +106,10 @@ suite("graphModel — elements perspective (ADR 0091 D2)", () => {
     const handler = byLabel(byLabel(roots, "Handlers").children, "relay_b");
     assert.deepStrictEqual(group(handler, "⇦ fed by").children.map((r) => r.label), ["route_pt", "route_shared"]);
     assert.ok(handler.description?.includes("shared ×2"));
+    // Handlers carry a distinct contextValue so only they get the "View as Steps" inline action;
+    // routers stay meforElement (wiring-map only). Steps renders Handlers, not Routers (ADR 0076).
+    assert.strictEqual(handler.contextValue, "meforElementHandler");
+    assert.strictEqual(router.contextValue, "meforElement");
   });
 
   test("outbound fan-in + inbound port and router binding are surfaced", () => {

@@ -118,6 +118,12 @@ def verify_totp_step(
     key = _decode_secret(secret)
     counter = int(moment // period)
     matched: int | None = None
+    # ASVS 11.2.4 DRIFT GUARD — do NOT add a `break` or an early `return` inside this loop. Every
+    # candidate step must be HOTP-computed and compared so the number of hmac.compare_digest calls is
+    # fixed by `window` alone, never by WHICH step matched (or whether any did). Pinned by
+    # tests/test_totp_window.py::test_compare_count_is_window_fixed_regardless_of_matching_step, which
+    # counts the comparisons and fails on an early exit. (The `step < 0` skip depends only on `now` —
+    # public wall-clock, not secret material — so it is a clock guard, not a data-dependent branch.)
     for step in range(counter - window, counter + window + 1):
         if step < 0:
             continue

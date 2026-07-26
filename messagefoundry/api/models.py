@@ -14,7 +14,12 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
-from messagefoundry.config.ai_policy import AiDataScope, AiMode, DataClass
+from messagefoundry.config.ai_policy import (
+    AiDataScope,
+    AiMode,
+    DataClass,
+    SecurityEnforcement,
+)
 
 
 class ChannelInfo(BaseModel):
@@ -265,6 +270,18 @@ class AlertInstanceInfo(BaseModel):
     acked_by: str | None = None
     acked_at: float | None = None
     resolved_at: float | None = None
+    # #143 — windowed NOTIFICATION-mute end-epoch (None/past = not suspended). Notification-only: a
+    # suspended instance stays open/counted (it is still returned by GET /alerts/active).
+    suspended_until: float | None = None
+
+
+class AlertSuspendRequest(BaseModel):
+    """Body for ``POST /alerts/{id}/suspend`` (#143) — the length of the NOTIFICATION-mute window. The
+    window end is ``now + minutes·60``; the instance keeps firing into state (stays open/counted) — only
+    re-alerts are silenced for the window. ``POST /alerts/{id}/resume`` takes no body."""
+
+    # Bounded so an operator can't set an unbounded / absurd window; 1 minute .. 30 days.
+    minutes: float = Field(gt=0, le=43200)
 
 
 class AlertInstanceList(BaseModel):
@@ -368,7 +385,7 @@ class ConnectionRow(BaseModel):
     channel_name: str
     destination: str | None  # destination name; None for the source row
     name: str  # display name
-    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining"
+    status: str  # "running" | "stopping" (outbound: operator-paused, an in-flight head still draining) | "stopped" (outbound: paused AND quiesced) | "failed" (start failed, ADR 0031) | "filtered" (DR run-profile parked it below [dr].priority_threshold, #61 ADR 0048) | "draining" | "not_deployed" (present in the graph but deployed=false, #233 ADR 0111 — never wired, deploying it is a config change; distinct from "stopped", which SHOULD be running)
     direction: str  # "in" (source) | "out" (destination)
     method: str  # connection method/protocol, e.g. MLLP / File / TCP / REST
     peer: str | None  # MLLP host or file directory
@@ -396,6 +413,30 @@ class ConnectionRow(BaseModel):
     # Lets an operator watching a backlog on one shard's view see WHICH shard is responsible for
     # draining it (controls/purge for a non-owned lane 409 with the same owner).
     owner_shard: str | None = None
+    # #131 (ADR 0007 amendment): the operator "object of interest" flag for the Flagged Objects filter.
+    # Display-only (no runtime effect); True when the connection is marked flagged. Console-settable via
+    # POST /connections/{name}/flag on a connections.toml-managed connection only. Additive + defaulted
+    # so an older client deserializes /connections unchanged.
+    flagged: bool = False
+    # #131: whether this connection is authored in connections.toml (vs code-first). The console shows
+    # the flag TOGGLE only on TOML-managed rows (the write seam persists there); a code-first row shows a
+    # read-only flag indicator. The API refuses the toggle on a non-TOML connection regardless (the guard
+    # of record). Additive + defaulted.
+    toml_managed: bool = False
+    # #136 (ADR 0065 amendment): destination-only per-message "Waiting for Reply" display state — True
+    # while this outbound's live connector is awaiting an MLLP ACK past its waiting_display_delay. DISPLAY
+    # ONLY (no delivery effect); False for source rows, non-ACK-waiting connectors, and no-ack mode.
+    # Additive + defaulted so an older client deserializes /connections unchanged.
+    waiting_for_reply: bool = False
+
+
+class ConnectionFlagRequest(BaseModel):
+    """Body for ``POST /connections/{name}/flag`` (#131, ADR 0007 amendment) — the FIRST
+    console→connections.toml write seam. ``direction`` disambiguates a name declared as both an inbound
+    and an outbound. Display-only; the write is refused (409) on a code-first connection (no TOML home)."""
+
+    flagged: bool
+    direction: Literal["inbound", "outbound"]
 
 
 class StatsResetTarget(BaseModel):
@@ -449,11 +490,73 @@ class StatsResponse(BaseModel):
     body_copies: int = 0
 
 
+class MetricsHistorySample(BaseModel):
+    """One point-in-time metrics sample for the console trend charts (BACKLOG #76, ADR 0065 amendment).
+    ``ts`` is epoch seconds; ``outbox_by_status`` is the outbound-row count by status at that instant.
+    Aggregate counts only — **never** a message field or body (no PHI)."""
+
+    ts: float
+    outbox_by_status: dict[str, int] = Field(default_factory=dict)
+
+
+class MetricsHistoryResponse(BaseModel):
+    """A bounded, in-memory ring of :class:`MetricsHistorySample` for the console trend charts (#76).
+    Oldest-first; fed by the existing ~1s ``/ws/stats`` sampler (no durable table — ``store_schema``
+    stays false — and no PHI). ``capacity`` is the ring's maximum retained sample count."""
+
+    samples: list[MetricsHistorySample] = Field(default_factory=list)
+    capacity: int = 0
+
+
+class GraphNode(BaseModel):
+    """One node in the by-name data-flow graph (BACKLOG #76, ADR 0065 amendment). ``kind`` is one of
+    ``inbound``/``router``/``handler``/``outbound``; ``status`` is the LIVE connection status for an
+    inbound/outbound node (``running``/``stopping``/``stopped``/``failed``/``filtered``/``draining``/
+    ``not_deployed``) and ``None`` for a router/handler node. Names + status only — no PHI. The colour a
+    console derives from ``status`` is live-derived, never operator-assigned (that is BACKLOG #79)."""
+
+    name: str
+    kind: str
+    status: str | None = None
+
+
+class GraphEdge(BaseModel):
+    """One directed edge ``source`` → ``target`` in the data-flow graph (BACKLOG #76). ``provenance`` is
+    ``declared``/``literal``/``heuristic`` (from :func:`messagefoundry.config.graph.build_wiring_graph`)."""
+
+    source: str
+    source_kind: str
+    target: str
+    target_kind: str
+    provenance: str
+
+
+class GraphResponse(BaseModel):
+    """The static by-name wiring graph (BACKLOG #76, ADR 0065 amendment): the Registry edge set from
+    :func:`messagefoundry.config.graph.build_wiring_graph` with each connection node's LIVE status joined
+    in. Read-only (``monitoring:read``); it constructs **no** ``channel``/``route`` bundling object
+    (CLAUDE.md §1) and carries **no** message body. ``dynamic`` lists the ``kind:name`` elements whose
+    full target set is not statically resolvable (their edge list may be incomplete — surfaced, never
+    silently dropped)."""
+
+    nodes: list[GraphNode] = Field(default_factory=list)
+    edges: list[GraphEdge] = Field(default_factory=list)
+    dynamic: list[str] = Field(default_factory=list)
+
+
 class Health(BaseModel):
     status: str = "ok"
     # WP-L3-07 (ASVS 13.4.6): the build version is a fingerprinting detail, disclosed only to an
     # authenticated caller. A tokenless liveness probe gets ``status`` with ``version`` omitted/None.
     version: str | None = None
+    # The client address the ENGINE observes for this request, echoed ONLY when
+    # [security].allowed_client_networks is in use (None — and omitted from nothing else — by default,
+    # so a stock deployment's /health is unchanged). ``/health`` is exempt from the network gate
+    # precisely so a locked-out operator can curl it and read this: it is the one self-service answer
+    # to "which address is the engine actually matching?", which also immediately exposes a reverse
+    # proxy or NAT that is rewriting the source. Disclosing the caller's own address to the caller
+    # reveals nothing it does not already know.
+    observed_client: str | None = None
 
 
 class EngineInfo(BaseModel):
@@ -475,12 +578,21 @@ class EngineKpis(BaseModel):
     and outbound endpoints (vs :class:`EngineInfo`.channels_*, which count inbound only);
     ``messages_per_second`` is the engine-wide drain rate, derived by **reusing the same
     ``recent_done`` rate window** that already powers the dashboard's per-destination backlog ETA (no
-    second sampler). Additive + defaulted so an older client deserializes ``/status`` unchanged."""
+    second sampler). Additive + defaulted so an older client deserializes ``/status`` unchanged.
+
+    ``connections_not_deployed`` (#233, ADR 0111) counts endpoints present in the graph but
+    ``deployed=false`` — never wired, never a lane. Such a connection is deliberately EXCLUDED from
+    ``connections_total`` (it is in the registry but is not a lane), so the running/stopped split keeps
+    counting only lanes and the ``connections_stopped == connections_total - connections_running``
+    identity holds unchanged. Without the exclusion, a not-deployed connection would inflate
+    ``connections_stopped`` and read as "should be running, isn't" — the exact confusion this state
+    exists to remove."""
 
     messages_total: int = 0
-    connections_total: int = 0  # inbound + outbound endpoints
+    connections_total: int = 0  # DEPLOYED inbound + outbound endpoints (not-deployed excluded)
     connections_running: int = 0
     connections_stopped: int = 0
+    connections_not_deployed: int = 0  # #233: present in the graph, deployed=false; not a lane
     messages_per_second: float = 0.0  # engine-wide, from recent_done / rate_window
 
 
@@ -507,6 +619,39 @@ class LogInfo(BaseModel):
     path: str
     size_bytes: int  # total bytes of regular files under the log directory (one level)
     disk_free_bytes: int  # free space on the log directory's filesystem
+
+
+class LogLevelInfo(BaseModel):
+    """Runtime log-verbosity state (BACKLOG #171, ADR 0130). ``level`` is the current effective root
+    level; ``configured`` is the startup ``[logging].level`` baseline a restart returns to; ``levels`` is
+    the accepted set for the control. **Not PHI** — level names only."""
+
+    level: str
+    configured: str | None = None
+    levels: list[str]
+
+
+class LogLevelUpdate(BaseModel):
+    """PATCH body for the runtime verbosity control (BACKLOG #171): the new root/uvicorn level. Ephemeral
+    — the override resets on process restart, and NOT on ``/config/reload`` (ADR 0130 §1)."""
+
+    level: str
+
+
+class LogTailPage(BaseModel):
+    """One page of the **redacted** application-log tail for the in-console viewer (BACKLOG #171, ADR
+    0130). ``lines`` are already passed through ``support.redact`` (HL7/DOB/name + secret spans scrubbed),
+    oldest-first within the page; ``offset`` counts lines back from the END of the newest log file and
+    ``total_lines`` is that file's line count, so the viewer can page. ``available`` is False when no
+    ``[logging].log_dir`` is configured or no readable log file exists (the viewer degrades gracefully).
+    Best-effort redaction — a residual single-token identifier can survive, so this route is RBAC-gated +
+    audited like a message view."""
+
+    lines: list[str]
+    total_lines: int
+    offset: int
+    limit: int
+    available: bool
 
 
 class UpdateInfo(BaseModel):
@@ -536,6 +681,18 @@ class PoolWaitInfo(BaseModel):
     mean_ms: float
 
 
+class ClaimPoolInfo(BaseModel):
+    """The ADR 0114 dedicated-claim-connection holder snapshot (SQL Server only, the
+    ``fifo_claim_prepared`` sub-lever). These connections live OUTSIDE the main pool — an aioodbc
+    pool cannot retain a cursor across acquire/release — so without this additive sibling the B11
+    connection-budget arithmetic would under-count the store's real connection footprint."""
+
+    open: int  # holders currently open (borrowed + idle)
+    idle: int  # holders sitting in the per-stage free lists
+    opened_total: int  # lifetime opens (a reopen after a discard counts again)
+    discarded_total: int  # lifetime discards (cancellation / unclassified errors only)
+
+
 class PoolInfo(BaseModel):
     """A **server-only** connection-pool snapshot (B11), surfaced as the additive ``pool`` field on
     :class:`SystemStatus`. ``None`` on SQLite (no pool — it has a single writer + lockfree read
@@ -548,6 +705,9 @@ class PoolInfo(BaseModel):
     size: int  # connections currently open in the pool
     idle: int  # currently-free connections (idle == 0 ⇒ saturated)
     acquire_wait: PoolWaitInfo  # PRIMARY: acquire() wait-time percentiles
+    # ADR 0114 sub-lever B: the out-of-pool dedicated claim holders. Additive + None unless
+    # fifo_claim_prepared is effectively active on SQL Server, so existing clients are untouched.
+    claim_pool: ClaimPoolInfo | None = None
 
 
 class SystemStatus(BaseModel):
@@ -695,6 +855,38 @@ class AiPolicy(BaseModel):
     reason: str | None = None
 
 
+class AiChatRequest(BaseModel):
+    """A single engine-brokered AI-assist request (ADR 0135, BACKLOG #95) — the body of
+    ``POST /ai/chat``. ``prompt`` is the IDE-assembled **code_only** context (the config graph *names* +
+    the active editor *code* — never message bodies / PHI). ``data_scope`` is the IDE's CLAIMED scope; the
+    SERVER IGNORES it for policy and re-resolves its own effective scope — a claim ABOVE what the server
+    enforces is DENIED (403), never honoured (the server is the sole enforcement point)."""
+
+    prompt: str = Field(min_length=1, max_length=200_000)
+    # The IDE's claimed data scope. Defaults to the code_only floor; the server NEVER trusts it to widen
+    # anything (it re-resolves the effective policy) and refuses an over-claim.
+    data_scope: AiDataScope = AiDataScope.CODE_ONLY
+
+
+class AiChatResponse(BaseModel):
+    """The engine-brokered AI-assist reply (ADR 0135). ``data_scope`` is the SERVER-enforced effective
+    scope actually applied (always ``code_only`` in this MVP), so the IDE can never infer it obtained
+    more than the server granted."""
+
+    reply: str
+    model: str
+    data_scope: AiDataScope
+
+
+class SecurityLoosening(BaseModel):
+    """One ``[security]`` switch currently at its INSECURE value (ADR 0118 AC-4/AC-5), as reported by the
+    read-only posture view. ``switch`` is the plain-language ``[security]`` key; ``risk`` names what the
+    deliberate opt-out gives up. Advisory — the posture GATES still refuse a production-PHI weakening."""
+
+    switch: str
+    risk: str
+
+
 class SecurityPosture(BaseModel):
     """The instance's **effective** PHI-at-rest security posture (M5), behind the authenticated,
     permission-gated ``GET /security/posture`` route. Surfaces what protection is *actually* in effect
@@ -711,6 +903,10 @@ class SecurityPosture(BaseModel):
 
     data_class: DataClass | None = None  # resolved PHI posture (synthetic|phi), if resolvable
     production: bool | None = None  # production-tier posture, if resolvable
+    # The security REFUSE/WARN dial (this refactor): enforce (secure default) reproduces the historical
+    # production=True refuse posture; warn reproduces the non-production warn+continue. Decoupled from the
+    # production tier above (that stays a true property; this drives the posture gates + escape-clamp).
+    enforcement: SecurityEnforcement = SecurityEnforcement.ENFORCE
     environment: str | None = None  # the active-environment NAME (ADR 0017)
     backend: str  # store backend: "sqlite" | "postgres" | "sqlserver"
     encryption_enabled: bool  # whether the LIVE store cipher encrypts at rest
@@ -723,6 +919,63 @@ class SecurityPosture(BaseModel):
     # PHI-bearing columns NOT encrypted at rest on this backend; empty on every backend (the SQL Server
     # error/last_error/detail residual was retired by H4) or when encryption is off, where it is N/A.
     plaintext_columns: list[str] = Field(default_factory=list)
+    # ADR 0118: the EFFECTIVE [security] switch values (the plain-language posture section), the active
+    # loosenings (each opt-out at its insecure value), and — on a synthetic instance — the notice that the
+    # PHI-only gates are (defensibly) relaxed. Read-only; the IDE is the sole authoring surface.
+    security: dict[str, object] = Field(default_factory=dict)
+    loosenings: list[SecurityLoosening] = Field(default_factory=list)
+    # Set WHERE handles_real_patient_data=false: the strict PHI-only controls (at-rest-encryption refusal,
+    # deny-by-default egress, bounded retention) are relaxed because the instance carries no ePHI (AC-6).
+    synthetic_relaxation: str | None = None
+    # FIPS-provider attestation (report-only, #73 / ADR 0120). ``fips_mode`` is the FIPS-provider state of
+    # the INTERPRETER's ssl/_hashlib OpenSSL (True/False, or None = undeterminable on a non-OpenSSL build);
+    # ``openssl_version`` is that OpenSSL's version string. Metadata only — NOT secret material (SECRET-1),
+    # and NOT a FIPS-140 certification. Scoped to the ssl/_hashlib OpenSSL, which is separate from the
+    # cryptography-wheel OpenSSL that encrypts PHI at rest — so it is "reported", never "certified".
+    fips_mode: bool | None = None
+    openssl_version: str | None = None
+    # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1 / ASVS 11.7.1) + the operator
+    # declaration (Phase 2). Named "self_reported" on purpose: these are values the host OS emits
+    # about ITSELF (/proc/cpuinfo flags, guest device-node presence), and 11.7.1 exists precisely
+    # because that OS may be the adversary. NONE OF THESE FIELDS SATISFIES ASVS 11.7.1, at any value,
+    # in any combination. Only a CPU-signed attestation report verified against the silicon vendor's
+    # root PKI would, and that is ADR 0152 rung 3 — not built. Capability and activation are kept as
+    # SEPARATE fields because a CPU flag ("this silicon can") and a guest device ("this guest is") are
+    # different facts; fusing them is the most likely route to a false compliance claim.
+    memory_encryption_self_reported_capability: bool | None = None
+    memory_encryption_self_reported_active: bool | None = None
+    memory_encryption_self_reported_mechanism: str | None = None
+    memory_encryption_readout_source: str | None = None
+    # [security].memory_encryption_operator_declared — the OPERATOR'S UNVERIFIED CLAIM that the host
+    # provides memory encryption. NOT called "attested": in confidential computing (the domain of
+    # 11.7.1) "attestation" means a CPU-signed quote verified against vendor root PKI, which is rung 3
+    # and is not built — and this field, unlike the four above, has no measurement behind it at all,
+    # so it is the single most quotable value in the response. The word has to carry its own weakness.
+    memory_encryption_operator_declared: bool = False
+    # Tri-state, and the third state is the point. None = nothing was measured that COULD contradict
+    # anything (nobody declared, or the platform is unreadable, or a missing guest device node is
+    # uninformative there — an SME/TME host, or a container that does not map /dev/sev-guest).
+    # False = declared and the read-out reports a guest interface present. True = declared while the
+    # host advertises a guest-attestable mechanism and exposes no guest interface. A bare bool would
+    # render "corroborated", "undeterminable" and "nobody claimed" identically as `false` — on
+    # Windows, false by vacuity — which is the same fusion this feature refuses for capability vs
+    # activation.
+    memory_encryption_readout_contradicts_declaration: bool | None = None
+    # The disclaimer that TRAVELS WITH THE ARTIFACT. ADR 0152 designates this endpoint the evidence
+    # artifact for 11.7.1, and every other disclaimer this feature writes lives where an assessor
+    # never looks (comments, docstrings, the ADR, the console HTML). Always populated, on every
+    # posture, precisely so no reading of this response is missing it. Prose-in-posture has precedent
+    # on this same model — see ``synthetic_relaxation`` above.
+    memory_encryption_note: str | None = None
+    # [security].allowed_client_networks observability. A control nobody can see firing is a control
+    # that gets ripped back out the first time someone cannot reach the console, so these answer "is it
+    # firing, and at whom?" without log-file access. Zero/None on every deployment that has not set the
+    # allow-list. ``client_address_monoculture`` is the R3 tripwire: the allow-list is set, no proxy is
+    # declared, and every observed request resolved to the same loopback address — i.e. an UNDECLARED
+    # reverse proxy is in front and the allow-list is INERT.
+    client_network_denials: int = 0
+    client_denied_last: str | None = None
+    client_address_monoculture: bool = False
 
 
 class ConnectionMetadata(BaseModel):
@@ -743,7 +996,9 @@ class ConnectionMetadata(BaseModel):
 
 
 class AlertRuleInfo(BaseModel):
-    """One operator-authored alert rule (ADR 0014), read-only. Pure routing/threshold data — no secrets."""
+    """One operator-authored alert rule (ADR 0014), read-only. Pure routing/threshold data — no secrets.
+    Per-rule recipient addresses (#146) are reported as a COUNT only (never the addresses), matching the
+    ``AlertsConfig.email_recipient_count`` policy."""
 
     event_type: str
     connection: str
@@ -752,12 +1007,27 @@ class AlertRuleInfo(BaseModel):
     severity: str
     transports: list[str] | None = None
     cooldown_seconds: float | None = None
+    recipient_count: int = (
+        0  # #146 — per-rule email recipients (count only; 0 = uses global email_to)
+    )
+    id: str | None = None  # #138 — operator rule label ({rule_id} template var); None = unlabelled
+    control_action: str | None = (
+        None  # #144 — restart_inbound/restart_outbound fired on match (None = none)
+    )
+    control_target: str | None = (
+        None  # #144 — connection acted on (None = the event's own connection)
+    )
+    mute: bool = False  # #143 — static per-rule NOTIFICATION mute (still records state)
+    escalate_tiers: int = 0  # #81 — number of occurrence-driven escalation tiers (0 = none)
+    schedule_configured: bool = False  # #81 — whether the rule is schedule-gated (present-or-not)
+    content_label: str | None = None  # #81 — content_match label this rule routes by (None = any)
 
 
 class AlertsConfig(BaseModel):
     """Read-only view of the loaded [alerts] config (ADR 0014, BACKLOG #22b). Transports are reported
     present-or-not; NO secrets (webhook URL, SMTP password/username) or recipient addresses are ever
-    included."""
+    included. The #138 alert-email templates are reported present-or-not (booleans) — the template TEXT
+    is non-PHI operator config, but present/absent is the honest read-only signal."""
 
     webhook_configured: bool
     webhook_timeout: float
@@ -768,6 +1038,10 @@ class AlertsConfig(BaseModel):
     email_recipient_count: int
     smtp_allowed_hosts: list[str]
     realert_seconds: float
+    # #138 — whether each operator-editable alert-email template is set (validated at config-load).
+    email_subject_template_configured: bool = False
+    email_body_template_configured: bool = False
+    email_html_template_configured: bool = False
     rules: list[AlertRuleInfo]
 
 
@@ -783,3 +1057,152 @@ class ConnectionTestResult(BaseModel):
     success: bool
     duration_ms: float
     detail: str | None = None
+
+
+class AlertTestEmailRequest(BaseModel):
+    """Body for ``POST /alerts/test-email`` (BACKLOG #118). All fields optional — an empty body tests
+    the configured ``[alerts]`` email transport against the configured ``email_to``. ``recipient_override``,
+    when set, redirects this one test send to a single alternate address (operator config, admin-gated);
+    it is never echoed back in the result."""
+
+    recipient_override: str | None = None
+
+
+class AlertTestEmailResult(BaseModel):
+    """Result of ``POST /alerts/test-email`` (BACKLOG #118) — a live SMTP send of a synthetic, PHI-free
+    event through the **real** alert-email transport (the same path a genuine alert takes). Carries NO
+    email addresses: only whether email is configured, the send outcome, how long the attempt took, the
+    recipient count, and a ``safe_exc``-scrubbed failure detail."""
+
+    configured: bool
+    success: bool
+    duration_ms: float
+    recipient_count: int
+    detail: str | None = None
+
+
+# --- Offline uploaded logs (BACKLOG #125/#126, ADR 0134) ----------------------------------------
+
+
+class UploadedFileInfo(BaseModel):
+    """Metadata about one operator-uploaded diagnostic file (no body). ``filename`` is display-only
+    (sanitized, never a path); ``content_type`` is the format tag; ``message_count`` is the number of
+    HL7 messages the file split into at upload time."""
+
+    file_id: str
+    filename: str
+    uploader: str
+    content_type: str
+    size: int
+    sha256: str
+    uploaded_at: float
+    message_count: int
+
+
+class UploadedFileList(BaseModel):
+    total: int
+    files: list[UploadedFileInfo]
+
+
+class UploadedMessageSummary(BaseModel):
+    """One split message inside an uploaded file (metadata only — never the decrypted body). ``index``
+    is its position in the file; ``message_type``/``control_id`` are peeked from the HL7."""
+
+    index: int
+    message_type: str | None
+    control_id: str | None
+    size: int
+
+
+class UploadedMessagesResult(BaseModel):
+    """A page of an uploaded file's split messages, after the (optional) offline filters/search.
+    ``scanned`` is how many messages were examined; ``matched`` how many matched; ``truncated`` True
+    when the result cap was hit."""
+
+    file_id: str
+    filename: str
+    messages: list[UploadedMessageSummary]
+    total_messages: int
+    scanned: int
+    matched: int
+    truncated: bool
+
+
+class UploadResendRequest(BaseModel):
+    """Resend one message from an uploaded file INTO a chosen inbound connection's pipeline (ADR 0134).
+
+    ``index`` is the 0-based message position in the file; ``to`` is the target inbound connection the
+    message is injected onto (a fresh ``RECEIVED`` via ``enqueue_ingress`` — NOT ``reingress``).
+    ``idempotency_key`` is unused today (each inject is a distinct receipt) but reserved for parity."""
+
+    index: int = Field(ge=0)
+    to: str = Field(min_length=1, max_length=256)  # the target inbound connection
+
+
+class UploadResendResult(BaseModel):
+    """The outcome of an uploaded-message inject: the new ``message_id`` minted on the target inbound's
+    channel. Carries ids only, never a body."""
+
+    file_id: str
+    index: int
+    to: str
+    message_id: str
+    status: str  # "injected"
+
+
+class UploadDeleteResult(BaseModel):
+    file_id: str
+    filename: str
+    deleted: bool
+
+
+# --- Saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) -------------------------
+
+
+class SearchPresetCriteria(BaseModel):
+    """The saved content-search form state. Mirrors the ``/messages/search`` typed params exactly (the
+    ADR 0046 seam). ``content`` / ``field_value`` are PHI-shaped — the preset column is encrypted at
+    rest and every save/recall is step-up-gated + audited."""
+
+    content: str | None = Field(None, max_length=512)
+    field_path: str | None = Field(None, max_length=32)
+    field_value: str | None = Field(None, max_length=512)
+    target: Literal["raw", "summary", "both"] = "both"
+    channel_id: str | None = Field(None, max_length=256)
+    status: str | None = Field(None, max_length=64)
+    message_type: str | None = Field(None, max_length=64)
+    control_id: str | None = Field(None, max_length=256)
+    limit: int = Field(50, ge=1, le=500)
+
+
+class SearchPresetInfo(BaseModel):
+    """A saved preset's identity + metadata (NO criteria — the PHI-shaped terms are returned only by the
+    step-up-gated layered-search compose, never listed)."""
+
+    id: str
+    name: str
+    created_at: float
+    updated_at: float
+
+
+class SearchPresetList(BaseModel):
+    total: int
+    presets: list[SearchPresetInfo]
+
+
+class SearchPresetCreateRequest(BaseModel):
+    """Create-or-replace a named preset for the calling user. ``name`` is a per-user unique label."""
+
+    name: str = Field(min_length=1, max_length=128)
+    criteria: SearchPresetCriteria
+
+
+class SearchPresetCreateResult(BaseModel):
+    id: str
+    name: str
+    status: str  # "created" | "replaced"
+
+
+class SearchPresetDeleteResult(BaseModel):
+    id: str
+    deleted: bool

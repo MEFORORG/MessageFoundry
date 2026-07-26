@@ -47,9 +47,9 @@ from messagefoundry.transports.database import (
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
-PROD_PHI = HopPosture(is_phi=True, production=True)
-STAGING_PHI = HopPosture(is_phi=True, production=False)
-DEV = HopPosture(is_phi=False, production=False)
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+DEV = HopPosture(is_phi=False, enforcing=False)
 
 _WEAK_DB = {"server": "s", "database": "d", "encrypt": False}
 
@@ -112,9 +112,8 @@ def test_db_unstamped_falls_back_to_unclamped_escape(monkeypatch: pytest.MonkeyP
 # --- DB: _build_dsn routes its verify-off refusal through the predicate --------------------------
 def test_build_dsn_prod_phi_weak_tls_refused_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="weakened"):
-            _build_dsn(dict(_WEAK_DB))
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
+        _build_dsn(dict(_WEAK_DB))
 
 
 def test_build_dsn_prod_phi_weak_tls_allowed_by_attestation(
@@ -130,9 +129,8 @@ def test_build_dsn_staging_phi_trust_cert_refused_without_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(STAGING_PHI):
-        with pytest.raises(ValueError, match="weakened"):
-            _build_dsn({"server": "s", "database": "d", "trust_server_certificate": True})
+    with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="weakened"):
+        _build_dsn({"server": "s", "database": "d", "trust_server_certificate": True})
 
 
 def test_build_dsn_dev_synthetic_escape_allows(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -144,9 +142,8 @@ def test_build_dsn_dev_synthetic_escape_allows(monkeypatch: pytest.MonkeyPatch) 
 # --- DB: DatabaseDestination construction + send-time byte-crossing re-assertion -----------------
 def test_database_destination_prod_phi_weak_tls_refused(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")  # inert on prod-PHI (the clamp)
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="weakened"):
-            DatabaseDestination(_db_dest())
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="weakened"):
+        DatabaseDestination(_db_dest())
 
 
 def test_database_destination_prod_phi_attested_constructs(
@@ -275,12 +272,17 @@ def test_serve_prod_phi_refuses_cleartext_even_with_flag(
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # pass the keyless-PHI gate
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\n[egress]\ndeny_by_default = true\n', encoding="utf-8"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n",
+        encoding="utf-8",
     )
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod", "--allow-insecure-bind"])
     assert rc == 2
     err = capsys.readouterr().err
-    assert "PRODUCTION PHI" in err and "--allow-insecure-bind cannot relax" in err
+    # The bind clamp keys on [security].enforcement (default enforce), not the production tier — so the
+    # refuse message references the enforcement level (a staging PHI instance at enforce refuses too;
+    # see test_cli.test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier).
+    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
 
 
 def test_serve_dev_synthetic_honors_flag(
@@ -295,7 +297,13 @@ def test_serve_dev_synthetic_honors_flag(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "0.0.0.0"\n', encoding="utf-8")
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic explicitly — this test proves the
+    # --allow-insecure-bind flag is honored on a synthetic instance (the PHI clamp is tested elsewhere).
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
+        encoding="utf-8",
+    )
     rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev", "--allow-insecure-bind"])
     assert rc == 0
     err = capsys.readouterr().err

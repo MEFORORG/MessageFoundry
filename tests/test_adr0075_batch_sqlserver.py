@@ -30,7 +30,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -316,3 +317,133 @@ async def test_ab_disposition_parity_on_vs_off(store: Any, filtered: bool) -> No
     assert on == off  # identical terminal disposition, flag ON vs OFF
     expected = MessageStatus.FILTERED.value if filtered else MessageStatus.PROCESSED.value
     assert on == expected
+
+
+# ============================ (f) SCALE-9: batched-handoff CRASH-REPLAY (AC-2) ============================
+# The ADR 0075 AC-2 hole. The FAIL-CLOSED test (b) above proves an applock-timeout rollback is
+# re-CLAIMABLE, but it never re-drives the handoff to a clean commit and never asserts the re-run yields
+# EXACTLY ONE non-duplicated next-stage row set. These pin, for BOTH batched hops under
+# set_batch_handoff_statements(True): at-least-once (a crash-rolled-back row is recoverable and eventually
+# handed off) AND at-most-once-per-commit (the rollback leaves ZERO next-stage rows, and the clean re-run
+# — plus an idempotent replay — adds exactly one, never a duplicate).
+#
+# The crash is DETERMINISTIC — never a real process kill or a sleep-race: a monkeypatched ``store._commit``
+# raises exactly once. That is the batched form's SOLE commit (``_route_handoff_batched`` /
+# ``_transform_handoff_batched`` each execute the whole folded body, then one ``await self._commit(conn)``
+# wrapped in ``except Exception: await conn.rollback(); raise``), so raising there is the faithful stand-in
+# for a crash after the body ran but before it committed. Recovery is ``reset_stale_inflight()`` + a
+# re-claim — exactly what a worker restart does to an INFLIGHT row. (mark_done is not batched by design, so
+# AC-2 scopes to route_handoff + transform_handoff. Batching is SQL-Server-only: Postgres/SQLite have no
+# set_batch_handoff_statements, so there is no PG/SQLite leg for this row.)
+
+
+def _crash_once_on_commit(store: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Arm the NEXT ``store._commit`` to raise once, then commit normally afterwards. The batched body's
+    ``except Exception: await conn.rollback(); raise`` rolls the whole folded handoff back — the mid-handoff
+    crash stand-in — while later commits (recovery, the clean re-run) go through untouched (no restore
+    needed, and no other DML-committing path is disturbed)."""
+    orig = store._commit
+    state = {"armed": True}
+
+    async def _flaky(conn: Any) -> None:
+        if state["armed"]:
+            state["armed"] = False
+            raise RuntimeError("simulated crash before the batched-handoff commit")
+        await orig(conn)
+
+    monkeypatch.setattr(store, "_commit", _flaky)
+
+
+async def test_batched_route_crash_before_commit_recovers_no_dup(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.set_batch_handoff_statements(True)
+    mid, ing = await _ingress_and_claim(store)
+    _crash_once_on_commit(store, monkeypatch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await _route(store, "IB", mid, ing, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED)
+    # Rolled back atomically: NO routed rows committed, disposition NOT advanced (at-most-once-per-commit).
+    assert await _stage_rows(store, mid, Stage.ROUTED.value) == []
+    assert await _status(store, mid) != MessageStatus.ROUTED.value
+    # The claimed ingress row is recoverable (the guard-DELETE rolled back) → the restart sweep re-pends it.
+    assert await store.reset_stale_inflight() >= 1
+    ing2 = await store.claim_next_fifo("IB", stage=Stage.INGRESS.value)
+    assert ing2 is not None
+    # Clean re-run commits (boom disarmed) → EXACTLY ONE routed row, correct disposition: zero-loss + zero-dup.
+    assert (
+        await _route(
+            store, "IB", mid, ing2, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED
+        )
+        is True
+    )
+    assert len(await _stage_rows(store, mid, Stage.ROUTED.value)) == 1
+    assert await _status(store, mid) == MessageStatus.ROUTED.value
+    assert await _stage_rows(store, mid, Stage.INGRESS.value) == []  # ingress consumed exactly once
+
+
+async def test_batched_transform_crash_before_commit_recovers_no_dup(
+    store: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store.set_batch_handoff_statements(True)
+    mid, ing = await _ingress_and_claim(store)
+    await _route(store, "IB", mid, ing, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED)
+    rtd = await _claim_routed(store)
+    _crash_once_on_commit(store, monkeypatch)
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await store.transform_handoff(
+            routed_id=rtd.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "OUTBODY")]
+        )
+    # Rolled back: NO outbound rows, disposition still ROUTED (the finalize UPDATE rolled back with the body).
+    assert await _stage_rows(store, mid, Stage.OUTBOUND.value) == []
+    assert await _status(store, mid) == MessageStatus.ROUTED.value
+    # The claimed routed row is recoverable → re-pended, re-claimed, re-run commits cleanly.
+    assert await store.reset_stale_inflight() >= 1
+    rtd2 = await _claim_routed(store)
+    assert (
+        await store.transform_handoff(
+            routed_id=rtd2.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "OUTBODY")]
+        )
+        is True
+    )
+    # EXACTLY ONE outbound row (no duplicate from the rolled-back attempt); delivering it finalizes PROCESSED.
+    assert len(await _stage_rows(store, mid, Stage.OUTBOUND.value)) == 1
+    ob = await store.claim_next_fifo("OB1", stage=Stage.OUTBOUND.value)
+    assert ob is not None
+    await store.mark_done(ob.id)
+    assert await _status(store, mid) == MessageStatus.PROCESSED.value
+
+
+async def test_batched_handoff_replay_idempotent_no_dup(store: Any) -> None:
+    # AC-2 idempotency delta: a crash AFTER commit replays the SAME handoff; the guard-DELETE finds the row
+    # already consumed (read_one None → rollback → False), so the re-run is a no-op with ZERO duplicate
+    # next-stage rows — for BOTH hops, under batching ON.
+    store.set_batch_handoff_statements(True)
+    mid, ing = await _ingress_and_claim(store)
+    assert (
+        await _route(store, "IB", mid, ing, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED)
+        is True
+    )
+    assert len(await _stage_rows(store, mid, Stage.ROUTED.value)) == 1
+    # Replay the identical route_handoff (same ingress_id) → False, routed rows UNCHANGED.
+    assert (
+        await _route(store, "IB", mid, ing, handlers=[("h", RAW)], disposition=MessageStatus.ROUTED)
+        is False
+    )
+    assert len(await _stage_rows(store, mid, Stage.ROUTED.value)) == 1
+
+    rtd = await _claim_routed(store)
+    assert (
+        await store.transform_handoff(
+            routed_id=rtd.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "OUTBODY")]
+        )
+        is True
+    )
+    assert len(await _stage_rows(store, mid, Stage.OUTBOUND.value)) == 1
+    # Replay the identical transform_handoff (same routed_id) → False, outbound rows UNCHANGED.
+    assert (
+        await store.transform_handoff(
+            routed_id=rtd.id, message_id=mid, channel_id="IB", deliveries=[("OB1", "OUTBODY")]
+        )
+        is False
+    )
+    assert len(await _stage_rows(store, mid, Stage.OUTBOUND.value)) == 1

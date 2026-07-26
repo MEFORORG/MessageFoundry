@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import os
-from typing import AsyncIterator
+from collections.abc import AsyncIterator
 
 import pytest
 
@@ -178,3 +178,57 @@ async def test_config_version_seed_and_bump(store) -> None:
     # A fresh reader sees the bumped value.
     other = _coord(store, "nodeB:2:bbbb")
     assert await other.config_version() == 2
+
+
+async def test_config_convergence_runner_reloads_from_real_db(store) -> None:
+    """HA-16 clause 2 (sibling reload propagation) over a REAL coordinator: a ConfigConvergenceRunner
+    on node B converges when a SECOND coordinator A bumps the shared ``cluster_config`` token in the DB
+    and B's cache is refreshed by an actual DB round-trip (the maintenance step, cluster_sqlserver.py:399).
+
+    The unit test in tests/test_cluster.py scripts ``config_version_cached`` on a fake coordinator; this
+    exercises the full live chain the fake can't — A bumps the DB row → B refreshes its cache from the
+    real DB → B's convergence runner reloads once and advances its applied version."""
+    from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
+
+    a = _coord(store, "nodeA:1:aaaa")
+    await a._ensure_tables()
+    b = _coord(store, "nodeB:2:bbbb")
+    # Seed both from the real DB: a fresh cluster_config initializes to 0, so neither node is behind.
+    assert await a.config_version() == 0
+    assert await b.config_version() == 0
+
+    applied = {"v": 0}
+    reloads: list[int] = []
+
+    async def reload() -> None:
+        # Convergence re-reads THIS node's own config dir; here we record the version B converged to.
+        reloads.append(b.config_version_cached())
+
+    runner = ConfigConvergenceRunner(
+        b,
+        applied_version=lambda: applied["v"],
+        set_applied_version=lambda v: applied.__setitem__("v", v),
+        reload=reload,
+        interval_seconds=10.0,
+    )
+    # Caught up (0 == 0): no reload.
+    assert await runner.converge_once() is False
+    assert reloads == []
+
+    # A real operator reload on node A bumps the shared token in the DB.
+    assert await a.bump_config_version() == 1
+    # B has NOT yet refreshed its cache from the DB, so its convergence poll still reads 0 → no reload.
+    # (The cached poll is what gates convergence, so the DB bump alone does nothing until B's tick.)
+    assert b.config_version_cached() == 0
+    assert await runner.converge_once() is False
+    assert reloads == []
+
+    # B's maintenance tick refreshes the cached version from the REAL DB (the config_version() step).
+    assert await b.config_version() == 1
+    assert b.config_version_cached() == 1
+    # Now B is behind → it reloads ONCE and advances applied to 1.
+    assert await runner.converge_once() is True
+    assert reloads == [1] and applied["v"] == 1
+    # Caught up again → no second reload (idempotent, no feedback loop).
+    assert await runner.converge_once() is False
+    assert reloads == [1]

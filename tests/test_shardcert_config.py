@@ -13,15 +13,14 @@ from __future__ import annotations
 
 import pytest
 
-from messagefoundry.config.wiring import Send, load_config
-from messagefoundry.parsing.message import Message
-
 from harness.config.shardcert._shape import (
     apply_transform,
     fifo_lane,
     load_shape,
     shared_dest_name,
 )
+from messagefoundry.config.wiring import Send, load_config
+from messagefoundry.parsing.message import Message
 
 _CONFIG_DIR = "harness/config/shardcert"
 

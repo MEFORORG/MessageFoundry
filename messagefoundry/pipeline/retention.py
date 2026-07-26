@@ -5,8 +5,11 @@
 Without enforcement, PHI accumulates in the message store indefinitely — including dead-lettered
 raw bodies. :class:`RetentionRunner` is the single background task that enforces the ``[retention]``
 service settings: past the configured windows it **nulls message/dead-letter bodies while keeping
-their metadata rows** (the Mirth Data-Pruner pattern — counts, disposition, and the audit trail stay
-intact; nothing is deleted), checkpoints the WAL, and ``VACUUM``s on a daily off-peak schedule. Each
+the message ROW** (the Mirth Data-Pruner pattern — counts, disposition, and the audit trail stay
+intact; the row survives, its PHI columns — ``metadata`` included, ASVS 14.2.7 — do not). Tiers that
+carry nothing BUT PHI and back no count (transform state, connection events, saved-search presets) are
+DELETEd outright rather than blanked. It also checkpoints the WAL and ``VACUUM``s on a daily off-peak
+schedule. Each
 pass that does real work writes **one** ``audit_log`` entry recording the cutoffs + counts (never any
 message content). When the store outgrows ``max_db_mb`` it raises an advisory ``storage_threshold``
 alert.
@@ -26,12 +29,15 @@ import asyncio
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 
 from messagefoundry.config.settings import RetentionSettings
 from messagefoundry.config.wiring import Registry
+from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.store import Store, StripResult
@@ -43,9 +49,90 @@ log = logging.getLogger(__name__)
 _SECONDS_PER_DAY = 86_400
 _BYTES_PER_MB = 1_000_000
 
+#: What counts as an "application log file" in ``[logging].log_dir`` — the same notion the ``/status``
+#: metering and the support-bundle tail use. Shared by the #120 delete sweep and the #119 compressor.
+_APP_LOG_SUFFIXES = (".log", ".txt")
+#: Suffix of the #119 gzip artifact, and of the temp file it is staged through (never a swept suffix,
+#: so a crash mid-write can't leave a half-file that a later pass mistakes for a finished archive).
+_GZ_SUFFIX = ".gz"
+_GZ_TMP_SUFFIX = ".gz.mftmp"
+#: Prefix of the staging file. The rest of the name is RANDOM (:func:`tempfile.mkstemp`), never derived
+#: from the source: a predictable staging path in a directory a second process (or an attacker) can write
+#: is an arbitrary-file-overwrite / log-destruction primitive — see :meth:`RetentionRunner._stage_archive`.
+_GZ_TMP_PREFIX = "mfgz-"
+#: Free-space precheck margin (#119): the peak on-disk cost of compressing a file is the source PLUS the
+#: archive, and gzip's worst case (incompressible input) is marginally LARGER than the source — so the
+#: requirement is ``size + max(10% of size, 1 MiB)``. Below that the file is skipped and logged rather
+#: than attempted, so a maintenance pass can never be what fills the volume.
+_COMPRESS_FREE_MARGIN_RATIO = 10  # divisor: size // 10 == 10%
+_COMPRESS_FREE_MIN_MARGIN_BYTES = 1 << 20  # 1 MiB
+#: Per-file ceiling (#119). The codec is bytes-in/bytes-out, so one file costs ~2x its size in RAM
+#: (source + archive) plus the round-trip buffer during validation. NSSM rotates at ~10 MB, so 64 MiB is
+#: ample headroom while bounding a maintenance pass's memory. A larger file is skipped and logged.
+_COMPRESS_MAX_FILE_BYTES = 64 << 20  # 64 MiB
+
 #: Per-connection "keep forever" (#34, ADR 0027): a cutoff of -inf makes ``received_at < cutoff`` always
 #: false, so that connection's bodies are never purged even while the global window prunes others.
 _KEEP_FOREVER = float("-inf")
+
+
+def _is_app_log_name(name: str, *, include_archives: bool) -> bool:
+    """Is ``name`` an application-log file this runner owns? ``.log``/``.txt`` always; the ``.log.gz``/
+    ``.txt.gz`` archives the #119 compressor produces only when ``include_archives`` (so an unrelated
+    ``.gz`` parked in the log directory is never swept, and neither is any ``.gz`` at all on a deployment
+    that has not enabled compression)."""
+    stem, ext = os.path.splitext(name.lower())
+    if ext in _APP_LOG_SUFFIXES:
+        return True
+    if include_archives and ext == _GZ_SUFFIX:
+        return os.path.splitext(stem)[1] in _APP_LOG_SUFFIXES
+    return False
+
+
+def _verify_archive(path: str, original: bytes, *, name: str) -> bool:
+    """Integrity-validate a written gzip archive: re-read it **off disk**, decompress it, and compare it
+    **byte-for-byte** with the source bytes. Only a True here may be followed by deleting the original.
+
+    The original's length is the exact expected output size, so it doubles as the decompression-bomb
+    ceiling (:func:`~messagefoundry.parsing.compression.gzip_decompress` refuses incrementally past it —
+    a corrupt archive claiming to expand to gigabytes is rejected, not materialized). Every failure is
+    logged with the file NAME and byte counts only; the round-tripped bytes are never logged (an
+    application log is operational text, PHI.md §7)."""
+    try:
+        with open(path, "rb") as fh:
+            blob = fh.read()
+    except OSError:
+        log.warning(
+            "app-log archive for %r could not be re-read for validation; original kept", name
+        )
+        return False
+    try:
+        round_trip = gzip_decompress(blob, max_output_bytes=len(original))
+    except CompressionError:
+        log.warning(
+            "app-log archive for %r failed integrity validation (corrupt/truncated); original kept",
+            name,
+        )
+        return False
+    if round_trip != original:
+        log.warning(
+            "app-log archive for %r failed integrity validation (%d bytes round-tripped, %d expected); "
+            "original kept",
+            name,
+            len(round_trip),
+            len(original),
+        )
+        return False
+    return True
+
+
+def _unlink_quietly(path: str) -> None:
+    """Best-effort removal of a staging file. A leftover ``*.gz.mftmp`` is inert (never a swept suffix,
+    never mistaken for an archive), so a failure here is logged at debug and otherwise ignored."""
+    try:
+        os.remove(path)
+    except OSError:
+        log.debug("could not remove the staging file %r", path, exc_info=True)
 
 
 @dataclass(frozen=True)
@@ -79,11 +166,31 @@ class RetentionPass:
     # removed from `[logging].log_dir`. Metadata only (mtime) — file content is never read. 0 when the
     # window/log_dir is unset (byte-identical audit for a deployment that doesn't use it).
     app_logs_deleted: int = 0
+    # Application log FILES gzipped this pass (#119) and the on-disk bytes reclaimed (source size minus
+    # archive size, summed over the files that compressed AND passed integrity validation). A file that
+    # was skipped (no free space, oversized, already archived) or whose archive failed validation counts
+    # in neither. Metadata only (names/sizes/mtimes) — file content is never logged or audited. Both 0
+    # when the window/log_dir is unset, so a deployment that doesn't use it has a byte-identical audit.
+    app_logs_compressed: int = 0
+    app_log_bytes_reclaimed: int = 0
+    # Saved-search presets DELETEd this pass (ADR 0136, ASVS 14.2.7): rows whose `updated_at` is past
+    # the `search_preset_days` window. Metadata only — the count, never a needle. 0 when the window is
+    # unset (the default), so a deployment that doesn't use it has a byte-identical audit detail.
+    search_presets_purged: int = 0
+    # This pass hit the `max_pass_seconds` between-phase duration cap (#121, ADR 0137) and SKIPPED its
+    # remaining phases — the skipped tail (incl. any due WAL-checkpoint/VACUUM) re-runs next interval with
+    # its last-run marker unadvanced. Always False when the cap is off (`max_pass_seconds<=0`, the
+    # default), so a deployment that doesn't use the cap is byte-identical.
+    capped: bool = False
 
     @property
     def did_work(self) -> bool:
         """Whether the pass changed anything worth an audit row (a routine WAL checkpoint alone
-        isn't — it leaves no data trace and would otherwise spam the audit log every pass)."""
+        isn't — it leaves no data trace and would otherwise spam the audit log every pass).
+
+        A ``capped`` pass counts as work worth recording: an operator needs to see that maintenance ran
+        out of its time budget and deferred phases (#121). With the cap off this is always False, so the
+        audit cadence is unchanged."""
         return (
             self.messages_purged > 0
             or self.dead_purged > 0
@@ -92,8 +199,11 @@ class RetentionPass:
             or self.documents_messages_stripped > 0
             or self.alert_instances_purged > 0
             or self.app_logs_deleted > 0
+            or self.app_logs_compressed > 0
+            or self.search_presets_purged > 0
             or self.vacuumed
             or self.over_limit
+            or self.capped
         )
 
 
@@ -109,6 +219,7 @@ class RetentionRunner:
         *,
         alert_sink: AlertSink | None = None,
         clock: Callable[[], float] = time.time,
+        monotonic: Callable[[], float] = time.monotonic,
         coordinator: ClusterCoordinator | None = None,
         registry_source: Callable[[], Registry | None] | None = None,
         log_dir: str | None = None,
@@ -125,6 +236,10 @@ class RetentionRunner:
         # Default to the logging sink so an over-limit store is at least visible without a notifier.
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._clock = clock
+        # A monotonic clock for the #121 between-phase duration cap — SEPARATE from `clock` (which is the
+        # wall clock feeding the retention *window* cutoffs and is often frozen in tests). Measuring
+        # elapsed pass time against a frozen window clock would never advance; monotonic can't go backwards.
+        self._monotonic = monotonic
         # Retention is a leader-only WRITE singleton (it purges PHI bodies + writes audit rows), so in
         # a cluster it must run on exactly one node. Default NullCoordinator → always leader → always
         # runs, so an existing caller/test that passes no coordinator is byte-identical (Track B Step 4).
@@ -150,18 +265,19 @@ class RetentionRunner:
             or s.dead_letter_days
             or s.state_max_age_days
             or s.connection_event_retention_hours
+            or s.search_preset_days
             or s.max_db_mb
             or s.wal_checkpoint_seconds
             or s.vacuum_time() is not None
         ):
             return True
-        # Application log-file retention (#120) needs BOTH a window and a log_dir to do anything, so
-        # only start the runner for it when both are present (avoids a no-op task for a configured
-        # window on a stdout-only deployment).
-        if s.app_log_days > 0 and self._log_dir:
+        # Application log-file retention (#120 delete, #119 compress) needs BOTH a window and a log_dir
+        # to do anything, so only start the runner for it when both are present (avoids a no-op task for
+        # a configured window on a stdout-only deployment).
+        if (s.app_log_days > 0 or s.app_log_compress_days > 0) and self._log_dir:
             return True
         registry = self._registry_source() if self._registry_source is not None else None
-        if registry is not None and any(
+        if registry is not None and any(  # noqa: SIM103
             ic.prune_documents_after is not None for ic in registry.inbound.values()
         ):
             return True
@@ -180,13 +296,16 @@ class RetentionRunner:
         self._task = asyncio.create_task(self._run())
         log.info(
             "retention enabled: messages_days=%d dead_letter_days=%d max_db_mb=%d "
-            "wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d (every %gs)",
+            "wal_checkpoint_seconds=%g vacuum_at=%r app_log_days=%d app_log_compress_days=%d "
+            "max_pass_seconds=%g (every %gs)",
             self._settings.messages_days,
             self._settings.dead_letter_days,
             self._settings.max_db_mb,
             self._settings.wal_checkpoint_seconds,
             self._settings.vacuum_at,
             self._settings.app_log_days,
+            self._settings.app_log_compress_days,
+            self._settings.max_pass_seconds,
             self._settings.purge_interval_seconds,
         )
 
@@ -197,7 +316,7 @@ class RetentionRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            try:  # noqa: SIM105
                 await task
             except asyncio.CancelledError:
                 pass
@@ -216,9 +335,9 @@ class RetentionRunner:
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     # --- one pass ------------------------------------------------------------
@@ -270,6 +389,25 @@ class RetentionRunner:
                 over_limit=False,
             )
 
+        # Between-phase duration cap (#121, ADR 0137): bound the wall time one maintenance pass may spend
+        # so a long pass can't run unbounded into the next window. `cap <= 0` (the default) disables it —
+        # byte-identical to the pre-#121 pass. `_deadline_hit()` reads a MONOTONIC clock (not `now`, the
+        # window wall-clock, which is often frozen in tests) and LATCHES `capped` the first time the elapsed
+        # pass time reaches the cap; each phase below runs only while the deadline is NOT yet hit. The check
+        # sits strictly BETWEEN phases — a phase that has already started always runs to completion, so a
+        # running VACUUM is never interrupted (its deadline check happens only BEFORE it is dispatched).
+        # Once the cap is hit the remaining phases are skipped and re-run next interval; a skipped
+        # WAL-checkpoint/VACUUM leaves its last-run marker unadvanced, so it stays due (defer, don't drop).
+        pass_start = self._monotonic()
+        cap = s.max_pass_seconds
+        capped = False
+
+        def _deadline_hit() -> bool:
+            nonlocal capped
+            if not capped and cap > 0 and self._monotonic() - pass_start >= cap:
+                capped = True
+            return capped
+
         # Per-connection retention overrides (#34, ADR 0027), resolved once per pass from the LIVE
         # registry: inbound name -> messages_days, outbound name -> dead_letter_days (0 = keep forever,
         # None = inherit the global window so the connection is omitted from the cutoff map → it uses the
@@ -279,14 +417,14 @@ class RetentionRunner:
         # window while the global default is keep-forever). Run the purge whenever the global window is
         # set OR any connection overrides it.
         messages_purged = 0
-        if s.messages_days > 0 or msg_days_overrides:
+        if not _deadline_hit() and (s.messages_days > 0 or msg_days_overrides):
             messages_purged = await self._store.purge_message_bodies(
                 older_than=self._global_cutoff(now, s.messages_days),
                 now=now,
                 connection_cutoffs=self._cutoff_map(now, msg_days_overrides),
             )
         dead_purged = 0
-        if s.dead_letter_days > 0 or dead_days_overrides:
+        if not _deadline_hit() and (s.dead_letter_days > 0 or dead_days_overrides):
             dead_purged = await self._store.purge_dead_letters(
                 older_than=self._global_cutoff(now, s.dead_letter_days),
                 now=now,
@@ -300,7 +438,10 @@ class RetentionRunner:
         # value with the connections sharing it (a single call carries one threshold).
         doc_overrides, doc_min_bytes, doc_content_types = self._resolve_document_prune()
         strip = StripResult()
-        for threshold in sorted(set(doc_min_bytes.values())):
+        # The whole embedded-document strip is one phase: skip it (empty threshold set) if the cap was hit
+        # before it; otherwise strip once per distinct min_bytes threshold.
+        doc_thresholds: list[int] = [] if _deadline_hit() else sorted(set(doc_min_bytes.values()))
+        for threshold in doc_thresholds:
             group = {n: d for n, d in doc_overrides.items() if doc_min_bytes[n] == threshold}
             part = await self._store.strip_embedded_documents(
                 older_than=_KEEP_FOREVER,  # no global document-prune default → keep-forever ELSE
@@ -315,7 +456,7 @@ class RetentionRunner:
                 bytes_reclaimed=strip.bytes_reclaimed + part.bytes_reclaimed,
             )
         state_purged = 0
-        if s.state_max_age_days > 0:
+        if not _deadline_hit() and s.state_max_age_days > 0:
             state_purged = await self._store.purge_state(
                 older_than=now - s.state_max_age_days * _SECONDS_PER_DAY, now=now
             )
@@ -323,26 +464,43 @@ class RetentionRunner:
         # else inherit the message-body window (the ADR 0021 §7.5 default — bound the log alongside
         # the bodies). A positive hours value can keep events longer OR shorter than message bodies.
         conn_events_purged = 0
-        if s.connection_event_retention_hours > 0:
-            conn_events_purged = await self._store.purge_connection_events(
-                older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-            )
-        elif s.messages_days > 0:
-            conn_events_purged = await self._store.purge_connection_events(
-                older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
-            )
+        if not _deadline_hit():
+            if s.connection_event_retention_hours > 0:
+                conn_events_purged = await self._store.purge_connection_events(
+                    older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                )
+            elif s.messages_days > 0:
+                conn_events_purged = await self._store.purge_connection_events(
+                    older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                )
 
         # Resolved operator-alert instances (#56, ADR 0044): pruned on the SAME window as connection
         # events (metadata-only, one pass). Only RESOLVED instances are eligible — an open/acknowledged
         # condition is never aged out from under an operator. No window set ⇒ inherit the body window.
         alert_instances_purged = 0
-        if s.connection_event_retention_hours > 0:
-            alert_instances_purged = await self._store.purge_alert_instances(
-                older_than=now - s.connection_event_retention_hours * 3600.0, now=now
-            )
-        elif s.messages_days > 0:
-            alert_instances_purged = await self._store.purge_alert_instances(
-                older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+        if not _deadline_hit():
+            if s.connection_event_retention_hours > 0:
+                alert_instances_purged = await self._store.purge_alert_instances(
+                    older_than=now - s.connection_event_retention_hours * 3600.0, now=now
+                )
+            elif s.messages_days > 0:
+                alert_instances_purged = await self._store.purge_alert_instances(
+                    older_than=now - s.messages_days * _SECONDS_PER_DAY, now=now
+                )
+
+        # Saved-search presets (ADR 0136, ASVS 14.2.7): the stored `criteria` is a PHI-shaped needle, so
+        # it gets a window like every other PHI tier. A PLAIN window with NO inheritance — unlike
+        # connection events above, an unset `search_preset_days` does NOT fall back to the body window.
+        # A preset is a user-authored artifact whose `updated_at` only moves on a SAVE, so inheriting a
+        # body window would silently delete every preset not re-saved inside it on the first pass after
+        # upgrade (a PHI instance always has a bounded body window). Opt-in only. BACKLOG #306 softened
+        # this further — the purge now keys on MAX(updated_at, last_used_at), so a preset merely RECALLED
+        # inside the window survives; the argument above still holds for the first pass after upgrade,
+        # where every pre-#306 row's `last_used_at` is NULL and the key degrades to `updated_at`.
+        search_presets_purged = 0
+        if not _deadline_hit() and s.search_preset_days > 0:
+            search_presets_purged = await self._store.purge_search_presets(
+                older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
             )
 
         # Application log-file retention (#120): delete app-log FILES older than `app_log_days` from
@@ -350,22 +508,47 @@ class RetentionRunner:
         # event loop; metadata only (mtime) — file content is never read (no PHI). A no-op unless the
         # window and a log_dir are both set, so a deployment that doesn't use it is byte-identical.
         app_logs_deleted = 0
-        if s.app_log_days > 0 and self._log_dir:
+        if not _deadline_hit() and s.app_log_days > 0 and self._log_dir:
             app_logs_deleted = await asyncio.to_thread(self._sweep_app_logs, now)
 
+        # Application log-file compression (#119): gzip app-log FILES older than `app_log_compress_days`
+        # in place, free-space-prechecked and integrity-validated before the original is removed. Its own
+        # phase beside the #120 sweep and deliberately AFTER it, so a file the delete window has already
+        # aged out is never compressed first (wasted I/O on a file about to vanish). Blocking file I/O
+        # (scandir/read/write/fsync/unlink), so it runs off the event loop exactly as the sweep does. It
+        # is the one phase that takes the deadline INSIDE itself (`_deadline_hit` is handed to the worker
+        # and re-read PER FILE): it is a loop over an unbounded directory of up-to-64 MiB files, so
+        # checking only before dispatch would let one dispatch run the whole directory and blow straight
+        # through `max_pass_seconds` (#121). Per-file granularity is the natural interruption point — a
+        # file is compressed whole or not at all, and whatever is left is simply still there next pass. A
+        # no-op unless the window and a log_dir are both set → byte-identical for a deployment that's off.
+        app_logs_compressed = 0
+        app_log_bytes_reclaimed = 0
+        if not _deadline_hit() and s.app_log_compress_days > 0 and self._log_dir:
+            app_logs_compressed, app_log_bytes_reclaimed = await asyncio.to_thread(
+                self._compress_app_logs, now, _deadline_hit
+            )
+
+        # Maintenance phases (WAL-checkpoint, then daily VACUUM). Their cadence markers advance ONLY when
+        # the phase actually runs, so a phase SKIPPED by the cap stays due for the next pass (#121). A
+        # running VACUUM is non-interruptible: the deadline is checked only BEFORE it is dispatched.
         wal_checkpointed = False
-        if s.wal_checkpoint_seconds > 0 and now - self._last_wal >= s.wal_checkpoint_seconds:
+        if (
+            not _deadline_hit()
+            and s.wal_checkpoint_seconds > 0
+            and now - self._last_wal >= s.wal_checkpoint_seconds
+        ):
             await self._store.wal_checkpoint()
             self._last_wal = now
             wal_checkpointed = True
 
         vacuumed = False
-        if self._vacuum_due(now):
+        if not _deadline_hit() and self._vacuum_due(now):
             await self._store.vacuum()
             self._last_vacuum_day = self._day_key(now)
             vacuumed = True
 
-        size_bytes, over_limit = await self._check_size()
+        size_bytes, over_limit = (0, False) if _deadline_hit() else await self._check_size()
 
         result = RetentionPass(
             messages_purged=messages_purged,
@@ -384,6 +567,10 @@ class RetentionRunner:
             document_prune_overrides=doc_overrides,
             alert_instances_purged=alert_instances_purged,
             app_logs_deleted=app_logs_deleted,
+            app_logs_compressed=app_logs_compressed,
+            app_log_bytes_reclaimed=app_log_bytes_reclaimed,
+            search_presets_purged=search_presets_purged,
+            capped=capped,
         )
         if result.did_work:
             await self._audit(result)
@@ -482,10 +669,17 @@ class RetentionRunner:
         file is never eligible. **Metadata only** — file content is never read (no PHI). Blocking
         (``scandir``/``stat``/``unlink``), so the caller runs it off the event loop. Never raises: a
         locked/vanished/permission-denied entry is skipped, not fatal — a log-retention hiccup must
-        never take a purge pass down. Returns the number of files deleted."""
+        never take a purge pass down. Returns the number of files deleted.
+
+        When (and ONLY when) compression is enabled (#119) the sweep also covers the archives it
+        produces — ``*.log.gz``/``*.txt.gz`` — on the same window, so compressing a file does not make
+        it immortal (the archive inherits the source's mtime, so it ages out on the original's clock).
+        With ``app_log_compress_days = 0`` the eligible set is exactly the pre-#119 one, so a deployment
+        that hasn't opted into compression is byte-identical."""
         days = self._settings.app_log_days
         if days <= 0 or not self._log_dir:
             return 0
+        include_archives = self._settings.app_log_compress_days > 0
         cutoff = now - days * _SECONDS_PER_DAY
         deleted = 0
         try:
@@ -496,7 +690,7 @@ class RetentionRunner:
             try:
                 if not entry.is_file(follow_symlinks=False):
                     continue
-                if os.path.splitext(entry.name)[1].lower() not in (".log", ".txt"):
+                if not _is_app_log_name(entry.name, include_archives=include_archives):
                     continue
                 if entry.stat(follow_symlinks=False).st_mtime >= cutoff:
                     continue
@@ -505,6 +699,246 @@ class RetentionRunner:
             except OSError:
                 continue  # locked/vanished/denied file → skip, never fatal
         return deleted
+
+    # --- application log-file compression (#119) -----------------------------
+
+    def _compress_app_logs(self, now: float, deadline_hit: Callable[[], bool]) -> tuple[int, int]:
+        """Gzip application-log FILES older than ``app_log_compress_days`` in ``[logging].log_dir`` to
+        ``<name>.gz``, returning ``(files_compressed, bytes_reclaimed)``.
+
+        Same file selection as the #120 sweep (one level, non-recursive, ``.log``/``.txt`` regular files,
+        by **mtime** so the currently-written file is never eligible) — archives are never re-compressed.
+        Five safety rules, in order, per file:
+
+        0. **Stop at the pass deadline.** ``deadline_hit`` (the caller's ``max_pass_seconds`` latch, #121)
+           is re-read **before every file**, so the phase releases the pass between files instead of
+           running the whole directory in one uninterruptible call. Whatever is left is untouched and is
+           simply picked up by the next pass — nothing is dropped, only deferred.
+        1. **Never clobber.** An existing ``<name>.gz`` means the file is already archived (or a crash
+           landed the archive but not the unlink); it is skipped, and the delete window cleans up.
+        2. **Free-space precheck.** ``shutil.disk_usage`` must show room for the source *plus* its
+           archive plus a margin, else the file is skipped and logged — a maintenance pass must never be
+           what fills the volume. Re-read per file, since each compression changes what is free.
+        3. **Never grow.** An archive that is not SMALLER than its source (an empty or already-compressed
+           log) is discarded and the original left alone — compressing must not cost disk.
+        4. **Integrity validation before deletion.** The archive is staged to an exclusively created,
+           unpredictably named temp file (:meth:`_stage_archive`), ``fsync``ed, validated, renamed into
+           place, and then **re-validated at ``dest``** — that last check, on the bytes actually sitting
+           where the log used to be, is the only thing that authorizes removing the original. Any failure
+           leaves the original **untouched** and is logged (:meth:`_compress_one`).
+
+        The archive inherits the source's mtime so the ``app_log_days`` delete window keeps applying to
+        it. Blocking I/O throughout, so the caller runs it off the event loop. Never raises — a
+        locked/vanished/denied entry is skipped, not fatal. Names, counts and sizes are logged; file
+        **content** never is (an application log is itself operational text, PHI.md §7)."""
+        days = self._settings.app_log_compress_days
+        if days <= 0 or not self._log_dir:
+            return 0, 0
+        cutoff = now - days * _SECONDS_PER_DAY
+        compressed = 0
+        reclaimed = 0
+        try:
+            entries = list(os.scandir(self._log_dir))
+        except OSError:
+            return 0, 0  # directory absent/unreadable → nothing compressed, never raise
+        for entry in entries:
+            # Per-file, not per-phase: one dispatch must not be able to overrun the whole pass budget.
+            # Checked BETWEEN files, so a file already being compressed always finishes (the same
+            # "never interrupt a started unit of work" rule the sibling phases follow).
+            if deadline_hit():
+                log.info(
+                    "app-log compression stopped at the pass cap after %d file(s); "
+                    "the rest are left for the next pass",
+                    compressed,
+                )
+                break
+            try:
+                if not entry.is_file(follow_symlinks=False):
+                    continue
+                # include_archives=False: an existing `.gz` is the OUTPUT of this phase, never its input.
+                if not _is_app_log_name(entry.name, include_archives=False):
+                    continue
+                st = entry.stat(follow_symlinks=False)
+                if st.st_mtime >= cutoff:
+                    continue
+                dest = entry.path + _GZ_SUFFIX
+                if os.path.exists(dest):
+                    continue  # already archived — never clobber an existing artifact
+                if st.st_size > _COMPRESS_MAX_FILE_BYTES:
+                    log.warning(
+                        "app-log compression skipped %r: %d bytes exceeds the %d-byte per-file ceiling",
+                        entry.name,
+                        st.st_size,
+                        _COMPRESS_MAX_FILE_BYTES,
+                    )
+                    continue
+                if not self._has_free_space(st.st_size, name=entry.name):
+                    continue
+                saved = self._compress_one(entry.path, dest, atime=st.st_atime, mtime=st.st_mtime)
+                if saved is None:
+                    continue  # skipped or failed validation — the original is still in place
+                compressed += 1
+                reclaimed += saved
+            except OSError:
+                # Locked/vanished/denied entry → skip, never fatal. Name only, never content.
+                log.warning("app-log compression skipped %r (filesystem error)", entry.name)
+                continue
+        return compressed, reclaimed
+
+    def _has_free_space(self, size: int, *, name: str) -> bool:
+        """Free-space precheck: is there room to write ``size``'s archive **beside** it?
+
+        Peak cost is the source plus the archive, and gzip's worst case (incompressible input) is
+        marginally larger than the source — so the bar is ``size + max(10% of size, 1 MiB)``. Under it,
+        the file is skipped and logged rather than attempted, so compression can never be what fills the
+        volume. A free-space read that itself fails is treated as "no room" (fail closed)."""
+        assert self._log_dir is not None  # guarded by the caller
+        try:
+            free = self._free_bytes(self._log_dir)
+        except OSError:
+            log.warning("app-log compression skipped %r: free space could not be read", name)
+            return False
+        required = size + max(size // _COMPRESS_FREE_MARGIN_RATIO, _COMPRESS_FREE_MIN_MARGIN_BYTES)
+        if free < required:
+            log.warning(
+                "app-log compression skipped %r: %d bytes free on %r, %d required for a %d-byte source",
+                name,
+                free,
+                self._log_dir,
+                required,
+                size,
+            )
+            return False
+        return True
+
+    @staticmethod
+    def _free_bytes(path: str) -> int:
+        """Bytes free on the filesystem holding ``path``. Split out from :meth:`_has_free_space` so the
+        precheck is directly testable — a full volume cannot otherwise be simulated."""
+        return shutil.disk_usage(path).free
+
+    def _compress_one(self, source: str, dest: str, *, atime: float, mtime: float) -> int | None:
+        """Gzip ``source`` → ``dest``, **validating the bytes at ``dest`` before removing the original**.
+
+        Returns the bytes reclaimed, or ``None`` when the original was left in place (read/codec/write
+        failure, a failed integrity check, or an archive that would not be SMALLER than the source).
+
+        **What authorizes the unlink** is a read-back of ``dest`` *after* the rename — never a check
+        against the staging path. Validating the staged file and then renaming "whatever is at that
+        path" is a TOCTOU: any process that rewrites the staging file inside that window puts UNVALIDATED
+        bytes at ``dest`` while the source is unlinked anyway, which destroys the only copy of the log and
+        reports it as a success. Both checks are kept — the staged one so an unvalidated artifact is never
+        placed at ``dest`` at all, the ``dest`` one because it is the only one that describes the bytes
+        the delete is traded for. (The staging file itself is unpredictable and exclusively created, see
+        :meth:`_stage_archive`, so that window is closed from the other side too.)"""
+        name = os.path.basename(source)
+        try:
+            with open(source, "rb") as fh:
+                data = fh.read()
+        except OSError:
+            log.warning("app-log compression skipped %r: unreadable", name)
+            return None
+        try:
+            blob = gzip_compress(data)
+        except CompressionError:
+            # Message names the codec only — never content (parsing/compression.py contract).
+            log.warning("app-log compression failed for %r: codec error; original kept", name)
+            return None
+        if len(blob) >= len(data):
+            # Compressing would COST disk, not save it — an empty log (NSSM's `service.err.log` is
+            # routinely 0 bytes, and a gzip member still carries an 18-byte header/trailer) or already-
+            # compressed content. Leave the original alone rather than swap it for something bigger.
+            # Re-evaluated each pass, which is the right trade: a few reads beat a permanent marker file.
+            log.debug("app-log compression skipped %r: the archive would not be smaller", name)
+            return None
+        tmp = self._stage_archive(blob, os.path.dirname(source) or ".", name=name)
+        if tmp is None:
+            return None
+        if not _verify_archive(tmp, data, name=name):
+            _unlink_quietly(tmp)
+            return None
+        try:
+            # Inherit the source's timestamps so the `app_log_days` delete window still ages the archive
+            # out on the ORIGINAL file's clock (compressing a log must not reset its retention clock).
+            os.utime(tmp, (atime, mtime))
+            os.replace(tmp, dest)
+        except OSError:
+            log.warning(
+                "app-log compression failed for %r: archive rename failed; original kept", name
+            )
+            _unlink_quietly(tmp)
+            return None
+        if not _verify_archive(dest, data, name=name):
+            # The ONLY gate on the unlink below, and it did not pass: whatever is at `dest` is not this
+            # log. Keep the original (it is still the only good copy) and do not count it as compressed.
+            # The artifact at `dest` is deliberately NOT removed: under a concurrent compressor it may be
+            # a VALID archive of a longer read of the same log whose source is already gone, and deleting
+            # that would be the very data loss this check exists to prevent. It is inert (the next pass
+            # skips a source whose `<name>.gz` exists) and the `app_log_days` window still ages it out.
+            log.warning(
+                "app-log %r: the archive did not validate AFTER being renamed into place; the original "
+                "is kept and NOT counted as compressed. The unvalidated %r needs an operator's review.",
+                name,
+                os.path.basename(dest),
+            )
+            return None
+        try:
+            os.remove(source)
+        except OSError:
+            # The VALIDATED archive is in place but the original could not be removed (locked). Not
+            # counted as compressed — the next pass sees `dest` and skips, and the delete window (or the
+            # operator) clears the leftover. Nothing is lost either way.
+            log.warning("app-log %r archived but the original could not be removed", name)
+            return None
+        # Measured against the bytes actually archived, not the earlier `stat` — the two differ if the
+        # file grew between the scan and the read, and the reclaim figure must describe what happened.
+        return len(data) - len(blob)
+
+    @staticmethod
+    def _stage_archive(blob: bytes, directory: str, *, name: str) -> str | None:
+        """Write ``blob`` to a **freshly created, unpredictably named** staging file in ``directory``
+        (the log directory, so the later :func:`os.replace` is a same-filesystem atomic rename), returning
+        its path — or ``None``, with the failure logged, if it could not be written.
+
+        :func:`tempfile.mkstemp` is what makes this safe, and both halves matter:
+
+        * **Unpredictable.** The old name was ``<source>.gz.mftmp`` — derived from the source, so every
+          process (and anything else able to write to the log directory) could compute it in advance and
+          plant or rewrite the file the compressor is about to validate-and-rename. Predictability is
+          what turns the rename into an attack primitive rather than a race one has to win blind.
+        * **Exclusive.** ``mkstemp`` opens ``O_CREAT|O_EXCL`` (plus ``O_NOFOLLOW`` where the platform has
+          it), so it **creates** the file or fails — it never truncates an existing file and never follows
+          a symlink to one (CWE-59/CWE-377). Plain ``open(path, "wb")`` does both, which made the staging
+          write an arbitrary-file-overwrite: a symlink at the predictable path pointed the compressor's
+          write at any file the service account could touch, including other logs.
+
+        This also makes concurrent compressors safe by construction — every shard runs its own
+        RetentionRunner over the SAME ``[logging].log_dir`` (each shard is its own leader under
+        ``NullCoordinator``), so a shared staging path was guaranteed collision, not a rare race."""
+        fd = -1
+        tmp = ""
+        try:
+            fd, tmp = tempfile.mkstemp(dir=directory, prefix=_GZ_TMP_PREFIX, suffix=_GZ_TMP_SUFFIX)
+            with os.fdopen(fd, "wb") as out:
+                fd = -1  # ownership handed to the file object; don't double-close in the handler
+                out.write(blob)
+                out.flush()
+                # fsync so the validation reads what actually reached the disk, not the page cache —
+                # the whole point is to prove the artifact before deleting the only other copy.
+                os.fsync(out.fileno())
+        except OSError:
+            log.warning(
+                "app-log compression failed for %r: archive write failed; original kept", name
+            )
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    log.debug("could not close the staging descriptor for %r", name, exc_info=True)
+            if tmp:
+                _unlink_quietly(tmp)
+            return None
+        return tmp
 
     async def _audit(self, result: RetentionPass) -> None:
         """Append one audit row recording the cutoffs + counts (no message content — no PHI)."""
@@ -536,6 +970,19 @@ class RetentionRunner:
                 # Application log files deleted this pass (#120) + the window — metadata only, no PHI.
                 "app_log_days": self._settings.app_log_days,
                 "app_logs_deleted": result.app_logs_deleted,
+                # Application log files gzipped this pass (#119) + the window + bytes reclaimed. Counts
+                # and sizes only — never a file name and never any file content (no PHI).
+                "app_log_compress_days": self._settings.app_log_compress_days,
+                "app_logs_compressed": result.app_logs_compressed,
+                "app_log_bytes_reclaimed": result.app_log_bytes_reclaimed,
+                # Saved-search presets DELETEd this pass (ADR 0136, ASVS 14.2.7) + the window. The COUNT
+                # only — a preset's criteria is a PHI-shaped needle and never enters the audit detail.
+                "search_preset_days": self._settings.search_preset_days,
+                "search_presets_purged": result.search_presets_purged,
+                # Between-phase duration cap (#121, ADR 0137): the configured ceiling + whether THIS pass
+                # hit it and skipped its remaining phases. Timing metadata only — no PHI.
+                "max_pass_seconds": self._settings.max_pass_seconds,
+                "capped": result.capped,
                 "vacuumed": result.vacuumed,
                 "db_size_bytes": result.size_bytes,
                 "max_db_mb": self._settings.max_db_mb,

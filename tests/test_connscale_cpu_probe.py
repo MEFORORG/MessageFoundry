@@ -50,13 +50,26 @@ def _sample(elapsed: float) -> EngineSample:
     )
 
 
+# A stable single-PID subtree — the common case, where every interval is a clean same-set delta.
+_STABLE_PIDS = frozenset({1234})
+
+
 def _derive(pairs: list[tuple[float, float | None]]) -> object:
-    """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds) readings."""
+    """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds) readings, holding the summed-over
+    PID set constant so every interval is a clean CPU delta (the stable-subtree common case)."""
+    return _derive_sets([(e, c, _STABLE_PIDS) for e, c in pairs])
+
+
+def _derive_sets(
+    triples: list[tuple[float, float | None, frozenset[int] | None]],
+) -> object:
+    """Drive ``_drain_proc`` over (elapsed_s, cumulative_cpu_seconds, cpu_pids) readings, so a test can
+    change the summed-over subtree between ticks (#220)."""
     samples = []
-    for elapsed, cpu in pairs:
+    for elapsed, cpu, pids in triples:
         s = _sample(elapsed)
         _PROC_BY_SAMPLE[id(s)] = ProcSample(
-            handles=61, cpu_seconds=cpu, working_set_bytes=6_000_000
+            handles=61, cpu_seconds=cpu, working_set_bytes=6_000_000, cpu_pids=pids
         )
         samples.append(s)
     return _drain_proc(samples)
@@ -92,6 +105,76 @@ def test_advancing_cpu_counter_yields_cores_busy() -> None:
 def test_a_single_reading_cannot_derive_cpu() -> None:
     d = _derive([(0.0, 12.5)])
     assert d.cpu_seconds_total is None  # a delta needs two points
+
+
+def test_falsifier_a_pid_joining_mid_window_does_not_inflate_cpu_total() -> None:
+    # BACKLOG #220 falsifier. The engine subtree = {100}, burning ~1 core. Mid-window a NEW pid 200
+    # joins (A3 re-resolution picks up a `serve --shard` worker) carrying its whole-life CPU — the
+    # summed counter jumps 12→64. Endpoint-differencing (last − first) over that jump reports 56 CPU-s,
+    # ~50 of which is pid 200's PRE-window life; the pre-fix code did exactly that. The piecewise sum
+    # over same-set intervals must count only the two clean 2-s/2-CPU intervals ⇒ 4.0, degrading the
+    # membership-change interval to a gap. This test FAILS on the pre-fix endpoint-difference code.
+    d = _derive_sets(
+        [
+            (0.0, 10.0, frozenset({100})),
+            (2.0, 12.0, frozenset({100})),  # +2 CPU over 2 s (1 core), clean
+            (4.0, 64.0, frozenset({100, 200})),  # pid 200 joins: +50 whole-life CPU → GAP
+            (6.0, 66.0, frozenset({100, 200})),  # +2 CPU over 2 s (1 core), clean
+        ]
+    )
+    assert d.cpu_seconds_total == pytest.approx(4.0)
+    assert d.cpu_seconds_total < 50.0  # the joining PID's pre-window CPU must NOT leak in
+    assert d.cpu_util_cores_mean == pytest.approx(1.0)  # 4 CPU-s over 4 s of clean span
+    assert d.cpu_util_cores_peak == pytest.approx(1.0)
+
+
+def test_a_membership_changed_interval_is_degraded_to_a_gap() -> None:
+    # Every interval crosses a subtree-set change (a worker joins, then another leaves): no clean
+    # interval survives, so the CPU gauges degrade to a GAP rather than a fabricated delta.
+    d = _derive_sets(
+        [
+            (0.0, 10.0, frozenset({100})),
+            (2.0, 30.0, frozenset({100, 200})),  # 200 joins → set change → gap
+            (4.0, 25.0, frozenset({100})),  # 200 departs → set change (and negative) → gap
+        ]
+    )
+    assert d.cpu_seconds_total is None
+    assert d.cpu_util_cores_mean is None
+    assert d.cpu_util_cores_peak is None
+    # The non-CPU gauges still read — the process set was observed, only its CPU delta is unsound.
+    assert d.handles_peak == 61
+    assert d.working_set_peak_bytes == 6_000_000
+
+
+def test_a_departing_pid_does_not_drive_cpu_negative() -> None:
+    # A departing PID makes the summed counter DROP; pre-fix `max(0, last−first)` clamped that to 0.0.
+    # Post-fix the departure interval is a gap and the surrounding clean intervals still measure CPU.
+    d = _derive_sets(
+        [
+            (0.0, 0.0, frozenset({100, 200})),
+            (2.0, 4.0, frozenset({100, 200})),  # +4 CPU over 2 s, clean (2 cores busy)
+            (4.0, 1.0, frozenset({100})),  # 200 departs: counter drops → GAP, not −3
+            (6.0, 3.0, frozenset({100})),  # +2 CPU over 2 s, clean (1 core busy)
+        ]
+    )
+    assert d.cpu_seconds_total == pytest.approx(6.0)  # 4 + 2, the departure interval excluded
+    assert d.cpu_util_cores_peak == pytest.approx(2.0)  # the 2-cores clean interval
+
+
+def test_flat_counter_with_a_membership_change_still_gaps_not_zero() -> None:
+    # Compose the flat-CPU-gap guard with membership degradation: a long flat span where the only
+    # non-flat motion is a set-change interval must stay a GAP, never regress into a plausible 0.00.
+    d = _derive_sets(
+        [
+            (0.0, 12.5, frozenset({100})),
+            (10.0, 12.5, frozenset({100})),  # flat, clean
+            (20.0, 40.0, frozenset({100, 200})),  # set change → gap (not counted)
+            (30.0, 40.0, frozenset({100, 200})),  # flat, clean
+        ]
+    )
+    # Clean covered span = 10 + 10 = 20 s, all flat ⇒ 0 CPU over ≥5 s ⇒ gap, not 0.00.
+    assert d.cpu_seconds_total is None
+    assert d.cpu_util_cores_mean is None
 
 
 _BURN = "x=0\nfor i in range(300_000_000): x+=i"

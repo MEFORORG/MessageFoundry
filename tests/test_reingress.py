@@ -26,8 +26,10 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     build_outbound_connection,
 )
+from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
+from messagefoundry.store.crypto import cell_aad
 from messagefoundry.transports.loopback import LoopbackSource
 
 
@@ -57,7 +59,7 @@ async def _insert_response_row(
 ) -> str:
     """Insert one Stage.RESPONSE work-row directly (Step 1 has no producer yet — that is Step 3). The
     payload is the encrypted artifact reference, exactly as complete_with_response will write it."""
-    ref = store._enc(f"{message_id}\x1fOB_X\x1f{seq}")
+    ref = store._enc(f"{message_id}\x1fOB_X\x1f{seq}", aad=cell_aad("queue", "payload", row_id))
     await store._db.execute(
         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
         " payload, status, attempts, next_attempt_at, created_at, updated_at)"
@@ -195,6 +197,42 @@ def test_cross_registry_reingress_to_must_name_a_loopback() -> None:
     _check(reg3)  # no raise
 
 
+def test_sharded_reingress_to_validates_against_the_unfiltered_graph() -> None:
+    # Regression (ADR 0013 x ADR 0073): the capturing outbound and its reingress_to loopback may live on
+    # DIFFERENT engine shards — every shard keeps every outbound, but only the loopback's owner keeps the
+    # inbound. Resolving the target against the FILTERED registry.inbound failed build_check on every
+    # non-owning shard (a permanent 422 on reload/promote) even though the runtime already spans the split.
+    reg = Registry()
+    reg.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r", shard="a"))
+    reg.add_inbound(build_inbound_connection("IB_270", MLLP(port=2599), router="r", shard="b"))
+    reg.add_outbound(
+        build_outbound_connection("OB_270", MLLP(host="h", port=1, reingress_to="IB_LOOP"))
+    )
+    _check(reg)  # unfiltered: fine
+    _check(filter_registry_for_shard(reg, "a"))  # the loopback's OWNER: fine
+    _check(filter_registry_for_shard(reg, "b"))  # the NON-owning shard: must ALSO be fine
+
+    # ...and the rule keeps its teeth on that same non-owning shard. A typo'd target exists on NO shard:
+    typo = Registry()
+    typo.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="r", shard="a"))
+    typo.add_inbound(build_inbound_connection("IB_270", MLLP(port=2599), router="r", shard="b"))
+    typo.add_outbound(
+        build_outbound_connection("OB_270", MLLP(host="h", port=1, reingress_to="IB_TYPO"))
+    )
+    with pytest.raises(WiringError, match="unknown/non-loopback"):
+        _check(filter_registry_for_shard(typo, "b"))
+
+    # ...and a target that exists on the OTHER shard but is not a Loopback still fails here too.
+    wrong = Registry()
+    wrong.add_inbound(build_inbound_connection("IB_MLLP", MLLP(port=2598), router="r", shard="a"))
+    wrong.add_inbound(build_inbound_connection("IB_270", MLLP(port=2599), router="r", shard="b"))
+    wrong.add_outbound(
+        build_outbound_connection("OB_270", MLLP(host="h", port=1, reingress_to="IB_MLLP"))
+    )
+    with pytest.raises(WiringError, match="unknown/non-loopback"):
+        _check(filter_registry_for_shard(wrong, "b"))
+
+
 def test_inert_loopback_logs_not_errors(caplog: pytest.LogCaptureFixture) -> None:
     import logging
 
@@ -320,7 +358,7 @@ async def test_ingress_handoff_produces_child_and_finalizes_origin(store: Messag
 
 async def test_ingress_handoff_is_idempotent_no_double_child(store: MessageStore) -> None:
     origin, work = await _seed_reingress(store)
-    kw = dict(
+    kw = dict(  # noqa: C408
         loopback_channel_id="IB_LOOP",
         correlation_depth_cap=8,
         control_id="C",
@@ -475,12 +513,108 @@ async def test_reingressed_handler_reads_origin_reply_via_response_get(tmp_path:
         await store.close()
 
 
+async def test_reingressed_handler_loses_response_view_after_retention_purge(tmp_path: Any) -> None:
+    """ASVS 14.2.7 consequence (iii), ACCEPTED and pinned — the sharpest of the three.
+
+    The inverse of ``test_reingressed_handler_reads_origin_reply_via_response_get``. The loopback
+    response_view is keyed on ``correlation_id``, which lives in ``messages.metadata`` — PHI, nulled by
+    the body window. Once the re-ingressed child's metadata is purged, the runner derives no
+    correlation and builds NO response_view, so ``response_get`` returns None and the Handler
+    transforms with no captured partner replies. It can therefore emit different CONTENT, not merely
+    different headers, which is why this is documented in PHI.md §8 rather than left to be discovered.
+
+    Accepted deliberately: retaining a PHI-bearing correlation bag past its retention window so a late
+    replay can be richer is the defect 14.2.7 exists to close. If this fails, the behaviour changed —
+    decide deliberately; do not exempt metadata from the purge to make it pass.
+    """
+    import asyncio
+
+    from messagefoundry import response_get
+    from messagefoundry.pipeline.wiring_runner import RegistryRunner
+
+    store = await MessageStore.open(tmp_path / "rv_purged.db")
+    calls: list[Any] = []
+    try:
+        reg = Registry()
+        reg.add_inbound(build_inbound_connection("IB_LOOP", Loopback(), router="route_loop"))
+        reg.add_router("route_loop", lambda msg: ["h_loop"])
+
+        def h_loop(msg: Any) -> None:
+            calls.append(response_get("OB_X"))
+            if len(calls) == 1:
+                raise RuntimeError("first pass fails — dead-letter the routed row")
+            return None  # second pass filters cleanly
+
+        reg.add_handler("h_loop", h_loop)
+
+        await store.enqueue_message(
+            channel_id="IB_REAL", raw="MSH|q", deliveries=[("OB_X", "q")], now=100.0
+        )
+        item = (await store.claim_ready(destination_name="OB_X", now=100.0))[0]
+        reply = "MSH|^~\\&|P|F|R|RF|20260101||RSP^K11|R1|P|2.5.1\r"
+        await store.complete_with_response(
+            item.id, body=reply, outcome="accepted", reingress_to="IB_LOOP", now=101.0
+        )
+
+        runner = RegistryRunner(reg, store, poll_interval=0.02)
+        await runner.start()
+        try:
+            # Pass 1: the child is re-ingressed, its Handler reads the origin's reply, then raises —
+            # leaving a DEAD routed row (replayable until purge_dead_letters' own, later window).
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if calls:
+                    break
+            assert calls and calls[0] is not None, "control: pre-purge the reply IS readable"
+            assert calls[0].body == reply
+
+            # The child is the loopback message — the one carrying the correlation_id.
+            children = await store.list_messages(channel_id="IB_LOOP", limit=10)
+            assert len(children) == 1
+            child_id = str(children[0]["id"])
+            assert await store.message_metadata_json(child_id) is not None  # control
+
+            # Let the raise settle into a DEAD routed row, which is what makes the child
+            # body-purge eligible (a DEAD row does not block eligibility; pending/inflight do).
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                async with store._read() as db:
+                    cur = await db.execute(
+                        "SELECT 1 FROM queue WHERE message_id=? AND status=?",
+                        (child_id, OutboxStatus.DEAD.value),
+                    )
+                    if await cur.fetchone():
+                        break
+
+            # Retention nulls the child's metadata.
+            assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
+            assert await store.message_metadata_json(child_id) is None
+
+            # Pass 2: replay the DEAD routed row. The Handler RUNS, but with no correlation_id to key
+            # the response_view on, response_get returns None — so it can emit different CONTENT.
+            assert await store.replay(child_id) >= 1
+            for _ in range(200):
+                await asyncio.sleep(0.02)
+                if len(calls) > 1:
+                    break
+        finally:
+            await runner.stop()
+
+        assert len(calls) > 1, (
+            "the Handler must still RUN — losing the view is not losing the message"
+        )
+        assert calls[-1] is None  # ...but with no captured reply to read
+    finally:
+        await store.close()
+
+
 async def test_ingress_handoff_corrupt_ref_dead_letters_not_loops(store: MessageStore) -> None:
     # A corrupt/unparseable work-row reference must dead-letter the token + ERROR the origin + CONSUME it
     # (return True) — never infinite-loop on a row that can't be parsed (review finding).
     origin, work = await _seed_reingress(store)
     await store._db.execute(
-        "UPDATE queue SET payload=? WHERE id=?", (store._enc("not-a-valid-ref"), work.id)
+        "UPDATE queue SET payload=? WHERE id=?",
+        (store._enc("not-a-valid-ref", aad=cell_aad("queue", "payload", work.id)), work.id),
     )
     await store._db.commit()
     ok = await store.ingress_handoff(

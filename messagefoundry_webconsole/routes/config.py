@@ -60,6 +60,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             engine=engine,
             user=identity,
             gate=gate,
+            request=request,
         )
         if isinstance(result, PendingApprovalResponse):
             return HTMLResponse(pages.reload_pending(result))

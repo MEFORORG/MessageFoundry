@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from messagefoundry.api.security import ws_token
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.ldap import AdPrincipal
@@ -169,6 +171,86 @@ async def test_kerberos_reject_is_audited() -> None:
         assert any(
             a["action"] == "auth.login_failed" and "kerberos" in (a["detail"] or "") for a in audit
         )
+    finally:
+        await store.close()
+
+
+# --- ADR 0142 AC-6: the federated session cap, and its byte-identity guard ----
+
+
+async def _session_for(store: MessageStore, token: str) -> tuple[float, float]:
+    """Return ``(created_at, expires_at)`` for a minted token."""
+    session = await store.get_session(hash_token(token))
+    assert session is not None
+    return session.created_at, session.expires_at
+
+
+async def test_local_and_ad_session_expiry_is_unchanged_by_the_cap_seam() -> None:
+    """AC-6's second half: `_issue_session` grew a `max_expires_at` knob, and every shipped caller
+    must keep landing on the flat local absolute lifetime. Asserted on the DERIVED lifetime rather
+    than a wall-clock deadline so the test cannot flake on a slow box."""
+    store = await _store()
+    try:
+        principal = AdPrincipal(
+            username="jdoe",
+            display_name="J Doe",
+            email="j@x",
+            dn="CN=jdoe,DC=x",
+            groups=frozenset({"cn=mf-ops,dc=x"}),
+        )
+
+        class _FakeLdap:
+            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+                return principal if username == "jdoe" else None
+
+            def resolve_principal(self, username: str) -> AdPrincipal | None:
+                return principal if username == "jdoe" else None
+
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+        await service.initialize()
+        await _local_user(service, "alice")
+
+        absolute = AuthSettings().session_absolute_hours * 3600
+        local_token = (await service.login("alice", PW)).token
+        assert local_token is not None
+        created, expires = await _session_for(store, local_token)
+        assert expires - created == pytest.approx(absolute, abs=2)
+
+        ad_token = (await service.login("jdoe", "pw", provider=AuthProvider.AD)).token
+        assert ad_token is not None
+        created, expires = await _session_for(store, ad_token)
+        assert expires - created == pytest.approx(absolute, abs=2)
+    finally:
+        await store.close()
+
+
+async def test_ad_login_success_audit_detail_is_byte_identical() -> None:
+    """The mech/evidence seam must be OMITTED, not null-valued, for the shipped directory paths —
+    `_json` is `json.dumps(sort_keys=True)`, so a null key is a different stored string."""
+    store = await _store()
+    try:
+        principal = AdPrincipal(
+            username="jdoe",
+            display_name="J Doe",
+            email="j@x",
+            dn="CN=jdoe,DC=x",
+            groups=frozenset({"cn=mf-ops,dc=x"}),
+        )
+
+        class _FakeLdap:
+            def authenticate(self, username: str, password: str) -> AdPrincipal | None:
+                return principal if username == "jdoe" else None
+
+            def resolve_principal(self, username: str) -> AdPrincipal | None:
+                return principal if username == "jdoe" else None
+
+        service = AuthService(store, _ad_settings(), ldap=_FakeLdap())  # type: ignore[arg-type]
+        await service.initialize()
+        assert (await service.login("jdoe", "pw", provider=AuthProvider.AD)).ok
+
+        rows = [a for a in await store.list_audit() if a["action"] == "auth.login_success"]
+        assert len(rows) == 1
+        assert rows[0]["detail"] == '{"provider": "ad", "roles": []}'
     finally:
         await store.close()
 

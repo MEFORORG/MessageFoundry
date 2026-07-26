@@ -17,11 +17,13 @@ error, deliberately **outside** the :class:`ValueError` dead-letter contract —
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
 from io import BytesIO
-from typing import TYPE_CHECKING, Any, Iterator
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.parsing.dicom._deps import load_dcmread, parse_error_types
+from messagefoundry.parsing.dicom._inflate import guard_part10_deflate
 from messagefoundry.parsing.dicom._util import (
     SR_SOP_CLASS_UIDS,
     first,
@@ -69,6 +71,10 @@ class DicomDataset:
         DICOM Part-10 object (PHI-safe). Requires the ``[dicom]`` extra; a missing extra raises
         :class:`RuntimeError` (not a data error)."""
         data = object_bytes(raw)
+        # ASVS 5.2.3: bound a Deflated Explicit VR LE object's inflate BEFORE dcmread (which would
+        # otherwise decompress the whole deflate stream into memory unbounded). Over-cap → DicomBombError
+        # (a DicomError → dead-letter). No-op for a non-deflated object.
+        guard_part10_deflate(data)
         dcmread = load_dcmread()
         try:
             ds = dcmread(BytesIO(data), stop_before_pixels=True, force=force)

@@ -249,7 +249,7 @@ Open a PR.
   Before touching any file, the window **verifies it is isolated and on the right base**, and STOPs if
   any check fails:
   ```
-  git rev-parse --show-toplevel    # must be the NEW worktree path, NOT C:/Users/Scott/Code/MessageFoundry
+  git rev-parse --show-toplevel    # must be the NEW worktree path, NOT C:/Users/<you>/Code/MessageFoundry
   git rev-parse --abbrev-ref HEAD  # must be the lane branch (asvs-1214-tls-revocation, …)
   git merge-base --is-ancestor origin/main HEAD && echo BASE_OK   # base includes merged #369
   ```

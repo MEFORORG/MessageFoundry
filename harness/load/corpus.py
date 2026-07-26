@@ -64,21 +64,44 @@ class Sampler:
         return self._keys[bisect.bisect_right(self._cum, x)]
 
 
+#: Sequence-space stride between concurrent SENDER PROCESSES (see ``seq_base``). Decimal, so a seq stays
+#: legible inside the 12-digit control id: worker ``j`` owns ``[j*1e9, (j+1)*1e9)`` — 1e9 seqs each (a run
+#: emits ~1e6 at the very most) and up to 999 workers before the 12-digit width is exhausted. FAIL LOUD in
+#: ``ControlIds.format``'s caller rather than silently widen: a 13-digit id would not round-trip MSH-10.
+SEQ_BASE_STRIDE: int = 1_000_000_000
+
+
 class Corpus:
-    """In-RAM pool of parsed templates, indexed for both ``CODE`` and ``CODE^TRIGGER`` mix keys."""
+    """In-RAM pool of parsed templates, indexed for both ``CODE`` and ``CODE^TRIGGER`` mix keys.
+
+    ``seq_base`` offsets this corpus's sequence space. It defaults to 0 — byte-identical to a single-sender
+    run — and exists for the MULTI-PROCESS sender tier, where each worker builds its OWN ``Corpus`` in its
+    OWN process. Left at 0 there, EVERY worker emits the identical stream ``0, 1, 2, …``, which:
+
+    * stamps the SAME control id on K different messages (two workers' ``SC000000000005`` are different
+      messages), and
+    * PHASE-LOCKS any seq-derived routing decision — the shardcert's PARTITIONED selector picks the
+      destination lane from the seq, so K lockstepped workers all target the SAME lane at the same instant:
+      the sender tier walks the lanes K-deep in bursts instead of spreading K concurrent messages over K
+      distinct lanes. The long-run per-lane load is unchanged (still R/L), but the per-lane arrival process
+      becomes bursty, which aliases against the soak's ``in_pipeline`` sampler.
+
+    Giving worker ``j`` ``seq_base = j * SEQ_BASE_STRIDE`` makes the K streams DISJOINT, so ids are unique
+    across the tier and the instantaneous lane spread is uniform."""
 
     def __init__(
         self,
         ids: ControlIds,
         by_code_trigger: dict[tuple[str, str], list[Message]],
         seed: str,
+        seq_base: int = 0,
     ) -> None:
         self._ids = ids
         self._by_ct = by_code_trigger
         self._by_code: dict[str, list[Message]] = {}
         for (code, _trigger), msgs in by_code_trigger.items():
             self._by_code.setdefault(code, []).extend(msgs)
-        self._seq = 0
+        self._seq = seq_base
         self._cursor: dict[str, int] = {}
         self._rng = random.Random(seed)
 
@@ -157,9 +180,12 @@ def corpus_from_file(path: str | Path, ids: ControlIds) -> Corpus:
     return Corpus(ids, by_ct, str(path))
 
 
-def build_corpus(profile: LoadProfile, ids: ControlIds) -> Corpus:
+def build_corpus(profile: LoadProfile, ids: ControlIds, seq_base: int = 0) -> Corpus:
     """Generate (validated, off the hot path) and parse the corpus a profile needs. Raises if a mix
-    references a message type/trigger the generators don't know."""
+    references a message type/trigger the generators don't know.
+
+    ``seq_base`` (default 0 ⇒ unchanged) offsets the sequence space so CONCURRENT SENDER PROCESSES do not
+    emit the same stream — see :class:`Corpus`."""
     pairs = _pairs_for_profile(profile)
     by_ct: dict[tuple[str, str], list[Message]] = {}
     for code, trigger in sorted(pairs):
@@ -173,4 +199,4 @@ def build_corpus(profile: LoadProfile, ids: ControlIds) -> Corpus:
             # a LoadProfileError, not a bare ValueError from deep in the generators.
             raise LoadProfileError(f"cannot generate corpus for {code}^{trigger}: {exc}") from exc
         by_ct[(code, trigger)] = [Message.parse(raw) for raw in raws]
-    return Corpus(ids, by_ct, profile.seed)
+    return Corpus(ids, by_ct, profile.seed, seq_base)

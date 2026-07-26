@@ -15,10 +15,8 @@ from datetime import datetime
 
 import pytest
 
-from messagefoundry.parsing import Peek
-from messagefoundry.generators import _core
+from messagefoundry.generators import _core, adt
 from messagefoundry.generators import _hl7data as d
-from messagefoundry.generators import adt
 from messagefoundry.generators.adt import (
     ALL_TRIGGERS,
     TRIGGER_TO_STRUCTURE,
@@ -26,6 +24,7 @@ from messagefoundry.generators.adt import (
     generate_message,
     seg,
 )
+from messagefoundry.parsing import Peek
 
 PER_TRIGGER = 50  # messages per trigger the CLI emits (and the full-corpus check regenerates)
 

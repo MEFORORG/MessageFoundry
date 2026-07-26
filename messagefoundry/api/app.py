@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import datetime
 import json
 import logging
 import mimetypes
@@ -31,10 +32,11 @@ import os
 import re
 import shutil
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
+from uuid import uuid4
 
 from fastapi import (
     Body,
@@ -49,26 +51,44 @@ from fastapi import (
 )
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.datastructures import MutableHeaders
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from messagefoundry import __version__
+from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
 from messagefoundry.api.approvals import ApprovalError, ApprovalGate
+from messagefoundry.api.auth_routes import add_auth_routes
+from messagefoundry.api.client_networks import ClientNetworkMiddleware
+from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
+from messagefoundry.api.metrics import (
+    METRICS_CONTENT_TYPE,
+    MetricsHistory,
+    render_metrics,
+)
 from messagefoundry.api.models import (
+    AiChatRequest,
+    AiChatResponse,
     AiPolicy,
     AlertInstanceInfo,
     AlertInstanceList,
     AlertRuleInfo,
     AlertsConfig,
+    AlertSuspendRequest,
+    AlertTestEmailRequest,
+    AlertTestEmailResult,
     ApprovalDecisionResult,
     ApprovalList,
     AttachmentInfo,
     CapturedResponseInfo,
     ChannelInfo,
+    ClaimPoolInfo,
     ClusterNode,
     ClusterNodeList,
     ClusterStatus,
     ConfigProvenance,
     ConnectionEventInfo,
+    ConnectionFlagRequest,
     ConnectionMetadata,
     ConnectionRow,
     ConnectionTestResult,
@@ -80,21 +100,29 @@ from messagefoundry.api.models import (
     DrActionResult,
     DrActivateRequest,
     DrStatus,
+    EditResendRequest,
+    EditResendResult,
     EngineInfo,
     EngineKpis,
     EventInfo,
+    GraphEdge,
+    GraphNode,
+    GraphResponse,
     Health,
     IntegrityResult,
     LogInfo,
+    LogLevelInfo,
+    LogLevelUpdate,
+    LogTailPage,
     MessageDetail,
     MessageList,
     MessageResponses,
     MessageSearchResults,
     MessageSummary,
+    MetricsHistoryResponse,
+    MetricsHistorySample,
     OutboundPayloadInfo,
     OutboundPayloads,
-    EditResendRequest,
-    EditResendResult,
     OutboxInfo,
     PendingApprovalInfo,
     PendingApprovalResponse,
@@ -106,23 +134,40 @@ from messagefoundry.api.models import (
     ReplayResult,
     ResendRequest,
     ResendResult,
+    SearchPresetCreateRequest,
+    SearchPresetCreateResult,
+    SearchPresetDeleteResult,
+    SearchPresetInfo,
+    SearchPresetList,
+    SecurityLoosening,
     SecurityPosture,
+    ServiceStatusInfo,
     StatsResetRequest,
     StatsResetResult,
     StatsResponse,
-    ServiceStatusInfo,
     SystemStatus,
     UpdateInfo,
+    UploadDeleteResult,
+    UploadedFileInfo,
+    UploadedFileList,
+    UploadedMessagesResult,
+    UploadedMessageSummary,
+    UploadResendRequest,
+    UploadResendResult,
 )
-from messagefoundry.api._ui_seam import ENGINE_UI_SEAM, CoreHandlers, UiDeps
-from messagefoundry.api.auth_routes import add_auth_routes
-from messagefoundry.api.field_authz import count_exposed, redact_unauthorized
-from messagefoundry.api.metrics import METRICS_CONTENT_TYPE, render_metrics
+from messagefoundry.api.multipart import (
+    MultipartError,
+    MultipartTooLargeError,
+    parse_single_file_upload,
+)
 from messagefoundry.api.security import (
     authorize_ws,
+    client_ip,
     enforce_phi_read_hop,
+    enforce_phi_read_pacing,
     optional_identity,
     require,
+    require_paced,
     require_phi_read,
     require_service_cert,
     require_step_up,
@@ -136,16 +181,37 @@ from messagefoundry.api.security import (
 # app.state.ui_ws_authorize, app.state.ui_connections_render (read by the always-on middleware/routes).
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.service import AuthService, BootstrapAdmin
-from messagefoundry.config.ai_policy import resolve_effective_policy
+from messagefoundry.auth.trust_anchors import (
+    AnchorSpec,
+    TrustAnchorError,
+    run_anchor_preflight,
+)
+from messagefoundry.config.ai_policy import (
+    AiDataScope,
+    AiMode,
+    DataClass,
+    resolve_effective_policy,
+)
+from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+from messagefoundry.config.fingerprint import config_fingerprint_detail
+from messagefoundry.config.memory_encryption import (
+    READOUT_DISCLAIMER,
+    platform_memory_encryption_readout,
+)
 from messagefoundry.config.models import (
     AckAfter,
     BuildupThreshold,
+    ConnectorType,
     InternalErrorPolicy,
     OrderingMode,
     Priority,
     RetryPolicy,
     SaturationThreshold,
     StallThreshold,
+)
+from messagefoundry.config.secretprovider import (
+    resolve_connector_secret,
+    resolve_secret_provider,
 )
 from messagefoundry.config.settings import (
     AiSettings,
@@ -163,6 +229,8 @@ from messagefoundry.config.settings import (
     SandboxSettings,
     SecretRotationSettings,
     SecretsSettings,
+    SecurityEnforcement,
+    SecuritySettings,
     ServiceStatusSettings,
     ShadowSettings,
     StoreBackend,
@@ -171,10 +239,9 @@ from messagefoundry.config.settings import (
     UpdateCheckSettings,
     hop_insecure_escape_downgrades,
     hop_posture_from_ai,
+    security_loosenings,
 )
-from messagefoundry.config.tls_policy import phi_read_hop_disposition
-from messagefoundry.config.fingerprint import config_fingerprint_detail
-from messagefoundry.config.secretprovider import resolve_secret_provider
+from messagefoundry.config.tls_policy import fips_attestation, phi_read_hop_disposition
 from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
@@ -183,23 +250,25 @@ from messagefoundry.config.wiring import (
     redacted_settings,
 )
 from messagefoundry.integrity import run_startup_attestation
-from messagefoundry.service_status import query_service_state
 from messagefoundry.last_resort import install_loop_exception_handler
+from messagefoundry.logging_setup import LOG_LEVELS, current_log_level, set_runtime_level
+from messagefoundry.parsing.sniff import attachment_mime_agrees, nontext_upload_reason
 from messagefoundry.pipeline import ConfigReloadDenied, Engine
+from messagefoundry.pipeline.alert_sinks import EmailTransport, notifier_from_settings
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pipeline.cluster import build_coordinator
 from messagefoundry.pipeline.connscale_shim import maybe_install_executor_shim
 from messagefoundry.pipeline.dr import DrActivationError
-from messagefoundry.pipeline.alert_sinks import notifier_from_settings
-from messagefoundry.pipeline.alerts import LoggingAlertSink
 from messagefoundry.pipeline.security_notify import security_notifier_from_settings
-from messagefoundry.pipeline.cluster import build_coordinator
-from messagefoundry.pipeline.wiring_runner import RegistryRunner, ShardLaneOwnershipError
-from messagefoundry.transports.base import (
-    DeliveryError,
-    DestinationConnector,
-    TestNotSupportedError,
+from messagefoundry.pipeline.wiring_runner import (
+    NotDeployedError,
+    RegistryRunner,
+    ShardLaneOwnershipError,
 )
+from messagefoundry.redaction import safe_exc, safe_text
+from messagefoundry.service_status import query_service_state
 from messagefoundry.store import Row, open_store, sqlite_settings
-from messagefoundry.store.base import ResendError
+from messagefoundry.store.base import ResendError, Store, build_store_cipher
 from messagefoundry.store.content_search import (
     DEFAULT_SCAN_LIMIT as DEFAULT_CONTENT_SCAN_LIMIT,
 )
@@ -212,17 +281,53 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.base import Store
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.store.store import _secure_file
+from messagefoundry.transports.ai_broker import AiBrokerError, ai_broker_from_settings
+from messagefoundry.transports.base import (
+    DeliveryError,
+    DestinationConnector,
+    TestNotSupportedError,
+)
+from messagefoundry.uploads import (
+    UploadContentError,
+    UploadedFileMeta,
+    UploadNotFoundError,
+    UploadPathError,
+    UploadQuotaError,
+    UploadRetentionRunner,
+    UploadStore,
+    UploadTooLargeError,
+    browse_messages,
+    sanitize_filename,
+    split_uploaded,
+)
 
 __all__ = ["create_app", "create_managed_app"]
 
 _RATE_WINDOW = 60.0  # seconds; window for the backlog throughput estimate
 _MAX_REQUEST_BODY_BYTES = 1 * 1024 * 1024  # 1 MiB cap on HTTP request bodies (API-INPUT)
+# The uploaded-logs upload routes (ADR 0134) carry a whole diagnostic file, so the 1 MiB body cap is
+# raised to [store].max_upload_bytes for these paths ONLY (every other route stays at 1 MiB). Both the
+# JSON-API path and the same-origin /ui path route through this one middleware.
+_UPLOAD_BODY_PATHS = frozenset({"/uploads", "/ui/uploaded-logs/upload"})
+# The most saved presets a single layered query may AND-compose (ADR 0136, BACKLOG #151). Bounds the
+# per-preset decrypt loop + keeps the composition tractable.
+_MAX_PRESET_LAYERS = 8
 _CONNECTION_TEST_TIMEOUT = 35.0  # overall cap for a POST /connections/{name}/test probe (seconds)
 _MAX_WS_CONNECTIONS = 64  # cap concurrent /ws/stats sockets (API-WS)
 _WS_REVALIDATE_SECONDS = 3.0  # re-check the session on an open /ws/stats this often (API-WS)
+#: Path prefixes whose JSON responses are served ``Cache-Control: no-store`` (ASVS 14.2.2). These are
+#: the PHI-read route families — every route gated by ``require_phi_read`` and every step-up GET that
+#: charges the PHI-read hop/pacing budget lives under one of them, so a browser, a proxy or any other
+#: intermediary is directed never to retain a message body, a search hit, a log line or an uploaded
+#: file's split messages. It is a PREFIX set on purpose: it covers a family's future members (the three
+#: routes this closed — ``/search/layered``, ``/logs/tail``, ``/uploads/{file_id}/messages`` — each
+#: shipped as a new member of a family whose siblings were already covered), and
+#: ``tests/test_no_store_phi_coverage.py`` walks ``app.routes`` and fails if a PHI read ever lands
+#: outside it. Non-GET routes under these prefixes pick the header up too, which is harmless.
+#: The ``/ui`` HTML surface is covered by its own branch in the middleware below.
+_NO_STORE_PREFIXES = ("/messages", "/dead-letters", "/search", "/logs", "/uploads")
 _log = logging.getLogger(__name__)
 
 
@@ -265,6 +370,13 @@ def _method_label(type_value: str) -> str:
     return _METHOD_LABELS.get(type_value, type_value.upper())
 
 
+def _is_toml_managed(source_file: str | None) -> bool:
+    """Whether a connection was authored in ``connections.toml`` (vs a code-first ``.py``), from its
+    registry ``source_file`` (#131). The console shows the flag TOGGLE only on a TOML-managed row; the
+    API's flag write refuses a non-TOML connection regardless (the guard of record)."""
+    return source_file is not None and source_file.endswith(CONNECTIONS_FILE_NAME)
+
+
 def _backlog(depth: int, recent: int) -> float | None:
     """Estimated seconds to clear the queue: 0 if empty, None if queued but nothing draining."""
     if depth == 0:
@@ -298,6 +410,43 @@ def _log_storage(log_dir: str | None) -> LogInfo | None:
     except OSError:
         return None
     return LogInfo(path=str(path), size_bytes=total, disk_free_bytes=free)
+
+
+def _read_log_tail(log_dir: str | None, *, limit: int, offset: int) -> tuple[list[str], int, bool]:
+    """A **redacted** page of the newest app-log file's tail for the in-console viewer (#171, ADR 0130).
+
+    Returns ``(redacted_lines, total_lines, available)``. ``offset`` counts lines back from the END of the
+    newest ``.log``/``.txt`` file (``offset=0`` = the most recent ``limit`` lines); the page is returned in
+    file order (oldest-first within the window). Every line is passed through
+    :func:`~messagefoundry.support.redact.redact_log_line` — the SAME redactor the support bundle uses — so
+    the browser sees identical PHI/secret coverage; the redaction is best-effort (a residual single-token
+    identifier can survive), which is why the route is RBAC-gated + audited. ``available`` is False when no
+    ``[logging].log_dir`` is configured or no readable log file exists, so ``/logs/tail`` degrades
+    gracefully. **Blocking** (a file read + redaction pass) — the caller runs it off the event loop — and
+    **never raises** (an unreadable dir/file yields an empty, unavailable page)."""
+    from messagefoundry.support.redact import redact_log_line
+
+    if not log_dir:
+        return [], 0, False
+    directory = Path(log_dir)
+    try:
+        files = [p for p in directory.iterdir() if p.is_file() and p.suffix in (".log", ".txt")]
+    except OSError:
+        return [], 0, False
+    if not files:
+        return [], 0, False
+    try:
+        newest = max(files, key=lambda p: p.stat().st_mtime)
+        # Tolerant decode of a legacy codepage; redaction runs on the decoded text.
+        text = newest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return [], 0, False
+    all_lines = text.splitlines()
+    total = len(all_lines)
+    end = max(0, total - offset)  # exclusive upper bound of this page (from the end)
+    start = max(0, end - limit)
+    page = all_lines[start:end]
+    return [redact_log_line(line) for line in page], total, True
 
 
 def _cookie_secure(request: Request) -> bool:
@@ -387,13 +536,20 @@ def _build_approval_gate(engine: Engine, settings: ApprovalsSettings) -> Approva
     return gate
 
 
-async def _record_reload_audit(engine: Engine, *, actor: str, dir_arg: object) -> None:
+async def _record_reload_audit(
+    engine: Engine, *, actor: str, dir_arg: object, client: str | None = None
+) -> None:
     """Write the ``config_reload`` audit row with the ADR 0041 D1 content fingerprint of what loaded.
 
     Shared by the inline reload endpoint and the dual-control executor so a held-then-approved reload
     records the same fingerprint-bearing row as an ungated one. The fingerprint is computed off the
     event loop and is best-effort — a fingerprint failure must never block the audit of a successful
-    reload. ``dir_arg`` is the requested config_dir (advisory; the row keys on engine.last_reload_dir)."""
+    reload. ``dir_arg`` is the requested config_dir (advisory; the row keys on engine.last_reload_dir).
+
+    ``client`` (ADR 0150) is the address of the actor named in the row. The inline endpoint passes the
+    requester's own address. The dual-control executor deliberately does NOT: there the row's ``actor``
+    is the original *requester*, while the request in flight belongs to the *approver*, so stamping the
+    approver's address would attribute one person's action to another's host — worse than NULL."""
     fingerprint: dict[str, object] = {}
     if engine.last_reload_dir is not None:
         try:
@@ -413,6 +569,7 @@ async def _record_reload_audit(engine: Engine, *, actor: str, dir_arg: object) -
                 **fingerprint,
             }
         ),
+        client=client,
     )
 
 
@@ -437,27 +594,140 @@ def _summary(row: Row) -> MessageSummary:
     )
 
 
-#: A conservative MIME type — ``type/subtype`` of RFC-2045 token chars only, no structural characters
+def _export_ndjson_line(row: Row) -> bytes:
+    """One NDJSON line for the bulk body export (#124, ADR 0131): the message metadata + the **decrypted
+    raw body** (the PHI egress). ``json.dumps`` escapes the CR-delimited HL7 / binary ``mfb64:`` markers
+    safely so a body can never break the one-object-per-line framing."""
+    d = dict(row)
+    obj = {
+        "id": d["id"],
+        "channel_id": d["channel_id"],
+        "received_at": d.get("received_at"),
+        "message_type": d.get("message_type"),
+        "control_id": d.get("control_id"),
+        "status": d.get("status"),
+        "raw": d["raw"],
+    }
+    return (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+#: A conservative MIME *shape* — ``type/subtype`` of RFC-2045 token chars only, no structural characters
 #: (``;``/space/CR/LF/``"``) that could inject or split the ``Content-Type`` header. An attachment's
 #: ``content_type`` originates from an attacker-influenced OBX-5.2 label, so a value failing this is
-#: served as the generic binary type below rather than trusted into the response header.
+#: served as the generic binary type below rather than trusted into the response header. This is a
+#: shape screen ONLY — it admits ``image/svg+xml``/``text/html``; the browser-active downgrade below is
+#: what makes the served type inert (ASVS 1.3.4).
 _SAFE_MIME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.+-]*/[A-Za-z0-9][A-Za-z0-9.+-]*$")
+#: Length bound on the served ``Content-Type``. The token grammar above is unbounded and the stored
+#: label has no column check, so an arbitrarily long attacker string would otherwise be echoed into a
+#: response header; no registered media type comes close to this.
+_MAX_ATTACHMENT_MIME_LEN = 255
 _DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
+
+#: Case-folded subtype tokens that make a media type **browser-active** — a representation a browser may
+#: execute, or render as markup, rather than treat as opaque bytes. Matched as SUBSTRINGS of the
+#: case-folded subtype, deliberately wider than exact-subtype equality or a ``+xml``-suffix test:
+#: ``application/x-javascript``, ``text/x-html``, ``image/svg`` (no ``+xml``) and ``application/xml-dtd``
+#: are all browser-active and every one of them slips past an equality/suffix check. ``script`` also
+#: catches ``ecmascript``/``vbscript``/``jscript``; the only benign type it sweeps up is
+#: ``application/postscript``, which no browser renders and which is not a pass-through requirement.
+_BROWSER_ACTIVE_SUBTYPE_TOKENS = ("html", "xml", "script", "svg")
+#: Top-level types that are browser-active whatever the subtype (``multipart/x-mixed-replace`` renders).
+_BROWSER_ACTIVE_TYPES = ("multipart",)
+
+#: The attachment download's Content-Security-Policy (ASVS 1.3.4). ``default-src 'none'`` denies every
+#: subresource and fetch; ``sandbox`` with NO ``allow-*`` token drops the response into a unique opaque
+#: origin with scripts, forms, popups and same-origin access all disabled. Layered UNDER the MIME
+#: downgrade, the unconditional ``Content-Disposition: attachment`` and the global ``nosniff``, so even
+#: a representation a browser would otherwise treat as markup cannot execute in the application origin.
+_ATTACHMENT_CSP = "default-src 'none'; sandbox"
+#: ``GET /messages/{message_id}/attachments/{attachment_id}`` and the web console's same-handler
+#: delegate ``GET /ui/messages/...`` — see :class:`AttachmentSecurityHeadersMiddleware`.
+_ATTACHMENT_PATH_RE = re.compile(r"^(?:/ui)?/messages/[^/]+/attachments/[^/]+$")
+
+
+def _is_browser_active_mime(mime: str) -> bool:
+    """True when ``mime`` (already shape-screened ``type/subtype``) names a representation a browser may
+    execute or render as markup.
+
+    **Case-folded, deliberately.** The token grammar admits uppercase and browsers match media types
+    case-insensitively, so ``Image/SVG+XML`` is exactly the threat ``image/svg+xml`` is (``mimetypes``
+    lower-cases internally too, so the mixed-case form even yields a ``.svg`` download name)."""
+    top, _, subtype = mime.casefold().partition("/")
+    if top in _BROWSER_ACTIVE_TYPES:
+        return True
+    return any(token in subtype for token in _BROWSER_ACTIVE_SUBTYPE_TOKENS)
 
 
 def _safe_attachment_content_type(content_type: str | None) -> str:
-    """The download ``Content-Type``: the stored ``content_type`` when it is a clean ``type/subtype``
-    MIME, else ``application/octet-stream`` (never an attacker-influenced value verbatim in the header)."""
+    """The download ``Content-Type``: the stored ``content_type`` when it is a clean, bounded
+    ``type/subtype`` MIME that is **not browser-active**, else ``application/octet-stream``.
+
+    The stored value is a verbatim, attacker-influenced OBX-5.2 label, so it is never trusted into the
+    response header (header-splitting shapes) and never trusted into the *browser* either: an
+    ``image/svg+xml`` or ``text/html`` label is downgraded to the inert binary type, which also stops
+    :func:`_attachment_filename` from deriving a ``.svg``/``.html`` download name (ASVS 1.3.4).
+
+    **Why downgrade rather than sanitize.** Attachment bytes are verbatim clinical payloads — ADR 0105
+    Approach B stores the OBX-5.5 value untouched and the preserve-the-original invariant forbids
+    rewriting them — so the control is *neutralize at serve* (inert MIME + attachment disposition +
+    nosniff + the sandbox CSP), never a sanitizing rewrite of the stored document. Inert types
+    (``application/pdf``, ``image/png``, …) still pass through under their own type."""
     ct = (content_type or "").strip()
-    return ct if _SAFE_MIME_RE.match(ct) else _DEFAULT_ATTACHMENT_MIME
+    if len(ct) > _MAX_ATTACHMENT_MIME_LEN or not _SAFE_MIME_RE.match(ct):
+        return _DEFAULT_ATTACHMENT_MIME
+    return _DEFAULT_ATTACHMENT_MIME if _is_browser_active_mime(ct) else ct
 
 
 def _attachment_filename(attachment_id: str, content_type: str) -> str:
     """A header-safe download filename. ``attachment_id`` is a 64-hex sha256 (safe by construction); a
     short prefix keeps it readable and a ``mimetypes`` extension (when the MIME is known) hints the type.
-    No user/attacker text reaches the ``Content-Disposition`` header."""
+    No user/attacker text reaches the ``Content-Disposition`` header. Callers pass the ALREADY-downgraded
+    :func:`_safe_attachment_content_type` result, so a browser-active label can never source the
+    extension."""
     ext = mimetypes.guess_extension(content_type) or ""
     return f"attachment-{attachment_id[:16]}{ext}"
+
+
+def _is_attachment_download_path(path: str) -> bool:
+    """True for the JSON attachment download route and the web console's ``/ui`` delegate of it."""
+    return _ATTACHMENT_PATH_RE.match(path) is not None
+
+
+class AttachmentSecurityHeadersMiddleware:
+    """Re-assert :data:`_ATTACHMENT_CSP` on every attachment download response (ASVS 1.3.4).
+
+    The route sets the header on its own ``Response``, which is enough on the JSON API path. It is NOT
+    enough on the console's ``GET /ui/messages/{id}/attachments/{id}`` delegate, which re-serves the very
+    same ``Response`` object: two ``/ui``-scoped writers **assign** (not ``setdefault``) a
+    ``Content-Security-Policy`` on any non-static ``/ui`` path — the engine's own ``_security_headers``
+    overlay and the console's ``UiSecurityHeadersMiddleware`` nonce CSP — so a route-level header there
+    is silently overwritten with a console CSP that has no ``sandbox``. Neither of those may be relaxed
+    globally without neutering the console's own hardening.
+
+    So this middleware is registered **after** ``mount_ui`` and therefore sits OUTSIDE both writers: on
+    the response path an outer ``send`` wrapper runs last, and last writer wins. It is scoped to the two
+    attachment paths, is a strict pass-through for everything else, and is a pure-ASGI middleware (not
+    ``BaseHTTPMiddleware``) so it adds no task hop. It stays INSIDE ``ClientNetworkMiddleware``, whose
+    address denial short-circuits with its own headers before reaching here.
+
+    ``tests/test_attachment_download_api.py`` asserts the SERVED header on both paths, so a middleware
+    re-ordering that puts a ``/ui`` CSP writer back on top fails there rather than silently."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or not _is_attachment_download_path(scope.get("path", "")):
+            await self.app(scope, receive, send)
+            return
+
+        async def send_wrapper(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                MutableHeaders(scope=message)["Content-Security-Policy"] = _ATTACHMENT_CSP
+            await send(message)
+
+        await self.app(scope, receive, send_wrapper)
 
 
 def _needle_shape(needle: str) -> str:
@@ -509,6 +779,55 @@ def _search_audit_detail(
     return detail
 
 
+def _compose_preset_layers(
+    criterias: list[dict[str, Any]],
+) -> tuple[SearchSpec, dict[str, str | None]]:
+    """AND-compose N saved-preset criteria into one ``(SearchSpec, metadata-filters)`` for
+    ``search_messages`` (ADR 0136 §5, BACKLOG #151). Each metadata scalar
+    (``channel_id``/``status``/``message_type``/``control_id``) takes the first non-empty value and
+    **rejects a conflicting second** (400). **Exactly one** preset may carry a content needle (a
+    ``content`` substring or a ``field_path``[+``field_value``]); >1 or 0 → 400. Raises
+    :class:`HTTPException` (400) on a conflict / missing-or-duplicate needle; the caller maps the
+    ``ContentSearchError`` from a malformed field path likewise."""
+    meta_keys = ("channel_id", "status", "message_type", "control_id")
+    meta: dict[str, str | None] = dict.fromkeys(meta_keys)
+    needle: dict[str, Any] | None = None
+    for crit in criterias:
+        for key in meta_keys:
+            value = crit.get(key)
+            value = value.strip() if isinstance(value, str) else value
+            if value:
+                if meta[key] is not None and meta[key] != value:
+                    raise HTTPException(
+                        400, f"layered presets conflict on {key!r}: {meta[key]!r} vs {value!r}"
+                    )
+                meta[key] = value
+        has_needle = bool((crit.get("content") or "").strip()) or bool(
+            (crit.get("field_path") or "").strip()
+        )
+        if has_needle:
+            if needle is not None:
+                raise HTTPException(
+                    400, "layered search allows at most one content predicate across presets"
+                )
+            needle = crit
+    if needle is None:
+        raise HTTPException(
+            400,
+            "layered search needs exactly one preset carrying a content term (substring or field)",
+        )
+    try:
+        spec = make_spec(
+            content=(needle.get("content") or None),
+            field_path=(needle.get("field_path") or None),
+            field_value=(needle.get("field_value") or None),
+            target=SearchTarget(needle.get("target") or "both"),
+        )
+    except (ContentSearchError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return spec, meta
+
+
 def _dead_row(row: Row) -> DeadLetterRow:
     d = dict(row)
     return DeadLetterRow(
@@ -551,13 +870,21 @@ def _plaintext_columns(backend: str, *, encryption_enabled: bool) -> list[str]:
     return []
 
 
-async def _audit_channel_denied(engine: Engine, identity: Identity, channel: str | None) -> None:
-    """Audit a per-channel RBAC denial (mirrors auth.permission_denied)."""
+async def _audit_channel_denied(
+    engine: Engine, identity: Identity, channel: str | None, client: str | None = None
+) -> None:
+    """Audit a per-channel RBAC denial (mirrors auth.permission_denied).
+
+    ``client`` (ADR 0150) is the caller's address — a denial is exactly the record an investigator
+    wants a host for. It is OPTIONAL because this helper is also handed to the console seam as a bare
+    callback (``audit_channel_denied=``), which has no request in hand; there it stays NULL rather than
+    inheriting some other caller's address."""
     await engine.store.record_audit(
         "auth.channel_denied",
         actor=identity.username,
         channel_id=channel,
         detail=json.dumps({"channel": channel}),
+        client=client,
     )
 
 
@@ -566,7 +893,13 @@ async def _run_connection_test(
 ) -> ConnectionTestResult:
     """Build a fresh connector for ``name`` and probe its reachability, never disturbing the live one.
     Reports a config (bad ``env()``/egress) or connectivity failure in the result rather than raising —
-    only an unexpected bug would 500. Closes the test connector afterward."""
+    only an unexpected bug would 500. Closes the test connector afterward.
+
+    Every ``detail`` here is scrubbed and length-bounded, because it does not stay in the response: the
+    route JSON-dumps it into ``audit_log.detail``, the one at-rest error column written **without** the
+    store cipher and teed **off-box** to syslog/SIEM. ``safe_*`` redacts PHI shapes and bounds the
+    length; it has no notion of a credential, so what actually keeps a secret out of here is the rule
+    that a connector's exceptions never interpolate a credential *value* — this is depth, not the seal."""
 
     def _result(
         *, supported: bool, success: bool, ms: float, detail: str | None
@@ -580,23 +913,38 @@ async def _run_connection_test(
             detail=detail,
         )
 
+    # A not-deployed connection (#233, ADR 0111) has no live endpoint to reach, and its env() must
+    # NEVER be resolved — so short-circuit BEFORE build_test_connector, which would resolve env()
+    # (raising on absent secrets), build a throwaway connector, and open a probe socket to the peer.
+    # The route has already enforced RBAC, so this can't disclose the not-deployed state to an
+    # unauthorized caller. supported=False (not success=False): there is nothing here to probe, which
+    # is a different answer from "probed and it failed" — it mirrors the not-testable listen-source case.
+    conn = rr.registry.inbound.get(name) or rr.registry.outbound.get(name)
+    if conn is not None and not conn.deployed:
+        return _result(
+            supported=False,
+            success=False,
+            ms=0.0,
+            detail="connection is not deployed (deployed=false) — nothing to test",
+        )
+
     try:
         _direction, connector = rr.build_test_connector(name)
     except WiringError as exc:
-        return _result(supported=True, success=False, ms=0.0, detail=str(exc))
+        return _result(supported=True, success=False, ms=0.0, detail=safe_text(str(exc)))
     start = time.monotonic()
     supported, success, detail = True, False, None
     try:
         await asyncio.wait_for(connector.test_connection(), _CONNECTION_TEST_TIMEOUT)
         success = True
     except TestNotSupportedError as exc:
-        supported, detail = False, str(exc)
-    except asyncio.TimeoutError:
+        supported, detail = False, safe_text(str(exc))
+    except TimeoutError:
         detail = f"timed out after {_CONNECTION_TEST_TIMEOUT:.0f}s"
     except DeliveryError as exc:
-        detail = str(exc)
+        detail = safe_text(str(exc))
     except Exception as exc:  # noqa: BLE001 - any probe failure is reported in the result, never a 500
-        detail = f"{type(exc).__name__}: {exc}"
+        detail = safe_exc(exc)
     finally:
         with suppress(Exception):  # closing a test connector must never mask the result
             if isinstance(connector, DestinationConnector):
@@ -673,20 +1021,29 @@ def create_app(
     auth: AuthService | None = None,
     ai_settings: AiSettings | None = None,
     store_settings: StoreSettings | None = None,
+    security_settings: SecuritySettings | None = None,
     approvals: ApprovalsSettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     service_settings: ServiceStatusSettings | None = None,
     expose_docs: bool = False,
     allow_no_auth: bool = False,
+    audit_all_authz: bool = False,
     ws_allowed_origins: Sequence[str] = (),
     serve_ui: bool = False,
     public_origin: str | None = None,
+    # ADR 0142: passed as CONFIG so the /ui/oidc registrar can gate at MOUNT time. It cannot read
+    # app.state.auth -- create_managed_app attaches the service in the lifespan, AFTER mount_ui
+    # has already fixed the route table.
+    oidc_enabled: bool = False,
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
+    loopback: bool = False,
     tls_terminated_upstream: bool = False,
     tls_client_cert_identities: Mapping[str, str] | None = None,
+    trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     log_dir: str | None = None,
+    configured_log_level: str | None = None,
 ) -> FastAPI:
     # The interactive docs (/docs, /redoc) and the OpenAPI schema (/openapi.json) are off by
     # default: they widen the attack surface and disclose the schema, which matters the moment the
@@ -711,8 +1068,52 @@ def create_app(
     # store opens; here it supports the direct-construction (test) path.
     if store_settings is not None:
         app.state.store_settings = store_settings
+    # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134). Filesystem-backed, encrypted at rest
+    # under the SAME store DEK. DISABLED (None) unless [store].uploads_dir is set — so no PHI-at-rest
+    # surface exists unless an operator opts in; every uploaded-logs route 503s when None.
+    #
+    # ASVS 11.3.4: prefer the LIVE store's cipher INSTANCE whenever one exists (an engine is bound here;
+    # the managed-serve lifespan rebinds this from its own open store). Its AES-GCM invocation bound is
+    # per-instance state, so a second cipher over the same DEK would charge nothing to the key's
+    # persisted count and would keep encrypting past the fail-closed 2**32 ceiling. `build_store_cipher`
+    # is the fallback for the genuinely store-LESS construction path only (embedding / tests), where
+    # there is no bound to share and nothing durable to charge.
+    app.state.upload_store = None
+    if store_settings is not None and store_settings.uploads_dir:
+        upload_cipher = (
+            engine.store.cipher() if engine is not None else build_store_cipher(store_settings)
+        )
+        app.state.upload_store = UploadStore(
+            store_settings.uploads_dir,
+            upload_cipher,
+            max_bytes=store_settings.max_upload_bytes,
+            # Per-user quotas + retention (ASVS 5.2.4) — defaults-ON, enforced in save() / prune.
+            max_files_per_user=store_settings.max_upload_files_per_user,
+            max_total_bytes_per_user=store_settings.max_upload_total_bytes_per_user,
+            retention_days=store_settings.uploads_retention_days,
+        )
+    # ADR 0118: the EFFECTIVE [security] switch values (serve syncs the gate-flipped egress/retention back
+    # in) back the read-only GET /security/posture view. None → the secure defaults for the test/embedding
+    # path. There is NO settings-write route; the IDE is the sole authoring surface.
+    app.state.security = security_settings or SecuritySettings()
+    # [security].allowed_client_networks, pre-parsed + normalized once at construction. EMPTY (the
+    # default) = no restriction: ClientNetworkMiddleware short-circuits on the first branch, so every
+    # existing deployment and test is behaviourally identical. See api/client_networks.py for WHICH
+    # address is evaluated and why.
+    app.state.client_networks = app.state.security.client_networks
+    # [api].trusted_proxies, for the address-monoculture tripwire only (a DECLARED proxy is the
+    # supported way for the engine to see real client addresses, so the tripwire stands down).
+    app.state.trusted_proxies = tuple(trusted_proxies)
+    # Network-denial observability (the control must be visible or an operator cannot tell a lockout
+    # from an outage): a monotonic counter + the last refused address, published by
+    # GET /security/posture.
+    app.state.client_denials = 0
+    app.state.client_denied_last = None
+    app.state.client_address_monoculture = False
     # Fail-closed when no auth is attached unless explicitly opted out (embedding/dev) — SYS-1.
     app.state.allow_no_auth = allow_no_auth
+    # ASVS 16.3.2 (#244): audit every authorization grant, not just the sensitive set (off by default).
+    app.state.audit_all_authz = audit_all_authz
     # Loaded [alerts] config for the read-only /alerts/rules view (independent of engine; may be None,
     # in which case the route falls back to all-off defaults). The lifespan path sets the live value.
     app.state.alerts_settings = alerts_settings
@@ -722,7 +1123,14 @@ def create_app(
     # Configured [logging].log_dir for the GET /status app-log metering (#50). None = stdout-only (no
     # metering). The managed-app lifespan sets the live value; here it backs the direct-construction path.
     app.state.log_dir = log_dir
+    # BACKLOG #171 (ADR 0130): the startup [logging].level baseline GET /logging/level reports next to the
+    # (possibly runtime-overridden, ephemeral) effective level. None when unknown (embedding/test path).
+    app.state.configured_log_level = configured_log_level
     app.state.ws_count = 0  # live /ws/stats connection count (API-WS cap)
+    # BACKLOG #76 (ADR 0065 amendment): the in-memory metrics-history ring the console trend charts read
+    # from GET /metrics/history. Fed by the ~1s /ws/stats sampler below (no new task, no extra store I/O);
+    # bounded + process-local (a durable table would flip store_schema — out of scope for this first slice).
+    app.state.metrics_history = MetricsHistory()
     app.state.ws_allowed_origins = tuple(
         ws_allowed_origins
     )  # browser Origins for /ws/stats (4.4.2)
@@ -741,6 +1149,13 @@ def create_app(
     # X-Forwarded-Proto would otherwise poison the cookie for the whole session.
     # tls_terminated_upstream additionally arms the one-shot /ui cleartext-scheme tripwire.
     app.state.exposure_protected = exposure_protected
+    # ADR 0143: whether the API binds a loopback host (http://127.0.0.1 — a W3C potentially-trustworthy
+    # origin). Read-only by the web console's UiSecurityHeadersMiddleware (via _auth.security_headers_
+    # context) to engage the http-SAFE browser hardening (nonce-CSP / COOP / CORP / Reporting) over a
+    # cleartext loopback secure-context WITHOUT auto-TLS. The session cookie's Secure / __Host- prefix
+    # still keys on effective_https (real https), so login is not broken over cleartext loopback; HSTS
+    # stays off here (the security-headers middleware emits it only over https / exposure_protected).
+    app.state.loopback = loopback
     app.state.tls_terminated_upstream = tls_terminated_upstream
     # mTLS client-cert → principal allow-list (#200, ADR 0002). Read by security.resolve_client_cert_
     # identity to map a VERIFIED peer cert's subject/SAN to an Identity (deny-by-default). Empty (the
@@ -754,12 +1169,17 @@ def create_app(
     # proxy-terminated) REFUSES rather than silently emitting PHI; the production-PHI clamp
     # (hop_insecure_escape_downgrades) stays the single authority for the global escape. posture=None (no
     # [ai], embedding/test) or a secure serve hop → ALLOW, so the loopback/dev default is byte-identical.
-    _phi_read_posture = hop_posture_from_ai(ai_settings) if ai_settings is not None else None
+    _phi_read_enforcement = (security_settings or SecuritySettings()).enforcement
+    _phi_read_posture = (
+        hop_posture_from_ai(ai_settings, enforcement=_phi_read_enforcement)
+        if ai_settings is not None
+        else None
+    )
     app.state.phi_read_hop_disposition = phi_read_hop_disposition(
         _phi_read_posture,
         serve_hop_secure=phi_read_hop_secure,
         audited_opt_out=(
-            hop_insecure_escape_downgrades(production=_phi_read_posture.production)
+            hop_insecure_escape_downgrades(enforcing=_phi_read_posture.enforcing)
             if _phi_read_posture is not None
             else False
         ),
@@ -838,8 +1258,9 @@ def create_app(
             )
         # /ui browser surface (ADR 0065 §5): a strict CSP (no unsafe-*) and no-store on every HTML
         # response; the vendored /ui/static assets keep StaticFiles' own cache. PHI JSON reads also get
-        # no-store so a browser/proxy never caches a message body. These are SET (override) so a stale
-        # cache directive can't slip through. nosniff/frame-deny/HSTS above still apply.
+        # no-store (every _NO_STORE_PREFIXES family, ASVS 14.2.2) so a browser/proxy never caches a
+        # message body, a search hit, a log line or an uploaded file's split messages. These are SET
+        # (override) so a stale cache directive can't slip through. nosniff/frame-deny/HSTS still apply.
         path = request.url.path
         if (path == "/ui" or path.startswith("/ui/")) and not path.startswith("/ui/static"):
             # The /ui CSP is co-versioned with the app.js/app.css it governs, so the web console owns
@@ -850,7 +1271,7 @@ def create_app(
             if ui_csp is not None:
                 response.headers["Content-Security-Policy"] = ui_csp
             response.headers["Cache-Control"] = "no-store"
-        elif path.startswith("/messages") or path.startswith("/dead-letters"):
+        elif path.startswith(_NO_STORE_PREFIXES):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -893,8 +1314,15 @@ def create_app(
                     status_code=411,
                 )
             return await call_next(request)
+        # ADR 0134: the uploaded-logs upload routes admit up to [store].max_upload_bytes; all else 1 MiB.
+        upload_store = getattr(request.app.state, "upload_store", None)
+        cap = (
+            upload_store.max_bytes
+            if upload_store is not None and request.url.path in _UPLOAD_BODY_PATHS
+            else _MAX_REQUEST_BODY_BYTES
+        )
         try:
-            too_big = int(length) > _MAX_REQUEST_BODY_BYTES
+            too_big = int(length) > cap
         except ValueError:
             _log.warning("rejected invalid Content-Length on %s from %s", request.url.path, client)
             return JSONResponse({"detail": "invalid Content-Length"}, status_code=400)
@@ -904,11 +1332,23 @@ def create_app(
         return await call_next(request)
 
     @app.get("/health", response_model=Health)
-    async def health(identity: Identity | None = Depends(optional_identity)) -> Health:
+    async def health(
+        request: Request, identity: Identity | None = Depends(optional_identity)
+    ) -> Health:
         # Liveness is always answerable (tokenless), but the build version is fingerprinting info, so
         # it is disclosed only to an authenticated caller (WP-L3-07 / ASVS 13.4.6). When auth is
         # disabled-with-allow_no_auth, optional_identity returns the system identity → version shown.
-        return Health(version=__version__ if identity is not None else None)
+        #
+        # observed_client is echoed ONLY when [security].allowed_client_networks is in use, so the
+        # default deployment's /health payload is byte-identical. This route is EXEMPT from the network
+        # gate (api/client_networks.py), which is what lets a locked-out operator curl it and discover
+        # which address the engine is matching — the difference between a diagnosable 403 and a
+        # console that looks dead.
+        networks = getattr(request.app.state, "client_networks", ())
+        observed = (request.client.host if request.client else None) if networks else None
+        return Health(
+            version=__version__ if identity is not None else None, observed_client=observed
+        )
 
     @app.get("/ai/policy", response_model=AiPolicy)
     async def ai_policy(
@@ -938,6 +1378,80 @@ def create_app(
             reason=eff.reason,
         )
 
+    @app.post("/ai/chat", response_model=AiChatResponse)
+    async def ai_chat(
+        body: AiChatRequest,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.AI_ASSIST)),
+    ) -> AiChatResponse:
+        """Broker one **code_only** AI-assist prompt to the customer-managed / self-hosted LLM (ADR 0135,
+        BACKLOG #95).
+
+        **The SERVER is the sole enforcement point.** It RE-RESOLVES the effective policy server-side from
+        the loaded ``[ai]`` settings — it NEVER trusts the IDE-supplied ``data_scope`` — and serves this
+        route only under the engine-broker mode. The MVP boundary is **code_only regardless of mode**: an
+        IDE claim above the server-enforced scope is DENIED (403). RBAC is deny-by-default via
+        ``AI_ASSIST``; the auth dependency shares the same session / CSRF posture as every other
+        authenticated mutating route (bearer for the native IDE client, ``SameSite`` cookie for a browser).
+        Every use is audited on the EXISTING hash-chained ``audit_log`` with **PHI-safe metadata only** —
+        never the prompt, the reply, or the provider key."""
+        ai = getattr(request.app.state, "ai", None) or AiSettings()
+        _data_class, prod = ai.derived_posture()
+        production = True if prod is None else prod  # unresolved posture -> strictest ceiling
+        # RE-RESOLVE server-side. NEVER trust the IDE-claimed mode/scope — the policy comes from [ai].
+        eff = resolve_effective_policy(
+            mode=ai.mode, data_scope=ai.data_scope, production=production
+        )
+        # This route serves ONLY the engine-broker mode. Any other central choice (off / byo / the P1/P2
+        # managed_claude paths) means the broker path is not the configured one — 409 = config conflict.
+        if eff.mode is not AiMode.MANAGED_ENDPOINT:
+            raise HTTPException(
+                409,
+                "engine-brokered AI assistance is not enabled (set [ai].mode = managed_endpoint)",
+            )
+        # code_only enforcement: the engine-broker MVP operates strictly at code_only regardless of mode
+        # (never PHI). A request CLAIMING a broader scope than the server enforces is DENIED — the IDE
+        # cannot obtain more than the re-resolved server policy grants (managed_endpoint never reaches phi).
+        enforced_scope = AiDataScope.CODE_ONLY
+        if body.data_scope is not enforced_scope:
+            raise HTTPException(
+                403,
+                "engine-brokered AI assistance is code_only in this release; the requested data_scope "
+                "exceeds what the server policy permits",
+            )
+        # Build the broker from the SERVER's settings (never the request body). The SSRF endpoint-allowlist
+        # + cleartext-credential checks run in the constructor; a misconfiguration is an operator error.
+        try:
+            broker = ai_broker_from_settings(ai)
+        except AiBrokerError as exc:
+            _log.warning("engine AI broker misconfigured: %s", exc)
+            raise HTTPException(503, "engine-brokered AI assistance is not available") from exc
+        try:
+            reply = await broker.chat_async(body.prompt)
+        except AiBrokerError as exc:
+            _log.warning("engine AI broker call failed: %s", exc)
+            raise HTTPException(502, "the AI provider request failed") from exc
+        # Per-use audit — reuse the EXISTING hash-chained audit_log (record_audit). PHI-safe metadata ONLY:
+        # never the prompt, the reply, or the api_key. Character counts are volumes, not content.
+        await engine.store.record_audit(
+            "ai.assist",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "mode": eff.mode.value,
+                    "data_scope": enforced_scope.value,
+                    "provider": ai.provider,
+                    "model": ai.model,
+                    "endpoint_host": broker.endpoint_host,
+                    "prompt_chars": len(body.prompt),
+                    "reply_chars": len(reply),
+                }
+            ),
+            client=client_ip(request),
+        )
+        return AiChatResponse(reply=reply, model=ai.model, data_scope=enforced_scope)
+
     @app.get("/security/posture", response_model=SecurityPosture)
     async def security_posture(
         request: Request,
@@ -963,6 +1477,31 @@ def create_app(
         ai = getattr(request.app.state, "ai", None) or AiSettings()
         data_class, production = ai.derived_posture()
         backend = store.backend.value
+        # ADR 0118: the effective [security] switch values + active loosenings + the synthetic-relaxation
+        # notice. security is the resolved SecuritySettings the serve path stashed (defaults on the
+        # test/embedding path). No secret material — these are booleans/ints only.
+        security = getattr(request.app.state, "security", None) or SecuritySettings()
+        loosenings = [
+            SecurityLoosening(switch=name, risk=risk)
+            for name, risk in security_loosenings(security)
+        ]
+        synthetic_relaxation = (
+            "strict PHI-only controls (at-rest-encryption refusal, deny-by-default egress, bounded "
+            "retention) are relaxed: this instance is marked synthetic "
+            "(handles_real_patient_data=false), so it carries no ePHI"
+            if data_class is not None and data_class is not DataClass.PHI
+            else None
+        )
+        # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):
+        # metadata (a boolean + version string), never key material, never enforced.
+        fips_mode, openssl_version = fips_attestation()
+        # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1). Pure platform read
+        # (/proc/cpuinfo flags + guest device presence on Linux; all-None everywhere else), no engine
+        # state, never raises. It reports what the HOST SAYS ABOUT ITSELF and therefore satisfies
+        # NOTHING — 11.7.1 exists because that host may be the adversary. Capability and activation
+        # stay separate fields; the route never fuses them.
+        memenc = platform_memory_encryption_readout()
+        memory_declared = security.memory_encryption_operator_declared
         await engine.store.record_audit(
             "security.posture_view",
             actor=identity.username,
@@ -971,12 +1510,15 @@ def create_app(
                     "backend": backend,
                     "encryption_enabled": info.encrypts,
                     "key_source": store.key_provider,
+                    "loosenings": [name for name, _ in security_loosenings(security)],
                 }
             ),
+            client=client_ip(request),
         )
         return SecurityPosture(
             data_class=data_class,
             production=production,
+            enforcement=security.enforcement,
             environment=ai.environment,
             backend=backend,
             encryption_enabled=info.encrypts,
@@ -985,6 +1527,33 @@ def create_app(
             require_encryption=store.require_encryption,
             allow_unencrypted_phi=store.allow_unencrypted_phi,
             plaintext_columns=_plaintext_columns(backend, encryption_enabled=info.encrypts),
+            security=security.model_dump(),
+            loosenings=loosenings,
+            synthetic_relaxation=synthetic_relaxation,
+            fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
+            openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
+            # ADR 0152: a SELF-REPORT plus the operator's claim. Neither satisfies ASVS 11.7.1 at any
+            # value — see the field comments on SecurityPosture. The disclaimer ships IN THE BODY
+            # (memory_encryption_note), unconditionally: this endpoint is the designated evidence
+            # artifact, and a disclaimer that lives only in a docstring never reaches its reader.
+            memory_encryption_self_reported_capability=memenc.capability,
+            memory_encryption_self_reported_active=memenc.active,
+            memory_encryption_self_reported_mechanism=memenc.mechanism,
+            memory_encryption_readout_source=memenc.source,
+            memory_encryption_operator_declared=memory_declared,
+            # Tri-state: None whenever nobody declared (there is nothing to contradict) or the
+            # read-out cannot tell. Never collapsed to False, which would read as "corroborated".
+            memory_encryption_readout_contradicts_declaration=(
+                memenc.contradicts_declaration if memory_declared else None
+            ),
+            memory_encryption_note=READOUT_DISCLAIMER,
+            # [security].allowed_client_networks observability (process-local counters, not persisted):
+            # is the source-network gate firing, at whom, and is it silently inert (R3)?
+            client_network_denials=getattr(request.app.state, "client_denials", 0),
+            client_denied_last=getattr(request.app.state, "client_denied_last", None),
+            client_address_monoculture=bool(
+                getattr(request.app.state, "client_address_monoculture", False)
+            ),
         )
 
     # --- connections list (inbound connections, for the Log Search filter) ---
@@ -1054,13 +1623,21 @@ def create_app(
                         channel_name=iname,
                         destination=None,
                         name=f"{iname} ▸ in",
+                        # deployed=False (#233, ADR 0111) WINS the ladder: a not-deployed inbound is
+                        # never wired, so it is neither failed nor merely stopped — it must read
+                        # "not_deployed" so an operator can tell it from a "stopped" lane that SHOULD
+                        # be running. (Never a live-state read: the flag is a REGISTRY fact.)
                         status=(
-                            "failed"
-                            if ifail
+                            "not_deployed"
+                            if not ic.deployed
                             else (
-                                "filtered"
-                                if ifiltered
-                                else ("running" if rr.inbound_running(iname) else "stopped")
+                                "failed"
+                                if ifail
+                                else (
+                                    "filtered"
+                                    if ifiltered
+                                    else ("running" if rr.inbound_running(iname) else "stopped")
+                                )
                             )
                         ),
                         direction="in",
@@ -1078,6 +1655,8 @@ def create_app(
                         # The failure reason (ADR 0031) or the DR-parked reason (#61) — whichever set
                         # the status; ifail takes precedence (a failed connection is never also parked).
                         error=ifail or ifiltered,
+                        flagged=ic.flagged,  # #131: object-of-interest marker (display-only)
+                        toml_managed=_is_toml_managed(ic.source_file),
                     )
                 )
             emitted_dests: set[str] = set()
@@ -1098,12 +1677,19 @@ def create_app(
                 if oc is not None:
                     dmethod = _method_label(oc.spec.type.value)
                     dpeer, dport = _peer_port(oc.spec.type.value, oc.spec.settings)
-                    # The collapsed display status: failed/filtered take precedence, else the live
-                    # per-outbound tri-state (running/stopping/stopped) — no longer the whole-engine state.
+                    # The collapsed display status: not-deployed (#233) WINS (never wired — not failed,
+                    # not merely paused/"stopped"), then failed/filtered, else the live per-outbound
+                    # tri-state (running/stopping/stopped) — no longer the whole-engine state. A
+                    # not-deployed lane is parked (paused+quiesced) exactly like a start-disabled one, so
+                    # outbound_status alone would report "stopped"; the flag disambiguates the two.
                     dstatus = (
-                        "failed"
-                        if dfail
-                        else ("filtered" if dfiltered else rr.outbound_status(dname))
+                        "not_deployed"
+                        if not oc.deployed
+                        else (
+                            "failed"
+                            if dfail
+                            else ("filtered" if dfiltered else rr.outbound_status(dname))
+                        )
                     )
                 else:
                     dmethod, dpeer, dport, dstatus = "—", None, None, "draining"
@@ -1138,6 +1724,12 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=(dfail or dfiltered) if oc is not None else None,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
+                        # #131: object-of-interest marker; a draining (removed) outbound has no oc → False.
+                        flagged=oc.flagged if oc is not None else False,
+                        toml_managed=_is_toml_managed(oc.source_file) if oc is not None else False,
+                        # #136: per-message "Waiting for Reply" display state (live connector, past its
+                        # display delay). Duck-typed → False for non-ACK-waiting / draining outbounds.
+                        waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )
                 )
             # ADR 0031 / #61 ADR 0048: an outbound that FAILED to build (0031) or was DR-PARKED below the
@@ -1151,11 +1743,19 @@ def create_app(
             }
             for name, reason in rr.filtered_connections().items():
                 standalone.setdefault(name, ("filtered", reason))
-            # Also surface any operator-paused outbound with no failed/filtered/edge row yet, so a paused
-            # idle/no-edge lane stays visible + selectable (its purge-eligibility is the `paused` field
-            # below; the status is the live tri-state stopping/stopped, reason None — no failure).
-            for oname in reg.outbound:
+            # Also surface any operator-paused OR not-deployed outbound with no failed/filtered/edge row
+            # yet, so a paused idle/no-edge lane stays visible + selectable (its purge-eligibility is the
+            # `paused` field below; the status is the live tri-state stopping/stopped, reason None — no
+            # failure). A not-deployed lane (#233, ADR 0111) is parked (paused+quiesced) just like a
+            # start-disabled one, so outbound_status reports "stopped" for it too — but it must surface as
+            # "not_deployed", never a silent "stopped", or a never-trafficked not-deployed lane is
+            # invisible (or worse, indistinguishable from a lane that SHOULD be running). Checked FIRST so
+            # deployed=False wins over the tri-state.
+            for oname, oc in reg.outbound.items():
                 if oname in standalone or oname in emitted_dests:
+                    continue
+                if not oc.deployed:
+                    standalone[oname] = ("not_deployed", None)
                     continue
                 ostatus = rr.outbound_status(oname)
                 if ostatus in ("stopping", "stopped"):
@@ -1192,20 +1792,33 @@ def create_app(
                         paused=rr.outbound_quiesced(dname),
                         error=dreason,
                         owner_shard=rr.destination_owner(dname),  # ADR 0073; None unsharded
+                        flagged=oc.flagged,  # #131: object-of-interest marker (display-only)
+                        toml_managed=_is_toml_managed(oc.source_file),
+                        # #136: per-message "Waiting for Reply" display state (live connector).
+                        waiting_for_reply=rr.outbound_waiting_for_reply(dname),
                     )
                 )
         return rows
 
     # --- code-first connection operations ------------------------------------
 
-    async def _control_guard(engine: Engine, identity: Identity, name: str) -> None:
+    async def _control_guard(
+        engine: Engine, identity: Identity, name: str, client: str | None = None
+    ) -> None:
         # Controlling an inbound connection is scoped per-channel (the connection IS the channel).
+        # `client` (ADR 0150) is the denied caller's address, threaded from the route's request.
         if not identity.can_access_channel(name):
-            await _audit_channel_denied(engine, identity, name)
+            await _audit_channel_denied(engine, identity, name, client)
             raise HTTPException(403, "not authorized for this connection")
 
     async def _dual_role_control(
-        engine: Engine, identity: Identity, name: str, action: str, *, role: str | None = None
+        engine: Engine,
+        identity: Identity,
+        name: str,
+        action: str,
+        *,
+        role: str | None = None,
+        client: str | None = None,
     ) -> dict[str, object]:
         """Start/stop/restart on an INBOUND *or* an OUTBOUND (the shared primitive behind both the JSON
         and /ui control routes). An inbound → per-channel ``_control_guard`` + ``rr.<action>_inbound``
@@ -1222,18 +1835,24 @@ def create_app(
         want_in = role in (None, "source")
         want_out = role in (None, "destination")
         if rr is not None and want_in and name in rr.registry.inbound:
-            await _control_guard(engine, identity, name)
-            if action == "start":
-                await rr.start_inbound(name)
-            elif action == "stop":
-                await rr.stop_inbound(name)
-            else:
-                await rr.restart_inbound(name)
+            await _control_guard(engine, identity, name, client)
+            try:
+                if action == "start":
+                    await rr.start_inbound(name)
+                elif action == "stop":
+                    await rr.stop_inbound(name)
+                else:
+                    await rr.restart_inbound(name)
+            except NotDeployedError as exc:
+                # #233 (ADR 0111): start/restart of a not-deployed connection is refused — deploying it
+                # is a CONFIG change (flip deployed=true + reload + supply its env() values), not a
+                # runtime action. (stop never raises: an already-parked lane is a no-op.)
+                raise HTTPException(409, str(exc)) from None
             return {"name": name, "running": rr.inbound_running(name)}
         if rr is not None and want_out and name in rr.registry.outbound:
             # A shared outbound spans channels, so a channel-scoped user can't control one (mirrors purge).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, name)
+                await _audit_channel_denied(engine, identity, name, client)
                 raise HTTPException(
                     403, "channel-scoped users cannot control a shared outbound connection"
                 )
@@ -1248,39 +1867,79 @@ def create_app(
                 # ADR 0073: this shard never runs the lane, so acting here would only produce a
                 # vacuous 'stopped' (and unlock purge) while the owner keeps delivering.
                 raise HTTPException(409, str(exc)) from None
+            except NotDeployedError as exc:
+                # #233 (ADR 0111): start/restart of a not-deployed outbound is refused — there is no
+                # connector to build and no worker to resume; deploying it is a config change, not a
+                # runtime action. (stop never raises: an already-parked lane is a no-op.)
+                raise HTTPException(409, str(exc)) from None
             return {"name": name, "running": rr.outbound_running(name)}
         # Neither an inbound nor an outbound (or no runner). Run the per-channel guard first so a scoped
         # user is 403'd for a name outside their scope (don't disclose existence), then 404.
-        await _control_guard(engine, identity, name)
+        await _control_guard(engine, identity, name, client)
         raise HTTPException(404, f"no such connection: {name}")
 
     @app.post("/connections/{name}/start")
     async def start_connection(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.CONNECTIONS_CONTROL)),
+        identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
     ) -> dict[str, object]:
-        return await _dual_role_control(engine, identity, name, "start")
+        return await _dual_role_control(engine, identity, name, "start", client=client_ip(request))
 
     @app.post("/connections/{name}/stop")
     async def stop_connection(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.CONNECTIONS_CONTROL)),
+        identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
     ) -> dict[str, object]:
-        return await _dual_role_control(engine, identity, name, "stop")
+        return await _dual_role_control(engine, identity, name, "stop", client=client_ip(request))
 
     @app.post("/connections/{name}/restart")
     async def restart_connection(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.CONNECTIONS_CONTROL)),
+        identity: Identity = Depends(require_paced(Permission.CONNECTIONS_CONTROL)),
     ) -> dict[str, object]:
-        return await _dual_role_control(engine, identity, name, "restart")
+        return await _dual_role_control(
+            engine, identity, name, "restart", client=client_ip(request)
+        )
+
+    @app.post("/connections/{name}/flag")
+    async def set_connection_flag(
+        name: str,
+        req: ConnectionFlagRequest,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_paced(Permission.CONFIG_DEPLOY)),
+    ) -> dict[str, object]:
+        """Set the object-of-interest flag (#131, ADR 0007 amendment) on a ``connections.toml``-managed
+        connection — the FIRST console→connections.toml write seam. Persists ``flagged`` through the
+        comment-preserving, validate-before-persist writer (``connections_edit``) and reflects it on the
+        live registry **without a reload** (a cosmetic-field replace — no connector rebuild, no delivery
+        change). A **code-first** connection has no TOML home and is refused **409** (the scope fork).
+        Gated by ``config:deploy`` (deny-by-default, paced) and audited — the console→TOML mutation path."""
+        try:
+            await engine.set_connection_flag(name, direction=req.direction, flagged=req.flagged)
+        except WiringError as exc:
+            # Not TOML-managed (scope fork) OR a validate-before-persist failure — the edit never landed.
+            raise HTTPException(409, str(exc)) from exc
+        await engine.store.record_audit(
+            "connection_flag_set",
+            actor=identity.username,
+            detail=json.dumps(
+                {"connection": name, "direction": req.direction, "flagged": req.flagged}
+            ),
+            client=client_ip(request),
+        )
+        return {"name": name, "direction": req.direction, "flagged": req.flagged}
 
     @app.get("/connections/{name}/metadata", response_model=ConnectionMetadata)
     async def connection_metadata(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
     ) -> ConnectionMetadata:
@@ -1291,7 +1950,9 @@ def create_app(
             raise HTTPException(503, "engine not started")
         ic = rr.registry.inbound.get(name)
         if ic is not None:
-            await _control_guard(engine, identity, name)  # inbound config is per-channel
+            await _control_guard(
+                engine, identity, name, client_ip(request)
+            )  # inbound config is per-channel
             return ConnectionMetadata(
                 name=name,
                 direction="in",
@@ -1308,7 +1969,7 @@ def create_app(
             if identity.allowed_channels is not None:
                 # An outbound spans channels, so a channel-scoped user can't read a shared one — the
                 # same boundary /test and /purge enforce (don't disclose shared-outbound topology).
-                await _audit_channel_denied(engine, identity, name)
+                await _audit_channel_denied(engine, identity, name, client_ip(request))
                 raise HTTPException(
                     403, "channel-scoped users cannot read a shared outbound connection"
                 )
@@ -1328,11 +1989,16 @@ def create_app(
     @app.post("/connections/{name}/test", response_model=ConnectionTestResult)
     async def connection_test(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.CONNECTIONS_TEST)),
+        identity: Identity = Depends(require_paced(Permission.CONNECTIONS_TEST)),
     ) -> ConnectionTestResult:
         """Probe a connection's reachability (operability Tier 4) — builds a **fresh** connector
-        (never the live one), honors the ``[egress]`` allowlist, and sends NO real data. Audited."""
+        (never the live one), honors the ``[egress]`` allowlist, and sends NO real data. Audited.
+
+        Paced by the #193 per-actor floor (ASVS 2.4.2): the probe fires a **live outbound dial** (a
+        reachability connect), so an unpaced actor could amplify it into an SSRF/port-scan sweep. It
+        draws from the same shared admin-write bucket as the other mutating flows."""
         rr = engine.registry_runner
         if rr is None:
             raise HTTPException(503, "engine not started")
@@ -1341,10 +2007,12 @@ def create_app(
             raise HTTPException(404, f"no such connection: {name}")
         direction = "in" if is_inbound else "out"
         if is_inbound:
-            await _control_guard(engine, identity, name)  # inbound test is per-channel
+            await _control_guard(
+                engine, identity, name, client_ip(request)
+            )  # inbound test is per-channel
         elif identity.allowed_channels is not None:
             # An outbound spans channels, so a channel-scoped user can't probe a shared one (like purge).
-            await _audit_channel_denied(engine, identity, name)
+            await _audit_channel_denied(engine, identity, name, client_ip(request))
             raise HTTPException(
                 403, "channel-scoped users cannot test a shared outbound connection"
             )
@@ -1363,6 +2031,76 @@ def create_app(
                     "detail": result.detail,
                 }
             ),
+            client=client_ip(request),
+        )
+        return result
+
+    @app.post("/connections/{name}/test-credential", response_model=ConnectionTestResult)
+    async def connection_test_credential(
+        name: str,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_paced(Permission.CONNECTIONS_TEST)),
+    ) -> ConnectionTestResult:
+        """Probe a **File** endpoint's reachability **under its configured alternate Windows / UNC-share
+        credential** (ADR 0132, #111) — the credentialed endpoint tester #111 asks for.
+
+        Same RBAC + pacing + fresh-connector probe as ``POST /connections/{name}/test`` (the probe dials
+        the share **under the impersonated identity**, sending no real data), but **400s unless** the
+        connection is a File endpoint with a ``credential_*`` identity configured — so an operator wiring
+        an alternate-credential share gets a clear, *targeted* "the credential reaches the share / does
+        not" answer rather than the generic connection test. Disjoint from ``/test`` (a separate route);
+        audited as ``connection_credential_test``."""
+        rr = engine.registry_runner
+        if rr is None:
+            raise HTTPException(503, "engine not started")
+        conn = rr.registry.inbound.get(name) or rr.registry.outbound.get(name)
+        if conn is None:
+            raise HTTPException(404, f"no such connection: {name}")
+        is_inbound = name in rr.registry.inbound
+        # Authorize BEFORE disclosing anything about the connection's type / credential config — so an
+        # out-of-scope channel-scoped caller gets a UNIFORM 403 regardless of whether the connection is a
+        # File endpoint with an alt credential (which would otherwise leak via the 400 below). Matches the
+        # sibling /test route and the _dual_role_control "guard first so a scoped user gets 403 rather than
+        # learning about an out-of-scope name" convention.
+        if is_inbound:
+            await _control_guard(
+                engine, identity, name, client_ip(request)
+            )  # inbound test is per-channel
+        elif identity.allowed_channels is not None:
+            # An outbound spans channels, so a channel-scoped user can't probe a shared one (like /test).
+            await _audit_channel_denied(engine, identity, name, client_ip(request))
+            raise HTTPException(
+                403, "channel-scoped users cannot test a shared outbound connection"
+            )
+        if (
+            conn.spec.type is not ConnectorType.FILE
+            or "credential_username" not in conn.spec.settings
+        ):
+            # No alt credential to test — a clear 400, not a generic probe (don't silently fall back to
+            # an uncredentialed test, which would answer a different question). Reached only by an
+            # AUTHORIZED caller, so it discloses config only to someone already in scope.
+            raise HTTPException(
+                400,
+                f"connection {name!r} has no alternate Windows credential configured "
+                "(set File credential_username / credential_password)",
+            )
+        direction = "in" if is_inbound else "out"
+        result = await _run_connection_test(rr, name, direction)
+        await engine.store.record_audit(
+            "connection_credential_test",
+            actor=identity.username,
+            channel_id=name if direction == "in" else None,
+            detail=json.dumps(
+                {
+                    "connection": name,
+                    "direction": direction,
+                    "supported": result.supported,
+                    "success": result.success,
+                    "detail": result.detail,
+                }
+            ),
+            client=client_ip(request),
         )
         return result
 
@@ -1370,6 +2108,7 @@ def create_app(
     async def purge_connection(
         name: str,
         response: Response,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         scope: str = Query("all", pattern="^(top|all)$"),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_PURGE)),
@@ -1379,7 +2118,7 @@ def create_app(
         # Purge targets an outbound and spans every inbound feeding it, so it can't be confined to a
         # per-(inbound-)channel scope — a channel-scoped user may not purge a shared outbound.
         if identity.allowed_channels is not None:
-            await _audit_channel_denied(engine, identity, name)
+            await _audit_channel_denied(engine, identity, name, client_ip(request))
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
             )
@@ -1407,7 +2146,10 @@ def create_app(
             gate is not None
         ):  # dual-control: hold for a second approver when [approvals] gates purge
             pending = await gate.guard(
-                "connection_purge", {"name": name, "scope": scope}, requester=identity.username
+                "connection_purge",
+                {"name": name, "scope": scope},
+                requester=identity.username,
+                client=client_ip(request),
             )
             if pending is not None:
                 response.status_code = 202
@@ -1422,8 +2164,9 @@ def create_app(
     @app.post("/statistics/reset", response_model=StatsResetResult)
     async def reset_statistics(
         req: StatsResetRequest,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
     ) -> StatsResetResult:
         """Zero the connections-dashboard cumulative counters (inbound read/errored, outbound
         written/dead) for the selected connections, or all of them. This moves an in-memory baseline —
@@ -1434,7 +2177,7 @@ def create_app(
         if req.all:
             # "Reset all" spans every channel, so a channel-scoped user may not run it (mirror purge).
             if identity.allowed_channels is not None:
-                await _audit_channel_denied(engine, identity, None)
+                await _audit_channel_denied(engine, identity, None, client_ip(request))
                 raise HTTPException(403, "channel-scoped users cannot reset all statistics")
         else:
             for t in req.targets:
@@ -1443,7 +2186,7 @@ def create_app(
                 if identity.allowed_channels is not None and not identity.can_access_channel(
                     t.channel_id
                 ):
-                    await _audit_channel_denied(engine, identity, t.channel_id)
+                    await _audit_channel_denied(engine, identity, t.channel_id, client_ip(request))
                     raise HTTPException(403, "connection is outside your channel scope")
                 if t.role == "source":
                     if t.channel_id not in inbound:
@@ -1468,6 +2211,7 @@ def create_app(
                     "reset": count,
                 }
             ),
+            client=client_ip(request),
         )
         return StatsResetResult(reset=count)
 
@@ -1488,6 +2232,7 @@ def create_app(
 
     @app.get("/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
         connection: str | None = Query(None, max_length=256),
@@ -1501,7 +2246,7 @@ def create_app(
         # Per-channel RBAC: an explicit out-of-scope connection= is denied (and audited), matching the
         # /dead-letters/replay boundary; otherwise the store filters to the caller's inbound events.
         if connection is not None and not identity.can_access_channel(connection):
-            await _audit_channel_denied(engine, identity, connection)
+            await _audit_channel_denied(engine, identity, connection, client_ip(request))
             raise HTTPException(403, "connection is outside your channel scope")
         rows = await engine.store.list_connection_events(
             connection=connection,
@@ -1515,6 +2260,7 @@ def create_app(
     @app.get("/connections/{name}/events", response_model=list[ConnectionEventInfo])
     async def list_connection_events_for(
         name: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require(Permission.MONITORING_READ)),
         kind: list[str] | None = Query(None),
@@ -1525,7 +2271,7 @@ def create_app(
         # Per-channel RBAC: 403 + audit an out-of-scope name (an outbound name isn't a channel a scoped
         # user can access, so this also denies shared-outbound topology); the store scope is defense-in-
         # depth on top of the guard.
-        await _control_guard(engine, identity, name)
+        await _control_guard(engine, identity, name, client_ip(request))
         rows = await engine.store.list_connection_events(
             connection=name,
             kinds=kind,
@@ -1551,6 +2297,7 @@ def create_app(
             acked_by=a.acked_by,
             acked_at=a.acked_at,
             resolved_at=a.resolved_at,
+            suspended_until=a.suspended_until,
         )
 
     @app.get("/alerts/active", response_model=AlertInstanceList)
@@ -1570,8 +2317,9 @@ def create_app(
     @app.post("/alerts/{alert_id}/ack", response_model=AlertInstanceInfo)
     async def ack_alert(
         alert_id: int,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
     ) -> AlertInstanceInfo:
         """Acknowledge an open alert instance (ADR 0044): set ``acknowledged`` + ``acked_by``/``acked_at``
         and exclude it from ``alerts_active``. Writes one metadata-only ``alert_ack`` audit row (no
@@ -1585,15 +2333,19 @@ def create_app(
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
         await engine.store.record_audit(
-            "alert_ack", actor=identity.username, detail=json.dumps({"alert_id": alert_id})
+            "alert_ack",
+            actor=identity.username,
+            detail=json.dumps({"alert_id": alert_id}),
+            client=client_ip(request),
         )
         return await _alert_instance_echo(engine, identity, alert_id)
 
     @app.post("/alerts/{alert_id}/resolve", response_model=AlertInstanceInfo)
     async def resolve_alert(
         alert_id: int,
+        request: Request,
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
     ) -> AlertInstanceInfo:
         """Resolve an open/acknowledged alert instance (ADR 0044): set ``resolved`` + ``resolved_at``.
         Writes one metadata-only ``alert_resolve`` audit row. 404 if the id is unknown or already
@@ -1605,9 +2357,191 @@ def create_app(
         if not ok:
             raise HTTPException(404, "alert instance not found or already resolved")
         await engine.store.record_audit(
-            "alert_resolve", actor=identity.username, detail=json.dumps({"alert_id": alert_id})
+            "alert_resolve",
+            actor=identity.username,
+            detail=json.dumps({"alert_id": alert_id}),
+            client=client_ip(request),
         )
-        return await _alert_instance_echo(engine, identity, alert_id)
+        echo = await _alert_instance_echo(engine, identity, alert_id)
+        # #81 (ADR 0133): a resolved condition is closed — drop the running notifier's in-memory suspend +
+        # escalation state for the key, so a later re-open starts un-suspended at the base tier (matching
+        # the fresh durable instance). Best-effort (no notifier in a JSON-only deployment).
+        _notifier_forget(request, echo.event_type, echo.connection)
+        return echo
+
+    @app.post("/alerts/{alert_id}/suspend", response_model=AlertInstanceInfo)
+    async def suspend_alert(
+        alert_id: int,
+        body: AlertSuspendRequest,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
+    ) -> AlertInstanceInfo:
+        """Windowed suspend (#143, ADR 0044 amendment): mute an alert instance's NOTIFICATIONS for
+        ``minutes`` (the window end is ``now + minutes·60``). **Notification-only** (AC-3) — the instance
+        stays ``open``/counted/visible; only re-alerts are silenced for the window, and it auto-un-mutes
+        at the window end (no timer). Durable in the store; the running notifier's suspend cache is
+        updated so the mute takes effect immediately. Writes one metadata-only ``alert_suspend`` audit row
+        (no message content). 404 if the id is unknown or already resolved."""
+        # AC-7 (parity with ack/resolve): scope-check before mutating — an out-of-scope id is refused with
+        # no state change and no audit row.
+        await _require_alert_scope(engine, identity, alert_id)
+        until = time.time() + body.minutes * 60.0
+        info = await engine.store.suspend_alert_instance(alert_id, until=until)
+        if info is None:
+            raise HTTPException(404, "alert instance not found or already resolved")
+        # Update the running notifier's in-memory suspend cache so the mute is honored immediately (the
+        # durable suspended_until is the cross-restart record; the sink primes from it at startup). Best-
+        # effort: absent in a JSON-only/no-transport deployment (the durable state still governs).
+        _notifier_suspend(request, info.event_type, info.connection, until=until)
+        await engine.store.record_audit(
+            "alert_suspend",
+            actor=identity.username,
+            detail=json.dumps({"alert_id": alert_id, "minutes": body.minutes}),
+            client=client_ip(request),
+        )
+        return _alert_instance_info(info)
+
+    @app.post("/alerts/{alert_id}/resume", response_model=AlertInstanceInfo)
+    async def resume_alert(
+        alert_id: int,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
+    ) -> AlertInstanceInfo:
+        """Clear a windowed suspend (#143) so re-alerts resume immediately. Writes one metadata-only
+        ``alert_resume`` audit row. 404 if the id is unknown or already resolved."""
+        await _require_alert_scope(engine, identity, alert_id)
+        info = await engine.store.resume_alert_instance(alert_id)
+        if info is None:
+            raise HTTPException(404, "alert instance not found or already resolved")
+        _notifier_resume(request, info.event_type, info.connection)
+        await engine.store.record_audit(
+            "alert_resume",
+            actor=identity.username,
+            detail=json.dumps({"alert_id": alert_id}),
+            client=client_ip(request),
+        )
+        return _alert_instance_info(info)
+
+    @app.post("/alerts/test-email", response_model=AlertTestEmailResult)
+    async def test_alert_email(
+        request: Request,
+        body: AlertTestEmailRequest | None = None,
+        identity: Identity = Depends(require(Permission.SERVICE_CONFIGURE)),
+    ) -> AlertTestEmailResult:
+        """Send a synthetic, **PHI-free** test event through the configured ``[alerts]`` email transport
+        so an operator can verify the alert mail server end-to-end (BACKLOG #118). This is the SAME code
+        path a real alert takes (``EmailTransport.send`` → ``send_plain_email``: subject/body render,
+        STARTTLS, the ``smtp_allowed_hosts`` egress allowlist), but it bypasses the fire-and-forget
+        notifier queue so the send's success/failure is reported synchronously.
+
+        Admin-gated (``service:configure``): it fires a live outbound SMTP dial, so it is service/settings
+        administration, not the diagnostic ack/resolve tier. The result carries **no** email addresses —
+        only a configured/success flag, the duration, the recipient count, and a ``safe_exc``-scrubbed
+        failure detail. One metadata-only ``alert_test_email`` audit row is written (best-effort; skipped
+        when no engine is bound). Never touches the message pipeline / staged queue."""
+        alerts: AlertsSettings = (
+            getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
+        )
+        # Email is "configured" iff the notifier would build an EmailTransport (same triple as
+        # notifier_from_settings / the /alerts/rules view) — refuse cleanly rather than 500 when it isn't.
+        if not (alerts.email_smtp_host and alerts.email_from and alerts.email_to):
+            return AlertTestEmailResult(
+                configured=False,
+                success=False,
+                duration_ms=0.0,
+                recipient_count=0,
+                detail="no alert email transport configured ([alerts].email_smtp_host + "
+                "email_from + email_to)",
+            )
+        # #146 parity: an explicit override redirects THIS test send to one alternate address; else the
+        # configured email_to. Addresses are operator config (never PHI) and are never echoed back.
+        override = body.recipient_override if body is not None else None
+        recipients = [override] if override else list(alerts.email_to)
+        # Resolve the SMTP password exactly as notifier_from_settings does: a [secrets].provider ref when
+        # set (fail-closed), else the env-sourced literal. secret_provider is present only on the serve
+        # path; the embedded path has none, so a provider-ref would fail closed (correct) and a plain
+        # env password works with None.
+        secret_provider = getattr(request.app.state, "secret_provider", None)
+        success = False
+        detail: str | None = None
+        start = time.perf_counter()
+        try:
+            smtp_password = resolve_connector_secret(
+                secret_provider,
+                ref=alerts.email_password_secret,
+                literal=alerts.email_password,
+                label="[alerts].email_password",
+            )
+            transport = EmailTransport(
+                host=alerts.email_smtp_host,
+                port=alerts.email_smtp_port,
+                sender=alerts.email_from,
+                recipients=recipients,
+                use_tls=alerts.email_use_tls,
+                username=alerts.email_username,
+                password=smtp_password,
+                timeout=alerts.email_timeout,
+                allowed_hosts=tuple(alerts.smtp_allowed_hosts),
+                subject_template=alerts.email_subject_template,
+                body_template=alerts.email_body_template,
+                html_template=alerts.email_html_template,
+            )
+            # A fixed synthetic event — carries only a type/severity/connection label + a static detail
+            # string; NO message body, NO PHI. The template-value allowlist maps these safely too.
+            await transport.send(
+                {
+                    "type": "test_email",
+                    "connection": "alert-configuration-test",
+                    "severity": "info",
+                    "detail": "MessageFoundry alert email connectivity test",
+                }
+            )
+            success = True
+        except Exception as exc:  # noqa: BLE001 — any SMTP/config failure is a test FAILURE, not a 500
+            # safe_exc scrubs + bounds the message so no SMTP server banner / internal detail (possible
+            # host/credential hints) escapes to the caller.
+            detail = safe_exc(exc)
+        duration_ms = (time.perf_counter() - start) * 1000.0
+        # Best-effort metadata-only audit (no addresses, no bodies) — mirrors connection_test. Skipped in
+        # a no-engine (embedded/test) deployment where there is no store to record into.
+        engine = getattr(request.app.state, "engine", None)
+        if engine is not None:
+            await engine.store.record_audit(
+                "alert_test_email",
+                actor=identity.username,
+                detail=json.dumps({"success": success, "recipient_count": len(recipients)}),
+                client=client_ip(request),
+            )
+        return AlertTestEmailResult(
+            configured=True,
+            success=success,
+            duration_ms=duration_ms,
+            recipient_count=len(recipients),
+            detail=detail,
+        )
+
+    def _notifier_suspend(
+        request: Request, event_type: str, connection: str, *, until: float
+    ) -> None:
+        # Reach the running NotifierAlertSink (wired into app.state by the serve lifespan) to update its
+        # in-memory suspend cache. None in a JSON-only/no-transport/test app — a no-op then (the durable
+        # store state governs; the sink primes from it at startup). Never raises into the route.
+        notifier = getattr(request.app.state, "notifier", None)
+        if notifier is not None:
+            notifier.suspend(event_type, connection, until=until)
+
+    def _notifier_resume(request: Request, event_type: str, connection: str) -> None:
+        notifier = getattr(request.app.state, "notifier", None)
+        if notifier is not None:
+            notifier.resume(event_type, connection)
+
+    def _notifier_forget(request: Request, event_type: str, connection: str) -> None:
+        # #81: drop the notifier's suspend + escalation state for a resolved key (see resolve_alert).
+        notifier = getattr(request.app.state, "notifier", None)
+        if notifier is not None:
+            notifier.forget(event_type, connection)
 
     async def _require_alert_scope(engine: Engine, identity: Identity, alert_id: int) -> None:
         # AC-7 pre-mutation RBAC gate for ack/resolve: a scoped read of the instance must succeed before
@@ -1676,6 +2610,7 @@ def create_app(
     async def replay_dead_letters(
         req: DeadLetterReplayRequest,
         response: Response,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
         gate: ApprovalGate | None = Depends(_get_gate),
@@ -1687,7 +2622,7 @@ def create_app(
         if identity.allowed_channels is not None and not identity.can_access_channel(
             req.channel_id
         ):
-            await _audit_channel_denied(engine, identity, req.channel_id)
+            await _audit_channel_denied(engine, identity, req.channel_id, client_ip(request))
             raise HTTPException(403, "specify a channel within your scope to replay")
         if (
             gate is not None
@@ -1696,6 +2631,7 @@ def create_app(
                 "dead_letter_replay",
                 {"channel_id": req.channel_id, "destination_name": req.destination_name},
                 requester=identity.username,
+                client=client_ip(request),
             )
             if pending is not None:
                 response.status_code = 202
@@ -1713,6 +2649,7 @@ def create_app(
                 actor=identity.username,
                 channel_id=req.channel_id,
                 detail=json.dumps({"destination_name": req.destination_name, "requeued": requeued}),
+                client=client_ip(request),
             )
         return DeadLetterReplayResult(requeued=requeued)
 
@@ -1731,7 +2668,8 @@ def create_app(
     @app.post("/approvals/{approval_id}/approve", response_model=ApprovalDecisionResult)
     async def approve_action(
         approval_id: str,
-        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        request: Request,
+        identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalDecisionResult:
         """Release a pending action: re-executes the captured operation and audits both identities. A
@@ -1739,7 +2677,9 @@ def create_app(
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:
-            outcome = await gate.approve(approval_id, approver=identity.username)
+            outcome = await gate.approve(
+                approval_id, approver=identity.username, client=client_ip(request)
+            )
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
         return ApprovalDecisionResult(**outcome)
@@ -1747,14 +2687,17 @@ def create_app(
     @app.post("/approvals/{approval_id}/reject", response_model=ApprovalDecisionResult)
     async def reject_action(
         approval_id: str,
-        identity: Identity = Depends(require(Permission.APPROVALS_APPROVE)),
+        request: Request,
+        identity: Identity = Depends(require_paced(Permission.APPROVALS_APPROVE)),
         gate: ApprovalGate | None = Depends(_get_gate),
     ) -> ApprovalDecisionResult:
         """Decline a pending action without executing it (audited)."""
         if gate is None:
             raise HTTPException(503, "approval workflow is not available")
         try:
-            outcome = await gate.reject(approval_id, approver=identity.username)
+            outcome = await gate.reject(
+                approval_id, approver=identity.username, client=client_ip(request)
+            )
         except ApprovalError as exc:
             raise HTTPException(exc.status, exc.detail) from exc
         return ApprovalDecisionResult(**outcome)
@@ -1765,6 +2708,7 @@ def create_app(
     async def reload_config(
         req: ReloadRequest,
         response: Response,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         user: Identity = Depends(require_step_up(Permission.CONFIG_DEPLOY)),
         gate: ApprovalGate | None = Depends(_get_gate),
@@ -1794,6 +2738,7 @@ def create_app(
                 "config_reload",
                 {"config_dir": req.config_dir, "requester": user.username},
                 requester=user.username,
+                client=client_ip(request),
             )
             if pending is not None:
                 response.status_code = 202
@@ -1802,6 +2747,29 @@ def create_app(
                     operation="config_reload",
                     detail="held for a second approver (dual-control)",
                 )
+        # #285 (ASVS 6.7.1): re-verify the operator-supplied trust anchors on every real deploy, BEFORE
+        # the graph swap — the on-disk PEMs are re-read, so a swapped anchor is audited (auth.trust_anchor)
+        # and a pinned-but-substituted / (under enforce) newly group-writable anchor REFUSES the deploy
+        # (422) rather than converging onto a tampered CA. Dormant (no-op) when no anchor is configured.
+        anchor_specs = getattr(request.app.state, "trust_anchor_specs", ())
+        if anchor_specs and not req.dry_run:
+            try:
+                await run_anchor_preflight(
+                    anchor_specs,
+                    engine.store,
+                    enforcing=getattr(request.app.state, "trust_anchors_enforcing", True),
+                )
+            except (TrustAnchorError, OSError) as exc:
+                _log.warning("config reload refused (trust anchor): %s", exc)
+                await engine.store.record_audit(
+                    "config_reload_failed",
+                    actor=user.username,
+                    detail=json.dumps(
+                        {"requested": req.config_dir, "dry_run": False, "reason": "trust_anchor"}
+                    ),
+                    client=client_ip(request),
+                )
+                raise HTTPException(422, "invalid configuration") from exc
         try:
             # propagate=True on the real apply so an operator reload on one node bumps the cluster-wide
             # config version and every other node converges (Track B Step 6); a dry_run never propagates
@@ -1814,6 +2782,7 @@ def create_app(
                 "config_reload_denied",
                 actor=user.username,
                 detail=json.dumps({"requested": req.config_dir, "dry_run": req.dry_run}),
+                client=client_ip(request),
             )
             raise HTTPException(403, "config directory is not an allowed reload root") from exc
         except FileNotFoundError as exc:
@@ -1824,6 +2793,7 @@ def create_app(
                 detail=json.dumps(
                     {"requested": req.config_dir, "dry_run": req.dry_run, "reason": "not_found"}
                 ),
+                client=client_ip(request),
             )
             raise HTTPException(404, "config directory not found") from exc
         except WiringError as exc:
@@ -1838,6 +2808,7 @@ def create_app(
                         "reason": "invalid_config",
                     }
                 ),
+                client=client_ip(request),
             )
             raise HTTPException(422, "invalid configuration") from exc
         # Bind "what loaded" to a reviewable content digest (ADR 0041 D1): the prior detail recorded
@@ -1869,9 +2840,12 @@ def create_app(
                         **fingerprint,
                     }
                 ),
+                client=client_ip(request),
             )
         else:
-            await _record_reload_audit(engine, actor=user.username, dir_arg=req.config_dir)
+            await _record_reload_audit(
+                engine, actor=user.username, dir_arg=req.config_dir, client=client_ip(request)
+            )
         rr = engine.registry_runner
         return ReloadResult(
             inbound=len(registry.inbound),
@@ -1898,7 +2872,7 @@ def create_app(
         limit: int = Query(50, ge=1, le=500),
         offset: int = Query(0, ge=0),
     ) -> MessageList:
-        filters = dict(
+        filters = dict(  # noqa: C408
             channel_id=channel_id,
             status=status,
             message_type=message_type,
@@ -1963,6 +2937,7 @@ def create_app(
         # #200 residual (ADR 0092): search is a bulk-PHI read behind require_step_up, NOT require_phi_read,
         # so it doesn't inherit the folded data-path guard — apply it explicitly before any decrypt.
         enforce_phi_read_hop(request)
+        enforce_phi_read_pacing(request, identity)  # step-up paces NON-GET only; this is a GET
         try:
             spec = make_spec(
                 content=content,
@@ -1997,7 +2972,7 @@ def create_app(
                 _search_audit_detail(
                     spec,
                     result,
-                    filters=dict(
+                    filters=dict(  # noqa: C408
                         channel_id=channel_id,
                         status=status,
                         message_type=message_type,
@@ -2005,6 +2980,7 @@ def create_app(
                     ),
                 )
             ),
+            client=client_ip(request),
         )
         # The summary exposure (matched rows actually carrying a summary) is ALSO coalesced into the
         # standard summary_access audit, mirroring /messages — so a search-then-harvest can't dodge it.
@@ -2022,6 +2998,115 @@ def create_app(
             scan_limit=spec.scan_limit,
         )
 
+    @app.get("/messages/export")
+    async def export_messages(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        # LARGEST PHI surface in the cluster (bulk raw bodies → a file): the strongest interactive gate —
+        # a fresh step-up + second factor over BOTH messages:view_raw AND a dedicated messages:export
+        # capability (ADR 0131 §2). Bulk egress is a distinct privilege from opening one message.
+        identity: Identity = Depends(
+            require_step_up(Permission.MESSAGES_EXPORT, Permission.MESSAGES_VIEW_RAW)
+        ),
+        ids: list[str] = Query(default=[]),  # noqa: B006 — FastAPI repeated ?ids= (save-selected)
+        content: str | None = Query(None, max_length=512),
+        field_path: str | None = Query(None, max_length=32),
+        field_value: str | None = Query(None, max_length=512),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        channel_id: str | None = Query(None, max_length=256),
+        status: str | None = Query(None, max_length=64),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(1000, ge=1, le=100_000),
+        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> StreamingResponse:
+        """Stream a batch of message bodies to a downloadable NDJSON file (#124, ADR 0131) — the
+        Corepoint-parity bulk export a one-at-a-time ``/messages/{id}`` raw view can't provide.
+
+        Selection is either an explicit ``ids`` set (the UI's *save-selected*) or the **basic**
+        ``/messages/search`` filters (the UI's *save-all* — reusing ``search_messages`` for the id set);
+        it then LOOPS ``get_message`` per id (no bulk store iterator — no store schema change). Each
+        streamed body is re-checked against the caller's per-channel scope (load-bearing for the
+        attacker-suppliable ``ids`` path); an out-of-scope id is skipped + audited (``auth.channel_denied``).
+        The whole export is recorded as ONE ``messages_export`` audit row **before streaming** — actor +
+        selection mode + basic filters + needle SHAPE (never the value) + the count of selected bodies — so
+        a scripted save-all cannot pull a body that was not first counted in a durable audit row. The
+        PHI-safe destination is the operator's responsibility."""
+        # #200 (ADR 0092): a bulk-PHI read behind step-up (NOT require_phi_read), so apply the data-path
+        # hop guard explicitly before any body is decrypted — exactly as the step-up search route does.
+        enforce_phi_read_hop(request)
+        # Charged BEFORE selection: export is a step-up GET, and step-up pacing is NON-GET only, so
+        # without this a single actor can stream far more bodies per minute here than the per-actor
+        # budget allows through /messages/{id}. Admission-time so a refused call does no store work.
+        enforce_phi_read_pacing(request, identity)
+        allowed = _scope(identity)  # per-channel RBAC (None = all)
+        if ids:
+            selected = ids[:limit]
+            selection: dict[str, object] = {"mode": "ids", "requested": len(ids)}
+        else:
+            try:
+                spec = make_spec(
+                    content=content,
+                    field_path=field_path,
+                    field_value=field_value,
+                    target=SearchTarget(target),
+                    scan_limit=scan_limit,
+                )
+            except ContentSearchError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            result = await engine.store.search_messages(
+                spec,
+                channel_id=channel_id,
+                status=status,
+                message_type=message_type,
+                control_id=control_id,
+                limit=limit,
+                allowed_channels=allowed,
+            )
+            selected = [str(r["id"]) for r in result.rows]
+            selection = {
+                "mode": "search",
+                **_search_audit_detail(
+                    spec,
+                    result,
+                    filters=dict(  # noqa: C408
+                        channel_id=channel_id,
+                        status=status,
+                        message_type=message_type,
+                        control_id=control_id,
+                    ),
+                ),
+            }
+        # The dedicated tamper-evident audit, written BEFORE any body streams (mirroring /audit/export):
+        # it counts EVERY selected body, so a scripted save-all can't harvest unaudited (ADR 0131 §4).
+        await engine.store.record_audit(
+            "messages_export",
+            actor=identity.username,
+            channel_id=channel_id,
+            detail=json.dumps({"selected": len(selected), **selection}),
+            client=client_ip(request),
+        )
+
+        async def _iter_ndjson() -> AsyncIterator[bytes]:
+            for mid in selected:
+                row = await engine.store.get_message(mid)
+                if row is None:
+                    continue
+                # Per-row channel scope on EVERY streamed body (load-bearing for the ids path); an
+                # out-of-scope id is skipped + audited, never exposed (ADR 0131 §3, mirrors get_message).
+                if not identity.can_access_channel(row["channel_id"]):
+                    await _audit_channel_denied(
+                        engine, identity, row["channel_id"], client_ip(request)
+                    )
+                    continue
+                yield _export_ndjson_line(row)
+
+        return StreamingResponse(
+            _iter_ndjson(),
+            media_type="application/x-ndjson",
+            headers={"Content-Disposition": 'attachment; filename="messages-export.ndjson"'},
+        )
+
     @app.get("/messages/{message_id}", response_model=MessageDetail)
     async def get_message(
         message_id: str,
@@ -2034,7 +3119,7 @@ def create_app(
         # message exists in another tenant's channel (per-channel RBAC).
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         # Opening a body is PHI access — record it (with the viewer) before returning. record_view
         # gives the per-message timeline; record_audit puts it in the tamper-evident, GET /audit-visible
@@ -2045,6 +3130,7 @@ def create_app(
             actor=identity.username,
             channel_id=row["channel_id"],
             detail=json.dumps({"message_id": message_id}),
+            client=client_ip(request),
         )
         outbox_rows = await engine.store.outbox_for(message_id)
         event_rows = await engine.store.events_for(message_id)
@@ -2106,6 +3192,7 @@ def create_app(
     async def download_attachment(
         message_id: str,
         attachment_id: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
     ) -> Response:
@@ -2130,7 +3217,7 @@ def create_app(
         # channel (per-channel RBAC), mirroring get_message.
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         # SECURITY CRUX: only serve an attachment that is LINKED to this message. Content-addressing
         # shares one physical blob across messages/tenants, so the linkage + the channel guard above are
@@ -2160,18 +3247,35 @@ def create_app(
             actor=identity.username,
             channel_id=row["channel_id"],
             detail=json.dumps({"message_id": message_id, "attachment_id": attachment_id}),
+            client=client_ip(request),
         )
+        # Neutralize at serve (ASVS 1.3.4): a browser-active OBX-5.2 label (svg/html/xml/script) is
+        # downgraded to the inert binary type, which also keeps the .svg/.html extension out of the
+        # download name, and the response carries a sandbox CSP so no served representation can execute
+        # in the application origin. The stored bytes are NEVER rewritten (ADR 0105 Approach B keeps the
+        # OBX-5.5 value verbatim). AttachmentSecurityHeadersMiddleware re-asserts the CSP from outside
+        # the /ui CSP writers so the console delegate serves it too.
         content_type = _safe_attachment_content_type(match["content_type"])
+        # Belt-and-braces MIME-vs-magic downgrade (ASVS 1.3.4/5.2.2): even a token-clean, stored MIME is
+        # sender-influenced (OBX-5.2), so if it names a sniffable family whose magic the actual bytes
+        # contradict, serve the generic octet-stream. Detach already downgrades on contradiction; this
+        # re-checks against the reconstructed bytes at serve time.
+        if not attachment_mime_agrees(content_type, body[:32]):
+            content_type = _DEFAULT_ATTACHMENT_MIME
         filename = _attachment_filename(attachment_id, content_type)
         return Response(
             content=body,
             media_type=content_type,
-            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Content-Security-Policy": _ATTACHMENT_CSP,
+            },
         )
 
     @app.get("/messages/{message_id}/responses", response_model=MessageResponses)
     async def get_message_responses(
         message_id: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_READ)),
     ) -> MessageResponses:
@@ -2183,7 +3287,7 @@ def create_app(
         # channel (per-channel RBAC), mirroring get_message.
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         captured = await engine.store.correlate_response(message_id)
         include_body = identity.has(Permission.MESSAGES_VIEW_RAW)
@@ -2196,6 +3300,7 @@ def create_app(
             detail=json.dumps(
                 {"message_id": message_id, "count": len(captured), "body": include_body}
             ),
+            client=client_ip(request),
         )
         if include_body and captured:
             await engine.store.record_view(message_id, actor=identity.username)
@@ -2223,6 +3328,7 @@ def create_app(
     @app.get("/messages/{message_id}/outbound", response_model=OutboundPayloads)
     async def get_message_outbound(
         message_id: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW)),
     ) -> OutboundPayloads:
@@ -2237,7 +3343,7 @@ def create_app(
         # channel (per-channel RBAC), mirroring get_message.
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         payload_rows = await engine.store.outbox_payloads_for(message_id)
         # Returning transformed bodies is PHI access — audit the read, and (when bodies are actually
@@ -2247,6 +3353,7 @@ def create_app(
             actor=identity.username,
             channel_id=row["channel_id"],
             detail=json.dumps({"message_id": message_id, "count": len(payload_rows)}),
+            client=client_ip(request),
         )
         if payload_rows:
             await engine.store.record_view(message_id, actor=identity.username)
@@ -2265,13 +3372,14 @@ def create_app(
     @app.post("/messages/{message_id}/replay", response_model=ReplayResult)
     async def replay_message(
         message_id: str,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_REPLAY)),
     ) -> ReplayResult:
         row = await engine.store.get_message(message_id)
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         requeued = await engine.replay(message_id)
         if requeued == 0:
@@ -2289,6 +3397,7 @@ def create_app(
             actor=identity.username,
             channel_id=row["channel_id"],
             detail=json.dumps({"message_id": message_id, "requeued": requeued}),
+            client=client_ip(request),
         )
         return ReplayResult(message_id=message_id, requeued=requeued)
 
@@ -2296,6 +3405,7 @@ def create_app(
     async def resend_message(
         message_id: str,
         body: ResendRequest,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_RESEND)),
     ) -> ResendResult:
@@ -2310,19 +3420,26 @@ def create_app(
         # channel (mirrors replay/get_message).
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
         # Cross-channel authorization: the caller must ALSO be scoped to the alternate outbound (its name
         # is treated as a channel for per-channel RBAC), so a channel-scoped operator cannot push PHI to
         # an outbound they can't reach. 403 (not 404) — the message IS visible; the target is denied.
         if not identity.can_access_channel(body.to):
-            await _audit_channel_denied(engine, identity, body.to)
+            await _audit_channel_denied(engine, identity, body.to, client_ip(request))
             raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
         # Target validation (must-fix #7): registered + owned-by-this-shard + running, else the row would
         # sit permanently pending (a silent drop).
         rr = engine.registry_runner
         if rr is None or body.to not in rr.registry.outbound:
             raise HTTPException(404, f"no such outbound connection: {body.to}")
+        # THE BACK DOOR (#233, ADR 0111): resend inserts an outbound-stage row DIRECTLY (store.resend_to),
+        # never passing through transform_one, so the transform-time decline that keeps a not-deployed
+        # lane empty does NOT cover this path. Refuse here — otherwise an operator could hand-queue a row
+        # into a lane with no connector, where it can only sit forever. 409 with the deploy-is-a-config-
+        # change prose (not the generic "not running", which invites a start that also 409s).
+        if not rr.registry.outbound[body.to].deployed:
+            raise HTTPException(409, str(NotDeployedError(body.to)))
         owner = rr.destination_owner(body.to)
         if owner is not None and owner != rr.registry.shard_id:
             raise HTTPException(
@@ -2358,6 +3475,7 @@ def create_app(
                         "outbox_id": outcome.outbox_id,
                     }
                 ),
+                client=client_ip(request),
             )
         return ResendResult(
             message_id=message_id,
@@ -2371,6 +3489,7 @@ def create_app(
     async def edit_resend_message(
         message_id: str,
         body: EditResendRequest,
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_step_up(Permission.MESSAGES_EDIT)),
     ) -> EditResendResult:
@@ -2387,18 +3506,24 @@ def create_app(
         # 404 (not 403) outside the caller's channel scope (mirrors resend/replay/get_message).
         if row is None or not identity.can_access_channel(row["channel_id"]):
             if row is not None:
-                await _audit_channel_denied(engine, identity, row["channel_id"])
+                await _audit_channel_denied(engine, identity, row["channel_id"], client_ip(request))
             raise HTTPException(404, f"no such message: {message_id}")
 
         if body.to is not None:
             # DIRECT power-path: deliver the edited body straight to an alternate outbound. Same cross-
             # channel authorization + target validation as #123's resend (registered/owned/running).
             if not identity.can_access_channel(body.to):
-                await _audit_channel_denied(engine, identity, body.to)
+                await _audit_channel_denied(engine, identity, body.to, client_ip(request))
                 raise HTTPException(403, f"not authorized to resend to outbound {body.to!r}")
             rr = engine.registry_runner
             if rr is None or body.to not in rr.registry.outbound:
                 raise HTTPException(404, f"no such outbound connection: {body.to}")
+            # THE BACK DOOR (#233, ADR 0111): the direct path reuses #123's resend seam, which inserts an
+            # outbound-stage row DIRECTLY (store.resend_to) without transform_one — so, exactly like
+            # /resend above, the transform-time not-deployed decline does not cover it. Refuse a
+            # not-deployed target so an operator can't hand-queue a row into a lane with no connector.
+            if not rr.registry.outbound[body.to].deployed:
+                raise HTTPException(409, str(NotDeployedError(body.to)))
             owner = rr.destination_owner(body.to)
             if owner is not None and owner != rr.registry.shard_id:
                 raise HTTPException(
@@ -2434,6 +3559,7 @@ def create_app(
                             "outbox_id": direct.outbox_id,
                         }
                     ),
+                    client=client_ip(request),
                 )
             return EditResendResult(
                 message_id=message_id,
@@ -2469,12 +3595,490 @@ def create_app(
                         "channel_id": outcome.channel_id,
                     }
                 ),
+                client=client_ip(request),
             )
         return EditResendResult(
             message_id=message_id,
             status=outcome.status,
             reroute=True,
             new_message_id=outcome.new_message_id,
+        )
+
+    # --- offline uploaded logs (BACKLOG #125/#126, ADR 0134) -----------------
+
+    def _require_upload_store(request: Request) -> UploadStore:
+        """The configured :class:`UploadStore`, or 503 when ``[store].uploads_dir`` is unset (the whole
+        uploaded-logs feature is opt-in, so no PHI-at-rest surface exists unless configured)."""
+        us: UploadStore | None = getattr(request.app.state, "upload_store", None)
+        if us is None:
+            raise HTTPException(503, "uploaded logs are not configured (set [store].uploads_dir)")
+        return us
+
+    def _upload_info(meta: UploadedFileMeta) -> UploadedFileInfo:
+        return UploadedFileInfo(
+            file_id=meta.file_id,
+            filename=meta.filename,
+            uploader=meta.uploader,
+            content_type=meta.content_type,
+            size=meta.size,
+            sha256=meta.sha256,
+            uploaded_at=meta.uploaded_at,
+            message_count=meta.message_count,
+        )
+
+    @app.post("/uploads", response_model=UploadedFileInfo)
+    async def upload_file(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_UPLOAD)),
+    ) -> UploadedFileInfo:
+        """Import an external message file for offline browsing (BACKLOG #125). The multipart body is
+        hand-parsed with stdlib (NO python-multipart, ADR 0134). Writes real HL7 PHI at rest (encrypted
+        under the store DEK when a key is set); step-up-gated + audited (metadata only).
+
+        **Text-only (ASVS 14.2.8).** This feature accepts only plain-text diagnostic logs (``.hl7`` /
+        ``.txt`` / ``.xml``). A metadata-bearing binary container (JPEG/PNG/PDF/ZIP incl. DOCX) or any
+        non-text body is refused with **HTTP 415** before anything is written — so no embedded metadata
+        (EXIF/XMP/docProps) can ever be stored.
+
+        **Consent (ASVS 14.2.8).** The original filename you supply and your username are stored and shown
+        to authorized operators, and recorded in the audit log; submitting an upload is your consent."""
+        us = _require_upload_store(request)
+        body = await request.body()
+        try:
+            part = parse_single_file_upload(
+                request.headers.get("content-type"), body, max_file_bytes=us.max_bytes
+            )
+        except MultipartTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from None
+        except MultipartError as exc:
+            raise HTTPException(400, str(exc)) from None
+        # ASVS 14.2.8: enforce the feature's text-only format contract at the route, BEFORE save. A binary
+        # container (JPEG/PNG/PDF/ZIP incl. DOCX) or a non-text body (NUL / control-dense) is refused with
+        # 415 + a metadata-only upload.reject audit — nothing is written, so no embedded-metadata container
+        # can reach the store (closes "no metadata stripping" without a stripping engine). Covers both
+        # POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
+        nontext = nontext_upload_reason(part.data)
+        if nontext is not None:
+            await engine.store.record_audit(
+                "upload.reject",
+                actor=identity.username,
+                detail=json.dumps(
+                    {"filename": sanitize_filename(part.filename), "reason": nontext}
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(415, nontext) from None
+        try:
+            meta = await us.save(data=part.data, filename=part.filename, uploader=identity.username)
+        except UploadTooLargeError as exc:
+            raise HTTPException(413, str(exc)) from None
+        except UploadContentError as exc:
+            # ASVS 5.2.2: disallowed extension or content/extension mismatch. Refuse with 400 and a
+            # metadata-only audit (the sanitized filename + the reason string — NEVER any content). Covers
+            # both POST /uploads and POST /ui/uploaded-logs/upload (this handler backs both).
+            await engine.store.record_audit(
+                "upload.reject",
+                actor=identity.username,
+                detail=json.dumps(
+                    {"filename": sanitize_filename(part.filename), "reason": str(exc)}
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(400, str(exc)) from None
+        except UploadQuotaError as exc:
+            # ASVS 5.2.4: the uploader's file-count or aggregate-byte quota would be exceeded. Refuse with
+            # 409 (Conflict — the state, not the request, is at fault) and a metadata-only audit; nothing
+            # was written. Covers both upload surfaces.
+            await engine.store.record_audit(
+                "upload.reject_quota",
+                actor=identity.username,
+                detail=json.dumps(
+                    {"filename": sanitize_filename(part.filename), "reason": str(exc)}
+                ),
+                client=client_ip(request),
+            )
+            raise HTTPException(409, str(exc)) from None
+        await engine.store.record_audit(
+            "upload.create",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "file_id": meta.file_id,
+                    "filename": meta.filename,
+                    "size": meta.size,
+                    "message_count": meta.message_count,
+                }
+            ),
+            client=client_ip(request),
+        )
+        # ASVS 5.2.4: opportunistic age-based retention sweep at save time (off-loop, best-effort). A prune
+        # error must never fail the upload the operator just made — it is logged and retried by the
+        # periodic task. Each pruned file is audited (file_id + uploader, never content).
+        try:
+            for pruned in await us.prune_expired():
+                await engine.store.record_audit(
+                    "upload.prune",
+                    actor=pruned.uploader or None,
+                    detail=json.dumps({"file_id": pruned.file_id, "uploader": pruned.uploader}),
+                    client=client_ip(request),
+                )
+        except OSError:
+            _log.warning("opportunistic uploaded-logs retention prune failed", exc_info=True)
+        return _upload_info(meta)
+
+    @app.get("/uploads", response_model=UploadedFileList)
+    async def list_uploaded_files(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.FILES_BROWSE)),
+    ) -> UploadedFileList:
+        """List uploaded files (metadata only — no bodies). Audited."""
+        us = _require_upload_store(request)
+        files = await us.list_files()
+        await engine.store.record_audit(
+            "upload.list",
+            actor=identity.username,
+            detail=json.dumps({"count": len(files)}),
+            client=client_ip(request),
+        )
+        return UploadedFileList(total=len(files), files=[_upload_info(m) for m in files])
+
+    @app.get("/uploads/{file_id}/messages", response_model=UploadedMessagesResult)
+    async def browse_uploaded_file(
+        request: Request,
+        file_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+        content: str | None = Query(None, max_length=512),
+        field_path: str | None = Query(None, max_length=32),
+        field_value: str | None = Query(None, max_length=512),
+        target: str = Query("both", pattern="^(raw|summary|both)$"),
+        message_type: str | None = Query(None, max_length=64),
+        control_id: str | None = Query(None, max_length=256),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> UploadedMessagesResult:
+        """Browse an uploaded file's split messages as a filterable log (BACKLOG #125). Decrypts + splits
+        real PHI, so it is step-up-gated + PHI-read-hop-guarded (like content search) and audited with the
+        needle SHAPE only (never its value). Returns metadata only — never a decrypted body."""
+        enforce_phi_read_hop(request)
+        enforce_phi_read_pacing(request, identity)  # bulk decrypt+split on a step-up GET
+        us = _require_upload_store(request)
+        spec: SearchSpec | None = None
+        if content or field_path:
+            try:
+                spec = make_spec(
+                    content=content,
+                    field_path=field_path,
+                    field_value=field_value,
+                    target=SearchTarget(target),
+                )
+            except ContentSearchError as exc:
+                raise HTTPException(400, str(exc)) from exc
+        try:
+            meta = await us.get_meta(file_id)
+            data = await us.read_bytes(file_id)
+        except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        result = await asyncio.to_thread(
+            browse_messages,
+            data,
+            spec=spec,
+            message_type=message_type,
+            control_id=control_id,
+            limit=limit,
+            offset=offset,
+        )
+        needle = None
+        if spec is not None:
+            needle = (
+                {"kind": "substring", "shape": _needle_shape(spec.substring)}
+                if spec.substring is not None
+                else {"kind": "field_path", "field_path": spec.field_path}
+            )
+        await engine.store.record_audit(
+            "upload.browse",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "file_id": file_id,
+                    "needle": needle,
+                    "message_type": message_type,
+                    "control_id": control_id,
+                    "matched": result.matched,
+                    "scanned": result.scanned,
+                }
+            ),
+            client=client_ip(request),
+        )
+        return UploadedMessagesResult(
+            file_id=file_id,
+            filename=meta.filename,
+            messages=[
+                UploadedMessageSummary(
+                    index=m.index,
+                    message_type=m.message_type,
+                    control_id=m.control_id,
+                    size=m.size,
+                )
+                for m in result.messages
+            ],
+            total_messages=result.total_messages,
+            scanned=result.scanned,
+            matched=result.matched,
+            truncated=result.truncated,
+        )
+
+    @app.post("/uploads/{file_id}/resend", response_model=UploadResendResult)
+    async def resend_uploaded_message(
+        request: Request,
+        file_id: str,
+        body: UploadResendRequest,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_BROWSE)),
+    ) -> UploadResendResult:
+        """Inject one message from an uploaded file INTO a chosen inbound connection (BACKLOG #125). Uses
+        the DISTINCT inject path ``engine.inject_message`` (``enqueue_ingress``) — a fresh ``RECEIVED`` on
+        the target inbound's channel — NOT ``reingress`` (which presupposes an origin row an uploaded file
+        never had). The target inbound must be registered + running, and the caller channel-scoped to it.
+        Step-up-gated + audited."""
+        us = _require_upload_store(request)
+        # Cross-channel authorization: the inbound name is treated as a channel for per-channel RBAC, so a
+        # scoped operator cannot inject PHI into an inbound they can't reach. 403 (target denied).
+        if not identity.can_access_channel(body.to):
+            await _audit_channel_denied(engine, identity, body.to, client_ip(request))
+            raise HTTPException(403, f"not authorized to inject into inbound {body.to!r}")
+        rr = engine.registry_runner
+        if rr is None or body.to not in rr.registry.inbound:
+            raise HTTPException(404, f"no such inbound connection: {body.to}")
+        try:
+            if not rr.inbound_running(body.to):
+                raise HTTPException(
+                    409, f"inbound {body.to!r} is not running — start it before resending"
+                )
+        except KeyError:
+            raise HTTPException(404, f"no such inbound connection: {body.to}") from None
+        try:
+            data = await us.read_bytes(file_id)
+        except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        parts = await asyncio.to_thread(split_uploaded, data)
+        if body.index >= len(parts):
+            raise HTTPException(
+                404, f"no message at index {body.index} (file has {len(parts)} messages)"
+            )
+        mid = await engine.inject_message(
+            channel_id=body.to,
+            raw=parts[body.index],
+            source_type="upload",
+            metadata=json.dumps({"upload_file_id": file_id, "upload_index": body.index}),
+        )
+        await engine.store.record_audit(
+            "upload.resend",
+            actor=identity.username,
+            channel_id=body.to,
+            detail=json.dumps(
+                {"file_id": file_id, "index": body.index, "to": body.to, "message_id": mid}
+            ),
+            client=client_ip(request),
+        )
+        return UploadResendResult(
+            file_id=file_id, index=body.index, to=body.to, message_id=mid, status="injected"
+        )
+
+    @app.delete("/uploads/{file_id}", response_model=UploadDeleteResult)
+    async def delete_uploaded_file(
+        request: Request,
+        file_id: str,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.FILES_DELETE)),
+    ) -> UploadDeleteResult:
+        """Delete an uploaded file from the server (BACKLOG #126) — destructive + irreversible. Guarded
+        by the path-traversal-safe ``file_id`` (a bad id 404s without a filesystem touch), step-up, and an
+        ``upload.delete`` audit row."""
+        us = _require_upload_store(request)
+        try:
+            meta = await us.delete(file_id)
+        except (UploadPathError, UploadNotFoundError):
+            raise HTTPException(404, "no such uploaded file") from None
+        await engine.store.record_audit(
+            "upload.delete",
+            actor=identity.username,
+            detail=json.dumps(
+                {"file_id": meta.file_id, "filename": meta.filename, "size": meta.size}
+            ),
+            client=client_ip(request),
+        )
+        return UploadDeleteResult(file_id=meta.file_id, filename=meta.filename, deleted=True)
+
+    # --- saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136) --
+
+    @app.get("/search/presets", response_model=SearchPresetList)
+    async def list_search_presets(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MESSAGES_READ)),
+    ) -> SearchPresetList:
+        """List the caller's saved presets — names + timestamps only (NEVER the criteria; the
+        PHI-shaped content term is returned only by the step-up-gated layered compose). Audited."""
+        rows = await engine.store.list_search_presets(identity.username)
+        await engine.store.record_audit(
+            "preset.list",
+            actor=identity.username,
+            detail=json.dumps({"count": len(rows)}),
+            client=client_ip(request),
+        )
+        return SearchPresetList(
+            total=len(rows),
+            presets=[
+                SearchPresetInfo(
+                    id=r["id"],
+                    name=r["name"],
+                    created_at=r["created_at"],
+                    updated_at=r["updated_at"],
+                )
+                for r in rows
+            ],
+        )
+
+    @app.post("/search/presets", response_model=SearchPresetCreateResult)
+    async def create_search_preset(
+        body: SearchPresetCreateRequest,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
+    ) -> SearchPresetCreateResult:
+        """Create-or-replace a named preset for the caller. Persists a possibly-PHI-shaped criteria
+        (encrypted at rest), so it is step-up-gated + audited (needle shape only). A malformed content
+        needle is rejected up front (make_spec) so a bad preset can't be saved."""
+        crit = body.criteria
+        needle_shape: str | None = None
+        if crit.content or crit.field_path:
+            try:
+                make_spec(
+                    content=crit.content,
+                    field_path=crit.field_path,
+                    field_value=crit.field_value,
+                    target=SearchTarget(crit.target),
+                )
+            except ContentSearchError as exc:
+                raise HTTPException(400, str(exc)) from exc
+            needle_shape = _needle_shape(crit.content) if crit.content else "field_path"
+        effective_id, replaced = await engine.store.upsert_search_preset(
+            preset_id=uuid4().hex,
+            owner=identity.username,
+            name=body.name,
+            criteria=crit.model_dump_json(),
+        )
+        await engine.store.record_audit(
+            "preset.create",
+            actor=identity.username,
+            detail=json.dumps(
+                {
+                    "id": effective_id,
+                    "name": body.name,
+                    "replaced": replaced,
+                    "needle_shape": needle_shape,  # coarse class only — never the value
+                }
+            ),
+            client=client_ip(request),
+        )
+        return SearchPresetCreateResult(
+            id=effective_id, name=body.name, status="replaced" if replaced else "created"
+        )
+
+    @app.delete("/search/presets/{preset_id}", response_model=SearchPresetDeleteResult)
+    async def delete_search_preset(
+        preset_id: str,
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MESSAGES_READ)),
+    ) -> SearchPresetDeleteResult:
+        """Delete one of the caller's presets (owner-scoped). Audited."""
+        deleted = await engine.store.delete_search_preset(
+            preset_id=preset_id, owner=identity.username
+        )
+        if not deleted:
+            raise HTTPException(404, f"no such preset: {preset_id}")
+        await engine.store.record_audit(
+            "preset.delete",
+            actor=identity.username,
+            detail=json.dumps({"id": preset_id}),
+            client=client_ip(request),
+        )
+        return SearchPresetDeleteResult(id=preset_id, deleted=True)
+
+    @app.get("/search/layered", response_model=MessageSearchResults)
+    async def layered_search(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_step_up(Permission.MESSAGES_READ)),
+        presets: str = Query(..., max_length=1024),
+        limit: int = Query(50, ge=1, le=500),
+        scan_limit: int = Query(DEFAULT_CONTENT_SCAN_LIMIT, ge=1, le=MAX_CONTENT_SCAN_LIMIT),
+    ) -> MessageSearchResults:
+        """Recall + **layer** several of the caller's presets into one combined content search (ADR
+        0136 §5). ``presets`` is a comma-separated list of the caller's preset ids (≤ 8). Their typed
+        params AND-compose (metadata conflict → 400; exactly one content predicate) over the ADR 0046
+        ``search_messages`` seam. Step-up-gated + PHI-hop-guarded + audited (needle shape only). The
+        content term is loaded server-side from the encrypted preset column — it never round-trips."""
+        enforce_phi_read_hop(request)
+        enforce_phi_read_pacing(request, identity)  # step-up paces NON-GET only; this is a GET
+        ids = [p.strip() for p in presets.split(",") if p.strip()]
+        if not ids:
+            raise HTTPException(400, "provide at least one preset id")
+        if len(ids) > _MAX_PRESET_LAYERS:
+            raise HTTPException(400, f"at most {_MAX_PRESET_LAYERS} presets may be layered")
+        criterias: list[dict[str, Any]] = []
+        for preset_id in ids:
+            row = await engine.store.get_search_preset(preset_id=preset_id, owner=identity.username)
+            if row is None:
+                raise HTTPException(404, f"no such preset: {preset_id}")
+            try:
+                criterias.append(json.loads(row["criteria"] or "{}"))
+            except (ValueError, TypeError) as exc:
+                raise HTTPException(400, f"preset {preset_id} has malformed criteria") from exc
+        spec, meta = _compose_preset_layers(criterias)
+        # Re-clamp the scan against the request bound (the composed spec used make_spec's default).
+        spec = make_spec(
+            content=spec.substring,
+            field_path=spec.field_path,
+            field_value=spec.field_value,
+            target=spec.target,
+            scan_limit=scan_limit,
+        )
+        allowed = _scope(identity)
+        result = await engine.store.search_messages(
+            spec,
+            channel_id=meta["channel_id"],
+            status=meta["status"],
+            message_type=meta["message_type"],
+            control_id=meta["control_id"],
+            limit=limit,
+            allowed_channels=allowed,
+        )
+        messages = [_summary(r) for r in result.rows]
+        messages = [redact_unauthorized(m, identity) for m in messages]
+        await engine.store.record_audit(
+            "preset.layered_search",
+            actor=identity.username,
+            channel_id=meta["channel_id"],
+            detail=json.dumps(
+                {
+                    "presets": len(ids),
+                    **_search_audit_detail(spec, result, filters=dict(meta)),
+                }
+            ),
+            client=client_ip(request),
+        )
+        return MessageSearchResults(
+            messages=messages,
+            scanned=result.scanned,
+            matched=result.matched,
+            truncated=result.truncated,
+            limit=limit,
+            scan_limit=spec.scan_limit,
         )
 
     # --- stats ---------------------------------------------------------------
@@ -2515,6 +4119,158 @@ def create_app(
         connection name + status — no PHI."""
         return Response(content=await render_metrics(engine), media_type=METRICS_CONTENT_TYPE)
 
+    @app.get("/metrics/history", response_model=MetricsHistoryResponse)
+    async def metrics_history(
+        request: Request,
+        _user: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> MetricsHistoryResponse:
+        """The in-memory metrics-history ring for the console trend charts (BACKLOG #76, ADR 0065
+        amendment). Oldest-first samples of the outbound-row-by-status counts, fed by the ~1s /ws/stats
+        sampler — **aggregate counts only, no PHI**, and no durable table (``store_schema`` stays false).
+        Gated by ``monitoring:read`` like ``/stats``/``/metrics``."""
+        history: MetricsHistory | None = getattr(request.app.state, "metrics_history", None)
+        if history is None:
+            return MetricsHistoryResponse(samples=[], capacity=0)
+        return MetricsHistoryResponse(
+            samples=[
+                MetricsHistorySample(ts=s.ts, outbox_by_status=dict(s.outbox_by_status))
+                for s in history.samples()
+            ],
+            capacity=history.capacity,
+        )
+
+    @app.get("/graph/edges", response_model=GraphResponse)
+    async def graph_edges(
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_READ)),
+    ) -> GraphResponse:
+        """The by-name data-flow graph (BACKLOG #76, ADR 0065 amendment): the **static Registry edge
+        set** (:func:`messagefoundry.config.graph.build_wiring_graph` — the same inbound → router →
+        handler → outbound extractor the ``graph --json`` CLI uses) joined with each connection node's
+        **live status** from the ``RegistryRunner``. Read-only + ``monitoring:read``; it constructs **no**
+        ``channel``/``route`` bundling object (CLAUDE.md §1), imports no ``pipeline/`` for the derivation,
+        and carries **no** message body. A **channel-scoped** caller sees ONLY the inbound → router →
+        handler subgraph reachable from their accessible inbound connections: every **shared-outbound**
+        node, its live status, and every edge to/from it are **dropped entirely** — matching the
+        connections dashboard, which shows a scoped user no destination (outbound) rows (an outbound
+        spans channels, so its state can reflect another channel's downstream). An unscoped caller sees
+        the whole estate."""
+        # Local import: config.graph is a pure, stdlib-only tooling module (imports config only, never
+        # api/ or pipeline/), so this stays a one-way api → config read with no pipeline dependency.
+        from messagefoundry.config.graph import build_wiring_graph
+
+        rr = engine.registry_runner
+        if rr is None:
+            return GraphResponse()
+        reg = rr.registry
+        # Off the event loop (#76 review): build_wiring_graph does blocking file open()+read()+ast.parse
+        # over every router/handler defining module (a fresh cache per call), which must not stall the
+        # loop on the 5s /ui/monitoring/live poll path. It only reads the Registry + the on-disk source
+        # (no engine state), so it is thread-safe; the live per-node status is read via rr.* on the loop
+        # AFTER the build (mirrors this file's asyncio.to_thread convention).
+        graph = await asyncio.to_thread(build_wiring_graph, reg)
+
+        def _inbound_status(name: str) -> str:
+            ic = reg.inbound[name]
+            if not ic.deployed:
+                return "not_deployed"
+            if rr.connection_failed(name):
+                return "failed"
+            if rr.connection_filtered(name):
+                return "filtered"
+            return "running" if rr.inbound_running(name) else "stopped"
+
+        def _outbound_status(name: str) -> str:
+            oc = reg.outbound[name]
+            if not oc.deployed:
+                return "not_deployed"
+            if rr.connection_failed(name):
+                return "failed"
+            if rr.connection_filtered(name):
+                return "filtered"
+            return rr.outbound_status(name)
+
+        # Node set: every inbound/outbound connection + every router/handler, keyed by (kind, name).
+        nodes: dict[tuple[str, str], GraphNode] = {}
+        for name in reg.inbound:
+            nodes[("inbound", name)] = GraphNode(
+                name=name, kind="inbound", status=_inbound_status(name)
+            )
+        for name in reg.outbound:
+            nodes[("outbound", name)] = GraphNode(
+                name=name, kind="outbound", status=_outbound_status(name)
+            )
+        for name in reg.routers:
+            nodes[("router", name)] = GraphNode(name=name, kind="router", status=None)
+        for name in reg.handlers:
+            nodes[("handler", name)] = GraphNode(name=name, kind="handler", status=None)
+
+        edges = list(graph.edges)
+
+        # Per-channel RBAC (#76 review — SECURITY): a channel-scoped caller must NOT see shared-outbound
+        # topology or its live status — an outbound spans channels, so its running/failed/filtered state
+        # can reflect ANOTHER channel's downstream. This mirrors the connections dashboard EXACTLY, which
+        # shows a scoped user NO destination (outbound) rows at all (see list_connections: `if scoped:
+        # continue`). So a scoped user sees only the inbound → router → handler subgraph reachable from
+        # their accessible inbound connections: the BFS never traverses INTO an outbound node (dropping
+        # every shared-outbound node AND its handler→outbound edges), nor into a pass-through inbound the
+        # caller can't access. An unscoped caller (allowed_channels is None) sees the whole estate.
+        if identity.allowed_channels is not None:
+            accessible_inbounds = {
+                name for name in reg.inbound if identity.can_access_channel(name)
+            }
+
+            def _traversable(node: tuple[str, str]) -> bool:
+                # Never cross into a shared outbound (the topology boundary); a router/handler is shared
+                # code with no live status; a pass-through inbound target is only visible if accessible.
+                kind, name = node
+                if kind == "outbound":
+                    return False
+                if kind == "inbound":
+                    return name in accessible_inbounds
+                return True
+
+            adjacency: dict[tuple[str, str], list[tuple[str, str]]] = {}
+            for e in edges:
+                adjacency.setdefault((e.source_kind, e.source), []).append(
+                    (e.target_kind, e.target)
+                )
+            reachable: set[tuple[str, str]] = {("inbound", name) for name in accessible_inbounds}
+            frontier = list(reachable)
+            while frontier:
+                node = frontier.pop()
+                for nxt in adjacency.get(node, ()):
+                    if nxt not in reachable and _traversable(nxt):
+                        reachable.add(nxt)
+                        frontier.append(nxt)
+            # Outbound nodes are never in `reachable`, so both the outbound nodes AND every edge with an
+            # outbound (or out-of-scope inbound) endpoint are dropped — no dangling edge to a hidden node.
+            nodes = {key: node for key, node in nodes.items() if key in reachable}
+            edges = [
+                e
+                for e in edges
+                if (e.source_kind, e.source) in reachable and (e.target_kind, e.target) in reachable
+            ]
+
+        return GraphResponse(
+            nodes=list(nodes.values()),
+            edges=[
+                GraphEdge(
+                    source=e.source,
+                    source_kind=e.source_kind,
+                    target=e.target,
+                    target_kind=e.target_kind,
+                    provenance=e.provenance,
+                )
+                for e in edges
+            ],
+            dynamic=sorted(
+                f"{kind}:{name}"
+                for kind, name in graph.dynamic
+                if identity.allowed_channels is None or (kind, name) in nodes
+            ),
+        )
+
     # --- alerts config (read-only) -------------------------------------------
 
     @app.get("/alerts/rules", response_model=AlertsConfig)
@@ -2538,6 +4294,10 @@ def create_app(
             email_recipient_count=len(alerts.email_to),
             smtp_allowed_hosts=list(alerts.smtp_allowed_hosts),
             realert_seconds=alerts.realert_seconds,
+            # #138: report each alert-email template present-or-not (never the text in this allowlist view).
+            email_subject_template_configured=bool(alerts.email_subject_template),
+            email_body_template_configured=bool(alerts.email_body_template),
+            email_html_template_configured=bool(alerts.email_html_template),
             rules=[
                 AlertRuleInfo(
                     event_type=r.event_type,
@@ -2547,6 +4307,16 @@ def create_app(
                     severity=r.severity.value,
                     transports=r.transports,
                     cooldown_seconds=r.cooldown_seconds,
+                    # #146: report the COUNT of per-rule recipients, never the addresses (secret-guard parity).
+                    recipient_count=len(r.recipients) if r.recipients else 0,
+                    id=r.id,  # #138 — the operator rule label ({rule_id})
+                    control_action=r.control_action,  # #144 — auto-remediation action
+                    control_target=r.control_target,
+                    mute=r.mute,  # #143 — static per-rule notification mute
+                    escalate_tiers=len(r.escalate),  # #81 — occurrence-driven escalation tier count
+                    schedule_configured=r.schedule
+                    is not None,  # #81 — schedule-gated (present-or-not)
+                    content_label=r.content_label,  # #81 — content_match label this rule routes by
                 )
                 for r in alerts.rules
             ],
@@ -2599,18 +4369,30 @@ def create_app(
         total = running = 0
         # Engine-wide KPI roll-up (#93): combined inbound + outbound endpoint counts with a
         # running/stopped breakdown (vs channels_*, which count inbound only).
-        conn_total = conn_running = 0
+        conn_total = conn_running = conn_not_deployed = 0
         rr = engine.registry_runner
         if rr is not None:  # one "channel" per inbound connection
-            total = len(rr.registry.inbound)
-            running = sum(1 for name in rr.registry.inbound if rr.inbound_running(name))
+            # #233 (ADR 0111): a not-deployed connection is present in the registry but is NOT a lane
+            # (never wired, never running). It is counted in its OWN bucket and EXCLUDED from the
+            # running/stopped totals, so the split counts only lanes and the invariant
+            # connections_stopped == connections_total - connections_running keeps meaning "deployed but
+            # not up". A deliberately-not-deployed connection must never be tallied as a stopped one —
+            # that is the exact confusion this state removes. channels_* (inbound-only) filters the same
+            # way for the same reason.
+            in_deployed = [name for name, ic in rr.registry.inbound.items() if ic.deployed]
+            out_deployed = [name for name, oc in rr.registry.outbound.items() if oc.deployed]
+            total = len(in_deployed)
+            running = sum(1 for name in in_deployed if rr.inbound_running(name))
             # outbound_running (not outbound_status) so the running/stopped split gates on the engine
             # actually running AND the lane not operator-paused — consistent with inbound_running's
             # actually-started semantics (outbound_status reports "running" for any non-paused lane even
             # before start, which would over-count a built-but-not-started runner).
-            out_running = sum(1 for name in rr.registry.outbound if rr.outbound_running(name))
-            conn_total = total + len(rr.registry.outbound)
+            out_running = sum(1 for name in out_deployed if rr.outbound_running(name))
+            conn_total = total + len(out_deployed)
             conn_running = running + out_running
+            conn_not_deployed = (len(rr.registry.inbound) - len(in_deployed)) + (
+                len(rr.registry.outbound) - len(out_deployed)
+            )
         db = await engine.store.db_status()
         # Engine-wide msg/s: REUSE the recent_done rate window that already powers backlog_seconds — sum
         # every destination's completions in the last _RATE_WINDOW seconds, no second sampler. The view
@@ -2623,6 +4405,7 @@ def create_app(
             connections_total=conn_total,
             connections_running=conn_running,
             connections_stopped=conn_total - conn_running,
+            connections_not_deployed=conn_not_deployed,
             messages_per_second=msgs_per_second,
         )
         # B11 connection-scale observability: the server-only connection-pool snapshot (acquire-wait
@@ -2642,6 +4425,19 @@ def create_app(
                     p99_ms=pool_status.acquire_wait.p99_ms,
                     max_ms=pool_status.acquire_wait.max_ms,
                     mean_ms=pool_status.acquire_wait.mean_ms,
+                ),
+                # ADR 0114 sub-lever B: the out-of-pool dedicated claim holders (None unless
+                # fifo_claim_prepared is effectively active) — additive, keeps the B11
+                # connection-budget arithmetic honest about the store's real footprint.
+                claim_pool=(
+                    ClaimPoolInfo(
+                        open=pool_status.claim_pool.open,
+                        idle=pool_status.claim_pool.idle,
+                        opened_total=pool_status.claim_pool.opened_total,
+                        discarded_total=pool_status.claim_pool.discarded_total,
+                    )
+                    if pool_status.claim_pool is not None
+                    else None
                 ),
             )
             if pool_status is not None
@@ -2692,6 +4488,89 @@ def create_app(
             pool=pool,
         )
 
+    # --- runtime log verbosity + redacted log-tail viewer (BACKLOG #171, ADR 0130) ----
+
+    @app.get("/logging/level", response_model=LogLevelInfo)
+    async def get_logging_level(
+        request: Request,
+        _: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+    ) -> LogLevelInfo:
+        """The current effective root log level, the startup ``[logging].level`` baseline a restart returns
+        to, and the accepted level set — the read half of the runtime verbosity control (#171, ADR 0130).
+        **Not PHI** (level names only); gated by ``monitoring:diagnose`` (the diagnostic tier)."""
+        return LogLevelInfo(
+            level=current_log_level(),
+            configured=getattr(request.app.state, "configured_log_level", None),
+            levels=list(LOG_LEVELS),
+        )
+
+    @app.patch("/logging/level", response_model=LogLevelInfo)
+    async def set_logging_level(
+        request: Request,
+        body: LogLevelUpdate,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+    ) -> LogLevelInfo:
+        """Change the live root + uvicorn log level WITHOUT a restart (#171, ADR 0130). The override is
+        **ephemeral**: a process restart re-asserts ``[logging].level``, and a ``/config/reload`` does NOT
+        reset it (``configure_logging`` does not re-run there), so it survives a reload and resets only on
+        restart. Gated by ``monitoring:diagnose``; an invalid level is a 400. The change is recorded as a
+        ``logging_level_change`` audit row (old → new, actor) — level names only, no PHI."""
+        previous = current_log_level()
+        try:
+            applied = set_runtime_level(body.level)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        await engine.store.record_audit(
+            "logging_level_change",
+            actor=identity.username,
+            detail=json.dumps({"from": previous, "to": applied}),
+            client=client_ip(request),
+        )
+        return LogLevelInfo(
+            level=applied,
+            configured=getattr(request.app.state, "configured_log_level", None),
+            levels=list(LOG_LEVELS),
+        )
+
+    @app.get("/logs/tail", response_model=LogTailPage)
+    async def get_logs_tail(
+        request: Request,
+        engine: Engine = Depends(_get_engine),
+        identity: Identity = Depends(require_phi_read(Permission.LOGS_VIEW)),
+        limit: int = Query(200, ge=1, le=2000),
+        offset: int = Query(0, ge=0),
+    ) -> LogTailPage:
+        """A paginated, **redacted** page of the newest application-log file's tail (#171, ADR 0130) — the
+        in-console viewer over the same redacted tail the support bundle produces. ``offset`` counts lines
+        back from the END (``offset=0`` = the most recent ``limit`` lines).
+
+        This is a genuine **new PHI read surface**: the app log is best-effort-redacted (a residual
+        single-token identifier can survive), so it rides ``require_phi_read`` — folding the ADR 0092
+        ``enforce_phi_read_hop`` data-path guard (a prod-PHI instance on an unproven-secure serve hop
+        refuses to emit) + the per-actor anti-automation throttle — under the new ``logs:view`` permission,
+        exactly like a message-detail read. Each served page writes a ``logs_view`` audit row counting how
+        many lines were exposed (**metadata only, never the content**). Degrades gracefully to an empty,
+        ``available=false`` page when no ``[logging].log_dir`` is configured or the file is unreadable."""
+        log_dir = getattr(request.app.state, "log_dir", None)
+        # Blocking file read + redaction pass — off the event loop, like /status app-log metering.
+        lines, total, available = await asyncio.to_thread(
+            _read_log_tail, log_dir, limit=limit, offset=offset
+        )
+        # Audit the redacted-log read like a message view (#171): actor + how many lines were exposed, never
+        # the content. Only when something was actually served, so a poll of an empty/unconfigured tail
+        # doesn't flood the chain.
+        if lines:
+            await engine.store.record_audit(
+                "logs_view",
+                actor=identity.username,
+                detail=json.dumps({"lines": len(lines), "offset": offset, "total": total}),
+                client=client_ip(request),
+            )
+        return LogTailPage(
+            lines=lines, total_lines=total, offset=offset, limit=limit, available=available
+        )
+
     # --- attested service-to-service identity (ADR 0083, #200 activation) ----
     # The ONLY route authenticated by a verified mTLS client cert instead of a bearer token: it lets a
     # peer service confirm the principal its certificate maps to (a service-mesh "whoami"). It is
@@ -2701,6 +4580,7 @@ def create_app(
 
     @app.get("/service/identity")
     async def service_identity(
+        request: Request,
         engine: Engine = Depends(_get_engine),
         identity: Identity = Depends(require_service_cert(Permission.MONITORING_READ)),
     ) -> dict[str, object]:
@@ -2716,6 +4596,7 @@ def create_app(
             "service_cert_auth",
             actor=identity.username,
             detail=json.dumps({"auth": "mtls-client-cert", "route": "/service/identity"}),
+            client=client_ip(request),
         )
         return {
             "username": identity.username,
@@ -2819,7 +4700,7 @@ def create_app(
     @app.post("/dr/activate", response_model=DrActionResult)
     async def dr_activate(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.DR_OPERATE)),
+        identity: Identity = Depends(require_paced(Permission.DR_OPERATE)),
         body: DrActivateRequest | None = Body(default=None),
     ) -> DrActionResult:
         """**Manually promote** this DR standby (#61, ADR 0048). Gated by the dedicated ``dr:operate``
@@ -2864,7 +4745,7 @@ def create_app(
     @app.post("/dr/release", response_model=DrActionResult)
     async def dr_release(
         engine: Engine = Depends(_get_engine),
-        identity: Identity = Depends(require(Permission.DR_OPERATE)),
+        identity: Identity = Depends(require_paced(Permission.DR_OPERATE)),
     ) -> DrActionResult:
         """**Fail back** from this DR standby to the recovered primary (#61, ADR 0048) — drain-then-hand-
         back, gated by ``dr:operate`` and audited. Releases the VIP (the optional release hook / the
@@ -2889,9 +4770,13 @@ def create_app(
     @app.post("/status/integrity-check", response_model=IntegrityResult)
     async def integrity_check(
         engine: Engine = Depends(_get_engine),
-        _user: Identity = Depends(require(Permission.MONITORING_DIAGNOSE)),
+        _user: Identity = Depends(require_paced(Permission.MONITORING_DIAGNOSE)),
     ) -> IntegrityResult:
-        """Run a database integrity check on demand (PRAGMA quick_check)."""
+        """Run a database integrity check on demand (PRAGMA quick_check).
+
+        Paced by the #193 per-actor floor (ASVS 2.4.2): a full-scan integrity check is a costly write-
+        surface operation, so it draws from the shared admin-write pacing bucket like the other mutating
+        POSTs rather than being callable in an unthrottled loop."""
         ok, detail = await engine.store.integrity_check()
         return IntegrityResult(ok=ok, detail=detail)
 
@@ -2972,7 +4857,14 @@ def create_app(
                 # The counts frame is built unconditionally; connections_html is attached only when the
                 # web console's render hook (app.state.ui_connections_render) is installed (serve_ui on,
                 # Option B Phase 0). Absent (JSON-only) → a counts-only push, native clients unaffected.
-                frame: dict[str, Any] = {"outbox_by_status": await engine_obj.store.stats()}
+                outbox_by_status = await engine_obj.store.stats()
+                frame: dict[str, Any] = {"outbox_by_status": outbox_by_status}
+                # BACKLOG #76: feed the metrics-history ring from the counts we ALREADY fetched (zero
+                # extra store I/O); record() dedupes on its ~1s min-interval so several open sockets never
+                # double-append the same instant. Metadata only (aggregate counts, no message body).
+                history = getattr(state, "metrics_history", None)
+                if history is not None:
+                    history.record(time.time(), outbox_by_status)
                 if ui_connections_render is not None:
                     rows = await list_connections(engine=engine_obj, identity=current)
                     frame["connections_html"] = str(ui_connections_render(rows))
@@ -3017,8 +4909,12 @@ def create_app(
         # UiDeps/CoreHandlers shape for a new seam would otherwise trip at construction with a raw
         # kwargs TypeError; this raises a clear UiSeamMismatch first.
         assert_engine_seam(ENGINE_UI_SEAM)
+        # Either source may know: create_managed_app passes the config flag; a caller that
+        # constructs with auth= directly (tests, embedders) gets it from the live service.
+        ui_oidc_enabled = oidc_enabled or bool(getattr(auth, "oidc_enabled", False))
         deps = UiDeps(
             engine_seam=ENGINE_UI_SEAM,
+            oidc_enabled=ui_oidc_enabled,
             get_engine=_get_engine,
             get_gate=_get_gate,
             cookie_secure=_cookie_secure,
@@ -3046,6 +4942,8 @@ def create_app(
                 service_status=service_status,
                 ack_alert=ack_alert,
                 resolve_alert=resolve_alert,
+                suspend_alert=suspend_alert,
+                resume_alert=resume_alert,
                 reset_statistics=reset_statistics,
                 integrity_check=integrity_check,
                 dr_activate=dr_activate,
@@ -3056,10 +4954,44 @@ def create_app(
                 reload_config=reload_config,
                 search_messages=search_messages,
                 audit_channel_denied=_audit_channel_denied,
+                upload_file=upload_file,
+                list_uploaded_files=list_uploaded_files,
+                browse_uploaded_file=browse_uploaded_file,
+                resend_uploaded_message=resend_uploaded_message,
+                delete_uploaded_file=delete_uploaded_file,
+                list_search_presets=list_search_presets,
+                create_search_preset=create_search_preset,
+                delete_search_preset=delete_search_preset,
+                layered_search=layered_search,
+                metrics_history=metrics_history,
+                graph_edges=graph_edges,
+                set_connection_flag=set_connection_flag,
             ),
             admin=admin,
         )
         mount_ui(app, deps)
+
+    # ASVS 1.3.4 — registered AFTER mount_ui so Starlette puts it OUTSIDE the console's
+    # UiSecurityHeadersMiddleware as well as the engine's own /ui CSP overlay (add_middleware inserts at
+    # index 0, so a later registration is further out and its response-path send wrapper runs LAST).
+    # Both of those ASSIGN a /ui CSP on any non-static /ui path, which includes the console's attachment
+    # delegate — without this the route's sandbox CSP would be silently replaced there. Registered
+    # OUTSIDE the serve_ui guard so the JSON-only deployment is covered identically.
+    app.add_middleware(AttachmentSecurityHeadersMiddleware)
+
+    # [security].allowed_client_networks — registered LAST, so Starlette makes it the OUTERMOST user
+    # middleware (add_middleware inserts at index 0; the stack is built from reversed(user_middleware)).
+    # It therefore runs above the attachment CSP re-assert, the console's UiSecurityHeadersMiddleware,
+    # the body cap, the security-headers middleware, the /ui/static mount and every auth dependency — a
+    # refused address reaches no route, no dependency and no body buffer. Registered OUTSIDE serve_ui so a
+    # JSON-only deployment is equally covered, and unconditionally so the control can never be
+    # silently missing after a config edit (an empty list short-circuits inside it).
+    #
+    # It must stay INSIDE uvicorn's ProxyHeadersMiddleware, which it is automatically by being part of
+    # the app uvicorn wraps. Do NOT wrap the app in __main__ before uvicorn.run: that would put the
+    # gate OUTSIDE the XFF rewrite, where scope["client"] is still the raw socket peer, and the
+    # declared-proxy topology (R2) would break completely — every client would look like the proxy.
+    app.add_middleware(ClientNetworkMiddleware)
 
     return app
 
@@ -3074,6 +5006,19 @@ def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettin
     base = Path(store_settings.path or ".").resolve()
     secret_file = base.parent / "bootstrap-admin.txt"
     body = f"username: {bootstrap.username}\npassword: {bootstrap.password}\n"
+    # ASVS 6.4.5: state the renewal deadline WITH the credential — an unclaimed bootstrap is
+    # auto-disabled at this instant, so the "sign in and change it before then" instruction ships
+    # alongside the secret rather than being an out-of-band assumption. None when expiry is off.
+    deadline = (
+        datetime.datetime.fromtimestamp(bootstrap.expires_at, tz=datetime.UTC).isoformat()
+        if bootstrap.expires_at is not None
+        else None
+    )
+    if deadline is not None:
+        body += (
+            f"expires: {deadline} — sign in and change this password before then, "
+            "or the unclaimed credential is disabled.\n"
+        )
     # Create the file owner-only from the instant it exists, closing the POSIX create-then-chmod TOCTOU
     # (SEC-020): O_EXCL + 0o600 means the secret is never group/world-readable even momentarily, and
     # O_EXCL also refuses to follow a pre-planted symlink/file at that path. A second service start
@@ -3092,9 +5037,10 @@ def _emit_bootstrap_admin(bootstrap: BootstrapAdmin, store_settings: StoreSettin
     _secure_file(secret_file)
     _log.warning(
         "Created bootstrap admin %r; one-time password written to %s — sign in, change it, then "
-        "delete that file.",
+        "delete that file%s.",
         bootstrap.username,
         secret_file,
+        f" (expires {deadline} unless claimed)" if deadline is not None else "",
     )
 
 
@@ -3115,6 +5061,55 @@ async def _session_reaper(store: Store) -> None:
         except Exception:
             _log.exception("session reaper: purge failed; will retry next interval")
         await asyncio.sleep(_SESSION_REAP_INTERVAL)
+
+
+async def _directory_reconciler(auth: AuthService, interval: float) -> None:
+    """Re-resolve directory principals holding live sessions, revoking those AD has disabled or
+    deleted (ADR 0079 mechanism 2). Created only when ``[auth].ad_session_recheck_seconds`` is set
+    AND AD is wired — at the default 0 no task exists and the upgrade is byte-identical.
+
+    Sleeps FIRST: a pass at startup would probe every session restored from the store before the
+    directory connection has been exercised even once, and a boot-time DC hiccup is the least
+    informative moment to run a control whose whole job is telling a real disable from a blip.
+
+    A transient failure must not kill the loop for the process lifetime (that would silently disable
+    the control until restart) — log and retry next interval, the session-reaper precedent."""
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await auth.reconcile_directory_sessions()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("directory reconcile: pass failed; will retry next interval")
+
+
+_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL = 3600.0  # re-check the bootstrap warn window hourly
+
+
+async def _bootstrap_expiry_reminder(auth: AuthService, sink: AlertSink) -> None:
+    """Remind an operator, ONCE, that an UNCLAIMED first-run bootstrap admin is nearing its auto-disable
+    deadline (ASVS 6.4.5 arm 2). API-lifespan-owned (like :func:`_session_reaper`), NOT engine-owned — it
+    reaches the :class:`AuthService` directly. ``auth.bootstrap_expiry_warning()`` evaluates the warn
+    window and latches once-per-process; a non-None result is the fresh reminder to emit as the PHI-free
+    ``bootstrap_admin_expiring`` alert (the ISO deadline + whole hours remaining — never the password).
+
+    A transient store error must not kill the loop for the process lifetime (that would silently drop the
+    reminder) — log and retry next interval, the session-reaper precedent."""
+    while True:
+        try:
+            warning = await auth.bootstrap_expiry_warning()
+            if warning is not None:
+                expires_at, hours_remaining = warning
+                iso = datetime.datetime.fromtimestamp(expires_at, tz=datetime.UTC).isoformat()
+                sink.bootstrap_admin_expiring(
+                    "bootstrap-admin", expires_at=iso, hours_remaining=hours_remaining
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _log.exception("bootstrap expiry reminder: pass failed; will retry next interval")
+        await asyncio.sleep(_BOOTSTRAP_EXPIRY_REMINDER_INTERVAL)
 
 
 def create_managed_app(
@@ -3155,20 +5150,24 @@ def create_managed_app(
     connection_events: bool = True,
     response_sent_default: bool = True,
     message_events: str = "all",  # #63 [diagnostics].message_events verbosity → open_store
+    audit_all_authz: bool = False,  # #244 [diagnostics].audit_all_authz (ASVS 16.3.2) → app.state
     env_values: Mapping[str, Any] | None = None,
     env_values_provider: Callable[[], Mapping[str, Any]] | None = None,
     auth_settings: AuthSettings | None = None,
     ai_settings: AiSettings | None = None,
+    security_settings: SecuritySettings | None = None,
     alerts_settings: AlertsSettings | None = None,
     secrets_settings: SecretsSettings | None = None,
     priority_default: Priority | None = None,
     retention_settings: RetentionSettings | None = None,
     cert_monitor_settings: CertMonitorSettings | None = None,
     secret_rotation_settings: SecretRotationSettings | None = None,
+    security_enforcement: SecurityEnforcement | None = None,
     update_check_settings: UpdateCheckSettings | None = None,
     backup_settings: BackupSettings | None = None,
     dr_settings: DrSettings | None = None,
     api_tls_cert_file: str | None = None,
+    api_tls_client_cert_files: Sequence[str] = (),
     api_listener: tuple[str, int] | None = None,
     reference_settings: ReferenceSettings | None = None,
     egress_settings: EgressSettings | None = None,
@@ -3185,11 +5184,16 @@ def create_managed_app(
     public_origin: str | None = None,
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
+    loopback: bool = False,
     tls_terminated_upstream: bool = False,
     tls_client_cert_identities: Mapping[str, str] | None = None,
+    trusted_proxies: Sequence[str] = (),
     phi_read_hop_secure: bool = True,
     registry_filter: Callable[[Registry], Registry] | None = None,
     log_dir: str | None = None,
+    configured_log_level: str | None = None,
+    trust_anchor_specs: Sequence[AnchorSpec] = (),
+    trust_anchors_enforcing: bool = True,
 ) -> FastAPI:
     """Build an app that owns its engine for its whole lifespan (CLI server / sync tests).
 
@@ -3228,8 +5232,36 @@ def create_managed_app(
         store = await open_store(
             resolved,
             message_events=message_events,
-            posture=hop_posture_from_ai(ai_settings) if ai_settings else None,
+            posture=(
+                hop_posture_from_ai(
+                    ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+                )
+                if ai_settings
+                else None
+            ),
         )
+        # Offline uploaded-logs store (BACKLOG #125/#126, ADR 0134), on the LIVE store's cipher instance.
+        # DISABLED (None) unless [store].uploads_dir is set, so no PHI-at-rest surface exists unless an
+        # operator opts in; every uploaded-logs route 503s when None.
+        #
+        # ASVS 11.3.4 — it MUST share the store's cipher object, not build a second one over the same
+        # DEK: the AES-GCM invocation bound is per-instance state, so a second instance would charge
+        # nothing to the key's persisted `cipher_meta` row (an under-count in the unsafe direction) and
+        # would keep encrypting under a key the store's cipher had already fail-closed on at 2**32.
+        if resolved.uploads_dir:
+            app.state.upload_store = UploadStore(
+                resolved.uploads_dir,
+                store.cipher(),
+                max_bytes=resolved.max_upload_bytes,
+                # ASVS 5.2.4: thread the operator's per-user quota + retention values into the SERVE
+                # path too. This lifespan rebuild exists to share the store's cipher (the 11.3.4 GCM
+                # bound); it must NOT drop the quota/retention knobs, or serve silently falls back to the
+                # 100/250 MiB/30 d UploadStore defaults and ignores operator [store] config (create_app
+                # wires them at build time; only this rebind was missing them).
+                max_files_per_user=resolved.max_upload_files_per_user,
+                max_total_bytes_per_user=resolved.max_upload_total_bytes_per_user,
+                retention_days=resolved.uploads_retention_days,
+            )
         # Operational alert notifier (webhook/email). None when no transport is configured → the
         # engine falls back to the logging sink. Its background dispatch task is owned by this
         # lifespan: started here, drained + stopped after the engine in the finally below.
@@ -3252,6 +5284,10 @@ def create_managed_app(
             # pure side observer off the emit path — never gates a disposition, never blocks a worker.
             notifier.set_store(store)
             notifier.start()
+            # #143 (ADR 0044 amendment): seed the sink's windowed-suspend cache from durable
+            # alert_instance.suspended_until so an operator suspend set before this process started is
+            # honored from the first emit. Best-effort (a store error is swallowed; notify path unaffected).
+            await notifier.prime_suspensions()
         # Startup self-attestation of the installed engine wheel (ADR 0041 D3) — runs BEFORE the engine
         # binds listeners. On drift it records a hash-chained `startup_integrity` audit row + alerts;
         # under [integrity].fail_closed_on_drift it raises IntegrityError here (refusing to start) so
@@ -3273,11 +5309,28 @@ def create_managed_app(
                     await notifier.aclose()
                 await store.close()
                 raise
+        # #285 (ASVS 6.7.1): preflight every operator-supplied auth-path trust anchor (OIDC / AD /
+        # api-mTLS client CA) BEFORE any listener binds — a group/world-writable anchor refuses (at
+        # enforce) or warns+audits, a configured SHA-256 pin mismatch always refuses, and a fingerprint
+        # change since the last load is audited (auth.trust_anchor). Dormant (no store call, no audit)
+        # when no anchor is configured. On a fatal violation it raises, so we tear down like attestation.
+        if trust_anchor_specs:
+            try:
+                await run_anchor_preflight(
+                    trust_anchor_specs, store, enforcing=trust_anchors_enforcing
+                )
+            except BaseException:
+                if notifier is not None:
+                    await notifier.aclose()
+                await store.close()
+                raise
         # Cluster coordinator (Track B Step 3) — built from the opened store so a Postgres-backed
         # store can reach its pool. Returns the no-op NullCoordinator unless [cluster].enabled on a
         # Postgres store, so single-node is byte-identical. The Engine owns its lifecycle (start/stop
         # in engine.start()/stop()), so the lifespan only constructs + passes it here.
-        coordinator = build_coordinator(store, cluster_settings)
+        # #145: thread the alert notifier so a leadership transition (HA failover / election) pages via
+        # leadership_acquired/lost. None → the coordinator's default LoggingAlertSink logs the transition.
+        coordinator = build_coordinator(store, cluster_settings, alert_sink=notifier)
         engine = Engine(
             store,
             poll_interval=poll_interval,
@@ -3320,6 +5373,7 @@ def create_managed_app(
             log_dir=log_dir,
             cert_monitor_settings=cert_monitor_settings,
             secret_rotation_settings=secret_rotation_settings,
+            security_enforcement=security_enforcement,
             update_check_settings=update_check_settings,
             backup_settings=backup_settings,
             # [dr] third-tier DR standby run-profile + cold-seed (#61, ADR 0048). When dr.enabled AND
@@ -3330,6 +5384,7 @@ def create_managed_app(
             store_settings=resolved,
             engine_version=__version__,
             api_tls_cert_file=api_tls_cert_file,
+            api_tls_client_cert_files=api_tls_client_cert_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -3337,7 +5392,13 @@ def create_managed_app(
             # its posture-keyed insecure-hop refusal on. Derived from [ai] here (the one place ai_settings
             # is in scope) so every runner this engine builds refuses/warns identically. None when the
             # instance declares no [ai] (test/embedding) — a cell then fail-closes.
-            hop_posture=hop_posture_from_ai(ai_settings) if ai_settings else None,
+            hop_posture=(
+                hop_posture_from_ai(
+                    ai_settings, enforcement=(security_settings or SecuritySettings()).enforcement
+                )
+                if ai_settings
+                else None
+            ),
             # #190 (ADR 0093): the [tls] client trust-anchor policy (internal-CA fallback for internal
             # outbound hops). None ([tls] unset) → the default system/no-op policy (byte-identical).
             trust_anchor_policy=tls_settings.policy() if tls_settings else None,
@@ -3358,15 +5419,69 @@ def create_managed_app(
                 loaded = registry_filter(loaded)
             engine.add_registry(loaded)
         await engine.start()
+        # #144 (ADR 0128): inject the connection-control callback INTO the notifier (the sink never imports
+        # RegistryRunner). A rule's control_action then auto-remediates via restart_inbound/restart_outbound;
+        # re-reading engine.registry_runner each call keeps it correct across a config reload that swaps the
+        # runner. The sink dispatches this off-worker + never-raise, so exceptions here are logged, not fatal.
+        if notifier is not None:
+
+            async def _alert_control(action: str, target: str) -> None:
+                rr = engine.registry_runner
+                if rr is None:
+                    return
+                if action == "restart_inbound":
+                    await rr.restart_inbound(target)
+                elif action == "restart_outbound":
+                    await rr.restart_outbound(target)
+
+            notifier.set_control_callback(_alert_control)
         app.state.engine = engine
+        # #285: stash the trust anchors so /config/reload re-verifies the on-disk PEMs (a swapped anchor
+        # is caught + audited, a pinned-but-substituted anchor refuses the deploy) — the reload seam.
+        app.state.trust_anchor_specs = tuple(trust_anchor_specs)
+        app.state.trust_anchors_enforcing = trust_anchors_enforcing
         app.state.store_settings = resolved  # back GET /security/posture (M5)
         app.state.alerts_settings = alerts_settings
+        # #143: expose the running notifier so POST /alerts/{id}/suspend|resume can update its in-memory
+        # suspend cache live (None here in a JSON-only/no-transport deployment — the durable store governs).
+        app.state.notifier = notifier
+        # ASVS 6.4.5: the cert-identity resolver reads [cert_monitor].warn_days off app.state to decide
+        # whether a service caller's client cert, observed at the mTLS handshake, is inside the warn
+        # window. None (the direct create_app / embedding path) leaves that check inert — deny-by-default
+        # for a monitoring signal, and byte-identical to before.
+        app.state.cert_monitor_settings = cert_monitor_settings
+        # #118: expose the connector SecretProvider so POST /alerts/test-email can resolve an
+        # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
+        # the embedded/test path — then only a plain env-sourced email_password can be tested.
+        app.state.secret_provider = secret_provider
         app.state.service_settings = service_settings  # back GET /service/status (L6a)
         app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
         app.state.approval_gate = _build_approval_gate(
             engine, approvals_settings or ApprovalsSettings()
         )
+        # ASVS 5.2.4: age-based retention prune for the uploaded-logs surface. Owned by this lifespan
+        # (started here, stopped in the finally) — the runner pattern of cert_expiry, but wired where the
+        # UploadStore lives (built in create_app from store_settings). None when [store].uploads_dir is
+        # unset (the subsystem is opt-in), so a deployment without uploaded logs spawns no task. The audit
+        # callback closes over the opened store so the leaf uploads module never imports it.
+        upload_retention_runner: UploadRetentionRunner | None = None
+        _upload_store: UploadStore | None = getattr(app.state, "upload_store", None)
+        if _upload_store is not None:
+
+            async def _audit_upload_prune(meta: UploadedFileMeta) -> None:
+                await store.record_audit(
+                    "upload.prune",
+                    actor=meta.uploader or None,
+                    detail=json.dumps({"file_id": meta.file_id, "uploader": meta.uploader}),
+                )
+
+            upload_retention_runner = UploadRetentionRunner(
+                _upload_store, audit=_audit_upload_prune
+            )
+            upload_retention_runner.start()
         reaper: asyncio.Task[None] | None = None
+        reconciler: asyncio.Task[None] | None = None
+        bootstrap_reminder: asyncio.Task[None] | None = None
         security_notifier = None
         if auth_settings is not None and auth_settings.enabled:
             # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
@@ -3390,6 +5505,11 @@ def create_managed_app(
                 auth_settings,
                 security_notifier=security_notifier,
                 secret_provider=secret_provider,
+                # #285 (ASVS 6.7.1): pass the enforcement dial so the OIDC anchor's construction-site
+                # preflight in build_idp_opener honors [security].enforcement — warn+audit (via the
+                # central run_anchor_preflight above) rather than refusing at enforce-only. Central
+                # preflight already ran before any listener bound; this keeps the seam consistent.
+                enforcing=trust_anchors_enforcing,
             )
             bootstrap = await auth.initialize()
             app.state.auth = auth
@@ -3424,16 +5544,62 @@ def create_managed_app(
                         exc,
                     )
                     auth.mark_kerberos_unavailable(str(exc))
+            if auth.oidc_enabled:
+                # ADR 0142: a CONFIG-ONLY preflight. Deliberately NOT the Kerberos shape above —
+                # it performs no network I/O and cannot mark the IdP unavailable, because
+                # "must not make a reachable IdP a precondition for operating the engine" is an
+                # explicit ADR constraint and AC-8 wants recovery without a restart. The settings
+                # validators already refuse a misconfigured [auth].oidc_* at load (AC-9), so this
+                # only surfaces the posture an operator should see in the boot log.
+                _log.info(
+                    "Federated sign-in (OIDC) is ENABLED for the browser console: issuer=%s "
+                    "redirect=%s. The engine verifies what the IdP ASSERTS about MFA, "
+                    "cryptographically — it cannot prove the IdP enforced it.",
+                    auth_settings.oidc_issuer,
+                    auth_settings.oidc_redirect_path,
+                )
             reaper = asyncio.create_task(_session_reaper(store))
+            if auth_settings.bootstrap_expiry_hours > 0:
+                # ASVS 6.4.5 arm 2: nudge an operator BEFORE an unclaimed first-run bootstrap admin is
+                # auto-disabled. API-lifespan-owned (like the session reaper), NOT engine-owned — it
+                # reaches the AuthService directly. The warn method latches once-per-window; the sink logs
+                # (LoggingAlertSink fallback) or notifies. No task when time-expiry is off (byte-identical).
+                bootstrap_reminder = asyncio.create_task(
+                    _bootstrap_expiry_reminder(auth, notifier or LoggingAlertSink())
+                )
+            if auth.directory_reconcile_enabled:
+                # ADR 0079 mechanism 2: propagate an AD disable/delete to live engine sessions.
+                # Default OFF (ad_session_recheck_seconds = 0) — no task, no behaviour change.
+                _log.info(
+                    "Directory session reconciliation is ENABLED: live AD sessions are "
+                    "re-resolved every %ds; a principal absent from the directory for %d "
+                    "consecutive passes has its sessions revoked. A directory outage revokes "
+                    "NOTHING, and a pass that would revoke too many at once aborts and alerts.",
+                    auth_settings.ad_session_recheck_seconds,
+                    auth_settings.ad_session_recheck_strikes,
+                )
+                reconciler = asyncio.create_task(
+                    _directory_reconciler(auth, auth_settings.ad_session_recheck_seconds)
+                )
         try:
             yield
         finally:
+            if upload_retention_runner is not None:
+                await upload_retention_runner.stop()
+            if reconciler is not None:
+                reconciler.cancel()
+                await asyncio.gather(reconciler, return_exceptions=True)
             if reaper is not None:
                 reaper.cancel()
                 # gather(return_exceptions): absorbs both our cancellation AND any exception a
                 # previously-died reaper stored, so it can't propagate here and skip engine.stop()
                 # (review M-33).
                 await asyncio.gather(reaper, return_exceptions=True)
+            if bootstrap_reminder is not None:
+                bootstrap_reminder.cancel()
+                # gather(return_exceptions): absorb our cancellation + any stored exception so it can't
+                # propagate here and skip engine.stop() (the reaper precedent).
+                await asyncio.gather(bootstrap_reminder, return_exceptions=True)
             await engine.stop()
             # B11: shut down the harness-only instrumented executor (None in production / other tests).
             # The engine is stopped (no more to_thread work), so a non-blocking shutdown is clean.
@@ -3454,15 +5620,25 @@ def create_managed_app(
     allow_no_auth = auth_settings is None or not auth_settings.enabled
     return create_app(
         lifespan=lifespan,
+        # Build the opt-in uploaded-logs store in the SERVE path too (previously only the direct/test
+        # path passed store_settings, so `serve` never wired it): the ASVS 5.2.4 retention runner above
+        # needs a live UploadStore to prune. None uploads_dir → create_app leaves upload_store None.
+        store_settings=resolved,
         ai_settings=ai_settings,
+        security_settings=security_settings,
         expose_docs=expose_docs,
         allow_no_auth=allow_no_auth,
+        audit_all_authz=audit_all_authz,
         ws_allowed_origins=ws_allowed_origins,
         serve_ui=serve_ui,
+        oidc_enabled=bool(auth_settings is not None and auth_settings.oidc_enabled),
         public_origin=public_origin,
         webauthn_rp_from_request=webauthn_rp_from_request,
         exposure_protected=exposure_protected,
+        loopback=loopback,
         tls_terminated_upstream=tls_terminated_upstream,
         tls_client_cert_identities=tls_client_cert_identities,
+        trusted_proxies=trusted_proxies,
         phi_read_hop_secure=phi_read_hop_secure,
+        configured_log_level=configured_log_level,
     )

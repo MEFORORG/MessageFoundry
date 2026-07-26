@@ -106,6 +106,17 @@ async def test_login_rate_limited_per_ip(engine: Engine) -> None:
         assert (await _login(c, "nobody", "x")).status_code == 429  # 3 — rate limited
 
 
+def test_admin_write_pacing_ships_default_on_at_the_calibrated_floor() -> None:
+    # ASVS 2.4.2 register drift-guard: anti-automation pacing is DEFAULT-ON (not opt-in) at the
+    # calibrated 12-writes / 1.0s floor recorded in ASVS-L3-RISK-ACCEPTANCE-REGISTER.md. Pinning the
+    # three shipped defaults keeps that register claim from silently re-drifting (the floor is set an
+    # order of magnitude above human console timing by design; see settings.py 1585-1591).
+    settings = AuthSettings()
+    assert settings.admin_write_rate_limit_enabled is True
+    assert settings.admin_write_rate_limit_per_actor == 12
+    assert settings.admin_write_rate_limit_window_seconds == 1.0
+
+
 # --- API-INPUT: length + body-size caps --------------------------------------
 
 

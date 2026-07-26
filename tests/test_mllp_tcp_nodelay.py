@@ -18,6 +18,10 @@ import time
 
 import pytest
 
+from harness.load.correlator import Correlator
+from harness.load.ids import ControlIds
+from harness.load.metrics import Counters, Histogram, LiveMetrics
+from harness.load.sink import CorrelationSink
 from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.transports import mllp as mllp_mod
 from messagefoundry.transports.mllp import (
@@ -27,11 +31,6 @@ from messagefoundry.transports.mllp import (
     build_ack,
     frame,
 )
-
-from harness.load.correlator import Correlator
-from harness.load.ids import ControlIds
-from harness.load.metrics import Counters, Histogram, LiveMetrics
-from harness.load.sink import CorrelationSink
 
 
 def _msg(control_id: str) -> str:

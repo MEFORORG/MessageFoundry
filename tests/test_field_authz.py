@@ -39,7 +39,7 @@ def _identity(*perms: Permission) -> Identity:
 
 
 def _summary(**over: Any) -> MessageSummary:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         id="m1",
         channel_id="IB",
         received_at=0.0,
@@ -55,7 +55,7 @@ def _summary(**over: Any) -> MessageSummary:
 
 
 def _dead(**over: Any) -> DeadLetterRow:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         outbox_id="o1",
         message_id="m1",
         channel_id="IB",

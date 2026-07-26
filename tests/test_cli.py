@@ -86,6 +86,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "acme_adt_router",
         "partner_x12_router",
         "immunization_router",
+        "bodycred_router",  # #236 SOAP body-secret submit (IB_IMMUNIZATION_BODYCRED_VXU.py)
         "rte_request_router",
         "rte_response_router",
         "fhir_router",
@@ -99,6 +100,7 @@ def test_graph_of_sample(capsys: pytest.CaptureFixture[str]) -> None:
         "acme_adt_handler",
         "partner_x12_handler",
         "immunization_submit_handler",
+        "bodycred_submit_handler",  # #236 SOAP body-secret submit (IB_IMMUNIZATION_BODYCRED_VXU.py)
         "rte_query_handler",
         "rte_result_handler",
         "fhir_handler",
@@ -324,14 +326,50 @@ def test_serve_keyless_phi_override_starts_with_warning(
     # refusal. (`require_encryption=true` would still win; tested separately.)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    # enforcement=warn reproduces the historical non-production dial (single-flag keyless override starts
+    # with a warning); under default enforce the second ack would be required (tested for prod above).
     (tmp_path / "messagefoundry.toml").write_text(
-        "[store]\nallow_unencrypted_phi = true\n", encoding="utf-8"
+        'security.enforcement = "warn"\nsecurity.allow_unencrypted_phi = true\n', encoding="utf-8"
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
     err = capsys.readouterr().err
     assert "allow_unencrypted_phi" in err and "UNENCRYPTED at rest" in err and "staging" in err
+
+
+def test_serve_keyless_prod_phi_single_flag_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # TIGHTENING (ADR 0140): on PRODUCTION, allow_unencrypted_phi ALONE no longer boots keyless — the
+    # deliberate production ack allow_unencrypted_phi_under_strict_enforcement is also required, otherwise serve
+    # fails closed. (Non-production keeps the single-flag path — see the staging test above.)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.allow_unencrypted_phi = true\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "prod"]) == 2
+    err = capsys.readouterr().err
+    assert "allow_unencrypted_phi_under_strict_enforcement" in err and "UNENCRYPTED at rest" in err
+
+
+def test_serve_keyless_prod_phi_both_acks_starts_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Both acks (allow_unencrypted_phi + allow_unencrypted_phi_under_strict_enforcement) boot a PRODUCTION instance
+    # keyless with a loud audited warning; the other prod gates (egress/retention/alerts) are pre-cleared
+    # so only the keyless posture is under test. Loopback default => the MFA gate never trips.
+    toml = (
+        "security.allow_unencrypted_phi = true\n"
+        "security.allow_unencrypted_phi_under_strict_enforcement = true\n"
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + _SECURE_ALERTS
+    )
+    rc, _ = _run_secure_serve(tmp_path, monkeypatch, toml, env="prod", key=False)
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "UNENCRYPTED at rest" in err and "prod" in err
 
 
 def test_serve_require_encryption_overrides_keyless_override(
@@ -341,7 +379,8 @@ def test_serve_require_encryption_overrides_keyless_override(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        "[store]\nrequire_encryption = true\nallow_unencrypted_phi = true\n", encoding="utf-8"
+        "security.allow_unencrypted_phi = true\n[store]\nrequire_encryption = true\n",
+        encoding="utf-8",
     )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 2
@@ -351,11 +390,14 @@ def test_serve_require_encryption_overrides_keyless_override(
 def test_serve_quiet_in_dev_without_key(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # dev is synthetic-only by policy (data_class != phi), so a keyless start is allowed and quiet — the
-    # H3 refusal is gated on data_class==phi, not the environment label. (CI parity: synthetic stays
-    # key-free.)
+    # GIVEN 1 (ADR 0148): dev now derives PHI, so a genuinely-synthetic box declares the opt-out
+    # explicitly (handles_real_patient_data=false). A synthetic instance keyless start is allowed and
+    # quiet — the H3 refusal is gated on data_class==phi. (CI parity: synthetic stays key-free.)
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n", encoding="utf-8"
+    )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
@@ -370,12 +412,52 @@ def test_serve_keyless_custom_phi_env_refuses(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[ai]\nenvironment = "test"\ndata_class = "phi"\nproduction = false\n', encoding="utf-8"
+        "security.handles_real_patient_data = true\nsecurity.production_instance = false\n"
+        '[ai]\nenvironment = "test"\n',
+        encoding="utf-8",
     )
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "test"]) == 2
     err = capsys.readouterr().err
     assert "PHI instance" in err and "UNENCRYPTED at rest" in err and "test" in err
+
+
+def test_serve_keyless_poc_phi_env_refuses_decoupled_from_name(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # DEPLOY-17 decoupling proof: a mislabeled/benign-named instance ('poc') that DECLARES PHI
+    # (data_class=phi, production=false) still fails closed keyless — the H3 refusal keys on
+    # data_class==phi, NOT the environment label, so a free-form name gets no free pass.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = true\nsecurity.production_instance = false\n"
+        '[ai]\nenvironment = "poc"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "poc"]) == 2
+    err = capsys.readouterr().err
+    assert "PHI instance" in err and "'poc'" in err and "UNENCRYPTED at rest" in err
+
+
+def test_serve_keyless_poc_phi_env_refuses_when_production_true(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # DEPLOY-17 name-independence mirror: the SAME benign 'poc' name with production=true takes the
+    # identical keyless refusal path — the fail-closed decision is driven by data_class==phi, never
+    # the env label or the production flag alone.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = true\nsecurity.production_instance = true\n"
+        '[ai]\nenvironment = "poc"\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "poc"]) == 2
+    err = capsys.readouterr().err
+    assert "PHI instance" in err and "'poc'" in err and "UNENCRYPTED at rest" in err
 
 
 def test_serve_refuses_open_egress_in_prod(
@@ -397,10 +479,13 @@ def test_serve_refuses_open_egress_in_prod(
 def test_serve_warns_open_egress_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A non-production PHI instance (staging) only WARNS on unrestricted egress and still starts —
-    # the fail-closed escalation is production-only.
+    # enforcement=warn reproduces the historical non-production dial: unrestricted egress only WARNS and
+    # still starts (under default enforce it refuses — the dial is decoupled from the production tier).
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # silence the keyless warning
+    (tmp_path / "messagefoundry.toml").write_text(
+        'security.enforcement = "warn"\n', encoding="utf-8"
+    )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "staging"]) == 0
@@ -430,7 +515,7 @@ def test_serve_custom_env_requires_explicit_posture(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "test"]) == 2
-    assert "data_class" in capsys.readouterr().err
+    assert "handles_real_patient_data" in capsys.readouterr().err
 
 
 def test_serve_custom_env_with_posture_starts(
@@ -440,7 +525,8 @@ def test_serve_custom_env_with_posture_starts(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[ai]\nenvironment = "test"\ndata_class = "synthetic"\nproduction = false\n',
+        "security.handles_real_patient_data = false\nsecurity.production_instance = false\n"
+        '[ai]\nenvironment = "test"\n',
         encoding="utf-8",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
@@ -456,8 +542,13 @@ def test_serve_refuses_non_loopback_bind_by_default(
 ) -> None:
     # Auth is enabled by default, so this exercises the cleartext-bind refuse, not the no-auth gate:
     # Phase 1 has no API TLS, so a non-loopback bind must fail closed unless the operator opts in.
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI gates stay quiet and only the bind gate decides.
     monkeypatch.chdir(tmp_path)
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "0.0.0.0"\n', encoding="utf-8")
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
+        encoding="utf-8",
+    )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
     assert "refusing to serve the API on non-loopback" in capsys.readouterr().err
 
@@ -470,7 +561,13 @@ def test_serve_allows_non_loopback_bind_with_flag(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # silence the at-rest warning
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)  # don't actually serve
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "0.0.0.0"\n', encoding="utf-8")
+    # GIVEN 1 (ADR 0148): declare synthetic so the enforce clamp doesn't refuse the PHI cleartext bind
+    # — this test is about the --allow-insecure-bind flag path on a synthetic instance.
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n',
+        encoding="utf-8",
+    )
     assert (
         main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "dev"])
         == 0
@@ -487,7 +584,12 @@ def test_serve_loopback_bind_needs_no_flag(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
-    (tmp_path / "messagefoundry.toml").write_text('[api]\nhost = "127.0.0.1"\n', encoding="utf-8")
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet and
+    # only the loopback-bind (no-flag) behavior is under test.
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\nsecurity.local_access_only = true\n",
+        encoding="utf-8",
+    )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "non-loopback" not in capsys.readouterr().err  # loopback never trips the guard
 
@@ -499,12 +601,51 @@ def test_serve_non_loopback_with_auth_off_refused_despite_flag(
     # full-privilege, unauthenticated API to the network — that stays a hard refuse regardless.
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\n[auth]\nenabled = false\n', encoding="utf-8"
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.require_sign_in = false\n",
+        encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind"]) == 2
     err = capsys.readouterr().err
     assert "enabled=false" in err  # the no-auth gate fired...
     assert "refusing to serve the API on non-loopback" not in err  # ...not the bind gate
+
+
+def test_serve_insecure_bind_clamp_keys_on_enforcement_not_tier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # GIVEN 2 (ADR 0148): the --allow-insecure-bind cleartext-bind clamp is keyed on
+    # [security].enforcement, NOT the production tier — so a PHI instance at the default `enforce`
+    # REFUSES the cleartext bind even on *staging* (decoupled from the tier, exactly like every other
+    # posture gate; byte-identical to the historical prod refuse), and `enforcement=warn` permits it.
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # pass the keyless gate
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    base = (
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        "security.handles_real_patient_data = true\nsecurity.block_unlisted_outbound = true\n"
+    )
+    # default enforce → a *staging* PHI cleartext bind is REFUSED at the bind gate (not just prod).
+    (tmp_path / "messagefoundry.toml").write_text(base, encoding="utf-8")
+    assert (
+        main(
+            ["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "staging"]
+        )
+        == 2
+    )
+    err = capsys.readouterr().err
+    assert "enforcement=enforce" in err and "cannot relax a PHI cleartext bind" in err
+    # enforcement=warn reproduces the historical non-production dial: the same bind warns + serves.
+    (tmp_path / "messagefoundry.toml").write_text(
+        base + 'security.enforcement = "warn"\n', encoding="utf-8"
+    )
+    assert (
+        main(
+            ["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "staging"]
+        )
+        == 0
+    )
+    assert "--allow-insecure-bind" in capsys.readouterr().err  # warned, served
 
 
 # --- MFA-at-exposure posture (sec-mfa-on; off-loopback bind + [auth].require_mfa) ----------------
@@ -522,7 +663,13 @@ def test_serve_non_loopback_with_auth_off_refused_despite_flag(
 # out explicitly (require_mfa = false). _expose_toml writes that opt-out by default.
 
 
-def _expose_toml(tmp_path: Path, *, require_mfa: bool = False) -> None:
+def _expose_toml(
+    tmp_path: Path,
+    *,
+    require_mfa: bool = False,
+    enforcement: str | None = None,
+    synthetic: bool = False,
+) -> None:
     """A non-loopback bind (exposed via a declared TLS-terminating proxy) with egress locked down.
 
     Exposed via Posture-B (``tls_terminated_upstream`` + ``trusted_proxies``) rather than a cleartext
@@ -536,13 +683,28 @@ def _expose_toml(tmp_path: Path, *, require_mfa: bool = False) -> None:
     #187 flipped the default ON, this must be written explicitly for the gate to fire; pass True to
     assert the gate stays silent when MFA is required."""
     auth = "true" if require_mfa else "false"
+    # enforcement=warn reproduces the historical non-production dial (the gate WARNS + starts) — the
+    # security REFUSE/WARN dial is decoupled from the production tier, so a staging-warn case sets it.
+    enforce_line = f'security.enforcement = "{enforcement}"\n' if enforcement else ""
+    # GIVEN 1 (ADR 0148): dev now derives PHI, so the synthetic-dev exposure case declares the opt-out
+    # explicitly to keep the PHI gates (keyless/egress/MFA) relaxed the way the old dev default did.
+    synthetic_line = "security.handles_real_patient_data = false\n" if synthetic else ""
     # Pass every non-MFA exposure gate (Posture-B declarations + egress deny-by-default + the #186/#188
     # secure retention + SMTP-alert channels) so require_mfa is the ONLY posture under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        enforce_line + synthetic_line + "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        f"security.require_mfa = {auth}\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.delete_message_bodies_after_days = 30\n"
+        # ADR 0152 rung 2: an EXPOSED PHI instance without an in-use data-protection declaration
+        # WARNS at every start (it refuses only behind require_memory_encryption_declaration).
+        # Declared here with the rest of the non-MFA plumbing so no case in this file is reading
+        # the LAST rung's output while asserting on the one under test.
+        "security.memory_encryption_operator_declared = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
-        "[egress]\ndeny_by_default = true\n"
-        f"[auth]\nrequire_mfa = {auth}\n" + _SECURE_RETENTION + _SECURE_ALERTS,
+        "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
         encoding="utf-8",
     )
 
@@ -554,7 +716,9 @@ def _expose_toml(tmp_path: Path, *, require_mfa: bool = False) -> None:
 # The building blocks below let a PRODUCTION PHI serve pass every PRIOR gate so exactly one new gate is
 # under test per case (a locked-down egress, a bounded retention, and a real SMTP channel). See
 # messagefoundry/__main__.py.
-_SECURE_RETENTION = "[retention]\nmessages_days = 30\ndead_letter_days = 30\n"
+_SECURE_RETENTION = (
+    "security.delete_message_bodies_after_days = 30\n[retention]\ndead_letter_days = 30\n"
+)
 _SECURE_ALERTS = '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
 
 
@@ -607,10 +771,11 @@ def test_serve_refuses_exposed_without_mfa_in_prod(
 def test_serve_warns_exposed_without_mfa_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Non-production PHI (staging) only WARNS and still starts — the fail-closed refuse is prod-only.
+    # enforcement=warn reproduces the historical non-production dial: the gate WARNS and still starts
+    # (the security dial is decoupled from the production tier — staging under default enforce refuses).
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # silence the keyless warning
-    _expose_toml(tmp_path)
+    _expose_toml(tmp_path, enforcement="warn")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert (
@@ -628,8 +793,9 @@ def test_serve_quiet_exposed_without_mfa_in_synthetic_dev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A synthetic instance (dev) stays quiet on the MFA posture (parity with keyless/egress gates).
+    # GIVEN 1 (ADR 0148): dev now derives PHI, so synthetic is declared explicitly (synthetic=True).
     monkeypatch.chdir(tmp_path)
-    _expose_toml(tmp_path)
+    _expose_toml(tmp_path, synthetic=True)
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     assert (
@@ -657,6 +823,40 @@ def test_serve_exposed_with_mfa_on_starts_in_prod(
     assert "require_mfa off" not in capsys.readouterr().err
 
 
+def test_serve_exposed_prod_phi_single_factor_ack_starts_with_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ADR 0140: allow_single_factor_admin_when_exposed=true lifts the production single-factor-admin
+    # refusal to the warn-and-start posture a non-production PHI exposure already takes (loud + audited).
+    # The default-off refuse case is test_serve_refuses_exposed_without_mfa_in_prod (the ack is absent there).
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)  # passes the keyless gate
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.require_mfa = false\n"
+        "security.allow_single_factor_admin_when_exposed = true\n"
+        "security.block_unlisted_outbound = true\n"
+        "security.delete_message_bodies_after_days = 30\n"
+        # ADR 0152 rung 2 declaration (see _expose_toml): the single-factor ACK is what is on
+        # trial here, not the last rung in the ladder.
+        "security.memory_encryption_operator_declared = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
+        "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
+        encoding="utf-8",
+    )
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    assert (
+        main(["serve", "--config", str(SAMPLES_CONFIG), "--allow-insecure-bind", "--env", "prod"])
+        == 0
+    )
+    err = capsys.readouterr().err
+    assert "require_mfa off" in err and "single-factor" in err
+    assert "refusing to start" not in err  # the ack downgraded refuse -> warn
+
+
 def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -670,12 +870,15 @@ def test_serve_refuses_exposed_without_mfa_even_with_ad_enabled(
         # Exposed via a declared TLS-terminating proxy (Posture-B) — #200 clamped --allow-insecure-bind
         # so it can no longer wave a prod-PHI cleartext bind past the exposed-gate; the MFA gate is
         # reached through a real TLS-terminated bind instead.
-        '[api]\nhost = "0.0.0.0"\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.require_mfa = false\n"
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
         'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
-        "[egress]\ndeny_by_default = true\n"
         # Opt out of the BACKLOG #187 secure default so the single-factor-at-exposure gate fires even
         # on an AD-enabled bind (the gate keys on require_mfa only; AD MFA is delegated to the directory).
-        "[auth]\nrequire_mfa = false\nad_enabled = true\n"
+        "[auth]\nad_enabled = true\n"
         'ad_server = "ldaps://dc1.example.com:636"\n'
         'ad_user_search_base = "ou=users,dc=example,dc=com"\n'
         'ad_bind_dn = "cn=svc,dc=example,dc=com"\n',
@@ -698,9 +901,9 @@ def test_serve_loopback_never_trips_mfa_advisory_in_prod(
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "127.0.0.1"\n[egress]\ndeny_by_default = true\n[auth]\nrequire_mfa = false\n'
-        + _SECURE_RETENTION
-        + _SECURE_ALERTS,
+        "security.local_access_only = true\n"
+        "security.require_mfa = false\n"
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + _SECURE_ALERTS,
         encoding="utf-8",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
@@ -746,7 +949,11 @@ def test_serve_warns_exposed_without_approvals_in_staging(
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nhost = "0.0.0.0"\n[egress]\ndeny_by_default = true\n[auth]\nrequire_mfa = true\n',
+        'security.enforcement = "warn"\n'
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_mfa = true\n",
         env="staging",
     )
     assert rc == 0
@@ -759,11 +966,15 @@ def test_serve_quiet_exposed_without_approvals_in_synthetic_dev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A synthetic instance (dev, data_class != PHI) stays quiet on the approvals posture, parity with
-    # the keyless / MFA / retention gates.
+    # the keyless / MFA / retention gates. GIVEN 1 (ADR 0148): dev derives PHI now, so declare the
+    # synthetic opt-out explicitly to keep the PHI gates relaxed.
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nhost = "0.0.0.0"\n[egress]\ndeny_by_default = true\n',
+        "security.handles_real_patient_data = false\n"
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n",
         env="dev",
     )
     assert rc == 0
@@ -779,9 +990,8 @@ def test_serve_loopback_prod_quiet_on_approvals(
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nhost = "127.0.0.1"\n[egress]\ndeny_by_default = true\n'
-        + _SECURE_RETENTION
-        + _SECURE_ALERTS,
+        "security.local_access_only = true\n"
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION + _SECURE_ALERTS,
         env="prod",
         allow_insecure=False,  # loopback needs no flag
     )
@@ -797,8 +1007,11 @@ def test_serve_exposed_with_approvals_on_no_warn(
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nhost = "0.0.0.0"\n[egress]\ndeny_by_default = true\n'
-        "[auth]\nrequire_mfa = true\n[approvals]\nenabled = true\n",
+        'security.enforcement = "warn"\n'
+        "security.local_access_only = false\n"
+        'security.listen_address = "0.0.0.0"\n'
+        "security.block_unlisted_outbound = true\n"
+        "security.require_mfa = true\n[approvals]\nenabled = true\n",
         env="staging",
     )
     assert rc == 0
@@ -848,6 +1061,61 @@ def test_protect_key_grants_named_service_account(
     assert captured["grants"] == ["*S-1-5-18", "NT SERVICE\\MessageFoundry"]
 
 
+# --- protect-key exit-2 branches (off-Windows + key-validation) ----------------------------------
+#
+# CLI-21 buildable slice: these drive the CLI's refusal paths that need neither Windows, real DPAPI,
+# nor icacls. The real CryptProtectData round-trip + DACL enforcement stay @windows_only ci-leg tests
+# (test_secrets_dpapi.py). Here we assert the CLI fails closed (rc==2) with the operator-facing message.
+
+
+def test_protect_key_off_windows_refuses_with_windows_only_message(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # --generate mints a valid 32-byte key, so validation passes and control reaches protect_key_to_file;
+    # off Windows that raises DpapiUnavailable -> the CLI must refuse (exit 2), not crash.
+    import messagefoundry.secrets_dpapi as dpapi_mod
+
+    def _raise(*_a: object, **_k: object) -> None:
+        raise dpapi_mod.DpapiUnavailable("DPAPI is Windows-only")
+
+    monkeypatch.setattr(dpapi_mod, "protect_key_to_file", _raise)
+    rc = main(["protect-key", "--out", str(tmp_path / "k.dpapi"), "--generate"])
+    assert rc == 2
+    assert "protect-key is Windows-only" in capsys.readouterr().err
+
+
+def test_protect_key_rejects_wrong_length_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A base64 key that decodes to the wrong byte count (16, not 32) is refused before any DPAPI call.
+    import base64
+
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", base64.b64encode(b"\x00" * 16).decode("ascii"))
+    rc = main(["protect-key", "--out", str(tmp_path / "k.dpapi")])
+    assert rc == 2
+    assert "base64 of 32 bytes" in capsys.readouterr().err
+
+
+def test_protect_key_rejects_non_base64_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A non-base64 value fails the decode -> raw="" -> the same 32-byte validation branch refuses it.
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "not valid base64!!!")
+    rc = main(["protect-key", "--out", str(tmp_path / "k.dpapi")])
+    assert rc == 2
+    assert "base64 of 32 bytes" in capsys.readouterr().err
+
+
+def test_protect_key_no_key_to_protect(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # No env key and no --generate: there is nothing to protect, so the CLI refuses.
+    monkeypatch.delenv("MEFOR_STORE_ENCRYPTION_KEY", raising=False)
+    rc = main(["protect-key", "--out", str(tmp_path / "k.dpapi")])
+    assert rc == 2
+    assert "no key to protect" in capsys.readouterr().err
+
+
 # --- L5b off-loopback browser-exposure ladder (ADR 0068 §8) --------------------------------------
 #
 # The new refusals/warnings EXTEND the existing gates (never weaken — the AC-6 and MFA-at-exposure
@@ -874,8 +1142,9 @@ def test_serve_ui_upstream_requires_public_origin(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nserve_ui = true\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n'
-        "[egress]\ndeny_by_default = true\n",
+        "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
     assert "requires [api].public_origin" in capsys.readouterr().err
@@ -885,11 +1154,16 @@ def test_serve_ui_upstream_with_public_origin_starts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # The refusal's happy path: one config line satisfies it (the error message names it).
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet — the /ui
+    # ladder is the subject here.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nserve_ui = true\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n'
-        'public_origin = "https://mefor.example.org"\n[egress]\ndeny_by_default = true\n',
+        "security.handles_real_patient_data = false\n"
+        "security.serve_web_console = true\n"
+        'security.web_console_public_address = "https://mefor.example.org"\n'
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 0
     assert "requires [api].public_origin" not in capsys.readouterr().err
@@ -903,8 +1177,10 @@ def test_serve_ui_http_public_origin_refused_with_declared_tls(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nserve_ui = true\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n'
-        'public_origin = "http://mefor.example.org"\n[egress]\ndeny_by_default = true\n',
+        "security.serve_web_console = true\n"
+        'security.web_console_public_address = "http://mefor.example.org"\n'
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
     )
     assert rc == 2
     assert "public_origin is http://" in capsys.readouterr().err
@@ -915,11 +1191,14 @@ def test_serve_ui_warns_on_undeclared_proxy_signal(
 ) -> None:
     # public_origin set on an unprotected loopback instance = the undeclared-proxy heuristic:
     # WARN (cookie ships without Secure until the posture is declared) but still start.
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nserve_ui = true\npublic_origin = "https://mefor.example.org"\n'
-        "[egress]\ndeny_by_default = true\n",
+        "security.handles_real_patient_data = false\n"
+        "security.serve_web_console = true\n"
+        'security.web_console_public_address = "https://mefor.example.org"\n'
+        "security.block_unlisted_outbound = true\n",
     )
     assert rc == 0
     err = capsys.readouterr().err
@@ -934,9 +1213,12 @@ def test_serve_ui_exposed_emits_842_guidance_and_new_ip_advisory(
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
-        '[api]\nserve_ui = true\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n'
-        'public_origin = "https://mefor.example.org"\n'
-        "[auth]\nrequire_mfa = true\n[egress]\ndeny_by_default = true\n",
+        'security.enforcement = "warn"\n'
+        "security.serve_web_console = true\n"
+        'security.web_console_public_address = "https://mefor.example.org"\n'
+        "security.require_mfa = true\n"
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
         env="staging",
     )
     assert rc == 0
@@ -955,15 +1237,13 @@ def test_serve_ui_declared_proxy_requires_mfa_on_prod_phi(
         tmp_path,
         monkeypatch,
         # require_mfa = false opts out of the BACKLOG #187 secure default so the exposure gate fires.
-        """[api]
-serve_ui = true
+        """security.serve_web_console = true
+security.web_console_public_address = "https://mefor.example.org"
+security.require_mfa = false
+security.block_unlisted_outbound = true
+[api]
 tls_terminated_upstream = true
 trusted_proxies = ["10.0.0.2"]
-public_origin = "https://mefor.example.org"
-[auth]
-require_mfa = false
-[egress]
-deny_by_default = true
 """,
         env="prod",
     )
@@ -975,26 +1255,113 @@ deny_by_default = true
 def test_serve_ui_declared_proxy_warns_mfa_on_staging_phi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Non-production PHI keeps the warn tier (parity with the off-loopback-bind gate).
+    # enforcement=warn reproduces the historical non-production warn tier (parity with the off-loopback
+    # bind gate); the security dial is decoupled from the production tier.
     rc = _l5b_serve(
         tmp_path,
         monkeypatch,
         # require_mfa = false opts out of the BACKLOG #187 secure default so the exposure gate fires.
-        """[api]
-serve_ui = true
+        """security.enforcement = "warn"
+security.serve_web_console = true
+security.web_console_public_address = "https://mefor.example.org"
+security.require_mfa = false
+security.block_unlisted_outbound = true
+[api]
 tls_terminated_upstream = true
 trusted_proxies = ["10.0.0.2"]
-public_origin = "https://mefor.example.org"
-[auth]
-require_mfa = false
-[egress]
-deny_by_default = true
 """,
         env="staging",
     )
     assert rc == 0
     err = capsys.readouterr().err
     assert "declared reverse proxy" in err and "single-factor over the network" in err
+
+
+# --- ADR 0143: the browser console is ON by default (loopback secure-context) ---------------------
+
+
+def test_serve_ui_default_on_loopback_mounts_ui(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ADR 0143: a BARE loopback serve (no [security]) mounts /ui by DEFAULT and no exposure gate
+    # refuses. create_managed_app is captured so we can assert the console is on (serve_ui=True) and
+    # the loopback secure-context signal (loopback=True) threads through to the app.
+    captured: dict[str, object] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    # GIVEN 1 (ADR 0148): declare synthetic so the bare loopback serve stays quiet on the PHI gates and
+    # only the ADR 0143 default-on console behavior is under test.
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        "messagefoundry.api.create_managed_app", lambda **kw: captured.update(kw) or object()
+    )
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+    assert rc == 0
+    assert captured["serve_ui"] is True  # console mounted by default (ADR 0143)
+    assert (
+        captured["loopback"] is True
+    )  # loopback secure-context signal threaded (http://127.0.0.1)
+    # no /ui exposure-gate refusal on the loopback default
+    assert "refusing to serve the browser ops dashboard" not in capsys.readouterr().err
+
+
+def test_serve_ui_explicit_offloopback_still_refuses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ADR 0143: the off-loopback /ui refusals are UNCHANGED for an EXPLICITLY-enabled console — an
+    # explicit serve_web_console=true behind a declared upstream proxy with no public_origin STILL
+    # refuses (the console stays opt-in + TLS-gated off-box).
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        "security.serve_web_console = true\n"
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+    )
+    assert rc == 2
+    assert "requires [api].public_origin" in capsys.readouterr().err
+
+
+def test_serve_ui_default_on_offloopback_degrades_json_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ADR 0143: the console defaults ON for LOOPBACK binds only. A DEFAULT-on (not explicitly requested)
+    # console on an off-loopback bind AUTO-DEGRADES to JSON-only rather than tripping the /ui exposure
+    # refusal — so a previously-working off-loopback JSON serve is not turned into a start failure.
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.2"]\n',
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "on by default (ADR 0143) for LOCAL loopback binds only" in err
+    assert "requires [api].public_origin" not in err  # the /ui refusal did NOT fire
+
+
+def test_serve_ui_default_on_public_origin_degrades_json_only(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ADR 0143: the `public_origin` branch of console_exposed also auto-degrades a DEFAULT-on console to
+    # JSON-only (pins the second OR-branch, not just tls_terminated_upstream). A set
+    # web_console_public_address with no explicit serve_web_console must NOT trip the /ui exposure refusal.
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI retention/notify gates stay quiet.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        "security.handles_real_patient_data = false\n"
+        "security.block_unlisted_outbound = true\n"
+        'security.web_console_public_address = "https://ops.example.com"\n',
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "on by default (ADR 0143) for LOCAL loopback binds only" in err
 
 
 # --- #186a secure-by-default data retention (bounded PHI-body windows) ----------------------------
@@ -1008,11 +1375,12 @@ def test_serve_refuses_unbounded_messages_retention_in_prod(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
+        "security.block_unlisted_outbound = true\n[retention]\ndead_letter_days = 30\n"
+        + _SECURE_ALERTS,
     )
     assert rc == 2
     err = capsys.readouterr().err
-    assert "[retention].messages_days" in err and "refusing to start" in err
+    assert "[security].delete_message_bodies_after_days" in err and "refusing to start" in err
 
 
 def test_serve_refuses_unbounded_dead_letter_retention_in_prod(
@@ -1024,34 +1392,86 @@ def test_serve_refuses_unbounded_dead_letter_retention_in_prod(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n[retention]\nmessages_days = 30\n" + _SECURE_ALERTS,
+        "security.block_unlisted_outbound = true\nsecurity.delete_message_bodies_after_days = 30\n"
+        + _SECURE_ALERTS,
     )
     assert rc == 2
     err = capsys.readouterr().err
     assert "[retention].dead_letter_days" in err and "refusing to start" in err
 
 
-def test_serve_retention_warns_not_refuses_in_staging(
+def test_serve_retention_auto_bounds_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Non-production PHI (staging) only WARNS on unbounded retention and still starts (warn tier).
-    rc, _ = _run_secure_serve(
+    # WP243 (#243, ASVS 14.2.7): non-production PHI (staging) with no [retention] windows now AUTO-BOUNDS
+    # each unset window to 30 days (secure-by-default) instead of merely warning — and never refuses.
+    rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n" + _SECURE_ALERTS,  # no [retention] windows
+        # enforcement=warn reproduces the non-production dial: unset windows AUTO-BOUND (not refuse).
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        + _SECURE_ALERTS,  # no [retention] windows
         env="staging",
     )
     assert rc == 0
+    retention = captured["retention_settings"]
+    assert retention.messages_days == 30 and retention.dead_letter_days == 30  # type: ignore[attr-defined]
     err = capsys.readouterr().err
-    assert "PHI message bodies accumulate without bound" in err
-    assert "refusing to start" not in err  # warned, did not refuse
+    assert "defaulted ON (30 days)" in err
+    assert "accumulate without bound" not in err  # auto-bounded, no longer merely warns
+    assert "refusing to start" not in err
+
+
+def test_serve_auto_bounds_retention_on_loopback_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # WP243 (#243, ASVS 14.2.7): a declared-PHI loopback instance ([ai].data_class=phi on a dev-named
+    # box) with no [retention] windows auto-bounds both PHI-body windows to 30 days.
+    rc, captured = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.handles_real_patient_data = true\n'
+        "security.block_unlisted_outbound = true\n" + _SECURE_ALERTS,
+        env="dev",
+    )
+    assert rc == 0
+    retention = captured["retention_settings"]
+    assert retention.messages_days == 30 and retention.dead_letter_days == 30  # type: ignore[attr-defined]
+    assert "defaulted ON (30 days)" in capsys.readouterr().err
+
+
+def test_serve_retention_respects_explicit_zero_in_staging(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # TRAP-C: an EXPLICIT 0 window on non-prod PHI is respected (model_fields_set), NOT auto-bounded —
+    # it stays 0 and the instance warns about the deliberately-unbounded window rather than defaulting it.
+    rc, captured = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        "security.delete_message_bodies_after_days = 0\n"
+        "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
+        env="staging",
+    )
+    assert rc == 0
+    retention = captured["retention_settings"]
+    assert retention.messages_days == 0  # type: ignore[attr-defined]  # explicit 0 respected, not bumped
+    assert retention.dead_letter_days == 30  # type: ignore[attr-defined]
+    assert "PHI message bodies accumulate without bound" in capsys.readouterr().err
 
 
 def test_serve_retention_quiet_in_synthetic_dev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A synthetic instance (dev) is exempt from the retention gate — byte-identical keyless start.
-    rc, _ = _run_secure_serve(tmp_path, monkeypatch, "", env="dev", key=False)
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare the synthetic opt-out explicitly.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.handles_real_patient_data = false\n",
+        env="dev",
+        key=False,
+    )
     assert rc == 0
     assert "retention" not in capsys.readouterr().err.lower()
 
@@ -1059,17 +1479,20 @@ def test_serve_retention_quiet_in_synthetic_dev(
 def test_serve_allow_unbounded_phi_override_starts_in_prod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The explicit, audited opt-out: [retention].allow_unbounded_phi=true downgrades the prod refusal
+    # The explicit, audited opt-out: [security].allow_keeping_phi_indefinitely=true downgrades the prod refusal
     # to a loud warning and starts (keep-forever retention accepted in writing).
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n[retention]\nallow_unbounded_phi = true\n"
+        "security.block_unlisted_outbound = true\nsecurity.allow_keeping_phi_indefinitely = true\n"
         + _SECURE_ALERTS,
     )
     assert rc == 0
     err = capsys.readouterr().err
-    assert "allow_unbounded_phi=true" in err and "retains PHI message bodies indefinitely" in err
+    assert (
+        "allow_keeping_phi_indefinitely=true" in err
+        and "retains PHI message bodies indefinitely" in err
+    )
 
 
 # --- #186c egress deny-by-default effective flip (production PHI) ---------------------------------
@@ -1085,44 +1508,88 @@ def test_serve_egress_deny_by_default_flips_on_prod(
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        '[egress]\nallowed_mllp = ["10.0.0.5"]\n' + _SECURE_RETENTION + _SECURE_ALERTS,
+        _SECURE_RETENTION + '[egress]\nallowed_mllp = ["10.0.0.5"]\n' + _SECURE_ALERTS,
     )
     assert rc == 0
     assert captured["egress_settings"].deny_by_default is True  # type: ignore[attr-defined]
-    assert "deny_by_default defaulted ON for a production PHI instance" in capsys.readouterr().err
+    assert (
+        "block_unlisted_outbound defaulted ON for a production PHI instance"
+        in capsys.readouterr().err
+    )
 
 
 def test_serve_egress_explicit_deny_false_warns_in_prod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The explicit, audited opt-out: [egress].deny_by_default=false on a production PHI instance keeps
+    # The explicit, audited opt-out: [security].block_unlisted_outbound=false on a production PHI instance keeps
     # the allow-any posture (NOT flipped) and emits a loud warning.
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        '[egress]\ndeny_by_default = false\nallowed_mllp = ["10.0.0.5"]\n'
+        "security.block_unlisted_outbound = false\n"
         + _SECURE_RETENTION
+        + '[egress]\nallowed_mllp = ["10.0.0.5"]\n'
         + _SECURE_ALERTS,
     )
     assert rc == 0
     assert captured["egress_settings"].deny_by_default is False  # type: ignore[attr-defined]
-    assert "deny_by_default=false on a production PHI instance" in capsys.readouterr().err
+    assert "block_unlisted_outbound=false on a production PHI instance" in capsys.readouterr().err
 
 
-def test_serve_egress_flip_skipped_in_staging(
+def test_serve_egress_flip_fires_in_staging_phi(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # The deny-by-default effective flip is production-only: a staging PHI instance with the field unset
-    # stays byte-identical (deny_by_default False) and gains no egress flip notice.
+    # WP243 (#243, ASVS 13.2.4/13.2.5): the deny-by-default effective flip now fires on ANY PHI
+    # instance, not just production — a staging PHI instance with the field unset gets deny_by_default
+    # flipped ON (the notice reads "PHI instance", not "production PHI instance", off production).
     rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        '[egress]\nallowed_mllp = ["10.0.0.5"]\n' + _SECURE_RETENTION + _SECURE_ALERTS,
+        _SECURE_RETENTION + '[egress]\nallowed_mllp = ["10.0.0.5"]\n' + _SECURE_ALERTS,
         env="staging",
     )
     assert rc == 0
+    assert captured["egress_settings"].deny_by_default is True  # type: ignore[attr-defined]
+    err = capsys.readouterr().err
+    assert "block_unlisted_outbound defaulted ON for a PHI instance" in err
+    assert "production PHI instance" not in err
+
+
+def test_serve_auto_denies_egress_on_loopback_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # WP243 (#243): a declared-PHI loopback instance (a dev-named box that sets [ai].data_class=phi)
+    # with no [egress] section still gets deny_by_default flipped ON — the flip keys on DECLARED PHI,
+    # not the built-in env name. (Open egress also warns on the non-prod instance; the flip closes it.)
+    rc, captured = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\nsecurity.handles_real_patient_data = true\n'
+        + _SECURE_RETENTION
+        + _SECURE_ALERTS,
+        env="dev",
+    )
+    assert rc == 0
+    assert captured["egress_settings"].deny_by_default is True  # type: ignore[attr-defined]
+    assert "block_unlisted_outbound defaulted ON for a PHI instance" in capsys.readouterr().err
+
+
+def test_serve_egress_flip_skipped_for_synthetic_dev(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # Byte-identical guard (TRAP-D): a NON-PHI (synthetic dev) serve is untouched by the WP243
+    # broadening — deny_by_default stays False and no flip notice is emitted. GIVEN 1 (ADR 0148): dev
+    # derives PHI now, so declare the synthetic opt-out explicitly to keep the flip skipped.
+    rc, captured = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        'security.handles_real_patient_data = false\n[egress]\nallowed_mllp = ["10.0.0.5"]\n',
+        env="dev",
+        key=False,  # synthetic — the flip keys on declared PHI
+    )
+    assert rc == 0
     assert captured["egress_settings"].deny_by_default is False  # type: ignore[attr-defined]
-    assert "deny_by_default defaulted ON" not in capsys.readouterr().err
+    assert "defaulted ON" not in capsys.readouterr().err
 
 
 # --- #188 out-of-band security-notification channel effective by default -------------------------
@@ -1137,7 +1604,7 @@ def test_serve_refuses_no_security_notify_channel_in_prod(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n" + _SECURE_RETENTION,  # no [alerts] SMTP
+        "security.block_unlisted_outbound = true\n" + _SECURE_RETENTION,  # no [alerts] SMTP
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -1152,7 +1619,7 @@ def test_serve_refuses_when_notify_security_events_off_in_prod(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n"
+        "security.block_unlisted_outbound = true\n"
         + _SECURE_RETENTION
         + _SECURE_ALERTS
         + "[auth]\nnotify_security_events = false\n",
@@ -1165,11 +1632,12 @@ def test_serve_refuses_when_notify_security_events_off_in_prod(
 def test_serve_notify_warns_not_refuses_in_staging(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # Non-production PHI (staging) only WARNS when no notify channel exists and still starts.
+    # enforcement=warn reproduces the non-production dial: a missing notify channel only WARNS + starts.
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n" + _SECURE_RETENTION,  # no SMTP
+        'security.enforcement = "warn"\nsecurity.block_unlisted_outbound = true\n'
+        + _SECURE_RETENTION,  # no SMTP
         env="staging",
     )
     assert rc == 0
@@ -1186,7 +1654,7 @@ def test_serve_security_notifications_required_override_starts_in_prod(
     rc, _ = _run_secure_serve(
         tmp_path,
         monkeypatch,
-        "[egress]\ndeny_by_default = true\n"
+        "security.block_unlisted_outbound = true\n"
         + _SECURE_RETENTION
         + "[alerts]\nsecurity_notifications_required = false\n",  # opt-out, no SMTP
     )
@@ -1200,7 +1668,14 @@ def test_serve_notify_quiet_in_synthetic_dev(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     # A synthetic instance (dev) is exempt from the security-notification gate — byte-identical start.
-    rc, _ = _run_secure_serve(tmp_path, monkeypatch, "", env="dev", key=False)
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare the synthetic opt-out explicitly.
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.handles_real_patient_data = false\n",
+        env="dev",
+        key=False,
+    )
     assert rc == 0
     assert "security-notification" not in capsys.readouterr().err
 
@@ -1218,8 +1693,11 @@ def test_serve_require_encryption_starts_with_configured_key(
 
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", generate_key())  # a configured (foreign) key
+    # GIVEN 1 (ADR 0148): declare synthetic so the PHI egress/retention/notify gates stay quiet and
+    # only the require_encryption presence guard is under test.
     (tmp_path / "messagefoundry.toml").write_text(
-        "[store]\nrequire_encryption = true\n", encoding="utf-8"
+        "security.handles_real_patient_data = false\n[store]\nrequire_encryption = true\n",
+        encoding="utf-8",
     )
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)

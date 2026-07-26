@@ -67,6 +67,13 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.parsing.binary import BinaryCarriageError
 from messagefoundry.parsing.binary import decode as _carriage_decode
 from messagefoundry.parsing.dicom._deps import load_dcmread
+from messagefoundry.parsing.dicom._inflate import (
+    DEFAULT_MAX_INFLATED_BYTES,
+    DEFLATED_EXPLICIT_VR_LE,
+    bounded_inflate_or_error,
+    guard_part10_deflate,
+)
+from messagefoundry.parsing.dicom.errors import DicomBombError
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -204,7 +211,9 @@ class DicomScpSource(SourceConnector):
         # Imported lazily (the [dicom] extra); a missing extra surfaces as an internal/connection error
         # at start, not a per-message data error — like the FHIR/SQL-Server backends.
         from pynetdicom import AE, StoragePresentationContexts, evt
-        from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]  # generated SOP-class const
+        from pynetdicom.sop_class import (  # type: ignore[attr-defined]
+            Verification,  # generated SOP-class const
+        )
 
         ae = AE(ae_title=self._ae_title)
         ae.maximum_associations = self._max_associations
@@ -258,6 +267,15 @@ class DicomScpSource(SourceConnector):
                     calling_ae,
                 )
                 return _STATUS_NOT_AUTHORIZED
+            # ASVS 5.2.3 (the network-facing SCP): when the negotiated presentation context is Deflated
+            # Explicit VR LE, pynetdicom would inflate the received Data Set UNBOUNDED the instant we
+            # touch event.dataset (max_object_bytes is checked only AFTER the post-inflation save_as
+            # re-encode). Pre-check the inflate in bounded memory over the RAW event.request.DataSet bytes
+            # BEFORE event.dataset — an over-cap deflate bomb is a DIMSE failure (never committed, never
+            # decoded). Bound by the object-size policy the SCP already enforces.
+            deflate_bomb = self._deflated_over_cap(event, peer_ip=peer_ip, calling_ae=calling_ae)
+            if deflate_bomb is not None:
+                return deflate_bomb
             # Re-encode the received object to its full Part-10 bytes (preamble + DICM + file meta).
             try:
                 dataset = event.dataset
@@ -293,6 +311,37 @@ class DicomScpSource(SourceConnector):
         except Exception as exc:  # noqa: BLE001 - last-resort: a callback must never raise to pynetdicom
             logger.error("DICOM C-STORE failed unexpectedly: %s", safe_exc(exc))
             return _STATUS_CANNOT_UNDERSTAND
+
+    def _deflated_over_cap(self, event: Any, *, peer_ip: str, calling_ae: str) -> int | None:
+        """ASVS 5.2.3 SCP guard. When the accepted context's transfer syntax is Deflated Explicit VR LE,
+        bound-inflate the RAW ``event.request.DataSet`` bytes (BEFORE ``event.dataset`` decodes them) and
+        return a DIMSE **failure** status if the object inflates past the cap — else ``None`` (proceed).
+        The bound is ``max_object_bytes`` (the object-size policy already enforced post-inflation), or the
+        16 MiB codec default when uncapped. PHI-safe: logs the cap + routing identifiers, never bytes."""
+        transfer_syntax = str(getattr(getattr(event, "context", None), "transfer_syntax", "") or "")
+        if transfer_syntax != DEFLATED_EXPLICIT_VR_LE:
+            return None
+        request = getattr(event, "request", None)
+        data_set = getattr(request, "DataSet", None)
+        if data_set is None:
+            return None  # nothing to inflate; the normal decode path handles an empty request
+        cap = (
+            self._max_object_bytes
+            if self._max_object_bytes is not None
+            else DEFAULT_MAX_INFLATED_BYTES
+        )
+        try:
+            bounded_inflate_or_error(data_set.getvalue(), max_bytes=cap)
+        except DicomBombError:
+            logger.warning(
+                "DICOM C-STORE from %s (AE %r): deflated object inflates past cap %d bytes — "
+                "refusing before decode",
+                peer_ip,
+                calling_ae,
+                cap,
+            )
+            return _STATUS_OUT_OF_RESOURCES
+        return None
 
     def _commit(
         self, object_bytes: bytes, *, peer_ip: str, sop_instance: str, sop_class: str
@@ -507,8 +556,28 @@ class DicomScuDestination(DestinationConnector):
     def _c_store(self, object_bytes: bytes) -> None:
         """Blocking: parse → associate → C-STORE → classify. Runs on a worker thread (``to_thread``),
         never the loop. ``load_dcmread`` is called first (outside the try) so a missing ``[dicom]`` extra
-        surfaces as a deploy ``RuntimeError`` (internal error), not a per-message data ``ERROR``."""
+        surfaces as a deploy ``RuntimeError`` (internal error), not a per-message data ``ERROR``.
+
+        ASVS 5.2.3 (SCU side): a **deflated** Part-10 file-drop passes the File source's DICM-magic-only
+        sniff and reaches this ``dcmread`` unparsed, where it would inflate UNBOUNDED — so bound the
+        inflate here too, ahead of ``dcmread``. (The network-facing SCP has its own guard over the
+        negotiated transfer syntax in ``_on_c_store``.) A deflate bomb is a permanent dead-letter (a retry
+        re-sends the identical bad object)."""
         dcmread = load_dcmread()
+        try:
+            guard_part10_deflate(
+                object_bytes,
+                max_bytes=self._max_object_bytes
+                if self._max_object_bytes is not None
+                else DEFAULT_MAX_INFLATED_BYTES,
+            )
+        except DicomBombError as exc:
+            raise NegativeAckError(
+                "DICOM C-STORE SCU: outgoing deflated object inflates past the max-object cap "
+                "(no retry)",
+                code="deflate-bomb",
+                permanent=True,
+            ) from exc
         try:
             dataset = dcmread(BytesIO(object_bytes))
             transfer_syntax = dataset.file_meta.TransferSyntaxUID
@@ -614,7 +683,9 @@ class DicomScuDestination(DestinationConnector):
         await asyncio.to_thread(self._c_echo)
 
     def _c_echo(self) -> None:
-        from pynetdicom.sop_class import Verification  # type: ignore[attr-defined]  # generated SOP-class const
+        from pynetdicom.sop_class import (  # type: ignore[attr-defined]
+            Verification,  # generated SOP-class const
+        )
 
         ae = self._build_ae()
         ae.add_requested_context(Verification)

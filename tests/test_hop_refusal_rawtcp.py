@@ -38,9 +38,9 @@ from messagefoundry.transports.tcp import TcpDestination
 from messagefoundry.transports.x12 import X12Destination
 
 # The three postures the gradient keys on (the AI-derived is_phi/production).
-PROD_PHI = HopPosture(is_phi=True, production=True)
-STAGING_PHI = HopPosture(is_phi=True, production=False)
-SYNTHETIC = HopPosture(is_phi=False, production=True)  # not is_phi → always ALLOW
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
 
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as remote/off-box)
 LOOPBACK = "127.0.0.1"
@@ -136,7 +136,7 @@ PLAINTEXT_BUILDERS = [
 
 @pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
 def test_construction_refuses_prod_phi_remote_cleartext(build_cfg, connector) -> None:
-    with active_hop_posture(PROD_PHI):  # the ENFORCED gate (posture stamped)
+    with active_hop_posture(PROD_PHI):  # the ENFORCED gate (posture stamped)  # noqa: SIM117
         with pytest.raises(InsecureHopRefused):
             connector(build_cfg(REMOTE))
 
@@ -170,9 +170,8 @@ def test_construction_warns_but_crosses_staging_phi(build_cfg, connector) -> Non
 
 @pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
 def test_construction_attested_allows_prod_phi(build_cfg, connector, caplog) -> None:
-    with active_hop_posture(PROD_PHI):
-        with caplog.at_level("WARNING"):
-            connector(build_cfg(REMOTE, attested=True, reason="proxy-terminated trusted segment"))
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        connector(build_cfg(REMOTE, attested=True, reason="proxy-terminated trusted segment"))
     # The attestation suppressed a would-be production refusal, so it is AUDITED (loud-logged).
     assert any("operator attestation" in r.message for r in caplog.records)
 
@@ -215,9 +214,8 @@ def test_escape_downgrades_staging_phi_but_never_prod(monkeypatch) -> None:
         TcpDestination(tcp_cfg(REMOTE))
     # Production PHI: the escape is CLAMPED to non-production, so it can NEVER satisfy a prod-PHI hop —
     # the production REFUSE arm still wins even with the escape set (decision 2 behaviour change).
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused):
-            TcpDestination(tcp_cfg(REMOTE))
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        TcpDestination(tcp_cfg(REMOTE))
 
 
 # --- send-time backstop (zero-I/O, before the first payload byte) -------------
@@ -344,9 +342,8 @@ def test_mllp_verify_off_still_refuses_under_staging_phi() -> None:
         type=ConnectorType.MLLP,
         settings={"host": REMOTE, "port": 5000, "tls": True, "tls_verify": False},
     )
-    with active_hop_posture(STAGING_PHI):
-        with pytest.raises(ValueError, match="tls_verify=false"):
-            MLLPDestination(cfg)
+    with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="tls_verify=false"):
+        MLLPDestination(cfg)
 
 
 def test_credentialed_plain_ftp_still_refuses_under_staging_phi() -> None:
@@ -363,6 +360,5 @@ def test_credentialed_plain_ftp_still_refuses_under_staging_phi() -> None:
             "password": "p",
         },
     )
-    with active_hop_posture(STAGING_PHI):
-        with pytest.raises(ValueError, match="CLEARTEXT"):
-            RemoteFileDestination(cfg)
+    with active_hop_posture(STAGING_PHI), pytest.raises(ValueError, match="CLEARTEXT"):
+        RemoteFileDestination(cfg)

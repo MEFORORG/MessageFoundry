@@ -23,6 +23,14 @@
                                                 engine the harness OWNS, and read the connection-scale
                                                 walls vs N. Exits 0 (no-loss + SLOs met) / 1 (an SLO
                                                 violated) / 2 (setup) / 3 (interrupted).
+``python -m harness --estate NAME``   → run the ESTATE demo-shape drive (#216): spin up a HETEROGENEOUS
+                                                estate (a majority of simple 1-in-1-out feeds + a minority
+                                                of fan-out hubs) and drive each connection at a calibrated
+                                                per-connection EVENT rate so the aggregate converges on a
+                                                target total events/sec (the 45M/day = ~520 ev/s shape).
+                                                Reports the achieved event rate + realized simple/hub split
+                                                vs spec. Exits 0 (no-loss + SLOs met) / 1 (violated) / 2
+                                                (setup) / 3 (interrupted).
 ``python -m harness multishard ...``  → run the multi-ENGINE store-contention sweep (WS-B): spin up N
                                                 concurrently-active `serve` engines against ONE shared
                                                 store (disjoint inbound/sink/API ports + disjoint
@@ -154,6 +162,23 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="list built-in connection-scale profiles",
     )
+    parser.add_argument(
+        "--estate",
+        help="run this ESTATE demo-shape profile (#216; built-in name or path to a .toml) and exit: "
+        "drive a heterogeneous estate (majority simple pass-through feeds + a minority of fan-out hubs) "
+        "at a calibrated per-connection EVENT rate so the aggregate converges on a target total ev/s",
+    )
+    parser.add_argument(
+        "--estate-api-port",
+        type=int,
+        default=8850,
+        help="estate: engine API port for the owned engine subprocess",
+    )
+    parser.add_argument(
+        "--list-estate-profiles",
+        action="store_true",
+        help="list built-in estate demo-shape profiles",
+    )
     parser.add_argument("--list-profiles", action="store_true", help="list built-in load profiles")
     parser.add_argument("--engine", default="http://127.0.0.1:8765", help="engine API base URL")
     parser.add_argument("--token", help="bearer token for an auth-enabled engine")
@@ -210,9 +235,14 @@ def main(argv: list[str] | None = None) -> int:
         return _list_profiles()
     if args.list_connscale_profiles:
         return _list_connscale_profiles()
-    if sum(bool(x) for x in (args.load, args.scenario, args.failover, args.connscale)) > 1:
+    if args.list_estate_profiles:
+        return _list_estate_profiles()
+    if (
+        sum(bool(x) for x in (args.load, args.scenario, args.failover, args.connscale, args.estate))
+        > 1
+    ):
         print(
-            "--load, --failover, --connscale, and --scenario are mutually exclusive",
+            "--load, --failover, --connscale, --estate, and --scenario are mutually exclusive",
             file=sys.stderr,
         )
         return 2
@@ -220,6 +250,8 @@ def main(argv: list[str] | None = None) -> int:
         return _run_failover(args)
     if args.connscale:
         return _run_connscale(args)
+    if args.estate:
+        return _run_estate(args)
     if args.load:
         return _run_load(args)
     if args.scenario:
@@ -473,6 +505,50 @@ def _run_connscale(args: argparse.Namespace) -> int:
     return report.exit_code
 
 
+def _list_estate_profiles() -> int:
+    from harness.load.estate.profile import list_estate_profiles
+
+    for name, description in list_estate_profiles().items():
+        print(f"  {name:<20} {description}")
+    return 0
+
+
+def _run_estate(args: argparse.Namespace) -> int:
+    import asyncio
+    from pathlib import Path
+
+    from harness.load.estate.profile import EstateProfileError, get_estate_profile
+    from harness.load.estate.runner import EstateError, run_estate
+
+    try:
+        profile = get_estate_profile(args.estate)
+    except EstateProfileError as exc:
+        print(f"bad estate profile: {exc}", file=sys.stderr)
+        return 2
+
+    try:
+        report = asyncio.run(
+            run_estate(
+                profile,
+                engine_api_port=args.estate_api_port,
+                sink_host="127.0.0.1",
+                sink_port=args.sink_port,
+                sink_ports=args.sink_ports,
+            )
+        )
+    except EstateError as exc:
+        print(f"estate setup failed: {exc}", file=sys.stderr)
+        return 2
+    except KeyboardInterrupt:
+        print("interrupted", file=sys.stderr)
+        return 3
+
+    print(report.render_console())
+    if args.report_json:
+        Path(args.report_json).write_text(report.to_json(), encoding="utf-8")
+    return report.exit_code
+
+
 def _run_multishard(argv: list[str]) -> int:
     import asyncio
     import os
@@ -630,6 +706,96 @@ def _add_shape_args(parser: argparse.ArgumentParser) -> None:
         help="D: destinations each accepted message actually delivers to — THE FAN-OUT (default: = "
         "--dests). Must satisfy 1 <= D <= --dests and D <= --handlers, else the graph fails loud",
     )
+    parser.add_argument(
+        "--routing",
+        choices=("broadcast", "partitioned", "partitioned-fanout"),
+        default="broadcast",
+        help="broadcast (default, unchanged): the router selects EVERY handler, so every message is "
+        "delivered to EVERY destination — which, because an outbound lane is strict-FIFO hard-1, caps "
+        "INGRESS at one message per per-lane cycle (~16 msg/s) at ANY --dests, by construction. "
+        "partitioned: the router selects ONE handler (destination = splitmix64(seq) %% --dests, off the "
+        "MSH-10 sequence number), which delivers to ONE destination — the REAL hub shape. Delivery is "
+        "unchanged (same lanes, same cycle) but a message occupies ONE lane, so ingress ~= aggregate "
+        "deliveries ~= dests/cycle. Fan-out is 1, so events/msg = 2 and txn/msg = 7 (vs 259 at H=D=64). "
+        "Rejected with --handlers/--delivering (partitioned pins H = D = --dests and expresses the fan-out "
+        "in the ROUTER). "
+        "partitioned-fanout: partitioned's high-ingress scaling but each message delivers to D DISTINCT "
+        "destinations (D = --delivering, chosen via splitmix64 partial Fisher-Yates off MSH-10), so "
+        "events/msg = 1 + D and txn/msg = 3 + 2D + 2D. REQUIRES --delivering (2 <= D < --dests); rejects "
+        "--handlers (H = --dests built). Size --dests >= D*G (G = shards*lanes-per-shard) so the effective "
+        "outbound width dests/D stays at least as wide as the inbound band; the fan-out lane-headroom "
+        "pre-flight warns (and refuses under --strict-inbound-bands) otherwise",
+    )
+
+
+def _reject_shape_overrides_under_partitioned(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    """Per-mode CLI guard on ``--handlers``/``--delivering``, mirroring :func:`load_shape` (which stays the
+    AUTHORITY and also guards the env-var path a shard subprocess resolves; this just turns a config-load
+    ValueError into a clean argparse usage error).
+
+    ``--routing partitioned`` pins ``H = D = --dests`` (the fan-out lives in the ROUTER, not in a
+    self-filtering handler), so BOTH ``--handlers`` and ``--delivering`` describe a shape it cannot serve.
+
+    ``--routing partitioned-fanout`` builds ``H = --dests`` owners (so ``--handlers`` is still rejected) but
+    the fan-out D IS ``--delivering``, so ``--delivering`` is REQUIRED — without it D would default to
+    ``--dests`` and degenerate to a broadcast-shaped delivery. (load_shape enforces the ``2 <= D <= dests``
+    value bound.)"""
+    if args.routing == "partitioned" and (args.handlers is not None or args.delivering is not None):
+        parser.error(
+            "--routing partitioned pins HANDLERS == DELIVERING == DESTS (the router selects ONE handler, "
+            "which delivers to ONE destination — the fan-out is 1 by construction, not by --delivering). "
+            "Drop --handlers/--delivering, or use --routing partitioned-fanout for a fan-out D > 1."
+        )
+    if args.routing == "partitioned-fanout":
+        if args.handlers is not None:
+            parser.error(
+                "--routing partitioned-fanout builds one owner handler per destination (HANDLERS == "
+                "--dests); the fan-out is --delivering, selected in the router. Drop --handlers."
+            )
+        if args.delivering is None:
+            parser.error(
+                "--routing partitioned-fanout REQUIRES --delivering (the fan-out D >= 2): each message "
+                "delivers to D distinct destinations. Without it, D defaults to --dests (a broadcast-"
+                "shaped delivery that re-caps ingress)."
+            )
+
+
+def _add_bench_truth_args(parser: argparse.ArgumentParser) -> None:
+    """The two BENCH-TRUTH knobs every shardcert entry point must expose (2026-07-14).
+
+    ``--store-pool-size`` (ARTIFACT 2): the bench used to pin ``MEFOR_STORE_POOL_SIZE=8`` — a FIFTH of the
+    product default — with a bare ``setdefault``, recorded in no artifact. The pool is per shard PROCESS, so
+    a 4-shard fleet ran on 32 store connections against a product posture of 160, and a POOL BIND is
+    indistinguishable, column for column, from the pooled-claim wall it would have been blamed on. The
+    default is now THE PRODUCT DEFAULT, the value is RECORDED in the report, and it is SWEEPABLE.
+
+    ``--strict-inbound-bands`` (ARTIFACT 5): the ingress and routed stages are ALSO hard-1 per-lane pools,
+    keyed on the INBOUND connection, of width ``G = shards x lanes_per_shard``. At ``G < dests`` the INBOUND
+    pool is the narrow one and a destination sweep plateaus on ingress. G < L is TRUE at the shipped defaults
+    (4 x 1 = 4 bands vs 8 dests), so the pre-flight WARNS by default; this flag makes it REFUSE, which is what
+    a deliberate lane sweep wants."""
+    from harness.load.shardcert import PRODUCT_STORE_POOL_SIZE
+
+    parser.add_argument(
+        "--store-pool-size",
+        type=int,
+        default=None,
+        help=f"MEFOR_STORE_POOL_SIZE for EVERY shard process (the store connection pool, per process). "
+        f"Default: the PRODUCT default ({PRODUCT_STORE_POOL_SIZE}) — the bench used to pin 8, one fifth of "
+        f"it, which caps fleet-wide store concurrency and manufactures a wall that reads exactly like the "
+        f"pooled-claim one. An ambient MEFOR_STORE_POOL_SIZE still wins over the default. The EFFECTIVE "
+        f"value is recorded in the report JSON",
+    )
+    parser.add_argument(
+        "--strict-inbound-bands",
+        action="store_true",
+        help="REFUSE to run when the inbound band count G (= shards x --lanes-per-shard) is below the "
+        "outbound lane count L (= --dests). The ingress/routed stages are per-lane pools keyed on the "
+        "INBOUND connection, so at G < L a lane/destination sweep plateaus on the INGRESS pool and reads as "
+        "a fake outbound wall. Default: WARN + record (G < L holds at the shipped defaults)",
+    )
 
 
 def _run_shardcert(argv: list[str]) -> int:
@@ -694,17 +860,25 @@ def _run_shardcert(argv: list[str]) -> int:
         help="server store backend LABEL (SQL Server only — this bench's reset/queue helpers are "
         "SqlServerStore-specific); the connection itself comes from MEFOR_STORE_*",
     )
+    _add_bench_truth_args(parser)
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
+    _reject_shape_overrides_under_partitioned(parser, args)
 
     if args.lanes_per_shard < 1:
         print("--lanes-per-shard must be >= 1", file=sys.stderr)
+        return 2
+    if args.store_pool_size is not None and args.store_pool_size < 1:
+        print("--store-pool-size must be >= 1", file=sys.stderr)
         return 2
 
     # Wire the graph-shape env knobs BEFORE the loader discovery + the serve subprocesses read them.
     os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
     os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
     os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+    # The routing mode is read back ONCE (load_routing) and then THREADED into _discover/_shape_env, so the
+    # discovered graph, the served fleet, and the reported accounting all derive from this single value.
+    os.environ["MEFOR_SHARDCERT_ROUTING"] = args.routing
 
     # N shards on ONE unified store ⇒ a server-DB backend is required (mirrors _run_multishard).
     backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
@@ -717,7 +891,12 @@ def _run_shardcert(argv: list[str]) -> int:
         return 2
     store_env = {k: v for k, v in os.environ.items() if k.startswith("MEFOR_STORE_")}
 
-    from harness.load.shardcert import parse_rate_ladder, run_shardcert, run_shardcert_ladder
+    from harness.load.shardcert import (
+        InboundBandTooNarrow,
+        parse_rate_ladder,
+        run_shardcert,
+        run_shardcert_ladder,
+    )
 
     try:
         if args.rate_ladder:
@@ -737,6 +916,8 @@ def _run_shardcert(argv: list[str]) -> int:
                     sink_host=args.sink_host,
                     sink_port=args.sink_port,
                     store_env=store_env,
+                    store_pool_size=args.store_pool_size,
+                    strict_bands=args.strict_inbound_bands,
                 )
             )
             print(ladder.render())
@@ -758,8 +939,15 @@ def _run_shardcert(argv: list[str]) -> int:
                 sink_port=args.sink_port,
                 store_env=store_env,
                 capture_peak=True,
+                store_pool_size=args.store_pool_size,
+                strict_bands=args.strict_inbound_bands,
             )
         )
+    except InboundBandTooNarrow as exc:
+        # ARTIFACT 5, under --strict-inbound-bands: the fleet would have measured the INGRESS pool while the
+        # operator was sweeping the OUTBOUND one. Exit 2 (setup), never 1 (a bench result).
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 3
@@ -942,11 +1130,16 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         help="server store backend LABEL (SQL Server only — this bench's reset/queue helpers are "
         "SqlServerStore-specific); the connection itself comes from MEFOR_STORE_*",
     )
+    _add_bench_truth_args(parser)
     _add_coord_args(parser)
     args = parser.parse_args(argv)
+    _reject_shape_overrides_under_partitioned(parser, args)
 
     if args.lanes_per_shard < 1:
         print("--lanes-per-shard must be >= 1", file=sys.stderr)
+        return 2
+    if args.store_pool_size is not None and args.store_pool_size < 1:
+        print("--store-pool-size must be >= 1", file=sys.stderr)
         return 2
 
     # Wire the AMBIENT graph-shape env knobs BEFORE run_shardcert_engine's config discovery + the serve
@@ -957,6 +1150,10 @@ def _run_shardcert_engine(argv: list[str]) -> int:
     os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
     os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
     os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+    # Routing IS set ambiently (unlike --dests/--handlers/--delivering): run_shardcert_engine reads it back
+    # once via load_routing() and threads it into _discover()/_shape_env() + the SHARDS_READY post, so there
+    # is still exactly one source for the value.
+    os.environ["MEFOR_SHARDCERT_ROUTING"] = args.routing
 
     # N shards on ONE unified store ⇒ a server-DB backend is required (mirrors _run_shardcert).
     backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
@@ -969,7 +1166,7 @@ def _run_shardcert_engine(argv: list[str]) -> int:
         return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import run_shardcert_engine
+    from harness.load.shardcert import InboundBandTooNarrow, run_shardcert_engine
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -993,8 +1190,13 @@ def _run_shardcert_engine(argv: list[str]) -> int:
                 inbound_bind_host=args.inbound_bind_host,
                 sink_host=args.sink_host,
                 claim_mode=args.claim_mode,
+                store_pool_size=args.store_pool_size,
+                strict_bands=args.strict_inbound_bands,
             )
         )
+    except InboundBandTooNarrow as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 3
@@ -1418,7 +1620,12 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         "--drain-timeout", type=float, default=150.0, help="per-climb-rung post-hold drain"
     )
     parser.add_argument(
-        "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
+        "--soak-hold-seconds",
+        type=float,
+        default=300.0,
+        help="soak hold in seconds (default 300s = 5 min; OMITTING THIS STILL RUNS A 300s SOAK when the "
+        "DRIVE half arms one — it is not 'off'). The DRIVE half dictates skip (its --no-soak / no-sustained-"
+        "rung posts LADDER_SOAK skip); this engine-side value is only the fallback hold, and 0 is NOT a skip.",
     )
     parser.add_argument(
         "--soak-drain-timeout",
@@ -1475,15 +1682,20 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
         default=900.0,
         help="how long the engine waits for the drive's LADDER_SOAK after the climb",
     )
+    _add_bench_truth_args(parser)
     _add_coord_args(parser)
     args = parser.parse_args(argv)
+    _reject_shape_overrides_under_partitioned(parser, args)
 
     if args.lanes_per_shard < 1:
         print("--lanes-per-shard must be >= 1", file=sys.stderr)
         return 2
+    if args.store_pool_size is not None and args.store_pool_size < 1:
+        print("--store-pool-size must be >= 1", file=sys.stderr)
+        return 2
 
     from harness.load.coord import FileDropCoord
-    from harness.load.shardcert import parse_rate_ladder
+    from harness.load.shardcert import InboundBandTooNarrow, parse_rate_ladder
     from harness.load.shardcert_ladder import run_engine_ladder
 
     try:
@@ -1497,6 +1709,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
     os.environ["MEFOR_SHARDCERT_SHARDS"] = args.shards
     os.environ["MEFOR_SHARDCERT_LANES_PER_SHARD"] = str(args.lanes_per_shard)
     os.environ["MEFOR_SHARDCERT_PERSISTENT"] = "1" if args.persistent else "0"
+    os.environ["MEFOR_SHARDCERT_ROUTING"] = args.routing
 
     backend = os.environ.get("MEFOR_STORE_BACKEND", "").strip().lower()
     if backend != args.store:
@@ -1546,8 +1759,13 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
                 soak_drain_timeout=soak_drain_timeout,
                 climb_drive_start_timeout=args.drive_start_timeout,
                 soak_timeout=args.soak_timeout,
+                store_pool_size=args.store_pool_size,
+                strict_bands=args.strict_inbound_bands,
             )
         )
+    except InboundBandTooNarrow as exc:
+        print(f"refusing to run: {exc}", file=sys.stderr)
+        return 2
     except KeyboardInterrupt:
         print("interrupted", file=sys.stderr)
         return 3
@@ -1583,7 +1801,12 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
         "--drain-timeout", type=float, default=150.0, help="per-climb-rung post-hold drain"
     )
     parser.add_argument(
-        "--soak-hold-seconds", type=float, default=300.0, help="soak hold (>=5 min)"
+        "--soak-hold-seconds",
+        type=float,
+        default=300.0,
+        help="soak hold in seconds (default 300s = 5 min; OMITTING THIS STILL RUNS A 300s SOAK — it is "
+        "not 'off'). To DISABLE the soak use --no-soak; --soak-hold-seconds 0 is NOT a skip (it runs a "
+        "degenerate 0s soak). The soak also self-skips when no climb rung sustained (nothing to soak).",
     )
     parser.add_argument(
         "--soak-drain-timeout",

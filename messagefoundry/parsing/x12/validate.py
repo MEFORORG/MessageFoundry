@@ -35,9 +35,10 @@ from __future__ import annotations
 import io
 import json
 import logging
+from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterator
+from typing import Any
 
 from messagefoundry.parsing.x12._deps import load_x12_validator
 from messagefoundry.parsing.x12.errors import X12ValidationError
@@ -175,7 +176,7 @@ def validate(raw: str | bytes) -> X12ValidationResult:
     a *failed* validation of a parseable interchange is returned as data (``valid=False``), not raised,
     so a Handler can still emit the negative ack. Raises :class:`RuntimeError` if the ``[x12]`` extra
     is absent (a deploy/config error, distinct from the ``ValueError``-rooted data errors)."""
-    if isinstance(raw, (bytes, bytearray)):
+    if isinstance(raw, (bytes, bytearray)):  # noqa: SIM108
         text = bytes(raw).decode("utf-8", "replace")
     else:
         text = raw

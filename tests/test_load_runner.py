@@ -14,8 +14,8 @@ import asyncio
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 import uvicorn
@@ -222,8 +222,8 @@ def test_cli_engine_setup_failure_exits_2(
 ) -> None:
     # A bad token / unreachable engine surfaces as ApiError (the client validates via /auth/me before
     # preflight). That's a setup failure → exit 2 with a message, not exit 1 + a traceback.
-    from messagefoundry.apiclient import ApiError
     from harness.load import runner
+    from messagefoundry.apiclient import ApiError
 
     async def _boom(*_args: object, **_kwargs: object) -> object:
         raise ApiError("401 Unauthorized")

@@ -17,11 +17,12 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _totp_clock import fresh_totp
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role, totp
-from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
+from messagefoundry.auth import Role
 from messagefoundry.auth.identity import Identity
+from messagefoundry.auth.notifications import ADMIN_NEW_IP, SecurityEvent
 from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
@@ -208,12 +209,12 @@ async def test_verify_mfa_reanchors_session_to_the_new_ip() -> None:
         identity, token = out.identity, out.token
         enroll = await service.begin_mfa_enrollment(identity)
         await service.confirm_mfa_enrollment(
-            identity, totp.totp(enroll.secret), token=token, client="10.1.1.1"
+            identity, fresh_totp(enroll.secret), token=token, client="10.1.1.1"
         )
         # Roam to a new address → flagged.
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is True
         # Completing MFA from the new address re-anchors the session (parity with reauth).
-        assert await service.verify_mfa(token, totp.totp(enroll.secret), client="10.2.2.2") is True
+        assert await service.verify_mfa(token, fresh_totp(enroll.secret), client="10.2.2.2") is True
         assert await service.flag_new_client_ip(token, "10.2.2.2", path="/users") is False
     finally:
         await store.close()

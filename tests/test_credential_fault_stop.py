@@ -15,7 +15,7 @@ import pytest
 
 from messagefoundry.config.wiring import Registry
 from messagefoundry.pipeline.alerts import LoggingAlertSink
-from messagefoundry.pipeline.wiring_runner import _ItemOutcome, RegistryRunner
+from messagefoundry.pipeline.wiring_runner import RegistryRunner, _ItemOutcome
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 

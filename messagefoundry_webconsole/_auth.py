@@ -18,30 +18,45 @@ from dataclasses import dataclass
 from urllib.parse import quote, urlsplit
 
 from fastapi import HTTPException, Request, Response, WebSocket, status
+from fastapi.responses import RedirectResponse
 
 from messagefoundry.api.security import get_auth
 from messagefoundry.auth import Identity, Permission
+from messagefoundry.auth.service import AuthService
 
 __all__ = [
     "BROWSER_HARDENING_OPT_OUT_ENV",
+    "CLEAR_SITE_DATA_HEADER",
+    "CLEAR_SITE_DATA_VALUE",
     "COOKIE_NAME",
+    "FLOW_COOKIE_NAME",
     "HOST_COOKIE_NAME",
+    "HOST_FLOW_COOKIE_NAME",
     "UI_CSP",
     "UiWriteAction",
+    "allow_reauth_attempt",
+    "assert_not_cross_site",
     "assert_same_origin",
     "authorize_ui_ws",
     "browser_hardening_enabled",
+    "clear_oidc_flow_cookie",
     "clear_session_cookie",
     "effective_https",
     "is_safe_ui_action",
     "is_unlock_action",
+    "login_redirect_response",
     "lookup_ui_action",
+    "oidc_flow_cookie_name",
     "register_ui_action",
     "require_ui",
     "require_ui_reauth_only",
+    "require_ui_reauth_only_action",
     "require_ui_step_up",
+    "require_ui_step_up_action",
+    "security_headers_context",
     "session_cookie_name",
     "session_token",
+    "set_oidc_flow_cookie",
     "set_session_cookie",
 ]
 
@@ -86,6 +101,24 @@ def effective_https(app_state: object, scheme: str) -> bool:
     return scheme in ("https", "wss") or bool(getattr(app_state, "exposure_protected", False))
 
 
+def security_headers_context(app_state: object, scheme: str) -> bool:
+    """Whether this connection may receive the http-SAFE /ui browser-security headers — the nonce CSP,
+    COOP, CORP and Reporting-Endpoints bundle (ADR 0143). True in an :func:`effective_https` context OR
+    over a **loopback secure-context** (``http://127.0.0.1`` — a W3C *potentially-trustworthy* origin,
+    signalled read-only by ``app.state.loopback``).
+
+    Deliberately BROADER than :func:`effective_https`, which still SOLELY gates the session cookie's
+    Secure flag + ``__Host-`` prefix. Splitting the two lets the header hardening engage over cleartext
+    loopback (a trustworthy origin where a conformant browser honours these headers) while the cookie
+    stays the plain ``mf_session`` — a browser REJECTS a Secure / ``__Host-`` cookie over http, so keying
+    the cookie on loopback would break login. HSTS is unaffected (the engine emits it only over real
+    https / ``exposure_protected``, never on loopback). Reads only the public ``app.state`` attribute the
+    engine exposes; imports no engine module (a graceful default keeps it compatible with an older
+    engine that predates the ``loopback`` seam).
+    """
+    return effective_https(app_state, scheme) or bool(getattr(app_state, "loopback", False))
+
+
 def session_cookie_name(conn: Request | WebSocket) -> str:
     """The session cookie name for this connection: ``__Host-mf_session`` in an effective-https context
     (unless the org opt-out is set), else the plain ``mf_session`` (unchanged over cleartext loopback —
@@ -116,14 +149,65 @@ UI_CSP = (
 _CROSS_ORIGIN_FETCH = frozenset({"cross-site", "same-site"})
 
 
+#: ASVS 14.3.1 — the header emitted on every response that ENDS a session's browser-visible life.
+#: There are exactly THREE emitters, and between them they cover every shape a termination takes:
+#: :func:`clear_session_cookie` (a route that deletes the cookie — sign-out, and the password change
+#: that revokes every session), :func:`_login_redirect` / :func:`login_redirect_response` (every
+#: SERVER-driven expiry, revoke or disable redirect), and the login RENDER in :mod:`.routes.core`
+#: (a post-termination landing reached by bookmark or Back, recognised by its outcome code or by a
+#: session cookie that no longer authenticates). Deletion and this header are deliberately fused in
+#: one helper rather than left as two lines a new route must remember to write together.
+#: ``"cache"`` ONLY: ``"cookies"`` is already covered by the explicit cookie deletion (and would clear
+#: the in-flight OIDC flow cookie), and ``"storage"`` would wipe the deliberately-persistent, PHI-free
+#: ``mfcols:v2`` column preferences (14.3.3), which are not session state. Defense-in-depth against
+#: Back/bfcache resurrection of a terminated session's rendered PHI page.
+CLEAR_SITE_DATA_HEADER = "Clear-Site-Data"
+CLEAR_SITE_DATA_VALUE = '"cache"'
+
+
 def _login_redirect(note: str = "") -> HTTPException:
-    """A 303 redirect (as an exception, to short-circuit a dependency) to the /ui login page."""
+    """A 303 redirect (as an exception, to short-circuit a dependency) to the /ui login page.
+
+    Carries :data:`CLEAR_SITE_DATA_HEADER` on the REDIRECT ITSELF (ASVS 14.3.1). Every SERVER-driven
+    session termination lands here — idle timeout, absolute timeout, revoke ("sign out everywhere
+    else"), admin disable, AD-reconcile revoke — and those are exactly the paths the residual names.
+    Attaching it to the 303 rather than only to the landing page means the header cannot depend on
+    which login URL the browser is sent to, or on the client watchdog having run at all (with
+    JavaScript blocked it never does).
+    """
     location = "/ui/login" + (f"?e={note}" if note else "")
-    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": location})
+    return HTTPException(
+        status.HTTP_303_SEE_OTHER,
+        headers={"Location": location, CLEAR_SITE_DATA_HEADER: CLEAR_SITE_DATA_VALUE},
+    )
+
+
+def login_redirect_response(note: str = "expired") -> RedirectResponse:
+    """The RESPONSE form of :func:`_login_redirect`, for a ROUTE that discovers the session is gone
+    (rather than a dependency, which raises). Same 14.3.1 header, same default outcome code, so the
+    two paths cannot drift apart."""
+    resp = RedirectResponse("/ui/login" + (f"?e={note}" if note else ""), status_code=303)
+    resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+    return resp
+
+
+def _mfa_redirect() -> HTTPException:
+    """A 303 to the /ui second-factor page (ASVS 6.3.3), the cookie-plane twin of the JSON gate's
+    403 + ``X-MFA-Required``.
+
+    Deliberately NOT :func:`_login_redirect`: the session is ALIVE and merely half-proven, so it must
+    not carry ``Clear-Site-Data`` — that header marks a TERMINATED session (14.3.1), and firing it
+    here would wipe the cache on an ordinary sign-in step and mislabel the state in the login page's
+    ``?e=`` code."""
+    return HTTPException(status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/mfa"})
 
 
 def require_ui(
-    *permissions: Permission, phi: bool = False, allow_must_change: bool = False
+    *permissions: Permission,
+    phi: bool = False,
+    allow_must_change: bool = False,
+    allow_mfa_pending: bool = False,
+    activity: bool = True,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request from the session cookie and assert ``permissions``.
 
@@ -136,6 +220,15 @@ def require_ui(
     A ``must_change_password`` account is 303'd to the browser change-password page (L4b) from every
     /ui route — ``allow_must_change=True`` is set ONLY by that page's own GET/POST (so the rotation
     can actually happen; anything else would loop).
+
+    ``activity=False`` (ASVS 14.3.1) validates the session WITHOUT refreshing its idle clock — the
+    same contract the engine's /ws/stats keepalive uses. Set it on the console's **timer-driven
+    background refreshes**, which no human initiates: the nav status/health poll, the live connections
+    fragment and the live flow fragment, plus the session-status probe the client watchdog runs. With
+    those polling on the default nav — i.e. on every PHI page — an abandoned tab otherwise slid
+    ``last_used_at`` forever and the idle deadline could never fire, so the automatic-logoff control
+    was defeated exactly where it matters most. Leave it True for anything an operator actually
+    clicks (navigation, the log tail/level controls, export): those ARE user activity.
     """
 
     async def dependency(request: Request) -> Identity:
@@ -143,14 +236,23 @@ def require_ui(
         if auth is None or not auth.enabled:
             # The browser UI always needs a real session — no allow_no_auth shortcut here.
             raise _login_redirect()
-        identity = await auth.identity_for_token(session_token(request))
+        token = session_token(request)
+        identity = await auth.identity_for_token(token, activity=activity)
         if identity is None:
-            raise _login_redirect()
+            # A cookie that no longer authenticates IS a post-termination landing (idle/absolute
+            # expiry, revoke, admin disable), so name it: the login page then explains itself
+            # instead of appearing as an unexplained form, and its render carries Clear-Site-Data
+            # too (14.3.1). A visitor with NO cookie never had a session — plain form, no code.
+            raise _login_redirect("expired" if token else "")
         if identity.must_change_password and not allow_must_change:
             # A flagged account can go nowhere but the change-password page (L4b) until it rotates.
             raise HTTPException(
                 status.HTTP_303_SEE_OTHER, headers={"Location": "/ui/account/password"}
             )
+        # ASVS 6.3.3, the cookie mirror of the JSON gate. Ordering matches require(): must_change
+        # above, permissions below — a pending session must not learn whether it holds a permission.
+        if not allow_mfa_pending and not await auth.mfa_satisfied(token):
+            raise _mfa_redirect()
         for permission in permissions:
             if not identity.has(permission):
                 await auth.audit_permission_denied(identity, permission, request.url.path)
@@ -164,6 +266,20 @@ def require_ui(
         return identity
 
     return dependency
+
+
+def allow_reauth_attempt(auth: AuthService, identity: Identity, client: str | None) -> bool:
+    """Per-ACTOR budget for the POST-session credential ceremonies (re-auth, password change, MFA
+    enrolment confirm), replacing the shared unauthenticated sign-in budget those used to draw on —
+    which let anyone able to reach the login page lock every signed-in operator out of step-up.
+
+    Resolved via ``getattr`` because the console ships as a **separately-versioned wheel**: mounted on
+    an engine that predates ``allow_reauth_attempt`` it degrades to the previous behaviour rather than
+    failing, so no ENGINE_UI_SEAM bump is required."""
+    gate = getattr(auth, "allow_reauth_attempt", None)
+    if gate is None:  # older engine — previous (shared sign-in budget) behaviour
+        return bool(auth.allow_login_attempt(client))
+    return bool(gate(identity.user_id))
 
 
 def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
@@ -184,6 +300,25 @@ def _origin_matches(app_state: object, origin: str, host: str | None) -> bool:
     return host is not None and urlsplit(origin).netloc.lower() == host.lower()
 
 
+def assert_not_cross_site(request: Request) -> None:
+    """Reject a request the BROWSER ITSELF labels cross-site — the ``Sec-Fetch-Site`` half of
+    :func:`assert_same_origin`, and nothing else (ASVS 3.5.1).
+
+    Deliberately NARROWER than :func:`assert_same_origin`: it consults only ``Sec-Fetch-Site`` and
+    never falls back to comparing ``Origin`` against our own origin. That fallback is right for a
+    document-initiated form POST, where an absent ``Sec-Fetch-Site`` means an OLD browser and the
+    ``Origin`` is authoritative — but it is WRONG for a browser-agent delivery such as a CSP violation
+    report, which is sent out-of-band by the user agent's reporting agent rather than by the document:
+    those carry no ``Sec-Fetch-*`` at all and may carry ``Origin: null``, which the ``Origin``
+    comparison would reject, silently killing every violation report (including the 3.7.5 enforcement
+    canary's). So the check keeps exactly the property that matters for such a sink — a report a
+    FOREIGN site's CSP aimed at us is refused instead of amplifying our log — and lets conforming
+    same-origin and agent-initiated delivery through.
+    """
+    if request.headers.get("sec-fetch-site") in _CROSS_ORIGIN_FETCH:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
+
+
 def assert_same_origin(request: Request) -> None:
     """Reject a cross-site state-changing /ui request — CSRF defense-in-depth (M2, ADR 0065 §M2).
 
@@ -194,11 +329,18 @@ def assert_same_origin(request: Request) -> None:
     ``Origin`` to our own origin (``[api].public_origin`` when set, else the request ``Host``). A
     same-origin form POST (the only way the /ui buttons submit) passes both. Token-free — so it needs no
     crypto import (avoids the ASVS 11.1.3 inventory gate).
+
+    It needs **no session**, which is why it is also the first statement of the two UNAUTHENTICATED
+    state-changing POSTs (ASVS 3.5.1): ``POST /ui/login``, where SameSite=Strict supplies nothing
+    because no session cookie exists yet, and ``POST /ui/logout``, which has no ``Depends`` gate at all
+    (by design — a must-change-confined session must be able to revoke itself, ASVS 7.4.4) and so has
+    no other request-provenance control. The header-less fallthrough is safe by construction: a browser
+    attaches ``Sec-Fetch-Site`` or ``Origin`` to every cross-site POST, so only a non-browser client —
+    which cannot be CSRF-ridden — passes header-less.
     """
     sec_fetch_site = request.headers.get("sec-fetch-site")
     if sec_fetch_site is not None:
-        if sec_fetch_site in _CROSS_ORIGIN_FETCH:
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "cross-site request rejected")
+        assert_not_cross_site(request)
         return
     origin = request.headers.get("origin")
     if origin and not _origin_matches(request.app.state, origin, request.headers.get("host")):
@@ -235,6 +377,10 @@ class UiWriteAction:
     step_up: bool = True
     auto_retry: bool = True
     unlock: bool = False
+    # 7.5.1 (ADR 0077): the single-use step-up ACTION grant string /ui/reauth mints for this
+    # continuation (None = mint nothing = a pure session-window refresh, today's default). Set on the
+    # browser factor-binding lanes so their /ui/reauth re-proof mints exactly that action's grant.
+    action: str | None = None
 
     def __post_init__(self) -> None:
         # Guard against a mis-registration that would let the re-auth flow POST-auto-submit a GET form
@@ -258,6 +404,7 @@ def register_ui_action(
     step_up: bool = True,
     auto_retry: bool = True,
     unlock: bool = False,
+    action: str | None = None,
 ) -> UiWriteAction:
     """Register a state-changing /ui action into the write-action registry. Idempotent by ``pattern``.
 
@@ -268,10 +415,10 @@ def register_ui_action(
     body-carrying admin forms); register those as ``auto_retry=False, unlock=True`` (the two are mutually
     exclusive — :class:`UiWriteAction` rejects both).
     """
-    action = UiWriteAction(re.compile(pattern), permission, step_up, auto_retry, unlock)
-    if not any(a.path_re.pattern == action.path_re.pattern for a in _UI_WRITE_ACTIONS):
-        _UI_WRITE_ACTIONS.append(action)
-    return action
+    entry = UiWriteAction(re.compile(pattern), permission, step_up, auto_retry, unlock, action)
+    if not any(a.path_re.pattern == entry.path_re.pattern for a in _UI_WRITE_ACTIONS):
+        _UI_WRITE_ACTIONS.append(entry)
+    return entry
 
 
 # Phase-0 replay actions (migrated verbatim from the former _SAFE_UI_ACTION_RE): a single message, all
@@ -367,7 +514,11 @@ def require_ui_step_up(
     redirected to the form, which re-opens inside a fresh window for a clean re-submit. The mapped value
     gets no trust: ``/ui/reauth`` still validates it against the write-action registry (fail-closed).
     """
-    base = require_ui(*permissions)
+    # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
+    # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the
+    # next= continuation*; letting the base pre-empt it would drop that continuation and land the
+    # operator on /ui instead of the action they clicked. Same refusal, better destination.
+    base = require_ui(*permissions, allow_mfa_pending=True)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
@@ -403,7 +554,9 @@ def require_ui_reauth_only(
     new-client-IP layer; a stale window 303s to /ui/reauth (which only asks for a TOTP code when one
     is actually enrolled).
     """
-    base = require_ui(*permissions)
+    # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
+    # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
+    base = require_ui(*permissions, allow_mfa_pending=True)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)
@@ -414,6 +567,83 @@ def require_ui_reauth_only(
         client = request.client.host if request.client else None
         new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
         if new_ip or not await auth.has_recent_step_up(token):
+            raise _reauth_redirect(
+                request, reauth_next(request) if reauth_next is not None else None
+            )
+        return identity
+
+    return dependency
+
+
+async def _ui_action_step_up_ok(auth: AuthService, token: str | None, action: str) -> bool:
+    """The /ui step-up decision for a per-action lane (ADR 0077), mirroring
+    ``api.security._action_step_up_ok``: when action-binding is enforced (default) a fresh single-use
+    grant BOUND to ``action`` (consumed here); when the org opted out
+    (``[auth].require_action_step_up = false``) the legacy session-window recency. Uses only PUBLIC
+    ``AuthService`` members, so no cross-package private import is needed."""
+    if auth.action_step_up_required:
+        return await auth.has_action_step_up(token, action)
+    return await auth.has_recent_step_up(token)
+
+
+def require_ui_step_up_action(
+    action: str,
+    *permissions: Permission,
+    reauth_next: Callable[[Request], str] | None = None,
+) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require_ui_step_up`, but the step-up must be a fresh proof **bound to** ``action``
+    (single-use, ADR 0077 / ASVS 7.5.1), not the shared session window. Keeps the MFA gate — used for
+    the durable-takeover browser factor ops (**disable-MFA**, **webauthn-delete**). Falls back to the
+    session window under ``[auth].require_action_step_up = false``. ``new_ip`` is checked FIRST so a
+    forced new-IP step-up short-circuits and leaves the single-use grant UNCONSUMED (mirrors
+    ``api.security.require_step_up_action``)."""
+    # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
+    # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the
+    # next= continuation*; letting the base pre-empt it would drop that continuation and land the
+    # operator on /ui instead of the action they clicked. Same refusal, better destination.
+    base = require_ui(*permissions, allow_mfa_pending=True)
+
+    async def dependency(request: Request) -> Identity:
+        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        auth = get_auth(request)
+        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+            raise _login_redirect()
+        token = session_token(request)
+        nxt = reauth_next(request) if reauth_next is not None else None
+        if not await auth.mfa_satisfied(token):
+            raise _reauth_redirect(request, nxt)
+        client = request.client.host if request.client else None
+        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
+            raise _reauth_redirect(request, nxt)
+        return identity
+
+    return dependency
+
+
+def require_ui_reauth_only_action(
+    action: str,
+    *permissions: Permission,
+    reauth_next: Callable[[Request], str] | None = None,
+) -> Callable[[Request], Awaitable[Identity]]:
+    """Like :func:`require_ui_reauth_only` (password-only, **no MFA gate** so a required-but-unenrolled
+    session can still enroll its first factor), but the step-up must be a fresh proof **bound to**
+    ``action`` (single-use, ADR 0077 / ASVS 7.5.1). Used by the browser factor-binding enroll lanes.
+    Falls back to the session window under ``[auth].require_action_step_up = false``. Same ``new_ip``-
+    first short-circuit so a forced new-IP step-up leaves the single-use grant UNCONSUMED."""
+    # allow_mfa_pending: a genuine exemption, not a re-route. These gate the ENROLLMENT path, and
+    # an un-enrolled user can never satisfy a gate standing in front of the route that enrolls them.
+    base = require_ui(*permissions, allow_mfa_pending=True)
+
+    async def dependency(request: Request) -> Identity:
+        identity = await base(request)  # cookie auth + permission (+ must-change gate)
+        auth = get_auth(request)
+        if auth is None or not auth.enabled:  # pragma: no cover - base already handled this
+            raise _login_redirect()
+        token = session_token(request)
+        client = request.client.host if request.client else None
+        new_ip = await auth.flag_new_client_ip(token, client, path=request.url.path)
+        if new_ip or not await _ui_action_step_up_ok(auth, token, action):
             raise _reauth_redirect(
                 request, reauth_next(request) if reauth_next is not None else None
             )
@@ -451,6 +681,10 @@ async def authorize_ui_ws(
     identity = await auth.identity_for_token(token)
     if identity is None or identity.must_change_password:
         return None, None
+    # ASVS 6.3.3, mirroring authorize_ws on the header path: an MFA-pending session does not stream.
+    # No exempt set — every /ui socket is a data feed, none is part of the enroll/verify escape path.
+    if not await auth.mfa_satisfied(token):
+        return None, None
     for permission in permissions:
         if not identity.has(permission):
             return None, None
@@ -479,17 +713,91 @@ def set_session_cookie(response: Response, token: str, *, request: Request) -> N
 
 
 def clear_session_cookie(response: Response, request: Request) -> None:
-    """Delete the session cookie (logout). Pairs with a server-side ``AuthService.logout`` revoke.
+    """End this browser's session: delete the session cookie AND stamp
+    :data:`CLEAR_SITE_DATA_HEADER` (ASVS 14.3.1). Pairs with a server-side revoke.
 
-    Deletes whichever name this scheme uses (:func:`session_cookie_name`). Over cleartext loopback this
-    stays byte-identical to the pre-#192 clear (``delete_cookie(COOKIE_NAME, path="/")``); the
+    Deletes whichever name this scheme uses (:func:`session_cookie_name`). Over cleartext loopback the
+    DELETION stays byte-identical to the pre-#192 clear (``delete_cookie(COOKIE_NAME, path="/")``); the
     ``__Host-`` deletion additionally carries Secure so the browser accepts the expiry (a ``__Host-``
-    cookie is only writable — expiry included — over a Secure connection)."""
+    cookie is only writable — expiry included — over a Secure connection).
+
+    The header is set HERE rather than beside each call site because deleting the session cookie IS
+    the browser-visible end of a session: fusing them makes the 14.3.1 control structurally
+    un-forgettable. It was previously two lines a route had to remember to write together, and
+    ``POST /ui/account/password`` — which revokes EVERY session for the user, the termination an
+    operator reaches for after a suspected compromise — wrote only one of them, so Back/bfcache could
+    resurrect the rendered PHI page across a full revoke. Both current callers (sign-out, password
+    change) are terminations; a future caller that deletes the cookie without ending the session would
+    be the anomaly and must justify itself, not the other way round.
+    """
     name = session_cookie_name(request)
     if name == COOKIE_NAME:
         response.delete_cookie(COOKIE_NAME, path="/")
     else:
         response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="strict")
+    response.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+
+
+# --- ADR 0142: the OIDC flow cookie (browser binding for the federated login) ------
+
+#: The federated-flow cookie. Carries only an opaque flow id — never a token, never the PKCE verifier
+#: (those stay server-side in the service's ``FlowCache``, keyed on ``sha256(flow_id)``).
+FLOW_COOKIE_NAME = "mf_oidc_flow"
+
+#: The ``__Host-`` twin, used on the same effective-https terms as :data:`HOST_COOKIE_NAME`.
+HOST_FLOW_COOKIE_NAME = "__Host-mf_oidc_flow"
+
+
+def oidc_flow_cookie_name(conn: Request | WebSocket) -> str:
+    """The flow-cookie name for this connection — the ONE resolver the set/read/clear sites share, so
+    the name the start leg writes and the name the callback reads can never disagree.
+
+    Mirrors :func:`session_cookie_name`: a browser silently DROPS a ``__Host-`` cookie that is not
+    Secure, and ``[api].public_origin`` legitimately permits an http:// origin, so on cleartext
+    loopback the plain name is used. Without that split, the callback would find no cookie and audit
+    ``flow_binding_missing`` forever on every dev deployment, with nothing pointing at the cause.
+    """
+    if effective_https(conn.app.state, conn.url.scheme) and browser_hardening_enabled():
+        return HOST_FLOW_COOKIE_NAME
+    return FLOW_COOKIE_NAME
+
+
+def set_oidc_flow_cookie(
+    response: Response, flow_id: str, *, request: Request, max_age: int
+) -> None:
+    """Stage the federated flow id in the browser (ADR 0142 browser-binding, AC-7).
+
+    ``SameSite=Lax``, deliberately NOT the session cookie's ``Strict``: Lax IS sent on a top-level
+    cross-site GET, which is exactly what the IdP's redirect back to ``/ui/oidc/callback`` is. A Strict
+    flow cookie would be withheld on that return and every federated login would fail
+    ``flow_binding_missing``. The session cookie's Strict is untouched — this is a separate, short-lived
+    cookie carrying no authority of its own.
+
+    ``max_age`` bounds it to the server-side flow TTL so an abandoned login does not leave a cookie
+    behind indefinitely.
+    """
+    secure = effective_https(request.app.state, request.url.scheme)
+    name = HOST_FLOW_COOKIE_NAME if (secure and browser_hardening_enabled()) else FLOW_COOKIE_NAME
+    response.set_cookie(
+        name,
+        flow_id,
+        max_age=max_age,
+        httponly=True,
+        samesite="lax",
+        secure=secure,
+        path="/",
+    )
+
+
+def clear_oidc_flow_cookie(response: Response, request: Request) -> None:
+    """Delete the flow cookie. Called on EVERY terminal callback response, success or failure: the
+    server-side flow is single-use, so a surviving cookie would make the next callback present a flow
+    id that no longer resolves — a confusing ``flow_binding_missing`` on an otherwise clean retry."""
+    name = oidc_flow_cookie_name(request)
+    if name == FLOW_COOKIE_NAME:
+        response.delete_cookie(FLOW_COOKIE_NAME, path="/")
+    else:
+        response.delete_cookie(name, path="/", secure=True, httponly=True, samesite="lax")
 
 
 # --- L5a: WebAuthn RP identity (ADR 0068 §7) --------------------------------------

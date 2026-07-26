@@ -10,29 +10,35 @@ DATABASE driver fake and the REST opener fake. paramiko need not be installed.
 from __future__ import annotations
 
 import asyncio
+import datetime
+import ipaddress
 import logging
 import posixpath
 import ssl
+from pathlib import Path
 from typing import Any
 
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.x509.oid import NameOID
 
-from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import Ftp, Sftp, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed, check_source_allowed
-from messagefoundry.transports import build_destination, build_source
+from messagefoundry.transports import build_destination, build_source, remotefile
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
-from messagefoundry.transports import remotefile
 from messagefoundry.transports.remotefile import (
     RemoteFileDestination,
     RemoteFileSource,
     _FtpClient,
+    _ftps_ssl_context,
     _RemoteClient,
     _RemoteError,
     _SftpClient,
 )
-
 
 # --- a fake remote client ----------------------------------------------------
 
@@ -101,7 +107,7 @@ def _dest(
     monkeypatch: pytest.MonkeyPatch, client: _FakeClient, **over: Any
 ) -> RemoteFileDestination:
     _install_client(monkeypatch, client)
-    base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")
+    base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
     d = build_destination(
         Destination(name="OB_REMOTE", type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings)
@@ -112,7 +118,7 @@ def _dest(
 
 def _src(monkeypatch: pytest.MonkeyPatch, client: _FakeClient, **over: Any) -> RemoteFileSource:
     _install_client(monkeypatch, client)
-    base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")
+    base: dict[str, Any] = dict(host="sftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
     s = build_source(Source(type=ConnectorType.REMOTEFILE, settings=Sftp(**base).settings))
     assert isinstance(s, RemoteFileSource)
@@ -129,6 +135,23 @@ class _RecordingHandler:
         if self._exc is not None:
             raise self._exc
         return None
+
+
+class _FakeLedger:
+    """In-memory ProcessedFileLedger stand-in (#142) — records a HASHED key, skips a seen key, prunes."""
+
+    def __init__(self) -> None:
+        self.keys: set[str] = set()
+        self.pruned = 0
+
+    async def is_processed(self, file_key: str) -> bool:
+        return file_key in self.keys
+
+    async def mark_processed(self, file_key: str) -> None:
+        self.keys.add(file_key)
+
+    async def prune(self) -> None:
+        self.pruned += 1
 
 
 # === destination =============================================================
@@ -221,12 +244,14 @@ async def test_destination_cleans_temp_on_failed_rename(monkeypatch: pytest.Monk
 async def test_source_polls_retrieves_and_moves_to_processed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    client = _FakeClient(files={"/in/a.hl7": b"AAA", "/in/b.hl7": b"BBB"})
+    # HL7-shaped bodies: content_type is unset (None), which now sniffs as hl7v2 (the None-skips-sniff
+    # carve-out was removed, ASVS 5.2.2), so the mechanics under test need a body the sniff accepts.
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/b.hl7": b"MSH|^~\\&|B"})
     src = _src(monkeypatch, client)
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"AAA", b"BBB"]  # both delivered, in sorted order
+    assert h.bodies == [b"MSH|^~\\&|A", b"MSH|^~\\&|B"]  # both delivered, in sorted order
     # Moved to the processed dir (only after the handler returned), not left in /in.
     assert "/in/.processed/a.hl7" in client.files
     assert "/in/.processed/b.hl7" in client.files
@@ -234,34 +259,89 @@ async def test_source_polls_retrieves_and_moves_to_processed(
 
 
 async def test_source_pattern_filters_non_matching(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _FakeClient(files={"/in/a.hl7": b"AAA", "/in/skip.txt": b"nope"})
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A", "/in/skip.txt": b"nope"})
     src = _src(monkeypatch, client, pattern="*.hl7")
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"AAA"]  # the .txt is ignored
+    assert h.bodies == [b"MSH|^~\\&|A"]  # the .txt is ignored (pattern), the .hl7 sniffs as HL7
 
 
 async def test_source_after_read_delete(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _FakeClient(files={"/in/a.hl7": b"AAA"})
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
     src = _src(monkeypatch, client, after_read="delete")
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"AAA"]
+    assert h.bodies == [b"MSH|^~\\&|A"]
     assert "/in/a.hl7" not in client.files  # deleted, not moved
     assert not any(p.startswith("/in/.processed") for p in client.files)
 
 
 async def test_source_handler_failure_leaves_file(monkeypatch: pytest.MonkeyPatch) -> None:
-    client = _FakeClient(files={"/in/a.hl7": b"AAA"})
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
     src = _src(monkeypatch, client)
     h = _RecordingHandler(exc=RuntimeError("store write failed"))
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"AAA"]  # handler attempted
+    assert h.bodies == [b"MSH|^~\\&|A"]  # handler attempted
     assert "/in/a.hl7" in client.files  # left in place → re-emits next poll (at-least-once)
     assert "/in/.processed/a.hl7" not in client.files
+
+
+async def test_source_after_read_leave_keeps_file_and_dedups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #142: after_read='leave' never moves/deletes the remote file, and the ledger dedups across polls.
+    client = _FakeClient(files={"/in/a.hl7": b"MSH|^~\\&|A"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+    src.processed_ledger = ledger
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [b"MSH|^~\\&|A"]  # ingested once
+    assert "/in/a.hl7" in client.files  # left in place
+    assert not any(p.startswith("/in/.processed") for p in client.files)  # never moved
+    assert len(ledger.keys) == 1  # a HASHED key recorded
+    (key,) = ledger.keys
+    assert len(key) == 64 and "a.hl7" not in key  # sha256 hex, no cleartext filename
+    await src._poll_once()  # a second poll must NOT re-ingest
+    assert h.bodies == [b"MSH|^~\\&|A"]
+
+
+async def test_source_leave_durable_ledger_read_is_the_dedup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #142 Finding-3 (remote): with an EMPTY in-memory cache, a file already in the DURABLE ledger is
+    # skipped with ZERO emits — exercising ledger.is_processed() in isolation.
+    client = _FakeClient(files={"/in/a.hl7": b"AAA"})
+    src = _src(monkeypatch, client, after_read="leave")
+    ledger = _FakeLedger()
+    ledger.keys.add(
+        src._file_key("a.hl7", 3)
+    )  # pre-seed durable (full remote path folded); cache empty
+    src.processed_ledger = ledger
+    assert len(src._processed_seen) == 0
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == []  # ZERO emits — the durable read decided
+    assert "/in/a.hl7" in client.files  # left in place
+
+
+async def test_source_leave_distinct_remote_paths_get_distinct_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #142 Finding-1 (remote): the key folds the FULL REMOTE PATH, so the same basename under a different
+    # remote_dir yields a DISTINCT hash (never collapsed to one).
+    c1 = _FakeClient(files={"/in/m.hl7": b"AAA"})
+    c2 = _FakeClient(files={"/other/m.hl7": b"AAA"})  # same name+size, different base
+    s1 = _src(monkeypatch, c1, after_read="leave", remote_dir="/in")
+    k1 = s1._file_key("m.hl7", 3)
+    s2 = _src(monkeypatch, c2, after_read="leave", remote_dir="/other")
+    k2 = s2._file_key("m.hl7", 3)
+    assert k1 != k2  # distinct remote paths → distinct hashed keys
 
 
 async def test_source_oversize_moves_to_error_without_retrieving(
@@ -445,35 +525,63 @@ async def test_source_content_sniff_quarantines_non_hl7_when_hl7v2(
     assert "/in/.processed/bad.hl7" not in client.files
 
 
-async def test_source_content_sniff_skipped_for_non_hl7_content_type(
+async def test_source_content_sniff_active_for_x12_quarantines_non_isa(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The gate is content_type-specific: an X12/DICOM/binary drop (any non-hl7v2 type) must NOT be
-    # rejected for lacking an MSH header — that would wrongly quarantine a legitimate non-HL7 file.
+    # ASVS 5.2.2: the sniff is content_type-SPECIFIC, not hl7v2-only. A remote x12 inbound sniffs the ISA
+    # magic — a conformant ISA body flows verbatim (no MSH header, by X12 design), while a non-ISA body on
+    # the SAME inbound is quarantined, proving the x12 sniff is genuinely active. (This replaces the stale
+    # "sniff disabled for non-hl7" test, whose ISA payload passed because it MATCHED, not because sniff was off.)
     x12_body = b"ISA*00*          *00*          *ZZ*SENDER"
-    client = _FakeClient(files={"/in/claim.hl7": x12_body})
+    client = _FakeClient(
+        files={"/in/claim.hl7": x12_body, "/in/bogus.hl7": b"%PDF not an x12 body"}
+    )
     src = _src(monkeypatch, client, pattern="*.hl7")
-    src.content_type = ContentType.X12  # non-HL7 → sniff disabled by design
+    src.content_type = ContentType.X12  # x12 inbound → ISA sniff stays ON
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [x12_body]  # delivered verbatim, not quarantined
-    assert "/in/.error/claim.hl7" not in client.files
+    assert h.bodies == [x12_body]  # only the conformant ISA body delivered
+    assert "/in/.error/claim.hl7" not in client.files  # NOT quarantined
+    assert "/in/.error/bogus.hl7" in client.files  # non-ISA quarantined (sniff active)
 
 
-async def test_source_content_sniff_off_when_content_type_unset(
+async def test_source_content_sniff_quarantines_non_fhir_when_fhir(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # content_type=None (a direct caller/test that never had it injected) leaves the sniff OFF, so the
-    # poll path is byte-identical to before this control existed (a non-HL7 body is still delivered).
-    client = _FakeClient(files={"/in/a.hl7": b"not-hl7"})
+    # ASVS 5.2.2 (WP245 follow-up): a remote drop declared content_type=fhir gets the JSON magic sniff
+    # (FHIR is HL7 FHIR JSON) — a PDF that merely matches the glob is quarantined to .error before its
+    # bytes reach the pipeline, while a JSON-shaped FHIR resource is delivered.
+    resource = b'{"resourceType":"Patient","id":"1"}'
+    client = _FakeClient(files={"/in/bad.fhir": b"%PDF-1.7 not fhir", "/in/ok.fhir": resource})
+    src = _src(monkeypatch, client, pattern="*.fhir")
+    src.content_type = ContentType.FHIR  # fhir inbound → JSON {/[ sniff ON
+    h = _RecordingHandler()
+    src._handler = h
+    await src._poll_once()
+    assert h.bodies == [resource]  # only the JSON-shaped FHIR resource delivered
+    assert "/in/.error/bad.fhir" in client.files  # the PDF was quarantined
+    assert "/in/.error/ok.fhir" not in client.files
+
+
+async def test_source_content_sniff_active_when_content_type_unset(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # ASVS 5.2.2: the former None-skips-sniff carve-out was REMOVED. content_type=None now converges onto
+    # the local File source's None→hl7v2 semantics, so a non-HL7 drop is quarantined to .error even when
+    # the inbound never had a content_type injected — while a real HL7 body still flows through.
+    client = _FakeClient(files={"/in/bad.hl7": b"not-hl7", "/in/ok.hl7": b"MSH|^~\\&|A|B"})
     src = _src(monkeypatch, client)
     assert src.content_type is None  # default: unset
     h = _RecordingHandler()
     src._handler = h
     await src._poll_once()
-    assert h.bodies == [b"not-hl7"]
-    assert "/in/.error/a.hl7" not in client.files
+    assert h.bodies == [b"MSH|^~\\&|A|B"]  # only the HL7 body delivered
+    assert (
+        "/in/.error/bad.hl7" in client.files
+    )  # the non-HL7 drop is now quarantined (sniff active)
+    assert "/in/.processed/bad.hl7" not in client.files
+    assert "/in/.error/ok.hl7" not in client.files
 
 
 def test_scan_hook_seam_defaults_to_noop_and_is_settable() -> None:
@@ -500,7 +608,7 @@ def test_scan_hook_seam_defaults_to_noop_and_is_settable() -> None:
 
 
 def _ftp_dest(**over: Any) -> Destination:
-    base: dict[str, Any] = dict(host="ftp.example.com", remote_dir="/in")
+    base: dict[str, Any] = dict(host="ftp.example.com", remote_dir="/in")  # noqa: C408
     base.update(over)
     return Destination(name="OB", type=ConnectorType.REMOTEFILE, settings=Ftp(**base).settings)
 
@@ -786,7 +894,7 @@ def test_ftp_factory_plain_vs_tls() -> None:
 
 @pytest.mark.parametrize("missing", ["host", "remote_dir"])
 def test_requires_core_settings(missing: str) -> None:
-    base: dict[str, Any] = dict(host="h", remote_dir="/in")
+    base: dict[str, Any] = dict(host="h", remote_dir="/in")  # noqa: C408
     base[missing] = ""
     with pytest.raises(ValueError):
         build_destination(
@@ -847,3 +955,80 @@ def test_sftp_ftp_exported_from_top_level_package() -> None:
 
     assert PublicSftp is Sftp and PublicFtp is Ftp
     assert "Sftp" in messagefoundry.__all__ and "Ftp" in messagefoundry.__all__
+
+
+# === security: FTPS mTLS encrypted client-key passphrase (FILE-19) ============
+#
+# The FTPS client-identity path in _ftps_ssl_context (remotefile.py:206-207) uses an empty-bytes
+# password callback — `pw_arg = key_password if key_password is not None else (lambda: b"")` — so an
+# encrypted client key with NO tls_key_password fails deterministically (ssl.SSLError) instead of
+# falling back to OpenSSL's blocking TTY prompt. There is no TTY under a service account / container,
+# so the prompt would hang the process forever. This is remotefile.py's own copy of the guard (the
+# MLLP twin _mllp_ssl_context has a separate copy); the coverage does not transfer.
+
+
+def _encrypted_client_cert(tmp_path: Path, passphrase: str) -> tuple[str, str]:
+    """A self-signed EC cert + a private key PEM **encrypted** with ``passphrase`` (PKCS#8), for the
+    FTPS client-identity (mTLS) path. Mirrors test_mllp_tls.py's ``_encrypted_cert`` helper."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "client.example.com")])
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
+        .add_extension(
+            x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
+            critical=False,
+        )
+        .sign(key, hashes.SHA256())
+    )
+    cp, kp = tmp_path / "ftps-enc-c.pem", tmp_path / "ftps-enc-k.pem"
+    cp.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    kp.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.BestAvailableEncryption(passphrase.encode("utf-8")),
+        )
+    )
+    return str(cp), str(kp)
+
+
+def test_ftps_encrypted_client_key_missing_password_raises_not_prompts(tmp_path: Path) -> None:
+    # LOAD-BEARING security assertion (FILE-19): an encrypted client key with NO tls_key_password must
+    # fail deterministically (ssl.SSLError) via the empty-bytes callback, NOT fall back to OpenSSL's
+    # blocking TTY prompt (there is no TTY under a service account). Without the guard at
+    # remotefile.py:206 this test would HANG on the prompt instead of raising.
+    cert, key = _encrypted_client_cert(tmp_path, "s3cr3t-pass")
+    with pytest.raises(ssl.SSLError):
+        _ftps_ssl_context({"host": "h", "tls_cert_file": cert, "tls_key_file": key})
+
+
+def test_ftps_encrypted_client_key_with_password_loads(tmp_path: Path) -> None:
+    # Positive companion: the correct tls_key_password decrypts the client key and yields a context —
+    # proving the passphrase is actually applied (not merely that the empty callback always fails).
+    cert, key = _encrypted_client_cert(tmp_path, "s3cr3t-pass")
+    ctx = _ftps_ssl_context(
+        {
+            "host": "h",
+            "tls_cert_file": cert,
+            "tls_key_file": key,
+            "tls_key_password": "s3cr3t-pass",
+        }
+    )
+    assert ctx is not None
+    assert ctx.minimum_version == ssl.TLSVersion.TLSv1_2
+
+
+def test_ftps_encrypted_client_key_wrong_password_raises(tmp_path: Path) -> None:
+    # Negative companion: a WRONG tls_key_password can't decrypt the client key → ssl.SSLError. Proves
+    # the passphrase is enforced, not ignored.
+    cert, key = _encrypted_client_cert(tmp_path, "s3cr3t-pass")
+    with pytest.raises(ssl.SSLError):
+        _ftps_ssl_context(
+            {"host": "h", "tls_cert_file": cert, "tls_key_file": key, "tls_key_password": "WRONG"}
+        )

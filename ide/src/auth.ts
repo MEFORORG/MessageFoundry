@@ -12,10 +12,28 @@ interface ProvidersInfo {
   local: boolean;
   ad: boolean;
   kerberos: boolean;
+  // Deliberately NOT mirroring the engine's `oidc` field (ADR 0142). Federated sign-in is
+  // browser-only by design — it needs a redirect, a flow cookie, and a same-site landing hop, none
+  // of which exist here — so surfacing it would offer the user a provider this client cannot drive.
+  // The extra JSON field is simply ignored (structural typing), so nothing breaks by omitting it.
 }
+/** The engine's own `CurrentUser` (api/auth_models.py). We keep `roles`/`permissions` so a caller can
+ *  tell the user WHAT their account can do, instead of discovering it as an opaque 403 later. */
+interface CurrentUser {
+  username: string;
+  roles: string[];
+  permissions: string[];
+}
+
+/** The engine's full LoginResponse. The client used to declare only `{token, must_change_password}` and
+ *  silently drop the rest — including `mfa_required`, which is exactly the field that explains why an
+ *  otherwise-valid token 403s on every step-up route (promote / config reload) until TOTP is enrolled. */
 interface LoginResponse {
   token: string;
+  token_type?: string;
   must_change_password: boolean;
+  mfa_required?: boolean;
+  user?: CurrentUser;
 }
 
 /** SecretStorage key for an engine URL (trailing slashes normalized so they don't fork the cache). */
@@ -25,6 +43,46 @@ function secretKey(url: string): string {
 
 export async function clearToken(ctx: vscode.ExtensionContext, url: string): Promise<void> {
   await ctx.secrets.delete(secretKey(url));
+}
+
+/**
+ * Warn about an account state the IDE cannot fix, and offer the one place that can. Credential
+ * management (password rotation, MFA enrolment) belongs to the web console (ADR 0065) — the IDE names
+ * the problem precisely and deep-links, rather than growing a second credential UI.
+ */
+async function showConsoleFix(url: string, problem: string, path: string): Promise<void> {
+  const open = "Open the web console";
+  const pick = await vscode.window.showWarningMessage(`MessageFoundry: ${problem}`, open);
+  if (pick === open) {
+    await vscode.env.openExternal(vscode.Uri.parse(url.replace(/\/+$/, "") + path));
+  }
+}
+
+/**
+ * Sign out for real: REVOKE the session on the engine, then forget the token locally.
+ *
+ * Dropping only the local copy is not signing out — it leaves the session alive on the engine until it
+ * idles out (30 min) or hits its absolute cap, so "signed out" would be a lie told to a user who may have
+ * just walked away from a shared machine. `POST /auth/logout` is must-change-exempt, so it works even for
+ * an account that is 403'd on everything else.
+ *
+ * The local token is cleared in a `finally`: if the engine is unreachable we cannot revoke, but we must
+ * still forget it here — refusing to sign out because the engine is down would be worse. The caller is told
+ * which of the two happened rather than being given a blanket "signed out".
+ */
+export async function signOut(ctx: vscode.ExtensionContext, url: string): Promise<boolean> {
+  const token = await peekToken(ctx, url);
+  if (!token) {
+    return true; // nothing to revoke
+  }
+  try {
+    await postJson<unknown>(url, "/auth/logout", {}, token);
+    return true;
+  } catch {
+    return false; // could not reach the engine to revoke — the session lives until it times out
+  } finally {
+    await clearToken(ctx, url);
+  }
 }
 
 /**
@@ -39,8 +97,15 @@ export async function peekToken(
   return await ctx.secrets.get(secretKey(url));
 }
 
-/** Prompt for credentials and sign in to `url`; stores + returns the token, or undefined if cancelled. */
-async function login(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
+/**
+ * Prompt for credentials and sign in to `url`; stores + returns the token, or undefined if cancelled.
+ *
+ * EXPORTED (it used to be private, reachable only as a side-effect of promote) so the engine status bar
+ * can offer "Sign in" directly — being signed out is the IDE's DEFAULT state against an auth-enabled
+ * engine, and there was no way to act on it. The non-loopback/plain-http refusal below runs BEFORE any
+ * credential prompt, so every new caller inherits ADR 0035's SEC-005 guard rather than re-implementing it.
+ */
+export async function signIn(ctx: vscode.ExtensionContext, url: string): Promise<string | undefined> {
   // Belt-and-suspenders: any caller of login()/withAuth() (not just promote) inherits the non-TLS
   // refusal — never prompt for or send credentials in clear to a non-loopback host (SEC-005).
   const gate = assertTargetAllowed(url);
@@ -96,9 +161,22 @@ async function login(ctx: vscode.ExtensionContext, url: string): Promise<string 
       throw e;
     }
     await ctx.secrets.store(secretKey(url), res.token);
+    // Both of these produce a token that LOOKS fine and then 403s later, so say so now, at the moment
+    // the user can act on it, rather than letting them discover it as an opaque failure mid-promote.
     if (res.must_change_password) {
-      void vscode.window.showWarningMessage(
-        "MessageFoundry: this account must change its password — set a new one in the Console.",
+      // The engine 403s this token on every route except /auth/logout, /auth/me and /me/password.
+      void showConsoleFix(
+        url,
+        "this account must change its password before it can do anything.",
+        "/ui/account/password",
+      );
+    } else if (res.mfa_required) {
+      // Login succeeded and reads will work, but every STEP-UP route (promote → POST /config/reload)
+      // stays 403 until TOTP is enrolled. The old client dropped this field entirely.
+      void showConsoleFix(
+        url,
+        "this account needs MFA before it can deploy config (reads will work).",
+        "/ui/account",
       );
     }
     return res.token;
@@ -112,7 +190,7 @@ export async function ensureToken(
   ctx: vscode.ExtensionContext,
   url: string,
 ): Promise<string | undefined> {
-  return (await ctx.secrets.get(secretKey(url))) ?? (await login(ctx, url));
+  return (await ctx.secrets.get(secretKey(url))) ?? (await signIn(ctx, url));
 }
 
 /**
@@ -135,7 +213,7 @@ export async function withAuth<T>(
   } catch (e) {
     if (e instanceof HttpError && e.status === 401) {
       await clearToken(ctx, url);
-      const fresh = await login(ctx, url);
+      const fresh = await signIn(ctx, url);
       if (fresh === undefined) {
         return undefined;
       }

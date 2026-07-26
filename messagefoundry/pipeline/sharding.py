@@ -156,8 +156,11 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
     When the (unfiltered) config names **more than one** shard, the result also carries the shard
     identity (``shard_id`` + the pinned ``all_shard_ids`` universe) that arms the ADR 0073
     sharded-mode behaviors: ownership-scoped startup recovery, the single-delivery-consumer-per-
-    outbound-lane gates, and the shard-set reload refusal. A single-shard config attaches neither —
-    it stays byte-identical to plain ``serve`` everywhere.
+    outbound-lane gates, and the shard-set reload refusal — plus the whole config's Loopback inbound
+    names (``all_loopback_inbound``), pinned for the same reason the shard universe is: the ADR 0013
+    ``reingress_to`` rule is a fact about the CONFIG, and a shard that doesn't own the loopback must
+    still validate it. A single-shard config attaches none of them — it stays byte-identical to plain
+    ``serve`` everywhere.
 
     Raising is intentionally avoided for an empty result — a shard id that matches no inbound yields
     an empty-intake registry; the caller (``serve --shard``) decides whether that is an error.
@@ -182,4 +185,10 @@ def filter_registry_for_shard(registry: Registry, shard: str) -> Registry:
         fhir_lookups=registry.fhir_lookups,
         shard_id=shard if sharded else None,
         all_shard_ids=tuple(ids) if sharded else None,
+        # Pin the UNFILTERED loopback inbounds beside the shard identity: `selected` drops the inbounds
+        # of every other shard, but `reingress_to` names a loopback that may legitimately live on one of
+        # them (the runtime spans the two — see RegistryRunner._wake_lane), so the ADR 0013 cross-registry
+        # check must still see the whole config or every non-owning shard fails its build_check. Derived
+        # from the SOURCE registry: deriving it from `selected` would reintroduce exactly that bug.
+        all_loopback_inbound=registry.loopback_inbound_names() if sharded else None,
     )

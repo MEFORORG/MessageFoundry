@@ -18,7 +18,8 @@ This module imports ``pydicom`` (third-party, not an engine package) and nothing
 from __future__ import annotations
 
 import struct
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 
 def _missing_extra(feature: str) -> RuntimeError:

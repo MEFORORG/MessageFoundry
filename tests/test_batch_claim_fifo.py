@@ -16,8 +16,9 @@ ingress→routed→outbound pipeline (``supports_ingest_stage = True``), so T1�
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 

@@ -27,6 +27,8 @@ from messagefoundry.store.store import (
     MessageStore,
     OutboxItem,
     OutboxStatus,
+    SecretRotationMetaRow,
+    SecretRotationMetaStore,
     Stage,
     StreamingAttachmentsUnsupported,
 )
@@ -42,6 +44,8 @@ __all__ = [
     "OutboxStatus",
     "QueueStore",
     "Row",
+    "SecretRotationMetaRow",
+    "SecretRotationMetaStore",
     "Stage",
     "Store",
     "StoreLifecycle",

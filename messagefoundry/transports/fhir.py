@@ -52,6 +52,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    encode_wire_body,
     register_destination,
 )
 
@@ -60,12 +61,15 @@ from messagefoundry.transports.base import (
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
+    InsecureHopGuard,
+    ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
+    _no_redirect_opener,
     _NoRedirectHandler,
     _redact_url,
-    InsecureHopGuard,
     capture_response_headers,
+    egress_route_from_settings,
     enforce_outbound_length_limits,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
@@ -255,8 +259,18 @@ class FhirDestination(DestinationConnector):
         attested = config.tls_hop_attested
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
+        self._proxy: ProxyConfig | None = egress_route_from_settings(
+            s, dest_scheme=scheme, attested=attested
+        )
+        dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
+        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
 
         self._headers = self._build_headers(s)
+        if proxy_dest is not None:
+            # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
+            self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.base_url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.base_url, attested=attested)
         # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
@@ -271,7 +285,8 @@ class FhirDestination(DestinationConnector):
         # The minted bearer is injected per-request in _post; the modes are mutually exclusive.
         from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
-        self._token_provider = bearer_provider_from_settings(s)
+        # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
+        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
         if self._token_provider is not None:
             # The bearer is injected per-request in _post, so the static-header cleartext check above
             # can't see it. Re-run the check treating the connection as credential-bearing, so an access
@@ -297,8 +312,11 @@ class FhirDestination(DestinationConnector):
             # expired FHIR-server cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener: urllib.request.OpenerDirector = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.base_url).hostname or ""
+                    urllib.parse.urlsplit(self.base_url).hostname or "", *proxy_handlers
                 )
+            elif proxy_handlers:
+                # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
+                self._opener = _no_redirect_opener(*proxy_handlers)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -312,7 +330,7 @@ class FhirDestination(DestinationConnector):
                 "FHIR destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.base_url),
             )
-            self._opener = _insecure_opener()
+            self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest — fold the challenge-answering handler into a per-connection opener (never the
         # shared one). None (default) → byte-identical. Mutually exclusive with a bearer provider.
         from messagefoundry.transports.http_auth import HttpAuthError, digest_handler_from_settings
@@ -491,7 +509,7 @@ class FhirDestination(DestinationConnector):
             self._hop_guard.assert_send(
                 urllib.parse.urlsplit(self.base_url).hostname or "", _redact_url(self.base_url)
             )
-        data = payload.encode(self.encoding)
+        data = encode_wire_body(payload, self.encoding, transport="FHIR")
         headers = {**self._headers, **extra_headers}
         if self._token_provider is not None:
             # ADR 0024: a fresh SMART bearer per request, acquired off-loop past the queue boundary (a
@@ -582,6 +600,7 @@ def _resolve_read_url(
     base: str,
     query: str,
     params: Mapping[str, str | list[str]] | None = None,
+    require_structured: bool = False,
 ) -> str:
     """Build a read-only ``GET`` URL from a ``FhirLookup`` ``query``: a read-by-id (``"Patient/123"``) or a
     search (``"Patient?identifier=MRN|123"``, or a path-only ``"Patient"`` plus structured ``params``).
@@ -633,6 +652,15 @@ def _resolve_read_url(
         encoded = _encode_search_params(params)
         return f"{url}?{encoded}" if encoded else url
     if sep:  # flat search query string — control-char gate + defense-in-depth injection screen
+        if require_structured:
+            # 1.2.2: the operator required the structured params= form
+            # ([egress].fhir_require_structured_params); close the author-encoded flat '?'-query escape
+            # hatch. Refused BEFORE the screen so the only accepted search form is the safely
+            # percent-encoded params= path. PHI-safe: names the shape/setting only, never search_part.
+            raise ValueError(
+                "FHIR read: flat '?'-query is refused ([egress].fhir_require_structured_params); "
+                "pass search parameters via params="
+            )
         if _has_control_char(search_part):
             raise ValueError("FHIR read search query contains an illegal control character")
         # Defense-in-depth (ASVS 1.2.2): reject the shapes the engine can flag unambiguously without
@@ -663,10 +691,16 @@ class FhirLookupExecutor:
     ``OperationOutcome`` issue code, a redacted host) — never the returned body, the query's parameter
     values, or the SMART token."""
 
-    def __init__(self, connections: Mapping[str, Mapping[str, Any]]) -> None:
+    def __init__(
+        self, connections: Mapping[str, Mapping[str, Any]], *, require_structured: bool = False
+    ) -> None:
         # connections: name -> already-env-resolved settings (the runner substitutes env() first).
         from messagefoundry.transports.smart import token_provider_from_settings
 
+        # 1.2.2 ([egress].fhir_require_structured_params): when True every search must use the
+        # per-value-encoded params= form; the flat '?'-query escape hatch is refused. Default False
+        # keeps the flat form (byte-identical). Threaded in by wiring_runner from EgressSettings.
+        self._require_structured = require_structured
         self._base: dict[str, str] = {}
         self._headers: dict[str, dict[str, str]] = {}
         self._timeout: dict[str, float] = {}
@@ -692,9 +726,17 @@ class FhirLookupExecutor:
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
             attested = bool(s.get("tls_hop_attested", False))
+            # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
+            # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).
+            proxy = egress_route_from_settings(s, dest_scheme=scheme, attested=attested)
+            base_host = urllib.parse.urlsplit(url).hostname or ""
+            proxy_dest = proxy.for_host(base_host) if proxy is not None else None
+            proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
             headers = self._build_headers(s)
+            if proxy_dest is not None:
+                headers.update(proxy_dest.auth_headers())  # pre-emptive Proxy-Authorization (0126)
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
-            token = token_provider_from_settings(s)
+            token = token_provider_from_settings(s, proxy=proxy)
             check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
             refuse_cleartext_credentials(scheme, check_headers, url, attested=attested)
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
@@ -703,7 +745,9 @@ class FhirLookupExecutor:
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
-                self._opener[cname] = _NO_REDIRECT_OPENER
+                self._opener[cname] = (
+                    _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+                )
             else:
                 # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
                 guard = refuse_verify_off(
@@ -715,7 +759,7 @@ class FhirLookupExecutor:
                     "FhirLookup %s has TLS verification DISABLED (verify_tls=false)",
                     _redact_url(url),
                 )
-                self._opener[cname] = _insecure_opener()
+                self._opener[cname] = _insecure_opener(*proxy_handlers)
 
     @staticmethod
     def _build_headers(s: Mapping[str, Any]) -> dict[str, str]:
@@ -764,7 +808,9 @@ class FhirLookupExecutor:
                 f"fhir_lookup: no FhirLookup connection named {connection!r} (declared: {known})"
             )
         try:
-            url = _resolve_read_url(self._base[connection], query, params)
+            url = _resolve_read_url(
+                self._base[connection], query, params, require_structured=self._require_structured
+            )
         except ValueError as exc:
             # PHI-safe: _resolve_read_url names only the offending shape/segment, never the query values.
             raise FhirLookupError(f"fhir_lookup on {connection!r}: {exc}") from exc

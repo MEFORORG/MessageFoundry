@@ -242,7 +242,7 @@ blocks the whole output). The mechanism, spelled out so the SoT claim is honest:
    making it importable is net-new work, not mere "exposure").
 2. **Fold in the drifted copy.** `tests/test_load_config.py`'s `_FORBIDDEN_SUBSTRINGS` (adds the
    estate-vendor tokens) **and** its
-   `54\d{4}` site-code pattern are merged into the authoritative list, and `test_load_config.py` imports the
+   site-code pattern are merged into the authoritative list, and `test_load_config.py` imports the
    merged SoT (its divergent copy is **deleted**). This collapses the two drifted engine-side sources into one.
 3. **The tee vendors the token *table*** under the §1 byte-parity CI check. So the honest count is **one
    engine-side authority + one parity-pinned tee copy** — *not* literally one file, but one authority with a
@@ -254,7 +254,7 @@ blocks the whole output). The mechanism, spelled out so the SoT claim is honest:
 fail-closed-on-false-positive is acceptable and safer than missing `^ACMEHOSP^` inside a field (which the
 publish-prose `\b…\b` word-boundary form misses). The existing **publish/pre-commit path keeps its `\b`
 word-boundary regexes** over staged source/config files — substring matching is **not** a global change to
-the publish guard. (Caveat for the owner pass: a bare `54\d{4}` substring over HL7 bodies — dense with
+the publish guard. (Caveat for the owner pass: a bare site-code substring over HL7 bodies — dense with
 6-digit timestamps/order numbers/set IDs — will mass-false-positive; it must be anchored to a field/component
 boundary or kept prose-scoped before it lands in the body-scan path. Some short tokens may likewise
 false-positive on unrelated synthetic IDs; on an anonymizer's *output* a fail-closed false positive is the
@@ -312,7 +312,7 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
 2. **Two-layer model — data field-map over code surrogate functions (CHOSEN) vs a single all-declarative rule table vs pure code-only rules.** A *single declarative table* that also encoded surrogate behaviour (an `action`/transform column, conditionals) is the seductive middle and the **§12 trap** — it grows into a de-id *DSL*, declarative *logic* authoring we declined (#26). *Pure code-only* (every rule a Python function, no data layer) honours §12 but fails §9's "centralize/inspect the rules" and makes per-deployment field customization a code edit. **CHOSEN:** split them — **field *selection* is data** (like [ADR 0007](0007-gui-manageable-connections-toml.md) transport config, overlay-able, inspectable, leak-auditable) and **surrogate *production* is code** (a registry the overlay can only *select* from, never extend, **enforced by the loader** rejecting any non-`path→kind`/`keep`/`drop` key). The data layer is provably incapable of expressing a transform, so the §12 line holds tighter than a single table would. **Rejected** both the all-declarative table and the all-code form.
 3. **Surrogate substitution (CHOSEN) vs blank/redact.** Blanking destroys field widths/repetitions/routing keys — the exact shapes the fixtures exist to exercise. **CHOSEN** datatype-faithful surrogates from the existing `_hl7data.py` pools. **Rejected** redaction as the default (kept only as the per-rule action for free-text, which defaults to full redaction — §3).
 4. **Per-run salted keyed pseudonymization (CHOSEN) vs a persisted consistency map vs a fixed global key.** A persisted map *is* PHI and a re-identification key — **forbidden by design (R6, §4)**. A fixed key makes surrogates brute-forceable back to originals. **CHOSEN** an in-memory, per-run-salted seed (CSPRNG, ≥128 bits, discarded at run end): consistent within a dataset, irreversible across runs (salt-dependent, not cryptographic — §4), nothing persisted. **Rejected** both. (Reproducibility tension and an optional HMAC/BLAKE2 upgrade noted in §4 / *To resolve on acceptance*.)
-5. **Reuse + reconcile `scan_forbidden` (CHOSEN) vs a new anonymizer-private denylist.** A second denylist is exactly the drift that already bit the repo (the `test_load_config.py` set diverged from `FORBIDDEN`). **CHOSEN** one reconciled engine-side authority (importable, folding in the test copy + `54xxxx` pattern, that test deleting its fork) with a parity-pinned tee copy, and a **separate body-only substring match mode** (the publish/pre-commit path keeps `\b` word-boundary). **Rejected** a private list.
+5. **Reuse + reconcile `scan_forbidden` (CHOSEN) vs a new anonymizer-private denylist.** A second denylist is exactly the drift that already bit the repo (the `test_load_config.py` set diverged from `FORBIDDEN`). **CHOSEN** one reconciled engine-side authority (importable, folding in the test copy + the site-code pattern, that test deleting its fork) with a parity-pinned tee copy, and a **separate body-only substring match mode** (the publish/pre-commit path keeps `\b` word-boundary). **Rejected** a private list.
 6. **Vendor `_hl7data.py` pools (CHOSEN) vs a new dep (e.g. Faker) vs importing `generators/`.** Importing `generators/` is impossible for the tee (`_core.py` pulls `hl7apy` + the engine). Faker is a new runtime dep, not vendorable into the dependency-free tee, and unjustified when conformant pools already exist. **CHOSEN** lifting the pure pools/encoders — **zero new dependencies**. **Rejected** Faker and the cross-package import.
 
 ## Consequences
@@ -377,8 +377,8 @@ AI-assistant `deidentified` data-scope source (PHI.md §9 forward-links to it on
       `KEEP` set (MSH-7/9/10/12, NK1-3, IN1-2/3/4, coded clinical segments) so correlation + routing realism
       survive.
 - [ ] Approve the **`scan_forbidden` reconciliation**: make `FORBIDDEN` importable; fold in
-      `test_load_config.py`'s tokens + `54xxxx` pattern and **delete that test's divergent copy**; add a
-      **body-only** substring match mode (publish/pre-commit stays on `\b`); **anchor or prose-scope `54\d{4}`**
+      `test_load_config.py`'s tokens + the site-code pattern and **delete that test's divergent copy**; add a
+      **body-only** substring match mode (publish/pre-commit stays on `\b`); **anchor or prose-scope the site-code pattern**
       before it touches the body scan (6-digit false-positive risk). This **touches owner-managed publish-guard
       config**, so it needs an explicit owner pass.
 - [ ] Confirm the **CSPRNG (≥128-bit), in-memory-only, discarded-at-run-end** keying, the no-re-id-map rule

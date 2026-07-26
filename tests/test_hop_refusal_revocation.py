@@ -30,16 +30,16 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     revocation_hop_disposition,
 )
-from messagefoundry.config.wiring import DICOMweb, FHIR, Rest, Soap
+from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.store.postgres import _build_ssl
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.email import EmailDestination
 from messagefoundry.transports.mllp import MLLPDestination
 
 # The three postures the gradient keys on (the AI-derived is_phi/production).
-PROD_PHI = HopPosture(is_phi=True, production=True)
-STAGING_PHI = HopPosture(is_phi=True, production=False)
-SYNTHETIC = HopPosture(is_phi=False, production=True)  # not is_phi → always ALLOW
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
 
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as remote/off-box)
 LOOPBACK = "127.0.0.1"
@@ -60,31 +60,31 @@ def test_revocation_hop_disposition_matrix() -> None:
     def disp(
         *,
         is_phi: bool,
-        production: bool,
+        enforcing: bool,
         is_loopback_hop: bool = False,
         proxy_proven: bool = False,
         attested: bool = False,
     ) -> HopDisposition:
         return revocation_hop_disposition(
             is_phi=is_phi,
-            production=production,
+            enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
             proxy_proven=proxy_proven,
             attested=attested,
         )
 
-    # loopback → ALLOW (on-box, not a network exposure) even on prod-PHI.
-    assert disp(is_phi=True, production=True, is_loopback_hop=True) is HopDisposition.ALLOW
+    # loopback → ALLOW (on-box, not a network exposure) even on enforcing-PHI.
+    assert disp(is_phi=True, enforcing=True, is_loopback_hop=True) is HopDisposition.ALLOW
     # a proven revocation-checking terminator → ALLOW.
-    assert disp(is_phi=True, production=True, proxy_proven=True) is HopDisposition.ALLOW
+    assert disp(is_phi=True, enforcing=True, proxy_proven=True) is HopDisposition.ALLOW
     # attested → ALLOW.
-    assert disp(is_phi=True, production=True, attested=True) is HopDisposition.ALLOW
+    assert disp(is_phi=True, enforcing=True, attested=True) is HopDisposition.ALLOW
     # synthetic (no PHI) → ALLOW.
-    assert disp(is_phi=False, production=True) is HopDisposition.ALLOW
-    # production PHI, unproven → REFUSE.
-    assert disp(is_phi=True, production=True) is HopDisposition.REFUSE
-    # non-production PHI → WARN (crosses, loud-logged).
-    assert disp(is_phi=True, production=False) is HopDisposition.WARN
+    assert disp(is_phi=False, enforcing=True) is HopDisposition.ALLOW
+    # enforcing PHI, unproven → REFUSE.
+    assert disp(is_phi=True, enforcing=True) is HopDisposition.REFUSE
+    # non-enforcing PHI → WARN (crosses, loud-logged).
+    assert disp(is_phi=True, enforcing=False) is HopDisposition.WARN
 
 
 # --- the guard: construction gate + unstamped no-op + attestation audit ------------------------------
@@ -102,9 +102,8 @@ def _guard(host: str, *, attested: bool = False, proxy_proven: bool = False) -> 
 
 
 def test_guard_refuses_prod_phi_remote() -> None:
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused, match="revocation"):
-            _guard(REMOTE).enforce_construction()
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _guard(REMOTE).enforce_construction()
 
 
 def test_guard_allows_loopback_synthetic_nonprod_attested() -> None:
@@ -131,9 +130,8 @@ def test_guard_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> N
 
 
 def test_guard_audits_attestation_that_suppresses_prod_refusal(caplog) -> None:
-    with active_hop_posture(PROD_PHI):
-        with caplog.at_level("WARNING"):
-            _guard(REMOTE, attested=True).enforce_construction()
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        _guard(REMOTE, attested=True).enforce_construction()
     assert any("operator attestation" in r.message for r in caplog.records)
 
 
@@ -151,9 +149,8 @@ def mllp_cfg(host: str, *, revocation_attested: bool = False, **over: object) ->
 
 
 def test_mllp_tls_verify_refuses_prod_phi_remote() -> None:
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused, match="revocation"):
-            MLLPDestination(mllp_cfg(REMOTE))
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        MLLPDestination(mllp_cfg(REMOTE))
 
 
 def test_mllp_tls_verify_allows_attested_loopback_synthetic_nonprod() -> None:
@@ -195,9 +192,8 @@ def test_mllp_cleartext_refuses_via_200_not_revocation() -> None:
     # A plaintext (tls off) prod-PHI remote hop is refused by the #200 cleartext gate (message names the
     # CLEARTEXT hop), not the #201 revocation gate — revocation only matters on a VERIFYING hop.
     cfg = Destination(name="OB", type=ConnectorType.MLLP, settings={"host": REMOTE, "port": 5000})
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused, match="cleartext"):
-            MLLPDestination(cfg)
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="cleartext"):
+        MLLPDestination(cfg)
 
 
 def test_mllp_verify_off_refuses_via_mllp_context_not_revocation() -> None:
@@ -208,9 +204,8 @@ def test_mllp_verify_off_refuses_via_mllp_context_not_revocation() -> None:
         type=ConnectorType.MLLP,
         settings={"host": REMOTE, "port": 5000, "tls": True, "tls_verify": False},
     )
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="tls_verify=false"):
-            MLLPDestination(cfg)
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="tls_verify=false"):
+        MLLPDestination(cfg)
 
 
 # --- REST / SOAP / FHIR https (verify path) ---------------------------------------------------------
@@ -245,9 +240,8 @@ def _build_https(spec: tuple[object, object, str], *, revocation_attested: bool 
 
 @pytest.mark.parametrize("cell", _HTTP_CELLS)
 def test_https_verified_refuses_prod_phi_remote(cell: str) -> None:
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused, match="revocation"):
-            _build_https(_HTTPS[cell])
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        _build_https(_HTTPS[cell])
 
 
 @pytest.mark.parametrize("cell", _HTTP_CELLS)
@@ -349,9 +343,8 @@ def email_cfg(host: str, *, revocation_attested: bool = False, **over: object) -
 
 def test_email_tls_refuses_prod_phi_remote() -> None:
     # use_tls defaults True (STARTTLS): a verified SMTP hop with no revocation check → refuse on prod-PHI.
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(InsecureHopRefused, match="revocation"):
-            EmailDestination(email_cfg(REMOTE))
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused, match="revocation"):
+        EmailDestination(email_cfg(REMOTE))
 
 
 def test_email_tls_allows_attested_loopback_synthetic_nonprod() -> None:
@@ -380,6 +373,5 @@ def test_email_cleartext_refuses_via_settings_not_revocation(
     # use_tls=false is a NON-verifying (cleartext) hop, refused by the email destination's own cleartext
     # guard (message names cleartext), so the revocation gate (verify path only) never fires here.
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="cleartext"):
-            EmailDestination(email_cfg(REMOTE, use_tls=False))
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="cleartext"):
+        EmailDestination(email_cfg(REMOTE, use_tls=False))

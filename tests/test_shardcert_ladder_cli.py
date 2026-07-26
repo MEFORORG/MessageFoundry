@@ -68,6 +68,7 @@ def _empty_report():
         dests=8,
         handlers=8,
         delivering=8,
+        routing="broadcast",
         driver_count=4,
         sink_count=8,
         climb=[],
@@ -229,3 +230,85 @@ def test_engine_ladder_logs_store_env_key_names_not_values(monkeypatch, tmp_path
     assert "store connection from ambient MEFOR_STORE_* env" in err
     assert "MEFOR_STORE_PASSWORD" in err  # the KEY is listed
     assert "TOPSECRETVALUE" not in err  # the VALUE never is (secrets rule)
+
+
+# =====================================================================================================
+# ARTIFACTS 2 + 5 (2026-07-14) — the bench-truth flags must actually REACH the runner.
+#
+# A flag that parses and never arrives is one more dead gate. These capture run_engine_ladder's kwargs and
+# assert the EFFECTIVE values, so `--store-pool-size` / `--strict-inbound-bands` cannot be quietly dropped
+# on the way through the CLI (which is exactly how a `setdefault("8")` survived unnoticed for months).
+# =====================================================================================================
+
+
+def test_engine_ladder_store_pool_size_defaults_to_none_so_the_runner_resolves_the_product_default(
+    monkeypatch, tmp_path
+) -> None:
+    """The CLI passes None ⇒ `resolve_store_pool_size` applies the PRECEDENCE (ambient env, else the PRODUCT
+    default 40). The default is NOT baked into argparse: if it were, an ambient MEFOR_STORE_POOL_SIZE — which
+    the old `setdefault` honoured — would be silently overridden by a flag the operator never typed."""
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    captured = _patch_engine(monkeypatch)
+    hm.main(
+        [
+            "shardcert-engine-ladder",
+            "--rate-ladder",
+            "24,28",
+            "--sink-port",
+            "9000",
+            "--coord-dir",
+            str(tmp_path),
+        ]
+    )
+    assert (
+        captured["store_pool_size"] is None
+    )  # ⇒ the runner resolves it (ambient > product default)
+    assert captured["strict_bands"] is False  # G < L WARNS by default — it is true at the defaults
+
+    from harness.load.shardcert import PRODUCT_STORE_POOL_SIZE, resolve_store_pool_size
+
+    assert resolve_store_pool_size({}, captured["store_pool_size"]) == PRODUCT_STORE_POOL_SIZE == 40
+
+
+def test_engine_ladder_store_pool_size_flag_reaches_the_runner(monkeypatch, tmp_path) -> None:
+    # The pool is now a SWEEPABLE variable — including a deliberate re-run of the old 8 for an A/B.
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    captured = _patch_engine(monkeypatch)
+    hm.main(
+        [
+            "shardcert-engine-ladder",
+            "--rate-ladder",
+            "24,28",
+            "--sink-port",
+            "9000",
+            "--coord-dir",
+            str(tmp_path),
+            "--store-pool-size",
+            "160",
+            "--strict-inbound-bands",
+        ]
+    )
+    assert captured["store_pool_size"] == 160
+    assert captured["strict_bands"] is True
+
+
+def test_engine_ladder_rejects_a_nonsense_pool_size(monkeypatch, tmp_path, capsys) -> None:
+    # Exit 2 = SETUP error, never 1 (a bench result). A zero-size pool would deadlock the fleet, and the
+    # failure would look like a hang, not a bad flag.
+    monkeypatch.setenv("MEFOR_STORE_BACKEND", "sqlserver")
+    _patch_engine(monkeypatch)
+    rc = hm.main(
+        [
+            "shardcert-engine-ladder",
+            "--rate-ladder",
+            "24",
+            "--sink-port",
+            "9000",
+            "--coord-dir",
+            str(tmp_path),
+            "--store-pool-size",
+            "0",
+        ]
+    )
+    assert rc == 2
+    assert "--store-pool-size must be >= 1" in capsys.readouterr().err

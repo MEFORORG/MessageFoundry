@@ -51,3 +51,40 @@ def test_webconsole_seam_snapshot_matches_golden() -> None:
             )
         )
         raise AssertionError(f"{_FAILURE_HINT}\n\n{diff}")
+
+
+def test_console_supports_exactly_the_engine_seam() -> None:
+    """The console accepts ONE seam — the engine's (BACKLOG #279, option (b)).
+
+    This is the enforcement half of narrowing the range. A seam bump has always required editing BOTH
+    constants (a new seam was never in the old set either), but nothing FAILED when the console side
+    was forgotten — the mismatch surfaced at a customer's startup as UiSeamMismatch. Now it fails
+    here, in CI, on the commit that bumps the engine.
+
+    If cross-seam support is ever wanted again, re-widen SUPPORTED_ENGINE_SEAMS **and** land the CI
+    matrix that installs the MIN and MAX supported engine builds. Deleting this test to allow a range
+    would restore exactly the untested claim #279 was filed against.
+    """
+    from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
+    from messagefoundry_webconsole import SUPPORTED_ENGINE_SEAMS
+
+    expected = frozenset({ENGINE_UI_SEAM})
+    assert expected == SUPPORTED_ENGINE_SEAMS, (
+        f"console supports {sorted(SUPPORTED_ENGINE_SEAMS)} but the engine ships seam "
+        f"{ENGINE_UI_SEAM}. Bumping ENGINE_UI_SEAM requires updating "
+        "messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS in the SAME commit."
+    )
+
+
+def test_assert_engine_seam_refuses_a_neighbouring_seam() -> None:
+    """The gate must reject an engine one seam older AND one newer — the older direction is what the
+    old {2..N} range silently accepted without ever testing it."""
+    import pytest
+
+    from messagefoundry.api._ui_seam import ENGINE_UI_SEAM
+    from messagefoundry_webconsole import UiSeamMismatch, assert_engine_seam
+
+    assert_engine_seam(ENGINE_UI_SEAM)  # the matching engine mounts
+    for skew in (ENGINE_UI_SEAM - 1, ENGINE_UI_SEAM + 1):
+        with pytest.raises(UiSeamMismatch):
+            assert_engine_seam(skew)

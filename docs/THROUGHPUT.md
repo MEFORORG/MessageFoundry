@@ -261,6 +261,18 @@ Aggregate capacity is the sum of the interfaces; the shared message store on a s
 headroom for the combined load, so you scale out by adding interfaces rather than trying to make one pipe
 infinitely fast.
 
+> ⚠️ **CORRECTION (2026-07-14) — do NOT size on "aggregate = the sum of the interfaces". That composition rule
+> is MEASURED-FALSE on the shipped default shape, and it over-reports.** Interfaces are not independent: they
+> contend on a shared upstream (store-side) wall, so per-interface ceilings do **not** add.
+> [`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §4 measured
+> **87 delivered/s across 16 lanes — 5.44/s per lane**, far below the ~60/s per-lane ceiling, because *"those
+> lanes are starved **upstream** by a **store-side** wall."* Summing would predict 16 × 60 = **960/s** against a
+> **measured 87/s — an ~11× over-report**. STEP-4 Arm 0 corroborates: at the ~16 msg/s plateau, outbound lane
+> occupancy was only ~46% of the structural per-lane cap — the lanes were nowhere near their own bound.
+> **Always take `min(measured concurrent multi-interface aggregate, Σ per-interface)`, and prefer the measured
+> concurrent run — never compose the aggregate.** (Recorded as blocker **B4** in the
+> [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md).)
+
 ---
 
 ## 8. Reference lab measurements (and their caveats)

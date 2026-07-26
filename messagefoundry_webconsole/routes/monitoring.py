@@ -42,6 +42,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.get("/ui/events", response_class=HTMLResponse)
     async def ui_events(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
         connection: str | None = Query(None, max_length=256),
@@ -57,5 +58,37 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             kind=kinds,
             since=None,
             limit=100,
+            request=request,
         )
         return HTMLResponse(pages.events(rows, connection=connection or "", kind=kind or ""))
+
+    async def _flow_data(request: Request, engine: Any, identity: Identity) -> tuple[Any, Any]:
+        """Fetch the two read-only monitoring:read sources for the Flow & trends page (BACKLOG #76):
+        the status-colored graph (from the Registry edges) + the metrics-history ring. Their own
+        ``Depends`` gates are skipped on a direct call, so ``require_ui`` re-asserted the permission."""
+        graph = await core.graph_edges(engine=engine, identity=identity)
+        history = await core.metrics_history(request, _user=identity)
+        return graph, history
+
+    @app.get("/ui/monitoring", response_class=HTMLResponse)
+    async def ui_monitoring(
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
+    ) -> HTMLResponse:
+        # #76: the status-colored by-name data-flow graph + the historical queue-trend chart, both
+        # inline SVG (CSP script-src 'self'). Read-only, metadata only — no message body.
+        graph, history = await _flow_data(request, engine, identity)
+        return HTMLResponse(pages.flow_and_trends(graph, history))
+
+    @app.get("/ui/monitoring/live", response_class=HTMLResponse)
+    async def ui_monitoring_live(
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        # activity=False (ASVS 14.3.1): the Flow page's auto-refresh is timer-driven, not user activity.
+        identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
+    ) -> HTMLResponse:
+        # The poll target app.js swaps into the page's [data-mf-fragment] container (server-rendered,
+        # already-escaped) so the graph's live status colours + the trend refresh without a WebSocket.
+        graph, history = await _flow_data(request, engine, identity)
+        return HTMLResponse(pages.flow_and_trends_fragment(graph, history))

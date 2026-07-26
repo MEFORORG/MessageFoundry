@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import socket
-from datetime import datetime, time, timezone
+from datetime import UTC, datetime, time
 from pathlib import Path
 
 import pytest
@@ -33,7 +33,7 @@ _WEEKDAYS = frozenset({0, 1, 2, 3, 4})
 
 
 def _utc(y: int, mo: int, d: int, h: int, mi: int = 0) -> datetime:
-    return datetime(y, mo, d, h, mi, tzinfo=timezone.utc)
+    return datetime(y, mo, d, h, mi, tzinfo=UTC)
 
 
 class _Clock:

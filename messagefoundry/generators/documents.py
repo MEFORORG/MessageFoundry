@@ -21,7 +21,9 @@ from __future__ import annotations
 import base64
 import random
 
-from messagefoundry.generators import all_types  # noqa: F401  (registers ORU/MDM/... specs on import)
+from messagefoundry.generators import (
+    all_types,  # noqa: F401  (registers ORU/MDM/... specs on import)
+)
 from messagefoundry.generators._core import DEFAULT_SEED, generate_message
 from messagefoundry.parsing.message import Message
 

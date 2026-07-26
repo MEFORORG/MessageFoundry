@@ -9,11 +9,13 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _totp_clock import fresh_totp
 
 from messagefoundry.api import create_app
-from messagefoundry.auth import Role, totp
+from messagefoundry.auth import Role
 from messagefoundry.auth.ldap import AdPrincipal
 from messagefoundry.auth.service import AuthService
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.settings import AiSettings, AuthSettings, StoreSettings
@@ -160,7 +162,7 @@ async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
 
         # Confirm with a live code → activates MFA + returns the one-time recovery codes.
         assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
-        r = await c.post("/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok))
+        r = await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok))
         assert r.status_code == 200 and len(r.json()["recovery_codes"]) == 10
         st = (await c.get("/me/mfa", headers=_auth(tok))).json()
         assert st["enabled"] is True and st["required"] is True
@@ -173,7 +175,7 @@ async def test_mfa_enroll_confirm_and_step_up_gate(engine: Engine) -> None:
         # A require_step_up route is blocked with X-MFA-Required until the 2nd factor is verified.
         r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
         assert r.status_code == 403 and r.headers.get("X-MFA-Required") == "1"
-        r = await c.post("/auth/mfa-verify", json={"code": totp.totp(secret)}, headers=_auth(tok2))
+        r = await c.post("/auth/mfa-verify", json={"code": fresh_totp(secret)}, headers=_auth(tok2))
         assert r.status_code == 200
         # Now it passes (password step-up satisfied at login; MFA now satisfied).
         r = await c.put("/ad-group-map", json={"entries": []}, headers=_auth(tok2))
@@ -191,7 +193,7 @@ async def test_mfa_verify_accepts_recovery_code_once(engine: Engine) -> None:
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         await _reauth(c, tok, purpose="mfa_confirm")  # …and a fresh one unlocks confirm
         confirm = await c.post(
-            "/me/mfa/confirm", json={"code": totp.totp(secret)}, headers=_auth(tok)
+            "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
         )
         recovery = confirm.json()["recovery_codes"]
 
@@ -257,7 +259,7 @@ async def test_require_mfa_admin_is_not_bootstrap_locked_out(engine: Engine) -> 
         secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
         assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
         confirmed = await c.post(
-            "/me/mfa/confirm", headers=_auth(tok), json={"code": totp.totp(secret)}
+            "/me/mfa/confirm", headers=_auth(tok), json={"code": fresh_totp(secret)}
         )
         assert confirmed.status_code == 200 and confirmed.json()["recovery_codes"]
         # The admin has escaped the required-but-unenrolled state: MFA is active and — because confirming
@@ -533,7 +535,9 @@ async def test_audit_csv_export_content_and_audit_event(engine: Engine) -> None:
         assert resp.headers["content-type"].startswith("text/csv")
         assert "attachment" in resp.headers["content-disposition"]
         lines = [ln for ln in resp.text.splitlines() if ln]
-        assert lines[0] == "ts,actor,action,channel_id,detail"
+        # ADR 0150 added `client` — the compliance officer's report now carries the "from where"
+        # alongside the who/what, which is what makes it usable for incident response.
+        assert lines[0] == "ts,actor,action,channel_id,client,detail"
         # only alice's row (filtered), and the header row
         assert len(lines) == 2
         assert "alice" in lines[1] and "message_view" in lines[1]
@@ -568,7 +572,7 @@ async def test_audit_export_injection_in_filter_is_safe(engine: Engine) -> None:
         assert resp.status_code == 200
         lines = [ln for ln in resp.text.splitlines() if ln]
         assert lines == [
-            "ts,actor,action,channel_id,detail"
+            "ts,actor,action,channel_id,client,detail"
         ]  # header only — payload matched nothing
     # the seeded row survived; the table was not dropped/altered
     assert len(await engine.store.list_audit(action="message_view")) == 1
@@ -585,12 +589,36 @@ def test_csv_safe_neutralizes_formula_triggers() -> None:
     assert _csv_safe("@SUM(A1)") == "'@SUM(A1)"
     assert _csv_safe("   =evil()") == "'   =evil()"  # trigger behind leading spaces
     assert _csv_safe("\t=evil()") == "'\t=evil()"  # raw leading TAB is itself a trigger
+    # ASVS 1.2.10: NUL is the character this (attacker-influenced) writer's own trigger set omitted —
+    # and str.lstrip() does not strip it, so neither prong caught it until the canonical rule landed.
+    assert _csv_safe("\x00=evil()") == "'\x00=evil()"
+    assert _csv_safe("\x00") == "'\x00"
     # benign values (incl. a plain float ts and a leading-digit string) pass through untouched
     assert _csv_safe("alice") == "alice"
     assert _csv_safe("message_view") == "message_view"
     assert _csv_safe('{"n": 1}') == '{"n": 1}'
     assert _csv_safe(100.0) == 100.0
     assert _csv_safe("") == ""
+
+
+def test_externally_managed_predicate_mirrors_service_not_local_gate() -> None:
+    # BACKLOG #276: the LOCAL-only ceremonies (change engine password, enroll engine TOTP, set
+    # engine-managed roles) must gate on ``!= LOCAL`` the way ``auth/service.py`` does — NOT on
+    # ``== AD``. An ``== AD`` check would wave a future third provider (e.g. "oidc") straight through
+    # a ceremony the service then rejects, diverging the two layers. Assert the branch is taken for
+    # *every* non-LOCAL provider, and only skipped for LOCAL.
+    from messagefoundry.api.auth_routes import AuthProvider, _externally_managed
+
+    # LOCAL — the one provider these ceremonies are FOR — is not externally managed.
+    assert _externally_managed(AuthProvider.LOCAL) is False
+    assert _externally_managed(AuthProvider.LOCAL.value) is False
+    # AD (today's only external provider) is, via both the enum and its stored string form.
+    assert _externally_managed(AuthProvider.AD) is True
+    assert _externally_managed(AuthProvider.AD.value) is True
+    # A hypothetical third provider must take the SAME external branch. This is the latent bug the
+    # alignment fixes: an ``== AD`` predicate would return False here and let it through.
+    assert _externally_managed("oidc") is True
+    assert _externally_managed("saml") is True
 
 
 async def test_audit_export_neutralizes_formula_injection_in_cells(engine: Engine) -> None:
@@ -662,6 +690,138 @@ async def test_admin_write_floor_has_headroom_over_a_legit_burst(engine: Engine)
             assert (await c.put("/ad-group-map", json=body, headers=h)).status_code == 200
 
 
+# --- BACKLOG #193 pacing COVERAGE via require_paced (ASVS 2.4.2) --------------
+# require_paced extends the same #193 per-actor limiter to the mutating admin routes that warrant
+# pacing but not a full step-up re-proof (connection start/stop/restart, DR activate/release,
+# approvals approve/reject, alert ack/resolve, statistics reset). POST /statistics/reset is the
+# cleanest such route that 200s without a live connection/coordinator (empty targets → reset 0).
+_RESET_BODY = {"all": False, "targets": []}
+
+
+async def test_require_paced_route_is_pace_limited(engine: Engine) -> None:
+    # The previously-require()-only POST /statistics/reset is now paced by the #193 limiter, while a
+    # GET on a swapped group stays exempt (the throttle is NON-GET-only, in the shared helper).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        assert (await c.post("/statistics/reset", json=_RESET_BODY, headers=h)).status_code == 200
+        assert (await c.post("/statistics/reset", json=_RESET_BODY, headers=h)).status_code == 200
+        throttled = await c.post("/statistics/reset", json=_RESET_BODY, headers=h)  # over the floor
+        assert throttled.status_code == 429
+        assert throttled.headers.get("Retry-After")
+        # A GET on a swapped group is exempt (method == GET) even after the write floor trips.
+        assert (await c.get("/alerts/active", headers=h)).status_code == 200
+
+
+async def test_require_paced_shares_one_bucket_with_step_up(engine: Engine) -> None:
+    # require_step_up and require_paced draw from the SAME per-actor bucket keyed on user_id (via
+    # _enforce_admin_write_pacing): two step-up writes exhaust the floor, then a paced write 429s.
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        assert (await c.put("/ad-group-map", json={"entries": []}, headers=h)).status_code == 200
+        assert (await c.put("/ad-group-map", json={"entries": []}, headers=h)).status_code == 200
+        # The paced route draws from the same exhausted bucket → 429.
+        assert (await c.post("/statistics/reset", json=_RESET_BODY, headers=h)).status_code == 429
+
+
+async def test_require_paced_inherits_the_mfa_access_gate(engine: Engine) -> None:
+    # INVERTED by ASVS 6.3.3, deliberately. require_paced builds on require(), so it now inherits the
+    # MFA ACCESS gate: an unenrolled admin can no longer POST a paced route. That is the point of the
+    # cell — /statistics/reset and /dr/activate must not be reachable by an MFA-pending admin.
+    #
+    # The distinction require_paced still draws against require_step_up is asserted on the far side of
+    # the gate: once the second factor is satisfied, the paced route passes while the step-up route
+    # keeps demanding a fresh password proof. Pinning it there keeps the original intent testable
+    # instead of deleting the coverage.
+    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    await _add(service, "adm", Role.ADMINISTRATOR)  # second factor not enrolled
+    async with _client(engine, service) as c:
+        tok = (await _login(c, "adm")).json()["token"]
+        h = _auth(tok)
+        pending = await c.post("/statistics/reset", json=_RESET_BODY, headers=h)
+        assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
+
+        # Enroll + confirm; confirming satisfies THIS session's factor (the escape path).
+        assert (await _reauth(c, tok, purpose="mfa_enroll")).status_code == 200
+        secret = (await c.post("/me/mfa/enroll", headers=h)).json()["secret"]
+        assert (await _reauth(c, tok, purpose="mfa_confirm")).status_code == 200
+        assert (
+            await c.post("/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=h)
+        ).status_code == 200
+
+        # Paced route: allowed again on the far side of the gate — require_paced adds throttling, not
+        # a second-factor requirement of its own; it inherits exactly the one require() applies.
+        assert (await c.post("/statistics/reset", json=_RESET_BODY, headers=h)).status_code == 200
+
+
+async def test_require_paced_is_byte_identical_when_limiter_disabled(engine: Engine) -> None:
+    # No new flag: disabling the existing #193 switch reverts require_paced to require() semantics
+    # exactly (the strict-byte-identical escape hatch).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_enabled=False,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        for _ in range(20):
+            assert (
+                await c.post("/statistics/reset", json=_RESET_BODY, headers=h)
+            ).status_code == 200
+
+
+async def test_connection_test_and_integrity_check_are_paced(engine: Engine) -> None:
+    # ASVS 2.4.2 completion (WP245 follow-up): the two mutating POSTs the #193 pacing sweep missed —
+    # POST /connections/{name}/test (fires a LIVE outbound reachability dial → SSRF/scan amplification)
+    # and POST /status/integrity-check (a costly full-scan) — are now require_paced, drawing from the
+    # shared per-actor admin-write bucket. Pacing runs in the dependency, BEFORE the route body, so an
+    # unknown-name probe still counts toward the floor (never reaching the live dial once throttled).
+    service = await _service(
+        engine,
+        AuthSettings(
+            require_mfa=False,
+            login_rate_limit_enabled=False,
+            admin_write_rate_limit_per_actor=2,
+            admin_write_rate_limit_window_seconds=60.0,
+        ),
+    )
+    await _add(service, "adm", Role.ADMINISTRATOR)
+    async with _client(engine, service) as c:
+        h = _auth((await _login(c, "adm")).json()["token"])
+        # /connections/{name}/test is paced: two probes pass the dependency (each counts toward the
+        # floor), the third is refused 429 before it can dial out.
+        assert (await c.post("/connections/none/test", headers=h)).status_code != 429
+        assert (await c.post("/connections/none/test", headers=h)).status_code != 429
+        throttled = await c.post("/connections/none/test", headers=h)
+        assert throttled.status_code == 429
+        assert throttled.headers.get("Retry-After")
+        # /status/integrity-check draws from the SAME exhausted per-actor bucket → 429 (also require_paced).
+        assert (await c.post("/status/integrity-check", headers=h)).status_code == 429
+
+
 async def test_change_own_password_revokes_sessions(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "u", Role.VIEWER)
@@ -694,11 +854,47 @@ async def test_change_own_password_revokes_sessions(engine: Engine) -> None:
         assert (await _login(c, "u", "a-brand-new-passphrase")).status_code == 200
 
 
+# --- post-session ceremonies draw on a per-ACTOR budget, not the sign-in one ---
+
+
+async def test_reauth_survives_an_exhausted_sign_in_budget(engine: Engine) -> None:
+    """Re-auth used to share the sign-in limiter's GLOBAL budget, so anyone able to reach the login
+    page could exhaust it and lock every signed-in operator out of step-up without holding a
+    credential. The ceremonies now key on the acting user (glob=0)."""
+    service = await _service(
+        engine, AuthSettings(login_rate_limit_per_ip=50, login_rate_limit_global=3)
+    )
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        token = (await _login(c, "op")).json()["token"]
+        for _ in range(6):  # unauthenticated flood exhausts the SHARED sign-in budget
+            await _login(c, "nobody", password="an-entirely-wrong-password")
+        assert (await _login(c, "op")).status_code == 429  # sign-in is indeed throttled
+        assert (await _reauth(c, token)).status_code == 200  # ...but step-up still works
+
+
+async def test_reauth_budget_is_per_actor(engine: Engine) -> None:
+    service = await _service(
+        engine, AuthSettings(login_rate_limit_per_ip=2, login_rate_limit_global=0)
+    )
+    await _add(service, "a", Role.OPERATOR)
+    await _add(service, "b", Role.OPERATOR)
+    async with _client(engine, service) as c:
+        ta = (await _login(c, "a")).json()["token"]
+        tb = (await _login(c, "b")).json()["token"]
+        for _ in range(2):
+            assert (await _reauth(c, ta)).status_code == 200
+        assert (await _reauth(c, ta)).status_code == 429  # actor a spent its own budget
+        assert (await _reauth(c, tb)).status_code == 200  # actor b is unaffected
+
+
 # --- WP-8: anti-automation on the PHI-read endpoints (ASVS 2.4.1) -------------
 
 
 async def test_phi_read_throttle_caps_per_actor_across_endpoints(engine: Engine) -> None:
-    service = await _service(engine, AuthSettings(phi_read_rate_limit_per_actor=3))
+    service = await _service(
+        engine, AuthSettings(phi_read_rate_limit_per_actor=3, require_mfa=False)
+    )
     await _add(service, "vw", Role.VIEWER)
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "vw")).json()["token"])
@@ -711,7 +907,9 @@ async def test_phi_read_throttle_caps_per_actor_across_endpoints(engine: Engine)
 
 
 async def test_phi_read_throttle_is_per_actor(engine: Engine) -> None:
-    service = await _service(engine, AuthSettings(phi_read_rate_limit_per_actor=2))
+    service = await _service(
+        engine, AuthSettings(phi_read_rate_limit_per_actor=2, require_mfa=False)
+    )
     await _add(service, "a", Role.VIEWER)
     await _add(service, "b", Role.VIEWER)
     async with _client(engine, service) as c:
@@ -725,7 +923,9 @@ async def test_phi_read_throttle_is_per_actor(engine: Engine) -> None:
 
 async def test_phi_read_raw_view_is_throttled(engine: Engine) -> None:
     mid = await engine.store.enqueue_message(channel_id="c", raw=ADT, deliveries=[])
-    service = await _service(engine, AuthSettings(phi_read_rate_limit_per_actor=1))
+    service = await _service(
+        engine, AuthSettings(phi_read_rate_limit_per_actor=1, require_mfa=False)
+    )
     await _add(service, "op", Role.OPERATOR)  # OPERATOR holds messages:view_raw
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "op")).json()["token"])
@@ -734,7 +934,9 @@ async def test_phi_read_raw_view_is_throttled(engine: Engine) -> None:
 
 
 async def test_phi_read_throttle_off_by_setting(engine: Engine) -> None:
-    service = await _service(engine, AuthSettings(phi_read_rate_limit_enabled=False))
+    service = await _service(
+        engine, AuthSettings(phi_read_rate_limit_enabled=False, require_mfa=False)
+    )
     await _add(service, "vw", Role.VIEWER)
     async with _client(engine, service) as c:
         h = _auth((await _login(c, "vw")).json()["token"])
@@ -786,6 +988,84 @@ async def test_cannot_revoke_another_users_session(engine: Engine) -> None:
         assert (await c.get("/auth/me", headers=_auth(tb))).status_code == 200  # b still signed in
 
 
+# --- 7.5.2: password re-proof before self-service session terminate (ASVS 7.5.2) ---------------
+
+
+async def test_revoke_session_requires_reauth_when_stale(engine: Engine) -> None:
+    # Terminating a session needs a fresh password re-proof. A stale window (login-seeded, default
+    # 300s) 403s with X-Step-Up-Required and NOT X-MFA-Required (password-only, no MFA gate).
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t1 = (await _login(c, "u")).json()["token"]
+        t2 = (await _login(c, "u")).json()["token"]
+        t1_sid = hash_token(t1)
+        await service.store.mark_session_reauthed(hash_token(t2), now=0.0)  # back-date the current
+        stale = await c.delete(f"/me/sessions/{t1_sid}", headers=_auth(t2))
+        assert stale.status_code == 403
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert stale.headers.get("X-MFA-Required") is None
+        assert (
+            await c.get("/auth/me", headers=_auth(t1))
+        ).status_code == 200  # nothing revoked yet
+        assert (await _reauth(c, t2)).status_code == 200
+        assert (await c.delete(f"/me/sessions/{t1_sid}", headers=_auth(t2))).status_code == 200
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # now revoked
+
+
+async def test_revoke_other_sessions_requires_reauth_when_stale(engine: Engine) -> None:
+    service = await _service(engine)
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t1 = (await _login(c, "u")).json()["token"]
+        t2 = (await _login(c, "u")).json()["token"]
+        await service.store.mark_session_reauthed(hash_token(t2), now=0.0)
+        stale = await c.delete("/me/sessions", headers=_auth(t2))
+        assert stale.status_code == 403 and stale.headers.get("X-Step-Up-Required") == "1"
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 200  # t1 untouched
+        assert (await _reauth(c, t2)).status_code == 200
+        assert (await c.delete("/me/sessions", headers=_auth(t2))).status_code == 200
+        assert (await c.get("/auth/me", headers=_auth(t1))).status_code == 401  # t1 signed out
+        assert (await c.get("/auth/me", headers=_auth(t2))).status_code == 200  # current kept
+
+
+async def test_revoke_no_mfa_user_gate_is_password_only(engine: Engine) -> None:
+    # TRAP guard: even a require_mfa session that has NOT enrolled a factor gets a password-only gate
+    # on terminate (X-Step-Up-Required, never X-MFA-Required) — never deadlocked out of revoking.
+    service = await _service(engine, AuthSettings(require_mfa=True, login_rate_limit_enabled=False))
+    await _add(service, "u", Role.VIEWER)
+    async with _client(engine, service) as c:
+        t = (await _login(c, "u")).json()["token"]
+        await service.store.mark_session_reauthed(hash_token(t), now=0.0)
+        stale = await c.delete("/me/sessions", headers=_auth(t))
+        assert stale.status_code == 403
+        assert stale.headers.get("X-Step-Up-Required") == "1"
+        assert stale.headers.get("X-MFA-Required") is None  # NOT the MFA gate
+        assert (await _reauth(c, t)).status_code == 200
+        assert (await c.delete("/me/sessions", headers=_auth(t))).status_code == 200
+
+
+async def test_revoke_ownership_404_survives_reauth(engine: Engine) -> None:
+    # 404-not-403 guard: after a fresh re-auth the ownership 404 for a foreign id is NOT converted
+    # into a step-up 403 (and while stale, the gate blocks with 403 before the ownership check).
+    service = await _service(engine)
+    await _add(service, "a", Role.VIEWER)
+    await _add(service, "b", Role.VIEWER)
+    async with _client(engine, service) as c:
+        ta = (await _login(c, "a")).json()["token"]
+        tb = (await _login(c, "b")).json()["token"]
+        b_sid = (await c.get("/me/sessions", headers=_auth(tb))).json()["sessions"][0]["id"]
+        await service.store.mark_session_reauthed(hash_token(ta), now=0.0)
+        assert (
+            await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
+        ).status_code == 403  # stale
+        assert (await _reauth(c, ta)).status_code == 200
+        assert (
+            await c.delete(f"/me/sessions/{b_sid}", headers=_auth(ta))
+        ).status_code == 404  # own
+        assert (await c.get("/auth/me", headers=_auth(tb))).status_code == 200  # b untouched
+
+
 async def test_admin_revokes_a_users_sessions(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "root", Role.ADMINISTRATOR)
@@ -800,7 +1080,7 @@ async def test_admin_revokes_a_users_sessions(engine: Engine) -> None:
 
 
 async def test_session_cap_evicts_oldest_on_login(engine: Engine) -> None:
-    service = await _service(engine, AuthSettings(max_sessions_per_user=2))
+    service = await _service(engine, AuthSettings(max_sessions_per_user=2, require_mfa=False))
     await _add(service, "u", Role.VIEWER)
     async with _client(engine, service) as c:
         t1 = (await _login(c, "u")).json()["token"]
@@ -874,7 +1154,10 @@ async def test_patch_user_preserves_omitted_fields(engine: Engine) -> None:
         actor="test",
     )
     async with _client(engine, service) as c:
-        h = _auth((await _login(c, "root")).json()["token"])
+        token = (await _login(c, "root")).json()["token"]
+        h = _auth(token)
+        # 7.5.1: PATCH /users/{id} is now action-bound — mint the admin_user_update grant first.
+        assert (await _reauth(c, token, purpose="admin_user_update")).status_code == 200
         r = await c.patch(f"/users/{uid}", headers=h, json={"disabled": True})
         assert r.status_code == 200
     user = await engine.store.get_user(uid)
@@ -997,6 +1280,32 @@ async def test_security_posture_keyless_reports_off(engine: Engine) -> None:
     assert body["key_source"] == "auto"
 
 
+async def test_security_posture_reports_fips_attestation(engine: Engine) -> None:
+    # #73 / ADR 0120: the posture route reports the interpreter ssl/_hashlib OpenSSL FIPS-provider state
+    # + version — report-only metadata, MONITORING_READ-gated + audited like the rest of the payload,
+    # and NOT secret material (AC-2/AC-3/AC-4).
+    import ssl as _ssl
+
+    from messagefoundry.config.tls_policy import fips_attestation
+
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # holds monitoring:read
+    async with _posture_client(engine, service) as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        resp = await c.get("/security/posture", headers=vw)
+    assert resp.status_code == 200
+    body = resp.json()
+    # The two additive fields are present and match the pure helper's read-out.
+    expected_mode, expected_version = fips_attestation()
+    assert "fips_mode" in body and body["fips_mode"] == expected_mode
+    assert body["openssl_version"] == expected_version == _ssl.OPENSSL_VERSION
+    # AC-4 — the version string is public metadata, never key material; the boolean carries no secret.
+    assert isinstance(body["openssl_version"], str)
+    # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
+    rows = await engine.store.list_audit(limit=20, action="security.posture_view")
+    assert rows  # at least the read above was recorded
+
+
 async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
     tmp_path: Path, engine: Engine
 ) -> None:
@@ -1006,7 +1315,7 @@ async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
     store = await MessageStore.open(tmp_path / "enc.db", cipher=make_cipher(key_b64))
     enc_engine = Engine(store, poll_interval=0.02)
     try:
-        service = AuthService(enc_engine.store, AuthSettings())
+        service = AuthService(enc_engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         await _add(service, "vw", Role.VIEWER)
         ai = AiSettings(environment="prod", data_class=DataClass.PHI, production=True)
@@ -1047,3 +1356,47 @@ def test_security_posture_sqlserver_reports_no_plaintext_residual() -> None:
     assert _plaintext_columns("postgres", encryption_enabled=True) == []
     # Encryption off is N/A everywhere (the encryption_enabled=false bit conveys it).
     assert _plaintext_columns("sqlserver", encryption_enabled=False) == []
+
+
+# --- ADR 0150: the client address reaches the audit row from the request ----------------------------
+
+
+async def test_authenticated_action_audits_the_caller_address(engine: Engine) -> None:
+    """End-to-end: an authenticated action records WHERE FROM, not just who and what. Before ADR 0150
+    an incident responder could see that `vw` viewed the security posture but not which host did it."""
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=("10.4.2.9", 51234)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/security/posture", headers=vw)).status_code == 200
+
+    rows = [
+        dict(r) for r in await engine.store.list_audit(limit=20, action="security.posture_view")
+    ]
+    assert rows and rows[0]["client"] == "10.4.2.9"
+    # The login that preceded it is attributed to the same host (auth/service.py threading).
+    logins = [dict(r) for r in await engine.store.list_audit(limit=20, action="auth.login_success")]
+    assert logins and logins[0]["client"] == "10.4.2.9"
+    # And the trail is still a valid tamper-evident chain with the addresses folded in.
+    ok, message = await engine.store.verify_audit_chain()
+    assert ok, message
+
+
+async def test_engine_internal_write_does_not_inherit_a_request_address(engine: Engine) -> None:
+    """A `system` row written AFTER a real request must stay NULL. A ContextVar carrier would have
+    leaked the operator's address into this row via asyncio.create_task — the rejected design."""
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service), client=("10.4.2.9", 51234)
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        assert (await c.get("/security/posture", headers=vw)).status_code == 200
+
+    await engine.store.record_audit("retention.purge", actor="system")
+    row = dict((await engine.store.list_audit(limit=1))[0])
+    assert row["action"] == "retention.purge" and row["client"] is None

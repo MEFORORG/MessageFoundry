@@ -32,7 +32,7 @@ via the :mod:`~messagefoundry.parsing.dicom.hl7_map` helpers, never a declarativ
 from __future__ import annotations
 
 from messagefoundry.parsing.dicom.dataset import DicomDataset, SrMeasurement
-from messagefoundry.parsing.dicom.errors import DicomError, DicomPeekError
+from messagefoundry.parsing.dicom.errors import DicomBombError, DicomError, DicomPeekError
 from messagefoundry.parsing.dicom.peek import DicomPeek
 
 __all__ = [
@@ -41,4 +41,5 @@ __all__ = [
     "SrMeasurement",
     "DicomError",
     "DicomPeekError",
+    "DicomBombError",
 ]

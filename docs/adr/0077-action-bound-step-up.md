@@ -138,3 +138,85 @@ the protected JSON routes.
       routes bind; admin/replay/config/purge keep the window; WebAuthn register and the browser `/ui`
       twins are deferred to the Wave-1 follow-on (residuals). Recorded in `api/security.py` +
       `api/auth_routes.py`.
+
+## Amendment (2026-07-17, WP245 — ASVS 7.5.2): re-auth before self-service session terminate
+
+The self-service **session-TERMINATE** routes — JSON `DELETE /me/sessions` and `DELETE
+/me/sessions/{id}`, and the `/ui` twins `POST /ui/account/sessions/{id}/revoke` +
+`.../sessions/revoke-others` — now gate on the **session-window re-auth** (`require_reauth_only` /
+`require_ui_reauth_only`, **password-only, no MFA gate** so a no-factor user can still revoke), instead
+of the plain authenticated dependency they carried before. This satisfies the ASVS 7.5.2 requirement
+that terminating a session re-proves the credential, closing the window in which a hijacked live session
+could silently sign the victim out everywhere.
+
+This is the **session-window family** (like admin/replay/config), deliberately **NOT** the single-use
+action-bound grants — those stay reserved for the durable-takeover factor-binding routes (this ADR's
+Decision). The two body-less `/ui` terminate actions are registered as `step_up=False` `auto_retry`
+continuations, so a stale-window `require_ui_reauth_only` 303 to `/ui/reauth?next=<action>` can re-POST
+them after re-verification (without the registry entry `lookup_ui_action` returns None and the revoke
+silently no-ops). No new setting — the gate reuses the shipped `[auth].step_up_max_age_seconds` window
+that login already seeds, so the fresh immediate-post-login revoke is byte-identical; the re-proof
+triggers only on a stale window or a new client IP. Ownership stays **404-not-403** (the re-auth gate
+runs before the body and returns the same 403 for owned and foreign ids, leaking no ownership). This
+closes the **terminate slice** of the deferred browser-`/ui` step-up residual.
+
+## Amendment (2026-07-17, WP245 — ASVS 7.5.1): /ui twins wired + admin-user-update binding
+
+The two residuals this ADR deferred are now built; 7.5.1 moves from Partial to Pass.
+
+**(a) JSON admin-user-update binding.** `PATCH /users/{user_id}` moves from the session-window
+`require_step_up(USERS_MANAGE)` to `require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE,
+USERS_MANAGE)` (new constant in `auth/service.py`). It is the one *broad-admin* route promoted to
+action-binding as ASVS 7.5.1 coverage on the user-management surface; the other
+`require_step_up(USERS_MANAGE)` routes and all admin/replay/config/purge routes keep the session window
+(7.5.3). Trade-off recorded: `require_step_up_action` does not carry the BACKLOG #193 / ASVS 2.4.2
+`allow_admin_write` NON-GET throttle that `require_step_up` applies, so that per-actor pacing no longer
+covers this route directly — accepted because each action-bound PATCH now requires its own fresh
+single-use grant, i.e. a fresh `POST /me/reauth`, which is itself login-rate-limited
+(`allow_login_attempt`), pacing scripted repeats indirectly.
+
+**(b) Browser /ui factor-binding twins.** The `messagefoundry_webconsole` surface no longer rides the
+legacy window for factor binding. New cookie-world deps `require_ui_step_up_action` /
+`require_ui_reauth_only_action` (in `webconsole/_auth.py`) consume `has_action_step_up` (falling back to
+`has_recent_step_up` under the `require_action_step_up=False` opt-out, via a `_ui_action_step_up_ok`
+helper mirroring `api/security.py:_action_step_up_ok`). `UiWriteAction` gains an `action` tag, and
+`POST /ui/reauth` mints the matching single-use grant by threading `reauth(purpose=<action.action>)`
+(None for every non-factor continuation, so replay/purge/config/create-user stay byte-identical). New
+constants `STEP_UP_ACTION_WEBAUTHN_ENROLL` / `STEP_UP_ACTION_WEBAUTHN_DELETE` join the MFA ones. Bound
+lanes: `POST /ui/account/mfa/enroll` (MFA_ENROLL), `POST /ui/account/mfa/verify` (MFA_CONFIRM),
+`POST /ui/account/mfa/disable` (MFA_DISABLE), `POST /ui/account/webauthn/enroll` (WEBAUTHN_ENROLL),
+`POST /ui/account/webauthn/{id}/delete` (WEBAUTHN_DELETE).
+
+**Single-use consume rule (the design invariant that made the /ui twin non-trivial).** Because
+`has_action_step_up` is single-use (pops the grant), each durable /ui action has exactly ONE consuming
+dependency per reauth. Intermediate hops a preceding reauth transits before the terminal mutation stay
+on the NON-consuming window dep: the `GET /ui/account/mfa/confirm` unlock form keeps
+`require_ui_reauth_only`, and the WebAuthn ceremony finish `POST /ui/account/webauthn/verify` keeps
+`require_ui_reauth_only`. Making either action-consuming would burn the single grant the reauth minted
+and infinite-loop.
+
+**CSRF-vs-step-up ordering (the interaction this ADR warned of).** The action grant is consumed in the
+dependency, before the in-body `assert_same_origin`. This is fail-safe: `SameSite=Strict` +
+`require_ui` reject a cross-site POST (no cookie → 303 to login) before the dependency runs, and an
+errant consume only re-prompts, never bypasses. The `new_ip or not _ui_action_step_up_ok(...)`
+short-circuit is preserved verbatim so a forced new-IP step-up leaves the grant UNCONSUMED (mirrors
+`api/security.py`).
+
+**Still deferred (named residuals, not built here):** the /ui *admin* user-management lane
+`POST /ui/users/{user_id}/update` (`webconsole/routes/admin.py`) stays window-gated, so the browser
+admin-user-update path diverges from the now-action-bound JSON `PATCH /users/{user_id}` — both still
+step-up-gated (no hole), coverage only. The process-local grant caveat (restart / multi-node LB →
+re-prompt, fail-safe) now applies to the /ui lanes too, unchanged from Consequences.
+
+## Acceptance Criteria (amendment)
+
+- **AC-6** — WHILE a /ui session is inside its login-seeded window, WHEN it POSTs a /ui factor-binding
+  lane (mfa/enroll, mfa/verify, mfa/disable, webauthn/enroll, webauthn/{id}/delete), THE SYSTEM SHALL
+  303 to /ui/reauth and complete only after a password (+factor) re-proof mints the matching grant.
+- **AC-7** — WHEN /ui/reauth re-proves for an unlock/auto-retry continuation carrying an `action`, THE
+  SYSTEM SHALL mint exactly that single-use grant; the GET unlock form and the WebAuthn verify hop
+  SHALL NOT consume it.
+- **AC-8** — WHERE [auth].require_action_step_up is False, THE /ui twins SHALL fall back to the session
+  window (byte-identical to pre-amendment /ui behaviour).
+- **AC-9** — WHEN PATCH /users/{user_id} is called inside the login window, THE SYSTEM SHALL 403 +
+  X-Step-Up-Action: admin_user_update until POST /me/reauth carries that purpose (single-use).

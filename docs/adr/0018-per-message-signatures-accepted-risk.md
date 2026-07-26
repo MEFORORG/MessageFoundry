@@ -128,3 +128,21 @@ controls and the build triggers, and revisit when a trigger fires.
 **Cross-references:** [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) (4.1.5 verdict) ·
 [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md) ·
 [Secure_Development_Standards.md](../Secure_Development_Standards.md) §A.6 · [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) · [ADR 0015](0015-ws-soap-outbound-mtls-wssecurity.md).
+
+## Amendment (2026-07-17) — 4.1.5 instructed at exposure; residual reaffirmed (ADR 0115 / WP #243)
+
+**Status:** Doc-only — no default changed; signing stays **opt-in per connection**. This records the
+ADR 0115 drive-to-Pass treatment of 4.1.5: because a global "sign everything" flip would break
+partners with no verifier, 4.1.5 is **instructed, not flipped**.
+[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Per-message
+signing for partner integrity" now instructs enabling detached-JWS signing (code-first
+`with_signing(...)`, a pinned `algorithm`, an `env()` PEM key) on any outbound whose **partner
+contract requires message-level integrity**. (There is no `connections.toml` `sign_*` data surface
+today — exposing it is a deferred §4 follow-up.)
+
+The residual recorded in the 2026-06-18 amendment above is **reaffirmed, not closed**: signing is
+**outbound only** — the inbound HTTP/SOAP/REST listen source now exists (ADR 0023 `HttpSource`) but
+does not verify inbound detached-JWS signatures, so engine-side inbound verify-accept remains unbuilt
+— and the key is operator-supplied **env/PEM**, not a managed HSM/KMS (ADR 0019 follow-up). So 4.1.5
+remains **Pass-with-documented-residual (Partial at strict L3)** even for the instructed deployment.
+ADR 0115 does not re-score.

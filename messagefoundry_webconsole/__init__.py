@@ -12,7 +12,7 @@ and the pure ``messagefoundry.parsing`` lib — never ``pipeline``/``store``/``t
 (CLAUDE.md §4).
 
 The console pins itself against the engine's :data:`~messagefoundry.api._ui_seam.ENGINE_UI_SEAM` via
-:data:`SUPPORTED_ENGINE_SEAMS` + :func:`assert_engine_seam`, so an out-of-range engine fails LOUD at
+:data:`SUPPORTED_ENGINE_SEAMS` + :func:`assert_engine_seam`, so a NON-MATCHING engine fails LOUD at
 startup (:class:`UiSeamMismatch`) rather than a raw ``TypeError`` from building the deps bundle.
 """
 
@@ -26,10 +26,26 @@ __version__ = "0.2.15"
 
 #: The engine contract versions this console build supports (``api._ui_seam.ENGINE_UI_SEAM``). A pair
 #: outside this set is refused at startup — the runtime backstop behind the PEP 508 compat range.
-# Seam 4 adds the additive MessageDetail.attachments list + the download_attachment handler (#149);
-# seam 3 adds the additive SystemStatus.kpis roll-up (#93). Older seams are kept because every new field
-# has a default, so an older engine still renders on this console (the missing field reads as its default).
-SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({2, 3, 4})
+# Seam 9 is the S8a console-dashboard lane (#76/#131/#136, ADR 0065 + ADR 0007 amendments): the
+# The console supports EXACTLY the engine seam it was built against — deliberately a single value,
+# not a range (BACKLOG #279, resolved 2026-07-21 in favour of option (b)).
+#
+# It used to accept {2..N}, justified by "every new field has a default, so an older engine still
+# renders on this console". That claim was never tested: CI installs ONE engine (HEAD) and runs the
+# package suite against it, so N-1 of the N accepted seams were exercised by nothing. Worse, the two
+# ways it silently stops being true — a new field WITHOUT a default, or a bare read of a new engine
+# attribute where getattr-with-default was needed — do NOT trip this handshake, because the older
+# engine's seam IS in the accepted set. The failure surfaced as a runtime AttributeError/TypeError on
+# a live console instead of a loud refusal at startup, which is the opposite of what this gate exists
+# for.
+#
+# Narrowing costs no extra per-bump work: a NEW seam was never in the old set either, so a bump has
+# always required editing BOTH constants. It drops only the untested tail.
+#
+# If cross-seam support is ever genuinely wanted, re-widen this set AND add the CI matrix that
+# installs the MIN and MAX supported engine builds — the claim and its test land together, or not
+# at all.
+SUPPORTED_ENGINE_SEAMS: frozenset[int] = frozenset({14})
 
 #: The vendored static assets shipped in THIS wheel (mounted at /ui/static by :func:`mount_ui`).
 STATIC_DIR = Path(__file__).parent / "static"
@@ -62,6 +78,7 @@ from ._auth import (  # noqa: E402
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
     UiWriteAction,
+    assert_not_cross_site,
     assert_same_origin,
     authorize_ui_ws,
     clear_session_cookie,
@@ -93,6 +110,7 @@ __all__ = [
     "UiWriteAction",
     "__version__",
     "assert_engine_seam",
+    "assert_not_cross_site",
     "assert_same_origin",
     "authorize_ui_ws",
     "clear_session_cookie",

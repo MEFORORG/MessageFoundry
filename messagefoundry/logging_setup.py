@@ -23,6 +23,7 @@ import json
 import logging
 import logging.handlers
 import os
+import re
 import socket
 import ssl
 import sys
@@ -34,10 +35,13 @@ from messagefoundry.redaction import redact
 
 __all__ = [
     "configure_logging",
+    "set_runtime_level",
+    "current_log_level",
     "silence_phi_prone_dependency_loggers",
     "ControlCharScrubFilter",
     "RedactionFilter",
     "JsonFormatter",
+    "CredentialQueryScrubFilter",
     "SyslogForward",
     "query_sntp_offset",
     "LOG_LEVELS",
@@ -125,6 +129,39 @@ class RedactionFilter(logging.Filter):
             record.exc_info = None
         if record.stack_info:
             record.stack_info = redact(record.stack_info)
+        return True
+
+
+#: Query-string parameters that carry a credential and must never reach a log line. ``code`` and
+#: ``state`` arrive on the OIDC callback's URL (ADR 0142 pins ``response_mode=query``), and uvicorn's
+#: access logger emits the full request line *including* the query string.
+_CREDENTIAL_QUERY_KEYS = ("code", "state", "id_token", "access_token", "token", "session_state")
+
+_CREDENTIAL_QUERY_RE = re.compile(
+    r"(?i)\b(" + "|".join(_CREDENTIAL_QUERY_KEYS) + r")=[^&\s\"']+",
+)
+
+
+class CredentialQueryScrubFilter(logging.Filter):
+    """Redact credential-bearing **query parameters** from every emitted record (ADR 0142 AC-10).
+
+    The motivating case is uvicorn's access log: ``GET /ui/oidc/callback?code=…&state=…`` is emitted at
+    INFO by ``uvicorn.access``, which :func:`configure_logging` deliberately routes to the same stdout
+    handler NSSM captures to disk and the off-box forwarder ships to a SIEM. AC-10 says the engine
+    SHALL NOT log the authorization ``code``; a live (if short-lived, PKCE-bound) credential landing in
+    a shipped log file is exactly what that forbids.
+
+    Installed as a **handler filter**, like :class:`RedactionFilter`, so it covers current *and future*
+    call sites by construction rather than depending on each one remembering to pre-scrub. The
+    parameter NAME is kept so a log stays diagnosable — only the value is replaced.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        scrubbed = _CREDENTIAL_QUERY_RE.sub(lambda m: f"{m.group(1)}=<redacted>", message)
+        if scrubbed != message:
+            record.msg = scrubbed
+            record.args = ()
         return True
 
 
@@ -270,6 +307,7 @@ def _install_phi_filters(handler: logging.Handler) -> None:
     the same PHI-safety + log-injection guarantees as stdout. The filters are idempotent, so a record
     dispatched to multiple filtered handlers is safely re-scrubbed."""
     handler.addFilter(RedactionFilter())  # PHI redaction — message + exception traceback (Gate #1)
+    handler.addFilter(CredentialQueryScrubFilter())  # OIDC code/state in a URL (ADR 0142 AC-10)
     handler.addFilter(ControlCharScrubFilter())  # log-injection defense (16.4.1)
 
 
@@ -374,6 +412,35 @@ def configure_logging(
 
     silence_phi_prone_dependency_loggers()
     return forwarder_installed
+
+
+def set_runtime_level(level: str) -> str:
+    """Change the live root + uvicorn log level at runtime (BACKLOG #171, ADR 0130), WITHOUT rebuilding
+    handlers — the surgical counterpart of :func:`configure_logging`, which owns the stream/off-box
+    handlers + PHI/scrub filters. ``level`` is validated against :data:`LOG_LEVELS` (a ``ValueError`` is
+    raised otherwise, so a caller can 4xx a bad value) and applied to the **root logger** and the three
+    ``_UVICORN_LOGGERS`` — exactly the level surface ``configure_logging`` sets, so the override re-levels
+    whatever handlers are installed (leaving room for a later file handler to build on this cleanly).
+
+    The override is **process-in-memory and ephemeral**: a **process restart** re-runs
+    ``configure_logging(settings.logging.level, …)`` and re-asserts the configured baseline, so the
+    override is gone; a **``/config/reload`` does NOT re-run ``configure_logging``**, so a runtime override
+    **survives a reload** and resets only on restart (ADR 0130 §1). Returns the normalized (upper-case)
+    level name applied."""
+    normalized = level.upper()
+    if normalized not in LOG_LEVELS:
+        raise ValueError(f"invalid log level: {level!r}; expected one of {', '.join(LOG_LEVELS)}")
+    numeric = _resolve_level(normalized)
+    logging.getLogger().setLevel(numeric)
+    for name in _UVICORN_LOGGERS:
+        logging.getLogger(name).setLevel(numeric)
+    return normalized
+
+
+def current_log_level() -> str:
+    """The root logger's current effective level name (``"DEBUG"``…``"CRITICAL"``) — reflects the startup
+    ``configure_logging`` baseline or a later :func:`set_runtime_level` override (BACKLOG #171)."""
+    return logging.getLevelName(logging.getLogger().level)
 
 
 def silence_phi_prone_dependency_loggers() -> None:

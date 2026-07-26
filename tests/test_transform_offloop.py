@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.active_environment import current_environment
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     ConnectorType,
@@ -28,7 +29,6 @@ from messagefoundry.config.wiring import (
     Registry,
     Send,
 )
-from messagefoundry.config.active_environment import current_environment
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus
 

@@ -29,7 +29,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     active_hop_posture,
 )
-from messagefoundry.config.wiring import DICOMweb, FHIR, Rest, Soap
+from messagefoundry.config.wiring import FHIR, DICOMweb, Rest, Soap
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.rest import (
@@ -59,9 +59,9 @@ _HTTPS = {
     "DICOMweb": (ConnectorType.DICOMWEB, DICOMweb, "https://pacs.example.org/dicom-web"),
 }
 
-_STAGING = HopPosture(is_phi=True, production=False)  # non-prod PHI (staging/dev)
-_PROD = HopPosture(is_phi=True, production=True)  # production PHI
-_SYNTHETIC = HopPosture(is_phi=False, production=False)  # no PHI on the wire
+_STAGING = HopPosture(is_phi=True, enforcing=False)  # non-prod PHI (staging/dev)
+_PROD = HopPosture(is_phi=True, enforcing=True)  # production PHI
+_SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # no PHI on the wire
 
 _CELLS = list(_CLEARTEXT)
 

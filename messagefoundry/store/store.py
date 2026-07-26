@@ -44,13 +44,13 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any, Sequence
+from typing import Any, Final, Protocol, runtime_checkable
 from uuid import uuid4
 
 import aiosqlite
@@ -61,13 +61,6 @@ from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.content_search import SearchSpec, row_matches
-from messagefoundry.store.document_strip import StripResult, cutoff_for
-from messagefoundry.store.metadata import (
-    decode_response_headers,
-    encode_response_headers,
-    merge_user_metadata,
-)
-from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
 from messagefoundry.store.crypto import (
     AesGcmCipher,
@@ -75,8 +68,19 @@ from messagefoundry.store.crypto import (
     CipherError,
     CipherInfo,
     IdentityCipher,
+    cell_aad,
     cipher_info,
+    decrypt_json_cell,
+    rotation_fingerprint_key,
 )
+from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.gcm_bound import checkpoint_invocations
+from messagefoundry.store.metadata import (
+    decode_response_headers,
+    encode_response_headers,
+    merge_user_metadata,
+)
+from messagefoundry.store.pool_metrics import PoolStatus
 
 log = logging.getLogger(__name__)
 
@@ -126,15 +130,15 @@ class _Member:
     return value (or an :class:`_AbortMember`'s ``result``) is delivered via ``future`` once the batch
     commits; on a group rollback every member's ``future`` is rejected so each caller re-runs."""
 
-    run: "Callable[[], Awaitable[Any]]"
-    future: "asyncio.Future[Any]"
+    run: Callable[[], Awaitable[Any]]
+    future: asyncio.Future[Any]
     # Optional post-commit hook run synchronously in the COMMITTER's frame the instant the batch
     # commits, BEFORE the future resolves — used to publish a read-through cache delta atomically with
     # the durable write. Living here (not in the caller's frame after `await fut`) means a committed
     # write's cache publish can never be skipped by the caller being cancelled while parked on the
     # future (e.g. a transform worker cancelled on reload). Only ever invoked on commit success; a
     # rolled-back member's hook never runs, so an uncommitted delta never leaks into the cache.
-    on_commit: "Callable[[Any], None] | None" = None
+    on_commit: Callable[[Any], None] | None = None
 
 
 class _GroupCommitter:
@@ -158,7 +162,7 @@ class _GroupCommitter:
         *,
         window_ms: float,
         max_batch: int,
-        note_commit: "Callable[[], None]",
+        note_commit: Callable[[], None],
     ) -> None:
         self._db = db
         self._lock = lock
@@ -186,9 +190,9 @@ class _GroupCommitter:
 
     async def submit(
         self,
-        run: "Callable[[], Awaitable[Any]]",
+        run: Callable[[], Awaitable[Any]],
         *,
-        on_commit: "Callable[[Any], None] | None" = None,
+        on_commit: Callable[[Any], None] | None = None,
     ) -> Any:
         """Enrol a member's statements in the open batch and await its committed result.
 
@@ -287,8 +291,8 @@ class _GroupCommitter:
 
     @staticmethod
     def _reject_all(
-        batch: "list[_Member]",
-        results: "list[tuple[_Member, Any, Exception | None]]",
+        batch: list[_Member],
+        results: list[tuple[_Member, Any, Exception | None]],
         *,
         fallback: Exception | None = None,
     ) -> None:
@@ -305,16 +309,17 @@ class _GroupCommitter:
             member.future.set_exception(err)
 
 
-class MessageStatus(str, Enum):
+class MessageStatus(str, Enum):  # noqa: UP042
     RECEIVED = "received"  # persisted at ingress, awaiting router+transform (staged pipeline)
     ROUTED = "routed"  # router produced ≥1 delivery; outbound rows queued, awaiting delivery
     PROCESSED = "processed"  # all destinations terminal (done or dead)
     ERROR = "error"  # parse/validation/processing failure (dead-lettered); logged, not routed
     FILTERED = "filtered"  # rejected by the channel filter; logged, intentionally not routed
     UNROUTED = "unrouted"  # accepted but no destination matched; logged, delivered nowhere
+    NOT_DEPLOYED = "not_deployed"  # every selected destination is present-but-not-deployed (#233)
 
 
-class OutboxStatus(str, Enum):
+class OutboxStatus(str, Enum):  # noqa: UP042
     PENDING = "pending"  # waiting, due at next_attempt_at
     INFLIGHT = "inflight"  # claimed by a worker, delivery in progress
     DONE = "done"  # delivered successfully
@@ -322,7 +327,7 @@ class OutboxStatus(str, Enum):
     CANCELLED = "cancelled"  # purged from the queue by an operator (terminal, non-error)
 
 
-class Stage(str, Enum):
+class Stage(str, Enum):  # noqa: UP042
     """Which pipeline stage a ``queue`` row belongs to (the stage discriminator).
 
     The staged pipeline (ADR 0001 Step B) has **three persisted stages**, ``ingress`` → ``routed`` →
@@ -485,21 +490,30 @@ class OutboxItem:
 
     @classmethod
     def from_row(
-        cls, row: aiosqlite.Row, cipher: Cipher, *, shared_ciphertext: str | None = None
-    ) -> "OutboxItem":
+        cls,
+        row: aiosqlite.Row,
+        cipher: Cipher,
+        *,
+        body_aad: bytes,
+        shared_ciphertext: str | None = None,
+    ) -> OutboxItem:
         """Build an item from a claimed queue row, decrypting its body for processing/delivery.
 
         ``shared_ciphertext`` is the store-once deref seam: when a row carries a ``body_ref`` (its body
         lives once in ``shared_body``), the caller passes that shared copy's ciphertext here and it is
         decrypted in place of the row's empty inline ``payload``. ``None`` (no ref) decrypts the inline
-        ``payload`` exactly as before — byte-identical."""
+        ``payload`` exactly as before — byte-identical. ``body_aad`` is the cell-binding AAD (ASVS
+        11.3.3) the caller built for the ciphertext's *source* cell: ``cell_aad("shared_body","body",
+        hash)`` for a deref'd shared body, ``cell_aad("queue","payload", row.id)`` for an inline one — so
+        the deref never reconstructs the wrong cell's AAD (a v1 row ignores it via dual-read)."""
         ciphertext = shared_ciphertext if shared_ciphertext is not None else row["payload"]
         return cls(
             id=row["id"],
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            payload=cipher.decrypt(ciphertext),  # decrypt the body for processing/delivery
+            # decrypt the body for processing/delivery, bound to its source cell (ASVS 11.3.3)
+            payload=cipher.decrypt(ciphertext, aad=body_aad),
             attempts=row["attempts"],
             stage=row["stage"],
             # Plaintext metadata (the handler to run), not a body — never encrypted. NULL off-routed.
@@ -584,6 +598,12 @@ class AlertInstance:
     acked_by: str | None
     acked_at: float | None
     resolved_at: float | None
+    # #143 — windowed NOTIFICATION mute: the epoch until which re-alerts are silenced (NULL/past = not
+    # suspended). The instance stays open/visible/counted regardless — suspend gates the notify only.
+    suspended_until: float | None = None
+    # #81 — highest occurrence-driven escalation tier reached on this open instance (0 = base tier). Set by
+    # the notifier's escalation logic (ADR 0133); monotonic within an open instance, resets on reopen.
+    escalation_tier: int = 0
 
 
 @dataclass(frozen=True)
@@ -693,7 +713,7 @@ class UserRecord:
     totp_enrolled_at: float | None = None
 
     @classmethod
-    def from_mapping(cls, d: Mapping[str, Any]) -> "UserRecord":
+    def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
         return cls(
             id=d["id"],
             username=d["username"],
@@ -734,7 +754,7 @@ class SessionRecord:
     mfa_verified_at: float | None = None
 
     @classmethod
-    def from_mapping(cls, d: Mapping[str, Any]) -> "SessionRecord":
+    def from_mapping(cls, d: Mapping[str, Any]) -> SessionRecord:
         return cls(
             token_hash=d["token_hash"],
             user_id=d["user_id"],
@@ -777,7 +797,7 @@ class WebAuthnCredential:
     last_used_at: float | None = None
 
     @classmethod
-    def from_mapping(cls, d: Mapping[str, Any]) -> "WebAuthnCredential":
+    def from_mapping(cls, d: Mapping[str, Any]) -> WebAuthnCredential:
         transports = d.get("transports")
         return cls(
             credential_id_hash=d["credential_id_hash"],
@@ -808,7 +828,9 @@ def audit_row_hash(
     action: str,
     channel_id: str | None,
     detail: str | None,
+    client: str | None = None,
     key: bytes | None = None,
+    mac: Callable[[bytes], str] | None = None,
 ) -> str:
     """SHA-256 (keyless) or HMAC-SHA256 (keyed) of (previous row's hash ‖ this row's content) — the
     audit-log tamper-evidence chain.
@@ -825,21 +847,114 @@ def audit_row_hash(
     fully-recomputed **forgery** by someone who can write rows yet does not hold the DEK. The canonical
     encoding is identical in both modes, so switching modes is purely SHA-256 → HMAC over the same
     input. Shared verbatim by all three store backends so the digest is byte-identical across
-    SQLite/Postgres/SQL Server."""
-    canonical = json.dumps(
-        [prev_hash, ts, actor, action, channel_id, detail], sort_keys=True, default=str
-    )
+    SQLite/Postgres/SQL Server.
+
+    **Isolated-module MAC (ADR 0138).** A ``mac`` provider (Vault/OpenBao Transit's ``generate_hmac``,
+    from ``Cipher.audit_mac_fn``) computes the row MAC INSIDE the vault — used by ``vault_transit`` mode
+    where the DEK never enters heap, so there is no ``key`` to HMAC with locally yet the chain is still
+    keyed (forgery-resistant). ``mac`` takes precedence over ``key``; with neither, the keyless SHA-256
+    default — BYTE-IDENTICAL to pre-#190 — is unchanged (the ``mac is None and key is None`` path is the
+    frozen default cipher's path).
+
+    **Client address (ADR 0150).** ``client`` — the caller's network address, when the write had one —
+    is folded into the chain as a **CONDITIONAL 7th element**: it is appended ONLY when it is not
+    ``None``. So a row with no client (every legacy row, and every engine-internal ``system`` write)
+    hashes over the SAME 6-element list as before and its stored ``row_hash`` still verifies
+    BYTE-IDENTICALLY — which is what lets one chain span pre- and post-upgrade rows. An unconditional
+    7th element would have appended ``null`` to every legacy row's payload and broken the chain at the
+    first one. The field must be *inside* the chained payload (not an unchained sibling column):
+    attribution an attacker can rewrite without breaking tamper-evidence would be worse than none.
+
+    The encoding stays injective across the two shapes because JSON is uniquely decodable: a 6- and a
+    7-element list can never render to the same bytes, and string values are escaped, so no crafted
+    ``detail`` can forge the trailing ``, "<client>"`` of the longer form."""
+    fields: list[object] = [prev_hash, ts, actor, action, channel_id, detail]
+    if client is not None:
+        fields.append(client)
+    canonical = json.dumps(fields, sort_keys=True, default=str)
     data = canonical.encode("utf-8")
+    if mac is not None:
+        return mac(data)  # computed inside the isolated module (Transit); no in-heap key
     if key is None:
         return hashlib.sha256(data).hexdigest()
     return hmac.new(key, data, hashlib.sha256).hexdigest()
 
 
+def audit_mac_bytes(value: str | None) -> bytes:
+    """Normalise a stored/recomputed ``audit_log.row_hash`` to comparison bytes for
+    :func:`hmac.compare_digest` (ASVS 11.2.4). Shared verbatim by all three store backends so the
+    constant-time comparison is byte-identical across SQLite/Postgres/SQL Server.
+
+    ``compare_digest`` is applied to **bytes**, not ``str``, deliberately: its ``str`` overload raises
+    ``TypeError`` on any non-ASCII input, and ``row_hash`` is an attacker-writable column on the exact
+    path where a break must be *reported* — a raise there propagates into
+    ``Engine._verify_audit_chain_on_start``, which swallows exceptions into a "could not run" log line
+    and fires **no** ``integrity_drift`` alert. A forged row carrying one non-ASCII character would then
+    silently downgrade a tamper alarm to a log breadcrumb. Encoding first makes the comparison total.
+
+    ``row_hash`` is also NULLable on all three backends (rows written before hash-chaining, until
+    :meth:`MessageStore._backfill_audit_chain` fills them), so ``None`` maps to empty bytes — which can
+    never equal a real digest, preserving today's "a NULL hash is a break" outcome without a type error.
+
+    ``surrogatepass`` keeps the mapping TOTAL and injective for every ``str`` CPython can hold: a lone
+    surrogate smuggled into the column encodes rather than raising, and two distinct strings can never
+    collide onto the same bytes."""
+    return (value or "").encode("utf-8", "surrogatepass")
+
+
+# #233 (ADR 0111): the event name for a Send declined because its target outbound is present-but-NOT-
+# deployed. Recorded once per declined destination (:func:`not_deployed_detail` for the detail). It has
+# TWO load-bearing roles, and both fail unless it is in the audit floor below: (1) it is the operator-
+# visible count-and-log record of the skipped leg (CLAUDE.md §12), and (2) it is the ONLY persisted
+# signal the finalizer reads to emit NOT_DEPLOYED instead of collapsing a zero-delivery message to
+# FILTERED. Dropping it at verbosity "errors"/"off" would take the disposition with it — an accept-and-
+# drop on exactly the instances that thinned their logs.
+NOT_DEPLOYED_EVENT: Final = "not_deployed"
+
+
+def not_deployed_detail(destination: str) -> str:
+    """The count-and-log detail for a Send declined because its outbound is present-but-NOT-deployed
+    (#233, ADR 0111). CONFIG-derived only (the connection name) — never message content (PHI)."""
+    return f"{destination} not deployed"
+
+
 # Compliance FLOOR for the `message_events` verbosity gate (#63): events that are ALWAYS recorded, at
 # EVERY verbosity — even "off". `viewed` is a PHI-access record (the HIPAA message-view trail must never
-# be dropped); `dead`/`error`/`failed` are terminal failure dispositions an operator relies on. A
-# blanket "off" that dropped these would silently discard the compliance-critical trail.
-_AUDIT_FLOOR_EVENTS = frozenset({"viewed", "dead", "error", "failed"})
+# be dropped); `dead`/`error`/`failed` are terminal failure dispositions an operator relies on;
+# `not_deployed` is the count-and-log record + NOT_DEPLOYED-disposition signal (see above). A blanket
+# "off" that dropped these would silently discard the compliance-critical trail.
+_AUDIT_FLOOR_EVENTS = frozenset({"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT})
+
+#: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
+#:
+#: Exported (not private) because ``docs/PHI.md`` §7 row 6 documents this list as the per-message
+#: disposition timeline and ASVS 16.1.1 scores that inventory: the doc named 9 of these 19 while
+#: reading as exhaustive. ``tests/test_phi_logging_inventory.py`` asserts the doc names every
+#: member and that the set matches the literal ``_event``/``_event_stmt`` call sites, so a new kind
+#: cannot ship undocumented.
+MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
+    {
+        "received",
+        "routed",
+        "unrouted",
+        "filtered",
+        "transformed",
+        "delivered",
+        "failed",
+        "dead",
+        "error",
+        "replayed",
+        "resent",
+        "reingressed",
+        "passthrough",
+        "passthrough_dropped",
+        "cancelled",
+        "edit_resend",
+        "edit_resubmit",
+        "viewed",
+        NOT_DEPLOYED_EVENT,
+    }
+)
 
 
 def should_record_event(event: str, verbosity: str) -> bool:
@@ -853,7 +968,7 @@ def should_record_event(event: str, verbosity: str) -> bool:
     (count-and-log) are written separately and are never affected."""
     if event in _AUDIT_FLOOR_EVENTS:
         return True
-    if verbosity == "all":
+    if verbosity == "all":  # noqa: SIM103
         return True
     # "errors" and "off" both drop routine success events (received/delivered/replayed/filtered); the
     # only error-class events are already in the floor above, so both levels keep exactly the floor.
@@ -1266,6 +1381,25 @@ CREATE TABLE IF NOT EXISTS resend_log (
 );
 CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id);
 
+-- Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
+-- (after_read='leave') File/RemoteFile poll source has ALREADY ingested, so a read-only share whose
+-- files another system owns can be polled without moving/deleting them and a left file is ingested
+-- ONCE. Shaped like `delivered_keys`/`resend_log`: HASHES + IDS ONLY, no body/PHI, so it is stored in
+-- the clear (NOT part of the `_cipher` seam). `file_key` is a SHA-256 of the file's identity
+-- (relative-path+mtime+size local / full-remote-path+size remote — the PATH is folded in, not just the
+-- basename, so two same-named files under different subdirs stay distinct and are BOTH ingested) — a
+-- DERIVED id, NEVER a cleartext path (a filename/path can embed an MRN) and never logged at INFO+.
+-- `channel_id` is the inbound connection name (config metadata, non-PHI) — scopes the dedup + the
+-- age/count prune per connection. The row is INSERTed AFTER the file's message(s) emit successfully (the
+-- FILE, not each split message, is the dedup unit). Additive: CREATE TABLE IF NOT EXISTS on every open.
+CREATE TABLE IF NOT EXISTS processed_files (
+    channel_id   TEXT NOT NULL,   -- inbound connection name (config metadata, non-PHI)
+    file_key     TEXT NOT NULL,   -- sha256(rel-path || mtime || size) — a HASHED derived id, never a path
+    processed_at REAL NOT NULL,   -- epoch ts recorded AFTER emit success; drives the age/count prune
+    PRIMARY KEY (channel_id, file_key)
+);
+CREATE INDEX IF NOT EXISTS ix_processed_files_channel ON processed_files(channel_id, processed_at);
+
 -- Connection/transport event log (Corepoint-style #46): inbound lifecycle (established/closed), the
 -- pre-ingress failures that have no message_id (allowlist/capacity/oversize/peer-reset/framing), and
 -- outbound lane transitions (connection_lost/restored). METADATA-ONLY — never a frame, body, or HL7
@@ -1306,7 +1440,9 @@ CREATE TABLE IF NOT EXISTS alert_instance (
     reason      TEXT,                 -- safe_text-scrubbed diagnostic, encrypted at rest
     acked_by    TEXT,                 -- operator who acknowledged (NULL until acked)
     acked_at    REAL,
-    resolved_at REAL                  -- when it resolved (NULL while open/acknowledged)
+    resolved_at REAL,                 -- when it resolved (NULL while open/acknowledged)
+    suspended_until REAL,             -- #143: windowed NOTIFICATION mute end-epoch (NULL/past = not suspended)
+    escalation_tier INTEGER NOT NULL DEFAULT 0  -- #81: highest occurrence-driven escalation tier reached (0=base)
 );
 -- One LIVE (non-resolved) instance per throttle key; resolved rows leave the index so the key re-opens.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
@@ -1320,6 +1456,7 @@ CREATE TABLE IF NOT EXISTS audit_log (
     action      TEXT NOT NULL,        -- e.g. summary_search_display, message_view, export
     channel_id  TEXT,
     detail      TEXT,                 -- JSON: filter, counts, exposed ids, ...
+    client      TEXT,                 -- WHERE from: caller's network address; NULL for engine-internal writes
     row_hash    TEXT                  -- sha256/hmac chain over (prev_hash + this row): tamper-evidence
 );
 CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
@@ -1332,6 +1469,19 @@ CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts);
 CREATE TABLE IF NOT EXISTS audit_chain_meta (
     id             INTEGER PRIMARY KEY CHECK (id = 1),
     keyed_from_id  INTEGER
+);
+
+-- Per-key AES-GCM invocation bound (ASVS 11.3.4). One row per `key_id` (the one-way SHA-256 DEK
+-- fingerprint), holding the cumulative count of invocations RESERVED under that key across every
+-- process that has ever opened this store. Reserve-then-spend: a process durably adds a block BEFORE
+-- spending it, so an UNCLEAN exit over-counts (it forfeits its unspent reserve) and never under-counts;
+-- a clean close settles the exact spend, and a long burst tops up per batch. A NEW key has no row
+-- and starts at zero for free; zeroing an EXISTING key_id is deliberately not offered (it would refresh
+-- the birthday budget of a key that never changed). Non-secret: a fingerprint plus a counter.
+CREATE TABLE IF NOT EXISTS cipher_meta (
+    key_id      TEXT PRIMARY KEY,
+    invocations INTEGER NOT NULL DEFAULT 0,
+    updated_at  REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS pending_approvals (
@@ -1435,6 +1585,37 @@ CREATE TABLE IF NOT EXISTS webauthn_credentials (
 );
 CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label);
+
+CREATE TABLE IF NOT EXISTS search_presets (
+    id         TEXT PRIMARY KEY,                 -- uuid4 hex; the cell-AAD pk for the encrypted criteria
+    owner      TEXT NOT NULL,                    -- the owning username (per-user; every read is owner-scoped)
+    name       TEXT NOT NULL,                    -- operator-chosen label, unique per owner
+    criteria   TEXT,                             -- JSON of the typed search params; AES-256-GCM at rest
+                                                 -- (content/field_value are PHI-shaped) — ADR 0136/0019
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    last_used_at REAL                            -- last RECALL (get_search_preset), #306. NULL = never
+                                                 -- recalled since the column landed, so the retention
+                                                 -- window falls back to updated_at for that row
+);
+-- UNIQUE(owner, name) covers both the owner-scoped list (WHERE owner) and the upsert (WHERE owner AND
+-- name); get/delete use the id PK — so no separate owner index is needed (ADR 0136, review follow-up).
+CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name);
+
+-- Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282). One row per tracked secret CLASS (the store
+-- DEK by its key-id, plus each configured connector/AD/SMTP/Vault/OIDC secret the engine holds). Every
+-- column is NON-SECRET: `fingerprint` is a KEYED MAC (DEK-derived subkey, HMAC — never a salted hash, so
+-- a low-entropy secret is not offline-guessable) OR the DEK's one-way key-id; `tracked_since` is the
+-- age FLOOR first observed (so a pre-existing year-old key gets a fresh clock on upgrade, never a
+-- retroactive alert); `last_rotated` is reset to today when the fingerprint changes (rotation is
+-- AUTO-DETECTED, never operator-attested). NEVER a secret value — the watcher reads a value only to MAC
+-- it, and persists/logs the MAC + dates alone.
+CREATE TABLE IF NOT EXISTS secret_rotation_meta (
+    secret_key    TEXT PRIMARY KEY,   -- registry class id: 'MEFOR_STORE_ENCRYPTION_KEY' (DEK) or an env/setting name
+    fingerprint   TEXT NOT NULL,      -- keyed MAC of the current value / DEK key-id — one-way, NOT the value
+    tracked_since TEXT NOT NULL,      -- ISO YYYY-MM-DD first observed (tracked-since age floor)
+    last_rotated  TEXT NOT NULL       -- ISO YYYY-MM-DD the fingerprint last changed (auto-detected rotation)
+);
 """
 
 # Columns added after the initial release; ALTER-ed in on open for existing DBs.
@@ -1442,6 +1623,44 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user
 # document in place (NULL = never pruned / no document was ever present). Orthogonal to `status` — it
 # alters no disposition/count; it is the message-level "evicted vs never present" signal a raw-view reads.
 _MESSAGE_MIGRATIONS = {"summary": "TEXT", "metadata": "TEXT", "documents_pruned": "REAL"}
+
+
+@dataclass(frozen=True)
+class SecretRotationMetaRow:
+    """One persisted secret-rotation watch record (ASVS 13.3.4, BACKLOG #282). All fields are
+    NON-SECRET: ``fingerprint`` is a keyed MAC / DEK key-id (one-way), ``tracked_since`` the age-floor
+    ISO date first observed, ``last_rotated`` the ISO date the fingerprint last changed. Never a value."""
+
+    secret_key: str
+    fingerprint: str
+    tracked_since: str
+    last_rotated: str
+
+
+@runtime_checkable
+class SecretRotationMetaStore(Protocol):
+    """The narrow store slice the secret-rotation watcher (ASVS 13.3.4) uses to persist its NON-SECRET
+    fingerprint/stamp meta and to obtain the DEK-derived MAC key it fingerprints with. A **separate**
+    protocol (not part of :class:`~messagefoundry.store.base.Store`) so a backend opts in structurally:
+    the SQLite :class:`MessageStore`, ``SqlServerStore`` and ``PostgresStore`` all implement it (#1186);
+    a backend that does not (e.g. a future keyless/read-only store) simply fails the ``isinstance``
+    narrowing and the watcher degrades to the operator-configured dates without persistence — never an
+    error."""
+
+    def secret_rotation_fingerprint_key(self) -> bytes | None:
+        """The DEK-derived HMAC key the watcher fingerprints secret values with (``None`` when the store
+        is keyless or the DEK never enters heap — then per-secret fingerprinting is skipped)."""
+        ...
+
+    async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
+        """Every persisted watch record, keyed by ``secret_key``."""
+        ...
+
+    async def upsert_secret_rotation_meta(
+        self, secret_key: str, *, fingerprint: str, tracked_since: str, last_rotated: str
+    ) -> None:
+        """Insert or replace one NON-SECRET watch record."""
+        ...
 
 
 class StreamingAttachmentsUnsupported(NotImplementedError):
@@ -1481,6 +1700,13 @@ class MessageStore:
     # Server + Postgres carry it as a not-supported stub (their flag is False) until Phase 4, so a
     # streaming connection targeting them raises a clear error rather than silently degrading.
     supports_streaming_attachments = True
+
+    # ADR 0006: SQLite is the REFERENCE implementation of the reference-set snapshot store — the
+    # `reference` / `reference_version` tables, build-new-then-atomic-flip, encrypted at rest, and the
+    # read-through cache `_load_reference_cache` warms for `reference_view()`. Postgres ports it; SQL
+    # Server does not have it, so a graph declaring a Reference(...) is refused there (see
+    # check_reference_backend_supported).
+    supports_reference_sets = True
     backend = StoreBackend.SQLITE
 
     def __init__(
@@ -1493,6 +1719,7 @@ class MessageStore:
         group_commit_max_batch: int = 64,
         synchronous: str = "NORMAL",
         audit_mac_key: bytes | None = None,
+        audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
     ) -> None:
         self._db = db
@@ -1510,6 +1737,11 @@ class MessageStore:
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
         # never persisted, never logged.
         self._audit_mac_key = audit_mac_key
+        # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit generate_hmac) that keys the
+        # audit chain WITHOUT an in-heap key — set only in `vault_transit` mode (from Cipher.audit_mac_fn).
+        # None → in-process keyed/keyless via `_audit_mac_key` (the default aesgcm/identity path, unchanged).
+        # It takes precedence over `_audit_mac_key`; the two are never both set (a cipher supplies one).
+        self._audit_mac_fn = audit_mac_fn
         # Audit-chain keying watermark (#190): the first audit_log.id hashed with the key. None = the
         # whole chain is keyless. Loaded (and, for a fresh encrypted store, auto-set) by open().
         self._audit_keyed_from: int | None = None
@@ -1564,28 +1796,84 @@ class MessageStore:
     # error / last_error / detail can embed raw HL7 fragments from exceptions, so they go through the
     # cipher like raw/payload. They're nullable and may be blanked by retention, so encrypt is
     # null/empty-safe (a NULL or purged '' stays as-is — never turns into ciphertext-of-empty).
+    #
+    # Cell-bound AAD (ASVS 11.3.3, ADR 0019): `aad` is a REQUIRED keyword — the caller passes
+    # cell_aad(table, column, *pk) for the exact cell being written/read, so a v2 ciphertext is bound to
+    # its (table, column, row). Making it required (not defaulted) makes mypy-strict flag any un-threaded
+    # site — a half-threaded cell would fail closed under aad_bind. With aad_bind OFF the cipher writes v1
+    # and ignores `aad` (dual-read of every legacy row), so passing it is always safe.
 
-    def _enc(self, value: str | None) -> str | None:
+    def _enc(self, value: str | None, *, aad: bytes) -> str | None:
         if not value:  # None or "" → leave blank (covers purged/empty values)
             return value
-        return self._cipher.encrypt(value)
+        return self._cipher.encrypt(value, aad=aad)
 
-    def _dec(self, value: str | None) -> str | None:
+    def _dec(self, value: str | None, *, aad: bytes) -> str | None:
         if value is None:
             return value
-        return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
+        # '' and legacy plaintext pass through unchanged; a v1 marker decrypts with None AAD (dual-read),
+        # a v2 marker with this `aad` — a wrong-cell v2 blob fails the tag → CipherError (fail-closed).
+        return self._cipher.decrypt(value, aad=aad)
 
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
         return cipher_info(self._cipher)
 
-    def _decode_row(self, row: aiosqlite.Row, *columns: str) -> dict[str, Any]:
-        """Materialize a read-row as a dict and decrypt the named cipher-covered text columns. Returned
-        as a plain dict (still satisfies the ``Row`` read contract: key access + ``keys()``)."""
+    # --- secret-rotation watch meta (ASVS 13.3.4, BACKLOG #282) ---------------
+    # NON-SECRET at-rest state: keyed-MAC / DEK-key-id fingerprints + ISO dates only, never a value.
+
+    def secret_rotation_fingerprint_key(self) -> bytes | None:
+        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
+        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
+        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
+        return rotation_fingerprint_key(self._cipher)
+
+    async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
+        """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
+        keyed-MAC fingerprints)."""
+        cur = await self._db.execute(
+            "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
+        )
+        rows = await cur.fetchall()
+        return {
+            r["secret_key"]: SecretRotationMetaRow(
+                secret_key=r["secret_key"],
+                fingerprint=r["fingerprint"],
+                tracked_since=r["tracked_since"],
+                last_rotated=r["last_rotated"],
+            )
+            for r in rows
+        }
+
+    async def upsert_secret_rotation_meta(
+        self, secret_key: str, *, fingerprint: str, tracked_since: str, last_rotated: str
+    ) -> None:
+        """Insert or replace one NON-SECRET watch record. Idempotent (INSERT OR REPLACE on the PK), so a
+        re-run — or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        async with self._lock:
+            await self._db.execute(
+                "INSERT OR REPLACE INTO secret_rotation_meta"
+                " (secret_key, fingerprint, tracked_since, last_rotated) VALUES (?, ?, ?, ?)",
+                (secret_key, fingerprint, tracked_since, last_rotated),
+            )
+            await self._commit()
+
+    def cipher(self) -> Cipher:
+        """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
+        return self._cipher
+
+    def _decode_row(
+        self, row: aiosqlite.Row, table: str, pk: tuple[object, ...], *columns: str
+    ) -> dict[str, Any]:
+        """Materialize a read-row as a dict and decrypt the named cipher-covered text columns, each bound
+        to its cell ``cell_aad(table, column, *pk)`` (ASVS 11.3.3). Returned as a plain dict (still
+        satisfies the ``Row`` read contract: key access + ``keys()``). All ``columns`` here share one
+        ``(table, pk)`` — a read that mixes columns from *different* tables (a join) decrypts them
+        explicitly at the call site instead (see ``list_dead``)."""
         d = dict(row)
         for col in columns:
             if col in d:
-                d[col] = self._dec(d[col])
+                d[col] = self._dec(d[col], aad=cell_aad(table, col, *pk))
         return d
 
     @classmethod
@@ -1598,8 +1886,9 @@ class MessageStore:
         group_commit_window_ms: float = 0.0,
         group_commit_max_batch: int = 64,
         audit_mac_key: bytes | None = None,
+        audit_mac_fn: Callable[[bytes], str] | None = None,
         message_events: str = "all",
-    ) -> "MessageStore":
+    ) -> MessageStore:
         sync = synchronous.upper()
         if sync not in ("NORMAL", "FULL"):
             raise ValueError(
@@ -1632,8 +1921,14 @@ class MessageStore:
             group_commit_max_batch=group_commit_max_batch,
             synchronous=sync,
             audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
+        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
+        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
+        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
+        # the cipher carries no bound (keyless / `vault_transit`).
+        await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
@@ -1700,9 +1995,9 @@ class MessageStore:
 
     async def _run_grouped(
         self,
-        body: "Callable[[], Awaitable[Any]]",
+        body: Callable[[], Awaitable[Any]],
         *,
-        on_commit: "Callable[[Any], None] | None" = None,
+        on_commit: Callable[[Any], None] | None = None,
     ) -> Any:
         """Run one grouped stage-handoff ``body`` (statements only — NO BEGIN/commit/rollback).
 
@@ -1768,7 +2063,15 @@ class MessageStore:
         cur = await self._db.execute("SELECT namespace, key, value FROM state")
         cache: dict[tuple[str, Any], Any] = {}
         for r in await cur.fetchall():
-            cache[(r["namespace"], r["key"])] = json.loads(self._cipher.decrypt(r["value"]))
+            # #241 F2: decrypt+json.loads through the fail-closed helper — a keyless open of an
+            # encrypted store raises an operator-facing StoreKeylessError (table + remedy), not a raw
+            # JSONDecodeError, and never silently drops an encrypted row.
+            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+                self._cipher,
+                r["value"],
+                aad=cell_aad("state", "value", r["namespace"], r["key"]),
+                table="state",
+            )
         self._state_cache = cache
 
     async def _load_reference_cache(self) -> None:
@@ -1780,15 +2083,24 @@ class MessageStore:
         returns. Bounded by the active snapshots' size (the ADR's v1 in-memory assumption)."""
         # Drive from reference_version (the authoritative active-version list) with a LEFT JOIN, so a
         # set that synced to ZERO rows still loads as an empty {} (present, not absent) after a reopen.
+        # Select v.version too: the reference.value AAD is (name, version, key), so the read must
+        # reconstruct the exact version the value was written under (ASVS 11.3.3).
         cur = await self._db.execute(
-            "SELECT v.name AS name, r.key AS key, r.value AS value FROM reference_version v "
+            "SELECT v.name AS name, v.version AS version, r.key AS key, r.value AS value "
+            "FROM reference_version v "
             "LEFT JOIN reference r ON r.name = v.name AND r.version = v.version"
         )
         cache: dict[str, dict[str, Any]] = {}
         for r in await cur.fetchall():
             entry = cache.setdefault(r["name"], {})
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
-                entry[r["key"]] = json.loads(self._cipher.decrypt(r["value"]))
+                # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
+                entry[r["key"]] = decrypt_json_cell(
+                    self._cipher,
+                    r["value"],
+                    aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
+                    table="reference",
+                )
         self._reference_cache = cache
 
     async def _backfill_audit_chain(self) -> None:
@@ -1797,7 +2109,8 @@ class MessageStore:
         Only rows missing a hash are filled, chained from the prior row — existing valid hashes are
         left untouched (so this can't silently re-bless a tampered row)."""
         cur = await self._db.execute(
-            "SELECT id, ts, actor, action, channel_id, detail, row_hash FROM audit_log ORDER BY id"
+            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+            " FROM audit_log ORDER BY id"
         )
         prev = ""
         updates: list[tuple[str, int]] = []
@@ -1812,6 +2125,7 @@ class MessageStore:
                 action=r["action"],
                 channel_id=r["channel_id"],
                 detail=r["detail"],
+                client=r["client"],
             )
             updates.append((prev, r["id"]))
         if updates:
@@ -1832,7 +2146,7 @@ class MessageStore:
         if row is not None and row["keyed_from_id"] is not None:
             self._audit_keyed_from = int(row["keyed_from_id"])
             return
-        if self._audit_mac_key is None:
+        if not self._audit_keyed_capable():
             return  # keyless store — the chain stays byte-identical to pre-#190
         cur = await self._db.execute("SELECT COUNT(*) AS n FROM audit_log")
         cnt = await cur.fetchone()
@@ -1844,23 +2158,30 @@ class MessageStore:
                 await self._commit()
             self._audit_keyed_from = 1
 
-    def _audit_append_key(self) -> bytes | None:
-        """The key a NEW ``audit_log`` row is hashed with (#190). Keyed once the watermark is set (a new
-        row always lands at an id ≥ the watermark), else keyless.
+    def _audit_keyed_capable(self) -> bool:
+        """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
+        provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
+        return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
-        Fail-closed when the chain is keyed but the DEK is absent (a keyed store opened writable without
-        its key): appending a keyless row above the keying watermark would make a legitimately-written
-        row read as tampered under a later keyed verify — manufacturing a FALSE break and defeating the
-        #190 guarantee. Refuse the append (raise) rather than silently corrupt the tamper-evidence chain;
-        this mirrors the symmetric guard already in :meth:`verify_audit_chain` (review major-1)."""
+    def _audit_append_mac(self) -> tuple[bytes | None, Callable[[bytes], str] | None]:
+        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with (#190 / ADR 0138). Keyed once the
+        watermark is set (a new row always lands at an id ≥ the watermark), else keyless ``(None, None)``.
+
+        Prefers the isolated-module MAC (Transit) when present; else the in-heap key. Fail-closed when the
+        chain is keyed but NEITHER secret is in hand (a keyed store opened writable without its key/vault):
+        appending a keyless row above the watermark would make a legitimately-written row read as tampered
+        under a later keyed verify — a FALSE break defeating the #190 guarantee. Refuse (raise) rather than
+        silently corrupt the chain; this mirrors the symmetric guard in :meth:`verify_audit_chain`."""
         if self._audit_keyed_from is None:
-            return None  # keyless chain — byte-identical to pre-#190
-        if self._audit_mac_key is None:
-            raise RuntimeError(
-                f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key "
-                "is configured; refusing to append a keyless audit row above the keying watermark"
-            )
-        return self._audit_mac_key
+            return None, None  # keyless chain — byte-identical to pre-#190
+        if self._audit_mac_fn is not None:
+            return None, self._audit_mac_fn  # keyed inside the isolated module (Transit)
+        if self._audit_mac_key is not None:
+            return self._audit_mac_key, None  # keyed with the in-heap HMAC key
+        raise RuntimeError(
+            f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key or "
+            "isolated-module MAC is configured; refusing to append a keyless audit row above the watermark"
+        )
 
     async def rekey_audit_chain(
         self, *, expected_anchor: tuple[int, str] | None = None
@@ -1872,7 +2193,7 @@ class MessageStore:
         keyless chain — refusing on any break so a forged/tampered chain can never be blessed into a
         keyed one. On success it sets the keying watermark to the NEXT id (it never rewrites an existing
         ``row_hash``), so every existing keyless row keeps verifying and every future row is keyed."""
-        if self._audit_mac_key is None:
+        if not self._audit_keyed_capable():
             return False, "no store encryption key configured; cannot key the audit chain"
         if self._audit_keyed_from is not None:
             return True, f"audit chain already keyed from id={self._audit_keyed_from}"
@@ -1894,26 +2215,28 @@ class MessageStore:
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail) added in WP-5, and summary/metadata (MRN + patient name +
     #: operator-attached values) added in EF-3. Used by the on-open migration and rotate-key.
+    # Cipher-covered columns whose PRIMARY KEY is a single `id` — they ride the generic id-keyed
+    # migration/rotation loops, binding cell_aad(table, column, id). (ASVS 11.3.3, ADR 0019.)
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
         ("queue", "payload"),
         ("messages", "error"),
         ("queue", "last_error"),
-        ("message_events", "detail"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
         ("messages", "metadata"),  # EF-3: code/operator-attached values
         (
             "users",
             "totp_secret",
         ),  # MFA secret (WP-14) — id-keyed, so it rides the migration + rotation
-        (
-            "connection_event",
-            "reason",
-        ),  # #46: scrubbed event reason — id-keyed, rides the loops below
-        (
-            "alert_instance",
-            "reason",
-        ),  # #56 (ADR 0044): scrubbed alert reason — id-keyed, rides the loops below
+        # Saved-search preset criteria (ADR 0136): content/field_value are PHI-shaped. id-keyed
+        # (`id` PK), so it rides the migration + rotation loops (cell_aad("search_presets","criteria", id)).
+        ("search_presets", "criteria"),
+        # NB: `message_events` (detail), `connection_event` (reason), and `alert_instance` (reason) are
+        # cipher-covered too, but their `id` is AUTOINCREMENT — unknown at the encrypting INSERT, and (for
+        # alert_instance) the reason is also written by an upsert UPDATE that never sees the id. So their
+        # cell_aad binds to insert-time-known natural columns instead of `id`, and they can't ride the
+        # id-keyed loops — each has its own composite pass in _encrypt_existing_rows / reencrypt_to_active
+        # (like `response`/`state`/`reference`), keyed by that same natural tuple (ASVS 11.3.3, ADR 0019).
         # NB: `webauthn_credentials` (ADR 0068) is DELIBERATELY not cipher-covered — COSE public keys
         # are verification material, not secrets (documented in ASVS-L2-PHASE0-CHANGES.md §4 so an
         # auditor reads it as a decision). A hash-keyed table couldn't ride the id-keyed rekey loops
@@ -1955,9 +2278,18 @@ class MessageStore:
                         break
                     await self._db.executemany(
                         f"UPDATE {table} SET {column}=? WHERE id=?",
-                        [(self._cipher.encrypt(r[column]), r["id"]) for r in rows],
+                        [
+                            (
+                                self._cipher.encrypt(
+                                    r[column], aad=cell_aad(table, column, r["id"])
+                                ),
+                                r["id"],
+                            )
+                            for r in rows
+                        ],
                     )
                     await self._commit()
+                    await self._charge_bound_batch()
                     total += len(rows)
             # The `state` table (composite PK, ADR 0005) can't use the id-keyed loop — migrate it
             # separately so a key enabled on an existing DB encrypts any legacy plaintext state values.
@@ -1972,9 +2304,20 @@ class MessageStore:
                     break
                 await self._db.executemany(
                     "UPDATE state SET value=? WHERE namespace=? AND key=?",
-                    [(self._cipher.encrypt(r["value"]), r["namespace"], r["key"]) for r in rows],
+                    [
+                        (
+                            self._cipher.encrypt(
+                                r["value"],
+                                aad=cell_aad("state", "value", r["namespace"], r["key"]),
+                            ),
+                            r["namespace"],
+                            r["key"],
+                        )
+                        for r in rows
+                    ],
                 )
                 await self._commit()
+                await self._charge_bound_batch()
                 total += len(rows)
             # The `reference` table (composite PK name,version,key — ADR 0006) likewise can't use the
             # id-keyed loop; migrate any legacy plaintext snapshot values separately.
@@ -1990,11 +2333,22 @@ class MessageStore:
                 await self._db.executemany(
                     "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?",
                     [
-                        (self._cipher.encrypt(r["value"]), r["name"], r["version"], r["key"])
+                        (
+                            self._cipher.encrypt(
+                                r["value"],
+                                aad=cell_aad(
+                                    "reference", "value", r["name"], r["version"], r["key"]
+                                ),
+                            ),
+                            r["name"],
+                            r["version"],
+                            r["key"],
+                        )
                         for r in rows
                     ],
                 )
                 await self._commit()
+                await self._charge_bound_batch()
                 total += len(rows)
             # The `response` table (composite PK message_id,destination_name,response_seq — ADR 0013) has
             # encrypted columns (body, detail, resp_headers — #154) and no `id`; migrate each on its own
@@ -2014,7 +2368,16 @@ class MessageStore:
                         " WHERE message_id=? AND destination_name=? AND response_seq=?",
                         [
                             (
-                                self._cipher.encrypt(r[column]),
+                                self._cipher.encrypt(
+                                    r[column],
+                                    aad=cell_aad(
+                                        "response",
+                                        column,
+                                        r["message_id"],
+                                        r["destination_name"],
+                                        r["response_seq"],
+                                    ),
+                                ),
                                 r["message_id"],
                                 r["destination_name"],
                                 r["response_seq"],
@@ -2023,6 +2386,7 @@ class MessageStore:
                         ],
                     )
                     await self._commit()
+                    await self._charge_bound_batch()
                     total += len(rows)
             # The `shared_body` table (store-once-deliver-many) is keyed by `hash` (the plaintext content
             # address), not `id`; migrate any legacy plaintext body separately. (Normally a no-op — a
@@ -2037,9 +2401,18 @@ class MessageStore:
                     break
                 await self._db.executemany(
                     "UPDATE shared_body SET body=? WHERE hash=?",
-                    [(self._cipher.encrypt(r["body"]), r["hash"]) for r in rows],
+                    [
+                        (
+                            self._cipher.encrypt(
+                                r["body"], aad=cell_aad("shared_body", "body", r["hash"])
+                            ),
+                            r["hash"],
+                        )
+                        for r in rows
+                    ],
                 )
                 await self._commit()
+                await self._charge_bound_batch()
                 total += len(rows)
             # The `attachment_chunk` table (#149, ADR 0105) is cipher-covered (`ciphertext`) and keyed by
             # the composite (attachment_id, seq); seal any legacy plaintext chunk. Normally a no-op (a
@@ -2056,14 +2429,135 @@ class MessageStore:
                 await self._db.executemany(
                     "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?",
                     [
-                        (self._cipher.encrypt(r["ciphertext"]), r["attachment_id"], r["seq"])
+                        (
+                            self._cipher.encrypt(
+                                r["ciphertext"],
+                                aad=cell_aad(
+                                    "attachment_chunk",
+                                    "ciphertext",
+                                    r["attachment_id"],
+                                    r["seq"],
+                                ),
+                            ),
+                            r["attachment_id"],
+                            r["seq"],
+                        )
                         for r in rows
                     ],
                 )
                 await self._commit()
+                await self._charge_bound_batch()
                 total += len(rows)
+            # The `message_events` (detail), `connection_event` (reason), and `alert_instance` (reason)
+            # tables have an AUTOINCREMENT `id`, so their cell_aad binds to insert-time-known natural
+            # columns, not `id` — they migrate on their own composite passes (UPDATE targets `id`, but the
+            # AAD is rebuilt from the selected natural columns so it matches the write/read path exactly).
+            total += await self._encrypt_message_events(like)
+            total += await self._encrypt_connection_events(like)
+            total += await self._encrypt_alert_instances(like)
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
+
+    async def _encrypt_message_events(self, like: str) -> int:
+        """One-time encrypt of legacy plaintext ``message_events.detail`` (caller holds the lock). The
+        cell_aad is (message_id, ts, event) — the row's insert-time-known identity — so a migrated value
+        decrypts under the same AAD ``events_for`` reads it with (ASVS 11.3.3)."""
+        migrated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, message_id, ts, event, detail FROM message_events"
+                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT 500",
+                (like,),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            await self._db.executemany(
+                "UPDATE message_events SET detail=? WHERE id=?",
+                [
+                    (
+                        self._cipher.encrypt(
+                            r["detail"],
+                            aad=cell_aad(
+                                "message_events", "detail", r["message_id"], r["ts"], r["event"]
+                            ),
+                        ),
+                        r["id"],
+                    )
+                    for r in rows
+                ],
+            )
+            await self._commit()
+            await self._charge_bound_batch()
+            migrated += len(rows)
+        return migrated
+
+    async def _encrypt_connection_events(self, like: str) -> int:
+        """One-time encrypt of legacy plaintext ``connection_event.reason`` (caller holds the lock),
+        bound to (connection, ts, kind) — the row's insert-time-known identity (ASVS 11.3.3)."""
+        migrated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, connection, ts, kind, reason FROM connection_event"
+                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
+                (like,),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            await self._db.executemany(
+                "UPDATE connection_event SET reason=? WHERE id=?",
+                [
+                    (
+                        self._cipher.encrypt(
+                            r["reason"],
+                            aad=cell_aad(
+                                "connection_event", "reason", r["connection"], r["ts"], r["kind"]
+                            ),
+                        ),
+                        r["id"],
+                    )
+                    for r in rows
+                ],
+            )
+            await self._commit()
+            await self._charge_bound_batch()
+            migrated += len(rows)
+        return migrated
+
+    async def _encrypt_alert_instances(self, like: str) -> int:
+        """One-time encrypt of legacy plaintext ``alert_instance.reason`` (caller holds the lock), bound
+        to (event_type, connection) — the de-dup grain the upsert keys on, so the same AAD covers both the
+        INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3)."""
+        migrated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, event_type, connection, reason FROM alert_instance"
+                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT 500",
+                (like,),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            await self._db.executemany(
+                "UPDATE alert_instance SET reason=? WHERE id=?",
+                [
+                    (
+                        self._cipher.encrypt(
+                            r["reason"],
+                            aad=cell_aad(
+                                "alert_instance", "reason", r["event_type"], r["connection"]
+                            ),
+                        ),
+                        r["id"],
+                    )
+                    for r in rows
+                ],
+            )
+            await self._commit()
+            await self._charge_bound_batch()
+            migrated += len(rows)
+        return migrated
 
     async def reencrypt_to_active(self, *, batch: int = 500) -> int:
         """Re-encrypt every cipher-covered value under the **active** key — the key-rotation re-encrypt
@@ -2094,12 +2588,21 @@ class MessageStore:
                     rows = list(await cur.fetchall())
                     if not rows:
                         break
-                    # decrypt (via the keyring) → encrypt (active). A CipherError here means a prior key
-                    # wasn't supplied; it propagates (the CLI surfaces it) before any UPDATE, so a batch
-                    # is all-or-nothing and PHI is never dropped.
-                    updates = [(cipher.encrypt(cipher.decrypt(r[column])), r["id"]) for r in rows]
+                    # decrypt (via the keyring) → encrypt (active), rebinding the same cell AAD (ASVS
+                    # 11.3.3). A CipherError here means a prior key wasn't supplied; it propagates (the CLI
+                    # surfaces it) before any UPDATE, so a batch is all-or-nothing and PHI is never dropped.
+                    updates = [
+                        (
+                            self._reencrypt_value(
+                                cipher, r[column], cell_aad(table, column, r["id"])
+                            ),
+                            r["id"],
+                        )
+                        for r in rows
+                    ]
                     await self._db.executemany(f"UPDATE {table} SET {column}=? WHERE id=?", updates)
                     await self._commit()
+                    await self._charge_bound_batch()
                     total += len(rows)
             # The `state` table has a composite PK (namespace,key), not an `id`, so it can't ride the
             # generic id-keyed loop above — rotate it with its own pass (ADR 0005).
@@ -2115,9 +2618,25 @@ class MessageStore:
             # — its own pass re-seals each detached-document chunk under the active key (chunk-at-a-time,
             # so the whole document is never materialized to re-seal it).
             total += await self._reencrypt_attachment_chunks_to_active(cipher, active_like, batch)
+            # The autoincrement-id tables bind cell_aad to natural columns (see _CIPHER_COLUMNS): rotate
+            # each on its own composite pass so a retired-key v2 value decrypts, and a v1 value upgrades,
+            # under the exact AAD its write/read path uses (ASVS 11.3.3).
+            total += await self._reencrypt_message_events_to_active(cipher, active_like, batch)
+            total += await self._reencrypt_connection_events_to_active(cipher, active_like, batch)
+            total += await self._reencrypt_alert_instances_to_active(cipher, active_like, batch)
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
+
+    @staticmethod
+    def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
+        """Decrypt (keyring — any configured key) then re-encrypt under the active key, rebinding the
+        SAME cell AAD (ASVS 11.3.3). A retired-key v2 value decrypts with its cell AAD and re-encrypts
+        under the active key with the identical AAD (the read AAD never drifts across a rotation); a v1
+        value decrypts with None AAD (the cipher dispatches v1→None internally, ignoring ``aad``) and,
+        under a v2-active cipher, upgrades to a cell-bound v2 value. The single seam every rotation
+        loop funnels through, so no loop can accidentally pair mismatched decrypt/encrypt AADs."""
+        return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
     async def _reencrypt_attachment_chunks_to_active(
         self, cipher: AesGcmCipher, active_like: str, batch: int
@@ -2138,13 +2657,22 @@ class MessageStore:
             if not rows:
                 break
             updates = [
-                (cipher.encrypt(cipher.decrypt(r["ciphertext"])), r["attachment_id"], r["seq"])
+                (
+                    self._reencrypt_value(
+                        cipher,
+                        r["ciphertext"],
+                        cell_aad("attachment_chunk", "ciphertext", r["attachment_id"], r["seq"]),
+                    ),
+                    r["attachment_id"],
+                    r["seq"],
+                )
                 for r in rows
             ]
             await self._db.executemany(
                 "UPDATE attachment_chunk SET ciphertext=? WHERE attachment_id=? AND seq=?", updates
             )
             await self._commit()
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
 
@@ -2165,9 +2693,18 @@ class MessageStore:
             rows = list(await cur.fetchall())
             if not rows:
                 break
-            updates = [(cipher.encrypt(cipher.decrypt(r["body"])), r["hash"]) for r in rows]
+            updates = [
+                (
+                    self._reencrypt_value(
+                        cipher, r["body"], cell_aad("shared_body", "body", r["hash"])
+                    ),
+                    r["hash"],
+                )
+                for r in rows
+            ]
             await self._db.executemany("UPDATE shared_body SET body=? WHERE hash=?", updates)
             await self._commit()
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
 
@@ -2190,12 +2727,20 @@ class MessageStore:
             if not rows:
                 break
             updates = [
-                (cipher.encrypt(cipher.decrypt(r["value"])), r["namespace"], r["key"]) for r in rows
+                (
+                    self._reencrypt_value(
+                        cipher, r["value"], cell_aad("state", "value", r["namespace"], r["key"])
+                    ),
+                    r["namespace"],
+                    r["key"],
+                )
+                for r in rows
             ]
             await self._db.executemany(
                 "UPDATE state SET value=? WHERE namespace=? AND key=?", updates
             )
             await self._commit()
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
 
@@ -2216,13 +2761,23 @@ class MessageStore:
             if not rows:
                 break
             updates = [
-                (cipher.encrypt(cipher.decrypt(r["value"])), r["name"], r["version"], r["key"])
+                (
+                    self._reencrypt_value(
+                        cipher,
+                        r["value"],
+                        cell_aad("reference", "value", r["name"], r["version"], r["key"]),
+                    ),
+                    r["name"],
+                    r["version"],
+                    r["key"],
+                )
                 for r in rows
             ]
             await self._db.executemany(
                 "UPDATE reference SET value=? WHERE name=? AND version=? AND key=?", updates
             )
             await self._commit()
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
 
@@ -2248,7 +2803,17 @@ class MessageStore:
                     break
                 updates = [
                     (
-                        cipher.encrypt(cipher.decrypt(r[column])),
+                        self._reencrypt_value(
+                            cipher,
+                            r[column],
+                            cell_aad(
+                                "response",
+                                column,
+                                r["message_id"],
+                                r["destination_name"],
+                                r["response_seq"],
+                            ),
+                        ),
                         r["message_id"],
                         r["destination_name"],
                         r["response_seq"],
@@ -2261,7 +2826,106 @@ class MessageStore:
                     updates,
                 )
                 await self._commit()
+                await self._charge_bound_batch()
                 rotated += len(rows)
+        return rotated
+
+    async def _reencrypt_message_events_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Rotate ``message_events.detail`` under the active key (caller holds the lock), rebinding its
+        (message_id, ts, event) cell AAD — the id-keyed loops can't reach it (autoincrement id). Mirrors
+        :meth:`_reencrypt_state_to_active`; UPDATE targets `id`, the AAD comes from the natural tuple."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, message_id, ts, event, detail FROM message_events"
+                " WHERE detail NOT LIKE ? AND detail <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (
+                    self._reencrypt_value(
+                        cipher,
+                        r["detail"],
+                        cell_aad("message_events", "detail", r["message_id"], r["ts"], r["event"]),
+                    ),
+                    r["id"],
+                )
+                for r in rows
+            ]
+            await self._db.executemany("UPDATE message_events SET detail=? WHERE id=?", updates)
+            await self._commit()
+            await self._charge_bound_batch()
+            rotated += len(rows)
+        return rotated
+
+    async def _reencrypt_connection_events_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Rotate ``connection_event.reason`` under the active key (caller holds the lock), rebinding its
+        (connection, ts, kind) cell AAD. Mirrors :meth:`_reencrypt_message_events_to_active`."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, connection, ts, kind, reason FROM connection_event"
+                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (
+                    self._reencrypt_value(
+                        cipher,
+                        r["reason"],
+                        cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                    ),
+                    r["id"],
+                )
+                for r in rows
+            ]
+            await self._db.executemany("UPDATE connection_event SET reason=? WHERE id=?", updates)
+            await self._commit()
+            await self._charge_bound_batch()
+            rotated += len(rows)
+        return rotated
+
+    async def _reencrypt_alert_instances_to_active(
+        self, cipher: AesGcmCipher, active_like: str, batch: int
+    ) -> int:
+        """Rotate ``alert_instance.reason`` under the active key (caller holds the lock), rebinding its
+        (event_type, connection) cell AAD — the de-dup grain the upsert keys on. Mirrors
+        :meth:`_reencrypt_message_events_to_active`."""
+        rotated = 0
+        while True:
+            cur = await self._db.execute(
+                "SELECT id, event_type, connection, reason FROM alert_instance"
+                " WHERE reason NOT LIKE ? AND reason <> '' LIMIT ?",
+                (active_like, batch),
+            )
+            rows = list(await cur.fetchall())
+            if not rows:
+                break
+            updates = [
+                (
+                    self._reencrypt_value(
+                        cipher,
+                        r["reason"],
+                        cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+                    ),
+                    r["id"],
+                )
+                for r in rows
+            ]
+            await self._db.executemany("UPDATE alert_instance SET reason=? WHERE id=?", updates)
+            await self._commit()
+            await self._charge_bound_batch()
+            rotated += len(rows)
         return rotated
 
     @staticmethod
@@ -2273,8 +2937,14 @@ class MessageStore:
             if column not in existing:
                 await db.execute(f"ALTER TABLE messages ADD COLUMN {column} {decl}")
         cur = await db.execute("PRAGMA table_info(audit_log)")
-        if "row_hash" not in {row["name"] for row in await cur.fetchall()}:
+        audit_cols = {row["name"] for row in await cur.fetchall()}
+        if "row_hash" not in audit_cols:
             await db.execute("ALTER TABLE audit_log ADD COLUMN row_hash TEXT")
+        # ADR 0150 client attribution: a pre-existing DB's audit_log predates the column. NULL on every
+        # existing row is CORRECT (their address was never captured) *and* is what keeps their row_hash
+        # valid — audit_row_hash omits the 7th element entirely when client is None.
+        if "client" not in audit_cols:
+            await db.execute("ALTER TABLE audit_log ADD COLUMN client TEXT")
         cur = await db.execute("PRAGMA table_info(users)")
         user_cols = {row["name"] for row in await cur.fetchall()}
         if "channel_scope" not in user_cols:
@@ -2364,6 +3034,25 @@ class MessageStore:
             await db.execute("ALTER TABLE response ADD COLUMN ack_code TEXT")
         if "ack_phase" not in response_cols:
             await db.execute("ALTER TABLE response ADD COLUMN ack_phase TEXT")
+        # #143/#81: a pre-existing alert_instance table (from #56) predates the windowed-suspend (#143) and
+        # escalation-tier (#81) columns — ALTER them in (NULL suspended_until = never suspended;
+        # escalation_tier DEFAULT 0 = base tier on existing rows, byte-identical). Created by _SCHEMA fresh.
+        cur = await db.execute("PRAGMA table_info(alert_instance)")
+        alert_cols = {row["name"] for row in await cur.fetchall()}
+        if alert_cols and "suspended_until" not in alert_cols:
+            await db.execute("ALTER TABLE alert_instance ADD COLUMN suspended_until REAL")
+        if alert_cols and "escalation_tier" not in alert_cols:
+            await db.execute(
+                "ALTER TABLE alert_instance ADD COLUMN escalation_tier INTEGER NOT NULL DEFAULT 0"
+            )
+        # #306: a pre-existing search_presets table (from #151/ADR 0136) predates last_used_at — ALTER
+        # it in. NULL on every existing row is CORRECT: those presets were never recall-stamped, so the
+        # purge's null-safe MAX falls back to updated_at and their window is byte-identical to before
+        # (no upgrade-time reprieve AND no upgrade-time mass deletion). Created by _SCHEMA on a fresh DB.
+        cur = await db.execute("PRAGMA table_info(search_presets)")
+        preset_cols = {row["name"] for row in await cur.fetchall()}
+        if preset_cols and "last_used_at" not in preset_cols:
+            await db.execute("ALTER TABLE search_presets ADD COLUMN last_used_at REAL")
         await MessageStore._migrate_outbox_to_queue(db)
 
     @staticmethod
@@ -2412,6 +3101,14 @@ class MessageStore:
             )
 
     async def close(self) -> None:
+        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
+        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
+        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
+        # a failing settlement must never turn a clean shutdown into an error.
+        try:
+            await self.checkpoint_cipher_invocations(settle=True)
+        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         # Stop the group-commit committer FIRST (if enabled) so it flushes any enrolled members and
         # resolves their futures before the write connection is closed — otherwise an in-flight handoff
         # would hang forever on a future no committer will ever complete.
@@ -2480,7 +3177,15 @@ class MessageStore:
                 if should_record_event("received", self._message_events):
                     await self._db.execute(
                         "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                        (mid, now, "received", self._enc(f"{len(deliveries)} destination(s)")),
+                        (
+                            mid,
+                            now,
+                            "received",
+                            self._enc(
+                                f"{len(deliveries)} destination(s)",
+                                aad=cell_aad("message_events", "detail", mid, now, "received"),
+                            ),
+                        ),
                     )
                 await self._commit()
             except Exception:
@@ -2540,7 +3245,13 @@ class MessageStore:
         await self._db.execute(
             "INSERT INTO shared_body (hash, body, refcount, created_at) VALUES (?,?,?,?) "
             "ON CONFLICT(hash) DO UPDATE SET refcount = refcount + excluded.refcount",
-            (body_hash, self._cipher.encrypt(payload), refs, now),
+            (
+                body_hash,
+                # Content-address cell (ASVS 11.3.3): the hash is over the plaintext, rotation-stable.
+                self._cipher.encrypt(payload, aad=cell_aad("shared_body", "body", body_hash)),
+                refs,
+                now,
+            ),
         )
         self.body_copies += 1  # A1: store-once fan-out writes the body ONCE regardless of ref count
 
@@ -2608,15 +3319,22 @@ class MessageStore:
         self._require_streaming_attachments()
         hasher = hashlib.sha256()
         total = 0
-        sealed: list[str] = []
+        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to its (attachment_id, seq) cell — but the
+        # attachment_id is the sha256 content address, known only once the full plaintext is hashed. So
+        # buffer the verbatim slices, hash them, then seal each under its (ref, seq). `chunks` is a
+        # slicing of an already-materialized OBX-5.5 value, so this adds no order-of-magnitude memory over
+        # the caller's own copy, and each AES-GCM seal still consumes exactly one chunk (one-chunk seal).
+        plaintext_chunks: list[str] = []
         for chunk in chunks:
             data = chunk.encode("utf-8")
             hasher.update(data)
             total += len(data)
-            sealed.append(
-                self._cipher.encrypt(chunk)
-            )  # bounded plaintext window: one chunk per seal
+            plaintext_chunks.append(chunk)
         ref = hasher.hexdigest()
+        sealed: list[str] = [
+            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+            for seq, c in enumerate(plaintext_chunks)
+        ]
         now = time.time()
         async with self._lock:
             try:
@@ -2653,10 +3371,15 @@ class MessageStore:
             if await cur.fetchone() is None:
                 raise KeyError(f"attachment {ref!r} not found")
             cur = await conn.execute(
-                "SELECT ciphertext FROM attachment_chunk WHERE attachment_id=? ORDER BY seq", (ref,)
+                "SELECT seq, ciphertext FROM attachment_chunk WHERE attachment_id=? ORDER BY seq",
+                (ref,),
             )
             async for row in cur:
-                yield self._cipher.decrypt(row["ciphertext"])
+                # Bound to (attachment_id, seq) — a chunk relocated to another attachment/seq fails closed.
+                yield self._cipher.decrypt(
+                    row["ciphertext"],
+                    aad=cell_aad("attachment_chunk", "ciphertext", ref, row["seq"]),
+                )
 
     async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
@@ -2861,7 +3584,11 @@ class MessageStore:
         row_id = uuid4().hex
         # When the body is shared, the inline payload is empty ('' — never ciphertext-of-empty, so it
         # reads back as a blank that the deref replaces). NOT NULL is satisfied by the '' sentinel.
-        stored_payload = "" if body_ref is not None else self._cipher.encrypt(payload)
+        stored_payload = (
+            ""
+            if body_ref is not None
+            else self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id))
+        )
         if body_ref is None:
             # A1: an inline body is one durable copy; a shared-body row (body_ref set) stores '' here and
             # the single copy is counted once in _reserve_shared_body (store-once-aware amplification).
@@ -2898,18 +3625,20 @@ class MessageStore:
         never kept twice at rest beyond the brief route→transform window (mirrors the ingress row)."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
+        # Hoist the row id so the payload can bind to its own (queue, payload, id) cell (ASVS 11.3.3).
+        row_id = uuid4().hex
         await self._db.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
             "  status, attempts, next_attempt_at, created_at, updated_at)"
             " VALUES (?,?,?,?,NULL,?,?,?,0,?,?,?)",
             (
-                uuid4().hex,
+                row_id,
                 mid,
                 Stage.ROUTED.value,
                 channel_id,
                 handler_name,
-                self._cipher.encrypt(payload),
+                self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
                 OutboxStatus.PENDING.value,
                 now,
                 created_at,
@@ -2970,17 +3699,19 @@ class MessageStore:
             )
             # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059).
             ingress_created_at = now
+            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            ingress_row_id = uuid4().hex
             await self._db.execute(
                 "INSERT INTO queue"
                 " (id, message_id, stage, channel_id, destination_name, payload,"
                 "  status, attempts, next_attempt_at, created_at, updated_at)"
                 " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
                 (
-                    uuid4().hex,
+                    ingress_row_id,
                     mid,
                     Stage.INGRESS.value,
                     channel_id,
-                    self._cipher.encrypt(raw),
+                    self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
                     OutboxStatus.PENDING.value,
                     now,
                     ingress_created_at,
@@ -2994,7 +3725,15 @@ class MessageStore:
             if should_record_event("received", self._message_events):
                 await self._db.execute(
                     "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                    (mid, now, "received", self._enc("ingress")),
+                    (
+                        mid,
+                        now,
+                        "received",
+                        self._enc(
+                            "ingress",
+                            aad=cell_aad("message_events", "detail", mid, now, "received"),
+                        ),
+                    ),
                 )
             # #149 two-object commit: incref each detached attachment AND record its message->attachment
             # linkage row in THIS transaction (same commit as the skeleton row), so the refcount that keeps
@@ -3161,7 +3900,15 @@ class MessageStore:
         commit — a rolled-back write never leaks into :meth:`reference_view`. Replaces the whole set
         (build-new-then-flip), so it is idempotent on a re-run with the same rows."""
         encrypted = [
-            (name, version, k, self._cipher.encrypt(json.dumps(v))) for k, v in rows.items()
+            (
+                name,
+                version,
+                k,
+                self._cipher.encrypt(
+                    json.dumps(v), aad=cell_aad("reference", "value", name, version, k)
+                ),
+            )
+            for k, v in rows.items()
         ]
         async with self._lock:
             try:
@@ -3224,7 +3971,13 @@ class MessageStore:
         await self._db.execute(
             "INSERT OR REPLACE INTO state (namespace, key, value, set_at, message_id)"
             " VALUES (?,?,?,?,?)",
-            (namespace, key, self._cipher.encrypt(value_json), now, message_id),
+            (
+                namespace,
+                key,
+                self._cipher.encrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
+                now,
+                message_id,
+            ),
         )
 
     async def transform_handoff(
@@ -3237,6 +3990,7 @@ class MessageStore:
         state_ops: Sequence[tuple[str, str, Any]] = (),  # (namespace, key, value) — ADR 0005
         pt_deliveries: Sequence[tuple[str, str]] = (),  # (pt_inbound_name, body) — ADR 0013 gen.
         meta_ops: Sequence[tuple[str, str]] = (),  # (key, value) SetMeta writes — ADR 0081 (#150)
+        declined: Sequence[str] = (),  # #233: Sends to a present-but-not-deployed connection
         correlation_depth_cap: int = 8,  # bounds internal PT re-ingress loops
         now: float | None = None,
     ) -> bool:
@@ -3299,7 +4053,11 @@ class MessageStore:
                     "SELECT metadata FROM messages WHERE id=?", (message_id,)
                 )
                 prow = await pcur.fetchone()
-                pmeta_json = self._dec(prow["metadata"]) if prow else None
+                pmeta_json = (
+                    self._dec(prow["metadata"], aad=cell_aad("messages", "metadata", message_id))
+                    if prow
+                    else None
+                )
             # Pass-through re-ingress (ADR 0013, generalized): produce each PT child + the parent's
             # done marker in THIS same transaction as the routed-row DELETE, so the handoff is atomic
             # and re-run-idempotent (absent lineage → depth 0).
@@ -3341,14 +4099,28 @@ class MessageStore:
                 merged = merge_user_metadata(pmeta_json, meta_ops)
                 await self._db.execute(
                     "UPDATE messages SET metadata=? WHERE id=?",
-                    (self._enc(merged), message_id),
+                    (
+                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        message_id,
+                    ),
                 )
             total_targets = len(deliveries) + len(pt_deliveries)
             await self._event(
                 message_id, "transformed", None, f"{total_targets} destination(s)", now
             )
+            # #233 (ADR 0111): one not_deployed event per Send declined because its target is present-
+            # but-not-deployed — written HERE, in the same claim→produce→complete transaction and
+            # BEFORE the finalizer, so it is (1) the durable count-and-log record of the skipped leg
+            # and (2) visible to the finalizer below (which reads only persisted rows). Without this
+            # persisted signal a message whose every delivery was declined would collapse to FILTERED.
+            for dest in declined:
+                await self._event(
+                    message_id, NOT_DEPLOYED_EVENT, dest, not_deployed_detail(dest), now
+                )
             # Finalizer owns the terminal disposition (incl. the ROUTED→FILTERED collapse when this
-            # was the last handler and nothing delivered anywhere). Runs in this same transaction.
+            # was the last handler and nothing delivered anywhere, and the ROUTED→NOT_DEPLOYED variant
+            # when the not_deployed events above are the only reason it delivered nothing). Runs in
+            # this same transaction.
             await self._maybe_finalize_message(message_id, now)
             return True
 
@@ -3398,11 +4170,12 @@ class MessageStore:
                 source_type,
                 control_id,
                 message_type,
-                self._cipher.encrypt(raw),
+                self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
                 status,
-                self._enc(error),
-                self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest like the body
-                self._enc(metadata),
+                self._enc(error, aad=cell_aad("messages", "error", mid)),
+                # EF-3: MRN/name is PHI — ciphered at rest like the body
+                self._enc(summary, aad=cell_aad("messages", "summary", mid)),
+                self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
             ),
         )
         self.body_copies += (
@@ -3454,7 +4227,14 @@ class MessageStore:
                 if should_record_event(event, self._message_events):
                     await self._db.execute(
                         "INSERT INTO message_events (message_id, ts, event, detail) VALUES (?,?,?,?)",
-                        (mid, now, event, self._enc(error)),
+                        (
+                            mid,
+                            now,
+                            event,
+                            self._enc(
+                                error, aad=cell_aad("message_events", "detail", mid, now, event)
+                            ),
+                        ),
                     )
                 await self._commit()
             except Exception:
@@ -3533,15 +4313,24 @@ class MessageStore:
         identical to the pre-feature path (no shared_body read). A missing shared body (corruption /
         premature GC) raises like any undecryptable payload, so the caller dead-letters that one row
         rather than stalling the lane."""
-        body_ref = row["body_ref"] if "body_ref" in row.keys() else None
+        body_ref = row["body_ref"] if "body_ref" in row.keys() else None  # noqa: SIM118
         if body_ref is None:
-            return OutboxItem.from_row(row, self._cipher)
+            # Inline body — bound to this queue row's own cell (ASVS 11.3.3).
+            return OutboxItem.from_row(
+                row, self._cipher, body_aad=cell_aad("queue", "payload", row["id"])
+            )
         async with self._read() as db:
             cur = await db.execute("SELECT body FROM shared_body WHERE hash=?", (body_ref,))
             br = await cur.fetchone()
         if br is None:
             raise CipherError(f"shared body {body_ref} missing")
-        return OutboxItem.from_row(row, self._cipher, shared_ciphertext=br["body"])
+        # Deref'd shared body — bound to the shared_body content-address cell, not this queue row.
+        return OutboxItem.from_row(
+            row,
+            self._cipher,
+            body_aad=cell_aad("shared_body", "body", body_ref),
+            shared_ciphertext=br["body"],
+        )
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
         # SQLite is single active node: there is no second writer to fence, so the H1 epoch guard is a
@@ -4009,7 +4798,13 @@ class MessageStore:
                 raise _AbortMember(None)
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=? WHERE id=?",
-                (OutboxStatus.DEAD.value, now, self._enc(error), now, outbox_id),
+                (
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                ),
             )
             await self._event(row["message_id"], "dead", row["destination_name"], error, now)
             await self._maybe_finalize_message(row["message_id"], now)
@@ -4169,10 +4964,18 @@ class MessageStore:
                     message_id,
                     destination_name,
                     seq,
-                    self._enc(body),
+                    self._enc(
+                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
+                    ),
                     outcome,
-                    self._enc(detail),
-                    self._enc(headers_json),
+                    self._enc(
+                        detail,
+                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                    ),
+                    self._enc(
+                        headers_json,
+                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
+                    ),
                     now,
                 ),
             )
@@ -4186,18 +4989,20 @@ class MessageStore:
                 artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                 # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
                 work_created = now
+                # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                work_row_id = uuid4().hex
                 await self._db.execute(
                     "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                     " handler_name, payload, status, attempts, next_attempt_at, created_at,"
                     " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
-                        uuid4().hex,
+                        work_row_id,
                         message_id,
                         Stage.RESPONSE.value,
                         reingress_to,
                         None,
                         None,
-                        self._enc(artifact_ref),
+                        self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
                         OutboxStatus.PENDING.value,
                         0,
                         now,
@@ -4266,8 +5071,12 @@ class MessageStore:
         ``correlation_depth``). The PT inbound's own router worker drains the INGRESS row and re-routes
         it. Idempotent re-run: the content-addressed id is pre-checked, so a partial-then-recovered run
         does not double-inject the message. Bounds internal loops by ``correlation_depth`` (mirrors
-        ``ingress_handoff``'s cap), computed purely from the parent's immutable metadata → re-run-stable.
-        """
+        ``ingress_handoff``'s cap), computed purely from the parent's metadata → re-run-stable **while
+        the parent's metadata survives**. Retention nulls ``messages.metadata`` on the body window
+        (ASVS 14.2.7), so a parent purged out from under a later re-ingress yields ``parent_meta={}``
+        and the child RE-BASES: depth restarts at 1 and the root falls back to the origin id. The cap
+        still bounds any single live chain; it is not a global lifetime bound across a purge. Accepted
+        and pinned by test — see PHI.md §8."""
         child_depth = int(parent_meta.get("correlation_depth", 0) or 0) + 1
         root = parent_meta.get("correlation_root_id") or parent_id
         if child_depth > correlation_depth_cap:
@@ -4309,18 +5118,20 @@ class MessageStore:
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059)
             ingress_created = now
+            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            pt_ingress_id = uuid4().hex
             await self._db.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                 " handler_name, payload, status, attempts, next_attempt_at, created_at,"
                 " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    uuid4().hex,
+                    pt_ingress_id,
                     new_mid,
                     Stage.INGRESS.value,
                     pt_channel,
                     None,
                     None,
-                    self._cipher.encrypt(body),
+                    self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
                     OutboxStatus.PENDING.value,
                     0,
                     now,
@@ -4352,18 +5163,21 @@ class MessageStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
         created_at = now
+        # Hoist the row id so the (empty) marker payload binds to its own (queue, payload, id) cell —
+        # the marker is finalizer-only, but a PHI-body read (outbox_payloads_for) still derefs it.
+        marker_id = uuid4().hex
         await self._db.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
             " VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (
-                uuid4().hex,
+                marker_id,
                 parent_id,
                 Stage.OUTBOUND.value,
                 pt_name,
                 pt_name,
                 None,
-                self._cipher.encrypt(""),
+                self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
                 status,
                 0,
                 now,
@@ -4432,7 +5246,13 @@ class MessageStore:
                     return False
                 origin_id = wr["message_id"]
                 try:
-                    ref = self._dec(wr["payload"]) or ""
+                    ref = (
+                        self._dec(
+                            wr["payload"],
+                            aad=cell_aad("queue", "payload", response_row_id),
+                        )
+                        or ""
+                    )
                     origin_msg_id, dest, seq_s = ref.split("\x1f")
                     seq = int(seq_s)
                 except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -4445,7 +5265,10 @@ class MessageStore:
                         " WHERE id=?",
                         (
                             OutboxStatus.DEAD.value,
-                            self._enc("re-ingress work-row reference is corrupt/unparseable"),
+                            self._enc(
+                                "re-ingress work-row reference is corrupt/unparseable",
+                                aad=cell_aad("queue", "last_error", response_row_id),
+                            ),
                             now,
                             now,
                             response_row_id,
@@ -4464,7 +5287,14 @@ class MessageStore:
                     (origin_msg_id, dest, seq),
                 )
                 art = await cur.fetchone()
-                body = self._dec(art["body"]) if (art and art["body"] is not None) else ""
+                body = (
+                    self._dec(
+                        art["body"],
+                        aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                    )
+                    if (art and art["body"] is not None)
+                    else ""
+                )
                 body = body or ""
                 # 3. The origin's correlation lineage (absent keys → depth 0, origin is its own root).
                 cur = await self._db.execute(
@@ -4472,7 +5302,12 @@ class MessageStore:
                 )
                 mrow = await cur.fetchone()
                 origin_meta: dict[str, Any] = {}
-                meta_json = self._dec(mrow["metadata"]) if mrow else None  # EF-3: ciphered at rest
+                # EF-3: ciphered at rest, bound to the origin message's metadata cell
+                meta_json = (
+                    self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
+                    if mrow
+                    else None
+                )
                 if meta_json:
                     loaded = json.loads(meta_json)
                     if isinstance(loaded, dict):
@@ -4489,7 +5324,8 @@ class MessageStore:
                             OutboxStatus.DEAD.value,
                             self._enc(
                                 f"re-ingress correlation depth exceeded "
-                                f"({child_depth} > {correlation_depth_cap})"
+                                f"({child_depth} > {correlation_depth_cap})",
+                                aad=cell_aad("queue", "last_error", response_row_id),
                             ),
                             now,
                             now,
@@ -4537,18 +5373,22 @@ class MessageStore:
                     if not peek_failed:
                         # ingest-time (ADR 0009) + metrics only; FIFO orders by rowid (ADR 0059)
                         ingress_created = now
+                        # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                        reingress_row_id = uuid4().hex
                         await self._db.execute(
                             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                             " handler_name, payload, status, attempts, next_attempt_at, created_at,"
                             " updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                             (
-                                uuid4().hex,
+                                reingress_row_id,
                                 new_mid,
                                 Stage.INGRESS.value,
                                 loopback_channel_id,
                                 None,
                                 None,
-                                self._cipher.encrypt(body),
+                                self._cipher.encrypt(
+                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                ),
                                 OutboxStatus.PENDING.value,
                                 0,
                                 now,
@@ -4597,7 +5437,7 @@ class MessageStore:
             row = await cur.fetchone()
             if row is None:
                 return None
-            ref = self._dec(row["payload"]) or ""
+            ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
             try:
                 mid, dest, seq_s = ref.split("\x1f")
             except ValueError:
@@ -4608,7 +5448,11 @@ class MessageStore:
                 (mid, dest, int(seq_s)),
             )
             art = await cur.fetchone()
-        return self._dec(art["body"]) if (art and art["body"] is not None) else ""
+        return (
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            if (art and art["body"] is not None)
+            else ""
+        )
 
     async def record_ack_sent(
         self,
@@ -4631,8 +5475,6 @@ class MessageStore:
         # is safe_text-scrubbed (#120) + encrypted.
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
-        enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
-        enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
         async with self._lock:
             try:
                 await self._db.execute("BEGIN")
@@ -4643,6 +5485,20 @@ class MessageStore:
                 )
                 seq_row = await cur.fetchone()
                 seq = (int(seq_row["m"]) if seq_row else 0) + 1
+                # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
+                enc_body = (
+                    self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                    if (ack_body and self._cipher.encrypts)
+                    else None
+                )
+                enc_detail = (
+                    self._enc(
+                        safe_text(detail)[:200],
+                        aad=cell_aad("response", "detail", message_id, dest, seq),
+                    )
+                    if detail
+                    else None
+                )
                 await self._db.execute(
                     "INSERT INTO response"
                     " (message_id, destination_name, response_seq, body, outcome, detail,"
@@ -4686,13 +5542,42 @@ class MessageStore:
                 destination_name=r["destination_name"],
                 response_seq=r["response_seq"],
                 outcome=r["outcome"],
-                detail=self._dec(r["detail"]),
+                detail=self._dec(
+                    r["detail"],
+                    aad=cell_aad(
+                        "response",
+                        "detail",
+                        r["message_id"],
+                        r["destination_name"],
+                        r["response_seq"],
+                    ),
+                ),
                 captured_at=r["captured_at"],
-                body=self._dec(r["body"]),
+                body=self._dec(
+                    r["body"],
+                    aad=cell_aad(
+                        "response",
+                        "body",
+                        r["message_id"],
+                        r["destination_name"],
+                        r["response_seq"],
+                    ),
+                ),
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
-                headers=decode_response_headers(self._dec(r["resp_headers"])),
+                headers=decode_response_headers(
+                    self._dec(
+                        r["resp_headers"],
+                        aad=cell_aad(
+                            "response",
+                            "resp_headers",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
+                ),
             )
             for r in rows
         ]
@@ -4727,7 +5612,13 @@ class MessageStore:
             await self._db.execute(
                 "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                 " WHERE id=?",
-                (status, next_at, self._enc(error), now, outbox_id),
+                (
+                    status,
+                    next_at,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                ),
             )
             await self._event(
                 row["message_id"],
@@ -4783,7 +5674,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     " WHERE id=?",
-                    (status, next_at, self._enc(error), now, outbox_id),
+                    (
+                        status,
+                        next_at,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                    ),
                 )
                 await self._event(
                     row["message_id"],
@@ -4820,7 +5717,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     " WHERE id=?",
-                    (OutboxStatus.DEAD.value, now, self._enc(error), now, outbox_id),
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                    ),
                 )
                 await self._event(row["message_id"], "dead", row["destination_name"], error, now)
                 finalize[row["message_id"]] = None
@@ -4953,7 +5856,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     " WHERE id=?",
-                    (OutboxStatus.DEAD.value, now, self._enc(error), now, row["id"]),
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                        now,
+                        row["id"],
+                    ),
                 )
                 await self._event(row["message_id"], "dead", row["destination_name"], error, now)
                 await self._maybe_finalize_message(row["message_id"], now)
@@ -4993,7 +5902,13 @@ class MessageStore:
                 await self._db.execute(
                     "UPDATE queue SET status=?, next_attempt_at=?, last_error=?, updated_at=?"
                     " WHERE id=?",
-                    (OutboxStatus.DEAD.value, now, self._enc(error), now, row["id"]),
+                    (
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                        now,
+                        row["id"],
+                    ),
                 )
                 await self._event(row["message_id"], "dead", None, error, now)
                 await self._maybe_finalize_message(row["message_id"], now)
@@ -5180,7 +6095,9 @@ class MessageStore:
                         )
                     # Correlate the child to the origin (mirrors `reingress`): correlation_id/_root_id/
                     # _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                    raw_meta = self._dec(mrow["metadata"])
+                    raw_meta = self._dec(
+                        mrow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                    )
                     try:
                         parent_meta = json.loads(raw_meta) if raw_meta else {}
                     except (ValueError, TypeError):
@@ -5239,7 +6156,7 @@ class MessageStore:
                         src_where += " AND destination_name=?"
                         src_params.append(from_)
                     cur = await self._db.execute(
-                        "SELECT q.destination_name, q.channel_id,"
+                        "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
                         " COALESCE(sb.body, q.payload) AS _body_ciphertext"
                         " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
                         f" WHERE {src_where} ORDER BY q.destination_name",
@@ -5260,7 +6177,14 @@ class MessageStore:
                     src = rows[0]
                     src_channel = str(src["channel_id"])
                     src_dest = str(src["destination_name"])
-                    decoded = self._dec(src["_body_ciphertext"])
+                    # The body's cell depends on its source: a store-once shared body (body_ref set) binds
+                    # to the shared_body content-address; an inline payload binds to the queue row (11.3.3).
+                    body_aad = (
+                        cell_aad("shared_body", "body", src["body_ref"])
+                        if src["body_ref"] is not None
+                        else cell_aad("queue", "payload", src["id"])
+                    )
+                    decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
                     # must-fix #2 / §5: a retention-nulled ('') source body would ship a zero-length body
                     # recorded PROCESSED. Reject rather than resend nothing. (A '' inline payload is exactly
                     # what purge_message_bodies leaves; the deref COALESCE already resolved any shared body.)
@@ -5372,7 +6296,9 @@ class MessageStore:
                     )
                 # Correlate the child to the origin (mirrors _insert_passthrough_child): correlation_id /
                 # _root_id / _depth link the logs, plus an explicit `edited_from` for the edit provenance.
-                raw_meta = self._dec(orow["metadata"])
+                raw_meta = self._dec(
+                    orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
+                )
                 try:
                     parent_meta = json.loads(raw_meta) if raw_meta else {}
                 except (ValueError, TypeError):
@@ -5408,17 +6334,21 @@ class MessageStore:
                         now=now,
                     )
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by rowid (ADR 0059).
+                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    resubmit_row_id = uuid4().hex
                     await self._db.execute(
                         "INSERT INTO queue"
                         " (id, message_id, stage, channel_id, destination_name, payload,"
                         "  status, attempts, next_attempt_at, created_at, updated_at)"
                         " VALUES (?,?,?,?,NULL,?,?,0,?,?,?)",
                         (
-                            uuid4().hex,
+                            resubmit_row_id,
                             new_mid,
                             Stage.INGRESS.value,
                             channel_id,
-                            self._cipher.encrypt(raw),
+                            self._cipher.encrypt(
+                                raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                            ),
                             OutboxStatus.PENDING.value,
                             now,
                             now,
@@ -5574,10 +6504,16 @@ class MessageStore:
         if row is None:
             return None
         record = dict(row)
-        record["raw"] = self._cipher.decrypt(record["raw"])  # decrypt the body for display
-        record["error"] = self._dec(record["error"])  # error may embed raw HL7 fragments (WP-5)
-        record["summary"] = self._dec(record["summary"])  # EF-3: MRN/name PHI, ciphered at rest
-        record["metadata"] = self._dec(record["metadata"])  # EF-3
+        mid = record["id"]
+        # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
+        record["raw"] = self._cipher.decrypt(record["raw"], aad=cell_aad("messages", "raw", mid))
+        # error may embed raw HL7 fragments (WP-5)
+        record["error"] = self._dec(record["error"], aad=cell_aad("messages", "error", mid))
+        # EF-3: MRN/name PHI, ciphered at rest
+        record["summary"] = self._dec(record["summary"], aad=cell_aad("messages", "summary", mid))
+        record["metadata"] = self._dec(  # EF-3
+            record["metadata"], aad=cell_aad("messages", "metadata", mid)
+        )
         return record
 
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -5588,7 +6524,7 @@ class MessageStore:
             row = await cur.fetchone()
         if row is None:
             return None
-        return self._dec(row["metadata"])
+        return self._dec(row["metadata"], aad=cell_aad("messages", "metadata", message_id))
 
     async def list_messages(
         self,
@@ -5629,7 +6565,8 @@ class MessageStore:
                 (*params, limit, offset),
             )
             return [
-                self._decode_row(r, "error", "summary", "metadata") for r in await cur.fetchall()
+                self._decode_row(r, "messages", (r["id"],), "error", "summary", "metadata")
+                for r in await cur.fetchall()
             ]
 
     async def count_messages(
@@ -5711,10 +6648,11 @@ class MessageStore:
                 truncated = True
                 break
             scanned += 1
-            raw = self._dec(cand["raw"])
-            summary = self._dec(cand["summary"])
+            cid = cand["id"]
+            raw = self._dec(cand["raw"], aad=cell_aad("messages", "raw", cid))
+            summary = self._dec(cand["summary"], aad=cell_aad("messages", "summary", cid))
             if row_matches(spec, raw=raw, summary=summary):
-                d = self._decode_row(cand, "error", "summary", "metadata")
+                d = self._decode_row(cand, "messages", (cid,), "error", "summary", "metadata")
                 d.pop("raw", None)  # never return the decrypted body in a list-shaped result
                 rows.append(d)
                 if len(rows) >= limit:
@@ -5746,7 +6684,16 @@ class MessageStore:
                 " ORDER BY o.updated_at DESC, o.id DESC LIMIT ? OFFSET ?",
                 (*params, limit, offset),
             )
-            return [self._decode_row(r, "last_error", "summary") for r in await cur.fetchall()]
+            # Mixed-table join: `last_error` is queue's (keyed by o.id, aliased outbox_id), `summary` is
+            # the joined messages row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+            out: list[dict[str, Any]] = []
+            for r in await cur.fetchall():
+                d = self._decode_row(r, "queue", (r["outbox_id"],), "last_error")
+                d["summary"] = self._dec(
+                    r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+                )
+                out.append(d)
+            return out
 
     async def count_dead(
         self,
@@ -5823,7 +6770,9 @@ class MessageStore:
                 "SELECT * FROM queue WHERE message_id=? AND stage=? ORDER BY destination_name",
                 (message_id, Stage.OUTBOUND.value),
             )
-            return [self._decode_row(r, "last_error") for r in await cur.fetchall()]
+            return [
+                self._decode_row(r, "queue", (r["id"],), "last_error") for r in await cur.fetchall()
+            ]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
         """Like :meth:`outbox_for`, but **also decrypts the transformed ``payload``** (PHI body) for
@@ -5843,8 +6792,14 @@ class MessageStore:
             )
             out: list[dict[str, Any]] = []
             for r in await cur.fetchall():
-                d = self._decode_row(r, "last_error")
-                d["payload"] = self._dec(d.pop("_body_ciphertext"))
+                d = self._decode_row(r, "queue", (r["id"],), "last_error")
+                # The body's cell depends on its source (store-once shared body vs inline payload).
+                body_aad = (
+                    cell_aad("shared_body", "body", r["body_ref"])
+                    if r["body_ref"] is not None
+                    else cell_aad("queue", "payload", r["id"])
+                )
+                d["payload"] = self._dec(d.pop("_body_ciphertext"), aad=body_aad)
                 out.append(d)
             return out
 
@@ -5853,7 +6808,12 @@ class MessageStore:
             cur = await db.execute(
                 "SELECT * FROM message_events WHERE message_id=? ORDER BY id", (message_id,)
             )
-            return [self._decode_row(r, "detail") for r in await cur.fetchall()]
+            return [
+                self._decode_row(
+                    r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+                )
+                for r in await cur.fetchall()
+            ]
 
     # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
     async def record_connection_event(
@@ -5872,7 +6832,16 @@ class MessageStore:
         # queue row, no finalizer call (connection_event is invisible to _maybe_finalize_message, which
         # scans `FROM queue`). reason goes through the safe_text PHI chokepoint (#120) + the cipher.
         now = time.time() if now is None else now
-        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        # Bound to (connection, ts, kind) — the row's insert-time-known identity; connection_event.id is
+        # autoincrement, unknown here, so cell_aad can't use it (ASVS 11.3.3).
+        reason_enc = (
+            self._enc(
+                safe_text(reason)[:200],
+                aad=cell_aad("connection_event", "reason", connection, now, kind),
+            )
+            if reason
+            else None
+        )
         async with self._lock:
             await self._db.execute(
                 "INSERT INTO connection_event"
@@ -5930,7 +6899,12 @@ class MessageStore:
                     kind=r["kind"],
                     peer_host=r["peer_host"],
                     message_id=r["message_id"],
-                    reason=self._dec(r["reason"]),
+                    reason=self._dec(
+                        r["reason"],
+                        aad=cell_aad(
+                            "connection_event", "reason", r["connection"], r["ts"], r["kind"]
+                        ),
+                    ),
                 )
                 for r in await cur.fetchall()
             ]
@@ -5944,6 +6918,7 @@ class MessageStore:
         connection: str,
         severity: str,
         reason: str | None = None,
+        escalation_tier: int = 0,
         now: float | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): a single short upsert under the write lock — NO queue row, NO
@@ -5952,21 +6927,33 @@ class MessageStore:
         # throttle key. If a live (open/acknowledged) instance exists, fold the re-fire into it (bump
         # last_seen + count, refresh severity/reason; an acknowledged instance STAYS acknowledged — the
         # operator already owns it). Otherwise insert a fresh `open` row. reason rides safe_text (#120) +
-        # the cipher. Never raises into the _emit caller (the caller wraps fail-soft).
+        # the cipher. escalation_tier (#81, ADR 0133) is MAX'd — monotonic within an open instance. Never
+        # raises into the _emit caller (the caller wraps fail-soft).
         now = time.time() if now is None else now
-        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
+        # both the INSERT and the re-fire UPDATE that never sees the autoincrement id (ASVS 11.3.3).
+        reason_enc = (
+            self._enc(
+                safe_text(reason)[:200],
+                aad=cell_aad("alert_instance", "reason", event_type, connection),
+            )
+            if reason
+            else None
+        )
         async with self._lock:
             cur = await self._db.execute(
-                "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?"
+                "UPDATE alert_instance SET last_seen=?, count=count+1, severity=?, reason=?,"
+                " escalation_tier=MAX(escalation_tier, ?)"
                 " WHERE event_type=? AND connection=? AND status!='resolved'",
-                (now, severity, reason_enc, event_type, connection),
+                (now, severity, reason_enc, escalation_tier, event_type, connection),
             )
             if cur.rowcount == 0:
                 await self._db.execute(
                     "INSERT INTO alert_instance"
-                    " (event_type, connection, severity, status, first_seen, last_seen, count, reason)"
-                    " VALUES (?,?,?,'open',?,?,1,?)",
-                    (event_type, connection, severity, now, now, reason_enc),
+                    " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
+                    " escalation_tier)"
+                    " VALUES (?,?,?,'open',?,?,1,?,?)",
+                    (event_type, connection, severity, now, now, reason_enc, escalation_tier),
                 )
             await self._commit()
 
@@ -5990,7 +6977,8 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
-                f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}"
+                " reason, acked_by, acked_at, resolved_at, suspended_until, escalation_tier"
+                f" FROM alert_instance{clause}"
                 " ORDER BY last_seen DESC, id DESC LIMIT ?",
                 params,
             )
@@ -6009,7 +6997,8 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute(
                 "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
-                f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}",
+                " reason, acked_by, acked_at, resolved_at, suspended_until, escalation_tier"
+                f" FROM alert_instance{clause}",
                 params,
             )
             row = await cur.fetchone()
@@ -6025,10 +7014,15 @@ class MessageStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=r["count"],
-            reason=self._dec(r["reason"]),
+            reason=self._dec(
+                r["reason"],
+                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+            ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
             resolved_at=r["resolved_at"],
+            suspended_until=r["suspended_until"],
+            escalation_tier=r["escalation_tier"],
         )
 
     async def ack_alert_instance(
@@ -6075,6 +7069,39 @@ class MessageStore:
             await self._commit()
             return int(cur.rowcount)
 
+    async def suspend_alert_instance(
+        self, alert_id: int, *, until: float, now: float | None = None
+    ) -> AlertInstance | None:
+        # #143 windowed suspend: mute NOTIFICATIONS for this instance's (event_type, connection) key until
+        # `until` (an epoch). NOTIFICATION-only (ADR 0044 AC-3): the instance's status/count/visibility is
+        # untouched — only `suspended_until` is set, so it stays open on the dashboard. Refuses a resolved
+        # instance (a resolved condition has nothing to mute). Returns the updated row (for the API echo +
+        # so the caller can seed the running sink's suspend cache), or None if unknown/already resolved.
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET suspended_until=? WHERE id=? AND status!='resolved'",
+                (until, alert_id),
+            )
+            await self._commit()
+            if cur.rowcount == 0:
+                return None
+        return await self.get_alert_instance(alert_id)
+
+    async def resume_alert_instance(
+        self, alert_id: int, *, now: float | None = None
+    ) -> AlertInstance | None:
+        # #143: clear a windowed suspend (re-alerts resume immediately). Idempotent (clearing an
+        # un-suspended instance is a no-op UPDATE). Returns the row, or None if unknown/already resolved.
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE alert_instance SET suspended_until=NULL WHERE id=? AND status!='resolved'",
+                (alert_id,),
+            )
+            await self._commit()
+            if cur.rowcount == 0:
+                return None
+        return await self.get_alert_instance(alert_id)
+
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         # Back ConnectionRow.alerts_active (ADR 0044 D4): the OPEN (not acknowledged, not resolved)
         # instance count per connection, joined to the dashboard rows by connection name. Lockfree read.
@@ -6117,10 +7144,18 @@ class MessageStore:
         actor: str | None = None,
         channel_id: str | None = None,
         detail: str | None = None,
+        client: str | None = None,
         now: float | None = None,
     ) -> None:
         """Append a row to the general audit log — the seam for PHI-access auditing (summary
         displays, detail views, exports, …). ``detail`` is an opaque (JSON) string.
+
+        ``client`` is the caller's network address (ADR 0150) — the "from where" that turns an entry
+        naming *who* and *what* into one an incident responder can trace to a host. Callers on a request
+        path pass ``client_ip(request)``; engine-internal writes (background workers, ``system``
+        actions) pass nothing and the column stays NULL. It is threaded EXPLICITLY rather than carried
+        ambiently: a ContextVar was rejected because it leaks across ``asyncio.create_task`` boundaries
+        and would stamp a live operator's address onto unrelated ``system`` rows.
 
         After the row is durably committed, a **PHI-safe metadata copy** is teed off-box via
         :func:`~messagefoundry.store.audit_tee.emit_audit_tee` (sec-offbox-log) so the audit trail
@@ -6130,6 +7165,9 @@ class MessageStore:
             cur = await self._db.execute("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
             last = await cur.fetchone()
             prev = last["row_hash"] if last and last["row_hash"] else ""
+            _key, _mac = (
+                self._audit_append_mac()
+            )  # keyed (in-heap or Transit) once watermark set, else keyless
             row_hash = audit_row_hash(
                 prev,
                 ts=now,
@@ -6137,17 +7175,21 @@ class MessageStore:
                 action=action,
                 channel_id=channel_id,
                 detail=detail,
-                key=self._audit_append_key(),  # keyed once the #190 watermark is set, else keyless
+                client=client,
+                key=_key,
+                mac=_mac,
             )
             await self._db.execute(
-                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-                " VALUES (?,?,?,?,?,?)",
-                (now, actor, action, channel_id, detail, row_hash),
+                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+                " VALUES (?,?,?,?,?,?,?)",
+                (now, actor, action, channel_id, detail, client, row_hash),
             )
             await self._commit()
         # Tee off-box AFTER commit (only forward what truly persisted) and OUTSIDE the lock (a
         # synchronous syslog send must never hold the write lock or block the event loop under it).
-        emit_audit_tee(action=action, actor=actor, channel_id=channel_id, detail=detail, ts=now)
+        emit_audit_tee(
+            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+        )
 
     async def list_audit(
         self,
@@ -6256,6 +7298,66 @@ class MessageStore:
             await self._commit()
             return cur.rowcount > 0
 
+    # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
+
+    async def add_cipher_invocations(self, key_id: str, count: int) -> int:
+        """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total.
+
+        The single accounting primitive: a reserve (before spending), a close-time settlement (which may
+        pass a NEGATIVE count to refund an unspent reserve), and the DR backup codec's post-run aggregate
+        all funnel through it. Atomic, so N processes sharing this one store aggregate onto the same row
+        (see :mod:`messagefoundry.store.gcm_bound`)."""
+        async with self._lock:
+            return await self._add_cipher_invocations_locked(key_id, count)
+
+    async def _add_cipher_invocations_locked(self, key_id: str, count: int) -> int:
+        """:meth:`add_cipher_invocations` with ``self._lock`` ALREADY HELD.
+
+        The rotation / at-rest-migration bursts hold the write lock across their whole batch loop and
+        must still charge the bound per batch (otherwise a kill mid-burst permanently under-counts every
+        value already re-encrypted). ``self._lock`` is a plain non-reentrant ``asyncio.Lock``, so they
+        charge through this variant; every other caller goes through the public method."""
+        now = time.time()
+        await self._db.execute(
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES (?,?,?)"
+            " ON CONFLICT(key_id) DO UPDATE SET"
+            " invocations = cipher_meta.invocations + excluded.invocations,"
+            " updated_at = excluded.updated_at",
+            (key_id, int(count), now),
+        )
+        cur = await self._db.execute(
+            "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+        )
+        row = await cur.fetchone()
+        await self._commit()
+        return int(row["invocations"]) if row is not None else int(count)
+
+    async def _charge_bound_batch(self) -> None:
+        """Top the AES-GCM invocation reserve up mid-burst — called after EVERY committed batch of a
+        rotation / at-rest-migration loop (ASVS 11.3.4; ``self._lock`` held).
+
+        Without it the reserve-ahead guarantee holds only for the first block: ``reencrypt_to_active``
+        is the single largest encrypt burst in the product, and charging it only at ``close()`` means an
+        unclean exit mid-rotation permanently under-counts every value already re-encrypted (a re-run
+        re-encrypts only what is left). Cheap: pure arithmetic per batch, one DB write per ~2**15
+        encrypts."""
+        await checkpoint_invocations(self._cipher, self._add_cipher_invocations_locked)
+
+    async def cipher_invocations(self, key_id: str) -> int:
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT invocations FROM cipher_meta WHERE key_id = ?", (key_id,)
+            )
+            row = await cur.fetchone()
+        return int(row["invocations"]) if row is not None else 0
+
+    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
+        return await checkpoint_invocations(
+            self._cipher, self.add_cipher_invocations, settle=settle
+        )
+
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty).
 
@@ -6281,30 +7383,45 @@ class MessageStore:
         A mismatch means a row was inserted, edited, or reordered out-of-band (AUDIT-INTEGRITY).
         Note: deleting the *newest* rows is NOT caught by the walk alone — the surviving prefix still
         chains cleanly. Pass ``expected_anchor`` (a ``(count, head_hash)`` previously returned by
-        :meth:`audit_anchor` and held out-of-band) to also detect that tail-truncation (review low-1)."""
-        # A watermark set but no key in hand → the keyed suffix is unverifiable (opened without the DEK).
-        # Report honestly rather than mis-flag every keyed row as tampered.
-        if self._audit_keyed_from is not None and self._audit_mac_key is None:
+        :meth:`audit_anchor` and held out-of-band) to also detect that tail-truncation (review low-1).
+
+        **Constant-time, full-walk (ASVS 11.2.4).** Every row MAC is compared with
+        :func:`hmac.compare_digest` over :func:`audit_mac_bytes` (never ``!=``, which short-circuits on
+        the first differing byte and leaks a forged digest's shared-prefix length), and the walk ALWAYS
+        runs to completion — the first divergent row id is recorded and reported *after* the walk, so
+        total verify time is a function of the chain LENGTH, not of where a forgery sits. The reported
+        message still names that row id: position is disclosed deliberately, in the operator-facing
+        result, so an alert stays actionable — what the change removes is the *timing* side channel, not
+        the intentional disclosure. (Under ``vault_transit`` each row MAC is a Transit round trip, so a
+        broken chain now pays the same N round trips a healthy one already pays — accepted: the
+        healthy-verify cost is the bound, and a tamper alarm must not be cheaper to provoke than a
+        clean pass.)"""
+        # A watermark set but no key/MAC in hand → the keyed suffix is unverifiable (opened without the
+        # DEK or the vault). Report honestly rather than mis-flag every keyed row as tampered.
+        if self._audit_keyed_from is not None and not self._audit_keyed_capable():
             return (
                 False,
                 "audit chain is keyed (from id="
-                f"{self._audit_keyed_from}) but no store encryption key is configured to verify it",
+                f"{self._audit_keyed_from}) but no store encryption key/MAC is configured to verify it",
             )
         async with self._read() as db:
             cur = await db.execute(
-                "SELECT id, ts, actor, action, channel_id, detail, row_hash FROM audit_log ORDER BY id"
+                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+                " FROM audit_log ORDER BY id"
             )
             rows = await cur.fetchall()
         prev = ""
         count = 0
+        first_break: int | None = None
         for r in rows:
-            # Per-row key: keyless below the #190 watermark, HMAC-keyed at/above it — so a keyless prefix
-            # and a keyed suffix both verify across an enabled-keying migration.
-            key = (
-                self._audit_mac_key
-                if self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
-                else None
+            # Per-row secret: keyless below the #190 watermark, keyed at/above it (in-heap HMAC key OR
+            # isolated-module Transit MAC) — so a keyless prefix and a keyed suffix both verify across an
+            # enabled-keying migration.
+            keyed_row = (
+                self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
             )
+            key = self._audit_mac_key if (keyed_row and self._audit_mac_fn is None) else None
+            mac = self._audit_mac_fn if keyed_row else None
             expected = audit_row_hash(
                 prev,
                 ts=r["ts"],
@@ -6312,15 +7429,30 @@ class MessageStore:
                 action=r["action"],
                 channel_id=r["channel_id"],
                 detail=r["detail"],
+                # NULL on every pre-ADR-0150 row → the 7th element is omitted and the legacy digest
+                # reproduces exactly, so a mixed old/new chain verifies end to end.
+                client=r["client"],
                 key=key,
+                mac=mac,
             )
-            if r["row_hash"] != expected:
-                return False, f"audit chain broken at row id={r['id']}"
-            prev = r["row_hash"]
+            # Bind the compare first so it is ALWAYS evaluated: folding it behind the
+            # `first_break is None` test would short-circuit the comparator once a break is known.
+            row_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
+            if not row_ok and first_break is None:
+                first_break = int(r["id"])
+            # Chain from the STORED hash (not `expected`) so a divergence is reported once, at its own
+            # row, instead of cascading a false break onto every successor.
+            prev = r["row_hash"] or ""
             count += 1
+        if first_break is not None:
+            return False, f"audit chain broken at row id={first_break}"
         if expected_anchor is not None:
             exp_count, exp_head = expected_anchor
-            if count < exp_count or prev != exp_head:
+            # Evaluate the head compare UNCONDITIONALLY (not behind `or`): the anchor head is a MAC too,
+            # so it gets the same constant-time treatment, and the comparator count stays independent of
+            # the row count.
+            head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
+            if count < exp_count or not head_ok:
                 return (
                     False,
                     f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
@@ -6451,7 +7583,7 @@ class MessageStore:
         async with self._lock:
             await self._db.execute(
                 "UPDATE users SET totp_secret=?, updated_at=? WHERE id=?",
-                (self._enc(secret), now, user_id),
+                (self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)), now, user_id),
             )
             await self._commit()
 
@@ -6460,7 +7592,11 @@ class MessageStore:
         async with self._read() as db:
             cur = await db.execute("SELECT totp_secret FROM users WHERE id=?", (user_id,))
             row = await cur.fetchone()
-        return self._dec(row["totp_secret"]) if row else None
+        return (
+            self._dec(row["totp_secret"], aad=cell_aad("users", "totp_secret", user_id))
+            if row
+            else None
+        )
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
@@ -6742,6 +7878,104 @@ class MessageStore:
             )
             return [str(r["role_id"]) for r in await cur.fetchall()]
 
+    # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
+
+    async def upsert_search_preset(
+        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+    ) -> tuple[str, bool]:
+        """Create-or-replace a per-user preset by ``(owner, name)``. On a name collision the EXISTING
+        row id is reused (so the encrypted criteria's cell-AAD binding stays stable) and criteria/
+        updated_at UPDATE; otherwise a fresh row with ``preset_id`` is inserted. The PHI-shaped criteria
+        is encrypted at rest (cell_aad bound to the effective id). Returns ``(effective_id, replaced)``."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            try:
+                await self._db.execute("BEGIN")
+                cur = await self._db.execute(
+                    "SELECT id FROM search_presets WHERE owner=? AND name=?", (owner, name)
+                )
+                row = await cur.fetchone()
+                effective_id = str(row["id"]) if row is not None else preset_id
+                enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+                if row is not None:
+                    await self._db.execute(
+                        "UPDATE search_presets SET criteria=?, updated_at=? WHERE id=?",
+                        (enc, now, effective_id),
+                    )
+                    replaced = True
+                else:
+                    await self._db.execute(
+                        "INSERT INTO search_presets"
+                        " (id, owner, name, criteria, created_at, updated_at) VALUES (?,?,?,?,?,?)",
+                        (effective_id, owner, name, enc, now, now),
+                    )
+                    replaced = False
+                await self._commit()
+                return effective_id, replaced
+            except Exception:
+                await self._db.rollback()
+                raise
+
+    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+        """List a user's presets (id/name/timestamps only — NEVER the criteria), newest name order."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, name, created_at, updated_at FROM search_presets"
+                " WHERE owner=? ORDER BY name",
+                (owner,),
+            )
+            return [dict(r) for r in await cur.fetchall()]
+
+    async def get_search_preset(
+        self, *, preset_id: str, owner: str, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """Return one owner-scoped preset with its criteria DECRYPTED, or ``None``.
+
+        A hit **stamps ``last_used_at``** (#306) so the retention window measures time-since-USED, not
+        time-since-edited — this is the only writer of that column. The stamp is deliberately a
+        separate, best-effort statement *after* the read: it is a usage hint, never part of the read's
+        contract, so a failure to write it is logged and swallowed rather than failing the recall (an
+        operator must always be able to run their saved search). The returned dict carries the
+        pre-stamp ``last_used_at`` — the value as of this recall's snapshot."""
+        async with self._read() as db:
+            cur = await db.execute(
+                "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
+                " WHERE id=? AND owner=?",
+                (preset_id, owner),
+            )
+            row = await cur.fetchone()
+            if row is None:
+                return None
+            out = dict(row)
+            out["criteria"] = self._dec(
+                row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+            )
+        # Outside the _read() block: on the :memory: fallback path _read() holds self._lock, and the
+        # pooled read connections are PRAGMA query_only=ON — the stamp must go to the writer.
+        await self._touch_search_preset(preset_id, now)
+        return out
+
+    async def _touch_search_preset(self, preset_id: str, now: float | None) -> None:
+        """Best-effort ``last_used_at`` stamp for a recalled preset (#306). Never raises."""
+        stamp = time.time() if now is None else now
+        try:
+            async with self._lock:
+                await self._db.execute(
+                    "UPDATE search_presets SET last_used_at=? WHERE id=?", (stamp, preset_id)
+                )
+                await self._commit()
+        except Exception:  # noqa: BLE001 — a usage hint must never fail the recall it annotates
+            log.warning("failed to stamp search-preset last_used_at", exc_info=True)
+
+    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+        """Delete an owner-scoped preset. Returns ``True`` if a row was removed. Idempotent."""
+        async with self._lock:
+            cur = await self._db.execute(
+                "DELETE FROM search_presets WHERE id=? AND owner=?", (preset_id, owner)
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+
     async def set_user_roles(
         self,
         user_id: str,
@@ -6924,6 +8158,20 @@ class MessageStore:
             )
             await self._commit()
 
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+        """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
+
+        ``token_hash`` is the PK, so this is a key update: the row keeps every other column and the
+        old hash stops resolving in the same transaction. Reports its rowcount so the caller can fail
+        closed when the session was revoked out from under it."""
+        async with self._lock:
+            cur = await self._db.execute(
+                "UPDATE sessions SET token_hash=? WHERE token_hash=? AND revoked_at IS NULL",
+                (new_token_hash, token_hash),
+            )
+            await self._commit()
+            return bool(cur.rowcount)
+
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         async with self._lock:
@@ -7040,18 +8288,27 @@ class MessageStore:
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
         """Null the PHI **bodies** of fully-resolved messages received before ``older_than`` while
-        **keeping their metadata rows** — the Mirth Data-Pruner pattern (count-and-log + audit stay
-        intact; nothing is accepted-and-dropped retroactively).
+        **keeping the message row** — the Mirth Data-Pruner pattern (count-and-log + audit stay
+        intact; nothing is accepted-and-dropped retroactively). The row survives; its PHI-bearing
+        *columns* do not.
 
         A message is eligible only when it has **no queue row still ``pending``/``inflight``**: never
         purge a body that hasn't finished its pipeline, or at-least-once delivery would lose data. For
-        each eligible message this blanks ``messages.raw``/``summary``/``error``, the ``done``/
-        ``cancelled`` outbound payloads + their ``last_error`` (delivered/cancelled history), and any
-        ``message_events.detail`` (all PHI-bearing). ``dead`` rows are intentionally left to
+        each eligible message this blanks ``messages.raw``/``summary``/``error``/``metadata``, the
+        ``done``/``cancelled`` outbound payloads + their ``last_error`` (delivered/cancelled history),
+        and any ``message_events.detail`` (all PHI-bearing). ``dead`` rows are intentionally left to
         :meth:`purge_dead_letters` (a dead row stays replayable until its own window) — and because
         replay re-queues a row's *own* payload, never ``messages.raw``, nulling the message body here
-        can't break a later dead-row replay. Idempotent (guards on a non-blank body); returns the
-        number of messages whose body was nulled.
+        can't break a later dead-row replay.
+
+        ``metadata`` (#150 SetMeta / operator-attached values, PHI per PHI.md §2) rides this same
+        window (ASVS 14.2.7): it is blanked in the SAME statement as the body, so it can never outlive
+        it. The guard is therefore ``raw <> '' OR metadata IS NOT NULL`` — a message purged by a
+        PRE-UPGRADE engine already has a blank ``raw`` but still holds its ``metadata``, and is swept
+        on the first pass after upgrade (and counted, so the sweep is audited). Purging metadata is
+        not free: see PHI.md §8 for the three replay/lineage consequences it is documented to accept.
+        Idempotent (the guard goes false once both are blank); returns the number of messages
+        whose body or metadata was nulled.
 
         A message's **streaming attachment** (#149, ADR 0105 Phase 3a) is released (decref → GC at 0 →
         delete the linkage) here only once the message has **no replayable queue row left** — i.e. no
@@ -7088,8 +8345,8 @@ class MessageStore:
             try:
                 await self._db.execute("BEGIN")
                 cur = await self._db.execute(
-                    f"UPDATE messages SET raw='', summary=NULL, error=NULL "
-                    f"WHERE raw <> '' AND id IN ({eligible})",
+                    f"UPDATE messages SET metadata=NULL, raw='', summary=NULL, error=NULL "
+                    f"WHERE (raw <> '' OR metadata IS NOT NULL) AND id IN ({eligible})",
                     (*cutoff_params, *inflight),
                 )
                 purged = cur.rowcount
@@ -7237,7 +8494,7 @@ class MessageStore:
             cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
             if row["received_at"] >= cutoff:
                 continue  # not past its own (per-connection) window — skip
-            raw = self._cipher.decrypt(row["raw"])
+            raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
             new_raw, n_docs, n_bytes = _strip_documents(
                 raw,
                 pruned_at=now,
@@ -7246,7 +8503,13 @@ class MessageStore:
             )
             if n_docs == 0:
                 continue  # no embedded document in this body — leave it (and its NULL flag) untouched
-            updates.append((self._cipher.encrypt(new_raw), now, row["id"]))
+            updates.append(
+                (
+                    self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                    now,
+                    row["id"],
+                )
+            )
             msgs += 1
             docs += n_docs
             reclaimed += n_bytes
@@ -7270,6 +8533,23 @@ class MessageStore:
         # their own window (driven by the RetentionRunner). A single short transaction.
         async with self._lock:
             cur = await self._db.execute("DELETE FROM connection_event WHERE ts < ?", (older_than,))
+            await self._commit()
+            return int(cur.rowcount)
+
+    async def purge_search_presets(self, *, older_than: float, now: float | None = None) -> int:
+        # ADR 0136 saved searches: `criteria` is a PHI-shaped needle (PHI.md §2), so it gets a window
+        # like any other PHI tier (ASVS 14.2.7). Whole-row DELETE — the criteria IS the payload, and a
+        # preset backs no count, so count-and-log does not reach it. Keys on the LATER of last-edited
+        # (`updated_at`, written by a save) and last-used (`last_used_at`, written by a recall) — #306.
+        # SQLite's 2-arg scalar max() returns NULL if ANY argument is NULL, so the COALESCE is what
+        # makes it null-safe: a pre-#306 row (last_used_at NULL) still purges on `updated_at` alone.
+        # A single short transaction.
+        async with self._lock:
+            cur = await self._db.execute(
+                "DELETE FROM search_presets"
+                " WHERE max(updated_at, coalesce(last_used_at, updated_at)) < ?",
+                (older_than,),
+            )
             await self._commit()
             return int(cur.rowcount)
 
@@ -7607,7 +8887,13 @@ class MessageStore:
         await self._db.execute(
             "INSERT INTO message_events (message_id, ts, event, destination, detail)"
             " VALUES (?,?,?,?,?)",
-            (message_id, now, event, destination, self._enc(detail)),
+            (
+                message_id,
+                now,
+                event,
+                destination,
+                self._enc(detail, aad=cell_aad("message_events", "detail", message_id, now, event)),
+            ),
         )
 
     async def _record_delivered_key(
@@ -7663,6 +8949,67 @@ class MessageStore:
             (key, outbox_id, message_id, destination_name, seq, now),
         )
 
+    # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
+    async def is_file_processed(self, *, channel_id: str, file_key: str) -> bool:
+        """True iff this connection already ingested the file whose HASHED ``file_key`` is given
+        (leave-in-place dedup). ``file_key`` is a derived id (never a cleartext filename); the read is a
+        single PK lookup on the lockfree read path."""
+        async with self._read() as conn:
+            cur = await conn.execute(
+                "SELECT 1 FROM processed_files WHERE channel_id=? AND file_key=? LIMIT 1",
+                (channel_id, file_key),
+            )
+            return await cur.fetchone() is not None
+
+    async def record_processed_file(
+        self, *, channel_id: str, file_key: str, now: float | None = None
+    ) -> None:
+        """Record that this connection has ingested the file identified by the HASHED ``file_key`` —
+        called AFTER a successful emit (the FILE, not each split message, is the dedup unit). Idempotent
+        (``INSERT OR IGNORE`` on the ``(channel_id, file_key)`` PK), so a crash-re-run is a no-op. HASHES
+        + IDS ONLY — no body/PHI, never logged at INFO+."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "INSERT OR IGNORE INTO processed_files (channel_id, file_key, processed_at)"
+                " VALUES (?,?,?)",
+                (channel_id, file_key, now),
+            )
+            await self._commit()
+
+    async def prune_processed_files(
+        self,
+        *,
+        channel_id: str,
+        older_than: float,
+        keep_last: int,
+        now: float | None = None,
+    ) -> int:
+        """Bound the dedup ledger for one connection: delete rows recorded before ``older_than`` and, if
+        the connection still has more than ``keep_last`` rows, the oldest surplus. Returns the number
+        deleted. Cheap + additive; a re-poll of a pruned-then-re-seen file simply re-ingests it (a
+        bounded duplicate, at-least-once)."""
+        del (
+            now
+        )  # signature parity with the other writers; pruning is age/count-driven, not clock-arg
+        async with self._lock:
+            cur = await self._db.execute(
+                "DELETE FROM processed_files WHERE channel_id=? AND processed_at < ?",
+                (channel_id, older_than),
+            )
+            deleted = cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            # Count-cap: keep only the newest `keep_last` rows for this channel (delete older surplus).
+            cur = await self._db.execute(
+                "DELETE FROM processed_files WHERE channel_id=? AND file_key IN ("
+                "  SELECT file_key FROM processed_files WHERE channel_id=?"
+                "  ORDER BY processed_at DESC, file_key DESC LIMIT -1 OFFSET ?"
+                ")",
+                (channel_id, channel_id, max(0, keep_last)),
+            )
+            deleted += cur.rowcount if cur.rowcount and cur.rowcount > 0 else 0
+            await self._commit()
+        return deleted
+
     async def _maybe_finalize_message(self, message_id: str, now: float) -> None:
         """Drive a message to its terminal disposition from its queue rows across **all** stages — the
         single source of truth for the staged-pipeline count-and-log flow (ADR 0001 Step B). Called on
@@ -7679,7 +9026,9 @@ class MessageStore:
         - else any **outbound** row exists → ``PROCESSED`` — all delivered (or operator-cancelled);
         - else **no rows remain** and the message is still ``ROUTED`` → ``FILTERED`` — every selected
           handler ran and produced zero deliveries (the ROUTED→FILTERED collapse the transform handoff
-          delegates here; a message that routed nowhere is ``UNROUTED``, already set, and untouched);
+          delegates here; a message that routed nowhere is ``UNROUTED``, already set, and untouched) —
+          UNLESS a ``not_deployed`` event was recorded (#233), in which case → ``NOT_DEPLOYED``: the
+          zero deliveries were declines to present-but-not-deployed targets, not an intentional filter;
         - else leave the disposition the handoff set."""
         cur = await self._db.execute(
             "SELECT stage, status, COUNT(*) AS n FROM queue WHERE message_id=? GROUP BY stage, status",
@@ -7705,7 +9054,19 @@ class MessageStore:
             msg = await cur.fetchone()
             if msg is None or msg["status"] != MessageStatus.ROUTED.value:
                 return
-            status = MessageStatus.FILTERED.value
+            # #233 (ADR 0111): distinguish "the handler(s) intentionally filtered" (→ FILTERED) from
+            # "every selected destination was declined as not-deployed" (→ NOT_DEPLOYED). The decline
+            # was persisted as a not_deployed event in the SAME handoff transaction, so it is visible
+            # here; its presence is the only signal that separates the two zero-delivery outcomes.
+            cur = await self._db.execute(
+                "SELECT 1 FROM message_events WHERE message_id=? AND event=? LIMIT 1",
+                (message_id, NOT_DEPLOYED_EVENT),
+            )
+            status = (
+                MessageStatus.NOT_DEPLOYED.value
+                if await cur.fetchone() is not None
+                else MessageStatus.FILTERED.value
+            )
         else:
             return  # only terminal non-dead non-outbound rows (shouldn't occur) — leave as-is
         await self._db.execute("UPDATE messages SET status=? WHERE id=?", (status, message_id))

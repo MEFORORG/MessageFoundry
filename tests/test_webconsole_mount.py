@@ -75,6 +75,33 @@ async def test_serve_ui_registers_representative_routes(engine: Engine) -> None:
     )
 
 
+async def test_static_dir_holds_exactly_the_curated_manifest() -> None:
+    """PACKAGING CONTAINMENT (ASVS 13.4.7): the shipped asset directory contains EXACTLY the curated
+    files and nothing else.
+
+    This walks the FILESYSTEM, not the git index, deliberately: the whole package tree is
+    force-included into the console wheel with no exclude list and the dev/CI install is editable, so
+    ``STATIC_DIR`` IS the working tree — and the worst stray, a ``.env``, is matched by the repo
+    ``.gitignore``, which means ``git status``, diffs and PR review all skip it while it would be
+    served. A filesystem walk is the only control that sees it.
+
+    The runtime extension allowlist (``_static.AllowlistedStaticFiles``) does not make this redundant:
+    it cannot catch an ALLOWED-extension accident such as a second stray ``.js`` or a minified map
+    renamed to ``app.map.js``.
+
+    Failing here means DELETE THE STRAY FILE. Only widen the expected set when a genuinely new asset
+    is intentionally shipped — every entry is unauthenticated, uncached, same-origin served content.
+    """
+    from messagefoundry_webconsole import STATIC_DIR
+
+    expected = {"app.css", "app.js", "csp-probe.js"}
+    actual = {p.name for p in STATIC_DIR.iterdir()}
+    assert actual == expected, (
+        f"unexpected content in {STATIC_DIR}: extra={sorted(actual - expected)} "
+        f"missing={sorted(expected - actual)} — delete the stray file rather than widening this set"
+    )
+
+
 async def test_serve_ui_populates_write_action_registry(engine: Engine) -> None:
     """The step-up re-auth allow-list (``_UI_WRITE_ACTIONS``) is populated once the console is
     mounted — the registry the /ui/reauth flow reads to decide which actions it may continue."""

@@ -19,8 +19,8 @@ here and is a documented follow-up — this codec is delimiter-framed only.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator
 
 __all__ = [
     "FrameError",

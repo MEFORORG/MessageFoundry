@@ -120,7 +120,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_nav_status(
         request: Request,
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
+        # activity=False (ASVS 14.3.1): a TIMER-driven background poll on every navved page, not user
+        # activity. Refreshing the idle clock here kept an abandoned tab — including every PHI page —
+        # signed in indefinitely, which defeated automatic logoff outright.
+        identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
     ) -> JSONResponse:
         # The nav heart + alerts bell poll this ~every 15s from every page. Metadata only — disk/pool/
         # cluster posture + an alert COUNT (no bodies, no PHI). It must NEVER raise: a crash would blank the

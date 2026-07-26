@@ -8,7 +8,7 @@ import argparse
 import asyncio
 import json
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -101,7 +101,7 @@ def test_parse_age_relative_and_absolute() -> None:
     now = time.time()
     assert abs(_parse_age("1h") - (now - 3600)) < 1.0
     assert abs(_parse_age("2d") - (now - 2 * 86400)) < 1.0
-    assert _parse_age("2026-06-01") == datetime(2026, 6, 1, tzinfo=timezone.utc).timestamp()
+    assert _parse_age("2026-06-01") == datetime(2026, 6, 1, tzinfo=UTC).timestamp()
 
 
 @pytest.mark.parametrize("bad", ["7", "7x", "yesterday", "2026-13-01"])

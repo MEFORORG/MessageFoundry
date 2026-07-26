@@ -38,7 +38,7 @@ def _sc_path() -> str:
     """The absolute path to ``sc.exe`` under System32 — pinned so a ``sc.exe`` planted earlier in the
     process PATH/CWD can never be run instead (PATH/CWD-hijack defense). Falls back to the bare name
     only if ``%SystemRoot%`` is somehow unset."""
-    system_root = os.environ.get("SystemRoot")
+    system_root = os.environ.get("SystemRoot")  # noqa: SIM112
     if system_root:
         return os.path.join(system_root, "System32", "sc.exe")
     return "sc"

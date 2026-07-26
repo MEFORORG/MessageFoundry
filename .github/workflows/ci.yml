@@ -72,10 +72,10 @@ jobs:
         shell: bash  # available on all runners (Git Bash on Windows) -> one set of commands
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python ${{ matrix.python-version }}
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           # No `cache: pip`: installs now go through uv (the "Set up uv" step below), which keeps its
@@ -126,9 +126,16 @@ jobs:
       # by the same SHA dependabot-lock-resync.yml already uses. Gated identically to the install
       # below (docs-only PRs skip both). enable-cache defaults to 'auto' — a GitHub-hosted cache on
       # hosted runners, the persistent on-disk uv cache on a self-hosted runner — keyed on the glob.
+      #
+      # EVERY install below passes `--constraint constraints.lock` — the HASHLESS export of uv.lock, kept
+      # in sync by the DEP-1 gate. Without it, `uv pip install -e ".[extras]"` RE-RESOLVES from
+      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 (626
+      # lint errors) and annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY
+      # open PR on the same day. The constraint pins every version to the lock while each job still
+      # installs only ITS OWN extras (so the narrow image-smoke set stays narrow).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -149,7 +156,7 @@ jobs:
           # + the browser ops console as a second editable wheel (Option B) so the moved /ui tests
           # (tests/test_webui.py etc. now import messagefoundry_webconsole) run on this full-suite leg.
           # It is NOT a published extra yet (would break uv lock), so install it by path.
-          uv pip install --system -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
 
       # ruff (lint + format) and mypy are PLATFORM-INDEPENDENT results — a ruff/format outcome is
       # identical on every OS, and mypy's platform-specific branches are covered by running it for
@@ -158,7 +165,7 @@ jobs:
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
       - name: Lint (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py scripts/docs/backlog_status_check.py
+        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py scripts/docs/backlog_status_check.py scripts/tray/make_icons.py
 
       - name: Format check (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
@@ -170,10 +177,17 @@ jobs:
       # skips. Previously those were typed only by the mypy on the Windows legs. (All win32 code uses
       # stdlib ctypes — typeshed's win32-conditional stubs cover it; there are no win32-only deps — so
       # this resolves on a Linux runner. Verified: both passes clean on 204 files.)
+      # `messagefoundry/tray` (the Windows notification-area service-manager, ADR 0113 — now shipped
+      # inside the wheel) is a win32-only ctypes package, so it is EXCLUDED here and typed on the win32
+      # pass only: its ungated ctypes.WinDLL method calls are unreachable-and-skipped under the linux
+      # platform but real under win32. Nothing in the engine imports it (it is a leaf entry point), so
+      # --exclude cleanly drops it from the linux build.
       - name: Type-check (mypy, strict — linux platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: mypy messagefoundry messagefoundry_webconsole
+        run: mypy messagefoundry messagefoundry_webconsole --exclude 'messagefoundry/tray/'
 
+      # The win32 pass types messagefoundry/tray (now inside the messagefoundry package, so no separate
+      # path argument) plus every other sys.platform=='win32' branch.
       - name: Type-check (mypy, strict — win32 platform)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
         run: mypy --platform win32 messagefoundry
@@ -214,9 +228,13 @@ jobs:
       # step above (`-e packaging/messagefoundry-webconsole`), so both suites exercise the same
       # engine build. Its pyproject sets asyncio_mode="auto" + session loop scopes; the timeout flags
       # mirror the engine step (a hung ASGI test fails fast + named, not at the silent job cap).
-      # SEAM MATRIX: only ENGINE_UI_SEAM==1 exists today, so this runs the package against the single
-      # installed engine (seam 1). When a seam 2 lands, expand this into a matrix that also installs
-      # the MIN/MAX SUPPORTED_ENGINE_SEAMS engine builds and runs the package suite against each.
+      # SEAM MATRIX — KNOWN GAP, deliberately recorded rather than silently carried. This runs the
+      # package against the ONE installed engine (whatever ENGINE_UI_SEAM is at HEAD). The original
+      # comment said "only ENGINE_UI_SEAM==1 exists today ... when a seam 2 lands, expand this into a
+      # matrix" — that trigger fired long ago and was never actioned: the console now supports a
+      # RANGE (SUPPORTED_ENGINE_SEAMS), so the back-compat claim that an older engine still renders
+      # is NOT exercised anywhere. Closing it means installing the MIN and MAX supported engine
+      # builds and running the package suite against each.
       - name: Web console tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
@@ -259,10 +277,10 @@ jobs:
       run:
         working-directory: ide
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "24"
           cache: npm
@@ -276,6 +294,15 @@ jobs:
 
       - name: Bundle (esbuild)
         run: npm run compile
+
+      # The vscode-free suites (the pure model layer: the engine link state + its two frozen boundary
+      # allowlists, the settings-scope SEC-005 invariant, the graph/steps/HL7 models, …). They need no
+      # Extension Host, so they run on EVERY leg — including ubuntu on the private repo, where PRs land.
+      # Before this step they ran NOWHERE here: `npm test` is Windows-only and the private repo's ide
+      # matrix is ubuntu-only, so the entire node-side estate was type-checked and never executed.
+      # ADR 0110's allowlists are only "asserted in CI" because of this line.
+      - name: Unit tests (node-side, no VS Code)
+        run: npm run test:unit
 
       - name: Integration tests (headless VS Code)
         if: runner.os == 'Windows'
@@ -315,7 +342,7 @@ jobs:
       # `matrix: ${{ fromJSON(needs.changes.outputs.ide_matrix) }}` in `ide`.
       ide_matrix: ${{ steps.f.outputs.ide_matrix }}
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
       - id: f
@@ -382,12 +409,17 @@ jobs:
           fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
           changed=$(git diff --name-only "$BASE_SHA...HEAD")
-          # NB: the tests/test_(...) alternation MUST list every file in the sqlserver-store /
-          # postgres-store throughput-lever pytest step below (the ADR 0057/0058/0060/0066 levers);
-          # those suites are MEFOR_TEST_SQLSERVER-gated and run ONLY on the server-DB legs, so a file
-          # not matched here edits with NO real SS/PG coverage (it merely skips the gated leg). Keep
-          # this in sync with that step (docs/throughput-build-plan.md).
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/settings|messagefoundry/transports/database|tests/test_(sqlserver|postgres|cluster|database_connector|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake)|\.github/workflows/ci\.yml)'; then
+          # NB: the tests/test_(...) alternation MUST list every file the sqlserver-store /
+          # postgres-store pytest steps below run (the ADR 0057/0058/0060/0066 throughput levers AND
+          # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
+          # and run ONLY on the server-DB legs, so a file not matched here edits with NO real SS/PG
+          # coverage (it merely skips the gated leg). Keep this in sync with those steps
+          # (docs/throughput-build-plan.md).
+          # The transports/ + config/wiring arms are the CAPTURE SURFACE: capture_response / reingress_to
+          # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
+          # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
+          # pull these legs, not just the SQLite suite.
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -464,10 +496,10 @@ jobs:
           - 1433:1433
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
@@ -493,14 +525,14 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
             requirements.lock
 
       - name: Install project (dev + sqlserver extras)
-        run: uv pip install --system -e ".[dev,sqlserver]"
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
       - name: Run the SQL Server store suite (against the real DB)
         env:
@@ -655,6 +687,29 @@ jobs:
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
 
+      - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # SQL Server has declared supports_response_capture + supports_pt_reingress True since ADR 0013
+        # landed, and the store suite above proves the T-SQL — but the CONNECTOR->RUNNER half of the RTE
+        # loop (a capturing outbound -> Stage.RESPONSE -> the response worker re-ingressing into a Loopback
+        # inbound) had only ever run on SQLite, so a server-DB regression in it could not be caught. The
+        # backend-parametrized case in this file closes that gap on the real backend.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v tests/test_x12_rte.py
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
   # `gh workflow run ci.yml --ref <branch>` to exercise it on a feature branch) + on PRs that touch
@@ -684,22 +739,22 @@ jobs:
           --health-retries 5
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
             requirements.lock
 
       - name: Install project (dev + postgres extras)
-        run: uv pip install --system -e ".[dev,postgres]"
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,postgres]"
 
       - name: Run the Postgres store suite (against the real DB)
         env:
@@ -785,6 +840,22 @@ jobs:
           MEFOR_STORE_POOL_SIZE: "4"
         run: pytest tests/test_connscale_postgres.py -v
 
+      - name: Run the RTE capture / re-ingress loop on real Postgres (ADR 0013/0016)
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # The Postgres twin of the sqlserver-store leg's RTE step (same backend-parametrized case, the
+        # `postgres` param). Postgres declares the same two capability flags True, so the same
+        # connector->runner gap existed here.
+        run: pytest -v tests/test_x12_rte.py
+
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
   # asserting zero message loss + all SLOs (exit 0) and uploading the JSON/CSV report. Skipped on PRs
@@ -802,33 +873,46 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
             requirements.lock
 
       - name: Install project (dev — engine + httpx client; no Qt needed for the headless load path)
-        run: uv pip install --system -e ".[dev]"
+        run: uv pip install --system --constraint constraints.lock -e ".[dev]"
 
       - name: Serve the load config (auth off) and run the smoke profile
         env:
-          MEFOR_AUTH_ENABLED: "false"  # the load CLI polls /stats etc. without a bearer token
+          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"  # the load CLI polls /stats etc. without a bearer token
           MEFOR_LOAD_FANOUT: "8"
           MEFOR_LOAD_RESULTS_FANOUT: "2"
           MEFOR_LOAD_TRANSFORM: edit
           MEFOR_LOAD_SINK_PORT: "2700"  # matches --sink-port below
+          # GIVEN 1 (ADR 0148): the default env `dev` now derives PHI, so a bare `serve --env dev` runs the
+          # secure PHI posture (secure-by-default). This leg validates that PHI+enforce serves green — so
+          # provision the production posture rather than opting out to synthetic: a store encryption key
+          # (minted at runtime below — never a committed literal), bounded PHI-body retention windows, and a
+          # locked-down egress allowlisting the synthetic loopback sink the load graph delivers to. The
+          # security-notification gate is skipped because auth is off (no accounts to notify).
+          MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"  # bound inbound PHI bodies at rest
+          MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"  # bound dead-lettered PHI bodies at rest
+          MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"  # deny-by-default egress
+          MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
           mkdir -p out/load
+          # Mint a throwaway AES-256 store key at runtime (PHI-at-rest must never be plaintext); never a
+          # committed literal (gitleaks). 32 random bytes, base64 — the MEFOR_STORE_ENCRYPTION_KEY format.
+          export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           python -m messagefoundry serve --config harness/config/load --env dev --db ./load-ci.db \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -883,10 +967,10 @@ jobs:
         ports:
           - 1433:1433
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
@@ -912,18 +996,18 @@ jobs:
             -Q "IF DB_ID('MessageFoundry') IS NULL CREATE DATABASE MessageFoundry; ALTER DATABASE MessageFoundry SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;"
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
             requirements.lock
 
       - name: Install project (dev + sqlserver extras)
-        run: uv pip install --system -e ".[dev,sqlserver]"
+        run: uv pip install --system --constraint constraints.lock -e ".[dev,sqlserver]"
 
       - name: Serve on the SQL Server store and run the smoke-sqlserver profile
         env:
-          MEFOR_AUTH_ENABLED: "false"  # the load CLI polls /stats etc. without a bearer token
+          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"  # the load CLI polls /stats etc. without a bearer token
           MEFOR_LOAD_FANOUT: "8"
           MEFOR_LOAD_RESULTS_FANOUT: "2"
           MEFOR_LOAD_TRANSFORM: edit
@@ -937,9 +1021,19 @@ jobs:
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
           MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
+          # GIVEN 1 (ADR 0148): `dev` now derives PHI, so provision the secure PHI posture (this leg
+          # validates PHI+enforce green, not a synthetic opt-out): bounded PHI-body retention windows +
+          # a locked-down egress allowlisting the loopback sink. The store key is minted at runtime below.
+          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
+          MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
+          MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
+          MEFOR_EGRESS_ALLOWED_MLLP: "127.0.0.1"  # the load graph fans out to the loopback correlation sink
         run: |
           set -o pipefail
           mkdir -p out/load
+          # Mint a throwaway AES-256 store key at runtime (never a committed literal — gitleaks).
+          export MEFOR_STORE_ENCRYPTION_KEY="$(python -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
           python -m messagefoundry serve --config harness/config/load --env dev \
             --host 127.0.0.1 --port 8765 > engine.log 2>&1 &
           engine_pid=$!
@@ -993,15 +1087,15 @@ jobs:
         shell: pwsh
 
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - name: Set up uv
-        uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           cache-dependency-glob: |
             pyproject.toml
@@ -1015,7 +1109,7 @@ jobs:
           # wiring with ModuleNotFoundError and /health never comes up. Install the connector extras the
           # graph needs (the "real Windows service path" a user running this graph would install). Keep
           # in sync with the connectors used in samples/config.
-          uv pip install --system -e ".[fhir,dicom]"
+          uv pip install --system --constraint constraints.lock -e ".[fhir,dicom]"
 
       # Run the install/uninstall scripts under Windows PowerShell 5.1 (shell: powershell) to
       # match what the console launches on an end-user machine — catches 5.1-only behaviour
@@ -1087,11 +1181,11 @@ jobs:
           # (30d) rather than setting [retention].allow_unbounded_phi=true: a real prod deployment configures
           # a window, so the smoke exercises the path it is meant to validate instead of opting out of it.
           nssm set MessageFoundry AppEnvironmentExtra `
-            "MEFOR_AUTH_ENABLED=false" `
+            "MEFOR_SECURITY_REQUIRE_SIGN_IN=false" `
             "MEFOR_STORE_ENCRYPTION_KEY=$storeKey" `
-            "MEFOR_RETENTION_MESSAGES_DAYS=30" `
+            "MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30" `
             "MEFOR_RETENTION_DEAD_LETTER_DAYS=30" `
-            "MEFOR_EGRESS_DENY_BY_DEFAULT=true" `
+            "MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true" `
             "MEFOR_EGRESS_ALLOWED_MLLP=receiver-prod.example.org:6661,powerscribe-prod.example.org:6665" `
             "MEFOR_EGRESS_ALLOWED_TCP=payer-prod.example.org:6662,rte-prod.example.org:6663,rte-result-prod.example.org:6664" `
             "MEFOR_EGRESS_ALLOWED_HTTP=iis-prod.example.org:8443,fhir-prod.example.org" `
@@ -1170,7 +1264,7 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Build the slim engine image
         run: docker build -f docker/Dockerfile -t messagefoundry:ci .
@@ -1190,7 +1284,20 @@ jobs:
           # (docker exec). A non-loopback bind without TLS would be refused by the startup bind guard
           # (and auth-off is refused off-loopback regardless of --allow-insecure-bind), so loopback +
           # in-container traffic is the correct posture for an auth-disabled smoke — no insecure override.
-          docker run -d --name mefor -e MEFOR_AUTH_ENABLED=false messagefoundry:smoke \
+          # GIVEN 1 (ADR 0148): `dev` now derives PHI, so `serve --env dev` runs the secure PHI posture.
+          # This smoke validates PHI+enforce green (not a synthetic opt-out): provision a runtime-minted
+          # store key (never a committed literal — gitleaks), bounded PHI-body retention windows, and a
+          # locked-down egress allowlisting the smoke config's File archive dir (/var/lib/mefor/out/adt).
+          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          storeKey="$(python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())')"
+          docker run -d --name mefor \
+            -e MEFOR_SECURITY_REQUIRE_SIGN_IN=false \
+            -e MEFOR_STORE_ENCRYPTION_KEY="$storeKey" \
+            -e MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS=30 \
+            -e MEFOR_RETENTION_DEAD_LETTER_DAYS=30 \
+            -e MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true \
+            -e MEFOR_EGRESS_ALLOWED_FILE_DIRS=/var/lib/mefor \
+            messagefoundry:smoke \
             serve --config /config --env dev --host 127.0.0.1 --port 8765
           # Readiness: /health is tokenless and always 200 once the listener is up.
           for _ in $(seq 1 60); do

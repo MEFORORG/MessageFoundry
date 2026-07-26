@@ -2,7 +2,7 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 
-import { findElements, isConfigFile } from "../../editorToolbar";
+import { findElements, hasHandler, isConfigFile } from "../../editorToolbar";
 
 // An absolute workspace root for the active platform, so isConfigFile's path.resolve is a no-op prefix
 // (resolve would otherwise inject the cwd drive on win32 and skew path.relative).
@@ -55,10 +55,21 @@ suite("findElements", () => {
   });
 });
 
+suite("hasHandler", () => {
+  test("true only when the file defines a @handler (gates the Steps affordance)", () => {
+    assert.strictEqual(hasHandler('@handler("h")\ndef handle(msg): ...'), true);
+    // A router-only / connection-only file cannot open as Steps.
+    assert.strictEqual(hasHandler('@router("IB")\ndef route(msg): ...'), false);
+    assert.strictEqual(hasHandler("OB = outbound(File())"), false);
+    assert.strictEqual(hasHandler(""), false);
+  });
+});
+
 interface Pkg {
   contributes: {
+    commands?: Array<{ command: string; title?: string; icon?: unknown }>;
     submenus?: Array<{ id: string; label: string; icon?: unknown }>;
-    menus: Record<string, Array<{ command?: string; submenu?: string; when?: string }>>;
+    menus: Record<string, Array<{ command?: string; submenu?: string; when?: string; group?: string }>>;
   };
 }
 
@@ -97,5 +108,58 @@ suite("editor toolbar contributions", () => {
         `the submenu is missing ${cmd}`,
       );
     }
+  });
+});
+
+// The "View as Steps" affordance must appear only where a file/row can actually open as Steps —
+// i.e. Handlers. In the editor it is gated on the activeFileHasHandler context key; in the tree it is
+// an inline action on Handler rows only (contextValue meforElementHandler).
+suite("View as Steps gating", () => {
+  test("openSteps is a distinct icon from Group Components (no shared glyph)", () => {
+    const cmds = pkg().contributes.commands ?? [];
+    const steps = cmds.find((c) => c.command === "messagefoundry.openSteps");
+    const group = cmds.find((c) => c.command === "messagefoundry.groupConnections");
+    assert.strictEqual(steps?.icon, "media/list-ordered-amber.svg");
+    assert.strictEqual(group?.icon, "media/list-tree-amber.svg");
+    assert.notStrictEqual(steps?.icon, group?.icon);
+  });
+
+  test("the editor-title button and submenu item are gated on activeFileHasHandler", () => {
+    const menus = pkg().contributes.menus;
+    const titleBtn = (menus["editor/title"] ?? []).find((e) => e.command === "messagefoundry.openSteps");
+    assert.ok(
+      titleBtn?.when?.includes("messagefoundry.activeFileHasHandler"),
+      "the editor-title View as Steps button must be gated on activeFileHasHandler",
+    );
+    const menuItem = (menus["messagefoundry.editorMenu"] ?? []).find(
+      (e) => e.command === "messagefoundry.openSteps",
+    );
+    assert.ok(
+      menuItem?.when?.includes("messagefoundry.activeFileHasHandler"),
+      "the submenu View as Steps item must be gated on activeFileHasHandler",
+    );
+  });
+
+  test("the tree inline Steps action targets Handler rows only, with the list-ordered icon", () => {
+    const cmds = pkg().contributes.commands ?? [];
+    const cmd = cmds.find((c) => c.command === "messagefoundry.openStepsFromNode");
+    assert.ok(cmd, "openStepsFromNode command must be declared");
+    assert.strictEqual(cmd?.icon, "media/list-ordered-amber.svg");
+
+    const inline = (pkg().contributes.menus["view/item/context"] ?? []).find(
+      (e) => e.command === "messagefoundry.openStepsFromNode" && e.group?.startsWith("inline"),
+    );
+    assert.ok(inline, "openStepsFromNode must have an inline view/item/context rule");
+    assert.ok(
+      inline?.when?.includes("meforElementHandler"),
+      "the inline Steps action must be gated on the Handler contextValue (meforElementHandler)",
+    );
+  });
+
+  test("openStepsFromNode is hidden from the command palette", () => {
+    const hidden = (pkg().contributes.menus["commandPalette"] ?? []).find(
+      (e) => e.command === "messagefoundry.openStepsFromNode",
+    );
+    assert.strictEqual(hidden?.when, "false", "openStepsFromNode must be hidden from the palette");
   });
 });

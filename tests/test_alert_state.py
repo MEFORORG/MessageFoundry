@@ -20,7 +20,6 @@ from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
 from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
-
 # --- store lifecycle ---------------------------------------------------------
 
 
@@ -230,6 +229,75 @@ async def test_purge_resolved_only(tmp_path: Path) -> None:
         await store.close()
 
 
+async def test_escalation_tier_persisted_monotonic(tmp_path: Path) -> None:
+    # #81 (store half): upsert persists escalation_tier and keeps it MONOTONIC within an open instance
+    # (a lower tier on a later fire never lowers it); a resolve+reopen starts fresh at the given tier.
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_X", severity="warning", now=100.0
+        )
+        (a,) = await store.list_active_alert_instances()
+        assert a.escalation_tier == 0
+        await store.upsert_alert_instance(
+            event_type="connection_error",
+            connection="OB_X",
+            severity="critical",
+            escalation_tier=2,
+            now=110.0,
+        )
+        (a,) = await store.list_active_alert_instances()
+        assert a.escalation_tier == 2 and a.count == 2
+        # a later fire at a LOWER tier does not lower it (monotonic MAX/GREATEST/CASE)
+        await store.upsert_alert_instance(
+            event_type="connection_error",
+            connection="OB_X",
+            severity="warning",
+            escalation_tier=1,
+            now=120.0,
+        )
+        (a,) = await store.list_active_alert_instances()
+        assert a.escalation_tier == 2
+        # resolve + reopen starts a fresh instance at the fresh tier
+        await store.resolve_alert_instance(a.id, now=130.0)
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_X", severity="warning", now=140.0
+        )
+        (b,) = await store.list_active_alert_instances()
+        assert b.id != a.id and b.escalation_tier == 0
+    finally:
+        await store.close()
+
+
+async def test_suspend_and_resume_instance(tmp_path: Path) -> None:
+    # #143 (store half): suspend sets suspended_until (NOTIFICATION-only — status/count/visibility
+    # untouched, so the instance stays on the active list); resume clears it.
+    store = await MessageStore.open(tmp_path / "a.db")
+    try:
+        await store.upsert_alert_instance(
+            event_type="connection_error", connection="OB_X", severity="critical", now=100.0
+        )
+        (a,) = await store.list_active_alert_instances()
+        assert a.suspended_until is None
+        got = await store.suspend_alert_instance(a.id, until=500.0, now=100.0)
+        assert got is not None and got.suspended_until == 500.0
+        # AC-3: still open, still counted, still visible — suspend gates NOTIFICATION only.
+        assert got.status == "open"
+        assert await store.count_open_alerts_by_connection() == {"OB_X": 1}
+        (still,) = await store.list_active_alert_instances()
+        assert still.suspended_until == 500.0
+        # resume clears the window
+        resumed = await store.resume_alert_instance(a.id)
+        assert resumed is not None and resumed.suspended_until is None
+        # unknown / resolved id -> None (both suspend and resume)
+        assert await store.suspend_alert_instance(99999, until=500.0) is None
+        await store.resolve_alert_instance(a.id, now=600.0)
+        assert await store.suspend_alert_instance(a.id, until=700.0) is None
+        assert await store.resume_alert_instance(a.id) is None
+    finally:
+        await store.close()
+
+
 async def test_instance_write_is_side_observer(tmp_path: Path) -> None:
     # AC-9 (store half): an alert-instance write touches NO queue row and does not change message counts
     # or disposition — it is invisible to the finalizer (which scans `FROM queue` only).
@@ -264,6 +332,7 @@ class _RecordingStore:
         connection: str,
         severity: str,
         reason: str | None = None,
+        escalation_tier: int = 0,
         now: float | None = None,
     ) -> None:
         if self.raise_on_upsert:
@@ -274,6 +343,7 @@ class _RecordingStore:
                 "connection": connection,
                 "severity": severity,
                 "reason": reason,
+                "escalation_tier": escalation_tier,
             }
         )
 
@@ -304,6 +374,7 @@ async def test_emit_upserts_instance_on_throttle_key() -> None:
             "connection": "OB_X",
             "severity": AlertSeverity.WARNING.value,
             "reason": "refused",
+            "escalation_tier": 0,
         }
     ]
 
@@ -318,6 +389,17 @@ async def test_suppressed_notification_still_recorded() -> None:
     await _drain(sink)
     assert len(store.upserts) == 1  # recorded despite suppression
     assert store.upserts[0]["connection"] == "OB_X"
+
+
+async def test_per_rule_mute_still_records_instance() -> None:
+    # #143 (AC-3): a per-rule static mute (mute=True) suppresses the NOTIFICATION but STILL records the
+    # instance — the dashboard shows the open condition the operator chose to mute.
+    store = _RecordingStore()
+    rule = AlertRule(event_type="connection_error", connection="*", mute=True)
+    sink = NotifierAlertSink([], rules=[rule], store=store)
+    sink.connection_error("OB_X", kind="connection_lost", detail="refused")
+    await _drain(sink)
+    assert len(store.upserts) == 1 and store.upserts[0]["connection"] == "OB_X"
 
 
 async def test_connection_restored_auto_resolves() -> None:
@@ -360,6 +442,8 @@ _ALERT_API = frozenset(
         "ack_alert_instance",
         "resolve_alert_instance",
         "resolve_alert_instances_for",
+        "suspend_alert_instance",  # #143 windowed suspend
+        "resume_alert_instance",  # #143 windowed resume
         "get_alert_instance",
         "count_open_alerts_by_connection",
         "purge_alert_instances",
@@ -375,7 +459,7 @@ def test_three_backend_parity_methods() -> None:
     from messagefoundry.store.sqlserver import SqlServerStore
 
     for cls in (MessageStore, PostgresStore, SqlServerStore, QueueStore):
-        assert _ALERT_API <= set(dir(cls)), cls.__name__
+        assert set(dir(cls)) >= _ALERT_API, cls.__name__
 
 
 def _create_body(stmt: str, table: str) -> str:
@@ -453,6 +537,8 @@ def test_three_backend_parity_columns() -> None:
         "acked_by",
         "acked_at",
         "resolved_at",
+        "suspended_until",  # #143 windowed suspend
+        "escalation_tier",  # #81 occurrence-driven escalation
     }
     assert _alert_table_columns_sqlite() == expected
     assert _alert_table_columns(pg._SCHEMA) == expected

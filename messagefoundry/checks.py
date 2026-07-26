@@ -13,7 +13,11 @@ checks). Two checks are **required** (they can block a commit):
   such a subdir runs against **every** inbound. A fixture may also declare its expected dry-run
   disposition in a sibling ``<fixture>.expect`` file (``RECEIVED``/``UNROUTED``/``FILTERED``/``ERROR``)
   — an executable acceptance-criteria check (Secure Development Standards §5); without one the default
-  is "must not ERROR". Absent fixtures → skipped (never blocks).
+  is "must not ERROR". Absent fixtures → skipped (never blocks). The preview runs under
+  ``[pipeline].snapshot_on_send`` (copy-on-Send, ADR 0104) resolved best-effort from this instance's
+  ``messagefoundry.toml`` (same resolution as the posture check); when no settings load it falls back
+  to the setting's own default (ON) — so the gate previews what the default engine actually delivers,
+  never a silent OFF (#230).
 
 A third required check, ``posture``, is **best-effort**: when a ``messagefoundry.toml`` is present
 (searched from ``config_dir`` upward + the CWD) it loads the service settings and — if an active
@@ -27,6 +31,13 @@ instance's derived security posture stamped, so a config ``serve`` would REFUSE 
 production-PHI cleartext / weakened-TLS transport hop (#200, ADR 0092) — FAILS at commit/CI time
 instead of only at runtime. Fail-safe SKIP when it can't resolve a real posture (no
 ``messagefoundry.toml``, or settings/graph that won't load), so a bare config dir is byte-identical.
+
+A fifth required check, ``reference-backend``, closes the ADR 0006 gap: a config declaring a
+``Reference(...)`` against a ``[store] backend`` with no reference-snapshot store (SQL Server — its schema
+has no ``reference`` tables) would pass this gate and then raise on every ``reference(...)`` read at run
+time, post-ACK, forever. It refuses that pairing here, keyed on the DECLARED backend, mirroring the
+engine's start-time refusal. Same fail-safe SKIPs as ``build-check`` (no ``messagefoundry.toml``, or
+settings/config that won't load).
 
 ``ruff`` and ``mypy`` are **advisory**: run only when installed (``shutil.which``) and never block —
 a non-developer author shouldn't be stopped by a lint nit. So is ``raise-fstring`` — an AST scan of the
@@ -42,8 +53,12 @@ Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check
 from __future__ import annotations
 
 import ast
+import functools
+import importlib.metadata
+import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,11 +111,16 @@ def run_checks(
     *,
     messages_dir: str | Path | None = None,
     run_lint: bool = True,
+    strict_handler_security: bool = False,
+    handler_security_allow: frozenset[str] = frozenset(),
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
-    fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass.
+    fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
+    (the opt-in ``--strict-handler-security``) promotes the ADR 0144 handler-security lint from
+    advisory to a **blocking** (required) check. ``handler_security_allow`` adds operator-vetted import
+    roots (``--handler-security-allow``) that the ``unvetted-import`` rule treats as known-good.
 
     ``service_config`` / ``suppress_service_toml_search`` plumb the ADR 0050 anchor (AC-6): an explicit
     ``messagefoundry.toml`` path (from ``--service-config``, resolved under ``--project-root``) is used
@@ -111,7 +131,12 @@ def run_checks(
     """
     results = [
         _check_validate(config_dir),
-        _check_dryrun(config_dir, messages_dir),
+        _check_dryrun(
+            config_dir,
+            messages_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
         _check_posture(
             config_dir,
             service_config=service_config,
@@ -122,16 +147,42 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
+        _check_reference_backend(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
     ]
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
         results.append(_run_tool("mypy", ["mypy", str(config_dir)]))
-    # Appended AFTER the ruff/mypy advisory block so it only adds an advisory result and never blocks
-    # the gate (required=False keeps __main__._check's "0 iff no required check failed" exit policy).
+        # ADR 0144 part B (Increment 3 curation): flake8-bandit "S" over the config dir — advisory,
+        # run-if-installed, the generic SAST net beside the domain-aware _check_handler_security. Keep
+        # the FULL S select for breadth (it still catches weak crypto S324, unsafe yaml.load S506,
+        # insecure-scheme urlopen S310, tarfile.extractall S202, mktemp S306, jinja autoescape S701,
+        # XXE S320, verify=False S501/S323) but --ignore the hardcoded-secret trio S105/S106/S107: they
+        # structurally false-positive on the ADR-0015 body_secrets placeholder tokens (committed PUBLIC
+        # high-entropy strings) and any password-shaped literal; real secrets never appear inline here
+        # (env()/MEFOR_VALUE_* substituted in the transport). Overlap with the AST ambient-authority /
+        # unsafe-db-lookup rules (S102/S307/S301/S602-605/S608) is harmless for an advisory print.
+        results.append(
+            _run_tool(
+                "ruff-security",
+                ["ruff", "check", "--select", "S", "--ignore", "S105,S106,S107", str(config_dir)],
+            )
+        )
+    # Appended AFTER the ruff/mypy advisory block. The first four are advisory (required=False, never
+    # block). _check_handler_security is advisory too UNLESS strict_handler_security promotes it to a
+    # required/blocking check (--strict-handler-security, ADR 0144 Increment 2).
     results.append(_check_raise_fstring(config_dir))
     results.append(_check_accepts_candidate(config_dir))
     results.append(_check_dead_config(config_dir))
     results.append(_check_send_target(config_dir))
+    results.append(
+        _check_handler_security(
+            config_dir, strict=strict_handler_security, allow=handler_security_allow
+        )
+    )
     return CheckReport(results)
 
 
@@ -385,6 +436,520 @@ def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:
     return CheckResult("accepts-candidate", ok=True, required=False, detail=detail)
 
 
+# --- ADR 0144: advisory security lint over admin-authored Router/Handler code -------------------
+# A stdlib-`ast` scan (mirroring _check_raise_fstring) that flags four families of risky patterns in
+# the config-dir Router/Handler modules. It is a documented COMPENSATING control for ASVS 15.2.5 /
+# 15.2.4 — the *static* half; the opt-in ADR 0087 subprocess sandbox is the runtime half. Static
+# analysis catches only a fraction of insecure code, so it is a **filter, not a boundary**, and is
+# therefore **advisory** (required=False, prints, never blocks) — a non-developer feed author is
+# never stopped by a lint nit (the same principle as ruff/mypy in run_checks).
+
+# phi-to-log: the message body reaching a print()/INFO+ log call (CLAUDE.md §9 "never log full
+# bodies at INFO or above"). DEBUG is below the bar and excluded.
+_LOG_SINK_ATTRS = frozenset(
+    {"info", "warning", "warn", "error", "exception", "critical", "fatal", "log"}
+)
+# control-metadata kwargs that never carry message content. NOTE: ``extra=`` is deliberately NOT here
+# — it is a structured-logging PHI channel, so it is scanned like any other content argument.
+_LOG_META_KWARGS = frozenset({"exc_info", "stack_info", "stacklevel"})
+# An attribute sink counts only on a *logger-shaped* receiver — a name ending in log/logger (log,
+# _log, audit_log, logger, _logger), the ``logging`` module, or a ``getLogger(...)`` result — so a
+# FHIR/ACK/validation builder like ``outcome.error(...)`` or ``warnings.warn(...)`` is not a sink.
+_LOGGER_NAME_SUFFIXES = ("log", "logger")
+
+# ambient-authority: reaching past the sanctioned Send/db_lookup boundary (CLAUDE.md §2/§8).
+_AMBIENT_BARE_NAMES = frozenset({"eval", "exec", "compile", "__import__"})
+_AMBIENT_ROOTS = frozenset(
+    {"subprocess", "socket", "requests", "httpx", "pickle", "marshal", "shelve", "ctypes", "shutil"}
+)
+# read-only socket lookups (host-local, no network I/O) — exempt from the socket root so stamping the
+# sending host into MSH-3/MSH-4 stays clean.
+_SOCKET_READONLY = frozenset(
+    {"gethostname", "getfqdn", "gethostbyname", "gethostbyaddr", "getservbyname", "getprotobyname"}
+)
+_AMBIENT_OS_PATHS = frozenset(
+    {
+        "os.system",
+        "os.popen",
+        "os.remove",
+        "os.unlink",
+        "os.rename",
+        "os.replace",
+        "os.mkdir",
+        "os.makedirs",
+        "os.rmdir",
+        "os.chmod",
+        "os.chown",
+        "os.kill",
+        "os.putenv",
+        "os.fork",
+    }
+)
+# filesystem-mutating method names matched on any receiver (pathlib + friends). Receiver-agnostic,
+# so a rare same-named in-memory method is an accepted advisory FP (ADR 0144 known gaps).
+_AMBIENT_FS_WRITE_ATTRS = frozenset(
+    {"write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch"}
+)
+
+# impure-transform: a re-run-divergent nondeterministic source inside a router/handler, breaking the
+# at-least-once purity invariant (CLAUDE.md §2). db_lookup/fhir_lookup are the sanctioned non-pure
+# reads and are deliberately NOT flagged.
+_IMPURE_PATHS = frozenset(
+    {
+        "time.time",
+        "time.time_ns",
+        "time.monotonic",
+        "time.monotonic_ns",
+        "time.perf_counter",
+        "time.perf_counter_ns",
+        "time.process_time",
+        "time.process_time_ns",
+        "uuid.uuid1",
+        "uuid.uuid4",
+        "os.urandom",
+        "os.getrandom",
+    }
+)
+_IMPURE_ROOTS = frozenset({"random", "secrets"})
+_DATETIME_NOW_ATTRS = frozenset({"now", "utcnow", "today"})
+# time.* wall-clock reads that diverge on a re-run ONLY when called with no time-tuple argument
+# (``time.gmtime(0)`` is deterministic; ``time.gmtime()`` reads the current clock).
+_TIME_WALLCLOCK_NOARG = frozenset({"time.localtime", "time.gmtime", "time.ctime", "time.asctime"})
+
+# db_lookup/fhir_lookup: the SQL statement / FHIR query is the 2nd positional or the
+# statement=/query= keyword; the params dict (parameterized / percent-encoded) is safe.
+_LOOKUP_NAMES = frozenset({"db_lookup", "fhir_lookup"})
+_LOOKUP_QUERY_KW = frozenset({"statement", "query"})
+
+
+def _message_fn_decorator(
+    node: ast.AST, names: tuple[str, ...] = ("handler", "router")
+) -> ast.Call | None:
+    """The ``@handler(...)`` / ``@router(...)`` decorator Call on ``node`` (bare or dotted), or None.
+
+    Generalizes :func:`_handler_decorator` to also match ``@router`` — the two decorated-scope
+    security rules (phi-to-log, impure-transform) apply to both. ``FunctionDef`` only (matching
+    ``_handler_decorator``); an ``async def`` handler is out of scope (a known ADR 0144 gap)."""
+    if not isinstance(node, ast.FunctionDef):
+        return None
+    for dec in node.decorator_list:
+        if not isinstance(dec, ast.Call):
+            continue
+        func = dec.func
+        if (isinstance(func, ast.Name) and func.id in names) or (
+            isinstance(func, ast.Attribute) and func.attr in names
+        ):
+            return dec
+    return None
+
+
+def _dotted_call_name(func: ast.expr) -> str | None:
+    """Reconstruct a dotted Name/Attribute chain (``os.path.join``) from a call's ``func``, or None
+    when it is not a pure Name/Attribute chain (e.g. the receiver is itself a call or subscript)."""
+    parts: list[str] = []
+    cur: ast.expr = func
+    while isinstance(cur, ast.Attribute):
+        parts.append(cur.attr)
+        cur = cur.value
+    if isinstance(cur, ast.Name):
+        parts.append(cur.id)
+        return ".".join(reversed(parts))
+    return None
+
+
+# HL7 MSH envelope metadata (control id / message type) is non-PHI, so logging it is the recommended
+# safe pattern — a msg reference solely through one of these accessors does not count as PHI-bearing.
+_NON_PHI_MSG_ACCESSORS = frozenset({"control_id", "message_type", "message_code", "trigger_event"})
+
+
+def _references_phi(node: ast.AST, symbol: str) -> bool:
+    """True when ``node``'s subtree references the message ``symbol`` in a PHI-bearing way — a bare
+    ``msg`` / ``msg.raw`` / ``msg["PID-3"]`` reaching a sink directly or via an f-string / concat /
+    ``.format`` / attribute access. A reference that is ONLY the receiver of a non-PHI MSH accessor
+    (``msg.control_id`` / ``msg.message_type``) is exempt — that envelope metadata is safe to log."""
+    exempt: set[int] = set()
+    for n in ast.walk(node):
+        if (
+            isinstance(n, ast.Attribute)
+            and n.attr in _NON_PHI_MSG_ACCESSORS
+            and isinstance(n.value, ast.Name)
+            and n.value.id == symbol
+        ):
+            exempt.add(id(n.value))
+    return any(
+        isinstance(n, ast.Name) and n.id == symbol and id(n) not in exempt for n in ast.walk(node)
+    )
+
+
+def _folds_to_constant(node: ast.expr) -> bool:
+    """True when ``node`` is a compile-time-constant string expression (only literals joined by
+    ``+``/``%``) — a ``"a" + "b"`` that carries no injected value and so is not a query risk."""
+    if isinstance(node, ast.Constant):
+        return True
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return _folds_to_constant(node.left) and _folds_to_constant(node.right)
+    return False
+
+
+def _is_dynamic_string(node: ast.expr) -> bool:
+    """True when ``node`` is a string built by interpolating a *non-constant* value (f-string with a
+    ``{expr}`` / ``+`` or ``%`` with a variable operand / ``.format(...)`` with args) — the injection
+    shape for a ``db_lookup``/``fhir_lookup`` query. A pure-literal concat folds to a constant and is
+    not flagged. (A trusted-identifier concat like ``"select from " + TABLE`` still flags — SQL cannot
+    parameterize an identifier, so the concatenation nudge is intentional; ADR 0144 known FP.)"""
+    if isinstance(node, ast.JoinedStr):
+        return any(isinstance(part, ast.FormattedValue) for part in node.values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Mod)):
+        return not _folds_to_constant(node)
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "format"
+        and bool(node.args or node.keywords)
+    )
+
+
+def _is_logger_receiver(recv: ast.expr) -> bool:
+    """True when ``recv`` looks like a stdlib logger — a Name/attribute ending in log/logger, the
+    ``logging`` module, or an inline ``getLogger(...)`` result. Distinguishes ``log.error(...)`` (a
+    sink) from ``outcome.error(...)`` / ``result.info(...)`` / ``warnings.warn(...)`` (not sinks)."""
+    if isinstance(recv, ast.Name):
+        return recv.id == "logging" or recv.id.endswith(_LOGGER_NAME_SUFFIXES)
+    if isinstance(recv, ast.Attribute):
+        return recv.attr == "logging" or recv.attr.endswith(_LOGGER_NAME_SUFFIXES)
+    if isinstance(recv, ast.Call):
+        fn = recv.func
+        return (isinstance(fn, ast.Name) and fn.id == "getLogger") or (
+            isinstance(fn, ast.Attribute) and fn.attr == "getLogger"
+        )
+    return False
+
+
+def _phi_to_log_hit(call: ast.Call, msg_sym: str) -> bool:
+    """The message symbol reaches a ``print`` / INFO+ *logger* call (its args, minus logging control
+    metadata). An attribute-form level call counts only on a logger-shaped receiver."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        is_sink = func.id == "print"
+    elif isinstance(func, ast.Attribute):
+        is_sink = func.attr in _LOG_SINK_ATTRS and _is_logger_receiver(func.value)
+    else:
+        is_sink = False
+    if not is_sink:
+        return False
+    checked: list[ast.expr] = list(call.args)
+    checked += [kw.value for kw in call.keywords if kw.arg not in _LOG_META_KWARGS]
+    return any(_references_phi(arg, msg_sym) for arg in checked)
+
+
+def _unsafe_lookup_hit(call: ast.Call) -> bool:
+    """A ``db_lookup``/``fhir_lookup`` whose statement/query argument is interpolated, not a literal."""
+    func = call.func
+    is_lookup = (isinstance(func, ast.Name) and func.id in _LOOKUP_NAMES) or (
+        isinstance(func, ast.Attribute) and func.attr in _LOOKUP_NAMES
+    )
+    if not is_lookup:
+        return False
+    query: ast.expr | None = None
+    # 2nd positional — but only when neither of the first two args is a ``*args`` splat (which would
+    # make positional indexing meaningless).
+    if len(call.args) >= 2 and not any(isinstance(a, ast.Starred) for a in call.args[:2]):
+        query = call.args[1]
+    for kw in call.keywords:
+        if kw.arg in _LOOKUP_QUERY_KW:
+            query = kw.value
+    return query is not None and _is_dynamic_string(query)
+
+
+def _open_mode(call: ast.Call, index: int = 1) -> str | None:
+    """The literal string mode of an open-style call, or None. ``index`` is the positional slot of the
+    mode arg — ``1`` for builtin ``open(file, mode)``, ``0`` for ``Path(...).open(mode)`` — and the
+    ``mode=`` keyword is honored either way."""
+    if len(call.args) > index:
+        arg = call.args[index]
+        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+            return arg.value
+    for kw in call.keywords:
+        if (
+            kw.arg == "mode"
+            and isinstance(kw.value, ast.Constant)
+            and isinstance(kw.value.value, str)
+        ):
+            return kw.value.value
+    return None
+
+
+def _is_write_mode(mode: str | None) -> bool:
+    """True when an ``open(...)`` mode string requests write/append/create/update access."""
+    return mode is not None and any(c in mode for c in ("w", "a", "x", "+"))
+
+
+def _ambient_authority_hit(call: ast.Call) -> bool:
+    """The call reaches past the sanctioned Send/db_lookup boundary (subprocess/socket/eval/raw
+    HTTP/dynamic-import/file-write). The sanctioned reads and pure stdlib data ops are exempt."""
+    func = call.func
+    if isinstance(func, ast.Name):
+        if func.id in _AMBIENT_BARE_NAMES:
+            return True
+        if func.id == "open" and _is_write_mode(_open_mode(call)):
+            return True
+    if isinstance(func, ast.Attribute):
+        if func.attr in _AMBIENT_FS_WRITE_ATTRS:
+            return True
+        # the attribute form ``Path(...).open("w")`` — mode is the FIRST arg here — flag only a write.
+        if func.attr == "open" and _is_write_mode(_open_mode(call, 0)):
+            return True
+    dotted = _dotted_call_name(func)
+    if dotted is None:
+        return False
+    parts = dotted.split(".")
+    root = parts[0]
+    if root == "socket":
+        # every socket.* is egress EXCEPT the read-only host lookups.
+        return len(parts) < 2 or parts[1] not in _SOCKET_READONLY
+    if root in _AMBIENT_ROOTS:
+        return True
+    if dotted in _AMBIENT_OS_PATHS:
+        return True
+    if len(parts) == 2 and root == "os" and parts[1].startswith(("exec", "spawn", "posix_spawn")):
+        return True
+    if dotted.startswith(("urllib.request.", "http.client.")):
+        return True
+    return dotted == "importlib.import_module"
+
+
+def _impure_transform_hit(call: ast.Call, imported: set[str]) -> bool:
+    """A re-run-divergent nondeterministic source in a router/handler body: wall clock (``time.time``,
+    no-arg ``time.localtime``/``gmtime``/``ctime``/``asctime``, single-arg ``time.strftime``),
+    ``random.*`` / ``secrets.*``, ``uuid1``/``uuid4``, ``os.urandom``/``os.getrandom``, or
+    ``datetime.now``/``utcnow``/``today``. ``strftime`` of a given tuple, ``uuid5``, and the sanctioned
+    ``db_lookup``/``fhir_lookup`` reads are not flagged.
+
+    Every rule except the ``datetime`` case is gated on ``imported`` (module names bound by an
+    ``import`` in this file), so a local variable shadowing ``secrets``/``random``/``time`` is not
+    mistaken for the stdlib module."""
+    dotted = _dotted_call_name(call.func)
+    if dotted is None:
+        return False
+    parts = dotted.split(".")
+    if parts[0] == "datetime" and parts[-1] in _DATETIME_NOW_ATTRS:
+        return True
+    if parts[0] not in imported:
+        return False
+    if dotted in _IMPURE_PATHS:
+        return True
+    if parts[0] in _IMPURE_ROOTS:
+        return True
+    if dotted in _TIME_WALLCLOCK_NOARG and not call.args:
+        return True
+    return dotted == "time.strftime" and len(call.args) == 1
+
+
+def _imported_modules(tree: ast.Module) -> set[str]:
+    """The module root names bound by an ``import`` in ``tree`` (``import a.b`` binds ``a``; ``import
+    a as x`` binds ``x``). Used to gate the impure-transform rule to real stdlib-module references."""
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                names.add(alias.asname or alias.name.split(".")[0])
+    return names
+
+
+def _body_calls(fn: ast.FunctionDef) -> list[ast.Call]:
+    """Every ``ast.Call`` in a function's executable body, NOT descending into nested def/class bodies
+    (each nested def is scanned on its own iteration) and NOT into the signature (decorators, default
+    args, annotations) — those are evaluated once at import time, so they cannot break per-message
+    purity or leak the message body, matching the undecorated-helper carve-out."""
+    nested = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+    calls: list[ast.Call] = []
+    stack: list[ast.AST] = [stmt for stmt in fn.body if not isinstance(stmt, nested)]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Call):
+            calls.append(node)
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, nested):
+                continue
+            stack.append(child)
+    return calls
+
+
+# unvetted-import (ADR 0144 Increment 2): a config-dir import of a package that is neither stdlib nor
+# first-party (`messagefoundry`) nor a shipped engine dependency nor a sibling config module — an
+# operator-added third-party package pulled into the engine process, i.e. the supply-chain surface a
+# typosquat / AI-hallucinated ("slopsquat") name lands on. First-party root always vetted.
+_FIRST_PARTY_ROOTS = frozenset({"messagefoundry"})
+
+
+def _normalize_dist(name: str) -> str:
+    """PEP 503 distribution-name normalization (``argon2-cffi`` / ``Argon2_CFFI`` → ``argon2-cffi``)."""
+    return re.sub(r"[-_.]+", "-", name).strip().lower()
+
+
+@functools.cache
+def _shipped_dep_import_roots() -> frozenset[str]:
+    """Top-level import names of MessageFoundry's declared distribution dependencies, so a Handler
+    importing a shipped dep (e.g. ``hl7``, or a lazily-imported optional-extra dep like ``pydicom``)
+    is not mistaken for an operator-added package. **Install-independent:** an installed dep maps to
+    its real import name(s); a declared-but-uninstalled dep falls back to a best-effort guess from the
+    dist name, so vetting does not drift with which extras happen to be installed on the box running
+    ``check``. Best-effort: any ``importlib.metadata`` failure degrades to empty and the caller then
+    skips the rule (never flags/blocks on a blind vet). Cached — the environment is stable per process."""
+    try:
+        dist_to_imports: dict[str, set[str]] = {}
+        for import_name, dists in importlib.metadata.packages_distributions().items():
+            for dist in dists:
+                dist_to_imports.setdefault(_normalize_dist(dist), set()).add(import_name)
+        roots: set[str] = set()
+        for req in importlib.metadata.requires("messagefoundry") or []:
+            dist = _normalize_dist(re.split(r"[<>=!~;\[( ]", req, maxsplit=1)[0])
+            # installed -> real import name(s); declared-but-uninstalled (an unbuilt optional extra
+            # like [dicom]'s pydicom) -> a dist-name guess, so a lazy `import pydicom` is vetted whether
+            # or not that extra is installed.
+            roots |= dist_to_imports.get(dist) or {dist.replace("-", "_")}
+        return frozenset(roots)
+    except Exception:  # noqa: BLE001 — best-effort env probe; degrade, never crash the advisory gate
+        return frozenset()
+
+
+def _is_type_checking_guard(node: ast.If) -> bool:
+    """True for ``if TYPE_CHECKING:`` / ``if typing.TYPE_CHECKING:`` — its body is type-only, never
+    executed, so imports inside it are not a runtime supply-chain surface."""
+    test = node.test
+    return (isinstance(test, ast.Name) and test.id == "TYPE_CHECKING") or (
+        isinstance(test, ast.Attribute) and test.attr == "TYPE_CHECKING"
+    )
+
+
+def _unvetted_import_hits(
+    tree: ast.Module,
+    local_modules: frozenset[str],
+    shipped_roots: frozenset[str],
+    allow: frozenset[str] = frozenset(),
+) -> list[tuple[int, str]]:
+    """Absolute imports of a top-level name that is not stdlib, not first-party, not a shipped engine
+    dep, not a sibling config module (``local_modules`` = the config dir's own ``*.py`` stems), and not
+    an operator-vetted root (``allow`` = ``--handler-security-allow``, import roots not dist names).
+    ``TYPE_CHECKING``-guarded (type-only) imports are excluded — they never run."""
+    vetted = sys.stdlib_module_names | _FIRST_PARTY_ROOTS | shipped_roots | local_modules | allow
+    type_only: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _is_type_checking_guard(node):
+            for stmt in node.body:
+                for sub in ast.walk(stmt):
+                    if isinstance(sub, (ast.Import, ast.ImportFrom)):
+                        type_only.add(id(sub))
+    hits: list[tuple[int, str]] = []
+    for node in ast.walk(tree):
+        if id(node) in type_only:
+            continue
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                root = alias.name.split(".")[0]
+                if root not in vetted:
+                    hits.append((node.lineno, root))
+        elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+            # level>0 is a relative (sibling-config) import — always first-party.
+            root = node.module.split(".")[0]
+            if root not in vetted:
+                hits.append((node.lineno, root))
+    return hits
+
+
+def _check_handler_security(
+    config_dir: str | Path, *, strict: bool = False, allow: frozenset[str] = frozenset()
+) -> CheckResult:
+    """Flag risky patterns in the config-dir Router/Handler modules — a static compensating control
+    for ASVS 15.2.5 / 15.2.4 (ADR 0144). Five rule families:
+
+    * ``phi-to-log`` — the message body reaching a ``print``/INFO+ log call (CLAUDE.md §9).
+    * ``unsafe-db-lookup`` — an f-string/concatenated statement into ``db_lookup``/``fhir_lookup``
+      instead of the parameterized ``params`` / structured form.
+    * ``ambient-authority`` — reaching past the sanctioned ``Send``/``db_lookup`` boundary
+      (``subprocess``/``socket``/``eval``/raw HTTP/dynamic import/file writes; CLAUDE.md §2/§8).
+    * ``impure-transform`` — a re-run-divergent nondeterministic source (wall clock / ``random`` /
+      ``uuid4``) in a router/handler, breaking the at-least-once purity invariant (CLAUDE.md §2).
+    * ``unvetted-import`` — an operator-added third-party import (supply-chain / slopsquat surface).
+
+    Static analysis catches only a fraction of insecure code, so this is a **filter, not a fix**.
+    **Advisory by default** (``required=False``, prints, never blocks); ``strict=True`` (the opt-in
+    ``--strict-handler-security`` block mode) promotes any finding to a **blocking** failure for an org
+    that wants a hard gate on its own CI. The runtime half is the opt-in ADR 0087 sandbox. Mirrors
+    :func:`_check_raise_fstring`: static ``ast`` only (never imports/executes the config), globs
+    ``*.py`` under ``config_dir`` (helpers included), and skips a broken/unreadable file (``validate``
+    reports those) so it never crashes the gate. ``phi-to-log`` and ``impure-transform`` are scoped to
+    ``@router``/``@handler`` bodies (so an undecorated helper's wall-clock fallback is not a false
+    positive); the other three scan the whole module."""
+    base = Path(config_dir)
+    if not base.is_dir():
+        return CheckResult(
+            "handler-security", ok=True, required=False, skipped=True, detail="not a config dir"
+        )
+    # sibling config modules (the dir's own *.py stems) are first-party for the unvetted-import rule.
+    local_modules = frozenset(p.stem for p in base.glob("*.py"))
+    # unvetted-import needs a trustworthy shipped-dep set to tell operator-added from shipped; if the
+    # metadata probe degraded to empty, skip the rule entirely rather than flag/block on a blind vet.
+    shipped = _shipped_dep_import_roots()
+    hits: list[str] = []
+    for path in sorted(base.glob("*.py")):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except (SyntaxError, OSError):
+            # A broken module is already caught by validate; never crash the advisory gate on it.
+            continue
+        imported = _imported_modules(tree)
+        file_hits: list[tuple[int, str]] = (
+            [
+                (lineno, f"unvetted-import:{mod}")
+                for lineno, mod in _unvetted_import_hits(tree, local_modules, shipped, allow)
+            ]
+            if shipped
+            else []
+        )
+        # Whole-file rules — unsafe-db-lookup + ambient-authority (helpers + module level included).
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if _unsafe_lookup_hit(node):
+                file_hits.append((node.lineno, "unsafe-db-lookup"))
+            if _ambient_authority_hit(node):
+                file_hits.append((node.lineno, "ambient-authority"))
+        # Decorated-scope rules — phi-to-log + impure-transform, over each router/handler's own body
+        # only (not nested defs, not the signature), so each call is scanned once with its own message
+        # symbol and an import-time default arg is never mistaken for per-message impurity.
+        for node in ast.walk(tree):
+            if _message_fn_decorator(node) is None:
+                continue
+            assert isinstance(node, ast.FunctionDef)  # narrowed by _message_fn_decorator
+            params = node.args.posonlyargs + node.args.args
+            msg_sym = params[0].arg if params else None
+            for sub in _body_calls(node):
+                if msg_sym is not None and _phi_to_log_hit(sub, msg_sym):
+                    file_hits.append((sub.lineno, "phi-to-log"))
+                if _impure_transform_hit(sub, imported):
+                    file_hits.append((sub.lineno, "impure-transform"))
+        hits += [f"{path.name}:{lineno} [{rule}]" for lineno, rule in sorted(file_hits)]
+    if not hits:
+        return CheckResult(
+            "handler-security",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail="no handler-security findings",
+        )
+    shown = ", ".join(hits[:5])
+    more = f" (+{len(hits) - 5} more)" if len(hits) > 5 else ""
+    kind = "finding(s)" if strict else "advisory finding(s)"
+    detail = (
+        f"{len(hits)} handler-security {kind} — static compensating control for "
+        f"ASVS 15.2.5, a filter not a boundary (ADR 0144): {shown}{more}"
+    )
+    # Advisory by default (ok=True/required=False — never blocks); strict block mode makes a finding a
+    # required failure (ok=False/required=True). The finding text is identical either way.
+    return CheckResult("handler-security", ok=not strict, required=strict, detail=detail)
+
+
 def _check_validate(config_dir: str | Path) -> CheckResult:
     from messagefoundry.config.wiring import validate_config
 
@@ -434,7 +999,46 @@ def _expected_disposition(fixture_path: str | Path) -> str | None:
     return normalized
 
 
-def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> CheckResult:
+def _resolve_snapshot_on_send(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None,
+    suppress_search: bool,
+) -> bool:
+    """Best-effort ``[pipeline].snapshot_on_send`` for the dry-run preview (#230 parity, ADR 0104).
+
+    Resolves this instance's ``messagefoundry.toml`` exactly like :func:`_check_posture` (explicit
+    ``service_config`` > root-anchored when ``suppress_search`` > legacy upward-walk) and returns the
+    loaded flag. When no settings resolve (no toml, or one that won't parse/validate), fall back to the
+    **Settings-model default (True)** — the posture of exactly the default, un-overridden engine —
+    never a hardcoded ``False``, which would preview the wrong posture for the engine this gate exists
+    to mirror (ADR 0104 §8.1)."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import PipelineSettings, load_settings
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return PipelineSettings().snapshot_on_send
+    try:
+        return load_settings(config_path=toml).pipeline.snapshot_on_send
+    except (FileNotFoundError, ValueError, ValidationError, OSError):
+        return PipelineSettings().snapshot_on_send
+
+
+def _check_dryrun(
+    config_dir: str | Path,
+    messages_dir: str | Path | None,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
     from messagefoundry.config.wiring import WiringError, load_config
     from messagefoundry.pipeline.dryrun import dry_run, read_message_sets
     from messagefoundry.store import MessageStatus
@@ -471,8 +1075,22 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
 
     # Per-feed mapping (#11): a fixture under <messages>/<inbound_name>/ is dry-run only against that
     # feed; an unmapped fixture (top-level, or under a non-feed subdir) cross-products every inbound.
+    #
+    # The DIRECTORY map keeps every inbound name (#233, ADR 0111): a fixture dir named after a
+    # not-deployed feed must still resolve to that feed, or it would silently become "unmapped" and be
+    # cross-producted against every OTHER feed — worse than the problem. It is the cross-product target
+    # list that drops the not-deployed feeds: an unmapped fixture must not be run against a feed nobody
+    # deployed (its Sends are declined, so it would report FILTERED and fail a .expect). An explicitly
+    # PINNED fixture still runs against its not-deployed feed — carrying the record is the point of the
+    # state, and dry-run resolves no env(), so previewing its router/handler logic stays free.
     inbound_names = list(reg.inbound)
+    deployed_inbounds = [n for n, ic in reg.inbound.items() if ic.deployed]
     message_sets = read_message_sets(mpath, inbound_names)
+    # #230 P4 (ADR 0104): preview under the engine's copy-on-Send posture (best-effort; fallback = the
+    # Settings-model default, ON) so the gate exercises the fixtures exactly as the engine would run them.
+    snapshot_on_send = _resolve_snapshot_on_send(
+        config_dir, service_config=service_config, suppress_search=suppress_search
+    )
     errors: list[str] = []
     total = 0
     pinned = 0
@@ -485,12 +1103,12 @@ def _check_dryrun(config_dir: str | Path, messages_dir: str | Path | None) -> Ch
         except ValueError as exc:
             errors.append(f"{label}: {exc}")
             continue
-        targets = [target] if target is not None else inbound_names
+        targets = [target] if target is not None else deployed_inbounds
         if target is not None:
             pinned += 1
         for ic_name in targets:
             total += 1
-            result = dry_run(reg, raw, inbound=ic_name)
+            result = dry_run(reg, raw, inbound=ic_name, snapshot_on_send=snapshot_on_send)
             if expected is not None:
                 asserted += 1
                 actual = result.disposition.name
@@ -680,7 +1298,7 @@ def _check_build(
             # The residual: stamp THIS instance's derived posture so the posture-keyed insecure-hop
             # refusal (ADR 0092) decides at commit/CI exactly as serve/reload do — a prod-PHI cleartext
             # hop raises here rather than shipping and only refusing at serve.
-            posture=hop_posture_from_ai(settings.ai),
+            posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
             trust_anchor_policy=settings.tls.policy(),
         )
     except WiringError as exc:
@@ -690,6 +1308,94 @@ def _check_build(
         ok=True,
         required=True,
         detail=f"connectors build against the {env_name or 'default'} posture",
+    )
+
+
+def _check_reference_backend(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Refuse a config that declares an ADR 0006 ``Reference(...)`` against a store backend with no
+    reference-snapshot store — the same fail-closed gate ``serve``/``reload`` apply
+    (:func:`~messagefoundry.pipeline.wiring_runner.check_reference_backend_supported`), brought forward to
+    commit/CI time.
+
+    Without it, a config declaring a reference set against a backend with no snapshot store passes the
+    whole gate and then breaks every message that reads the set at run time — post-ACK, forever, because
+    ``write_reference_snapshot`` can never materialize it there (the pre-#235 SQL Server failure this
+    check was built for; all three shipped backends now implement the snapshot store, so today it guards
+    a future backend that leaves the allow-list default). The engine-start gate reads the capability
+    off the LIVE store; ``check`` has no store, so it reads it off the DECLARED backend
+    (``settings.store.backend``) via :func:`~messagefoundry.store.base.backend_supports_reference_sets`,
+    which resolves the same class flag — one source of truth, no drift.
+
+    Required, but **fail-safe SKIP** on the same convention as :func:`_check_build`: no
+    ``messagefoundry.toml`` → SKIP (a bare config dir declares no backend, and the SQLITE default supports
+    reference sets anyway); settings or config that won't load → SKIP (``validate``/``build-check`` already
+    report those). A ``serve``-time backend override can still diverge from the toml this reads — the
+    engine-start gate is the backstop for that, which is why both halves exist."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.config.wiring import WiringError, load_config
+    from messagefoundry.store.base import backend_supports_reference_sets
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "reference-backend",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail="no messagefoundry.toml",
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "reference-backend",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=f"settings did not load: {exc}",
+        )
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "reference-backend",
+            ok=True,
+            required=True,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    backend = settings.store.backend
+    if registry.references and not backend_supports_reference_sets(backend):
+        names = ", ".join(repr(n) for n in sorted(registry.references))
+        plural = "s" if len(registry.references) > 1 else ""
+        detail = (
+            f"reference set{plural} {names} require{'' if plural else 's'} a store backend that "
+            f"implements ADR 0006 reference snapshots; backend "
+            f"{backend.value!r} does not — serve would refuse to start"
+        )
+        return CheckResult("reference-backend", ok=False, required=True, detail=detail)
+    return CheckResult(
+        "reference-backend",
+        ok=True,
+        required=True,
+        detail=(
+            f"{len(registry.references)} reference set(s) against the {backend.value} backend"
+            if registry.references
+            else "no reference sets declared"
+        ),
     )
 
 

@@ -20,8 +20,7 @@ import logging
 
 import pytest
 
-from messagefoundry.store import MessageStore
-from messagefoundry.store import audit_tee
+from messagefoundry.store import MessageStore, audit_tee
 from messagefoundry.store.audit_tee import emit_audit_tee
 
 
@@ -63,7 +62,12 @@ def _only(handler: _ListHandler) -> dict:
 
 async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
     await store.record_audit(
-        "auth.login", actor="alice", channel_id="IB_ACME_ADT", detail=None, now=123.0
+        "auth.login",
+        actor="alice",
+        channel_id="IB_ACME_ADT",
+        detail=None,
+        client="10.4.2.9",
+        now=123.0,
     )
     rec = _only(audit_capture)
     assert rec == {
@@ -72,6 +76,7 @@ async def test_record_audit_tees_metadata_off_box(store, audit_capture) -> None:
         "action": "auth.login",
         "actor": "alice",
         "channel_id": "IB_ACME_ADT",
+        "client": "10.4.2.9",  # ADR 0150: the recorded address travels off-box with the row
         "detail": None,
     }
     assert audit_capture.records[0].levelno == logging.INFO
@@ -132,7 +137,12 @@ async def test_audit_row_persists_and_tee_emits_together(store, audit_capture) -
 
 def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
     emit_audit_tee(
-        action="auth.login", actor="alice", channel_id="IB_ACME_ADT", detail=None, ts=10.0
+        action="auth.login",
+        actor="alice",
+        channel_id="IB_ACME_ADT",
+        detail=None,
+        client="10.4.2.9",
+        ts=10.0,
     )
     assert _only(audit_capture) == {
         "event": "audit",
@@ -140,9 +150,20 @@ def test_emit_audit_tee_shape_is_metadata_only(audit_capture) -> None:
         "action": "auth.login",
         "actor": "alice",
         "channel_id": "IB_ACME_ADT",
+        # ADR 0150: the "from where" travels off-box as a DISCRETE field, so a SIEM can index the
+        # source address without parsing the redacted detail blob. It is an infrastructure
+        # identifier, not message content, so it is forwarded verbatim (never through safe_text).
+        "client": "10.4.2.9",
         "detail": None,
     }
     assert audit_capture.records[0].levelno == logging.INFO
+
+
+def test_emit_audit_tee_client_defaults_to_none_for_engine_internal_writes(audit_capture) -> None:
+    """An engine-internal write omits ``client`` entirely; the field must ship as null, never as a
+    stale address inherited from whatever request happened to run last (ADR 0150)."""
+    emit_audit_tee(action="retention.purge", actor="system", channel_id=None, detail=None, ts=3.0)
+    assert _only(audit_capture)["client"] is None
 
 
 def test_emit_audit_tee_redacts_hl7_in_detail(audit_capture) -> None:

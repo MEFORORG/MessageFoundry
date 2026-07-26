@@ -4,9 +4,9 @@
 
 from __future__ import annotations
 
-import pytest
-
 from typing import Any
+
+import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Validation
 from messagefoundry.config.wiring import (
@@ -148,16 +148,17 @@ def test_transform_one_returns_deliveries() -> None:
         return Send("out", msg)
 
     reg = _registry(lambda m: ["h"], {"h": handle})
-    deliveries, state_ops, meta_ops = transform_one(reg, "h", ADT_A01)
+    deliveries, state_ops, meta_ops, declined = transform_one(reg, "h", ADT_A01)
     assert [d.to for d in deliveries] == ["out"]
     assert isinstance(deliveries[0], DeliveryPreview) and "FOUNDRY" in deliveries[0].payload
     assert state_ops == []  # no SetState declared (ADR 0005)
     assert meta_ops == []  # no SetMeta declared (ADR 0081)
+    assert declined == []  # every target deployed (#233) — nothing declined
 
 
 def test_transform_one_filtering_handler_returns_no_deliveries() -> None:
     reg = _registry(lambda m: ["h"], {"h": lambda m: None})
-    assert transform_one(reg, "h", ADT_A01) == ([], [], [])
+    assert transform_one(reg, "h", ADT_A01) == ([], [], [], [])
 
 
 def test_transform_one_unknown_outbound_raises() -> None:
@@ -211,9 +212,9 @@ def test_route_message_recomposes_identically() -> None:
 def test_split_messages_separator_agnostic() -> None:
     # A batch whose MSH-1 isn't `|` must still split per-message (low-4), not parse as one.
     batch = (
-        "MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
-        "MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
-    ).encode("utf-8")
+        b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
+        b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
+    )
     msgs = split_messages(batch)
     assert len(msgs) == 2
     assert msgs[0].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")
@@ -317,7 +318,7 @@ def test_transform_one_honors_prebuilt_payload() -> None:
 
     reg = _registry(lambda m: ["h"], {"h": handle})
     other = Message.parse(ADT_A01.replace("MSG1", "FROMPAYLOAD"))
-    deliveries, _, _ = transform_one(reg, "h", ADT_A01, payload=other)
+    deliveries, _, _, _ = transform_one(reg, "h", ADT_A01, payload=other)
     assert "FROMPAYLOAD" in deliveries[0].payload  # the prebuilt payload won, not the raw arg
 
 

@@ -148,6 +148,241 @@ async def test_claimed_bootstrap_is_not_retired() -> None:
         await store.close()
 
 
+# --- ASVS 6.4.5 arm 1: the bootstrap credential carries its own expiry deadline ------------------
+
+
+async def test_bootstrap_admin_carries_its_expiry_deadline() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=72))
+        boot = await service.initialize()
+        assert boot is not None and boot.expires_at is not None
+        admin = await store.get_user_by_username("admin")
+        # exactly created_at + window (same base _retire_superseded_bootstrap uses) — not a fresh clock
+        assert abs(boot.expires_at - (admin.created_at + 72 * 3600)) < 1.0
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_admin_deadline_is_none_when_expiry_off() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(bootstrap_expiry_hours=0))
+        boot = await service.initialize()
+        assert boot is not None and boot.expires_at is None
+    finally:
+        await store.close()
+
+
+# --- ASVS 6.4.5 arm 2: an unclaimed bootstrap admin is reminded BEFORE it is auto-disabled --------
+
+
+async def test_bootstrap_expiry_warning_fires_once_in_window() -> None:
+    # An unclaimed bootstrap 24h from auto-disable draws exactly ONE reminder: the in-memory latch
+    # collapses a periodic caller to a single emit per process (the runner re-checks hourly).
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        expires_at = admin.created_at + 72 * 3600
+        at_t_minus_24h = expires_at - 24 * 3600  # exactly the window's leading edge
+        first = await service.bootstrap_expiry_warning(now=at_t_minus_24h)
+        assert first is not None
+        surfaced_expires, hours_remaining = first
+        assert (
+            abs(surfaced_expires - expires_at) < 1.0
+        )  # the exact retirement instant, not a fresh clock
+        assert hours_remaining == 24
+        # a second pass anywhere in the window is latched → no second reminder
+        assert await service.bootstrap_expiry_warning(now=at_t_minus_24h + 3600) is None
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_expiry_warning_silent_before_the_window() -> None:
+    # Before [expires_at - warn_hours, expires_at): nothing — and a pre-window pass does NOT consume the
+    # latch, so the real window still fires afterwards.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        await service.initialize()
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        expires_at = admin.created_at + 72 * 3600
+        assert await service.bootstrap_expiry_warning(now=expires_at - 25 * 3600) is None  # before
+        assert (
+            await service.bootstrap_expiry_warning(now=expires_at - 12 * 3600) is not None
+        )  # inside
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_expiry_warning_silent_when_claimed() -> None:
+    # "claimed fires nothing": once the operator changes the password (must_change → False) it is a
+    # normal admin account and draws no retirement reminder, even inside what would be the window.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        await service.initialize()
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        await store.set_password(
+            admin.id,
+            password_hash=hash_password("a-claimed-real-passphrase"),
+            must_change_password=False,
+        )
+        expires_at = admin.created_at + 72 * 3600
+        assert await service.bootstrap_expiry_warning(now=expires_at - 1 * 3600) is None
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_expiry_warning_silent_when_expiry_off() -> None:
+    # No time-expiry configured → the credential is never auto-disabled, so there is nothing to warn of,
+    # however far past the (non-existent) deadline the clock is pushed.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=0, bootstrap_warn_hours=24)
+        )
+        await service.initialize()
+        assert await service.bootstrap_expiry_warning(now=time.time() + 999 * 3600) is None
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_expiry_warning_silent_after_the_deadline() -> None:
+    # At/after expires_at, retirement itself takes over (_retire_superseded_bootstrap); the pre-warning
+    # does not fire past the deadline.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(bootstrap_expiry_hours=72, bootstrap_warn_hours=24)
+        )
+        await service.initialize()
+        admin = await store.get_user_by_username("admin")
+        assert admin is not None
+        expires_at = admin.created_at + 72 * 3600
+        assert await service.bootstrap_expiry_warning(now=expires_at + 1) is None
+    finally:
+        await store.close()
+
+
+# --- ASVS 6.4.1: an admin-issued initial/reset credential expires when unclaimed -----------------
+
+
+async def _make_reset_temp(store, service, *, username: str = "alice") -> str:
+    """Create a local user, then admin-reset it → a must_change temp with password_changed_at=now."""
+    await store.upsert_role(role_id="viewer", display_name="Viewer")
+    await service.create_local_user(
+        username=username,
+        password="a-long-enough-original-passphrase",
+        display_name=None,
+        email=None,
+        roles=["viewer"],
+        actor="admin",
+    )
+    user = await store.get_user_by_username(username)
+    assert user is not None
+    return await service.admin_reset_password(user.id, actor="admin")
+
+
+async def test_reset_temp_password_expires_when_unclaimed() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=72))
+        await service.initialize()
+        temp = await _make_reset_temp(store, service)
+        assert (await service.login("alice", temp)).ok  # within the window: usable
+        # age the temp past its expiry window (password_changed_at, not created_at)
+        alice = await store.get_user_by_username("alice")
+        assert alice is not None
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 73 * 3600, alice.id),
+        )
+        await store._db.commit()
+        out = await service.login("alice", temp)
+        assert not out.ok  # expired → refused, even with the CORRECT temp password
+        assert out.error == "invalid credentials"  # generic — not distinguishable from a wrong pw
+        # the account is NOT disabled (unlike bootstrap) — an admin can re-issue a fresh temp
+        assert (await store.get_user_by_username("alice")).disabled is False
+    finally:
+        await store.close()
+
+
+async def test_claimed_temp_password_is_not_gated() -> None:
+    # Once the user claims the temp (change → must_change False), it is a normal credential and the
+    # 6.4.1 expiry no longer applies, however old password_changed_at becomes.
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=72))
+        await service.initialize()
+        await _make_reset_temp(store, service)
+        alice = await store.get_user_by_username("alice")
+        await store.set_password(
+            alice.id,
+            password_hash=hash_password("the-users-own-chosen-passphrase"),
+            must_change_password=False,
+        )
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 999 * 3600, alice.id),
+        )
+        await store._db.commit()
+        assert (await service.login("alice", "the-users-own-chosen-passphrase")).ok
+    finally:
+        await store.close()
+
+
+async def test_initial_password_expiry_zero_disables_the_gate() -> None:
+    store = await _store()
+    try:
+        service = AuthService(store, AuthSettings(initial_password_expiry_hours=0))
+        await service.initialize()
+        temp = await _make_reset_temp(store, service)
+        alice = await store.get_user_by_username("alice")
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 9999 * 3600, alice.id),
+        )
+        await store._db.commit()
+        assert (await service.login("alice", temp)).ok  # gate off → an aged temp still works
+    finally:
+        await store.close()
+
+
+async def test_bootstrap_admin_is_not_gated_by_initial_password_expiry() -> None:
+    # The bootstrap admin is must_change + carries password_changed_at, but is CARVED OUT of the
+    # 6.4.1 gate (it has its own bootstrap_expiry_hours path). With bootstrap expiry off, an aged,
+    # unclaimed bootstrap still logs in — the initial-password gate must not catch it.
+    store = await _store()
+    try:
+        service = AuthService(
+            store, AuthSettings(initial_password_expiry_hours=1, bootstrap_expiry_hours=0)
+        )
+        boot = await service.initialize()
+        assert boot is not None
+        admin = await store.get_user_by_username("admin")
+        await store._db.execute(
+            "UPDATE users SET password_changed_at=? WHERE id=?",
+            (time.time() - 500 * 3600, admin.id),
+        )
+        await store._db.commit()
+        assert (await service.login("admin", boot.password)).ok  # not gated by the 6.4.1 expiry
+    finally:
+        await store.close()
+
+
 async def test_local_login_lockout_after_threshold() -> None:
     store = await _store()
     try:

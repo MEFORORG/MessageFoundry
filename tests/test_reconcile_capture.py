@@ -15,9 +15,8 @@ import json
 import time
 from pathlib import Path
 
-from messagefoundry.transports.mllp import MLLPDecoder, frame
-
 from harness.reconcile.capture import CaptureSink
+from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 
 def _message(control_id: str) -> str:
@@ -62,7 +61,7 @@ def test_capture_acks_and_writes_jsonl(tmp_path: Path) -> None:
     acks = asyncio.run(scenario())
     # Each message got an AA echoing its control id (MSA-2).
     assert len(acks) == 2
-    for cid, ack in zip(["CID0001", "CID0002"], acks):
+    for cid, ack in zip(["CID0001", "CID0002"], acks):  # noqa: B905
         text = ack.decode("latin-1")
         assert "MSA|AA|" in text and cid in text
 

@@ -1,0 +1,311 @@
+# Security loosening guide (`[security]`)
+
+> The inverse of a hardening guide. MessageFoundry ships **secure by default** — every `[security]`
+> switch defaults to the protective position ([ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)).
+> This document is the deliberate-deviation register CISA *Secure by Design* prescribes: for each
+> protection you can turn off, **what you lose**, **when it is acceptable**, and the **compensating
+> controls**. Loosening a protection is warned at `serve` (a plain-language line naming the risk) and is
+> surfaced read-only in the web console (`GET /security/posture`).
+
+**Two invariants hold no matter what you set here** ([ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5, the *No-loosen rule*):
+
+1. **A PHI weakening under strict enforcement is still refused — with two explicitly-acknowledged
+   exceptions.** No `[security]` value — and no `--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS` escape —
+   can start a **PHI instance at `enforcement = enforce`** (the default) with a **cleartext off-box bind, no
+   auth, open egress, or unbounded PHI retention**. Those four still fail closed (`serve` exits 2),
+   unconditionally. At the default this is **byte-identical to the former production-PHI refusal** — [ADR
+   0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 2) re-keyed the
+   refuse/warn dial off the *derived* `production` tier and onto the *explicit* `enforcement` level;
+   `enforcement = warn` reproduces the historical non-production warn-and-start (a loud, audited loosening —
+   see the `enforcement = warn` deviation below). **Two of these controls may be lifted while staying at
+   `enforce`, but only behind a dedicated acknowledgment switch that does nothing else** (the No-loosen
+   carve-out, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5 as amended, [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)):
+   `allow_single_factor_admin_when_exposed` (single-factor admin at exposure) and
+   `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI under strict enforcement, which *also*
+   requires `allow_unencrypted_phi`). Each defaults `false` — byte-identical to today's refusal — and when set
+   drops the refusal to a **loud, audited warning** (the same warn-and-start `enforcement = warn` takes
+   globally, but scoped to exactly one control, plus a startup **AUDIT** line) and is surfaced read-only in
+   `GET /security/posture`. Without its ack, each still fails closed under strict enforcement.
+2. **ePHI access is always audited.** The tamper-evident audit hash-chain and the message-event compliance
+   floor are unconditional — independent of every switch here (including `audit_all_authorization_decisions`).
+
+Editing is **IDE-only** (the VS Code *Edit Security Settings* command, which shells `messagefoundry
+security show|set`); the web console is **read-only**. See [CONFIGURATION.md](CONFIGURATION.md) for the
+section reference.
+
+---
+
+## The switches
+
+| Group | Switch | Secure default |
+|---|---|---|
+| Network access | `local_access_only` | `true` (loopback bind) |
+| | `listen_address` | `127.0.0.1` |
+| | `require_encryption_for_remote` | `true` |
+| | `serve_web_console` | `true` (on by default, ADR 0143 — *not* a loosening; disabling shrinks surface) |
+| | `web_console_public_address` | `""` |
+| | `allowed_client_networks` | `[]` (*conditional* — see below: empty is the SECURE position on a loopback bind, a loosening only once exposed) |
+| Encryption | `encrypt_stored_data` | `true` |
+| | `allow_unencrypted_phi` | `false` |
+| | `allow_unencrypted_phi_under_strict_enforcement` | `false` |
+| In-use data protection | `memory_encryption_operator_declared` | `false` (ADR 0152 — *not* a loosening: it ASSERTS a host property rather than giving one up. Its absence on an exposed PHI instance warns at every start) |
+| | `require_memory_encryption_declaration` | `false` (*not* a loosening either — it TIGHTENS, turning that warning into a refusal. Opt-in because the property is a host property that cannot be satisfied on Windows) |
+| Sign-in & identity | `require_sign_in` | `true` |
+| | `require_mfa` | `true` |
+| | `allow_single_factor_admin_when_exposed` | `false` |
+| | `sign_out_after_idle_minutes` | `30` |
+| | `max_session_hours` | `12` |
+| Data handling | `block_unlisted_outbound` | `true` |
+| | `delete_message_bodies_after_days` | `30` (`0` = keep forever) |
+| | `allow_keeping_phi_indefinitely` | `false` |
+| | `audit_all_authorization_decisions` | `false` (see note) |
+| Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
+| Posture lever | `handles_real_patient_data` | *derived from environment* |
+| | `production_instance` | *derived from environment* |
+
+`enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
+**decoupled** from `production_instance` — a PHI *staging* box is now strict by default too. `enforcement`
+gates every "still refused" clause below; `enforcement = warn` downgrades them all to loud, audited warnings.
+
+`handles_real_patient_data` / `production_instance` default to the value **derived from the active
+environment name** (ADR 0148 GIVEN 1: **`dev` → PHI/non-prod**, `staging` → PHI/non-prod, `prod` → PHI/prod);
+a custom-named environment must declare them or `serve` fails closed. `handles_real_patient_data` is the
+*master data-class lever* — the PHI-only gates below key on it — and now defaults to PHI on every built-in
+env (a genuinely-synthetic box must set it `false` explicitly; see its deviation below).
+
+`audit_all_authorization_decisions = false` is a deliberate **secure-and-usable** default, not a loosening
+(ADR 0118 §5, owner-confirmed): ePHI access is already always audited, and forcing full authz tracing on
+would flood the hash-chained audit log (console polling + the `/ws/stats` feed), which itself degrades
+security monitoring. Turn it **on** for an off-loopback deployment that wants the full L3 authorization
+trail.
+
+---
+
+## Deliberate deviations
+
+### `local_access_only = false` — expose the operator API/console off this machine
+- **What you lose:** the API + web console become reachable from the network, not just this host.
+- **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
+- **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
+  revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
+  host / mTLS ([OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md)).
+- **Still refused:** an off-box bind without TLS (unless `require_encryption_for_remote = false`, below).
+
+### `allowed_client_networks = []` (empty) **while the console is exposed** — no source-network allow-list
+> **Conditional, unlike every other entry here.** An empty list is the **secure** position on the default
+> loopback bind (there is nothing off-box to restrict) and is reported as a loosening **only once the
+> surface is actually exposed** — `local_access_only = false`, *or* a set `web_console_public_address`.
+> That second term matters: the recommended off-box topology keeps the **loopback bind** behind a reverse
+> proxy, so a bind-only test would never fire in the most-exposed supported posture.
+- **What you lose:** every host that can route to the bind — or to the proxy in front of it — may reach the
+  sign-in page. The engine asserts nothing about *which* networks may reach the operator surface, so the
+  restriction exists (if at all) only in firewall config that `GET /security/posture` cannot see.
+- **When acceptable:** whenever the host firewall (or the proxy's own `allow`/`deny`) already enforces the
+  restriction — which is the **stronger** placement, at SYN rather than after TLS. Leaving this empty is a
+  perfectly defensible choice; it is listed so the absence is *visible*, not to push you into setting it.
+- **Compensating controls:** the host-firewall `-RemoteAddress` rule
+  ([ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md)); nginx/Caddy `allow`/`deny`; network segmentation.
+- **Before setting it:** read the section in
+  [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md) — it is **inert behind an undeclared
+  proxy or NAT**, it tightens `[api].trusted_proxies` to single hosts, and a lockout costs a service
+  restart ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)).
+- **Still refused:** nothing — this is advisory only. An exposed bind with an empty list starts normally.
+
+### `require_encryption_for_remote = false` — accept cleartext for off-machine access
+- **What you lose:** bearer tokens and PHI cross the network **in cleartext**. This is the config-file twin
+  of the `--allow-insecure-bind` dev escape.
+- **When acceptable:** a lab/loopback-adjacent trusted, firewalled segment; never for real remote PHI.
+- **Compensating controls:** network isolation; prefer in-process TLS (`[api].tls_cert_file`) or a
+  TLS-terminating proxy instead.
+- **Still refused:** a **production-PHI** cleartext bind — the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
+  clamp cannot be relaxed by this switch or by `--allow-insecure-bind`.
+
+### `serve_web_console = false` — do **not** mount the browser ops console at `/ui` (surface-reducing opt-out)
+> **Not a loosening — the inverse.** The console is **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md))
+> because it is the operator UI, effectively core. Setting `serve_web_console = false` **removes** the `/ui`
+> HTML/session-cookie attack surface, leaving a smaller JSON-only deployment — a surface-*reducing* opt-out
+> (a hardening), listed here only for completeness. It does **not** appear in `security_loosenings()`.
+- **When to disable:** a headless JSON-only deployment, or a hardened bastion where the browser console is
+  not wanted.
+- **Off-box note:** the default-on applies to **local loopback** binds only. On an **exposed** instance
+  (a non-loopback host, a declared TLS-terminating proxy, or a set `web_console_public_address`) a
+  *default-on* console **auto-degrades to JSON-only** — serving it off-box is a deliberate opt-in
+  (`serve_web_console = true` with TLS + `web_console_public_address`). The `/ui` surface stays *stricter*
+  than the JSON API: an explicitly-enabled console off-loopback requires `exposure_protected` (TLS or a
+  declared proxy) and `web_console_public_address`, and is refused even under `--allow-insecure-bind`.
+
+### `encrypt_stored_data = false` — do not encrypt PHI at rest
+- **What you lose:** message bodies, the summary/metadata (MRN + patient name), and error columns are stored
+  **unencrypted** at rest (only volume encryption would protect them).
+- **When acceptable:** a synthetic/CI instance (which carries no ePHI) — where it is a no-op anyway.
+- **Compensating controls:** OS/volume encryption; restricted DB file permissions.
+- **Still refused:** a **PHI** instance keyless — unless you also set `allow_unencrypted_phi = true` (the
+  explicit, audited escape).
+
+### `allow_unencrypted_phi = true` — start a PHI instance with no encryption key
+- **What you lose:** the keyless-PHI refusal; a PHI instance boots and stores PHI unencrypted at rest.
+- **When acceptable:** a deliberate, audited operational choice on a host where volume encryption protects
+  the data path, pending key provisioning.
+- **Compensating controls:** volume encryption; a startup **AUDIT** line records the override.
+- **Still refused:** `[store].require_encryption = true` (the plumbing "force a key even on synthetic") wins
+  over this; and under **strict enforcement** (`enforcement = enforce`, the default) this flag alone is **no
+  longer enough** — keyless start additionally requires `allow_unencrypted_phi_under_strict_enforcement = true`
+  (below), otherwise `serve` exits 2.
+
+### `require_sign_in = false` — disable authentication
+- **What you lose:** every request runs as a full-privilege *system* identity; no RBAC.
+- **When acceptable:** a **loopback-only** embedding/dev harness.
+- **Compensating controls:** loopback bind only.
+- **Still refused:** a non-loopback bind with auth off is a **hard refuse** — serving full-privilege admin to
+  the network is never one "I accept the risk" away, at any posture.
+
+### `require_mfa = false` — single-factor admin
+- **What you lose:** the Administrator role authenticates with a password only (no native TOTP second
+  factor). AD/Kerberos MFA is delegated to the directory and is unaffected.
+- **When acceptable:** a loopback single-operator box where the second factor adds friction without a
+  network exposure.
+- **Compensating controls:** keep the bind loopback; enable `admin_new_ip_step_up` if exposed.
+- **Still refused:** an **exposed PHI** bind with `require_mfa` off refuses to start under **strict
+  enforcement** (`enforcement = enforce`, the default; warns at `enforcement = warn`) — unless
+  `allow_single_factor_admin_when_exposed = true` (below) explicitly lifts that refusal to the same audited
+  warning while staying at `enforce`.
+
+### `sign_out_after_idle_minutes` / `max_session_hours` — longer sessions
+- **What you lose:** a longer idle/absolute session window widens the hijack replay window.
+- **When acceptable:** operational ergonomics on a trusted host.
+- **Compensating controls:** keep them bounded; shorter is safer.
+
+### `block_unlisted_outbound = false` — allow-any outbound egress
+- **What you lose:** deny-by-default egress; a transform may send to **any** destination (PHI exfiltration
+  risk) once a transport's `[egress].allowed_*` list is empty.
+- **When acceptable:** a synthetic/dev instance, or where every destination is otherwise controlled.
+- **Compensating controls:** enumerate `[egress].allowed_*` per transport; network egress filtering.
+- **Still refused:** a **PHI** instance with fully-open egress refuses to start under **strict enforcement**
+  (`enforcement = enforce`, the default; warns at `enforcement = warn`); a PHI instance that leaves this unset
+  gets deny-by-default flipped **on**.
+
+### `delete_message_bodies_after_days = 0` / `allow_keeping_phi_indefinitely = true` — unbounded PHI retention
+- **What you lose:** PHI message bodies accumulate at rest without bound (data-minimization failure).
+- **When acceptable:** a documented retention requirement that genuinely needs keep-forever, accepted in
+  writing.
+- **Compensating controls:** a bounded window (e.g. 30 days); a startup **AUDIT** line records the override.
+- **Still refused:** a **PHI** instance with an unbounded PHI-body window refuses under **strict enforcement**
+  (`enforcement = enforce`, the default) unless `allow_keeping_phi_indefinitely = true` (which downgrades the
+  refusal to a loud audited warning); at `enforcement = warn` a PHI instance auto-bounds each unset window to
+  30 days.
+
+### `allow_single_factor_admin_when_exposed = true` — lift the strict-enforcement single-factor-admin refusal
+- **What you lose:** on a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
+  whose admin surface is exposed (off-loopback bind or a declared reverse proxy) with `require_mfa` off,
+  MessageFoundry normally **refuses to start** — the Administrator role would authenticate with a single
+  factor over the network. This ack **downgrades that refusal to a loud, audited warning** (the same
+  warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
+  single-factor while staying at `enforce`.
+- **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
+  outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway, or AD/Kerberos MFA
+  delegated to the directory (this flag gates only local Administrator accounts).
+- **Compensating controls:** front the admin surface with an MFA-enforcing proxy; prefer `require_mfa = true`
+  (native TOTP); enable `admin_new_ip_step_up`. A startup **AUDIT** line records the override and the posture
+  view (`GET /security/posture`) names it.
+- **Still refused:** every **other** strict-enforcement PHI floor item (cleartext off-box bind, auth-off to
+  the network, open egress, unbounded retention) — this ack lifts **only** the single-factor-admin refusal,
+  and only at exposure. `require_mfa` off on a **loopback** bind was never refused (no exposure), so this ack
+  is a no-op there.
+
+### `allow_unencrypted_phi_under_strict_enforcement = true` — permit keyless PHI under strict enforcement
+- **What you lose:** a **PHI** instance under **strict enforcement** (`enforcement = enforce`, the default)
+  may start **keyless**, storing PHI unencrypted at rest. This ack is required **in addition to**
+  `allow_unencrypted_phi` (which alone permits keyless PHI only once `enforcement = warn`); with both set, the
+  strict-enforcement keyless refusal drops to a loud audited warning while staying at `enforce`.
+- **When acceptable:** a deliberate, audited choice on a host where **volume/disk encryption** protects the
+  data path, pending application-key provisioning — the same rationale as `allow_unencrypted_phi`, raised to
+  strict enforcement where it must be stated twice.
+- **Compensating controls:** volume encryption; restricted DB file permissions; provision
+  `MEFOR_STORE_ENCRYPTION_KEY` and drop both acks. A startup **AUDIT** line records the override.
+- **Still refused:** `[store].require_encryption = true` still wins (unconditional); and
+  `allow_unencrypted_phi_under_strict_enforcement` **alone**, without `allow_unencrypted_phi`, does **not**
+  permit keyless PHI — both are required at `enforce`.
+- **Note (behaviour change):** before this switch existed, `allow_unencrypted_phi` alone booted a
+  production keyless instance (the keyless gate had no production branch). Requiring the second ack under
+  strict enforcement is a deliberate, slight **tightening** ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md);
+  the ack was renamed from `allow_unencrypted_phi_in_production` by [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) when the dial moved from the `production` tier to `enforcement`).
+
+### `enforcement = warn` — warn instead of refuse on the PHI serve-gate floor
+- **What you lose:** the serve-gate **refuse/warn dial** flips from *refuse* to *warn-and-continue*, and the
+  [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) blunt escapes
+  (`--allow-insecure-bind` / `MEFOR_ALLOW_INSECURE_TLS`) are **honoured** again. This reproduces the
+  historical **non-production** PHI behaviour on a box that is otherwise strict-by-default: the cleartext
+  off-box bind, open-egress, and single-factor-admin-at-exposure refusals downgrade to loud audited warnings,
+  and an unset PHI retention window auto-bounds to 30 days rather than refusing. Named once by
+  `security_loosenings()` and in `GET /security/posture`.
+- **When acceptable:** a PHI **staging / pre-prod** box that must mirror production's *config* (so the
+  encryption / egress / retention paths are exercised, not first met in production) but is deliberately run at
+  warn severity during bring-up; or a custom PHI-loopback env. A stock production instance never needs it (it
+  is `enforce`-equivalent already).
+- **Compensating controls:** return to `enforce` before carrying real patient traffic; the warnings + startup
+  **AUDIT** line + posture view keep the deviation visible.
+- **Still refused (even at `warn`):** the **no-auth-to-the-network** hard refuse (`require_sign_in = false` on
+  a non-loopback bind) is unconditional at **any** enforcement level — `enforcement = warn` does **not** open
+  it — and the unconditional ePHI audit floor is untouched. `enforcement` is **binary** (no `off`): silencing
+  a PHI cleartext hop *entirely* is only reachable by declaring the box synthetic
+  (`handles_real_patient_data = false`), never by the dial ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
+
+### `handles_real_patient_data = false` — declare a genuinely-synthetic (no-ePHI) instance
+- **What you lose (nothing — it is an honest scope declaration):** the instance asserts it carries **no real
+  patient data**, so the ePHI-specific gates (at-rest-encryption requirement, deny-by-default egress, bounded
+  PHI retention, the PHI transport-hop refusals) relax to their synthetic posture — a no-op on data that is
+  not PHI. Since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1
+  the built-in `dev` / `staging` / `prod` envs all derive **PHI**, so a genuinely-throwaway CI / dev box must
+  set this **explicitly** — it is no longer the `dev` default.
+- **When acceptable:** a CI runner, a local dev box, or a demo that only ever processes synthetic / sample
+  HL7. **Never** on an instance that touches real patient data — a false declaration silently disables the
+  ePHI safeguards.
+- **Compensating controls:** it is a **loud, audited opt-out** — named by `security_loosenings()`, surfaced in
+  `GET /security/posture`, and warned at `serve`. Keep it out of any config a PHI instance could inherit.
+- **Still refused:** `[store].require_encryption = true` still forces a key even on synthetic; and this is a
+  **data-class** declaration, **orthogonal to `enforcement`** — it does not lower the AI data-scope ceiling or
+  re-enable DEBUG-with-PHI logging (both keyed on the retained `production` tier fact, not on `data_class`).
+
+---
+
+## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
+
+Assembled, not asserted per switch. **Provenance:** the NIST SP 800-53r5 control IDs/titles and the HIPAA
+Security Rule technical-safeguard citations are HIGH-confidence (verified against the primary catalogs —
+see *Sources*); the **HIPAA → 800-53r5 crosswalk** is [NIST SP 800-66r2](https://csrc.nist.gov/pubs/sp/800/66/r2/final)
+Appendix D. The **OWASP ASVS 5.0 chapters** (V6 Authentication, V7 Session Management, V8 Authorization, V11
+Cryptography, V12 Secure Communication, V13 Configuration, V14 Data Protection, V16 Security Logging) are
+verified against the [ASVS v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) primary source and match the
+project's own ASVS-5.0 L3 drive-to-pass mappings (BACKLOG #242–246); **exact ASVS sub-requirement IDs are
+carried from that drive-to-pass, not re-derived here.**
+
+| `[security]` switch(es) | OWASP ASVS v5.0 | NIST SP 800-53r5 | HIPAA §164.312 |
+|---|---|---|---|
+| `local_access_only`, `listen_address`, `require_encryption_for_remote` | V12 Secure Communication | **SC-7** Boundary Protection · **SC-8** Transmission Confidentiality and Integrity | §164.312(e)(1) Transmission Security |
+| `serve_web_console`, `web_console_public_address` | V13 Configuration · V3 Web Frontend Security | **SC-7** Boundary Protection · **AC-3** Access Enforcement | §164.312(a)(1) Access Control |
+| `encrypt_stored_data`, `allow_unencrypted_phi` | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
+| `allow_unencrypted_phi_under_strict_enforcement` (strict-enforcement ack) | V11 Cryptography | **SC-28** Protection of Information at Rest · **SC-13** Cryptographic Protection | §164.312(a)(2)(iv) Encryption and Decryption |
+| `require_sign_in` | V6 Authentication | **IA-2** Identification and Authentication (Organizational Users) | §164.312(d) Person or Entity Authentication |
+| `require_mfa` | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
+| `allow_single_factor_admin_when_exposed` (production ack) | V6 Authentication (multi-factor) | **IA-2(1)/(2)** MFA to Privileged / Non-Privileged Accounts | §164.312(d) Person or Entity Authentication |
+| `sign_out_after_idle_minutes`, `max_session_hours` | V7 Session Management | **AC-12** Session Termination | §164.312(a)(2)(iii) Automatic Logoff |
+| `block_unlisted_outbound` | V14 Data Protection | **AC-4** Information Flow Enforcement · **SC-7(5)** Deny by Default — Allow by Exception | §164.312(e)(1) Transmission Security |
+| `delete_message_bodies_after_days`, `allow_keeping_phi_indefinitely` | V14 Data Protection | **SI-12** Information Management and Retention | §164.316(b)(2) documentation retention · data-minimization (§164.502(b)) |
+| `audit_all_authorization_decisions` | V16 Security Logging and Error Handling | **AU-2** Event Logging · **AU-3** Content of Audit Records | §164.312(b) Audit Controls |
+| `handles_real_patient_data`, `production_instance` (posture lever) | V13 Configuration (risk-based) | **RA-2** Security Categorization · **AC-6** Least Privilege (risk-based tailoring) | §164.308(a)(1) Risk Analysis / Management |
+| `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
+
+> The synthetic-vs-PHI relaxation (a synthetic instance keeps the PHI-only gates relaxed) is **risk-based
+> tailoring** keyed on `handles_real_patient_data`: an instance carrying no ePHI is out of scope for the
+> ePHI-specific safeguards, which 800-53r5 supports via security categorization (RA-2) and the least-
+> privilege / need-to-apply principle (AC-6). The posture view **states** the relaxation so it is never
+> silent (ADR 0118 AC-6).
+
+### Sources
+
+- [OWASP Application Security Verification Standard v5.0.0](https://github.com/OWASP/ASVS/tree/v5.0.0) — chapter structure.
+- [NIST SP 800-53 Rev. 5, Security and Privacy Controls](https://csrc.nist.gov/pubs/sp/800/53/r5/upd1/final) — control catalog (SC-7, SC-8, SC-28, SC-13, IA-2, AC-12, AC-4, AU-2, AU-3, SI-12, RA-2, AC-6).
+- [NIST SP 800-66 Rev. 2, Implementing the HIPAA Security Rule](https://csrc.nist.gov/pubs/sp/800/66/r2/final) — Appendix D HIPAA → 800-53r5 crosswalk.
+- [45 CFR §164.312 — Technical safeguards](https://www.hhs.gov/hipaa/for-professionals/security/index.html) (HHS).
+- [CISA — Secure by Design](https://www.cisa.gov/securebydesign) — secure defaults + the loosening-guide model.

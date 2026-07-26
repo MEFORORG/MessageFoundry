@@ -11,11 +11,10 @@ from __future__ import annotations
 import collections
 import random
 
-from messagefoundry.parsing import Peek, normalize
-
 from harness.load.corpus import build_corpus
 from harness.load.ids import ControlIds
 from harness.load.profile import TypeMix, load_profile_text
+from messagefoundry.parsing import Peek, normalize
 
 _IDS = ControlIds(prefix="LX", width=12)
 

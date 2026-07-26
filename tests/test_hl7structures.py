@@ -51,7 +51,7 @@ def test_structure_segments_walk_and_dedup() -> None:
 def test_single_source_map() -> None:
     # generators/adt.py imports the map from here — there must be exactly ONE (CLAUDE.md: never duplicate).
     # getattr, not attribute access, so mypy's no-implicit-reexport doesn't flag adt's imported name.
-    assert getattr(adt, "TRIGGER_TO_STRUCTURE") is TRIGGER_TO_STRUCTURE
+    assert adt.TRIGGER_TO_STRUCTURE is TRIGGER_TO_STRUCTURE
 
 
 def test_verified_paths_readback_gate() -> None:

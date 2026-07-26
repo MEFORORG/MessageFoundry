@@ -110,7 +110,7 @@ export async function openCodeSetEditor(
   current.webview.onDidReceiveMessage(
     async (m: { command?: string; detail?: Detail; name?: string; to?: string }) => {
       if (m?.command === "save" && m.detail) {
-        await save(m.detail, current, opts.onSaved);
+        await save(m.detail, current, opts.onSaved, opts.editName);
       } else if (m?.command === "rename" && m.name && m.to) {
         await rename(m.name, m.to, current, opts.onSaved);
       } else if (m?.command === "delete" && m.name) {
@@ -125,13 +125,25 @@ export async function openCodeSetEditor(
   current.webview.html = codeSetFormHtml(current.webview, initial, readonly, existing);
 }
 
-async function save(detail: Detail, current: vscode.WebviewPanel, onSaved?: () => void): Promise<void> {
+async function save(
+  detail: Detail,
+  current: vscode.WebviewPanel,
+  onSaved?: () => void,
+  editName?: string,
+): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     return;
   }
+  // Create-intent (#240): pass `--name <editName>` on an EDIT of an existing stem so the CLI treats the
+  // save as an overwrite of that code set; OMIT it when creating a new table so the server refuses a
+  // name collision (`create=--name is None`) instead of silently overwriting an existing code set.
+  const args = ["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(detail)];
+  if (editName) {
+    args.push("--name", editName);
+  }
   try {
-    await runJson(["codeset", "upsert", "--config", configDir(), "--data", JSON.stringify(detail)], ws);
+    await runJson(args, ws);
   } catch (e) {
     // Surface the validation/CLI error inline so the user can fix the grid (file was not changed).
     current.webview.postMessage({ command: "error", message: String(e) });

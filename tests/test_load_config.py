@@ -221,8 +221,10 @@ def test_all_shipped_profiles_parse() -> None:
     # profile). connscale*/pooled*/fuse*/batch*.toml are a DIFFERENT schema ([connscale], not [load])
     # consumed by the --connscale CLI (covered by test_connscale_profile.py / test_connscale_fuse.py /
     # test_connscale_batch.py) — exactly the set that list_connscale_profiles() globs (connscale*,
-    # pooled*, fuse*, batch*) — so they are excluded here. Keep this in step with
-    # harness.load.connscale.profile.list_connscale_profiles().
+    # pooled*, fuse*, batch*) — so they are excluded here. estate*.toml are ANOTHER distinct schema
+    # ([estate], the #216 demo-shape driver, covered by test_estate_profile.py) globbed by
+    # list_estate_profiles(), excluded for the same reason. Keep this in step with
+    # harness.load.connscale.profile.list_connscale_profiles() + harness.load.estate.profile.list_estate_profiles().
     profiles = [
         p
         for p in sorted(PROFILES_DIR.glob("*.toml"))
@@ -231,6 +233,7 @@ def test_all_shipped_profiles_parse() -> None:
             or p.name.startswith("pooled")
             or p.name.startswith("fuse")
             or p.name.startswith("batch")
+            or p.name.startswith("estate")
         )
     ]
     assert len(profiles) >= 8, "expected the shipped profile set; did the directory move?"

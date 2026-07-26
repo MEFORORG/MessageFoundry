@@ -32,9 +32,10 @@ from __future__ import annotations
 import asyncio
 import os
 import random
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, cast
+from typing import Any, cast
 
 import pytest
 
@@ -1246,7 +1247,7 @@ async def test_adr0070_6_spin_collapses_to_backoff(store: Any) -> None:
         # THE fix-A store fact: list_fifo_lanes reports the head NOT-due (> now). The old release left
         # it past-due (<= now), which is exactly what re-readied it ~4×/s.
         lanes = await store.list_fifo_lanes(Stage.INGRESS.value, now=mc.now)
-        head_due = {ln: due for ln, due in lanes}[lane]
+        head_due = {ln: due for ln, due in lanes}[lane]  # noqa: C416
         assert head_due > mc.now
         assert head_due == pytest.approx(park_until)
 
@@ -1757,8 +1758,30 @@ async def test_resume_resweeps_backed_off_head_then_drains(store: Any) -> None:
         d.resume_lane(
             lane
         )  # head still NOT due -> claim EMPTY -> IDLE; the immediate sweep arms a timer
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
-        assert lane in d._timer_deadline
+        # HALF ONE — "re-arms from the head" — asserted SYNCHRONOUSLY, with no await in between.
+        # `resume_lane` is sync and `mark_ready` flips IDLE -> READY inside it, so the re-arm is
+        # observable the instant it returns and nothing can race us to it. This half used to be
+        # pinned only by accident: the old code asserted the timer immediately after waiting on the
+        # phase, so dropping `mark_ready` was *sometimes* caught by the timer assertion firing before
+        # the sweep had run — detection by luck, in a test that also failed by luck.
+        assert d.phase(lane) == _LanePhase.READY
+        # HALF TWO — "requests an immediate sweep".
+        # Poll for BOTH, not just the phase. `resume_lane` drives two INDEPENDENT async paths: the
+        # claim episode (READY -> CLAIMING -> IDLE when the claim comes back empty) and the sweep it
+        # requests via `_sweep_now.set()`, which is what actually arms the timer. Nothing orders those
+        # two, so IDLE is reachable while `_timer_deadline` is still empty — waiting on the phase and
+        # then asserting the timer is polling a PROXY for the condition under test, and it flaked on
+        # CI's Postgres leg exactly that way (`assert 'IB_RESUME_RETRY' in {}`).
+        #
+        # Safe to poll for presence: the dispatcher runs on the ManualClock here, which does not
+        # advance until the `mc.advance(...)` below, so an armed timer cannot fire and disappear
+        # underneath the assertion.
+        #
+        # NB the sibling park assertion (`_wait_until(phase == PARKED)` then `lane in d._timers`)
+        # needs no such treatment — `_park` sets the phase and arms its timer in ONE synchronous span.
+        assert await _wait_until(
+            lambda: d.phase(lane) == _LanePhase.IDLE and lane in d._timer_deadline
+        )
         assert d._timer_deadline[lane] == pytest.approx(nxt)  # armed at the head's exact due time
         assert (
             len([r for r in stub.records if r.lane == lane]) == 1

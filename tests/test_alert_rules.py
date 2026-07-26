@@ -24,7 +24,7 @@ class _RecordingTransport:
         self.name = name
         self.events: list[dict[str, Any]] = []
 
-    async def send(self, event: dict[str, Any]) -> None:
+    async def send(self, event: dict[str, Any], **_kw: Any) -> None:
         self.events.append(event)
 
 
@@ -376,6 +376,20 @@ def test_rule_targets_rcsi_off_degraded_and_routes() -> None:
     d = AlertRuleSet([rule]).decide({"type": "rcsi_off_degraded", "connection": "pipeline"})
     assert d.severity == "critical"
     assert d.transports == ("webhook",)  # decide() returns the rule's subset as a tuple
+
+
+def test_rule_targets_bootstrap_admin_expiring_and_routes() -> None:
+    # ASVS 6.4.5 arm 2: an unclaimed first-run bootstrap admin about to be auto-disabled is page-worthy
+    # on an exposed instance — an operator must be able to escalate the reminder and route it to a
+    # dedicated transport, not just take the default (all transports, warning).
+    rule = AlertRule(
+        event_type="bootstrap_admin_expiring", severity=AlertSeverity.CRITICAL, transports=["email"]
+    )
+    d = AlertRuleSet([rule]).decide(
+        {"type": "bootstrap_admin_expiring", "connection": "bootstrap-admin"}
+    )
+    assert d.severity == "critical"
+    assert d.transports == ("email",)
 
 
 async def test_lane_stuck_and_rcsi_off_degraded_emit_and_route_end_to_end() -> None:

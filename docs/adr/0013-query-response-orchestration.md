@@ -466,6 +466,17 @@ A task isn't done until these pass (CLAUDE.md §5 — new behavior gets a test):
   `check`/dry-run **without a store**; the `connections.toml` desugar path fails identically.
 - **Backend parity.** A Postgres `complete_with_response` test producing an identical `response` row +
   finalization; a **SQL Server "rejected at engine start"** test.
+
+  > **Update (2026-07-14):** the SQL Server **"rejected at engine start"** test is **VOID** — it would
+  > fail. SQL Server has implemented capture + `reingress_to`/`Loopback()` re-ingress at full parity since
+  > #249 (`c6010195`, 2026-06-15), so a capturing outbound is **accepted**, not rejected. This resolves a
+  > contradiction *within this very document*: the "Backend parity" section below already states correctly
+  > that SQL Server "implements the `response` table + `complete_with_response` with the **same
+  > single-transaction boundary**, so capture works identically there (`supports_response_capture =
+  > True`)". **That passage is the correct one** — it matches the code; this test-plan bullet does not.
+  > The real parity tests exercise the capture/re-ingress loop against a **real SQL Server** and a real
+  > Postgres in `tests/test_x12_rte.py`. See the
+  > [capability matrix](../CONFIGURATION.md#per-backend-capability-matrix).
 - **Finalizer invisibility.** A message with a `done` outbound **and** a `response` row finalizes to
   `PROCESSED` (the `response` table never appears in `_maybe_finalize_message`'s `GROUP BY`).
 - **Retention.** `purge_message_bodies` nulls `response.body`/`detail` in the same transaction for the
@@ -519,3 +530,54 @@ into the *existing* DeliveryResponse carriage.
 (`HTTP 201`) shown verbatim; overloading it with structured header JSON would break that contract and every
 reader. The nullable encrypted column reuses the store's existing column-migration + PHI-at-rest machinery
 and reaches the designed `response_get` reader with zero new surface.
+
+## Amendment (2026-07-17) — DATABASE capture of stored-proc OUT params + scalar return value (BACKLOG #67)
+
+The "DATABASE capture must be `RETURNING`/`OUTPUT`" subsection (above) captures a write's `RETURNING`/`OUTPUT`
+**result-set** via one pre-commit `fetchall()`. It missed one real shape: a **stored procedure** that returns
+its status through **OUT parameters** and/or a **scalar return value** rather than a result-set — and a proc
+batch that reports those via a trailing readback `SELECT` (`DECLARE @rv INT; EXEC @rv = dbo.proc :mrn; SELECT
+@rv AS status;`) carries **neither** a `RETURNING` **nor** an `OUTPUT` token, so the wiring gate rejected
+`capture_response=True` on it. #67 folds this in as a **narrow, additive** extension.
+
+**Contract.**
+
+- A new **explicit opt-in** setting `capture_out_params: bool = False` on `Database()` (default off →
+  **byte-identical**). It is the choke the wiring gate widens on — **NOT** a loosening of the `returning`/
+  `output` substring test. When set, the wiring factory (`config/wiring.py`, the same pre-commit choke that
+  validates every capture) requires the statement to be a **stored-proc call** (an ODBC `{ … CALL … }` escape,
+  or a leading `EXEC`/`EXECUTE`) and then **authorizes capture without the substring** — so a scalar-return or
+  OUT-param proc captures, while the flag can never silently mask a plain `INSERT`/`UPDATE` whose result-set
+  would re-run non-idempotently. `capture_out_params=True` **implies** `capture_response=True` (the connector
+  self-consistently captures when out-params are requested, regardless of whether the wiring gate ran).
+- **Same-cursor, pre-commit read only.** The OUT/return values are read back from the **same cursor before the
+  existing `commit()`**, exactly like the result-set path — **never** a separate post-commit `SELECT` (which
+  would re-execute the non-idempotent proc on an at-least-once re-run and read *different* state). Because
+  `pyodbc`/`aioodbc` do **not** support native ODBC output-parameter binding (a documented driver limitation),
+  the sanctioned mechanism is a **trailing readback `SELECT`** of the OUT params + scalar return **in the same
+  proc batch**, whose result-set is fetched pre-commit — this is the only re-run-stable path on this stack.
+- **`_capture` merges all result sets** when `capture_out_params` is set: a proc can emit data result-set(s)
+  **and** a trailing OUT/return `SELECT`, so capture walks `cursor.nextset()` and merges every set's rows into
+  the one bounded JSON body (respecting the existing `capture_max_rows`/`capture_max_bytes` caps), rather than
+  reading only the first set and dropping the OUT/return values. Default (`capture_out_params=False`) stays the
+  single-`fetchall()` path, byte-identical. `_capture` **still never raises** — a capture problem degrades to
+  `no_reply`/`unparseable` with an empty body and **must not un-succeed** the already-successful write.
+- **PHI.** OUT/return scalars are **PHI-class** identically to a result-set — they ride the existing
+  AES-256-GCM `response` table, are reachable only through the body-gated `GET /messages/{id}/responses`, and
+  are never logged at INFO+. No new store column, no new read surface, no schema change (they reuse the
+  `response.body` carriage).
+
+**Atomicity caveat (recorded, not solved).** The pre-commit-capture guarantee assumes the proc's writes and
+its readback `SELECT` share **our** transaction. A stored procedure that issues an **internal `COMMIT` or
+`ROLLBACK`** (or opens its own transaction) **defeats that assumption**: an internal `COMMIT` already durably
+persisted the write before our `commit()`, and an internal `ROLLBACK` discards work under our `BEGIN` — so on
+an at-least-once re-run the readback can diverge from what was persisted. This is the same class as the
+standing "a non-idempotent outbound re-derives a different value on re-send" hazard (the residual capture
+re-run window above), made explicit for procs: **write the proc to be idempotent and to not COMMIT/ROLLBACK
+internally**, or accept that a crash-re-send may capture a different OUT/return value as `response_seq = N+1`.
+
+**Why the explicit flag (over loosening the substring test).** Dropping the `returning`/`output` requirement
+for *every* capturing DATABASE statement would let a plain non-idempotent `INSERT` capture its result-set with
+no re-run-stability signal — exactly the hazard the substring gate guards. The opt-in flag keeps that gate
+intact for ordinary writes and narrows the widened path to **operator-declared stored-proc calls**, where the
+idempotency + no-internal-transaction obligation is stated and owned.

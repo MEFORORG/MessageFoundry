@@ -86,9 +86,9 @@ def test_split_batch_drops_fhs_bhs_envelope() -> None:
 def test_split_batch_custom_separators() -> None:
     # A batch whose MSH-1 isn't `|` must still split per-message (not be read as one giant message).
     batch = (
-        "MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
-        "MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
-    ).encode("utf-8")
+        b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A01^M1^P^2.5.1\r"
+        b"MSH^~|\\&^A^B^C^D^20260101^^ADT~A02^M2^P^2.5.1\r"
+    )
     msgs = split_batch(batch)
     assert len(msgs) == 2
     assert msgs[0].startswith("MSH^~|\\&^A^B^C^D^20260101^^ADT~A01")

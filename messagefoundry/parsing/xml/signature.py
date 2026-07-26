@@ -21,7 +21,6 @@ Pure: no engine imports.
 from __future__ import annotations
 
 import hashlib  # noqa: F401 - crypto-inventory anchor: XML-DSig digests run via signxml/cryptography
-
 from dataclasses import dataclass
 
 from messagefoundry.parsing.xml._deps import load_signxml

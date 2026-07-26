@@ -59,6 +59,12 @@ export function findElements(text: string): ConfigElement[] {
   return out;
 }
 
+/** True when `text` defines at least one `@handler` — the only element the Steps view can render, so
+ *  the "View as Steps" editor-title button / menu item is offered only for files that have one. */
+export function hasHandler(text: string): boolean {
+  return findElements(text).some((el) => el.kind === "handler");
+}
+
 class ConfigCodeLensProvider implements vscode.CodeLensProvider {
   private readonly changed = new vscode.EventEmitter<void>();
   readonly onDidChangeCodeLenses = this.changed.event;
@@ -82,7 +88,7 @@ class ConfigCodeLensProvider implements vscode.CodeLensProvider {
       if (el.kind === "handler") {
         lenses.push(
           new vscode.CodeLens(range, {
-            title: "$(list-tree) View as Steps",
+            title: "$(list-ordered) View as Steps",
             tooltip: "Open this Handler as the read-only Steps view (ADR 0076)",
             command: "messagefoundry.openSteps",
             arguments: [document.uri],
@@ -118,8 +124,12 @@ class ConfigCodeLensProvider implements vscode.CodeLensProvider {
  */
 export function registerEditorToolbar(context: vscode.ExtensionContext): void {
   const update = (editor: vscode.TextEditor | undefined): void => {
-    const on = !!editor && isConfigFile(editor.document.uri.fsPath, workspaceDir(), configDir());
-    void vscode.commands.executeCommand("setContext", "messagefoundry.isConfigFile", on);
+    const isCfg = !!editor && isConfigFile(editor.document.uri.fsPath, workspaceDir(), configDir());
+    void vscode.commands.executeCommand("setContext", "messagefoundry.isConfigFile", isCfg);
+    // The Steps view only renders Handlers, so its editor-title button / submenu item appears only when
+    // the active config file actually defines one (the per-@handler CodeLens is already so gated).
+    const hasH = !!(editor && isCfg && hasHandler(editor.document.getText()));
+    void vscode.commands.executeCommand("setContext", "messagefoundry.activeFileHasHandler", hasH);
   };
   update(vscode.window.activeTextEditor);
 
@@ -127,6 +137,13 @@ export function registerEditorToolbar(context: vscode.ExtensionContext): void {
   context.subscriptions.push(
     lenses,
     vscode.window.onDidChangeActiveTextEditor(update),
+    // Keep the handler context key live as a `@handler` is typed into / out of the active file.
+    vscode.workspace.onDidChangeTextDocument((e) => {
+      const active = vscode.window.activeTextEditor;
+      if (active && e.document === active.document) {
+        update(active);
+      }
+    }),
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("messagefoundry.configDir")) {
         update(vscode.window.activeTextEditor);

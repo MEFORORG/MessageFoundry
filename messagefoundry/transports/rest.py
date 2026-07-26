@@ -58,6 +58,7 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    encode_wire_body,
     register_destination,
 )
 from messagefoundry.transports.signing import MessageSigner, signer_from_destination
@@ -65,8 +66,13 @@ from messagefoundry.transports.signing import MessageSigner, signer_from_destina
 __all__ = [
     "DYNAMIC_HEADER_PREFIX",
     "InsecureHopGuard",
+    "ProxyConfig",
     "RestDestination",
     "capture_response_headers",
+    "ech_sidecar_url_from_settings",
+    "egress_route_from_settings",
+    "proxy_auth_handler_from_settings",
+    "proxy_config_from_settings",
     "enforce_outbound_length_limits",
     "normalize_header_allowlist",
     "outbound_headers_from_metadata",
@@ -214,15 +220,34 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
 _NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
 
 
-def _insecure_opener() -> urllib.request.OpenerDirector:
-    """A no-redirect opener that does **not** verify TLS — built only when the dev escape is set."""
+def _no_redirect_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+) -> urllib.request.OpenerDirector:
+    """A PER-CONNECTION verifying, no-redirect opener carrying ``extra_handlers`` (a forward-proxy
+    ``ProxyHandler``, a reactive ``ProxyDigestAuthHandler``, …) — used in place of the shared
+    :data:`_NO_REDIRECT_OPENER` whenever a connection needs a handler the shared one lacks, so the shared
+    opener is **never** mutated (ADR 0126). Passing a ``ProxyHandler`` here also suppresses urllib's
+    default env-reading ProxyHandler (``build_opener`` skips a default whose class a supplied handler
+    already covers), so there is never a competing double-proxy."""
+    return urllib.request.build_opener(_NoRedirectHandler, *extra_handlers)
+
+
+def _insecure_opener(
+    *extra_handlers: urllib.request.BaseHandler,
+) -> urllib.request.OpenerDirector:
+    """A no-redirect opener that does **not** verify TLS — built only when the dev escape is set. Threads
+    any ``extra_handlers`` (e.g. a forward-proxy handler, ADR 0126) into the same per-connection opener."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(
+        _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
+    )
 
 
-def _expiry_relaxed_opener(host: str) -> urllib.request.OpenerDirector:
+def _expiry_relaxed_opener(
+    host: str, *extra_handlers: urllib.request.BaseHandler
+) -> urllib.request.OpenerDirector:
     """A no-redirect opener that verifies chain + hostname but tolerates an EXPIRED server cert (#129,
     ADR 0094). Built per connection (not the shared module-level verifying opener) only when
     ``tls_allow_expired=true``: it starts from the same verifying default context (OS trust store,
@@ -232,7 +257,9 @@ def _expiry_relaxed_opener(host: str) -> urllib.request.OpenerDirector:
     still rejected. Shared verbatim by the SOAP destination."""
     ctx = ssl.create_default_context()
     relax_verify_expiry(ctx, host=host)  # chain + hostname stay enforced; only expiry is relaxed
-    return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(
+        _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
+    )
 
 
 def _redact_url(url: str) -> str:
@@ -263,7 +290,7 @@ def _current_hop_posture_fail_closed() -> HopPosture:
     send-time recompute which runs past that scope) sees ``None`` and fails closed — treats the hop as
     production PHI so an unproven posture never *relaxes* a refusal (ADR 0092 decision 7)."""
     posture = current_hop_posture()
-    return HopPosture(is_phi=True, production=True) if posture is None else posture
+    return HopPosture(is_phi=True, enforcing=True) if posture is None else posture
 
 
 def _shipped_strict_disposition(
@@ -277,10 +304,10 @@ def _shipped_strict_disposition(
     REFUSE for a non-prod PHI hop that reaches the gradient's WARN *without* the escape (arm 6). Only the
     non-prod escape (arm 4 → WARN), a per-hop attestation, on-box loopback, or a synthetic instance
     (all → ALLOW) relaxes it. Pure — no I/O — so the send-time guard can reuse it verbatim."""
-    audited_opt_out = hop_insecure_escape_downgrades(production=posture.production)
+    audited_opt_out = hop_insecure_escape_downgrades(enforcing=posture.enforcing)
     disposition = insecure_hop_disposition(
         is_phi=posture.is_phi,
-        production=posture.production,
+        enforcing=posture.enforcing,
         is_loopback_hop=is_loopback_hop_host(host),
         hop_attested=attested,
         audited_opt_out=audited_opt_out,
@@ -334,7 +361,7 @@ def _enforce_shipped_hop(
         disposition is HopDisposition.ALLOW
         and attested
         and posture.is_phi
-        and posture.production
+        and posture.enforcing
         and not is_loopback_hop_host(host)
     ):
         logger.warning(
@@ -483,6 +510,312 @@ def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
             )
 
 
+# --- forward/egress web proxy (BACKLOG #112/#127/#128, ADR 0126) -----------------------------------
+#
+# A per-connection forward proxy for the whole stdlib HTTP family (REST/SOAP/FHIR/fhir_lookup/DICOMweb +
+# the OAuth2/SMART token endpoints). Built into a per-connection ``ProxyHandler`` threaded through EVERY
+# opener path (the shared _NO_REDIRECT_OPENER is NEVER mutated), plus the pre-emptive tunnel-header Basic
+# credential the reactive stdlib handlers cannot supply for an https destination. Off by default →
+# byte-identical.
+
+#: Sentinel ``proxy_url`` value meaning "Use the OS/environment default web proxy" (getproxies()), #112.
+_PROXY_DEFAULT = "default"
+
+
+def _normalize_no_proxy(value: Any) -> tuple[str, ...]:
+    """The per-connection proxy-bypass list as a tuple of lowercased host patterns (#128). Accepts a
+    list/tuple of names or a single comma-separated string; anything else (incl. ``None``) → empty."""
+    if not value:
+        return ()
+    items: list[str]
+    if isinstance(value, str):
+        items = value.split(",")
+    elif isinstance(value, (list, tuple, set, frozenset)):
+        items = [str(x) for x in value]
+    else:
+        return ()
+    return tuple(p.strip().lower() for p in items if p and str(p).strip())
+
+
+def _strip_proxy_host_port(host: str) -> str:
+    """A bypass-comparable host: strip an optional ``[…]`` bracket and a trailing ``:port`` — but NEVER
+    port-split an IPv6 literal. The callers pass ``urlsplit(url).hostname``, which is already UNBRACKETED
+    and PORT-LESS (``https://[::1]:8443/`` → ``"::1"``), so an IPv6 host (>= 2 colons) must be left intact:
+    ``"::1".split(":")`` would truncate it to ``""``. A bypass-LIST entry may be authored ``[::1]`` or
+    ``::1``; both normalize to ``::1`` here. A non-IPv6 ``name:port`` / IPv4:port still strips its port."""
+    bare = host.strip().strip("[]")
+    return bare if bare.count(":") >= 2 else bare.split(":", 1)[0]
+
+
+def _proxy_bypasses(host: str, bypass: tuple[str, ...]) -> bool:
+    """NO_PROXY-style match of ``host`` against a per-connection bypass list (#128): exact host, a
+    ``.suffix`` / ``*.suffix`` domain match, or ``*`` (bypass all). Optional port + trailing dot are
+    stripped; an IPv6 literal (``::1``, ``2001:db8::1``) is matched intact (never port-truncated)."""
+    if not host or not bypass:
+        return False
+    h = _strip_proxy_host_port(host).lower().rstrip(".")
+    for raw in bypass:
+        pat = _strip_proxy_host_port(raw).lower().rstrip(".")
+        if not pat:
+            continue
+        if pat == "*":
+            return True
+        suffix = pat.lstrip("*").strip(".")
+        if not suffix:
+            continue
+        if h == suffix or h.endswith("." + suffix):
+            return True
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _ProxyDigestRecipe:
+    """Inputs for a fresh reactive ``ProxyDigestAuthHandler`` (#127, http-destination only). Rebuilt per
+    opener (a urllib handler binds to its opener, so it is never shared across openers)."""
+
+    proxy_url: str
+    user: str
+    password: str
+
+    def build(self) -> urllib.request.ProxyDigestAuthHandler:
+        pwmgr = urllib.request.HTTPPasswordMgrWithDefaultRealm()
+        pwmgr.add_password(None, self.proxy_url, self.user, self.password)
+        return urllib.request.ProxyDigestAuthHandler(pwmgr)
+
+
+@dataclass(frozen=True, slots=True)
+class ProxyConfig:
+    """A resolved per-connection forward proxy (ADR 0126). Carries the proxy address (or the "use default
+    web proxy" flag), the NO_PROXY bypass list, the pre-emptive Basic ``Proxy-Authorization`` header (or
+    none), and the reactive Digest recipe (or none). :meth:`for_host` resolves it against a specific
+    target host (a destination / a token endpoint), returning ``None`` when that host is bypassed (#128)."""
+
+    proxies: tuple[tuple[str, str], ...]  # (("http", url), ("https", url)); () when use_default
+    use_default: bool  # True → ProxyHandler() reading getproxies() ("Use Default Web Proxy", #112)
+    bypass: tuple[str, ...]
+    auth_header: tuple[tuple[str, str], ...]  # (("Proxy-Authorization", "Basic .."),) or ()
+    digest: _ProxyDigestRecipe | None
+    redacted: str  # a PHI/secret-safe rendering of the proxy for logs (never the raw URL/creds)
+
+    def _build_proxy_handler(self) -> urllib.request.ProxyHandler:
+        if self.use_default:
+            return urllib.request.ProxyHandler()  # reads getproxies() (+ system no_proxy) fresh
+        return urllib.request.ProxyHandler(dict(self.proxies))
+
+    def for_host(self, host: str) -> _HostProxy | None:
+        """The proxy resolved for ``host``, or ``None`` if the host is bypassed (#128) — a bypassed host
+        gets NO proxy handler and NO proxy credential (byte-identical to no proxy)."""
+        if _proxy_bypasses(host, self.bypass):
+            return None
+        return _HostProxy(self)
+
+
+@dataclass(frozen=True, slots=True)
+class _HostProxy:
+    """A :class:`ProxyConfig` resolved for one (non-bypassed) target host."""
+
+    config: ProxyConfig
+
+    def opener_handlers(self) -> tuple[urllib.request.BaseHandler, ...]:
+        """Fresh handlers to thread into THIS host's opener (a ProxyHandler, + a reactive Digest handler
+        when configured). Fresh each call — a urllib handler binds to its opener, so it is never shared."""
+        handlers: list[urllib.request.BaseHandler] = [self.config._build_proxy_handler()]
+        if self.config.digest is not None:
+            handlers.append(self.config.digest.build())
+        return tuple(handlers)
+
+    def auth_headers(self) -> dict[str, str]:
+        """The pre-emptive proxy-auth header(s) to add to each request (Basic; empty for Digest/none)."""
+        return dict(self.config.auth_header)
+
+
+def proxy_auth_handler_from_settings(
+    s: Mapping[str, Any],
+    *,
+    proxy_url: str,
+    proxy_scheme: str,
+    dest_scheme: str,
+    attested: bool,
+) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
+    """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
+    recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
+    here beside the opener plumbing so ``smart.py``'s token opener can reuse it without a
+    ``smart → http_auth`` import cycle; ``http_auth.py`` re-exports the name.)
+
+    Basic (the default when a credential is set) → a pre-emptive ``Proxy-Authorization: Basic`` header,
+    which works for BOTH http and https destinations (urllib moves it into the CONNECT tunnel for https).
+    Digest → the reactive stdlib handler, **refused for an https destination** (the 407 is inside the
+    CONNECT tunnel; digest-over-CONNECT is unsupported). NTLM/Windows → **refused** (deferred, ADR 0126).
+    A cleartext ``http`` proxy hop carrying the credential is refused REGARDLESS of destination scheme via
+    the ONE posture-keyed authority (:func:`refuse_cleartext_credential_hop`)."""
+    user = s.get("proxy_user")
+    password = s.get("proxy_password")
+    auth_type = s.get("proxy_auth_type")
+    if not user and not password:
+        if auth_type:
+            raise ValueError(
+                "proxy_auth_type is set without proxy_user/proxy_password — configure the proxy "
+                "credentials (via env()) or drop proxy_auth_type (ADR 0126)"
+            )
+        return (), None
+    if not user or not password:
+        raise ValueError(
+            "a proxy credential needs BOTH proxy_user and proxy_password (put the password in env()) "
+            "(ADR 0126)"
+        )
+    # A proxy credential over a cleartext http proxy hop crosses in the clear on the CONNECT/request —
+    # refuse it REGARDLESS of destination scheme, posture-keyed (ADR 0092). Names only the proxy host.
+    refuse_cleartext_credential_hop(
+        proxy_scheme, proxy_url, credential="web-proxy credential", attested=attested
+    )
+    kind = str(auth_type or "basic").strip().lower()
+    if kind == "basic":
+        raw = f"{user}:{password}".encode()
+        header = ("Proxy-Authorization", "Basic " + base64.b64encode(raw).decode("ascii"))
+        return (header,), None
+    if kind == "digest":
+        if dest_scheme == "https":
+            raise ValueError(
+                "proxy_auth_type='digest' is not supported for an https destination — the proxy's 407 "
+                "challenge arrives inside the CONNECT tunnel (digest-over-CONNECT is unsupported); use "
+                "proxy_auth_type='basic' (pre-emptive) or a local authenticating proxy (ADR 0126)"
+            )
+        return (), _ProxyDigestRecipe(proxy_url, str(user), str(password))
+    if kind in ("ntlm", "windows"):
+        raise ValueError(
+            f"proxy_auth_type={kind!r} is deferred (NTLM/Negotiate is connection-bound; urllib opens a "
+            "new connection per request) — use 'basic'/'digest' or a local authenticating proxy such as "
+            "cntlm (ADR 0126)"
+        )
+    raise ValueError(
+        f"proxy_auth_type must be one of basic/digest/ntlm/windows, got {kind!r} (ADR 0126)"
+    )
+
+
+def proxy_config_from_settings(
+    s: Mapping[str, Any], *, dest_scheme: str, attested: bool = False
+) -> ProxyConfig | None:
+    """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
+    or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
+    (#128), and ``proxy_user``/``proxy_password``/``proxy_auth_type`` (#127). ``dest_scheme`` is the
+    target's scheme (for the digest-over-https refusal); ``attested`` keys the cleartext-proxy-hop guard.
+
+    ``proxy_url``: absent/empty → ``None``; ``"default"`` → the OS/environment default web proxy
+    (``getproxies()``); an ``http(s)://`` URL → an explicit forward proxy used for both schemes."""
+    raw = s.get("proxy_url")
+    if not raw:
+        return None
+    bypass = _normalize_no_proxy(s.get("proxy_no_proxy"))
+    proxy_url = str(raw).strip()
+    if proxy_url.lower() == _PROXY_DEFAULT:
+        # "Use Default Web Proxy" — explicit creds are meaningless here (the system proxy carries its own),
+        # so reject the ambiguous combo rather than silently drop a configured credential.
+        if s.get("proxy_user") or s.get("proxy_password") or s.get("proxy_auth_type"):
+            raise ValueError(
+                "proxy_url='default' (use the system default web proxy) cannot be combined with "
+                "explicit proxy credentials — set an explicit proxy_url to authenticate (ADR 0126)"
+            )
+        return ProxyConfig(
+            proxies=(),
+            use_default=True,
+            bypass=bypass,
+            auth_header=(),
+            digest=None,
+            redacted="default web proxy",
+        )
+    proxy_scheme = urllib.parse.urlsplit(proxy_url).scheme.lower()
+    if proxy_scheme not in ("http", "https"):
+        raise ValueError(
+            f"proxy_url must be 'default' or an http(s):// address, got scheme {proxy_scheme!r} "
+            "(ADR 0126)"
+        )
+    auth_header, digest = proxy_auth_handler_from_settings(
+        s,
+        proxy_url=proxy_url,
+        proxy_scheme=proxy_scheme,
+        dest_scheme=dest_scheme,
+        attested=attested,
+    )
+    return ProxyConfig(
+        proxies=(("http", proxy_url), ("https", proxy_url)),
+        use_default=False,
+        bypass=bypass,
+        auth_header=auth_header,
+        digest=digest,
+        redacted=_redact_url(proxy_url),
+    )
+
+
+# --- ECH egress route (ADR 0139, ASVS 12.1.5) ---------------------------------------------------------
+
+_ECH_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost"})
+
+
+def _is_loopback_host(host: str) -> bool:
+    h = host.strip().lower().strip("[]")
+    return h in _ECH_LOOPBACK_HOSTS or h.startswith("127.")
+
+
+def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
+    """The loopback ECH-sidecar base URL for this connection (ADR 0139), or ``None`` when ``ech_egress``
+    is unset (byte-identical).
+
+    ECH hides the outbound SNI, but stdlib ``ssl`` (OpenSSL 3.5.x) has no ECH — it is an OpenSSL 4.0
+    feature (a local ``ctypes`` probe found zero ECH symbols in the bundled ``libssl``). So an
+    ``ech_egress`` connection routes through a **loopback ECH sidecar** — the TLS-**terminating**
+    re-originator at ``tools/ech-sidecar/`` (proven to hide the SNI against a real ECH endpoint). It is
+    NOT a forward proxy: a proxy would tunnel ``https`` via CONNECT and the engine's own non-ECH
+    ClientHello would still leak the SNI. Instead the REST destination sends its request to the sidecar
+    over **cleartext loopback** with the real destination in the ``Host`` header (see
+    :meth:`RestDestination._ech_request`), and the sidecar re-originates the ``https`` + ECH connection —
+    verifying the upstream cert. So **destination TLS (verification + ECH) is delegated to the sidecar**;
+    the engine→sidecar hop is same-host cleartext (ADR 0092 loopback posture).
+
+    Config fails closed: ``ech_egress`` set with no ``ech_sidecar`` raises, and a **non-loopback** sidecar
+    is refused (a remote "sidecar" would leak the SNI on the hop to it, defeating the purpose).
+
+    Inert until a destination actually publishes an ECHConfig (as of 2026-07 a DoH probe found no EHR
+    endpoint does — demand-gated, ADR 0139)."""
+    if not s.get("ech_egress"):
+        return None
+    raw = s.get("ech_sidecar")
+    sidecar = str(raw).strip() if raw else ""
+    if not sidecar:
+        raise ValueError(
+            "ech_egress is set but ech_sidecar is empty — supply the loopback ECH sidecar URL, "
+            "e.g. http://127.0.0.1:8123 (ADR 0139)"
+        )
+    parsed = urllib.parse.urlsplit(sidecar)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise ValueError(
+            f"ech_sidecar must be an http(s):// loopback URL, got {sidecar!r} (ADR 0139)"
+        )
+    if not _is_loopback_host(parsed.hostname):
+        raise ValueError(
+            "ech_sidecar must be a loopback address (the ECH sidecar runs beside the engine; a remote "
+            "sidecar would leak the SNI on the hop to it, defeating the purpose) (ADR 0139)"
+        )
+    return sidecar.rstrip("/")
+
+
+def egress_route_from_settings(
+    s: Mapping[str, Any], *, dest_scheme: str, attested: bool = False
+) -> ProxyConfig | None:
+    """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
+    (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is
+    implemented only on the REST destination in this build, so any *other* connector that reaches here
+    with ``ech_egress`` set would silently NOT hide the SNI — refuse loudly rather than leak it. (The
+    REST destination resolves ECH itself via :func:`ech_sidecar_url_from_settings` and never calls this
+    for the ECH case.)"""
+    if s.get("ech_egress"):
+        raise ValueError(
+            "ech_egress (ASVS 12.1.5 SNI hiding) is supported only on the REST destination in this "
+            "build; on this connector it would NOT hide the SNI, so it is refused rather than silently "
+            "leaking it (ADR 0139)"
+        )
+    return proxy_config_from_settings(s, dest_scheme=dest_scheme, attested=attested)
+
+
 class RestDestination(DestinationConnector):
     """Deliver each transformed payload to an HTTP(S) endpoint (outbound only today)."""
 
@@ -515,7 +848,30 @@ class RestDestination(DestinationConnector):
         attested = config.tls_hop_attested
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
+        # request to a loopback terminating sidecar at send time (see _ech_request); destination TLS +
+        # ECH are the sidecar's, so no forward proxy is used. Off (default) → None → byte-identical.
+        self._ech_sidecar: str | None = ech_sidecar_url_from_settings(s)
+        if self._ech_sidecar is not None and s.get("proxy_url"):
+            raise ValueError(
+                "ech_egress and proxy_url are mutually exclusive — the ECH sidecar IS this connection's "
+                "egress path (ADR 0139)"
+            )
+        # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy. None (default, or when
+        # ECH is active) → no ProxyHandler and no Proxy-Authorization threaded below → byte-identical.
+        self._proxy: ProxyConfig | None = (
+            None
+            if self._ech_sidecar is not None
+            else egress_route_from_settings(s, dest_scheme=scheme, attested=attested)
+        )
+        dest_host = urllib.parse.urlsplit(self.url).hostname or ""
+        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
         self._headers = self._build_headers(s)
+        if proxy_dest is not None:
+            # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none). urllib moves it into the
+            # CONNECT tunnel for an https destination, sends it to the proxy for an http one (ADR 0126).
+            self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.url, attested=attested)
         # ASVS 12.2.1: even without an Authorization header the request body is PHI, so a cleartext
@@ -532,7 +888,8 @@ class RestDestination(DestinationConnector):
         # in _post; the two modes are mutually exclusive (a loud HttpAuthError otherwise).
         from messagefoundry.transports.http_auth import bearer_provider_from_settings
 
-        self._token_provider = bearer_provider_from_settings(s)
+        # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
+        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
         if self._token_provider is not None:
             # The SMART bearer is injected per-request in _post, so the static-header cleartext check
             # above can't see it. Re-run the check treating the connection as credential-bearing, so a
@@ -558,8 +915,12 @@ class RestDestination(DestinationConnector):
             # keeps verification ON, so it is NOT an insecure hop in the #200 sense (no refusal keys on it).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or ""
+                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
                 )
+            elif proxy_handlers:
+                # A forward proxy is configured → a PER-CONNECTION verifying opener carrying it (never the
+                # shared one; ADR 0126). No proxy → the shared opener stays (byte-identical).
+                self._opener = _no_redirect_opener(*proxy_handlers)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -575,7 +936,7 @@ class RestDestination(DestinationConnector):
                 "REST destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.url),
             )
-            self._opener = _insecure_opener()
+            self._opener = _insecure_opener(*proxy_handlers)
         # #65: HTTP Digest (RFC 7616) — fold the challenge-answering handler into a PER-CONNECTION opener
         # (never mutate the shared _NO_REDIRECT_OPENER). urllib answers the 401 + retries within
         # opener.open(). None (default) → byte-identical. Mutually exclusive with a bearer provider.
@@ -592,6 +953,30 @@ class RestDestination(DestinationConnector):
                 # Rebuild a per-connection verifying opener so add_handler never touches the shared one.
                 self._opener = urllib.request.build_opener(_NoRedirectHandler)
             self._opener.add_handler(digest)
+        if self._ech_sidecar is not None:
+            # ECH mode (ADR 0139): the engine->sidecar hop is cleartext http over loopback (the sidecar
+            # owns destination TLS + ECH + cert verification), so a plain no-redirect opener carries it —
+            # never the verify/proxy/insecure opener built above for a direct destination hop.
+            self._opener = _no_redirect_opener()
+
+    def _ech_request(
+        self, data: bytes | None, headers: dict[str, str], method: str
+    ) -> urllib.request.Request:
+        """Re-address the request to the loopback ECH sidecar (ADR 0139): the request goes to the sidecar
+        over cleartext http with the real destination in the ``Host`` header; the sidecar re-originates
+        the ``https`` + ECH connection to that host (verifying its cert), so the SNI never leaves this
+        host in cleartext. Destination TLS is delegated to the sidecar; the engine->sidecar hop is
+        same-host loopback (ADR 0092 posture)."""
+        assert self._ech_sidecar is not None  # only called on the ECH path (guarded by the caller)
+        parsed = urllib.parse.urlsplit(self.url)
+        path = parsed.path or "/"
+        if parsed.query:
+            path += "?" + parsed.query
+        h = dict(headers)
+        h["Host"] = parsed.netloc  # tell the sidecar the real upstream (host[:port])
+        return urllib.request.Request(  # noqa: S310  # nosec B310 — http to a validated loopback sidecar
+            self._ech_sidecar + path, data=data, headers=h, method=method
+        )
 
     @staticmethod
     def _build_headers(s: dict[str, Any]) -> dict[str, str]:
@@ -646,8 +1031,12 @@ class RestDestination(DestinationConnector):
                 **self._headers,
                 "Authorization": f"Bearer {self._token_provider.access_token()}",
             }
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.url, headers=headers, method="HEAD"
+        req = (
+            self._ech_request(None, dict(headers), "HEAD")
+            if self._ech_sidecar is not None
+            else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
+                self.url, headers=headers, method="HEAD"
+            )
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
@@ -673,7 +1062,7 @@ class RestDestination(DestinationConnector):
             self._hop_guard.assert_send(
                 urllib.parse.urlsplit(self.url).hostname or "", _redact_url(self.url)
             )
-        data = payload.encode(self.encoding)
+        data = encode_wire_body(payload, self.encoding, transport="REST")
         headers = self._headers
         if dynamic_headers or self._token_provider is not None or self._signer is not None:
             headers = dict(self._headers)
@@ -691,11 +1080,12 @@ class RestDestination(DestinationConnector):
                 # per-request header. Minted here in send()'s off-loop worker, past the queue boundary, so
                 # a retry re-mints it (re-run purity holds, like the WS-Security nonce — ADR 0015).
                 headers.update(self._signer.signature_headers(data))
-        req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
-            self.url,
-            data=data,
-            headers=headers,
-            method=self.method,
+        req = (
+            self._ech_request(data, headers, self.method)
+            if self._ech_sidecar is not None
+            else urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s)
+                self.url, data=data, headers=headers, method=self.method
+            )
         )
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:

@@ -98,6 +98,51 @@ async def test_active_list_ack_resolve_round_trip(
     assert (await noauth_client.post("/alerts/999999/resolve")).status_code == 404
 
 
+async def test_suspend_resume_round_trip(engine: Engine, noauth_client: httpx.AsyncClient) -> None:
+    # #143: suspend sets a NOTIFICATION-mute window (instance stays open/counted/visible); resume clears
+    # it. Both audit metadata-only; unknown/resolved id → 404.
+    await engine.store.upsert_alert_instance(
+        event_type="connection_error", connection="OB_X", severity="critical", now=100.0
+    )
+    (a,) = (await noauth_client.get("/alerts/active")).json()["alerts"]
+    alert_id = a["id"]
+    assert a["suspended_until"] is None
+
+    rs = await noauth_client.post(f"/alerts/{alert_id}/suspend", json={"minutes": 30})
+    assert rs.status_code == 200
+    body = rs.json()
+    assert body["suspended_until"] is not None and body["status"] == "open"
+    # AC-3: still open + still on the active list (suspend gates notification only, never visibility)
+    active = (await noauth_client.get("/alerts/active")).json()["alerts"]
+    assert [x["id"] for x in active] == [alert_id]
+    assert active[0]["suspended_until"] is not None
+    sus_rows = [
+        r for r in await engine.store.list_audit(limit=100) if r["action"] == "alert_suspend"
+    ]
+    assert len(sus_rows) == 1 and "OB_X" not in (sus_rows[0]["detail"] or "")  # metadata-only
+
+    # resume clears the window, audited
+    rr = await noauth_client.post(f"/alerts/{alert_id}/resume")
+    assert rr.status_code == 200 and rr.json()["suspended_until"] is None
+    res_rows = [
+        r for r in await engine.store.list_audit(limit=100) if r["action"] == "alert_resume"
+    ]
+    assert len(res_rows) == 1
+
+    # a bad window is rejected by validation (422); unknown / resolved id → 404
+    assert (
+        await noauth_client.post(f"/alerts/{alert_id}/suspend", json={"minutes": 0})
+    ).status_code == 422
+    assert (
+        await noauth_client.post("/alerts/999999/suspend", json={"minutes": 5})
+    ).status_code == 404
+    await noauth_client.post(f"/alerts/{alert_id}/resolve")
+    assert (
+        await noauth_client.post(f"/alerts/{alert_id}/suspend", json={"minutes": 5})
+    ).status_code == 404
+    assert (await noauth_client.post(f"/alerts/{alert_id}/resume")).status_code == 404
+
+
 # --- ConnectionRow.alerts_active (AC-6) --------------------------------------
 
 
@@ -135,7 +180,7 @@ async def test_alerts_active_reflects_open_count(
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

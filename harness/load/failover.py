@@ -97,6 +97,11 @@ class EngineNode:
         self.api_port = api_port
         self.url = f"http://127.0.0.1:{api_port}"
         self._env = dict(env)
+        # GIVEN 1 (ADR 0148): the default env `dev` now derives PHI, so a bare `serve --env dev` runs the
+        # secure PHI posture (keyless/egress/retention/notify refusals). This harness node serves the
+        # SYNTHETIC load graph (no real PHI), so declare the loud opt-out — matching the `--env dev`
+        # "synthetic-only env" intent in start(). setdefault so a PHI scenario can still override it.
+        self._env.setdefault("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
         self._config_dir = config_dir
         self._cwd = cwd
         self._proc: asyncio.subprocess.Process | None = None
@@ -724,7 +729,7 @@ def _node_env(
     env["MEFOR_CLUSTER_HEARTBEAT_SECONDS"] = repr(fo.heartbeat_seconds)
     env["MEFOR_CLUSTER_LEADER_FENCE_TIMEOUT_SECONDS"] = repr(fo.leader_fence_timeout_seconds)
     env["MEFOR_CLUSTER_LEADER_LEASE_TTL_SECONDS"] = repr(fo.leader_lease_ttl_seconds)
-    env["MEFOR_AUTH_ENABLED"] = "false"  # no token needed for the harness's API reads
+    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = "false"  # no token needed for the harness's API reads
     # A clustered node drives concurrent background work against the pool (the validator requires >= 2,
     # >= 3 for Postgres). Force headroom regardless of what the CI store env set.
     try:

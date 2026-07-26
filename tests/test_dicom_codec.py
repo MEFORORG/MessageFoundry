@@ -14,14 +14,19 @@ pytest.importorskip("pydicom", reason="DICOM codec tests need the [dicom] extra"
 
 from messagefoundry.parsing import Message, RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import (  # noqa: E402
+    DicomBombError,
     DicomDataset,
     DicomError,
     DicomPeek,
     DicomPeekError,
     hl7_map,
 )
-
-from tests._dicom_sample import BASIC_TEXT_SR, make_sr_part10  # noqa: E402
+from tests._dicom_sample import (  # noqa: E402
+    BASIC_TEXT_SR,
+    make_deflated_bomb_part10,
+    make_deflated_ok_part10,
+    make_sr_part10,
+)
 
 # A patient name fabricated for the PHI-leak assertions (must never appear in an error/log message).
 _PHI_NAME = "Zzyzx^Quintessa^PhiCanary"
@@ -106,6 +111,82 @@ def test_dataset_walks_sr_measurements_depth_first() -> None:
 def test_dataset_fails_loud_on_non_dicom() -> None:
     with pytest.raises(DicomError):
         DicomDataset.parse(b"\x00\x01\x02 not dicom")
+
+
+# --- ASVS 5.2.3: bounded inflate of a Deflated Explicit VR LE object BEFORE dcmread ------------------
+
+
+def test_peek_rejects_deflated_decompression_bomb() -> None:
+    # A tiny compressed Data Set that inflates to 64 MiB (> the 16 MiB codec cap) is rejected on the peek
+    # path as a DicomBombError (a DicomError → dead-letter), in bounded memory, before dcmread inflates it.
+    bomb = make_deflated_bomb_part10(inflated_bytes=64 * 1024 * 1024)
+    with pytest.raises(DicomBombError):
+        DicomPeek.parse(bomb)
+
+
+def test_dataset_rejects_deflated_decompression_bomb() -> None:
+    bomb = make_deflated_bomb_part10(inflated_bytes=64 * 1024 * 1024)
+    with pytest.raises(DicomBombError):
+        DicomDataset.parse(bomb)
+
+
+def test_deflated_bomb_error_is_a_dicom_error_and_phi_safe() -> None:
+    # DicomBombError routes exactly like any malformed object (DicomError/ValueError) and names only the
+    # cap, never any bytes/element value.
+    bomb = make_deflated_bomb_part10(inflated_bytes=64 * 1024 * 1024)
+    try:
+        DicomDataset.parse(bomb)
+    except DicomBombError as exc:
+        assert isinstance(exc, DicomError) and isinstance(exc, ValueError)
+        assert "Bomb^Test" not in str(exc) and "BOMB-1" not in str(exc)
+    else:
+        pytest.fail("expected DicomBombError")
+
+
+def test_valid_deflated_object_still_parses_under_the_cap() -> None:
+    # Non-regression: the guard is a no-op for a legitimate (small) deflated object — dcmread still parses.
+    ok = make_deflated_ok_part10(patient_name="Ok^Deflated")
+    peek = DicomPeek.parse(ok)
+    assert peek.transfer_syntax_uid == "1.2.840.10008.1.2.1.99"
+    assert DicomDataset.parse(ok).patient_name == "Ok^Deflated"
+
+
+# --- missing [dicom] extra: a deploy error, distinct from the ValueError data errors (DICOM-5) ------
+
+
+def test_missing_dicom_extra_raises_runtimeerror_not_valueerror(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A missing [dicom] extra must fail as a RuntimeError (deploy/config), NEVER as the ValueError-rooted
+    # DicomError (data). If it were a ValueError, a Handler's `except ValueError` (which routes malformed
+    # DICOM to the dead-letter path) would silently swallow a "you forgot to install the extra" error.
+    from messagefoundry.parsing.dicom import _deps
+
+    # None in sys.modules makes `from pydicom import dcmread` raise ImportError — the no-extra path (the
+    # module's importorskip means the real pydicom is present here, so we simulate its absence).
+    monkeypatch.setitem(sys.modules, "pydicom", None)
+
+    with pytest.raises(RuntimeError, match=r"messagefoundry\[dicom\]"):
+        _deps.load_dcmread()
+
+    # Both parse entry points funnel through load_dcmread, so both surface the same RuntimeError.
+    for parse in (DicomDataset.parse, DicomPeek.parse):
+        with pytest.raises(RuntimeError) as excinfo:
+            parse(b"MEFOR-not-a-dicom-object")
+        exc = excinfo.value
+        assert not isinstance(exc, ValueError)  # a Handler's `except ValueError` won't catch it
+        assert not isinstance(exc, DicomError)
+        assert "pip install 'messagefoundry[dicom]'" in str(exc)
+
+    # Belt-and-suspenders: prove the error escapes an `except ValueError` (the Handler dead-letter guard).
+    escaped = False
+    try:
+        DicomPeek.parse(b"still-not-dicom")
+    except ValueError:  # pragma: no cover - must NOT be taken (RuntimeError is not a ValueError)
+        escaped = False
+    except RuntimeError:
+        escaped = True
+    assert escaped
 
 
 # --- hl7_map (DICOM -> HL7 v2 helpers) ---------------------------------------

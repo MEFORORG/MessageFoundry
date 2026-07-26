@@ -11,7 +11,11 @@ the single switch the two consult so the parity tests can drive the same suite o
 * A **runtime fallback guard** lives in ``peek.py``/``message.py``: each built-ins parse is wrapped so
   an *unexpected* internal error (anything other than the contract's :class:`HL7PeekError`) falls back
   to the python-hl7 path and is logged, never crashing a connection. ``HL7PeekError`` (no-MSH / empty /
-  malformed-path) is the contract and is **re-raised**, not fallen back from.
+  malformed-path / over-budget escape expansion) is the contract and is **re-raised**, not fallen back
+  from — every contract guard runs *before* the wrapped call, and the guard additionally re-raises the
+  type so the invariant holds structurally. This matters for the ASVS 1.3.3 expansion budget: falling
+  back would hand an over-budget message to python-hl7's **unbounded** ``unescape``, converting the
+  clamp into a bypass.
 
 The flag is read **per parse** (not cached), so a test can toggle it between calls.
 """

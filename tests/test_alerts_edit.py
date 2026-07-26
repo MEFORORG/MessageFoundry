@@ -13,7 +13,8 @@ import pytest
 
 from messagefoundry.__main__ import main
 from messagefoundry.config import alerts_edit
-from messagefoundry.config.settings import load_settings
+from messagefoundry.config.alerts_edit import _RULE_FIELDS
+from messagefoundry.config.settings import AlertRule, load_settings
 
 
 def _svc(tmp_path: Path) -> Path:
@@ -144,3 +145,73 @@ def test_add_rejects_index_field(tmp_path: Path, capsys: pytest.CaptureFixture[s
     rc, out = _add(svc, {"event_type": "connection_stopped", "index": 0}, capsys)
     assert rc == 1 and "invalid alert rule" in out
     assert not svc.exists()
+
+
+# --- #240: reader/writer schema-drift guard + fail-loud unknown keys ----------
+
+
+def test_rule_fields_parity_with_model() -> None:
+    # The CI guard of record (#240, mirroring PR #1076 for connections): the write whitelist must equal
+    # the read model's fields, so a field added to AlertRule but not _RULE_FIELDS (which would be
+    # SILENTLY DROPPED from every GUI/CLI-authored rule) fails THIS test instead of quietly losing data.
+    assert set(_RULE_FIELDS) == set(AlertRule.model_fields)
+
+
+def test_rule_fields_parity_guard_is_falsifiable() -> None:
+    # Demonstrate the guard actually bites: drop a field from the tuple and set-equality with the model
+    # breaks — the exact drift (a model field absent from the writer whitelist) the guard is there to
+    # catch. mute/content_label/escalate/schedule were the real drift this lane closed.
+    drifted = set(_RULE_FIELDS) - {"schedule"}
+    assert drifted != set(AlertRule.model_fields)
+    for field in ("mute", "content_label", "escalate", "schedule"):
+        assert field in set(_RULE_FIELDS)  # the four keys #81/#143 added to the model, once dropped
+
+
+def test_add_rejects_unknown_key_direct(tmp_path: Path) -> None:
+    # A direct add_rule (no CLI model_validate pre-check) must FAIL LOUD on an unknown posted key
+    # rather than silently dropping it in _build_table — the #234 data-loss idiom this closes.
+    svc = _svc(tmp_path)
+    with pytest.raises(alerts_edit.AlertRuleError, match="unknown key.*bogus_field"):
+        alerts_edit.add_rule(
+            svc, {"event_type": "connection_stopped", "bogus_field": "x"}, validate=lambda _p: None
+        )
+    assert not svc.exists()  # rejected before any file was written
+
+
+def test_cli_add_rejects_unknown_key(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    # Via the CLI, AlertRule's extra="forbid" catches it first ("invalid alert rule"); either way the
+    # unknown key is refused, never written.
+    svc = _svc(tmp_path)
+    rc, out = _add(svc, {"event_type": "connection_stopped", "bogus_field": "x"}, capsys)
+    assert rc == 1
+    assert not svc.exists()
+
+
+def test_add_writes_and_round_trips_newly_whitelisted_fields(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # #240 root fix: mute/content_label/escalate/schedule were in AlertRule but NOT _RULE_FIELDS, so
+    # the writer silently dropped them. Now they must survive a GUI save round-trip through the real
+    # engine load path (proving they are no longer stripped before the validate callback runs).
+    svc = _svc(tmp_path)
+    rule = {
+        "event_type": "content_match",
+        "mute": True,
+        "content_label": "sepsis",
+        "escalate": [{"after_count": 3, "severity": "critical", "transports": ["email"]}],
+        "schedule": {
+            "windows": [
+                {"days": [0, 1, 2, 3, 4], "start": "08:00:00", "end": "17:00:00", "timezone": "UTC"}
+            ],
+            "invert": False,
+        },
+    }
+    rc, _ = _add(svc, rule, capsys)
+    assert rc == 0
+    loaded = load_settings(config_path=svc).alerts.rules
+    assert len(loaded) == 1
+    r = loaded[0]
+    assert r.mute is True
+    assert r.content_label == "sepsis"
+    assert len(r.escalate) == 1 and r.escalate[0].after_count == 3
+    assert r.schedule is not None and len(r.schedule.windows) == 1

@@ -499,3 +499,36 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
       matching SQLite behavior. **If store-once is later implemented on SS/PG**, `purge_dead_letters` must
       null `body_ref` (as SQLite's `_release_outbound_body_refs` does) **before** the attachment release,
       or a dead-row-only attachment would over-retain — keep this coupling with the dead-row split.
+- [x] Security re-score (WP245, ASVS L3 **5.4.1 / 5.4.2**; 2026-07-17): the download endpoint's
+      response-header controls are **EFFECTIVE independent of the streaming-detach threshold**. The
+      server-derived `Content-Disposition: attachment; filename="attachment-<sha256[:16]><ext>"`
+      (`_attachment_filename`, api/app.py:460-465 — no user/attacker text) and the `_SAFE_MIME_RE`
+      allowlist that serves an attacker-influenced OBX-5.2 `content_type` as `application/octet-stream`
+      (`_safe_attachment_content_type`, api/app.py:453-457) are a property of the download **response
+      construction**, evaluated per-download over the stored content-address + `content_type` — **not**
+      gated on the ingress `stream_threshold_bytes`. The 2026-07-16 assessment scored these Partial as
+      "built-but-dormant" (streaming detach is OFF by default, so no attachment exists to serve in the
+      assessed posture); the re-score records them **effective** on the evidence that
+      `tests/test_attachment_download_api.py` seeds an attachment **straight through the store**
+      (`put_attachment` + `enqueue_ingress(attachment_refs=…)`, no inbound `stream_threshold_bytes`) and
+      pins the **full** served `Content-Disposition` (`test_download_round_trips_to_original_bytes`) plus
+      the `application/octet-stream` default **and its octet extension** on a CRLF-injection `content_type`
+      (`test_download_content_type_defaults_when_not_clean_mime`). **DOC/test re-score only — no
+      product-code change, and streaming detach is NOT enabled: `stream_threshold_bytes` stays `None` =
+      OFF by default** (flipping it on merely to "produce a filename" would change ingress and is out of
+      scope).
+- [x] Security re-score reconcile (ASVS L3 **5.4.1 / 5.4.2**; 2026-07-20): a second adversarial pass
+      (`docs/security/ASVS-L3-ASSESSMENT-2026-07-20.md` §2.B) **refuted the 07-17 Pass-B** for both
+      cells — not on the code (the served-filename / MIME controls are still safe-by-construction and
+      threshold-independent) but on the *deployment*: because `stream_threshold_bytes` is `None` = OFF by
+      default **and the off-loopback runbook did not instruct the detach path**, no attachment exists to
+      serve in the documented posture, so both were held **Partial in both postures** (dormant +
+      runbook-silent). **Disposition (unchanged in substance):** the `_attachment_filename` /
+      `_safe_attachment_content_type` controls remain **EFFECTIVE independent of the detach threshold** —
+      evaluated per-download over the stored content-address + `content_type`. The runbook gap is now
+      closed: [`OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Served-attachment
+      filename + Content-Type safety on the streaming-detach path" instructs `stream_threshold_bytes` on
+      the HL7 inbound, so a Posture-B operator who streams very-large documents exercises the download
+      surface → **5.4.1 / 5.4.2 Pass-B**. **Posture A stays Partial (dormant)**: the threshold is **not**
+      flipped on by default (byte-identical ingress). DOC + runbook reconcile only — **no product-code
+      change**.

@@ -175,6 +175,7 @@ What CI **does** guarantee on every PR:
 
 ## See also
 
+- [SECURING-HANDLER-CONFIG-IN-CI.md](security/SECURING-HANDLER-CONFIG-IN-CI.md) — the handler-security controls (`--strict-handler-security`, the Semgrep taint leg, and Handler-dep `pip-audit`) that harden the `check` + `audit-pin` jobs above (ADR 0144)
 - [ADR 0017 — Consumer deployment model](adr/0017-consumer-deployment-model.md)
 - [EARLY-ADOPTER-GUIDE.md](EARLY-ADOPTER-GUIDE.md) (§8 validation toolchain, §9 capacity testing)
 - [INSTALL-GUIDE.md](INSTALL-GUIDE.md) (manual verify-before-install recipe)

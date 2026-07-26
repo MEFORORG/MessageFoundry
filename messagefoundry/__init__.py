@@ -11,63 +11,6 @@ Config modules define the message graph against this surface::
     from messagefoundry import inbound, outbound, router, handler, Send, MLLP, File, Message
 """
 
-from messagefoundry.config.models import (
-    AckMode,
-    BatchConfig,
-    BuildupThreshold,
-    ContentType,
-    InternalErrorPolicy,
-    OrderingMode,
-    RetryPolicy,
-    SaturationThreshold,
-    StallThreshold,
-)
-from messagefoundry.config.active_environment import current_environment
-from messagefoundry.config.db_lookup import DbLookupError, db_lookup
-from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
-from messagefoundry.config.ingest_time import current_ingest_time
-from messagefoundry.config.reference import reference
-from messagefoundry.config.response import response_get
-from messagefoundry.config.state import state_get
-from messagefoundry.config.wiring import (
-    CodeSet,
-    Database,
-    DatabaseLookup,
-    DatabasePoll,
-    DatabaseRef,
-    Direct,
-    Email,
-    FhirLookup,
-    File,
-    FileRef,
-    Ftp,
-    FHIR,
-    Http,
-    DICOM,
-    DICOMweb,
-    Loopback,
-    MLLP,
-    PassThrough,
-    Reference,
-    Rest,
-    SMTP,
-    Sftp,
-    Soap,
-    Tcp,
-    Timer,
-    X12,
-    Send,
-    SetMeta,
-    SetState,
-    MessageTypeError,
-    code_set,
-    env,
-    handler,
-    inbound,
-    message_type_of,
-    outbound,
-    router,
-)
 from messagefoundry.actions import (
     append_to_field,
     arith_field,
@@ -85,7 +28,73 @@ from messagefoundry.actions import (
     substring_field,
     trim_field,
 )
+from messagefoundry.config.active_environment import current_environment
+from messagefoundry.config.db_lookup import DbLookupError, db_lookup
+from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.ingest_time import current_ingest_time
+from messagefoundry.config.models import (
+    AckMode,
+    BatchConfig,
+    BuildupThreshold,
+    ContentType,
+    InternalErrorPolicy,
+    OrderingMode,
+    RetryPolicy,
+    SaturationThreshold,
+    StallThreshold,
+)
+from messagefoundry.config.reference import reference
+from messagefoundry.config.response import response_get
+from messagefoundry.config.state import state_get
+from messagefoundry.config.wiring import (
+    DICOM,
+    FHIR,
+    MLLP,
+    SMTP,
+    X12,
+    CodeSet,
+    Database,
+    DatabaseLookup,
+    DatabasePoll,
+    DatabaseRef,
+    DICOMweb,
+    Direct,
+    Email,
+    FhirLookup,
+    File,
+    FileRef,
+    Ftp,
+    Http,
+    Loopback,
+    MessageTypeError,
+    PassThrough,
+    Reference,
+    Rest,
+    Send,
+    SetMeta,
+    SetState,
+    Sftp,
+    Soap,
+    Tcp,
+    Timer,
+    code_set,
+    env,
+    handler,
+    inbound,
+    message_type_of,
+    outbound,
+    router,
+)
 from messagefoundry.diagnostics import checkpoint, log_note
+from messagefoundry.parsing.compression import (
+    CompressionError,
+    deflate_compress,
+    deflate_decompress,
+    gzip_compress,
+    gzip_decompress,
+    zip_compress,
+    zip_decompress,
+)
 from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.split import split_by_obr
@@ -183,5 +192,13 @@ __all__ = [
     "hl7_now",
     "age_from_dob",
     "length_of_stay",
+    # Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip for on-demand Handler use.
+    "CompressionError",
+    "gzip_compress",
+    "gzip_decompress",
+    "deflate_compress",
+    "deflate_decompress",
+    "zip_compress",
+    "zip_decompress",
     "__version__",
 ]

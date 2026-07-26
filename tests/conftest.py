@@ -120,6 +120,36 @@ os.environ.setdefault("MEFOR_TEST_QSETTINGS_ORG", f"MEFOR-Test-{_SLOT}")
 
 
 @pytest.fixture(scope="session", autouse=True)
+def _force_aad_bind_when_requested() -> Iterator[None]:
+    """ASVS 11.3.3 correctness net (cell-bound at-rest AAD, ADR 0019).
+
+    When ``MEFOR_TEST_FORCE_AAD_BIND=1`` is set, force EVERY ``AesGcmCipher`` into the cell-bound
+    ``mfenc:v2`` writer (``write_v2=True``) at its single construction chokepoint. Re-running the store
+    round-trip suites under this flag turns every real write→read path into an AAD round-trip, so a
+    mismatched encrypt/decrypt cell (a half-threaded ``cell_aad``) surfaces as a ``CipherError`` — the
+    decisive check that no cell was missed. OFF by default (the suite runs the frozen v1 writer,
+    byte-identical at rest), so the flag is opt-in for the dedicated aad_bind sweep and never perturbs
+    the default run or the v1-format assertions in ``test_store_encryption.py``."""
+    if os.environ.get("MEFOR_TEST_FORCE_AAD_BIND") != "1":
+        yield
+        return
+    from messagefoundry.store import crypto
+
+    orig_init = crypto.AesGcmCipher.__init__
+
+    def _forced_init(  # type: ignore[no-untyped-def]
+        self, active_key, retired_keys=(), *, write_v2=False
+    ):
+        orig_init(self, active_key, retired_keys, write_v2=True)
+
+    crypto.AesGcmCipher.__init__ = _forced_init  # type: ignore[method-assign]
+    try:
+        yield
+    finally:
+        crypto.AesGcmCipher.__init__ = orig_init  # type: ignore[method-assign]
+
+
+@pytest.fixture(scope="session", autouse=True)
 def _allow_insecure_config_source_in_tests() -> Iterator[None]:
     """The suite loads sample/harness configs from the repo checkout, which is intentionally
     user-writable — and on the Windows CI runner the default workspace ACL grants ``BUILTIN\\Users``

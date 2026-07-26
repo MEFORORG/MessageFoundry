@@ -48,6 +48,7 @@ import {
   REDACTED_LIVE_VALUE,
   TOOLBAR_INSERT_DEFAULTS,
   addMenuGroups,
+  buildAddDestinationRequest,
   buildAddMenuRequest,
   buildDeleteRequest,
   buildEditRequest,
@@ -93,6 +94,18 @@ const RERENDER_DEBOUNCE_MS = 250;
  * gathered `{field: value}` map, or `undefined` if the user cancelled any step (so nothing is inserted).
  * A code-set / destination lookup that fails degrades to a free-text input rather than blocking the flow.
  */
+/** Pick an outbound destination — a QuickPick over the graph's outbounds, degrading to free text when the
+ * graph can't be read (shared by the Add→Send prompt and the per-row "＋ dest" flow). */
+async function pickDestination(title: string, label: string): Promise<string | undefined> {
+  const graph = await runJson<Graph>(["graph", "--config", configDir()], workspaceDir()).catch(
+    () => undefined,
+  );
+  const names = (graph?.outbound ?? []).map((o) => o.name);
+  return names.length
+    ? await vscode.window.showQuickPick(names, { title, placeHolder: label })
+    : await vscode.window.showInputBox({ title, prompt: label });
+}
+
 async function runInsertPrompts(item: AddMenuItem): Promise<Record<string, string> | undefined> {
   const values: Record<string, string> = {};
   for (const p of item.prompts) {
@@ -109,13 +122,7 @@ async function runInsertPrompts(item: AddMenuItem): Promise<Record<string, strin
         ? await vscode.window.showQuickPick(names, { title: item.label, placeHolder: p.label })
         : await vscode.window.showInputBox({ title: item.label, prompt: `${p.label} (no code sets found)` });
     } else if (p.kind === "destination") {
-      const graph = await runJson<Graph>(["graph", "--config", configDir()], workspaceDir()).catch(
-        () => undefined,
-      );
-      const names = (graph?.outbound ?? []).map((o) => o.name);
-      value = names.length
-        ? await vscode.window.showQuickPick(names, { title: item.label, placeHolder: p.label })
-        : await vscode.window.showInputBox({ title: item.label, prompt: p.label });
+      value = await pickDestination(item.label, p.label);
     } else {
       value = await vscode.window.showInputBox({
         title: item.label,
@@ -535,6 +542,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         level?: string;
         position?: string;
         mode?: string;
+        appended?: boolean; // ADR 0104 fan-out "＋ dest" — the anchor send's flags (for isReturnRow)
+        scaffold?: string;
       }) => {
         if (m?.command === "test") {
           // Reuse the existing Test Bench (dry-run this workspace's config — no engine, no sending).
@@ -641,6 +650,28 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
               expectSrc: m.expectSrc,
             }),
           );
+        } else if (
+          m?.command === "addDestination" &&
+          typeof m.handler === "string" &&
+          typeof m.lineStart === "number" &&
+          typeof m.lineEnd === "number"
+        ) {
+          // ADR 0104 fan-out "＋ dest": pick a destination, then add_destination via the SAME byte-stable
+          // applyStructural path. The anchor's fan-out flags drive the insert position (isReturnRow).
+          const anchor = {
+            handler: m.handler,
+            lineStart: m.lineStart,
+            lineEnd: m.lineEnd,
+            expectSrc: typeof m.expectSrc === "string" ? m.expectSrc : undefined,
+            kind: (typeof m.kind === "string" ? m.kind : "send") as RowKind,
+            appended: m.appended === true,
+            scaffold: typeof m.scaffold === "string" ? m.scaffold : undefined,
+          };
+          void pickDestination("Add destination", "Destination (fan out)").then((dest) => {
+            if (dest !== undefined && dest !== "" && !disposed) {
+              void applyStructural(buildAddDestinationRequest(anchor, dest));
+            }
+          });
         } else if (
           m?.command === "moveRow" &&
           typeof m.handler === "string" &&
@@ -948,6 +979,9 @@ function pageHtml(
              color: var(--vscode-editorHoverWidget-foreground, var(--vscode-foreground));
              background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background));
              border: 1px solid var(--vscode-editorHoverWidget-border, var(--vscode-panel-border)); }
+    /* ADR 0104 fan-out: the managed accumulator boundary (sends = [] / return sends) reads as muted, non-actionable scaffold. */
+    li.row.row-scaffold { opacity: 0.6; }
+    li.row.row-scaffold .kind { border-style: dashed; }
     li.row .row-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
     li.row .kind { text-transform: uppercase; font-size: 10px; letter-spacing: 0.04em; font-weight: 700;
                    color: var(--vscode-descriptionForeground); border: 1px solid var(--vscode-panel-border);

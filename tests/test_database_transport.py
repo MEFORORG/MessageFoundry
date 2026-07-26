@@ -42,7 +42,7 @@ INSERT = "INSERT INTO obs (mrn, val) VALUES (:mrn, :val)"
 
 
 def _dest(**over: Any) -> DatabaseDestination:
-    base: dict[str, Any] = dict(server="sql.example.com", database="MFDB", statement=INSERT)
+    base: dict[str, Any] = dict(server="sql.example.com", database="MFDB", statement=INSERT)  # noqa: C408
     base.update(over)
     d = build_destination(
         Destination(name="OB_DB", type=ConnectorType.DATABASE, settings=Database(**base).settings)
@@ -312,7 +312,7 @@ def test_database_odbc_params_reject_envref() -> None:
 
 @pytest.mark.parametrize("missing", ["server", "database", "statement"])
 def test_requires_core_settings(missing: str) -> None:
-    base: dict[str, Any] = dict(server="s", database="d", statement=INSERT)
+    base: dict[str, Any] = dict(server="s", database="d", statement=INSERT)  # noqa: C408
     base[missing] = ""
     with pytest.raises(ValueError):
         build_destination(
@@ -508,7 +508,7 @@ MARK = "UPDATE mf_inbox SET status='DONE' WHERE id=:id"
 
 
 def _src(**over: Any) -> DatabaseSource:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         server="sql.example.com", database="MFDB", poll_statement=POLL, mark_statement=MARK
     )
     base.update(over)
@@ -633,7 +633,7 @@ async def test_source_json_serializes_dates_decimal_bytes() -> None:
 async def test_source_body_column_decodes_bytes_verbatim() -> None:
     src = _src(body_column="payload", mark_statement=None)
     h = _RecordingHandler()
-    hl7 = "MSH|^~\\&|A|B".encode()
+    hl7 = b"MSH|^~\\&|A|B"
     await _run_poll(src, ["id", "payload"], [(1, hl7)], h)
     assert h.bodies[0] == hl7  # a column holding an HL7 message round-trips byte-for-byte
 
@@ -781,7 +781,7 @@ async def test_source_stop_closes_the_pool() -> None:
 
 @pytest.mark.parametrize("missing", ["server", "database", "poll_statement"])
 def test_source_requires_core_settings(missing: str) -> None:
-    base: dict[str, Any] = dict(server="s", database="d", poll_statement=POLL)
+    base: dict[str, Any] = dict(server="s", database="d", poll_statement=POLL)  # noqa: C408
     base[missing] = ""
     with pytest.raises(ValueError):
         build_source(Source(type=ConnectorType.DATABASE, settings=DatabasePoll(**base).settings))

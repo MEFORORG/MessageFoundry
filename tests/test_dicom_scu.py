@@ -9,9 +9,10 @@ proving byte-faithful forwarding, C-ECHO ``test_connection``, the status→retry
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from contextlib import contextmanager
 from io import BytesIO
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -23,7 +24,6 @@ from messagefoundry.parsing import RawMessage  # noqa: E402
 from messagefoundry.parsing.dicom import DicomPeek  # noqa: E402
 from messagefoundry.transports.base import DeliveryError, NegativeAckError  # noqa: E402
 from messagefoundry.transports.dicom import DicomScuDestination  # noqa: E402
-
 from tests._dicom_sample import BASIC_TEXT_SR, make_sr_part10  # noqa: E402
 
 _SCP_AE = "PACS_SCP"
@@ -109,14 +109,14 @@ async def test_scu_unreachable_is_transient_delivery_error() -> None:
 
 
 async def test_scu_out_of_resources_is_transient() -> None:
-    with _storage_scp(status=0xA700) as port:  # Refused: Out of Resources
+    with _storage_scp(status=0xA700) as port:  # Refused: Out of Resources  # noqa: SIM117
         with pytest.raises(DeliveryError) as exc:
             await _scu(port).send(_carry(make_sr_part10()))
     assert not isinstance(exc.value, NegativeAckError)  # transient, not a permanent dead-letter
 
 
 async def test_scu_hard_refusal_is_permanent() -> None:
-    with _storage_scp(status=0xC000) as port:  # Cannot Understand — a hard refusal
+    with _storage_scp(status=0xC000) as port:  # Cannot Understand — a hard refusal  # noqa: SIM117
         with pytest.raises(NegativeAckError) as exc:
             await _scu(port).send(_carry(make_sr_part10()))
     assert exc.value.permanent is True
@@ -131,33 +131,29 @@ async def test_scu_warning_status_is_delivered() -> None:
 async def test_scu_unsupported_sop_class_is_permanent() -> None:
     # The peer answers the association but accepts no presentation context for the object's SOP class
     # (storage rejected) — deterministic, so it must dead-letter permanently, never retry forever.
-    with _storage_scp(storage=False) as port:
-        with pytest.raises(NegativeAckError) as exc:
-            await _scu(port).send(_carry(make_sr_part10()))
+    with _storage_scp(storage=False) as port, pytest.raises(NegativeAckError) as exc:
+        await _scu(port).send(_carry(make_sr_part10()))
     assert exc.value.permanent is True
 
 
 async def test_scu_bad_object_is_permanent() -> None:
     # A valid carriage whose decoded bytes are NOT a parseable Part-10 object → permanent (code=bad-object),
     # distinct from the bad-carriage path. No association is attempted.
-    with _storage_scp() as port:
-        with pytest.raises(NegativeAckError) as exc:
-            await _scu(port).send(_carry(b"not-a-dicom-object"))
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as exc:
+        await _scu(port).send(_carry(b"not-a-dicom-object"))
     assert exc.value.permanent is True
     assert exc.value.code == "bad-object"
 
 
 async def test_scu_bad_carriage_is_permanent() -> None:
-    with _storage_scp() as port:
-        with pytest.raises(NegativeAckError) as exc:
-            await _scu(port).send("not-a-carriage-value")
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as exc:
+        await _scu(port).send("not-a-carriage-value")
     assert exc.value.permanent is True
 
 
 async def test_scu_over_max_object_bytes_is_permanent() -> None:
-    with _storage_scp() as port:
-        with pytest.raises(NegativeAckError) as exc:
-            await _scu(port, max_object_bytes=64).send(_carry(make_sr_part10()))
+    with _storage_scp() as port, pytest.raises(NegativeAckError) as exc:
+        await _scu(port, max_object_bytes=64).send(_carry(make_sr_part10()))
     assert exc.value.permanent is True
 
 

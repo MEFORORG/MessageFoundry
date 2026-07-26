@@ -23,13 +23,17 @@ _NONCE_RE = re.compile(r"script-src 'nonce-([A-Za-z0-9_-]+)' 'strict-dynamic'")
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 
 
-def _client(engine: Engine, service: AuthService, *, scheme: str) -> httpx.AsyncClient:
-    transport = httpx.ASGITransport(app=create_app(engine, auth=service, serve_ui=True))
+def _client(
+    engine: Engine, service: AuthService, *, scheme: str, loopback: bool = False
+) -> httpx.AsyncClient:
+    transport = httpx.ASGITransport(
+        app=create_app(engine, auth=service, serve_ui=True, loopback=loopback)
+    )
     return httpx.AsyncClient(transport=transport, base_url=f"{scheme}://t")
 
 
@@ -136,9 +140,32 @@ async def test_https_nonce_csp_coop_and_reporting(engine: Engine) -> None:
         assert m2 and m2.group(1) != m1.group(1)
 
 
+async def test_https_insecure_context_banner_is_nonced(engine: Engine) -> None:
+    """3.7.5: over effective-https the page shell carries the nonce'd insecure-context feature-detect
+    script, stamped with the SAME per-response nonce as the CSP header, with no inline on* handler."""
+    service = await _service(engine)
+    async with _client(engine, service, scheme="https") as c:
+        r = await c.get("/ui/login")
+        m = _NONCE_RE.search(r.headers["content-security-policy"])
+        assert m, r.headers["content-security-policy"]
+        nonce = m.group(1)
+        # the feature-detect script + its stable banner id are present
+        assert "window.isSecureContext" in r.text
+        assert "mf-insecure-context-banner" in r.text
+        # the inline banner <script> carries the per-response nonce (same one as the header)
+        assert (
+            '<script nonce="' + nonce + '">(function(){try{if(window.isSecureContext' in r.text
+        ), r.text
+        # degrade-never-block: no inline event handlers anywhere in the shell
+        assert "onload=" not in r.text and "onerror=" not in r.text
+
+
 async def test_http_hardening_is_a_noop(engine: Engine) -> None:
-    """Over cleartext loopback the middleware is a strict no-op: the engine's static self-CSP stands,
-    no nonce, no COOP, no reporting header, and the <script> tag carries no nonce."""
+    """Over cleartext http WITHOUT the loopback secure-context signal (app.state.loopback unset — e.g.
+    an off-loopback cleartext bind with no exposure_protected) the middleware is a strict no-op: the
+    engine's static self-CSP stands, no nonce, no COOP, no reporting header, and the <script> tag
+    carries no nonce. (A loopback secure-context DOES engage the http-safe headers — see the ADR 0143
+    hybrid test below.)"""
     service = await _service(engine)
     async with _client(engine, service, scheme="http") as c:
         r = await c.get("/ui/login")
@@ -148,9 +175,47 @@ async def test_http_hardening_is_a_noop(engine: Engine) -> None:
         assert "cross-origin-opener-policy" not in r.headers
         assert "reporting-endpoints" not in r.headers
         assert 'nonce="' not in r.text
+        # 3.7.5 byte-identity: no feature-detect banner over cleartext loopback (nonce None -> not
+        # emitted; the loopback ``script-src 'self'`` CSP would otherwise block an un-nonced inline script)
+        assert "window.isSecureContext" not in r.text
+        assert "mf-insecure-context-banner" not in r.text
         # the pre-existing hardening still applies (engine seam untouched)
         assert r.headers["cache-control"] == "no-store"
         assert r.headers["x-frame-options"] == "DENY"
+
+
+# --- ADR 0143: the loopback secure-context hybrid (headers engage, cookie stays plain) ------------
+
+
+async def test_loopback_http_engages_headers_but_keeps_plain_cookie(engine: Engine) -> None:
+    """ADR 0143 HYBRID: over a loopback secure-context (http://127.0.0.1, ``app.state.loopback``) the
+    http-SAFE headers ENGAGE (nonce-CSP + COOP + CORP + Reporting-Endpoints), but the session cookie
+    STAYS the plain ``mf_session`` (no Secure / __Host-) — a browser rejects a Secure/__Host- cookie
+    over http, so keying the cookie on loopback would break login. The two are CONSISTENT: headers on,
+    cookie plain, and the plain cookie still authenticates the dashboard. HSTS stays OFF (no auto-TLS)."""
+    service = await _service(engine)
+    await _add(service, "op", Role.OPERATOR)
+    async with _client(engine, service, scheme="http", loopback=True) as c:
+        # the http-safe hardening engages on the /ui HTML surface even over cleartext http
+        page = await c.get("/ui/login")
+        csp = page.headers["content-security-policy"]
+        assert _NONCE_RE.search(csp), csp
+        assert "strict-dynamic" in csp and "frame-ancestors 'none'" in csp
+        assert "unsafe-inline" not in csp and "unsafe-eval" not in csp
+        assert page.headers["cross-origin-opener-policy"] == "same-origin"
+        assert page.headers["cross-origin-resource-policy"] == "same-origin"
+        assert page.headers["reporting-endpoints"] == 'mf-csp="/ui/csp-report"'
+        # HSTS stays OFF over loopback http (no auto-TLS on loopback — ADR 0143)
+        assert "strict-transport-security" not in {k.lower() for k in page.headers}
+        # the session cookie STAYS the plain mf_session — NOT __Host-, NO Secure
+        r = await _login(c, "op")
+        set_cookie = r.headers["set-cookie"]
+        low = set_cookie.lower()
+        assert set_cookie.split("=", 1)[0] == "mf_session"
+        assert "__host-" not in low and "secure" not in low
+        assert "httponly" in low and "samesite=strict" in low
+        # headers-on + cookie-plain are consistent: the plain cookie still authenticates the dashboard
+        assert (await c.get("/ui")).status_code == 200
 
 
 async def test_static_asset_not_wrapped_over_https(engine: Engine) -> None:
@@ -208,10 +273,13 @@ async def test_csp_report_endpoint_accepts_and_204(engine: Engine) -> None:
 
 
 def test_csp_report_summary_shapes() -> None:
-    """Unit-level: the summariser handles both delivery shapes and hostile input without raising."""
-    from messagefoundry_webconsole.routes.core import _csp_report_summary
+    """Unit-level: the normaliser handles both delivery shapes and hostile input without raising, and
+    the summariser bounds every field. ``_csp_report_bodies`` returns a LIST (ASVS 3.7.5): a
+    Reporting-API POST batches reports, and collapsing the batch to its first entry is what let a real
+    violation be classified by the enforcement canary sitting in front of it."""
+    from messagefoundry_webconsole.routes.core import _csp_report_bodies, _csp_report_summary
 
-    legacy = _csp_report_summary(
+    legacy = _csp_report_bodies(
         {
             "csp-report": {
                 "document-uri": "u",
@@ -220,17 +288,26 @@ def test_csp_report_summary_shapes() -> None:
             }
         }
     )
-    assert "document-uri=u" in legacy and "violated-directive=script-src" in legacy
-    modern = _csp_report_summary(
-        [{"body": {"documentURL": "u", "effectiveDirective": "script-src", "blockedURL": "b"}}]
+    assert legacy is not None and len(legacy) == 1
+    summary = _csp_report_summary(legacy[0])
+    assert "document-uri=u" in summary and "violated-directive=script-src" in summary
+    modern = _csp_report_bodies(
+        [
+            {"body": {"documentURL": "u", "effectiveDirective": "script-src", "blockedURL": "b"}},
+            {"body": {"blockedURL": "inline"}},
+        ]
     )
-    assert "document-uri=u" in modern and "blocked-uri=b" in modern
+    # EVERY entry survives normalization — not just the first
+    assert modern is not None and len(modern) == 2
+    assert "document-uri=u" in _csp_report_summary(modern[0])
+    assert "blocked-uri=inline" in _csp_report_summary(modern[1])
+    assert _csp_report_bodies({}) == [{}]
+    assert _csp_report_bodies([]) == []
+    assert _csp_report_bodies("hostile") is None
+    assert _csp_report_bodies(12345) is None
     assert _csp_report_summary({}) == "empty"
-    assert _csp_report_summary([]) == "empty"
-    assert _csp_report_summary("hostile") == "non-object"
-    assert _csp_report_summary(12345) == "non-object"
     # a huge field is bounded (256 chars per value)
-    big = _csp_report_summary({"csp-report": {"document-uri": "x" * 5000}})
+    big = _csp_report_summary({"document-uri": "x" * 5000})
     assert len(big) < 400
 
 
@@ -255,5 +332,6 @@ async def test_opt_out_reverts_to_legacy_over_https(
         csp = page.headers["content-security-policy"]
         assert "script-src 'self'" in csp and "nonce-" not in csp
         assert "cross-origin-opener-policy" not in page.headers
+        assert "window.isSecureContext" not in page.text  # opt-out reverts -> banner not emitted
         # the reverted plain cookie still authenticates (name resolver agrees on read)
         assert (await c.get("/ui")).status_code == 200

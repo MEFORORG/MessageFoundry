@@ -16,7 +16,7 @@ import time
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, NamedTuple, Protocol, cast
 
 from messagefoundry.config.code_sets import CodeSetError, load_code_set
 from messagefoundry.config.models import ConnectorType, ContentType
@@ -51,6 +51,7 @@ __all__ = [
     "DeliveryPreview",
     "StateOpPreview",
     "MetaOpPreview",
+    "TransformOutcome",
     "RouteOutcome",
     "DryRunResult",
     "TraceHook",
@@ -182,6 +183,27 @@ class MetaOpPreview:
     value: str
 
 
+class TransformOutcome(NamedTuple):
+    """What one Handler run produced — the return of :func:`transform_one`.
+
+    A tuple (not a dataclass) so the three engine call sites and the dry-run keep indexing/unpacking it
+    like the ``(deliveries, state_ops, meta_ops)`` triple it grew from; ``declined`` is the 4th member.
+
+    ``declined`` names — **one entry per declined** :class:`~messagefoundry.config.wiring.Send`, in Send
+    order, duplicates kept — the destinations this Handler addressed that are present in the graph but
+    **not deployed** (#233, ADR 0111). They are deliberately NOT in ``deliveries``: a
+    :class:`DeliveryPreview` is what a caller turns into an outbound-stage row, so keeping the decline
+    out of that list is what structurally prevents a row from ever queueing to a lane with no delivery
+    worker. It is a SEPARATE list rather than a silent omission because a decline that no caller can see
+    would be an accept-and-drop (CLAUDE.md §12) — the caller MUST record it (the live engine persists a
+    per-destination event + the NOT_DEPLOYED disposition from it)."""
+
+    deliveries: list[DeliveryPreview]
+    state_ops: list[StateOpPreview]
+    meta_ops: list[MetaOpPreview]
+    declined: list[str]
+
+
 def _accepted(
     registry: Registry,
     names: list[str],
@@ -251,6 +273,9 @@ class RouteOutcome:
     deliveries: list[DeliveryPreview]
     state_ops: list[StateOpPreview] = field(default_factory=list)  # declared writes (ADR 0005)
     meta_ops: list[MetaOpPreview] = field(default_factory=list)  # metadata writes (ADR 0081)
+    # Sends addressed to a present-but-NOT-DEPLOYED connection (#233, ADR 0111) — declined, never
+    # delivered. Defaulted, so every existing construction is unchanged. See TransformOutcome.declined.
+    declined: list[str] = field(default_factory=list)
 
     @property
     def routed(self) -> bool:
@@ -343,14 +368,24 @@ def transform_one(
     tracer: TraceHook | None = None,
     sandbox: SandboxSession | None = None,
     run_context: RunContext | None = None,
-) -> tuple[list[DeliveryPreview], list[StateOpPreview], list[MetaOpPreview]]:
-    """Run **one** Handler on its own freshly-built payload; return ``(deliveries, state_ops, meta_ops)``.
+) -> TransformOutcome:
+    """Run **one** Handler on its own freshly-built payload; return
+    :class:`TransformOutcome` — ``(deliveries, state_ops, meta_ops, declined)``.
 
     The **transform half** of the split routing core (ADR 0001 Step B): a single handler, its own
     payload (a :class:`Message`, or a :class:`RawMessage` when ``content_type`` is non-HL7 — so one
     handler's transforms can't leak into another's), with every ``Send`` target validated against the
     outbound registry. An unknown outbound fails closed **here** (``ValueError``): an undeliverable
     target would otherwise enqueue an outbound row no worker drains (silent accept-and-strand).
+
+    A ``Send`` naming a **present-but-not-deployed** connection (#233, ADR 0111) is **declined** here
+    rather than delivered: it never becomes a :class:`DeliveryPreview`, so no caller can commit an
+    outbound-stage row for it, and it lands in ``declined`` for the caller to record. This one seam is
+    the whole enforcement point — it is shared by the split transform worker, the ADR-0057 inline
+    fast-path, the ADR-0071 fused sync path, and dry-run / ``messagefoundry check`` / the Test Bench,
+    exactly as ADR 0084's ``accepts=`` seam (:func:`_accepted`) covers all four consumers of the router
+    half. It is keyed on the **registry flag** — a property of the graph, never of live runner state —
+    because at-least-once (ADR 0001) requires a crash re-run to re-derive an *identical* delivery set.
 
     A Handler may also return :class:`~messagefoundry.config.wiring.SetState` ops (ADR 0005); they are
     split out (``state_ops``) and applied exactly-once by the store inside the transform handoff (the
@@ -401,22 +436,34 @@ def transform_one(
             f"handler {hname!r} SetMeta payload is {meta_bytes} bytes (> {META_MAX_BYTES} per message)"
         )
     deliveries: list[DeliveryPreview] = []
+    declined: list[str] = []
     for send in sends:
         # A Send.to names a known OUTBOUND (deliver there) OR a pass-through (PT) INBOUND (ADR 0013,
         # generalized — re-ingress the body through that internal inbound's own Router). Either fails
         # closed HERE if unknown: an undeliverable target would otherwise enqueue a row no worker drains
         # (silent accept-and-strand). A non-PT inbound is NOT a valid target (only an outbound or a PT).
         tic = registry.inbound.get(send.to)
-        is_pt = tic is not None and tic.spec.type is ConnectorType.PT
-        if not is_pt and send.to not in registry.outbound:
-            raise ValueError(
-                f"handler {hname!r} sent to unknown outbound/pass-through connection {send.to!r}"
-            )
+        if tic is not None and tic.spec.type is ConnectorType.PT:
+            is_pt, deployed = True, tic.deployed
+        else:
+            is_pt = False
+            oc = registry.outbound.get(send.to)
+            if oc is None:
+                raise ValueError(
+                    f"handler {hname!r} sent to unknown outbound/pass-through connection {send.to!r}"
+                )
+            deployed = oc.deployed
+        if not deployed:
+            # #233 (ADR 0111): present in the graph, NOT deployed. Skip the DeliveryPreview entirely —
+            # the target has no delivery worker, so a row queued to it could only sit forever (and
+            # buildup-alert on an intentional state). Recorded in `declined`, never silently dropped.
+            declined.append(send.to)
+            continue
         out_payload = send.message if isinstance(send.message, str) else send.message.encode()
         deliveries.append(DeliveryPreview(to=send.to, payload=out_payload, is_passthrough=is_pt))
     state_ops = [StateOpPreview(namespace=op.namespace, key=op.key, value=op.value) for op in ops]
     meta_ops = [MetaOpPreview(key=m.key, value=m.value) for m in meta]
-    return deliveries, state_ops, meta_ops
+    return TransformOutcome(deliveries, state_ops, meta_ops, declined)
 
 
 def _dry_run_reference_view(registry: Registry) -> dict[str, Mapping[str, Any]]:
@@ -462,13 +509,16 @@ def route_message(
     ``tracer`` (ADR 0072) is threaded to :func:`route_only` / :func:`transform_one` so the traced
     dry-run can observe each Router/Handler call; it is a pure observer, so the outcome is byte-identical.
 
-    ``snapshot_on_send`` (ADR 0104) mirrors the ``[pipeline].snapshot_on_send`` service setting for the
-    preview: ``False`` (the default — the default engine posture) previews the last-write-collapse
-    behaviour; ``True`` activates copy-on-Send so a divergent fan-out (mutate the same message between two
-    ``Send``\\ s) previews per-destination bytes exactly as an engine with the flag enabled delivers them.
-    The offline ``messagefoundry dryrun`` / ``check`` CLIs do not load service settings, so they preview
-    the default (``False``) posture; a programmatic caller (or the Test Bench, once the default flips) may
-    pass ``True`` for parity with such an engine.
+    ``snapshot_on_send`` (ADR 0104) selects which posture the preview reproduces: ``True`` activates
+    copy-on-Send so a divergent fan-out (mutate the same message between two ``Send``\\ s) previews
+    per-destination bytes exactly as an engine with the flag enabled delivers them; ``False`` previews the
+    pre-ADR-0104 last-write-collapse behaviour. This param still defaults ``False`` (ADR 0104 §8.1: a
+    preview that doesn't opt in does not snapshot) — but note the **engine default is now ``True``**
+    (``[pipeline].snapshot_on_send`` flipped in BACKLOG #230). The ``messagefoundry dryrun`` / ``check``
+    CLIs therefore load the service settings best-effort and pass the resolved value here (falling back to
+    the Settings-model default, ON, when none load — #230 P4), so the CLI preview matches what the engine
+    actually delivers; a programmatic caller or the Test Bench should likewise pass
+    ``settings.pipeline.snapshot_on_send`` for parity with the live engine.
     """
     # Publish the graph's code sets so a call-time code_set(...) inside a Router/Handler resolves
     # during a dry-run / Test Bench / `messagefoundry check` preview (the loader only had them active
@@ -487,6 +537,7 @@ def route_message(
     deliveries: list[DeliveryPreview] = []
     state_ops: list[StateOpPreview] = []
     meta_ops: list[MetaOpPreview] = []
+    declined: list[str] = []
     # Activate the same run-scoped providers the live engine uses (via the shared run_context registry),
     # so router + handlers resolve identically here and in the staged engine. Dry-run runs router and
     # transform in one block, so it uses the transform (superset) phase; it has no live environment, so
@@ -514,7 +565,7 @@ def route_message(
             registry, ic, raw, payload=shared, tracer=tracer, sandbox=sandbox, run_context=rc
         )
         for hname in names:
-            ds, ops, meta = transform_one(
+            ds, ops, meta, skipped = transform_one(
                 registry,
                 hname,
                 raw,
@@ -529,8 +580,13 @@ def route_message(
                 sim_state[(op.namespace, op.key)] = op.value  # visible to subsequent handlers
             state_ops.extend(ops)
             meta_ops.extend(meta)
+            declined.extend(skipped)  # #233: Sends to a not-deployed connection (never delivered)
     return RouteOutcome(
-        handlers=names, deliveries=deliveries, state_ops=state_ops, meta_ops=meta_ops
+        handlers=names,
+        deliveries=deliveries,
+        state_ops=state_ops,
+        meta_ops=meta_ops,
+        declined=declined,
     )
 
 
@@ -633,6 +689,9 @@ def dry_run(
     ``tracer`` (ADR 0072) is an optional observer threaded to the routing core so the traced dry-run
     (:func:`messagefoundry.pipeline.dryrun_trace.trace_dry_run`) can capture the Router/Handler execution;
     it does not change the disposition or would-send payloads (byte-identical to ``tracer=None``).
+
+    ``snapshot_on_send`` (ADR 0104) is threaded to :func:`route_message` — see its docstring. The library
+    default stays ``False`` (§8.1); the CLI passes its resolved ``[pipeline].snapshot_on_send`` (#230).
     """
     ic = select_inbound(registry, inbound)
     if ic.content_type is not ContentType.HL7V2:

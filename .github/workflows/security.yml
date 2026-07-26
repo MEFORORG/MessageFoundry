@@ -41,8 +41,8 @@ jobs:
     # red (the intended forcing function) — bump the lockfile, or `pip-audit --ignore-vuln <ID>` to
     # accept a triaged advisory.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Check the lockfile is in sync with pyproject (DEP-1)
@@ -58,7 +58,11 @@ jobs:
           # match the header recorded in each committed file, so re-export is byte-identical when in sync.
           uv export --no-emit-project --no-dev --format requirements.txt -o docker/locks/requirements-core.lock
           uv export --no-emit-project --no-dev --extra sqlserver --format requirements.txt -o docker/locks/requirements-sqlserver.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock
+          # CI's own installs pass `--constraint constraints.lock` (see ci.yml): a HASHLESS export of this
+          # same lock, so a fresh `uv pip install -e ".[extras]"` cannot drift to a newer upstream
+          # release. Re-export it here so it can never fall out of step with uv.lock.
+          uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -84,9 +88,9 @@ jobs:
       run:
         working-directory: ide
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Node
-        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
         with:
           node-version: "24"
       - name: Audit the locked npm dependencies (install-free)
@@ -95,36 +99,89 @@ jobs:
         run: npm audit --package-lock-only
 
   sbom:
-    name: SBOM (CycloneDX)
+    name: SBOMs (CycloneDX, multi-ecosystem)
     runs-on: ubuntu-latest
-    # Advisory (non-blocking): generate a machine-readable CycloneDX SBOM from the committed, pinned
-    # lockfile and retain it as a build artifact, so "are we exposed to CVE-X?" is answerable from a
-    # recorded bill of materials rather than a fresh resolve (ASVS 15.1.2). The step still fails if
-    # the SBOM can't be produced, so a lockfile that won't render is caught.
+    # Advisory (non-blocking): generate machine-readable, LICENSE-complete CycloneDX SBOMs for the two code
+    # artifacts whose dependency trees pip-audit/npm-audit already watch — the Python engine (from the
+    # hash-locked core runtime lock) and the VS Code extension (from its npm lockfile) — score their quality,
+    # and retain them, so "are we exposed to CVE-X? under what license?" is answerable from a recorded bill of
+    # materials rather than a fresh resolve (ASVS 15.1.2). The container image's SBOM is emitted by the `trivy`
+    # job below (which builds the image). Full rationale: docs/SUPPLY-CHAIN.md + ADR 0149. Each step still
+    # fails if its SBOM can't be produced (a lock that won't render is caught), but continue-on-error keeps
+    # the job off the merge path.
     continue-on-error: true
-    # Daily cron + on-demand only (CI cost): the SBOM derives from the COMMITTED lockfile, so a
-    # per-PR build adds no information over a daily one — the artifact answers "are we exposed to
-    # CVE-X?" from the recorded bill of materials, a freshness question, not a merge gate. Advisory
-    # (continue-on-error) and NOT a required check, so this gate can never wedge a PR.
+    # Daily cron + on-demand only (CI cost): the SBOMs derive from COMMITTED lockfiles, so a per-PR build adds
+    # no information over a daily one — a freshness question, not a merge gate. Advisory (continue-on-error)
+    # and NOT a required check, so this gate can never wedge a PR.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - name: Generate a CycloneDX SBOM from the lockfile
+      - name: Set up Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24"
+      - name: Generate the Python engine SBOM (license-complete, hash-locked core runtime)
         run: |
-          # cyclonedx-bom~=7.3 (was ~=4.6): the 4.x line drags cyclonedx-python-lib 7.x → lxml<6, which
-          # has no cp314 wheel, so on the 3.14 runner pip source-builds lxml and fails. 7.3 → lxml 6.x
-          # (cp314 wheels). The 7.x `requirements` CLI renamed `--outfile` → `--output-file`.
+          # environment mode reads each installed dist's METADATA so component LICENSES populate — the
+          # `requirements <lockfile>` parser has no metadata and emits license-less components. The core lock
+          # (docker/locks/requirements-core.lock) is the honest runtime closure `pip install messagefoundry`
+          # pulls; the all-extras requirements.lock stays covered by the pip-audit job above. cyclonedx-bom
+          # ~=7.3 → lxml 6.x (cp314 wheels) so the 3.14 runner doesn't source-build lxml. ADR 0149.
           python -m pip install --upgrade pip "cyclonedx-bom~=7.3"
-          cyclonedx-py requirements requirements.lock --output-format JSON --output-file sbom.cdx.json
-      - name: Upload the SBOM artifact
-        # SHA-pinned for supply-chain integrity, matching ci.yml's upload-artifact pin.
+          python -m venv /tmp/sbomenv
+          /tmp/sbomenv/bin/pip install --upgrade pip
+          /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
+            --pyproject pyproject.toml --mc-type application \
+            --output-format JSON --output-file sbom-python.cdx.json
+          # Declare the SBOM lifecycle (CISA "Build" type) + backfill the hatchling-dynamic root version.
+          python scripts/security/sbom_finalize.py sbom-python.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py
+      - name: Generate the VS Code extension SBOM (npm, install-free)
+        # if: always() so a Python-SBOM failure above doesn't skip this independent generator.
+        if: always()
+        working-directory: ide
+        run: |
+          # --package-lock-only reads package-lock.json directly (no `npm install`), matching the npm-audit
+          # job's install-free posture. The extension has NO runtime npm dependencies (esbuild bundles the
+          # payload), so we capture the FULL tree — the build toolchain (esbuild/typescript/…) is the npm
+          # supply chain worth inventorying, and this mirrors npm-audit's full-tree scan. Tool version pinned.
+          npx --yes @cyclonedx/cyclonedx-npm@6.0.0 --package-lock-only \
+            --output-format JSON --output-file ../sbom-ide.cdx.json
+          python ../scripts/security/sbom_finalize.py ../sbom-ide.cdx.json --phase build
+      - name: Score SBOM quality (sbomqs — advisory)
+        # continue-on-error (matching the release.yml twin): sbomqs is advisory, so a download/checksum/parse
+        # hiccup here must never skip the SBOM-artifact upload below (the actual deliverable).
+        continue-on-error: true
+        run: |
+          # sbomqs grades an SBOM 0-10 across structural/semantic/quality completeness and prints the NTIA
+          # minimum-elements breakdown, so an SBOM-completeness regression is visible. Pinned + checksum-
+          # verified against the release's own goreleaser checksums.txt. ADR 0149.
+          VER=2.0.11
+          asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "${asset}"
+          curl -sSfL "${base}/checksums.txt" -o sbomqs-checksums.txt
+          grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
+          tar -xzf "${asset}" sbomqs
+          sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
+          sbomqs score -b sbom-python.cdx.json
+          sbomqs score -b sbom-ide.cdx.json
+          sbomqs compliance --ntia sbom-python.cdx.json || true
+      - name: Upload the SBOM artifacts
+        # if: always() + if-no-files-found: ignore so whichever SBOM(s) generated are retained even if a
+        # sibling generator failed. SHA-pinned for supply-chain integrity, matching ci.yml's upload pin.
+        if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: sbom-cyclonedx
-          path: sbom.cdx.json
+          path: |
+            sbom-python.cdx.json
+            sbom-ide.cdx.json
+          if-no-files-found: ignore
 
   trivy:
     name: trivy (container image vulnerabilities)
@@ -142,7 +199,7 @@ jobs:
     # continue-on-error per the note above), REMOVE this gate too so it runs pre-merge again.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Build the slim engine image
         # The slim default the docker-smoke leg (ci.yml) and the Dockerfile's `docker build` docs produce.
         run: docker build -f docker/Dockerfile -t messagefoundry:scan .
@@ -155,13 +212,32 @@ jobs:
             | tar -xz -C /tmp trivy
           sudo install -m 0755 /tmp/trivy /usr/local/bin/trivy
           trivy --version
+      - name: Generate the container-image SBOM (CycloneDX — OS + Python layers)
+        # The image SBOM is the "container contents" manifest NTIA's Consumer Playbook expects for a
+        # containerized artifact: the Debian base + system libs AND the installed Python runtime, none of
+        # which the lockfile/npm SBOMs capture. Retained so an operator can inventory the running image.
+        # RUN BEFORE the vuln scan on purpose: the scan's `--exit-code 1` fails its step on a fixable CVE,
+        # which (default `if: success()`) would SKIP any SBOM step placed after it — so the inventory would
+        # vanish exactly on the vulnerable runs that need it. ubuntu-latest ships python3; sbom_finalize is
+        # stdlib-only. ADR 0149.
+        run: |
+          trivy image --no-progress --format cyclonedx --output sbom-image.cdx.json messagefoundry:scan
+          python3 scripts/security/sbom_finalize.py sbom-image.cdx.json --phase build
+      - name: Upload the image SBOM
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sbom-container-image
+          path: sbom-image.cdx.json
       - name: Scan the image (fixable HIGH/CRITICAL fail the build)
         # --ignore-unfixed keeps the gate ACTIONABLE: a Debian CVE with no upstream fix can't be
         # remediated by us and shouldn't redden CI; only patchable HIGH/CRITICAL fail. --scanners vuln
-        # keeps this to CVEs (secrets stay gitleaks' job). Extend to `--target runtime-sqlserver` (more
-        # OS surface) once this is green. Trivy auto-pulls its vuln DB from ghcr.io on first run.
+        # keeps this to CVEs (secrets stay gitleaks' job). --vex applies our maintained OpenVEX so a
+        # vulnerability we've assessed as not_affected/fixed is suppressed here too — the SAME file
+        # operators feed their scanners (--show-suppressed logs what was suppressed and why). Extend to
+        # `--target runtime-sqlserver` (more OS surface) once green. Trivy auto-pulls its vuln DB from ghcr.io.
         run: |
           trivy image --no-progress --scanners vuln \
+            --vex security/vex/messagefoundry.openvex.json --show-suppressed \
             --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 \
             messagefoundry:scan
       - name: Lint the Dockerfile for misconfig (informational)
@@ -175,8 +251,8 @@ jobs:
     # BLOCKING: the baseline is clean, so any NEW insecure pattern (that isn't a reviewed per-line
     # `# nosec`) fails the build instead of merging unnoticed.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Scan source for insecure patterns
@@ -203,7 +279,7 @@ jobs:
     runs-on: ubuntu-latest
     # BLOCKING: full-history scan came back clean; a newly-introduced secret now fails the build.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
       - name: Install gitleaks (pinned)
@@ -222,8 +298,8 @@ jobs:
     runs-on: ubuntu-latest
     # BLOCKING: the first run was 0 findings; a new match for any rule now fails the build.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Run the MessageFoundry rules
@@ -233,6 +309,17 @@ jobs:
           # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
           # dangerous-sink rules as the engine.
           semgrep --config .semgrep --error --metrics off messagefoundry tee
+      - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)
+        run: |
+          # semgrep is already installed by the step above (same job). This is why the packaged rules
+          # need NO project dependency to validate — the CI-installed semgrep is the authority.
+          RULES=messagefoundry/security/semgrep/handler-security.yml
+          semgrep --validate --config "$RULES"                            # rule-syntax gate
+          # Behavioural gate: the two recovered false-negatives (inter-statement taint + aliased-import)
+          # and the other rules fire exactly as annotated; the `# ok` cases stay clean. A --json assert
+          # (not `semgrep --test`, which crashes on Windows path-pairing) so it is deterministic.
+          python scripts/ci/assert_semgrep_handler_taint.py
+          semgrep --config "$RULES" --error --metrics off samples/config  # shipped samples stay clean
 
   # zizmor (GitHub Actions static analysis) moved to its own paths-filtered workflow
   # (.github/workflows/zizmor.yml): it lints .github/** only, so running it on every PR was pure
@@ -246,8 +333,8 @@ jobs:
     # companion to docs/security/ASVS-L2-PHASE0-CHANGES.md §4). A new/moved/undocumented crypto usage —
     # or a stale inventory entry — fails the build, so the inventory can't silently drift (WP-L3-02).
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Diff crypto call sites against the inventory
@@ -264,8 +351,8 @@ jobs:
     # brought forward to PR/push-to-main time so a token can't ride a squash-merge onto main and sit there
     # until the next publish catches it. See docs/security/PUBLISHING.md.
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Scan the publishable subset for forbidden content

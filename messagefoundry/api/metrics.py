@@ -23,8 +23,9 @@ are gauges (current state).
 from __future__ import annotations
 
 import time
-from collections.abc import Iterable, Sequence
-from dataclasses import dataclass
+from collections import deque
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import psutil
@@ -45,11 +46,68 @@ if TYPE_CHECKING:  # avoid pulling the heavy engine import into the default path
 __all__ = [
     "DEFAULT_LATENCY_BUCKETS",
     "METRICS_CONTENT_TYPE",
+    "MetricsHistory",
+    "MetricsSample",
     "OtelMetricsExporter",
     "build_otel_meter_provider",
     "gather_snapshot",
     "render_metrics",
 ]
+
+
+# --- historical-metrics ring (BACKLOG #76, ADR 0065 amendment) --------------
+# A tiny, in-memory, bounded ring of point-in-time samples for the console trend charts. It is the
+# FIRST SLICE deliberately: a durable history table would flip store_schema (out of scope), so this
+# holds only the last `capacity` samples in process memory (lost on restart — the correct posture for a
+# cosmetic trend view). It is fed by the existing ~1s /ws/stats sampler (no new background task), and
+# each sample is derived from the `outbox_by_status` dict that loop ALREADY fetches per tick, so the
+# sampler adds ZERO extra store I/O. Metadata only — aggregate counts, never a message body / PHI.
+
+
+@dataclass(frozen=True)
+class MetricsSample:
+    """One point-in-time metrics sample: epoch ``ts`` + the outbound-row count by status at that instant.
+
+    Aggregate counts only (never a message field / body). ``outbox_by_status`` is copied at record time
+    so a later mutation of the caller's dict can't rewrite history.
+    """
+
+    ts: float
+    outbox_by_status: Mapping[str, int] = field(default_factory=dict)
+
+
+class MetricsHistory:
+    """A bounded, in-memory ring of :class:`MetricsSample` for the console trend charts (#76).
+
+    ``record`` is the cheap append the /ws/stats sampler calls each tick; it DEDUPES on a minimum
+    inter-sample interval so several open sockets (each running their own 1s loop) never double-append
+    the same instant. Thread-affinity is the asyncio event loop — every writer (the /ws/stats loop) and
+    the single reader (``GET /metrics/history``) run on it, so no lock is needed.
+    """
+
+    def __init__(self, *, capacity: int = 900, min_interval: float = 0.9) -> None:
+        # capacity 900 × ~1s ≈ 15 min of trend at the /ws/stats cadence — bounded memory, no durability.
+        self._samples: deque[MetricsSample] = deque(maxlen=max(1, capacity))
+        self._capacity = max(1, capacity)
+        self._min_interval = min_interval
+        self._last_ts = 0.0
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
+
+    def record(self, ts: float, outbox_by_status: Mapping[str, int]) -> None:
+        """Append a sample IF at least ``min_interval`` has elapsed since the last one (dedupe across
+        concurrent sockets). Cheap: one dict copy + a deque append, no I/O."""
+        if self._samples and (ts - self._last_ts) < self._min_interval:
+            return
+        self._last_ts = ts
+        self._samples.append(MetricsSample(ts=ts, outbox_by_status=dict(outbox_by_status)))
+
+    def samples(self) -> list[MetricsSample]:
+        """The retained samples, oldest-first (a copy — the ring keeps mutating under the sampler)."""
+        return list(self._samples)
+
 
 # Cumulative delivery-latency bucket boundaries (seconds) — the Prometheus ``le`` ladder.
 DEFAULT_LATENCY_BUCKETS: tuple[float, ...] = (
@@ -75,7 +133,7 @@ _RATE_WINDOW = 60.0  # seconds; window for connection_metrics' throughput aggreg
 # reports a real interval rather than 0. Values are host/process aggregates — never PHI, and carry no
 # labels, so they leave the strict {connection,destination,status,version,le} label allowlist untouched.
 _PROC = psutil.Process()
-try:  # pragma: no cover - priming; the returned 0.0 first-call value is discarded
+try:  # pragma: no cover - priming; the returned 0.0 first-call value is discarded  # noqa: SIM105
     psutil.cpu_percent(interval=None)
 except psutil.Error:
     pass
@@ -372,7 +430,7 @@ class _MetricsCollector:
         for h in s.latency:
             buckets: list[tuple[str, float]] = [
                 (str(boundary), float(cum))
-                for boundary, cum in zip(DEFAULT_LATENCY_BUCKETS, h.bucket_counts)
+                for boundary, cum in zip(DEFAULT_LATENCY_BUCKETS, h.bucket_counts)  # noqa: B905
             ]
             buckets.append(("+Inf", float(h.count)))
             latency.add_metric(

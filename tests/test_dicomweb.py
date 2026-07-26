@@ -12,6 +12,7 @@ from __future__ import annotations
 import email.message
 import io
 import json
+import logging
 import urllib.error
 import urllib.request
 
@@ -24,7 +25,6 @@ from messagefoundry.parsing import RawMessage
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, DeliveryResponse, NegativeAckError
 from messagefoundry.transports.dicomweb import DicomWebDestination
-import logging
 
 BASE = "https://pacs.example.org/dicom-web"
 # An opaque "DICOM object" — the destination never parses it, so any bytes exercise the carriage + framing.
@@ -173,7 +173,7 @@ def test_dicomweb_cleartext_http_nonloopback_allowed_with_escape(
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = build_destination(
             Destination(
                 name="OB",
@@ -366,9 +366,8 @@ async def test_dicomweb_failed_sop_response_body_not_logged(
     dest = _dest()
     dest._opener = _FakeOpener(body=failed_body.encode(), status=200)  # type: ignore[assignment]
     # Root DEBUG: also covers any delivery-worker exception logging of the raised error.
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(NegativeAckError) as exc:
-            await dest.send(PAYLOAD)
+    with caplog.at_level(logging.DEBUG), pytest.raises(NegativeAckError) as exc:
+        await dest.send(PAYLOAD)
     assert exc.value.permanent is True
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert _PHI_CANARY not in blob and "Secretpatient" not in blob
@@ -385,9 +384,8 @@ async def test_dicomweb_http_error_response_body_not_logged(
     ).encode()
     dest = _dest()
     dest._opener = _FakeOpener(exc=_http_error(409, error_body))  # type: ignore[assignment]
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(DeliveryError) as exc:
-            await dest.send(PAYLOAD)
+    with caplog.at_level(logging.DEBUG), pytest.raises(DeliveryError) as exc:
+        await dest.send(PAYLOAD)
     blob = "\n".join(r.getMessage() for r in caplog.records)
     assert _PHI_CANARY not in blob and "Secretpatient" not in blob
     assert _PHI_CANARY not in str(exc.value) and "Secretpatient" not in str(exc.value)

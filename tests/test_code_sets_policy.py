@@ -30,7 +30,6 @@ from messagefoundry.config.code_sets import (
 )
 from messagefoundry.config.codeset_edit import show_code_set
 
-
 # --- model -------------------------------------------------------------------
 
 
@@ -227,7 +226,7 @@ def test_translate_is_pure_without_a_capture_scope() -> None:
 
 def test_captured_values_not_logged_at_info(caplog: pytest.LogCaptureFixture) -> None:
     cs = CodeSet("diet", {}, UnmappedPolicy(UnmappedKind.PASSTHROUGH))
-    with caplog.at_level(logging.INFO, logger="messagefoundry.config.code_sets"):
+    with caplog.at_level(logging.INFO, logger="messagefoundry.config.code_sets"):  # noqa: SIM117
         with capturing(message_id="msg-1"):
             cs.translate("SECRET-MRN-123")
     # the PHI-derived key must not appear in any INFO+ record
@@ -238,9 +237,8 @@ def test_captured_values_not_logged_at_info(caplog: pytest.LogCaptureFixture) ->
 
 def test_capture_counts_at_debug_carry_no_values(caplog: pytest.LogCaptureFixture) -> None:
     cs = CodeSet("diet", {}, UnmappedPolicy(UnmappedKind.PASSTHROUGH))
-    with caplog.at_level(logging.DEBUG, logger="messagefoundry.config.code_sets"):
-        with capturing():
-            cs.translate("SECRET-MRN-123")
+    with caplog.at_level(logging.DEBUG, logger="messagefoundry.config.code_sets"), capturing():
+        cs.translate("SECRET-MRN-123")
     # the DEBUG drain logs per-set COUNTS only — never the value
     assert "SECRET-MRN-123" not in caplog.text
     assert any("unmapped code-set inputs" in r.getMessage() for r in caplog.records)

@@ -328,6 +328,9 @@ def test_serve_refuses_shard_with_cluster_enabled(
 
     monkeypatch.chdir(tmp_path)
     (tmp_path / "messagefoundry.toml").write_text(
+        # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet —
+        # the shard+cluster mutual-exclusion refusal is the subject here.
+        "security.handles_real_patient_data = false\n"
         # [cluster].enabled requires a server-DB backend (+ its connection essentials) at settings
         # validation; the refusal under test fires before any store is opened, so nothing is dialed.
         '[store]\nbackend = "postgres"\nserver = "127.0.0.1"\ndatabase = "mf"\n'

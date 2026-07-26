@@ -219,6 +219,18 @@ so this is a **secret**-handling rule (the token is a bearer credential), parall
    `token_url` is testable and avoids a startup network dependency. **CHOSEN (MVP):** explicit URL; discovery is
    a deferred increment (and is itself a *client-side consume*, not the server-side *publish* that belongs to
    ADR 0023).
+
+   > **Amended 2026-07-21 by [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+   > (BACKLOG #274).** The engine now has a second OAuth2/OIDC surface, in the **opposite trust
+   > direction**: this ADR describes MessageFoundry as an OAuth2 **client presenting** an assertion to a
+   > partner's authorization server, while ADR 0142 makes it a **relying party consuming** an IdP's
+   > `id_token`. That inversion is why the discovery posture is settled the same way but for a *stronger*
+   > reason: 0142 pins its endpoints with **no `.well-known` discovery at all, permanently and by design**
+   > — not as a deferred increment. Consuming a token means an attacker-influenced URL would be a live
+   > SSRF/key-substitution lever, so the RP must never learn an endpoint from the network. Nothing here
+   > changes for the outbound SMART path; the two surfaces share the "no discovery" answer and share the
+   > `transports/signing.py` core (0142 adds the **verify** side to this ADR's **mint** side), but they
+   > must not be collapsed into one mechanism — the threat models point opposite ways.
 6. **Reuse rest.py's hardened opener + extend the egress gate to `token_url` (CHOSEN) vs an unguarded token
    fetch.** The token endpoint is a second egress host; reusing the no-redirect/TLS opener and adding it to
    `allowed_http` closes the fail-open hole. **CHOSEN.**

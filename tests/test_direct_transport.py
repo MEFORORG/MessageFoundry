@@ -35,7 +35,7 @@ from cryptography.x509.oid import NameOID
 
 import messagefoundry.transports.direct as direct_mod
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import EgressSettings, INSECURE_TLS_ESCAPE_ENV
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.direct import DirectDestination
@@ -52,7 +52,7 @@ _SYNTHETIC_HL7 = (
 def _mint_ca() -> tuple[rsa.RSAPrivateKey, x509.Certificate]:
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Direct CA")])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(name)
@@ -75,7 +75,7 @@ def _mint_leaf(
     """A leaf cert signed by the given CA."""
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, common_name)])
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(subject)
@@ -155,7 +155,7 @@ class _FakeSMTP:
     """A drop-in for ``smtplib.SMTP`` / ``SMTP_SSL`` recording the exchange. ``fail_at`` makes the named
     step raise so the DeliveryError mapping is exercised. Mirrors test_email_destination._FakeSMTP."""
 
-    instances: list["_FakeSMTP"] = []
+    instances: list[_FakeSMTP] = []
 
     def __init__(
         self, host: str, port: int, timeout: float = 0.0, fail_at: str | None = None
@@ -173,7 +173,7 @@ class _FakeSMTP:
         if fail_at == "connect":
             raise OSError("connection refused")
 
-    def __enter__(self) -> "_FakeSMTP":
+    def __enter__(self) -> _FakeSMTP:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -270,7 +270,7 @@ async def test_decrypt_with_wrong_key_fails(
 
     # A different (non-recipient) key must NOT be able to decrypt — confidentiality is real.
     wrong_key, wrong_cert = _mint_leaf("wrong@x.example", pki["ca_key"], pki["ca_cert"])
-    with pytest.raises(Exception):  # cryptography raises on a recipient/key mismatch
+    with pytest.raises(Exception):  # cryptography raises on a recipient/key mismatch  # noqa: B017
         pkcs7.pkcs7_decrypt_der(enveloped, wrong_cert, wrong_key, [])
 
 

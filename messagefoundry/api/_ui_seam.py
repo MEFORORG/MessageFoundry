@@ -30,7 +30,46 @@ from typing import Any
 #: console declares ``SUPPORTED_ENGINE_SEAMS`` and refuses a skew at startup (``assert_engine_seam``).
 #: seam v4: MessageDetail gained the additive `attachments` list + a `download_attachment` handler
 #: (the streaming-attachment operator read surface, BACKLOG #149 / ADR 0105 Phase 3b).
-ENGINE_UI_SEAM: int = 4
+#: seam v5: SecurityPosture gained the additive report-only `fips_mode` + `openssl_version` fields
+#: (the FIPS-provider attestation the status page renders, BACKLOG #73 / ADR 0120).
+#: seam v6: CoreHandlers gained `suspend_alert` / `resume_alert` (the windowed alert suspend/resume the
+#: /ui Alerts page invokes) + AlertInstanceInfo gained the additive `suspended_until` field (#143 /
+#: ADR 0044 amendment).
+#: seam v7: CoreHandlers gained the offline uploaded-logs handlers `upload_file` / `list_uploaded_files`
+#: / `browse_uploaded_file` / `resend_uploaded_message` / `delete_uploaded_file` (the /ui Uploaded Logs
+#: page, BACKLOG #125/#126 / ADR 0134).
+#: seam v8: CoreHandlers gained the saved-search preset handlers `list_search_presets` /
+#: `create_search_preset` / `delete_search_preset` / `layered_search` (the /ui save/recall/layer UI on
+#: the content-search page, BACKLOG #151 / ADR 0136).
+#: seam v9: the S8a console-dashboard lane (BACKLOG #76/#131/#136, ADR 0065 + ADR 0007 amendments) —
+#: CoreHandlers gained `metrics_history` / `graph_edges` (the Flow & trends page's read-only history
+#: ring + status-colored data-flow graph, #76) and `set_connection_flag` (the FIRST
+#: console→connections.toml write seam — the object-flag toggle, #131); ConnectionRow gained the
+#: additive `flagged` (#131) + `waiting_for_reply` (#136) fields; MetricsHistoryResponse / GraphResponse
+#: are new rendered DTOs. (Fields are added across the lane's commits; the seam is bumped once.)
+#: seam v10: federated SSO (ADR 0142, BACKLOG #274) — AuthService gained the browser-facing
+#: `begin_oidc_login` / `complete_oidc_login` / `audit_oidc_reject` methods the /ui/oidc legs call,
+#: plus the `oidc_enabled` / `oidc_available` properties. The METHODS are what force the bump (a
+#: missing method is a hard AttributeError at request time); the console reads the properties via
+#: getattr with a default, so an older engine degrades instead of raising.
+#: seam v11: SecurityPosture gained the additive report-only `enforcement` field — the
+#: `[security].enforcement` level (enforce|warn) the status page renders alongside `production`
+#: (GIVEN 2 / ADR 0148): the explicit refuse/warn dial that replaces the derived production tier as the
+#: serve-gate + ADR 0092 escape-clamp key. Additive with a default, so older seams are retained.
+#: seam v12: SecurityPosture gained the additive `client_network_denials` / `client_denied_last` /
+#: `client_address_monoculture` observability fields for `[security].allowed_client_networks` — is the
+#: operator-surface source-network gate firing, at whom, and is it silently inert behind an undeclared
+#: reverse proxy. Additive with defaults, so older seams are retained.
+#: seam v13: SecurityPosture gained the additive REPORT-ONLY memory-encryption read-out
+#: (`memory_encryption_self_reported_capability` / `_active` / `_mechanism`,
+#: `memory_encryption_readout_source`) plus the operator declaration, the tri-state read-out check and
+#: the in-body disclaimer (`memory_encryption_operator_declared`,
+#: `memory_encryption_readout_contradicts_declaration`, `memory_encryption_note`) — ADR 0152 rungs 1+2
+#: for ASVS 11.7.1. Report-only in the ADR 0120 shape (additive, None = undeterminable); NONE of these
+#: fields satisfies 11.7.1, and the status page renders them worded "self-reported", never "compliant".
+#: (The last three were renamed/retyped from an earlier draft of THIS seam — v13 is unreleased, so the
+#: field set is corrected in place rather than burning v14 on a shape no console ever saw.)
+ENGINE_UI_SEAM: int = 14
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +105,8 @@ class CoreHandlers:
     service_status: Callable[..., Awaitable[Any]]
     ack_alert: Callable[..., Awaitable[Any]]
     resolve_alert: Callable[..., Awaitable[Any]]
+    suspend_alert: Callable[..., Awaitable[Any]]  # #143 windowed suspend (seam v6)
+    resume_alert: Callable[..., Awaitable[Any]]  # #143 windowed resume (seam v6)
     reset_statistics: Callable[..., Awaitable[Any]]
     integrity_check: Callable[..., Awaitable[Any]]
     dr_activate: Callable[..., Awaitable[Any]]
@@ -76,6 +117,24 @@ class CoreHandlers:
     reload_config: Callable[..., Awaitable[Any]]
     search_messages: Callable[..., Awaitable[Any]]
     audit_channel_denied: Callable[..., Awaitable[Any]]
+    # Offline uploaded logs (BACKLOG #125/#126, ADR 0134; seam v7)
+    upload_file: Callable[..., Awaitable[Any]]
+    list_uploaded_files: Callable[..., Awaitable[Any]]
+    browse_uploaded_file: Callable[..., Awaitable[Any]]
+    resend_uploaded_message: Callable[..., Awaitable[Any]]
+    delete_uploaded_file: Callable[..., Awaitable[Any]]
+    # Saved / layered Log-Search filter presets (BACKLOG #151, ADR 0136; seam v8)
+    list_search_presets: Callable[..., Awaitable[Any]]
+    create_search_preset: Callable[..., Awaitable[Any]]
+    delete_search_preset: Callable[..., Awaitable[Any]]
+    layered_search: Callable[..., Awaitable[Any]]
+    # Console Flow & trends page (BACKLOG #76, ADR 0065 amendment; seam v9): the metrics-history ring
+    # + the status-colored by-name data-flow graph, both read-only + monitoring:read.
+    metrics_history: Callable[..., Awaitable[Any]]
+    graph_edges: Callable[..., Awaitable[Any]]
+    # First console→connections.toml write seam (BACKLOG #131, ADR 0007 amendment; seam v9): the
+    # object-flag toggle (config:deploy). TOML-managed connections only — a code-first one is refused 409.
+    set_connection_flag: Callable[..., Awaitable[Any]]
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,3 +193,9 @@ class UiDeps:
     default_scan_limit: int
     core: CoreHandlers
     admin: AdminHandlers
+    #: Whether ``[auth].oidc_enabled`` is set (ADR 0142). Passed as CONFIG rather than read off
+    #: ``app.state.auth``, because ``create_managed_app`` — the path ``messagefoundry serve`` uses —
+    #: attaches the AuthService inside the lifespan, LONG after ``mount_ui`` has fixed the route
+    #: table. A registrar that gated on ``app.state.auth`` would therefore register nothing in
+    #: production while passing every test that constructs the app with ``auth=`` directly.
+    oidc_enabled: bool = False

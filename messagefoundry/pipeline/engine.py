@@ -37,6 +37,7 @@ from messagefoundry.config.settings import (
     RetentionSettings,
     SandboxSettings,
     SecretRotationSettings,
+    SecurityEnforcement,
     ShadowSettings,
     StoreSettings,
     UpdateCheckSettings,
@@ -46,31 +47,36 @@ from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     Registry,
     WiringError,
+    connector_secret_env_values,
     load_config,
 )
 from messagefoundry.pipeline.alerts import AlertSink
-from messagefoundry.redaction import safe_exc
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
+from messagefoundry.pipeline.gcm_invocations import GcmInvocationRunner
 from messagefoundry.pipeline.leader_tasks import LeaderMaintenanceRunner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
+from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.secret_rotation import (
     MonitoredSecret,
     SecretRotationRunner,
-    secrets_from_settings,
+    SecretStamp,
+    reconcile_rotation_meta,
+    secrets_from_settings_and_stamps,
 )
-from messagefoundry.pipeline.retention import RetentionRunner
 from messagefoundry.pipeline.sharding import owned_destination_set
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
     check_pt_backend_supported,
+    check_reference_backend_supported,
 )
-from messagefoundry.store import MessageStore, Store
+from messagefoundry.redaction import safe_exc
+from messagefoundry.store import MessageStore, SecretRotationMetaStore, Store
 from messagefoundry.store.store import (
     ConnectionMetrics,
     DestinationMetrics,
@@ -141,12 +147,14 @@ class Engine:
         retention_settings: RetentionSettings | None = None,
         cert_monitor_settings: CertMonitorSettings | None = None,
         secret_rotation_settings: SecretRotationSettings | None = None,
+        security_enforcement: SecurityEnforcement | None = None,
         update_check_settings: UpdateCheckSettings | None = None,
         backup_settings: BackupSettings | None = None,
         dr_settings: DrSettings | None = None,
         store_settings: StoreSettings | None = None,
         engine_version: str = "",
         api_tls_cert_file: str | None = None,
+        api_tls_client_cert_files: Sequence[str] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
@@ -252,6 +260,10 @@ class Engine:
         # certs (read live, so a reload that adds/removes a TLS connection is picked up).
         self._cert_monitor_settings = cert_monitor_settings
         self._api_tls_cert_file = api_tls_cert_file
+        # ASVS 6.4.5: operator-held copies of INBOUND service callers' client certs. Certs the engine
+        # verifies rather than presents, so the served-cert enumeration cannot see them; watching them by
+        # file is what catches a caller whose cert expires while it has stopped connecting.
+        self._api_tls_client_cert_files = tuple(api_tls_client_cert_files)
         # The engine's own API listener (host, port), reserved so no inbound listener can steal it (it
         # would collide with uvicorn at bind). None (embedding/tests with no API socket) → nothing
         # reserved. Rendered into the (label, host, port) tuples every runner consults for port-conflict
@@ -262,12 +274,20 @@ class Engine:
             else ()
         )
         self._cert_expiry_runner: CertExpiryRunner | None = None
+        self._gcm_invocation_runner: GcmInvocationRunner | None = None
         # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — the secret-side twin of
         # cert_monitor. None (embedding/tests) → no reminder task; a no-op when warn_days=0 or nothing is
         # tracked. The tracked-secret set is derived at scan time from [secret_rotation] so a reload is
         # reflected. PHI-free: it reads rotation DATES only, never a secret value.
         self._secret_rotation_settings = secret_rotation_settings
         self._secret_rotation_runner: SecretRotationRunner | None = None
+        # [security].enforcement dial (ADR 0148) — the ASVS 13.3.4 ENFORCE escalation reads it to decide
+        # whether a DEK past max_age + grace escalates its rotation alert at restart. Default ENFORCE (the
+        # secure default) when not supplied (embedding/tests).
+        self._security_enforcement = security_enforcement or SecurityEnforcement.ENFORCE
+        # Reconciled secret-rotation stamps (ASVS 13.3.4): fingerprint/tracked-since/last-rotated per
+        # tracked class, populated once at start() from store meta. NON-SECRET (keyed-MAC + dates only).
+        self._secret_rotation_stamps: dict[str, SecretStamp] = {}
         # [update_check] no-network version diff (#30, ADR 0026). None (embedding/tests) → no task. A
         # maintenance task like cert_monitor: independent of the message graph, surviving reloads, a no-op
         # when disabled. Its latest result feeds the additive /status `update` field.
@@ -365,6 +385,12 @@ class Engine:
         self._graph_stop = asyncio.Event()
         self._graph_lock = asyncio.Lock()
         self._graph_reconcile_interval = 1.0
+        # Serializes ALL console→connections.toml writes (#131/#136 review): the read-modify-write of the
+        # config file is not atomic on its own, so two concurrent config:deploy writers could lose an
+        # update. A single engine-level lock guarding every such write (a future console→TOML writer must
+        # take it too) keeps them serial; the writer's unique-temp + os.replace (connections_edit) guards
+        # against a DIFFERENT process (the `connection` CLI) writing concurrently.
+        self._toml_write_lock = asyncio.Lock()
         # Background store-pool pre-warm (Workstream A — failover drain): fired on graph start/promotion
         # AFTER the on-promotion recovery, so it never competes with recovery for the pool. At most one is
         # in flight (a re-promotion cancels the prior one — see _fire_pool_warm); tracked only so stop()
@@ -442,6 +468,7 @@ class Engine:
         secret_rotation_settings: SecretRotationSettings | None = None,
         update_check_settings: UpdateCheckSettings | None = None,
         api_tls_cert_file: str | None = None,
+        api_tls_client_cert_files: Sequence[str] = (),
         api_listener: tuple[str, int] | None = None,
         reference_settings: ReferenceSettings | None = None,
         egress_settings: EgressSettings | None = None,
@@ -454,7 +481,7 @@ class Engine:
         coordinator: ClusterCoordinator | None = None,
         cluster_settings: ClusterSettings | None = None,
         registry_filter: Callable[[Registry], Registry] | None = None,
-    ) -> "Engine":
+    ) -> Engine:
         """Open a SQLite-backed engine from a path (convenience for tests/embedding). The service
         path goes through :func:`~messagefoundry.store.open_store` (backend-agnostic). The SQLite
         convenience path leaves ``coordinator`` unset → the no-op :class:`NullCoordinator`
@@ -501,6 +528,7 @@ class Engine:
             secret_rotation_settings=secret_rotation_settings,
             update_check_settings=update_check_settings,
             api_tls_cert_file=api_tls_cert_file,
+            api_tls_client_cert_files=api_tls_client_cert_files,
             api_listener=api_listener,
             reference_settings=reference_settings,
             egress_settings=egress_settings,
@@ -703,16 +731,33 @@ class Engine:
         ``tls_cert_file`` certs (read live off the registry, so a config reload is reflected). Passed to
         the :class:`CertExpiryRunner` as its cert source so each scan reflects the current graph."""
         registry = self._registry_runner.registry if self._registry_runner is not None else None
-        return certs_from_registry(registry, self._api_tls_cert_file)
+        return certs_from_registry(
+            registry, self._api_tls_cert_file, self._api_tls_client_cert_files
+        )
 
     def _tracked_secrets(self) -> list[MonitoredSecret]:
-        """The long-lived secrets whose rotation age the engine tracks right now (read live off
-        ``[secret_rotation]`` so a config reload is reflected). Passed to the
-        :class:`SecretRotationRunner` as its secret source. PHI-free: rotation dates + identifiers only,
-        never a secret value."""
+        """The long-lived secrets whose rotation age the engine tracks right now: the DEK (operator date
+        when set, else the auto-detected tracked-since / rotation stamp) + each reconciled non-DEK class
+        (ASVS 13.3.4). Read live off ``[secret_rotation]`` + the stamps reconciled at start, so a config
+        reload is reflected. Passed to the :class:`SecretRotationRunner` as its secret source. PHI-free:
+        rotation dates + identifiers only, never a secret value."""
         if self._secret_rotation_settings is None:
             return []
-        return secrets_from_settings(self._secret_rotation_settings)
+        return secrets_from_settings_and_stamps(
+            self._secret_rotation_settings, self._secret_rotation_stamps
+        )
+
+    def _connector_secret_env_values(self) -> dict[str, str]:
+        """The per-Connection ``env()`` credential VALUES the wired graph holds right now, keyed by their
+        env-value key (a NON-SECRET id), for the ASVS-13.3.4 rotation fingerprinter (passed as
+        ``reconcile_rotation_meta``'s ``extra_values`` so a connector credential is keyed-MAC'd exactly
+        like the fixed ``MEFOR_*`` classes). Read live off the registry + this instance's env values;
+        empty until a graph is wired. Values are returned transiently to be MAC'd — never persisted or
+        logged."""
+        registry = self._registry_runner.registry if self._registry_runner is not None else None
+        if registry is None:
+            return {}
+        return connector_secret_env_values(registry, self._env_values)
 
     @property
     def coordinator(self) -> ClusterCoordinator:
@@ -861,15 +906,16 @@ class Engine:
         if self._registry_runner is not None:
             # Fail loud (not at the first received message) if the configured store can't run the
             # staged ingress pipeline: the inbound path unconditionally calls store.enqueue_ingress,
-            # so a backend whose enqueue_ingress/handoff is a NotImplementedError stub (SQL Server,
-            # gated on BACKLOG #1) would otherwise wedge every inbound at runtime with no ACK/NAK. This
-            # check fails loud on EVERY node (leader or standby) — a misconfigured backend should refuse
-            # at startup, not only when this node is promoted.
+            # so a FUTURE backend whose enqueue_ingress/handoff is a NotImplementedError stub would
+            # otherwise wedge every inbound at runtime with no ACK/NAK. All three shipped backends
+            # (SQLite, Postgres, SQL Server) set supports_ingest_stage=True, so this is the fail-closed
+            # allow-list guard for a staging-incapable backend, not a live restriction. It fails loud on
+            # EVERY node (leader or standby) — a misconfigured backend should refuse at startup, not
+            # only when this node is promoted.
             if not getattr(self.store, "supports_ingest_stage", True):
                 raise RuntimeError(
                     "the configured store backend does not support the staged ingress pipeline "
-                    "(ADR 0001 Step A is SQLite-only; SQL Server staging is gated on BACKLOG #1) — "
-                    "use the sqlite backend"
+                    "(ADR 0001) — SQLite, Postgres, and SQL Server all do"
                 )
             # Fail-fast (not at the first Handler Send into a PT connector) if the wired graph contains a
             # pass-through (PT) inbound but the configured backend doesn't implement PT re-ingress (the
@@ -878,6 +924,13 @@ class Engine:
             # implemented the branch is rejected here, before any inbound listener binds,
             # so the runtime NotImplementedError (after the inbound is already ACKed) can never surface.
             self._check_pt_backend_supported()
+            # Fail-fast (not per-message, post-ACK, forever) if the graph declares a reference set but the
+            # backend has no ADR 0006 snapshot store to materialize it into. This MUST run before
+            # _start_graph below: that path calls _reconcile_reference_sync(startup=True) -> sync_all() ->
+            # write_reference_snapshot, which is exactly what detonates on such a backend. Like the
+            # supports_ingest_stage check it fires on EVERY node (leader or standby) — which also covers
+            # the clustered branch, where the reference runner starts on every node before leadership.
+            self._check_reference_backend_supported()
             if not self._coordinator.is_clustered():
                 # SINGLE-NODE (NullCoordinator, always leader): bring the graph up now, exactly as
                 # before — byte-identical. The config-drift sweeps + reference materialize + listener
@@ -946,11 +999,46 @@ class Engine:
                 alert_sink=self._alert_sink,
             )
             self._cert_expiry_runner.start()
-        # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5) — a maintenance task like
-        # cert_monitor: independent of the message graph, surviving reloads, a no-op when warn_days=0 or
-        # nothing is tracked. NOT leader-gated: it reads node-local config dates only and writes no store
-        # rows (the per-secret realert throttle bounds any alert spam), so each node may run it.
+        # ASVS 11.3.4: checkpoint the store cipher's PERSISTED per-key AES-GCM invocation reserve and
+        # alarm at 2**31 (half the fail-closed 2**32 birthday ceiling). A no-op when the store carries no
+        # bounded cipher (keyless / `vault_transit`). NOT leader-gated and NOT settings-gated: every
+        # process spends its own reserved blocks, so every process must refill its own, and the bound is
+        # a correctness control rather than an operator preference.
+        self._gcm_invocation_runner = GcmInvocationRunner(self.store, alert_sink=self._alert_sink)
+        self._gcm_invocation_runner.start()
+        # [secret_rotation] secret-rotation reminder (#195b, ADR 0019 §5; widened in ASVS 13.3.4 / #282) —
+        # a maintenance task like cert_monitor: independent of the message graph, surviving reloads, a
+        # no-op when warn_days=0 or nothing is tracked. NOT leader-gated: it reads node-local config +
+        # fingerprints and the per-secret realert throttle bounds any alert spam, so each node may run it.
         if self._secret_rotation_settings is not None:
+            # Reconcile the NON-SECRET fingerprint/tracked-since stamps once at start (ASVS 13.3.4): the
+            # DEK is tracked live-by-default off a persisted key-id stamp; each held connector/AD/SMTP/
+            # Vault/OIDC secret is fingerprinted with a DEK-derived keyed MAC so a change auto-detects a
+            # rotation; and the ENFORCE escalation fires here (at restart) for a DEK past max_age + grace.
+            # The upserts are idempotent (keyed-MAC + dates only, never a value). All three shipped
+            # backends (SQLite, SQL Server, Postgres) implement the narrow SecretRotationMetaStore
+            # (#1186), so this isinstance gate engages on each and the reconcile + ENFORCE escalation
+            # runs; a backend that did NOT would degrade to the operator-configured dates without
+            # persistence — never an error.
+            if isinstance(self.store, SecretRotationMetaStore):
+                try:
+                    self._secret_rotation_stamps = await reconcile_rotation_meta(
+                        self.store,
+                        self._secret_rotation_settings,
+                        dek_key_id=self.store.cipher_info().active_key_id,
+                        enforcement=self._security_enforcement,
+                        alert_sink=self._alert_sink,
+                        # Per-Connection env() connector credentials resolved from the live graph, so
+                        # they ride the SAME keyed-MAC fingerprint mechanism as the fixed MEFOR_* classes
+                        # (ASVS 13.3.4). Read transiently to be MAC'd — never persisted or logged.
+                        extra_values=self._connector_secret_env_values(),
+                    )
+                except Exception:
+                    # A reconcile failure must never take the engine down — the runner still works off the
+                    # operator-configured dates (empty stamps). Logged, not raised.
+                    log.exception(
+                        "secret-rotation stamp reconcile failed; continuing with config dates"
+                    )
             self._secret_rotation_runner = SecretRotationRunner(
                 self._tracked_secrets,
                 self._secret_rotation_settings,
@@ -1050,6 +1138,18 @@ class Engine:
         if self._registry_runner is None:
             return
         check_pt_backend_supported(self._registry_runner.registry, self.store)
+
+    def _check_reference_backend_supported(self) -> None:
+        """Gate the start-time graph through the SINGLE source of truth for the reference-set backend
+        allow-list (:func:`check_reference_backend_supported`) — the same gate the reload + dry-run paths
+        reach via :meth:`RegistryRunner.build_check`. Reject a graph declaring an ADR 0006
+        ``Reference(...)`` on a backend with no snapshot store, BEFORE the startup sync tries to write
+        one and before any handler's ``reference(...)`` read can raise post-ACK. No-op when there is no
+        wired graph, no declared set, or a supporting backend — all three shipped backends support
+        reference sets (SQL Server since BACKLOG #235), so today this guards future backends."""
+        if self._registry_runner is None:
+            return
+        check_reference_backend_supported(self._registry_runner.registry, self.store)
 
     async def _start_graph(self) -> None:
         """Bring the wired graph up: (A4) recover the prior leader's stranded in-flight rows + lane
@@ -1164,11 +1264,11 @@ class Engine:
                 raise
             except Exception:
                 log.exception("engine graph supervisor reconcile failed; will retry")
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(
                     self._graph_stop.wait(), timeout=self._graph_reconcile_interval
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
 
     def _set_applied_config_version(self, version: int) -> None:
@@ -1182,6 +1282,84 @@ class Engine:
         the shared version token again (or nodes would chase each other's reloads). Passing ``None``
         reloads the startup ``--config`` dir."""
         await self.reload(propagate=False)
+
+    async def set_connection_flag(self, name: str, *, direction: str, flagged: bool) -> None:
+        """Set the operator "object of interest" flag on a ``connections.toml``-managed connection (#131,
+        ADR 0007 amendment) — the FIRST console→``connections.toml`` write seam.
+
+        Persists ``flagged`` into ``connections.toml`` via the comment/format-preserving,
+        validate-before-persist writer (:mod:`config.connections_edit`, round-tripping the full target
+        entry so no other field is lost), then reflects it on the LIVE in-memory :class:`Registry` entry
+        in place — a cosmetic-field :func:`dataclasses.replace`, so **no** connector is rebuilt, **no**
+        graph reload runs, and the delivery path is untouched. The flag is display-only; no runtime path
+        reads it.
+
+        ``direction`` is ``"inbound"`` / ``"outbound"`` (it disambiguates a name declared as both).
+        Raises :class:`WiringError` when the connection is **not** in ``connections.toml`` — the SCOPE
+        FORK: a *code-first* connection has no TOML home, so the console flag is refused there (the
+        universal-object flag would need a store table, deliberately not built) — when no config dir is
+        known, or when the validated write fails. The caller maps that to a 409.
+        """
+        from messagefoundry.config import connections_edit
+        from messagefoundry.config.connections_file import CONNECTIONS_FILE_NAME
+        from messagefoundry.pipeline.wiring_runner import build_check_registry
+
+        if direction not in ("inbound", "outbound"):
+            raise WiringError("connection flag direction must be 'inbound' or 'outbound'")
+        config_dir = self.last_reload_dir or self.config_dir
+        if config_dir is None:
+            raise WiringError(
+                "no config directory is configured — a connection flag cannot be persisted"
+            )
+        cfg_dir: Path = config_dir
+        egress = self._egress_settings or EgressSettings()
+
+        def _write() -> None:
+            entries = connections_edit.list_connections(cfg_dir)
+            match = next(
+                (e for e in entries if e.get("name") == name and e.get("direction") == direction),
+                None,
+            )
+            if match is None:
+                # SCOPE FORK (#131): a code-first (or unknown) connection has no TOML home to persist to.
+                raise WiringError(
+                    f"connection {name!r} is not managed in {CONNECTIONS_FILE_NAME} — "
+                    "the object flag is settable only on a connections.toml-managed connection "
+                    "(a code-first connection has no TOML home for it)"
+                )
+            match["flagged"] = flagged
+
+            def validate(check_dir: Path) -> None:
+                registry = load_config(check_dir)
+                build_check_registry(
+                    registry,
+                    inbound_bind_host=self._inbound_bind_host,
+                    env_values=self._env_values,
+                    egress=egress,
+                    reserved_bindings=self._reserved_bindings,
+                    posture=self._hop_posture,
+                    trust_anchor_policy=self._trust_anchor_policy,
+                )
+
+            connections_edit.upsert_connection(cfg_dir, match, validate=validate)
+
+        # Serialize the whole read-modify-write + live reflect under the engine-level TOML-write lock so
+        # two concurrent config:deploy flag toggles can't interleave (lost update / racing temp files);
+        # the write itself runs off the event loop (file I/O + a full load_config in its validate callback).
+        async with self._toml_write_lock:
+            await asyncio.to_thread(_write)
+
+            # Reflect it live, in place (cosmetic field only — no connector rebuild, no reload).
+            # Best-effort: the durable connections.toml is the source of truth, so a concurrent reload
+            # that raced this simply re-reads the persisted value on its next load.
+            rr = self._registry_runner
+            if rr is not None:
+                if direction == "inbound" and name in rr.registry.inbound:
+                    rr.registry.inbound[name] = replace(rr.registry.inbound[name], flagged=flagged)
+                elif direction == "outbound" and name in rr.registry.outbound:
+                    rr.registry.outbound[name] = replace(
+                        rr.registry.outbound[name], flagged=flagged
+                    )
 
     async def reload(
         self,
@@ -1386,6 +1564,30 @@ class Engine:
             self._registry_runner.notify_work()
         return outcome
 
+    async def inject_message(
+        self,
+        *,
+        channel_id: str,
+        raw: str,
+        source_type: str = "upload",
+        metadata: str | None = None,
+    ) -> str:
+        """Inject a fresh ``RECEIVED`` message onto ``channel_id``'s **ingress** stage — the DISTINCT
+        inject path for the offline uploaded-logs resend (BACKLOG #125, ADR 0134). It reuses the exact
+        primitive the live listener uses (:meth:`QueueStore.enqueue_ingress`), so the injected message
+        flows the normal router→transform→outbound pipeline as a genuine receipt (count-and-log intact).
+
+        This is deliberately **not** :meth:`edit_resend_reroute`/``reingress``: that presupposes an
+        origin ``messages`` row (for its channel + correlation), which an uploaded, never-ingested file
+        has none of. ``enqueue_ingress`` takes the target inbound channel **directly**. Target
+        validation (registered/running) + RBAC + audit are the API's job. Returns the new message id."""
+        mid = await self.store.enqueue_ingress(
+            channel_id=channel_id, raw=raw, source_type=source_type, metadata=metadata
+        )
+        if self._registry_runner is not None and self._registry_runner.running:
+            self._registry_runner.notify_work()
+        return mid
+
     async def edit_resend_direct(
         self, message_id: str, *, to: str, raw: str, idempotency_key: str
     ) -> ResendOutcome:
@@ -1506,7 +1708,7 @@ class Engine:
             self._graph_supervisor = None
             try:
                 await asyncio.wait_for(supervisor, timeout=10.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 # wait_for already cancelled the task on timeout; absorb its cancellation.
                 await asyncio.gather(supervisor, return_exceptions=True)
         if self._retention_runner is not None:
@@ -1536,6 +1738,14 @@ class Engine:
             await self._reference_runner.stop()
         if self._registry_runner is not None:
             await self._registry_runner.stop()
+        # Settle the GCM invocation bound only AFTER the message graph has quiesced. stop() spends the
+        # unused remainder of this process's reserved block and unhooks the refill signal, so anything
+        # that encrypts after it runs is charged against no reservation with no checkpointer left to
+        # refill one. The registry runner is what drives those encrypts, so settling ahead of it would
+        # silently under-count every write performed during the shutdown drain.
+        if self._gcm_invocation_runner is not None:
+            await self._gcm_invocation_runner.stop()
+            self._gcm_invocation_runner = None
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.

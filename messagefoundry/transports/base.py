@@ -16,18 +16,27 @@ from __future__ import annotations
 
 import abc
 import asyncio
-import ipaddress
-from collections.abc import Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, ClassVar
+from typing import ClassVar, Protocol
 
-from messagefoundry.config.models import ContentType, ConnectorType, Destination, Source
+from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+
+# Re-exported, not defined here: the matcher moved to the neutral, stdlib-only
+# ``messagefoundry.netaddr`` so the operator-surface allow-list
+# ([security].allowed_client_networks, enforced in API middleware) can share ONE matcher and one
+# CIDR syntax with the per-connection source_ip_allowlist. The API must not import transports/ and
+# transports/ must not import api/, so the shared leaf lives at the package root. The five connector
+# call sites (mllp/tcp/x12/dicom/http_listener) keep importing it from here, unchanged.
+from messagefoundry.netaddr import peer_ip_allowed
 
 __all__ = [
     "InboundHandler",
     "ConnectionEventSink",
+    "ProcessedFileLedger",
     "DeliveryError",
     "NegativeAckError",
+    "SourceStartupError",
     "TestNotSupportedError",
     "DeliveryResponse",
     "SourceConnector",
@@ -53,44 +62,28 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
 
 
-def _peer_ip(peername: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
-    """Extract the peer IP from asyncio's ``writer.get_extra_info('peername')`` — a ``(host, port)``
-    tuple for IP sockets. Returns ``None`` when there is no resolvable IP (e.g. a UNIX socket)."""
-    if not isinstance(peername, tuple) or not peername:
-        return None
-    host = peername[0]
-    if not isinstance(host, str):
-        return None
-    try:
-        return ipaddress.ip_address(host.split("%")[0])  # strip an IPv6 zone id (fe80::1%eth0)
-    except ValueError:
-        return None
+class ProcessedFileLedger(Protocol):
+    """The store-backed **process-in-place dedup ledger** a leave-in-place (``after_read='leave'``) poll
+    source uses (ADR 0129, BACKLOG #142). The runner injects an adapter closing over the store + the
+    inbound's channel id; the source passes only a **HASHED** ``file_key`` (a derived id — sha256 of the
+    file's path + mtime/size), so ``transports/`` never imports the store and **no cleartext path crosses
+    the seam** (a filename/path can embed an MRN). ``None`` on the source means no durable ledger (a
+    direct caller / test), and the connector falls back to a bounded in-process cache. Same
+    runtime-injection shape as :data:`ConnectionEventSink`.
+    """
 
+    async def is_processed(self, file_key: str) -> bool:
+        """True iff this connection already ingested the file with this hashed ``file_key``."""
+        ...
 
-def peer_ip_allowed(peername: Any, allowlist: Sequence[str] | None) -> bool:
-    """Whether a connecting peer is permitted by an inbound ``source_ip_allowlist`` (Tier 4
-    operability). ``allowlist`` holds IP addresses and/or CIDR networks; ``None``/empty permits
-    everyone (the ``[egress]`` allowlist convention). A peer with no resolvable IP is **denied** when
-    an allowlist is set (fail closed). Entries are validated at wiring time; a malformed one is
-    skipped here defensively. An IPv4-mapped IPv6 peer (``::ffff:a.b.c.d`` on a dual-stack socket)
-    also matches an IPv4 allowlist entry."""
-    if not allowlist:
-        return True
-    addr = _peer_ip(peername)
-    if addr is None:
-        return False
-    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = [addr]
-    mapped = getattr(addr, "ipv4_mapped", None)
-    if mapped is not None:
-        candidates.append(mapped)
-    for entry in allowlist:
-        try:
-            network = ipaddress.ip_network(entry, strict=False)  # a bare IP becomes a /32 or /128
-        except ValueError:
-            continue
-        if any(candidate in network for candidate in candidates):
-            return True
-    return False
+    async def mark_processed(self, file_key: str) -> None:
+        """Record this file as ingested — called AFTER a successful emit (the file is the dedup unit)."""
+        ...
+
+    async def prune(self) -> None:
+        """Bound the ledger's growth (age + count). Called at most once per poll tick, only when a new
+        file was recorded, so a stable read-only share never churns the store."""
+        ...
 
 
 class DeliveryError(Exception):
@@ -138,6 +131,48 @@ class TestNotSupportedError(Exception):
     separately from "unreachable"."""
 
     __test__ = False  # not a pytest test class despite the "Test" prefix
+
+
+class SourceStartupError(Exception):
+    """A source's **opt-in at-start validation** (:meth:`SourceConnector.validate_startup`) failed — a
+    File/RemoteFile connection whose ``validate_directory`` toggle is on, pointed at a directory that is
+    **missing or unusable** at start (BACKLOG #114). Raised from the runner's bind path so ADR 0031
+    isolates the connection as ``failed`` at start, instead of the default run-time deferral (a scan
+    that logs-and-retries every poll). Distinct from :class:`DeliveryError` (a delivery outcome)."""
+
+
+def encode_wire_body(payload: str, encoding: str, *, transport: str) -> bytes:
+    """Encode an outbound payload to the bytes that go on the wire (or to disk), failing CONTENT-FREE.
+
+    A bare ``payload.encode(encoding)`` raises ``UnicodeEncodeError``, which is a **``ValueError``** —
+    so a connector's ``except (TimeoutError, OSError)`` does not catch it, and in several connectors
+    the encode sits outside the ``try`` entirely. It escapes ``send()`` to the delivery worker's
+    generic handler, which persists ``internal error: {safe_exc(exc)}`` into **``queue.last_error``**
+    *and* **``message_events.detail``** — plaintext on a default (``IdentityCipher``) store. And
+    ``str(UnicodeEncodeError)`` **names the offending character**::
+
+        UnicodeEncodeError: 'ascii' codec can't encode character '\\xe9' in position 137
+
+    That character is a character of the *message*: PHI, or a credential once a config secret can
+    reach the body. ``safe_exc``/``redact`` scrub HL7 *shapes* and have no notion of either.
+
+    So this names the codec and the **position** — an index, never the content — and raises
+    ``from None``: the chained ``UnicodeEncodeError`` carries ``.object``, which is the **entire
+    payload**, so any handler that walks ``__cause__`` would resurrect what we just refused to log.
+
+    **Permanent** because it is: the same bytes will never encode on a retry, so it dead-letters
+    rather than looping the lane forever. (``direct.py`` already had the right instinct — it catches
+    ``ValueError`` around its encode and reports ``type(exc).__name__`` only — but it maps to a
+    *transient* error, so an un-encodable body retries there instead of dead-lettering.)"""
+    try:
+        return payload.encode(encoding)
+    except UnicodeEncodeError as exc:
+        raise NegativeAckError(
+            f"{transport}: payload is not encodable as {encoding!r} "
+            f"(first offending character at position {exc.start})",
+            code="encoding",
+            permanent=True,
+        ) from None
 
 
 # The closed vocabulary for a captured reply's outcome (ADR 0013). Kept here, beside the transport
@@ -211,6 +246,15 @@ class SourceConnector(abc.ABC):
     #: test that never sets it is byte-identical.
     content_type: ContentType | None = None
 
+    #: Optional runner-injected process-in-place dedup ledger (ADR 0129, BACKLOG #142), backed by the
+    #: store's ``processed_files`` table. A leave-in-place (``after_read='leave'``) poll source uses it to
+    #: record each file it has ingested (by a HASHED key — never a cleartext filename) and skip it on a
+    #: later poll, so a read-only share whose files another system owns can be polled without moving or
+    #: deleting them. ``None`` (the default) = no durable ledger (a direct caller / test) → the source
+    #: falls back to an in-process set. Same runtime-injection shape as :attr:`on_connection_event`;
+    #: ``transports/`` stays store-agnostic.
+    processed_ledger: ProcessedFileLedger | None = None
+
     @abc.abstractmethod
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -228,6 +272,18 @@ class SourceConnector(abc.ABC):
 
     @abc.abstractmethod
     async def stop(self) -> None: ...
+
+    async def validate_startup(self) -> None:
+        """Optional **opt-in** at-start validity check for the source's external resource, run by the
+        runner in ``_start_inbound_unsafe`` right before the bind (BACKLOG #114). The **default is a
+        no-op** — validation stays deferred to run time (byte-identical: a poll source that can't reach
+        its resource logs-and-retries every poll rather than failing start). A poll source (FILE/
+        REMOTEFILE) overrides it to **fail-fast** when its ``validate_directory`` setting is on: a
+        missing/unusable directory raises :class:`SourceStartupError`, which the caller isolates as
+        ADR-0031 ``failed`` at start. Unlike :meth:`test_connection` (the on-demand ``POST
+        /connections/{name}/test`` probe, which may **create** the watch directory), this check must
+        **not** create anything — a merely-missing directory must FAIL, not be fabricated and pass."""
+        return None
 
     async def test_connection(self) -> None:
         """Probe the source's external resource for reachability — sending NO real data and writing no
@@ -317,10 +373,10 @@ async def probe_tcp_reachable(host: str, port: int, timeout: float, label: str) 
     :class:`DeliveryError` if the connect fails or times out."""
     try:
         _reader, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout)
-    except (OSError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, OSError) as exc:
         raise DeliveryError(f"{label} connect to {host}:{port} failed: {exc}") from exc
     writer.close()
-    try:
+    try:  # noqa: SIM105
         await writer.wait_closed()
     except OSError:
         pass

@@ -12,6 +12,7 @@ map, and make the id trivially reversible at the sink.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
 
 @dataclass(frozen=True)
@@ -40,3 +41,20 @@ class ControlIds:
         if not tail.isdigit():
             return None
         return int(tail)
+
+
+#: THE shardcert control-id scheme — the ONE definition of the wire format its senders stamp and its
+#: PARTITIONED router decodes. Defined here, beside :class:`ControlIds`, because it is now READ on the
+#: engine side too (``harness.config.shardcert._shape.ShardCertShape.destination_index`` recovers the seq
+#: to pick the destination lane), which makes the prefix a genuine SENDER↔ROUTER contract rather than a
+#: sender-local detail. Every shardcert sender (single-box, two-box driver, sink) and the graph MUST import
+#: this object — a re-spelled ``ControlIds(prefix="SC")`` beside it is the two-place-constant drift this
+#: harness keeps getting bitten by, and here it would be a five-place one: change the prefix in four of the
+#: five and the router raises on every message, voiding the whole run.
+#:
+#: Unlike the other benches' senders (connscale's ``CS{pid:x}``, multishard's ``MS``, failover's ``FO``) the
+#: prefix is deliberately NOT run-scoped: the ROUTER — in a separate ``serve --shard`` process that never
+#: sees the sender's pid — has to know it a priori. If shardcert ever needs run-scoping (a re-run against a
+#: long-lived DB colliding with prior ids), the scope must be threaded to the engine through the graph env,
+#: not minted per-sender.
+SHARDCERT_IDS: Final = ControlIds(prefix="SC")

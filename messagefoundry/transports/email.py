@@ -18,10 +18,17 @@ one-way dependency rule, CLAUDE.md §4); the two copies are deliberately indepen
 **STARTTLS by default** (``use_tls=True``): the connector issues ``STARTTLS`` before ``AUTH``/data on
 the ``587`` submission port; port ``465`` (implicit TLS) maps to ``smtplib.SMTP_SSL``. Disabling TLS
 (``use_tls=False``) is **refused unless** the project-wide dev escape ``MEFOR_ALLOW_INSECURE_TLS`` is
-set (``insecure_tls_allowed()``), and credentials are **never** sent over a cleartext channel (a
-``username``/``password`` with ``use_tls=False`` and no escape raises at construction) — the same
-``refuse_cleartext_credentials`` posture the REST destination takes. The ``[egress].allowed_smtp``
-allowlist is the authoritative fail-closed host gate (enforced by the runner at load/reload/start).
+set — read through the CLAMPED ``weakened_tls_escape_permitted_here()`` (#200, ADR 0092), so the blunt
+global escape can no longer silence a cleartext hop on an enforcing production-PHI instance — or the
+connection attests the hop (``tls_hop_attested``). Credentials are **never** sent over a cleartext
+channel (a ``username``/``password`` with ``use_tls=False`` raises at construction, even with the
+escape) — the same ``refuse_cleartext_credentials`` posture the REST destination takes. The message
+**body** is PHI on that same cleartext hop, so it is additionally governed by the shared
+:class:`~messagefoundry.transports.mllp.InsecureHopGuard` gradient every other cleartext-egress
+transport consumes (refuse enforcing-production-PHI off-loopback, warn non-enforcing PHI, allow
+loopback / synthetic / attested), rather than the bare warning it used to get. The
+``[egress].allowed_smtp`` allowlist is the authoritative fail-closed host gate (enforced by the runner
+at load/reload/start).
 
 **Idempotency.** Delivery is at-least-once, so a retry **re-sends** the email; a mailbox has no
 idempotency key, so a rare duplicate is possible after a transient failure between server-accept and
@@ -37,12 +44,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import smtplib
-from email.message import EmailMessage
 from collections.abc import Mapping
+from email.message import EmailMessage
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    weakened_tls_escape_permitted_here,
+)
 from messagefoundry.config.tls_policy import RevocationHopGuard
 from messagefoundry.transports.base import (
     DeliveryError,
@@ -50,6 +60,7 @@ from messagefoundry.transports.base import (
     DestinationConnector,
     register_destination,
 )
+from messagefoundry.transports.mllp import InsecureHopGuard
 
 __all__ = ["EmailDestination"]
 
@@ -103,14 +114,23 @@ class EmailDestination(DestinationConnector):
         # STARTTLS-by-default posture, mirroring RestDestination's verify_tls /
         # refuse_cleartext_credentials handling. Disabling TLS puts the body (PHI) and any AUTH
         # credentials on the wire in cleartext, so it is refused unless the project-wide dev escape is
-        # set, and logged loudly when allowed. The escape is the SAME insecure_tls_allowed() gate the
-        # whole project uses — not a new mechanism.
+        # set. The escape is the SAME project-wide gate every sibling connector uses — not a new
+        # mechanism — but it is now read through the CLAMPED weakened_tls_escape_permitted_here()
+        # (#200, ADR 0092 decision 2) rather than the raw insecure_tls_allowed(): the blunt global
+        # escape must not silence a cleartext hop on an ENFORCING production-PHI instance, exactly as
+        # it no longer does for MLLP/FTPS tls_verify=false or credentialed plain-ftp. A per-connection
+        # `tls_hop_attested` also satisfies this opt-in gate, so an operator who has attested the hop
+        # is legitimately secure (a trusted segment / on-box relay) is not forced to ALSO set a blunt
+        # process-wide env var — without this, attestation would be dead config on EMAIL alone.
+        self._hop_guard: InsecureHopGuard | None = None
         if not self.use_tls:
-            if not insecure_tls_allowed():
+            if not (weakened_tls_escape_permitted_here() or config.tls_hop_attested):
                 raise ValueError(
                     "Email destination use_tls=false sends the message (and any credentials) over "
                     f"cleartext SMTP; refused unless {INSECURE_TLS_ESCAPE_ENV} is set "
-                    "(dev/trusted-network only) — use STARTTLS (the default)"
+                    "(dev/trusted-network only) or the connection sets tls_hop_attested=true — use "
+                    "STARTTLS (the default). Refused on a production-PHI instance even with the "
+                    "escape (#200)."
                 )
             # Credentials over an un-encrypted channel are never allowed, even with the escape: a
             # cleartext AUTH puts the password on the wire (the refuse_cleartext_credentials rule).
@@ -119,11 +139,23 @@ class EmailDestination(DestinationConnector):
                     "Email destination sends SMTP AUTH credentials over cleartext (use_tls=false); "
                     "refused — credentials require STARTTLS/implicit TLS"
                 )
-            logger.warning(
-                "Email destination %s has TLS DISABLED (use_tls=false); the message crosses the "
-                "network in CLEARTEXT (dev/trusted-network only)",
-                self.host,
+            # #200 (ADR 0092): the credential is refused outright above, but the message BODY is PHI and
+            # was previously only WARNed about before being put on the wire — a warn where the (strictly
+            # less sensitive) credential got a refusal. Route the body decision through the ONE shared
+            # authority every other cleartext-egress transport consumes (raw TCP / X12 / plaintext DIMSE /
+            # anonymous FTP), so SMTP decides identically: REFUSE an enforcing production-PHI hop
+            # off-loopback, WARN a non-enforcing PHI hop, ALLOW loopback / synthetic / per-connection-
+            # attested. No-op off the enforced construction gate (posture unstamped), so no existing
+            # dev/lab lane that already carried the escape breaks.
+            self._hop_guard = InsecureHopGuard.capture(
+                host=self.host,
+                port=self.port,
+                cell="EMAIL outbound",
+                description="cleartext SMTP egress (use_tls=false)",
+                attested=config.tls_hop_attested,
+                attested_reason=config.tls_hop_attested_reason,
             )
+            self._hop_guard.enforce_construction()
         else:
             # #201 (ADR 0078 amendment): STARTTLS (587) / implicit-TLS SMTP_SSL (465) verifies the server
             # cert, but smtplib's default SSL context does NO OCSP/CRL revocation (stdlib ssl has none) —
@@ -175,6 +207,10 @@ class EmailDestination(DestinationConnector):
         # Lifted from pipeline/alert_sinks.py send_plain_email (NOT imported — the one-way dependency
         # rule, ADR 0029). PHI/secret-safe error text: the host + SMTP failure class only, never the
         # body, the recipients' PHI, or the password.
+        if self._hop_guard is not None:
+            # Zero-I/O send-time backstop at the byte crossing (the tcp/x12/dicom pattern): re-assert the
+            # captured cleartext decision so a reload can't route PHI around the construction-only gate.
+            self._hop_guard.assert_send()
         msg = self._build_message(payload)
         try:
             with self._connect() as smtp:

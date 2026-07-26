@@ -24,7 +24,6 @@ from messagefoundry.auth.notifications import MFA_DISABLED, SecurityEvent  # noq
 from messagefoundry.auth.service import AuthService  # noqa: E402
 from messagefoundry.config.settings import AuthSettings  # noqa: E402
 from messagefoundry.store.store import MessageStore  # noqa: E402
-
 from tests._soft_webauthn import SoftAuthenticator  # noqa: E402
 
 RP = "t"
@@ -320,7 +319,9 @@ async def test_ad_user_cannot_enroll_passkey() -> None:
             dn="CN=aduser,DC=x",
             groups=frozenset(),
         )
-        out = await service._complete_ad_login(principal, None)
+        # mfa_verified is the per-mechanism grant (ASVS 6.3.4); the simple-bind leg passes True under
+        # the signed delegated-directory relaxation, which is what this AD principal stands in for.
+        out = await service._complete_ad_login(principal, None, mfa_verified=True)
         assert out.ok and out.identity is not None and out.token is not None
         with pytest.raises(ValueError, match="only local users"):
             await service.begin_webauthn_registration(

@@ -21,6 +21,8 @@ __all__ = [
     "XmlPathError",
     "XmlValidationError",
     "XmlSecurityError",
+    "WsdlError",
+    "WsdlSecurityError",
 ]
 
 
@@ -50,3 +52,18 @@ class XmlSecurityError(XmlError):
     (``resolve_entities=False``, ``no_network=True``, ``load_dtd=False``, ``huge_tree=False``), so XXE /
     billion-laughs entity expansion / external-DTD SSRF are refused, not merely ignored. Raised so an
     operator sees *why* a payload was rejected rather than getting a silently-empty parse."""
+
+
+class WsdlError(XmlError):
+    """A WSDL document is malformed, not a WSDL, or an envelope could not be validated against it (BACKLOG
+    #69, ADR 0122). A ``ValueError`` subclass (via :class:`XmlError`), so a Handler's ``except ValueError``
+    routes it to the error/dead-letter path without special-casing. **PHI-safe**: names element QNames /
+    reason categories only, never element content."""
+
+
+class WsdlSecurityError(WsdlError):
+    """A WSDL import could not be resolved without leaving the machine (ADR 0122). ``parse_wsdl`` refuses a
+    ``wsdl:import`` / ``xsd:import`` / ``xsd:include`` whose ``location``/``schemaLocation`` points over the
+    network (``http:``/``https:``/``ftp:``/a network-path ``//host`` reference) — the distinct WSDL-layer
+    resolution seam the ``xmlschema`` ``allow="local"`` no-network config does **not** cover — so a crafted
+    WSDL can't SSRF past the XSD lockdown. **PHI-safe**: names the URI *scheme* only, never the full URL."""

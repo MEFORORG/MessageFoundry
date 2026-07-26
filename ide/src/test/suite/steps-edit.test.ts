@@ -989,26 +989,60 @@ suite("Steps context menu — explicit before/after insert (right-click, ADR 010
 
 suite("Steps context menu — item enablement matrix (ADR 0103)", () => {
   test("an editable action row that can walk both ways enables every item", () => {
-    assert.deepStrictEqual(contextMenuEnablement("action", { canMoveUp: true, canMoveDown: true }), {
+    assert.deepStrictEqual(contextMenuEnablement({ kind: "action" }, { canMoveUp: true, canMoveDown: true }), {
       insertBefore: true,
       insertAfter: true,
       deleteRow: true,
       moveUp: true,
       moveDown: true,
+      addDestination: false, // not a send row
     });
   });
 
-  test("a send row suppresses Insert after (dead code after the return) but stays deletable", () => {
-    const e = contextMenuEnablement("send", { canMoveUp: true, canMoveDown: false });
+  test("Add destination is enabled on a real send (returned or appended), never on a filter", () => {
+    assert.strictEqual(contextMenuEnablement({ kind: "send" }, { canMoveUp: false, canMoveDown: false }).addDestination, true);
+    assert.strictEqual(
+      contextMenuEnablement({ kind: "send", appended: true }, { canMoveUp: false, canMoveDown: false })
+        .addDestination,
+      true,
+    );
+    assert.strictEqual(
+      contextMenuEnablement({ kind: "send", filtered: true }, { canMoveUp: false, canMoveDown: false })
+        .addDestination,
+      false, // a `return []` filter — nothing to fan out
+    );
+    assert.strictEqual(contextMenuEnablement({ kind: "code" }, { canMoveUp: false, canMoveDown: false }).addDestination, false);
+  });
+
+  test("a returned send suppresses Insert after (dead code after the return) but stays deletable", () => {
+    const e = contextMenuEnablement({ kind: "send" }, { canMoveUp: true, canMoveDown: false });
     assert.strictEqual(e.insertBefore, true);
     assert.strictEqual(e.insertAfter, false);
     assert.strictEqual(e.deleteRow, true);
     assert.strictEqual(e.moveDown, false);
   });
 
+  test("a mid-body append send (ADR 0104) ALLOWS Insert after — it is not a return", () => {
+    const e = contextMenuEnablement(
+      { kind: "send", appended: true },
+      { canMoveUp: true, canMoveDown: true },
+    );
+    assert.strictEqual(e.insertAfter, true);
+    assert.strictEqual(e.deleteRow, true);
+  });
+
+  test("the accumulator return-collector footer suppresses Insert after and is read-only", () => {
+    const e = contextMenuEnablement(
+      { kind: "code", scaffold: "return_collector" },
+      { canMoveUp: false, canMoveDown: false },
+    );
+    assert.strictEqual(e.insertAfter, false); // a step after `return sends` is dead code
+    assert.strictEqual(e.deleteRow, false); // managed scaffold, read-only
+  });
+
   test("code/control rows are read-only: Insert both ways, but never Delete", () => {
     for (const kind of ["code", "control"] as const) {
-      const e = contextMenuEnablement(kind, { canMoveUp: false, canMoveDown: false });
+      const e = contextMenuEnablement({ kind }, { canMoveUp: false, canMoveDown: false });
       assert.strictEqual(e.insertBefore, true, kind);
       assert.strictEqual(e.insertAfter, true, kind);
       assert.strictEqual(e.deleteRow, false, kind);
@@ -1018,7 +1052,7 @@ suite("Steps context menu — item enablement matrix (ADR 0103)", () => {
   });
 
   test("move up/down follow the walk booleans verbatim", () => {
-    const e = contextMenuEnablement("lookup", { canMoveUp: false, canMoveDown: true });
+    const e = contextMenuEnablement({ kind: "lookup" }, { canMoveUp: false, canMoveDown: true });
     assert.strictEqual(e.moveUp, false);
     assert.strictEqual(e.moveDown, true);
   });
@@ -1094,11 +1128,13 @@ suite("Steps v2 — structural ops force a re-projection (never a queued param c
     assert.deepStrictEqual(
       [...STRUCTURAL_OPS].sort(),
       [
+        "add_destination",
         "delete_row",
         "insert_clause",
         "insert_code_lookup",
         "insert_comment",
         "insert_row",
+        "insert_send",
         "move_row",
         "paste_block",
         "template",

@@ -1,5 +1,47 @@
 # ShardCert two-box SIZING ceiling ladder (PR-C2)
 
+> ## 🚨 Bench-truth changes — 2026-07-14 (READ FIRST: a DEFAULT MOVED)
+>
+> Four **harness-side artifacts**, each able to MANUFACTURE a fake ceiling, were fixed. One of them changes
+> the **fleet configuration** the documented command line produces, so **a fresh run and a run banked before
+> this date are NOT config-comparable.**
+>
+> 1. **⚠️ THE STORE POOL DEFAULT MOVED: 8 → 40 (the product default).** The bench used to pin
+>    `MEFOR_STORE_POOL_SIZE=8` with a bare `setdefault` — **one fifth** of `StoreSettings.pool_size` (40) —
+>    at two sites, recorded nowhere. With 4 shard processes that is **32** concurrent store connections for
+>    the whole fleet, against a product posture of 160. At a ~12 ms store round-trip and 7 committed
+>    txns/message (partitioned) that caps ingress at ~380 msg/s, **flat in `L`** — i.e. **column-for-column
+>    identical to the pooled-claim wall** (strands at outbound, `claim_mean` grows, immune to drive and to
+>    the drive box's disk). It would have commissioned an engine rewrite against a harness artifact.
+>    * The pool is now an **explicit, recorded, sweepable** variable: **`--store-pool-size N`** (defaults to
+>      the product 40; an ambient `MEFOR_STORE_POOL_SIZE` still wins over the default, as the old
+>      `setdefault` did).
+>    * The **effective** value is printed to **stderr at fleet launch** and recorded in the report JSON at
+>      **`store_pool.requested_pool_size`** — beside the engine's own **`engine_max_size`** (`/status`), so a
+>      requested-vs-observed mismatch is a finding rather than a silent 8.
+>    * A **pre-registered tripwire** (`store_pool.tripwire`) fires on `acquire_wait` p95 ≥ 5 ms, p99 ≥ 5 ms,
+>      or mean ≥ 1 ms (baseline mean **0.0135 ms**, measured at ~21% pool utilisation). If it trips, **the
+>      pool is the constraint** — do not attribute that rung's ceiling to the claim query.
+>    * **Banked runs are NOT invalidated.** At the 16 msg/s broadcast plateau the pool sat at ~21%
+>      utilisation with an `acquire_wait` mean of 0.0135 ms — no queueing. It was a *future* trap.
+> 2. **The ceiling now reports what the engine ACCEPTED, beside what we OFFERED.**
+>    `ceiling.pinned_ingress_rate` is offered-derived (`acked` never enters it); `ceiling.pinned_accepted_*`
+>    / `accepted_events_per_s` / `publishable_accepted_events_per_s` are built from `acked` over the same
+>    real span. **Quote the accepted figures.**
+> 3. **A per-rung FIDELITY gate** (`fidelity`, `sent >= 98%` **and** `acked >= 95%` of offered) separates
+>    *"my load generator is too small"* (**DRIVE SHORTFALL** — not an engine result) from *"the engine would
+>    not take it"* (**ENGINE INTAKE BIND** — a real finding, and a **different** one from a lane/claim wall).
+>    A rung failing it is **VOID for the ceiling** — it can pin neither the floor nor the bracket — and the
+>    **soak** is gated on it too (an un-driven soak can no longer certify a held ceiling). Expect this to
+>    fire: partitioned needs **~520 msg/s** of drive against the **~16** the rig pushes today, so an
+>    under-driven climb is the DEFAULT expectation.
+> 4. **The inbound pool (`G`) is recorded beside the outbound one (`L`).** `ingress ≈ G/cycle`,
+>    `routed ≈ G/cycle`, `outbound ≈ L/cycle`, with `G = shards × lanes_per_shard`. At the shipped defaults
+>    `G = 4` vs `L = 8`, so **the inbound pool is already the narrow one** and a destination/lane sweep
+>    plateaus on INGRESS. A stderr pre-flight warns at `G < L` (`--strict-inbound-bands` refuses), and
+>    `topology.inbound_bands` records it. ⚠️ The check compares lane **counts**, not **cycle times** — the
+>    ingress cycle is heavier — so a clean `G >= L` verdict does **not** exclude an ingress bind.
+>
 > ## ⚠️ Measurement caveats — read before trusting any number this emits
 >
 > Originally written 2026-07-09 against the first full run. **Re-verified 2026-07-10 against the code:
@@ -51,6 +93,38 @@
 > **bracket** the ceiling with two long soaks around `pinned_ingress_rate` using `--soak-rate <N>` on the
 > **drive box** (it overrides the auto-pick, and still runs the soak even if nothing sustained). Judge on
 > the soak's store-truth (`drained ∧ stranded==0 ∧ dead_total==0`) + the sink socket-truth.
+>
+> ### 6. The `fill_ratio` "still filling" gate does **NOT** apply to this (two-box) ladder — 2026-07-13
+>
+> `harness/load/shardcert.py` grew a **third** ceiling term on 2026-07-13: `ShardCertStepRecord.filling`.
+> It splits the **hold**'s E2E stream into two equal-length **steady** cohorts (the warm-up ramp and the
+> post-hold **drain** are excluded — a drain-contaminated second half would let `--drain-timeout` move the
+> ceiling, and a knob must never move the ceiling), flags a rung when `p50(2nd) / p50(1st) > 1.5`, and
+> **ABSTAINS** below 30 samples per half. A flagged rung is a **ceiling even when `no_loss` and `drained`
+> both pass** — it drained only because the offer stopped.
+>
+> **It fires ONLY on the co-located ladder** (`harness shardcert --rate-ladder` → `run_shardcert_ladder`),
+> where one process both sends and sinks so a `Correlator` can join send↔receive timestamps. **This two-box
+> ladder cannot compute it**: senders and sinks are separate processes behind a metadata-only coord, a sink's
+> `Correlator` never sees `on_send`, and `ShardCertDriveReport` therefore has **no E2E field at all**. Its
+> `.ceiling` **abstains explicitly** (`throughput.filling_evaluated: false`, with the reason, in the rung
+> JSON), and the two-box per-rung verdict — `shardcert_ladder.classify_rung` — has **no filling term**.
+>
+> **What that means for your numbers:**
+> - **Every two-box ceiling, including the ~16 msg/s STEP-4 plateau, is measured WITHOUT this gate** and may
+>   still **over-report** the sustainable rate by scoring a still-filling rung as SUSTAINED. Caveat 1's
+>   drain-discount (`sustainable_ingress_rate`) is the only correction in play here — and it is a *rate*
+>   correction, not a *verdict* one.
+> - **v2 vs v1 ceilings ARE comparable on this path** (the term abstains, so nothing changed). The ladder
+>   JSON stamps `ceiling_gate_version` so you never have to guess. On the **co-located** path they are
+>   **not** comparable: the gate can only ever **lower** a reported ceiling.
+> - **Naming:** it is `fill_ratio`, **not** "M2". STEP-4 §7's **M2** is a *different* quantity (the store's
+>   `E2E_complete` split by engine received-ts, symmetric bar ≤ 0.10, used to EXCLUDE a rung from a
+>   regression). Two bars under one name would be a live confusion hazard, so the name is not reused.
+> - **To close the gap** you need BOTH halves: an in-hold latency-growth signal plumbed into the two-box tier
+>   (the engine's `E2E_complete` out of `message_events` — what `scripts/bench/stage_residency.py` already
+>   computes — is the natural source), **and** a `filling` term added to `classify_rung`. Either alone is a
+>   no-op.
 >
 > **⚠️ A collapsed soak still exits `0`** (B9 — corrects an earlier claim in this box that it exits `1`).
 > `exit_code` encodes **correctness only**: `0` correctness held · `1` FIFO inversion/duplicate · `2` setup

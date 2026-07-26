@@ -20,8 +20,9 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.config.settings import ClusterSettings
-from messagefoundry.config.wiring import Registry, load_config
+from messagefoundry.config.settings import ClusterSettings, ReferenceSettings
+from messagefoundry.config.wiring import FileRef, ReferenceSpec, Registry, load_config
+from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.cluster import (
     ClusterCoordinator,
     ClusterMember,
@@ -32,12 +33,9 @@ from messagefoundry.pipeline.cluster import (
 )
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.engine import Engine
-from messagefoundry.pipeline import wiring_runner
 from messagefoundry.pipeline.reference_sync import ReferenceSyncRunner
 from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.config.settings import ReferenceSettings
-from messagefoundry.config.wiring import FileRef, ReferenceSpec
 from messagefoundry.store import MessageStatus, MessageStore, Stage
 from messagefoundry.transports.base import InboundHandler, SourceConnector
 

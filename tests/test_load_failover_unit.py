@@ -300,7 +300,9 @@ def test_node_env_configures_cluster_and_forces_pool() -> None:
     )
     assert env["MEFOR_CLUSTER_ENABLED"] == "true"
     assert env["MEFOR_CLUSTER_NODE_ID"] == "fo-a"
-    assert env["MEFOR_AUTH_ENABLED"] == "false"
+    assert (
+        env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] == "false"
+    )  # ADR 0118 rename (was MEFOR_AUTH_ENABLED)
     assert int(env["MEFOR_STORE_POOL_SIZE"]) >= 5  # forced up from the inherited 1
     assert env["MEFOR_LOAD_ADT_PORT"] == "2600"
     assert env["MEFOR_LOAD_SINK_PORT"] == "2700"

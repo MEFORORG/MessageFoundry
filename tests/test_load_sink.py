@@ -13,12 +13,11 @@ from __future__ import annotations
 import asyncio
 import time
 
-from messagefoundry.transports.mllp import MLLPDecoder, frame
-
 from harness.load.correlator import Correlator
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.sink import CorrelationSink
+from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 _IDS = ControlIds(prefix="LX", width=12)
 

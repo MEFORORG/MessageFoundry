@@ -4,6 +4,8 @@
 // mapping, the upsert argv, the per-step validators, and the step plan here (no vscode) lets the whole
 // state machine be unit-tested node-side (the CI ide job has no Python / Extension Host).
 
+import { type ConnObj, type SavePlan, planSave } from "./connectionMerge";
+
 /** The connection object the `connection upsert --data <json>` CLI consumes (ADR 0007). Mirrors the
  *  shape connectionEditor.ts builds; kept local so this module imports nothing from vscode/cli. */
 export interface WizardConnObj {
@@ -16,6 +18,10 @@ export interface WizardConnObj {
   strict?: boolean;
   ordering?: string;
   retry?: Record<string, unknown>;
+  // Index signature mirrors ConnObj (connectionMerge.ts) so a WizardConnObj is structurally assignable
+  // to ConnObj — the create-semantics collision gate (planWizardSave) can hand it straight to the shared
+  // planSave without a cast or conversion. Transparent at runtime (adds no keys).
+  [k: string]: unknown;
 }
 
 /** Transports the keyboard-first wizard offers. Deliberately only the ones it can fully configure via
@@ -149,4 +155,18 @@ export function buildConnObj(state: WizardState): WizardConnObj {
 /** The `messagefoundry connection upsert` argv (sans the `--json` the runJson helper appends). */
 export function connectionUpsertArgs(configDir: string, conn: WizardConnObj): string[] {
   return ["connection", "upsert", "--config", configDir, "--data", JSON.stringify(conn)];
+}
+
+/**
+ * Run the shared save policy ({@link planSave}) under CREATE semantics for the keyboard wizard (#240 c).
+ * The wizard always authors a brand-new connection, and `connection upsert` is a full REPLACE, so
+ * colliding with ANY existing name must be REFUSED (no `editingName` to permit an in-place replace, no
+ * `mergeFrom` source to merge over — a create stands alone). Reusing planSave keeps the wizard's refusal
+ * byte-for-byte the same as the webview form's (connectionEditor.ts / configEditors.ts) instead of a
+ * second, drift-prone gate. `WizardConnObj` is structurally assignable to `ConnObj` (its index sig
+ * accepts the wizard's known keys), so no conversion is needed. Pure — the Extension-Host caller
+ * (connectionQuickInput.saveConnection) fetches the fresh `connection list` and surfaces the refusal.
+ */
+export function planWizardSave(entries: readonly ConnObj[], conn: WizardConnObj): SavePlan {
+  return planSave(entries, conn, {});
 }

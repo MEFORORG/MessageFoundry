@@ -8,7 +8,11 @@ rule ``LDAP_MATCHING_RULE_IN_CHAIN``). Windows SSO is handled by a SPNEGO server
 that yields the authenticated principal, whose groups are resolved the same way.
 
 All calls here are **synchronous**; :class:`~messagefoundry.auth.service.AuthService` runs them via
-``asyncio.to_thread`` so the event loop never blocks. ``ldap3``/``spnego`` are imported lazily so a
+``asyncio.to_thread`` so the event loop never blocks. That dispatch carries **no** ``asyncio.wait_for``,
+so the only bound on an unresponsive domain controller is the pair of finite ``ldap3`` timeouts every
+``Server``/``Connection`` here is constructed with — ``[auth].ad_connect_timeout`` (the TCP connect) and
+``[auth].ad_receive_timeout`` (each LDAP response read), both defaulting to 10 s (ASVS 13.1.3). ldap3's
+own defaults are ``None`` on both, i.e. wait forever. ``ldap3``/``spnego`` are imported lazily so a
 local-only deployment never touches them.
 """
 
@@ -55,7 +59,7 @@ def _escape_filter(value: str) -> str:
     out: list[str] = []
     for ch in value:
         if ch in "\\*()\x00":
-            out.append("\\%02x" % ord(ch))
+            out.append("\\%02x" % ord(ch))  # noqa: UP031
         else:
             out.append(ch)
     return "".join(out)
@@ -126,17 +130,30 @@ class LdapAuthenticator:
         if str(self._s.ad_server).lower().startswith("ldaps"):
             validate = ssl.CERT_REQUIRED if self._s.ad_tls_verify else ssl.CERT_NONE
             tls = ldap3.Tls(validate=validate, ca_certs_file=self._s.ad_tls_ca_cert_file)
-        return ldap3.Server(self._s.ad_server, tls=tls, get_info=ldap3.NONE)
+        # ASVS 13.1.3: ldap3's Server.connect_timeout defaults to None (wait forever) and the engine
+        # never sets a process-wide socket default, so this is the ONLY bound on the TCP connect to the
+        # domain controller. Every Server in this module is built here, so threading it here covers the
+        # service-account bind AND the user bind.
+        return ldap3.Server(
+            self._s.ad_server,
+            tls=tls,
+            get_info=ldap3.NONE,
+            connect_timeout=self._s.ad_connect_timeout,
+        )
 
     def _service_conn(self) -> Any:
         import ldap3
 
+        # ASVS 13.1.3: receive_timeout bounds every LDAP RESPONSE read on this connection (the bind and
+        # each search). ldap3's default is None — an unresponsive DC would otherwise pin the thread-pool
+        # worker AuthService dispatches this call on, since that dispatch has no asyncio.wait_for.
         return ldap3.Connection(
             self._server(),
             user=self._s.ad_bind_dn,
             password=self._bind_password,  # resolved once in __init__ (env or [secrets].provider)
             authentication=ldap3.SIMPLE,
             auto_bind=True,
+            receive_timeout=self._s.ad_receive_timeout,
         )
 
     def _find_user(self, conn: Any, username: str) -> dict[str, Any] | None:
@@ -212,12 +229,25 @@ class LdapAuthenticator:
                 if info is None:
                     return None
                 user_dn = str(info["dn"])
+                # The password-verifying bind — a SECOND connection (and a second Server, built by
+                # _server() with its own connect_timeout). It carries the same finite receive_timeout
+                # so a DC that accepts the TCP connect but never answers the bind cannot hang the
+                # login thread (ASVS 13.1.3).
                 user_conn = ldap3.Connection(
-                    self._server(), user=user_dn, password=password, authentication=ldap3.SIMPLE
+                    self._server(),
+                    user=user_dn,
+                    password=password,
+                    authentication=ldap3.SIMPLE,
+                    receive_timeout=self._s.ad_receive_timeout,
                 )
-                if not user_conn.bind():
-                    return None
-                user_conn.unbind()
+                # Released on BOTH paths. A rejected password is the common adversarial case, so
+                # returning early without unbinding would leave the connection to GC under exactly
+                # the load that matters (ASVS 13.1.3 — resource release).
+                try:
+                    if not user_conn.bind():
+                        return None
+                finally:
+                    user_conn.unbind()
                 groups = self._resolve_groups(svc, user_dn, info["memberOf"])
         except ldap3.core.exceptions.LDAPException as exc:  # pragma: no cover - needs real AD
             raise LdapError(str(exc)) from exc

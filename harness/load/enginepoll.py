@@ -24,7 +24,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence, TypeVar
+from typing import Any, Iterable, Mapping, Sequence, TypeVar
 
 from messagefoundry.apiclient import ApiError, EngineClient
 
@@ -114,6 +114,29 @@ class EngineSample:
     pool_wait_p95_ms: float | None = None
     pool_wait_p99_ms: float | None = None
     pool_wait_max_ms: float | None = None
+    # ARTIFACT 2 (2026-07-14). The four fields above take the FIRST shard reporting a pool
+    # (`_first_not_none`), which MASKS a per-shard bind: one saturated shard among four averages into
+    # invisibility if it is not the first. These are the shard-aware aggregates — added rather than
+    # redefining the existing ones, so no banked consumer moves. (`pool_wait_max_ms` was briefly flipped to
+    # a max-across-shards; that REDEFINED a field `connscale/report.py` emits as `pool_wait.max_ms` under an
+    # unbumped SCHEMA_VERSION, so it is back to first-shard and the max lives here, beside its siblings.)
+    #
+    # `pool_max_size` is the engine's OWN view of its configured maximum (`status.pool.max_size`), which the
+    # poller never read. It is the only way to CHECK the harness's requested MEFOR_STORE_POOL_SIZE actually
+    # took effect — a mismatch between requested and observed is itself a finding.
+    pool_max_size: int | None = None  # configured pool MAXIMUM (per engine process)
+    pool_idle_min: int | None = (
+        None  # MIN idle across shards (0 ⇒ at least one shard's pool is dry)
+    )
+    pool_wait_p95_max_ms: float | None = (
+        None  # MAX p95 across shards — the un-maskable saturation read
+    )
+    pool_wait_p99_max_ms: float | None = None
+    #: MAX of the per-shard acquire-wait MAXIMUM — "the worst acquire ANY shard saw". The legacy
+    #: `pool_wait_max_ms` is first-shard-wins (like its p50/p95/p99 siblings) and stays that way; this is the
+    #: across-shard read, and it is the one :meth:`PoolStats.from_sample` uses.
+    pool_wait_max_max_ms: float | None = None
+    pool_shards_reporting: int = 0  # how many shards reported a pool at all (0 ⇒ SQLite / no pool)
 
     @property
     def backlog(self) -> int:
@@ -157,6 +180,258 @@ class _ShardSample:
     pool_wait_p95_ms: float | None = None
     pool_wait_p99_ms: float | None = None
     pool_wait_max_ms: float | None = None
+    #: The engine's OWN configured pool maximum (``status.pool.max_size``) — see EngineSample.pool_max_size.
+    pool_max_size: int | None = None
+
+
+#: The pool ``acquire_wait`` MEAN measured on the STEP-2 rig at the ~16 msg/s broadcast plateau, where the
+#: pool provably was NOT the constraint (560 txn/s against 32 fleet-wide connections ⇒ ~21% utilisation).
+#: Every tripwire bar below is stated as a multiple of THIS, so the numbers are anchored to a measurement
+#: rather than to taste.
+POOL_ACQUIRE_WAIT_BASELINE_MS = 0.0135
+
+#: PRE-REGISTERED POOL TRIPWIRE (ARTIFACT 2, 2026-07-14). If any of these fires, the STORE POOL is the
+#: constraint and the run's ceiling is a POOL BIND — not a claim wall, not a lane wall. A pool bind strands
+#: at outbound, grows claim_mean, and is immune to drive and to the drive box's disk, i.e. it is IDENTICAL
+#: to the pooled-claim wall in every column we have ever looked at. This is the discriminator.
+#:
+#: ⚠️ The MEAN is the WEAK instrument and must never be the only one. ``AcquireWaitHistogram.record()`` fires
+#: on EVERY acquire (``store/sqlserver.py``), not only ones that waited — so ``count`` is really a
+#: store-round-trip counter and ``mean_ms`` is DILUTED by the flood of zero-wait acquires. A pool that is dry
+#: 5% of the time (and blocking for 20 ms when it is) still reports a ~1 ms mean. Hence the PRIMARY bar is
+#: p95: at a healthy pool the 95th percentile acquire is still ~free, so a p95 in the milliseconds means one
+#: acquire in twenty is QUEUEING for a connection.
+#:
+#: ⚠️ THE p95 BAR IS NOT ANCHORED TO A MEASUREMENT ON THIS RIG. :data:`POOL_ACQUIRE_WAIT_BASELINE_MS` is a
+#: MEAN, and no p95 was recorded at that known-unbound reference point — so only the SECONDARY (mean) bar is
+#: stated as a multiple of a measured baseline. The p95 bar below is imported wholesale from the STEP-4
+#: falsifier doc. The JSON therefore emits ``baseline_p95_ms: null`` beside ``p95_ms``, so a reader cannot
+#: assume the p95 bar shares the mean's anchor. Record a p95 at the unbound reference rung and restate this
+#: as an explicit multiple of it.
+_POOL_TRIP_P95_MS = (
+    5.0  # the STEP-4 falsifier bar (docs/benchmarks/STEP4-bracket-and-littles-law.md) — UN-ANCHORED
+)
+#: The p99 bar. ``record()`` fires on EVERY acquire, so the flood of zero-wait acquires dilutes the
+#: PERCENTILES as well as the mean: a pool that is dry for 4% of acquires (blocking ~12 ms each) leaves
+#: p95 ≈ 0 and mean ≈ 0.5 ms — BOTH bars abstain while the pool is materially constraining. p99 is the only
+#: instrument that sees a 1–5% bind, and it is already surfaced per-shard (`pool_wait_p99_max_ms`), so it
+#: gets a bar. Same 5 ms value as the p95 bar: at a healthy pool even the 99th-percentile acquire is ~free
+#: (baseline mean 0.0135 ms), so 5 ms at p99 is a wall of waiters however few of them there are.
+_POOL_TRIP_P99_MS = 5.0
+_POOL_TRIP_MEAN_MS = 1.0  # ~74x the measured baseline — a mean this high needs a wall of waiters
+
+
+@dataclass(frozen=True)
+class PoolStats:
+    """The store connection pool's saturation evidence for ONE rung — the record that makes a POOL BIND
+    impossible to mistake for a claim wall ever again (ARTIFACT 2).
+
+    ``requested`` is what the HARNESS asked for (``MEFOR_STORE_POOL_SIZE`` handed to every ``serve --shard``
+    subprocess, per PROCESS); ``max_size`` is what the ENGINE says it configured (``/status`` ``pool.max_size``,
+    per process). They are recorded SEPARATELY on purpose: asserting the pool size from the harness's own env
+    is exactly the kind of unverified assumption this whole exercise exists to kill, so the run also MEASURES
+    it, and a divergence is a finding rather than a silent 8-vs-40.
+
+    All sentinels mean "not measured", never "zero": ``requested`` -1, the ``max_size``/``idle`` fields None,
+    and ``shards_reporting`` 0 (which is also the honest reading on SQLite, where there IS no pool)."""
+
+    requested: int = (
+        -1
+    )  # MEFOR_STORE_POOL_SIZE the harness set on each shard process (-1 = unrecorded)
+    max_size: int | None = None  # the engine's OWN configured maximum, per process
+    size: int | None = None  # connections currently open
+    idle_min: int | None = None  # MIN free connections across shards (0 ⇒ a shard's pool is dry)
+    shards_reporting: int = (
+        0  # shards that reported a pool (0 ⇒ no pool: SQLite, or /status too old)
+    )
+    acquire_wait_count: int = 0  # Σ acquires (NOT Σ waits — record() fires on every acquire)
+    acquire_wait_mean_ms: float = 0.0  # diluted by zero-wait acquires — SECONDARY evidence only
+    acquire_wait_p95_ms: float | None = None  # PRIMARY: max across shards
+    acquire_wait_p99_ms: float | None = None
+    acquire_wait_max_ms: float | None = None
+
+    @property
+    def measured(self) -> bool:
+        """A pool was actually observed (some shard reported one). ``False`` ⇒ the tripwire ABSTAINS — it
+        never reads "no data" as "no queueing" (the dead-gate failure mode this whole PR is about)."""
+        return self.shards_reporting > 0
+
+    @property
+    def tripped(self) -> bool:
+        """THE PRE-REGISTERED TRIPWIRE: the pool is the constraint. p95 is primary, p99 catches the 1–5%
+        bind that dilutes p95 to ~0, and the mean is the weakest (most diluted) bar. Never fires on absent
+        data — an unmeasured pool is UNKNOWN, not innocent."""
+        if not self.measured:
+            return False
+        p95 = self.acquire_wait_p95_ms
+        p99 = self.acquire_wait_p99_ms
+        return (
+            (p95 is not None and p95 >= _POOL_TRIP_P95_MS)
+            or (p99 is not None and p99 >= _POOL_TRIP_P99_MS)
+            or (self.acquire_wait_mean_ms >= _POOL_TRIP_MEAN_MS)
+        )
+
+    @property
+    def trip_reason(self) -> str | None:
+        """WHY it tripped, in the operator's own units, or ``None``. Also reports the un-tripped
+        ``idle_min == 0`` observation as advisory — it is read at the DRAIN sample (after the offer stopped),
+        where an idle pool is expected, so it is NOT a gate; a mid-hold sampler would be needed for that."""
+        if not self.measured:
+            return None
+        p95 = self.acquire_wait_p95_ms
+        p99 = self.acquire_wait_p99_ms
+        if p95 is not None and p95 >= _POOL_TRIP_P95_MS:
+            return (
+                f"pool acquire_wait p95={p95:.3f}ms >= {_POOL_TRIP_P95_MS}ms — one acquire in twenty "
+                f"QUEUED for a store connection (baseline {POOL_ACQUIRE_WAIT_BASELINE_MS}ms). THE POOL IS "
+                f"THE CONSTRAINT: raise --store-pool-size before attributing this rung to the claim query"
+            )
+        if p99 is not None and p99 >= _POOL_TRIP_P99_MS:
+            return (
+                f"pool acquire_wait p99={p99:.3f}ms >= {_POOL_TRIP_P99_MS}ms (p95 is BELOW its bar) — the "
+                "pool is dry for a MINORITY of acquires (1-5%), which is exactly the bind that dilutes p95 "
+                "and the mean toward zero because record() fires on EVERY acquire, not only on the ones "
+                "that waited. THE POOL IS THE CONSTRAINT: raise --store-pool-size before attributing this "
+                "rung to the claim query"
+            )
+        if self.acquire_wait_mean_ms >= _POOL_TRIP_MEAN_MS:
+            return (
+                f"pool acquire_wait mean={self.acquire_wait_mean_ms:.3f}ms >= {_POOL_TRIP_MEAN_MS}ms "
+                f"(~{self.acquire_wait_mean_ms / POOL_ACQUIRE_WAIT_BASELINE_MS:.0f}x the "
+                f"{POOL_ACQUIRE_WAIT_BASELINE_MS}ms baseline) — and the mean is DILUTED by zero-wait "
+                "acquires, so the true queueing is worse. THE POOL IS THE CONSTRAINT"
+            )
+        return None
+
+    @property
+    def requested_matches_engine(self) -> bool | None:
+        """Whether the engine CONFIRMED the pool size the harness requested. ``None`` when either side is
+        unrecorded (can't compare). ``False`` is a real finding: the env did not reach the process."""
+        if self.requested < 0 or self.max_size is None:
+            return None
+        return self.requested == self.max_size
+
+    @classmethod
+    def from_sample(cls, sample: Any | None, *, requested: int = -1) -> PoolStats:
+        """Fold a poller sample (the fleet aggregate at drain) into the rung's pool record. ``None`` sample
+        ⇒ everything stays at the not-measured sentinels.
+
+        ``getattr``-with-default throughout, and typed ``Any`` rather than ``EngineSample``, for the same
+        reason :meth:`EnginePoller._sample_shard` reads the engine's ``/stats`` that way: the caller may hand
+        us a partial/older sample object, and a pool record that RAISES rather than reading "not measured" is
+        a measurement instrument that takes the whole bench down with it."""
+        if sample is None:
+            return cls(requested=requested)
+        return cls(
+            requested=requested,
+            max_size=getattr(sample, "pool_max_size", None),
+            size=getattr(sample, "pool_size", None),
+            idle_min=getattr(sample, "pool_idle_min", None),
+            shards_reporting=int(getattr(sample, "pool_shards_reporting", 0) or 0),
+            acquire_wait_count=int(getattr(sample, "pool_acquire_wait_count", 0) or 0),
+            acquire_wait_mean_ms=float(getattr(sample, "pool_acquire_wait_mean_ms", 0.0) or 0.0),
+            acquire_wait_p95_ms=getattr(sample, "pool_wait_p95_max_ms", None),
+            acquire_wait_p99_ms=getattr(sample, "pool_wait_p99_max_ms", None),
+            # The ACROSS-SHARD max (`pool_wait_max_max_ms`), not the legacy first-shard `pool_wait_max_ms`:
+            # this is the only consumer that wants "the worst acquire ANY shard saw", and reading the legacy
+            # field would mask a bind on a non-first shard exactly as the p95/p99 fields used to.
+            acquire_wait_max_ms=getattr(sample, "pool_wait_max_max_ms", None),
+        )
+
+    def to_json_dict(self) -> dict[str, object]:
+        return {
+            "requested_pool_size": self.requested,
+            "engine_max_size": self.max_size,
+            "requested_matches_engine": self.requested_matches_engine,
+            "size": self.size,
+            "idle_min": self.idle_min,
+            "shards_reporting": self.shards_reporting,
+            "measured": self.measured,
+            # count = Σ ACQUIRES (record() fires on every acquire), so mean_ms is diluted by zero-wait
+            # acquires. Emitted with that caveat in the key comment because a reader WILL otherwise treat a
+            # small mean as proof of no queueing — the exact fake instrument the tripwire is built around.
+            "acquire_wait": {
+                "count": self.acquire_wait_count,
+                "mean_ms": round(self.acquire_wait_mean_ms, 4),
+                "p95_ms": self.acquire_wait_p95_ms,
+                "p99_ms": self.acquire_wait_p99_ms,
+                "max_ms": self.acquire_wait_max_ms,
+                "baseline_mean_ms": POOL_ACQUIRE_WAIT_BASELINE_MS,
+                # EXPLICITLY null: no p95 was recorded at the known-unbound reference point, so the p95 BAR
+                # below is NOT a multiple of a measurement on this rig (it is the STEP-4 doc's bar). Emitted
+                # so a reader does not assume it shares `baseline_mean_ms`'s anchor.
+                "baseline_p95_ms": None,
+            },
+            "tripwire": {
+                "p95_ms_bar": _POOL_TRIP_P95_MS,
+                "p95_bar_anchored_to_baseline": False,  # see baseline_p95_ms
+                "p99_ms_bar": _POOL_TRIP_P99_MS,
+                "mean_ms_bar": _POOL_TRIP_MEAN_MS,
+                "tripped": self.tripped,
+                "reason": self.trip_reason,
+            },
+        }
+
+    @classmethod
+    def from_json_dict(cls, d: Mapping[str, Any]) -> PoolStats:
+        wait = d.get("acquire_wait") or {}
+        wait_map: Mapping[str, Any] = wait if isinstance(wait, Mapping) else {}
+
+        def _opt_f(key: str) -> float | None:
+            v = wait_map.get(key)
+            return None if v is None else float(v)
+
+        raw_max = d.get("engine_max_size")
+        raw_size = d.get("size")
+        raw_idle = d.get("idle_min")
+        return cls(
+            requested=int(d.get("requested_pool_size", -1)),
+            max_size=None if raw_max is None else int(raw_max),
+            size=None if raw_size is None else int(raw_size),
+            idle_min=None if raw_idle is None else int(raw_idle),
+            shards_reporting=int(d.get("shards_reporting", 0)),
+            acquire_wait_count=int(wait_map.get("count", 0)),
+            acquire_wait_mean_ms=float(wait_map.get("mean_ms", 0.0)),
+            acquire_wait_p95_ms=_opt_f("p95_ms"),
+            acquire_wait_p99_ms=_opt_f("p99_ms"),
+            acquire_wait_max_ms=_opt_f("max_ms"),
+        )
+
+    def render(self) -> str:
+        if not self.measured:
+            return (
+                f"store pool: (not measured — no shard reported a pool; requested={self.requested})"
+            )
+        p95 = "n/a" if self.acquire_wait_p95_ms is None else f"{self.acquire_wait_p95_ms:.3f}ms"
+        p99 = "n/a" if self.acquire_wait_p99_ms is None else f"{self.acquire_wait_p99_ms:.3f}ms"
+        mismatch = "" if self.requested_matches_engine is not False else "  <= REQUESTED != ENGINE"
+        return (
+            f"store pool: requested={self.requested} engine_max={self.max_size} "
+            f"open={self.size} idle_min={self.idle_min} shards={self.shards_reporting} | "
+            f"acquire_wait n={self.acquire_wait_count} mean={self.acquire_wait_mean_ms:.4f}ms "
+            f"p95={p95} p99={p99}"
+            + mismatch
+            + ("  <= POOL BIND (tripwire)" if self.tripped else "")
+        )
+
+
+#: A :class:`PoolStats` with nothing measured — the default when a rung's engine report carried no pool
+#: block (an older engine half, a lost ENGINE_RUNG_REPORT, or a SQLite store, which has no pool at all).
+EMPTY_POOL_STATS = PoolStats()
+
+
+def _min_not_none(values: Iterable[int | None]) -> int | None:
+    """The MIN over the non-``None`` values (``None`` if all are ``None``). Used for pool IDLE: taking the
+    FIRST shard's reading (as the legacy fields do) masks a bind on any other shard."""
+    seen = [v for v in values if v is not None]
+    return min(seen) if seen else None
+
+
+def _max_not_none(values: Iterable[float | None]) -> float | None:
+    """The MAX over the non-``None`` values (``None`` if all are ``None``). Used for the pool WAIT
+    percentiles: the fleet is bound if ANY shard's pool is bound, so the worst shard is the reading."""
+    seen = [v for v in values if v is not None]
+    return max(seen) if seen else None
 
 
 async def sample_until_reconciled(
@@ -374,6 +649,19 @@ class EnginePoller:
             pool_wait_p95_ms=_first_not_none(s.pool_wait_p95_ms for s in shard_samples),
             pool_wait_p99_ms=_first_not_none(s.pool_wait_p99_ms for s in shard_samples),
             pool_wait_max_ms=_first_not_none(s.pool_wait_max_ms for s in shard_samples),
+            # ARTIFACT 2: the shard-aware pool aggregates. The `_first_not_none` fields above are kept
+            # byte-identical — `pool_wait_max_ms` is read by `connscale/runner.py` and emitted as
+            # `pool_wait.max_ms` in connscale's OWN report (SCHEMA_VERSION 1), so flipping its aggregation
+            # here would silently move a banked key in another bench with no schema bump. It MASKS a
+            # per-shard bind, so the honest across-shard reads are ADDED beside it (the same pattern as the
+            # p95/p99 pair) and `PoolStats.from_sample` reads those. `pool_max_size` is a per-process CONFIG
+            # value (identical across shards by construction), so first-wins is right for it.
+            pool_max_size=_first_not_none(s.pool_max_size for s in shard_samples),
+            pool_idle_min=_min_not_none(s.pool_idle for s in shard_samples),
+            pool_wait_p95_max_ms=_max_not_none(s.pool_wait_p95_ms for s in shard_samples),
+            pool_wait_p99_max_ms=_max_not_none(s.pool_wait_p99_ms for s in shard_samples),
+            pool_wait_max_max_ms=_max_not_none(s.pool_wait_max_ms for s in shard_samples),
+            pool_shards_reporting=sum(1 for s in shard_samples if s.pool_size is not None),
         )
 
     @staticmethod
@@ -419,6 +707,9 @@ class EnginePoller:
             executor_busy=getattr(stats, "executor_busy", None),
             pool_size=_pool_attr(status, "size"),
             pool_idle=_pool_attr(status, "idle"),
+            # The engine's OWN configured maximum. Read so the run can CHECK the pool size it asked for,
+            # rather than asserting it from the env it set (ARTIFACT 2).
+            pool_max_size=_pool_attr(status, "max_size"),
             pool_wait_p50_ms=_pool_wait_attr(status, "p50_ms"),
             pool_wait_p95_ms=_pool_wait_attr(status, "p95_ms"),
             pool_wait_p99_ms=_pool_wait_attr(status, "p99_ms"),

@@ -110,7 +110,7 @@ def _weakened_tls_permitted(*, attested: bool) -> bool:
     posture = current_hop_posture()
     if posture is None:
         return insecure_tls_allowed()
-    return hop_insecure_escape_downgrades(production=posture.production)
+    return hop_insecure_escape_downgrades(enforcing=posture.enforcing)
 
 
 def _audit_attested_weakened_tls(cell: str) -> None:
@@ -118,7 +118,7 @@ def _audit_attested_weakened_tls(cell: str) -> None:
     refusal (#200 decision 3 — attestation is AUDITED when it crosses a prod-PHI hop). No-op on a
     non-prod / non-PHI / unstamped posture (nothing was suppressed there)."""
     posture = current_hop_posture()
-    if posture is not None and posture.is_phi and posture.production:
+    if posture is not None and posture.is_phi and posture.enforcing:
         logger.warning(
             "%s: weakened TLS permitted by per-connection tls_hop_attested on a production-PHI "
             "instance (operator attests the hop is secure by other means)",
@@ -558,7 +558,16 @@ class DatabaseDestination(DestinationConnector):
         # crash-replay against changed state. Wiring rejects a capturing statement with no RETURNING/
         # OUTPUT. The result-set is JSON-serialized and bounded by row/byte caps (over-cap →
         # outcome='unparseable' with an empty body, never an unbounded blob).
-        self.capture_response: bool = bool(s.get("capture_response", False))
+        # #67 (ADR 0013 amendment): capture a stored-proc call's OUT parameters + scalar RETURN value
+        # (not just a RETURNING/OUTPUT result-set). It is read back pre-commit from the SAME cursor via a
+        # trailing readback SELECT in the proc batch (pyodbc/aioodbc do not support native ODBC
+        # output-param binding), so it inherits the same re-run-stability as the result-set path.
+        # Setting it IMPLIES capture (the connector self-consistently captures when OUT params are
+        # requested, regardless of whether the wiring gate ran). Default False → byte-identical.
+        self.capture_out_params: bool = bool(s.get("capture_out_params", False))
+        self.capture_response: bool = (
+            bool(s.get("capture_response", False)) or self.capture_out_params
+        )
         self._capture_max_rows = int(s.get("capture_max_rows", 100))
         self._capture_max_bytes = int(s.get("capture_max_bytes", 256 * 1024))
 
@@ -607,7 +616,12 @@ class DatabaseDestination(DestinationConnector):
         Never raises (capture must not un-succeed a committed write): a missing result set / over-cap
         becomes ``no_reply`` / ``unparseable`` with an empty body. Generated ids in a RETURNING are
         only as stable as the write's idempotency — a non-idempotent INSERT re-derives a new id on a
-        crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs)."""
+        crash-re-send (the standing 'outbounds must be idempotent' requirement; see the connector docs).
+
+        With ``capture_out_params`` (a stored-proc call, #67) it delegates to :meth:`_capture_merged`,
+        which walks EVERY result set so a proc's OUT/return readback SELECT isn't dropped."""
+        if self.capture_out_params:
+            return await self._capture_merged(cur)
         try:
             rows = await cur.fetchall()
         except Exception:  # noqa: BLE001 - statement produced no result set; capture nothing, keep the write
@@ -622,7 +636,7 @@ class DatabaseDestination(DestinationConnector):
             )
         try:
             cols = [d[0] for d in cur.description] if cur.description else []
-            data = [dict(zip(cols, tuple(row))) for row in rows]
+            data = [dict(zip(cols, tuple(row))) for row in rows]  # noqa: B905
             body = json.dumps(data, default=_json_default)
         except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
             # _json_default raises TypeError on a column type it can't encode; serializing must never
@@ -639,6 +653,67 @@ class DatabaseDestination(DestinationConnector):
                 detail=f"result-set exceeded capture_max_bytes={self._capture_max_bytes}",
             )
         return DeliveryResponse(body=body, outcome="accepted", detail=f"{len(rows)} row(s)")
+
+    async def _capture_merged(self, cur: Any) -> DeliveryResponse:
+        """Capture a stored-proc call's OUT parameters + scalar RETURN value (BACKLOG #67, ADR 0013
+        amendment).
+
+        A proc can emit data result-set(s) **and** a trailing readback SELECT of its OUT/return values
+        (``DECLARE @rv INT; EXEC @rv = dbo.proc :mrn; SELECT @rv AS status;``), so this walks EVERY
+        result set (``cursor.nextset()``) and merges each set's rows into one bounded JSON body — reading
+        only the first set (as :meth:`_capture` does) would drop the OUT/return values. Read pre-commit
+        from the same cursor, so it is re-run-stable to the same degree as the write's idempotency (see
+        the atomicity caveat for a proc that COMMIT/ROLLBACKs internally). Bounded by
+        ``capture_max_rows``/``capture_max_bytes`` like the single-set path.
+
+        Never raises (capture must not un-succeed a committed write): a problem degrades to
+        ``no_reply``/``unparseable`` with an empty body."""
+        merged: list[dict[str, Any]] = []
+        advance = getattr(cur, "nextset", None)
+        while True:
+            try:
+                rows = await cur.fetchall()
+            except Exception:  # noqa: BLE001 - this set is not a query (INSERT/EXEC) → nothing to fetch
+                rows = []
+            if rows:
+                try:
+                    cols = [d[0] for d in cur.description] if cur.description else []
+                    merged.extend(dict(zip(cols, tuple(row))) for row in rows)  # noqa: B905
+                except Exception:  # noqa: BLE001 - malformed description → skip this set, keep the write
+                    pass
+            if len(merged) > self._capture_max_rows:
+                return DeliveryResponse(
+                    body="",
+                    outcome="unparseable",
+                    detail=f"result-set exceeded capture_max_rows={self._capture_max_rows}",
+                )
+            if advance is None:
+                break  # a driver/cursor with no nextset() → single set only
+            try:
+                has_next = await advance()
+            except Exception:  # noqa: BLE001 - driver can't advance → stop with what we have
+                break
+            if not has_next:
+                break
+        if not merged:
+            return DeliveryResponse(
+                body="", outcome="no_reply", detail="no OUT params / return value"
+            )
+        try:
+            body = json.dumps(merged, default=_json_default)
+        except Exception as exc:  # noqa: BLE001 - an unserializable column type must NOT fail the write
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set not serializable ({type(exc).__name__})",
+            )
+        if len(body.encode("utf-8")) > self._capture_max_bytes:
+            return DeliveryResponse(
+                body="",
+                outcome="unparseable",
+                detail=f"result-set exceeded capture_max_bytes={self._capture_max_bytes}",
+            )
+        return DeliveryResponse(body=body, outcome="accepted", detail=f"{len(merged)} row(s)")
 
     async def test_connection(self) -> None:
         await _probe_db(self._get_pool, timeout=self._acquire_timeout)
@@ -753,9 +828,9 @@ class DatabaseSource(SourceConnector):
                 # NOT kill the poller — that would silently stop the connection from receiving while it
                 # still reports running. Log and retry on the next interval (mirrors the File source).
                 logger.exception("DATABASE source poll failed; retrying next interval")
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self._poll_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # poll interval elapsed; poll again
 
     def _may_poll(self) -> bool:
@@ -781,7 +856,7 @@ class DatabaseSource(SourceConnector):
         for row in rows:
             if self._stop.is_set():
                 break  # shutting down — leave the rest unmarked for the next start (at-least-once)
-            record = dict(zip(columns, row))
+            record = dict(zip(columns, row))  # noqa: B905
             try:
                 body = self._body(record)
             except (ValueError, TypeError) as exc:
@@ -978,7 +1053,7 @@ class DatabaseLookupExecutor:
             ) from exc
         finally:
             await pool.release(conn)
-        return [dict(zip(columns, row)) for row in rows]
+        return [dict(zip(columns, row)) for row in rows]  # noqa: B905
 
     async def aclose(self) -> None:
         """Close every opened pool (idempotent; safe if no pool was ever opened)."""

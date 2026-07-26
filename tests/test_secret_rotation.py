@@ -20,7 +20,7 @@ from messagefoundry.pipeline.secret_rotation import (
     secrets_from_settings,
 )
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 # A fixed reference instant so the rotation windows + the runner's clock are deterministic.
 _REF = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)
 _REF_TS = _REF.timestamp()
@@ -199,7 +199,7 @@ def test_notifier_sink_emits_secret_rotation_event() -> None:
         def __init__(self) -> None:
             self.events: list[dict[str, object]] = []
 
-        async def send(self, event: dict[str, object]) -> None:
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
             self.events.append(event)
 
     async def _go() -> None:

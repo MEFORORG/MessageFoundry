@@ -13,8 +13,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -42,12 +43,34 @@ async def _open_sqlserver() -> Any:
     return store
 
 
-@pytest.fixture(params=["sqlite", "sqlserver"])
+async def _open_postgres() -> Any:
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    # Clean slate — the canonical Postgres idiom (test_postgres_store.py): one TRUNCATE ... CASCADE,
+    # then re-seed the read-through caches from the now-empty tables so a prior test's rows don't
+    # linger in this handle's in-memory state. Postgres has NO separate `outbox` table (the SS list's
+    # `outbox` is a SQL Server artifact) — the staged queue is the unified `queue` table.
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "TRUNCATE message_events, state, queue, response, messages RESTART IDENTITY CASCADE"
+        )
+    await store._load_state_cache()
+    await store._load_reference_cache()
+    return store
+
+
+@pytest.fixture(params=["sqlite", "sqlserver", "postgres"])
 async def store(request: Any, tmp_path: Path) -> AsyncIterator[Any]:
     if request.param == "sqlserver":
         if not os.getenv("MEFOR_TEST_SQLSERVER"):
             pytest.skip("set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env) for the SQL Server leg")
         s = await _open_sqlserver()
+    elif request.param == "postgres":
+        if not os.getenv("MEFOR_TEST_POSTGRES"):
+            pytest.skip("set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env) for the Postgres leg")
+        s = await _open_postgres()
     else:
         s = await MessageStore.open(tmp_path / "meta.db")
     yield s
@@ -154,12 +177,12 @@ def test_setmeta_flows_through_transform_one() -> None:
     reg = Registry()
     reg.add_router("r", lambda m: ["h"])
     reg.add_handler("h", lambda m: [SetMeta("mrn_source", "ACME")])
-    _deliveries, _state, meta = transform_one(reg, "h", RAW)
+    _deliveries, _state, meta, _ = transform_one(reg, "h", RAW)
     assert [(m.key, m.value) for m in meta] == [("mrn_source", "ACME")]
 
 
 def test_non_str_value_rejected_at_construction() -> None:
-    with pytest.raises(Exception):  # WiringError: value must be a str
+    with pytest.raises(Exception):  # WiringError: value must be a str  # noqa: B017
         SetMeta("k", 123)  # type: ignore[arg-type]
 
 
@@ -208,3 +231,42 @@ async def test_message_metadata_json_absent_and_unknown(store: Any) -> None:
     mid, _rtd = await _to_routed(store)  # ingress/routed only — no SetMeta merged
     assert user_metadata(await store.message_metadata_json(mid)) is None  # no user bag yet
     assert await store.message_metadata_json("nonexistent-id") is None  # unknown message -> None
+
+
+# --- criterion 7 (ASVS 14.2.7): retention nulls the bag, and dynamic headers go with it ----------
+
+
+async def test_retention_purge_drops_the_dynamic_headers_bag(store: Any) -> None:
+    """ACCEPTED consequence (ii), pinned: past the body window there are no dynamic headers.
+
+    A `dead` outbound row stays replayable until `purge_dead_letters` takes it — a LATER window than
+    the body — so a row replayed in between derives its headers from a metadata column retention has
+    already nulled. It delivers with NO `dynamic_headers` rather than the headers of its first attempt.
+
+    This is a deliberate trade, not a bug: keeping a PHI-bearing bag past its retention window purely
+    so a late replay can be richer is exactly what 14.2.7 forbids. If this test fails, the behaviour
+    changed — decide deliberately rather than exempting metadata from the purge.
+    """
+    from messagefoundry.transports.rest import outbound_headers_from_metadata
+
+    mid, rtd = await _to_routed(store)
+    await store.transform_handoff(
+        routed_id=rtd.id,
+        message_id=mid,
+        channel_id="IB",
+        deliveries=[("OB1", "OUTBODY")],
+        meta_ops=[("http.header.X-Idempotency-Key", "idem-1")],
+    )
+    raw = await store.message_metadata_json(mid)
+    user_json = user_metadata(raw)
+    assert user_json is not None
+    assert outbound_headers_from_metadata(json.loads(user_json)) == {"X-Idempotency-Key": "idem-1"}
+
+    # Drive every outbound row terminal so the message is body-purge eligible, then purge.
+    for row in await store.outbox_for(mid):
+        await store.mark_done(str(row["id"]))
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
+
+    # The delivery worker's read now yields nothing, so the header chain derives an EMPTY set.
+    assert await store.message_metadata_json(mid) is None
+    assert user_metadata(await store.message_metadata_json(mid)) is None

@@ -141,5 +141,5 @@ async def test_close_shuts_down_every_pooled_connection(tmp_path) -> None:
     assert store._read_conns == []
     assert store._read_pool is None
     # Every pooled connection is closed: a use-after-close raises rather than silently working.
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         await conns[0].execute("SELECT 1")

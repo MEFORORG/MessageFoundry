@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class Status(str, Enum):
+class Status(str, Enum):  # noqa: UP042
     """Outcome of a single verify check. ``str`` mix-in so it serialises as its value."""
 
     PASS = "PASS"  # nosec B105 — a check-status enum value, not a credential

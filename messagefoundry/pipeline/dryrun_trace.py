@@ -53,11 +53,12 @@ from __future__ import annotations
 
 import inspect
 import sys
+from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
 from time import perf_counter
 from types import CodeType, FrameType
-from typing import Any, Iterator
+from typing import Any
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.fhir_lookup import FhirLookupError
@@ -383,16 +384,30 @@ def _patched_message_writes() -> Iterator[None]:
 
 
 def trace_dry_run(
-    registry: Any, raw: str | bytes, *, inbound: str | None = None, show_phi: bool = False
+    registry: Any,
+    raw: str | bytes,
+    *,
+    inbound: str | None = None,
+    show_phi: bool = False,
+    snapshot_on_send: bool = False,
 ) -> dict[str, Any]:
     """Dry-run ``raw`` against ``registry`` with the execution tracer installed; return the trace JSON.
 
     Byte-identical to :func:`messagefoundry.pipeline.dryrun.dry_run` in disposition / routed-to /
     would-send outbounds (it drives the same call path); adds a per-invocation execution trace. See the
-    module docstring for the emitted shape and capture semantics."""
+    module docstring for the emitted shape and capture semantics.
+
+    ``snapshot_on_send`` (ADR 0104) is passed straight through to the internal :func:`dry_run` so a
+    traced preview runs under the same copy-on-Send posture as the plain one — without the passthrough,
+    ``dryrun --trace`` would silently preview a different posture than plain ``dryrun`` and break the
+    byte-identical contract above. The *library* default stays ``False`` (ADR 0104 §8.1: a preview that
+    doesn't opt in does not snapshot); the ``dryrun`` CLI passes its resolved
+    ``[pipeline].snapshot_on_send`` to both paths (#230)."""
     tracer = _Tracer(show_phi=show_phi)
     with _patched_message_writes():
-        result = dry_run(registry, raw, inbound=inbound, tracer=tracer)
+        result = dry_run(
+            registry, raw, inbound=inbound, tracer=tracer, snapshot_on_send=snapshot_on_send
+        )
     disposition = result.disposition.value
     return {
         "inbound": result.inbound,

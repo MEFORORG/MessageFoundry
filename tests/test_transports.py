@@ -8,6 +8,7 @@ so the framing and ACK round-trip are exercised end-to-end, not mocked."""
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import time
 from pathlib import Path
@@ -15,11 +16,12 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.config.models import AckMode, ConnectorType, ContentType, Destination, Source
-from messagefoundry.config.wiring import File, MLLP
+from messagefoundry.config.wiring import MLLP, File
 from messagefoundry.parsing import RawMessage
+from messagefoundry.parsing.compression import gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import Peek
 from messagefoundry.transports import build_destination, build_source
-from messagefoundry.transports.base import DeliveryError, NegativeAckError
+from messagefoundry.transports.base import DeliveryError, NegativeAckError, SourceStartupError
 from messagefoundry.transports.file import (
     DEFAULT_MAX_FILE_BYTES,
     FileSource,
@@ -554,6 +556,367 @@ async def test_file_source_after_read_delete(tmp_path: Path) -> None:
     assert not (inbox / ".processed" / "m.hl7").exists()  # deleted, not moved
 
 
+def _raise_locked(*_a: object, **_k: object) -> None:
+    raise OSError("locked")
+
+
+async def test_file_source_move_failure_leaves_file_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FILE-5: when archiving a processed file can't move it (dest unwritable / file locked), _move
+    # catches OSError, logs it, and swallows — the file stays in place (re-read next scan, a bounded
+    # duplicate) rather than crashing the poller or vanishing unrecorded. Monkeypatch (not POSIX chmod)
+    # because this runs on Windows.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(inbox)}))
+    monkeypatch.setattr(Path, "replace", _raise_locked)  # every move raises
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        src._after_processing(inbox / "m.hl7")  # default after_read="move"
+    assert (inbox / "m.hl7").exists()  # left in place, not lost
+    assert not (inbox / ".processed" / "m.hl7").exists()  # never archived
+    assert "could not move" in caplog.text
+
+
+async def test_file_source_delete_failure_leaves_file_in_place(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FILE-5 (delete mode): after_read="delete" that can't unlink the processed file catches OSError,
+    # logs it (the file will be re-read = a bounded duplicate), and swallows — never crashes the poller.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
+    src = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(inbox), "after_read": "delete"})
+    )
+    monkeypatch.setattr(Path, "unlink", _raise_locked)  # every delete raises
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.file"):
+        src._after_processing(inbox / "m.hl7")
+    assert (inbox / "m.hl7").exists()  # still there, not silently dropped
+    assert "could not delete" in caplog.text
+
+
+# --- #114 opt-in startup directory validation -------------------------------
+
+
+async def test_file_validate_directory_off_is_noop_on_missing_dir(tmp_path: Path) -> None:
+    # Default (validate_directory unset): a missing directory does NOT fail validate_startup — the
+    # historical run-time deferral (the source binds and logs-and-retries once started). #114.
+    src = FileSource(
+        Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path / "nope")})
+    )
+    await src.validate_startup()  # no raise
+
+
+async def test_file_validate_directory_fails_fast_on_missing_dir(tmp_path: Path) -> None:
+    # validate_directory=true + a missing directory → SourceStartupError, and the probe NEVER creates
+    # the directory (the #114 semantic-gap guard: reusing the mkdir'ing probe would fabricate+pass it).
+    missing = tmp_path / "nope"
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(missing), "validate_directory": True},
+        )
+    )
+    with pytest.raises(SourceStartupError):
+        await src.validate_startup()
+    assert not missing.exists()  # never fabricated by the probe
+
+
+async def test_file_validate_directory_passes_on_existing_writable_dir(tmp_path: Path) -> None:
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "validate_directory": True},
+        )
+    )
+    await src.validate_startup()  # exists + writable → passes
+
+
+async def test_file_validate_directory_leave_mode_requires_only_read(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A leave-in-place source (#142) never writes to the poll dir, so validate_directory checks READ
+    # only — a read-only share passes. Force the write probe to fail: leave mode must NOT call it (so it
+    # still passes), while a move-mode source on the same dir DOES fail (write required).
+    import messagefoundry.transports.file as filemod
+
+    inbox = tmp_path / "ro"
+    inbox.mkdir()
+    monkeypatch.setattr(filemod.tempfile, "mkstemp", _raise_locked)  # any write probe raises
+    leave = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "validate_directory": True,
+                "after_read": "leave",
+            },
+        )
+    )
+    await leave.validate_startup()  # read-only probe → no write attempt → passes
+    move = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "validate_directory": True},
+        )
+    )
+    with pytest.raises(SourceStartupError):
+        await move.validate_startup()  # move mode needs write → the failing probe raises
+
+
+# --- #142 leave-in-place process-in-place disposition -----------------------
+
+
+class _FakeLedger:
+    """An in-memory ProcessedFileLedger stand-in — proves the connector calls the injected seam
+    (records a HASHED key, skips a seen key, prunes) without a real store."""
+
+    def __init__(self) -> None:
+        self.keys: set[str] = set()
+        self.pruned = 0
+
+    async def is_processed(self, file_key: str) -> bool:
+        return file_key in self.keys
+
+    async def mark_processed(self, file_key: str) -> None:
+        self.keys.add(file_key)
+
+    async def prune(self) -> None:
+        self.pruned += 1
+
+
+def test_file_source_rejects_unknown_after_read(tmp_path: Path) -> None:
+    with pytest.raises(ValueError):
+        FileSource(
+            Source(
+                type=ConnectorType.FILE, settings={"directory": str(tmp_path), "after_read": "x"}
+            )
+        )
+
+
+async def test_file_source_leave_in_place_keeps_file_and_dedups(tmp_path: Path) -> None:
+    # after_read='leave' (#142): the source file is NEVER moved/deleted, and the durable ledger dedups
+    # so it is ingested exactly ONCE despite many polls. The ledger holds a HASHED key (64 hex chars).
+    inbox = tmp_path / "share"
+    inbox.mkdir()
+    (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "after_read": "leave",
+            },
+        )
+    )
+    ledger = _FakeLedger()
+    src.processed_ledger = ledger
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: bool(received))
+        await asyncio.sleep(0.1)  # several more poll cycles — must NOT re-ingest
+    finally:
+        await src.stop()
+        await task
+    assert len(received) == 1  # ingested ONCE, not once-per-poll
+    assert (inbox / "m.hl7").exists()  # left in place
+    assert not (inbox / ".processed" / "m.hl7").exists()  # never moved
+    assert len(ledger.keys) == 1
+    (key,) = ledger.keys
+    assert len(key) == 64 and all(c in "0123456789abcdef" for c in key)  # a sha256 hex digest
+    assert "m.hl7" not in key  # the cleartext filename never appears in the key
+    assert ledger.pruned >= 1  # pruned after recording a new file
+
+
+async def test_file_source_leave_in_place_reingests_a_changed_file(tmp_path: Path) -> None:
+    # An UPDATED file (new size → new hashed key) is re-ingested; an unchanged file is not.
+    inbox = tmp_path / "share"
+    inbox.mkdir()
+    f = inbox / "m.hl7"
+    f.write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "after_read": "leave",
+            },
+        )
+    )
+    src.processed_ledger = _FakeLedger()
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: len(received) >= 1)
+        f.write_bytes(ADT.encode("utf-8") + b"PID|2||changed\r")  # different size → new key
+        await _until(lambda: len(received) >= 2)
+    finally:
+        await src.stop()
+        await task
+    assert len(received) >= 2
+
+
+async def test_file_source_leave_in_place_without_ledger_uses_memory(tmp_path: Path) -> None:
+    # No durable ledger injected (a direct caller/test): the in-process set still dedups within the
+    # process lifetime, and the file is left in place.
+    inbox = tmp_path / "share"
+    inbox.mkdir()
+    (inbox / "m.hl7").write_bytes(ADT.encode("utf-8"))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "after_read": "leave",
+            },
+        )
+    )  # processed_ledger stays None
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: bool(received))
+        await asyncio.sleep(0.1)
+    finally:
+        await src.stop()
+        await task
+    assert len(received) == 1
+    assert (inbox / "m.hl7").exists()
+
+
+async def test_file_source_leave_recursive_same_name_distinct_subdirs(tmp_path: Path) -> None:
+    # #142 Finding-1 guard: under recursive=True, two DISTINCT same-basename files in different subdirs
+    # that ALSO share size AND mtime (the coarse-share collision this feature targets) must BOTH be
+    # ingested — the dedup key folds the RELATIVE PATH, so they get DISTINCT hashes. A basename-only key
+    # would silently dedup the second away (an accept-and-drop of a received file).
+    inbox = tmp_path / "share"
+    (inbox / "a").mkdir(parents=True)
+    (inbox / "b").mkdir(parents=True)
+    body = ADT.encode("utf-8")
+    fa, fb = inbox / "a" / "m.hl7", inbox / "b" / "m.hl7"
+    fa.write_bytes(body)
+    fb.write_bytes(body)  # identical content → identical size
+    ts = 1_700_000_000  # force identical mtime on both (the collision the finding describes)
+    os.utime(fa, (ts, ts))
+    os.utime(fb, (ts, ts))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "recursive": True,
+                "after_read": "leave",
+            },
+        )
+    )
+    ledger = _FakeLedger()
+    src.processed_ledger = ledger
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: len(received) >= 2)
+        await asyncio.sleep(0.1)  # no further re-ingest
+    finally:
+        await src.stop()
+        await task
+    assert len(received) == 2  # BOTH ingested — never one silently deduped
+    assert len(ledger.keys) == 2  # two DISTINCT hashed keys (path folded in)
+    assert fa.exists() and fb.exists()  # both left in place
+
+
+async def test_file_source_leave_durable_ledger_read_is_the_dedup(tmp_path: Path) -> None:
+    # #142 Finding-3: with an EMPTY in-memory cache, a file already recorded in the DURABLE ledger is
+    # skipped with ZERO emits — exercising ledger.is_processed() in isolation (the cross-restart /
+    # failover path the in-memory fast-path short-circuit otherwise hides).
+    inbox = tmp_path / "share"
+    inbox.mkdir()
+    f = inbox / "m.hl7"
+    f.write_bytes(ADT.encode("utf-8"))
+    src = FileSource(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.01,
+                "after_read": "leave",
+            },
+        )
+    )
+    ledger = _FakeLedger()
+    ledger.keys.add(
+        src._file_key(f)
+    )  # pre-seed the DURABLE ledger; the in-memory cache stays EMPTY
+    src.processed_ledger = ledger
+    assert len(src._processed_seen) == 0
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await asyncio.sleep(0.15)  # several polls — the durable read must dedup it every time
+    finally:
+        await src.stop()
+        await task
+    assert received == []  # ZERO emits — the durable is_processed() read is the deciding dedup
+    assert f.exists()
+
+
+async def test_file_source_run_loop_survives_a_scan_error(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # FILE-13: a scan that raises (mirrors test_remotefile_transport's poll-error test) must NOT kill
+    # the poller — _run catches it, logs, and keeps looping; that a "running" connection silently stops
+    # receiving (and re-raises inside stop()/reload) is exactly review H-4. We force _scan_once to raise
+    # directly (the P2 table's "bad glob / vanished dir" triggers are swallowed one level down in
+    # _candidates and never reach the outer guard) and set _stop inside it so _run exits after one tick.
+    src = FileSource(Source(type=ConnectorType.FILE, settings={"directory": str(tmp_path)}))
+    calls: list[int] = []
+
+    async def boom() -> None:
+        calls.append(1)
+        src._stop.set()  # so _run exits after this single caught tick
+        raise RuntimeError("scan blew up")
+
+    src._scan_once = boom  # type: ignore[method-assign]
+    src.poll_seconds = 0.0
+    src._stop.clear()
+    with caplog.at_level(logging.ERROR, logger="messagefoundry.transports.file"):
+        await src._run()  # must NOT propagate — a bad scan never kills the poller
+    assert calls == [1]
+    assert "file source scan failed" in caplog.text
+
+
 async def test_file_source_recursive_descends_subdirs(tmp_path: Path) -> None:
     inbox = tmp_path / "in"
     (inbox / "sub").mkdir(parents=True)
@@ -911,6 +1274,181 @@ async def test_file_source_leaves_file_in_place_on_handler_failure(tmp_path: Pat
     assert not (inbox / ".error" / "msg.hl7").exists()  # never quarantined
 
 
+# --- file connector: gzip compress / decompress (ADR 0123) -------------------
+
+
+async def test_file_destination_gzip_compress(tmp_path: Path) -> None:
+    # compress="gzip" gzips the drop and appends `.gz`; the gunzip of the file is the original payload.
+    dest = build_destination(
+        Destination(
+            name="archive",
+            type=ConnectorType.FILE,
+            settings={"directory": str(tmp_path), "filename": "out.hl7", "compress": "gzip"},
+        )
+    )
+    await dest.send(ADT)
+    written = tmp_path / "out.hl7.gz"
+    assert written.exists()  # `.gz` appended
+    assert not (tmp_path / "out.hl7").exists()
+    assert gzip_decompress(written.read_bytes()) == ADT.encode("utf-8")
+
+
+async def test_file_source_gunzips_before_sniff(tmp_path: Path) -> None:
+    # AC-5: a gzipped HL7 drop is gunzipped, sniffed on the DECOMPRESSED bytes (which do start with
+    # MSH), and the HL7 is emitted. Without decompress=, the gzip container fails the MSH sniff.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "msg.hl7.gz").write_bytes(gzip_compress(ADT.encode("utf-8")))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+            },
+        )
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: bool(received))
+    finally:
+        await src.stop()
+        await task
+    assert received == [ADT.encode("utf-8")]  # decompressed HL7, not the gzip container
+    assert (inbox / ".processed" / "msg.hl7.gz").exists()
+    assert not (inbox / ".error" / "msg.hl7.gz").exists()
+
+
+async def test_file_source_quarantines_decompression_bomb(tmp_path: Path) -> None:
+    # AC-6: a gzip that expands past max_decompressed_bytes is a bomb — the ORIGINAL compressed file is
+    # moved to .error and never emitted (never accept-and-dropped). The compressed st_size cap can't
+    # catch this (the archive on disk is tiny).
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    bomb = gzip_compress(b"\x00" * (4 * 1024 * 1024))
+    assert len(bomb) < 50_000  # small on disk — passes the compressed max_file_bytes cap
+    (inbox / "bomb.hl7.gz").write_bytes(bomb)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+                "max_decompressed_bytes": 1024,
+            },
+        )
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: (inbox / ".error" / "bomb.hl7.gz").exists())
+    finally:
+        await src.stop()
+        await task
+    assert received == []  # never emitted
+    assert (inbox / ".error" / "bomb.hl7.gz").exists()
+
+
+async def test_file_source_quarantines_corrupt_archive(tmp_path: Path) -> None:
+    # A file that isn't a valid gzip stream is quarantined to .error, never crashes the poller.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "junk.hl7.gz").write_bytes(b"not a gzip stream at all")
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+            },
+        )
+    )
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: (inbox / ".error" / "junk.hl7.gz").exists())
+    finally:
+        await src.stop()
+        await task
+    assert received == []
+
+
+async def test_file_source_gunzips_non_hl7_content_type(tmp_path: Path) -> None:
+    # Decompression is orthogonal to content_type: a gzipped X12/binary drop gunzips too (before the
+    # content_type-gated sniff, which is skipped for a non-hl7v2 inbound), emitting the raw payload.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    payload = b"ISA*00*...*~GS*...*~"  # non-HL7 (X12-ish); no MSH header
+    (inbox / "edi.x12.gz").write_bytes(gzip_compress(payload))
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={
+                "directory": str(inbox),
+                "pattern": "*.gz",
+                "poll_seconds": 0.01,
+                "decompress": "gzip",
+            },
+        )
+    )
+    src.content_type = ContentType.X12  # runner injects this; set it directly
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: bool(received))
+    finally:
+        await src.stop()
+        await task
+    assert received == [payload]  # decompressed, emitted verbatim (no sniff, no split)
+
+
+def test_file_connector_rejects_unsupported_compression() -> None:
+    # Single-stream gzip only: a zip/deflate value is rejected at construction (config typo caught at
+    # wiring / `messagefoundry check`), not silently ignored.
+    with pytest.raises(ValueError, match="compress"):
+        build_destination(
+            Destination(
+                name="ob",
+                type=ConnectorType.FILE,
+                settings={"directory": "x", "compress": "zip"},
+            )
+        )
+    with pytest.raises(ValueError, match="decompress"):
+        FileSource(
+            Source(type=ConnectorType.FILE, settings={"directory": "x", "decompress": "bzip2"})
+        )
+
+
+def test_file_factory_carries_compression_knobs() -> None:
+    spec = File(directory="/tmp/x", compress="gzip", decompress="gzip", max_decompressed_bytes=999)
+    assert spec.settings["compress"] == "gzip"
+    assert spec.settings["decompress"] == "gzip"
+    assert spec.settings["max_decompressed_bytes"] == 999
+
+
 # --- file source: content_type-gated ingress (ADR 0004 / 0028) ---------------
 
 
@@ -951,14 +1489,17 @@ async def test_file_source_ingests_binary_file_when_content_type_binary(tmp_path
     assert (inbox / ".processed" / "doc.pdf").exists()  # processed like any received message
 
 
-async def test_file_source_skips_sniff_for_non_hl7_content_type(tmp_path: Path) -> None:
-    # The header sniff is content_type-gated (mirrors RemoteFileSource): a non-hl7v2 drop (here X12,
-    # which has no MSH header by design) must NOT be rejected for lacking an MSH/FHS/BHS header — it
-    # flows to the pipeline verbatim rather than being quarantined to .error.
+async def test_file_source_sniffs_x12_and_quarantines_non_isa(tmp_path: Path) -> None:
+    # The accept-time sniff is PER content_type, not hl7v2-only: an x12 inbound sniffs the ISA magic
+    # (ASVS 5.2.2). A conformant ISA drop (no MSH header, by X12 design) flows to the pipeline verbatim;
+    # a non-ISA body on the SAME x12 inbound is quarantined — proving the x12 sniff is genuinely ACTIVE.
+    # (This replaces the stale "sniff disabled for non-hl7" test, whose ISA payload passed because it
+    # MATCHED the x12 magic, not because the sniff was off.)
     inbox = tmp_path / "in"
     inbox.mkdir()
     x12 = b"ISA*00*          *00*          *ZZ*SENDER\r"
     (inbox / "claim.hl7").write_bytes(x12)
+    (inbox / "bogus.hl7").write_bytes(b"%PDF-1.7 not an x12 interchange")
     received: list[bytes] = []
 
     async def handler(raw: bytes) -> None:
@@ -970,15 +1511,48 @@ async def test_file_source_skips_sniff_for_non_hl7_content_type(tmp_path: Path) 
             settings={"directory": str(inbox), "pattern": "*.hl7", "poll_seconds": 0.01},
         )
     )
-    src.content_type = ContentType.X12  # non-HL7 → sniff disabled by design
+    src.content_type = ContentType.X12  # x12 inbound → ISA sniff stays ON
     task = asyncio.create_task(src.start(handler))
     try:
-        await _until(lambda: len(received) == 1)
+        await _until(lambda: received == [x12] and (inbox / ".error" / "bogus.hl7").exists())
     finally:
         await src.stop()
         await task
-    assert received == [x12]  # delivered verbatim
-    assert not (inbox / ".error" / "claim.hl7").exists()
+    assert received == [x12]  # conformant ISA delivered verbatim (magic matched)
+    assert not (inbox / ".error" / "claim.hl7").exists()  # NOT quarantined
+    assert (inbox / ".error" / "bogus.hl7").exists()  # non-ISA quarantined (sniff is active)
+
+
+async def test_file_source_quarantines_non_fhir_when_content_type_fhir(tmp_path: Path) -> None:
+    # ASVS 5.2.2 (WP245 follow-up): a File inbound declared content_type=fhir runs the JSON magic sniff
+    # (FHIR is HL7 FHIR JSON) — a PDF that merely matches the glob is quarantined to .error before its
+    # bytes reach the pipeline, while a JSON-shaped FHIR resource flows through.
+    inbox = tmp_path / "in"
+    inbox.mkdir()
+    (inbox / "bad.fhir").write_bytes(b"%PDF-1.7\r\nnot a fhir resource")
+    resource = b'{"resourceType":"Patient","id":"1"}'
+    (inbox / "ok.fhir").write_bytes(resource)
+    received: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        received.append(raw)
+
+    src = build_source(
+        Source(
+            type=ConnectorType.FILE,
+            settings={"directory": str(inbox), "pattern": "*.fhir", "poll_seconds": 0.01},
+        )
+    )
+    src.content_type = ContentType.FHIR  # fhir inbound → JSON {/[ sniff ON
+    task = asyncio.create_task(src.start(handler))
+    try:
+        await _until(lambda: received == [resource] and (inbox / ".error" / "bad.fhir").exists())
+    finally:
+        await src.stop()
+        await task
+    assert received == [resource]  # JSON-shaped FHIR delivered
+    assert (inbox / ".error" / "bad.fhir").exists()  # the PDF quarantined before the pipeline
+    assert not (inbox / ".error" / "ok.fhir").exists()
 
 
 async def test_file_source_quarantines_non_hl7_when_content_type_hl7v2(tmp_path: Path) -> None:

@@ -224,7 +224,7 @@ Lane 6 (disjoint). Cross-cutting security docs stay Coordinator-only.
 **Lane 1 — 5.4.3 remote-file AV**
 ```
 ultracode. First action: scripts/worktree/new.ps1 -Name asvs-543-file-ingest-av -Base origin/main
-Verify isolation: git rev-parse --show-toplevel must be the NEW worktree (NOT C:/Users/Scott/Code/MessageFoundry);
+Verify isolation: git rev-parse --show-toplevel must be the NEW worktree (NOT C:/Users/<you>/Code/MessageFoundry);
 git rev-parse --abbrev-ref HEAD must be asvs-543-file-ingest-av; git merge-base --is-ancestor origin/main HEAD.
 GOAL — ASVS 5.4.3, honest Pass: RemoteFileSource (transports/remotefile.py:613) hands raw bytes to the handler
 with NO content-sniff/AV, unlike local FileSource. (a) apply the same _looks_like_hl7 content sniff to the remote

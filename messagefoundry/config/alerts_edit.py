@@ -23,14 +23,23 @@ the next engine restart — ``POST /config/reload`` re-runs the ``--config`` gra
 from __future__ import annotations
 
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import tomlkit
 
 #: Scalar/array fields written (in this order) for one rule. Only keys present in the input are
 #: emitted, and only ``None`` is treated as absent — an empty ``transports = []`` (the "suppress"
 #: outcome) is a real value and IS written. Mirrors ``settings.AlertRule``'s field order.
+#:
+#: This tuple is the write half of a reader/writer schema pair (the read half is
+#: ``settings.AlertRule.model_fields``): a field added to ``AlertRule`` but omitted here is
+#: **silently dropped** from every GUI/CLI-authored rule — the #234 schema-drift data-loss bug. The
+#: ``tests/test_alerts_edit.py`` parity guard pins ``set(_RULE_FIELDS) == set(AlertRule.model_fields)``
+#: as the CI guard of record, so that drift fails a test instead of silently deleting data. Scalars/
+#: arrays come first; the nested sub-tables (``escalate`` array-of-tables, ``schedule`` table) are LAST
+#: so every rule's scalar keys stay above its sub-table headers (a TOML validity requirement).
 _RULE_FIELDS = (
     "event_type",
     "connection",
@@ -39,6 +48,15 @@ _RULE_FIELDS = (
     "severity",
     "transports",
     "cooldown_seconds",
+    "recipients",  # #146 — per-rule email recipient override (None = global email_to)
+    "id",  # #138 — optional operator label surfaced as the {rule_id} template variable
+    "control_action",  # #144 — restart_inbound/restart_outbound to auto-fire on match
+    "control_target",  # #144 — the connection to act on (None = the event's own connection)
+    "mute",  # #143 — static per-rule notification mute (bool); False is a real value, kept
+    "content_label",  # #81 — route content_match alerts by their operator label
+    # Nested sub-structures LAST (see the note above): escalate is an array-of-tables, schedule a table.
+    "escalate",  # #81 — occurrence-driven escalation tiers (list[EscalationTier])
+    "schedule",  # #81 — schedule-aware matching window (Schedule | None)
 )
 
 Validate = Callable[[Path], None]
@@ -132,6 +150,16 @@ def _validate_input(obj: Any) -> None:
         # `index` is the read-only ordinal `list` adds for addressing; it's not a rule field
         # (AlertRule forbids extras), so a round-tripped entry must drop it before `add`.
         raise AlertRuleError("alert rule must not carry an 'index' field")
+    # Fail-loud unknown keys (#240), mirroring connections_edit's message shape. The direct add_rule
+    # path never runs AlertRule.model_validate (the CLI does, belt-and-braces), so without this an
+    # unknown posted key would be silently dropped by _build_table before the validate callback ever
+    # sees it — the #234 data-loss idiom this closes. The parity guard keeps _RULE_FIELDS == the model.
+    extra = set(obj) - set(_RULE_FIELDS)
+    if extra:
+        raise AlertRuleError(
+            f"alert rule: unknown key(s) {', '.join(sorted(extra))} "
+            f"(allowed: {', '.join(sorted(_RULE_FIELDS))})"
+        )
 
 
 def _build_table(obj: dict[str, Any]) -> Any:

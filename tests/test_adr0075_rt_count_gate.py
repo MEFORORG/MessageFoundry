@@ -18,11 +18,10 @@ throughput GO/NO-GO needs the live-rig A/B — this gate proves the round-trip A
 
 from __future__ import annotations
 
+import adr0075_batch_harness as h
 import pytest
 
 from messagefoundry.store import sqlserver as ss
-
-import adr0075_batch_harness as h
 
 # Round-trips = executes + the one commit. UNBATCHED baseline (hot path, N=1 handler / 1 delivery).
 ROUTE_RT_UNBATCHED = 6  # DELETE, INSERT_ROUTED, APPLOCK, UPDATE, EVENT (5) + commit
@@ -67,8 +66,9 @@ async def test_route_round_trip_floor() -> None:
     assert un_exec + un_commit == ROUTE_RT_UNBATCHED
     assert ba_exec + ba_commit == ROUTE_RT_STRICT
     # 33.3% strict drop, pinned.
-    assert (ROUTE_RT_UNBATCHED - ROUTE_RT_STRICT) / ROUTE_RT_UNBATCHED == pytest.approx(
-        1 / 3, abs=1e-9
+    assert (
+        pytest.approx(1 / 3, abs=1e-9)
+        == (ROUTE_RT_UNBATCHED - ROUTE_RT_STRICT) / ROUTE_RT_UNBATCHED
     )
     # The shipped strict count does NOT reach the soft floor -> the >=40% (soft) figure is unachieved here.
     assert ROUTE_RT_STRICT > ROUTE_RT_SOFT
@@ -80,8 +80,9 @@ async def test_transform_round_trip_floor() -> None:
     assert un_exec + un_commit == TRANSFORM_RT_UNBATCHED
     assert ba_exec + ba_commit == TRANSFORM_RT_STRICT
     # 28.6% strict drop, pinned.
-    assert (TRANSFORM_RT_UNBATCHED - TRANSFORM_RT_STRICT) / TRANSFORM_RT_UNBATCHED == pytest.approx(
-        2 / 7, abs=1e-9
+    assert (
+        pytest.approx(2 / 7, abs=1e-9)
+        == (TRANSFORM_RT_UNBATCHED - TRANSFORM_RT_STRICT) / TRANSFORM_RT_UNBATCHED
     )
     assert TRANSFORM_RT_STRICT > TRANSFORM_RT_SOFT
 
@@ -113,7 +114,7 @@ async def test_both_floors_are_pinned_and_ordered() -> None:
 FILTERED_RT_UNBATCHED = 7
 FILTERED_RT_BATCHED = 6
 
-_FILTERED_KWARGS: dict[str, object] = dict(
+_FILTERED_KWARGS: dict[str, object] = dict(  # noqa: C408
     routed_id="rtd-f",
     message_id="m-f",
     channel_id="IB",

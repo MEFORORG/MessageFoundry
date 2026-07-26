@@ -26,6 +26,7 @@ validator) without crossing the engine's one-way dependency boundaries. Three co
 
 from __future__ import annotations
 
+import _hashlib
 import enum
 import ipaddress
 import logging
@@ -50,6 +51,7 @@ TLS_REVOCATION_ATTESTED_ENV = "MEFOR_TLS_REVOCATION_ATTESTED"
 __all__ = [
     "APPROVED_KEX_GROUPS",
     "TLS_REVOCATION_ATTESTED_ENV",
+    "fips_attestation",
     "HopDisposition",
     "HopPosture",
     "InsecureHopRefused",
@@ -81,6 +83,28 @@ _APPROVED_TLS_MIN_VERSIONS = ("1.2", "1.3")
 #: Approved forward-secret key-exchange groups in preference order (X25519 first). These are the modern
 #: NIST/FIPS-permitted ECDHE curves; the string is the OpenSSL group list passed to ``set_groups``.
 APPROVED_KEX_GROUPS = "X25519:secp384r1:secp256r1"
+
+
+def fips_attestation() -> tuple[bool | None, str]:
+    """Report the **interpreter's** OpenSSL FIPS-provider state — a read-out, never enforcement (#73).
+
+    Returns ``(fips_mode, openssl_version)`` where:
+
+    * ``fips_mode`` — ``True``/``False`` from ``_hashlib.get_fips_mode()`` (the OpenSSL library-context
+      FIPS flag; ``1`` = the FIPS provider is active), or ``None`` = *undeterminable* on an alternative /
+      non-OpenSSL build that exposes no ``get_fips_mode``. The ``getattr`` guard is a **runtime** guard for
+      that build only — this repo's typeshed declares ``_hashlib.get_fips_mode() -> int``, so it type-checks
+      clean with **no** ``type: ignore``.
+    * ``openssl_version`` — :data:`ssl.OPENSSL_VERSION`, the linked OpenSSL version string.
+
+    **Scope (do not overclaim):** this attests the OpenSSL that the CPython interpreter's ``ssl`` (TLS in
+    transit) and ``hashlib``/``hmac`` are linked against — **NOT** the separately-linked OpenSSL inside the
+    ``pyca/cryptography`` wheel that encrypts PHI **at rest**. Report it as *reported* for the ``ssl``/
+    ``_hashlib`` OpenSSL, never as "FIPS-140 certified" (ADR 0120). Neither value is secret material — a
+    boolean and a public version string are metadata (SECRET-1). Never raises."""
+    get_fips_mode = getattr(_hashlib, "get_fips_mode", None)
+    fips_mode = None if get_fips_mode is None else bool(get_fips_mode())
+    return fips_mode, ssl.OPENSSL_VERSION
 
 
 def harden_kex_groups(ctx: ssl.SSLContext) -> None:
@@ -211,7 +235,7 @@ def in_process_tls_revocation_refused(
         return False
     if proxy_terminated:
         return False  # revocation delegated to the declared upstream terminator (proven in front)
-    if attested:
+    if attested:  # noqa: SIM103
         return False  # operator attested their terminator/PKI enforces revocation (the opt-out)
     return True
 
@@ -328,26 +352,28 @@ class HopPosture:
     """The instance security posture an insecure-hop decision is keyed on (#200).
 
     ``is_phi`` — the instance carries real PHI (``[ai].data_class == phi``), independent of the
-    environment name. ``production`` — the instance's production flag (``[ai].production``). Both are
-    the *derived* posture (built-in dev/staging/prod derivation applied); an unresolved custom-env
-    posture fails closed to ``(True, True)`` via :meth:`fail_closed` — see decision 7 of ADR 0092.
+    environment name. ``enforcing`` — whether the security REFUSE/WARN dial is at ENFORCE
+    (``[security].enforcement == enforce``, the secure default); it re-keys the ADR 0092 refuse/clamp
+    dial off the old production-tier flag onto the explicit enforcement level (this refactor). Both are
+    the *derived* posture (built-in dev/staging/prod derivation applied for ``is_phi``); an unresolved
+    custom-env ``is_phi`` fails closed to ``True`` via :meth:`fail_closed` — see decision 7 of ADR 0092.
     Held in a contextvar for the duration of connector construction (:func:`active_hop_posture`)."""
 
     is_phi: bool
-    production: bool
+    enforcing: bool
 
     @classmethod
-    def fail_closed(cls, *, is_phi: bool | None, production: bool | None) -> HopPosture:
+    def fail_closed(cls, *, is_phi: bool | None, enforcing: bool | None) -> HopPosture:
         """Build a posture, defaulting an *unknown* (``None``) dimension to the strict value.
 
-        A custom-env instance may leave ``data_class`` / ``production`` unresolved (``serve`` refuses
-        such a start, but an offline build-check / embedding may still construct connectors). An unknown
-        dimension defaults to the fail-closed value — ``is_phi=True`` / ``production=True`` — so an
-        unproven posture never *relaxes* a hop decision. A fully-declared config passes its real values
-        through unchanged (decision 7: resolve to the declared posture, not strictest-by-default)."""
+        A custom-env instance may leave ``data_class`` unresolved (``serve`` refuses such a start, but an
+        offline build-check / embedding may still construct connectors). An unknown dimension defaults to
+        the fail-closed value — ``is_phi=True`` / ``enforcing=True`` — so an unproven posture never
+        *relaxes* a hop decision. A fully-declared config passes its real values through unchanged
+        (decision 7: resolve to the declared posture, not strictest-by-default)."""
         return cls(
             is_phi=True if is_phi is None else is_phi,
-            production=True if production is None else production,
+            enforcing=True if enforcing is None else enforcing,
         )
 
 
@@ -373,7 +399,7 @@ def is_loopback_hop_host(host: str) -> bool:
 def insecure_hop_disposition(
     *,
     is_phi: bool,
-    production: bool,
+    enforcing: bool,
     is_loopback_hop: bool,
     hop_attested: bool,
     audited_opt_out: bool,
@@ -388,16 +414,16 @@ def insecure_hop_disposition(
        attestation that this hop is legitimately secure (a proxy-terminated / trusted-segment hop).
     #. not ``is_phi`` (synthetic instance) → :attr:`~HopDisposition.ALLOW` — no PHI rides the hop.
     #. ``audited_opt_out`` → :attr:`~HopDisposition.WARN` — the global escape, **already clamped by the
-       caller** to non-production (see ``settings.hop_insecure_escape_downgrades``); on production the
-       caller passes ``False`` here, so this arm never fires for a prod-PHI hop.
-    #. ``production`` → :attr:`~HopDisposition.REFUSE` — a production PHI hop with no attestation: do
+       caller** to non-enforcing (see ``settings.hop_insecure_escape_downgrades``); under ENFORCE the
+       caller passes ``False`` here, so this arm never fires for an enforcing PHI hop.
+    #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing PHI hop with no attestation: do
        not put PHI on the wire in the clear.
-    #. else (non-production PHI — dev/staging) → :attr:`~HopDisposition.WARN`.
+    #. else (non-enforcing PHI — the WARN posture) → :attr:`~HopDisposition.WARN`.
 
-    Note the escape (``audited_opt_out``) can never satisfy a prod-PHI hop: it is clamped to ``False``
-    on production upstream, so the ``production`` arm always wins there (decision 2). Attestation
-    (``hop_attested``) is the *only* per-hop way to cross a prod-PHI hop, and it is audited when it
-    suppresses a would-be prod refusal (the cell audits at that point)."""
+    Note the escape (``audited_opt_out``) can never satisfy an enforcing PHI hop: it is clamped to
+    ``False`` under ENFORCE upstream, so the ``enforcing`` arm always wins there (decision 2).
+    Attestation (``hop_attested``) is the *only* per-hop way to cross an enforcing PHI hop, and it is
+    audited when it suppresses a would-be enforcing refusal (the cell audits at that point)."""
     if is_loopback_hop:
         return HopDisposition.ALLOW
     if hop_attested:
@@ -406,7 +432,7 @@ def insecure_hop_disposition(
         return HopDisposition.ALLOW
     if audited_opt_out:
         return HopDisposition.WARN
-    if production:
+    if enforcing:
         return HopDisposition.REFUSE
     return HopDisposition.WARN
 
@@ -498,7 +524,7 @@ def phi_read_hop_disposition(
         return HopDisposition.ALLOW
     return insecure_hop_disposition(
         is_phi=posture.is_phi,
-        production=posture.production,
+        enforcing=posture.enforcing,
         is_loopback_hop=serve_hop_secure,
         hop_attested=False,
         audited_opt_out=audited_opt_out,
@@ -525,7 +551,7 @@ def phi_read_hop_disposition(
 def revocation_hop_disposition(
     *,
     is_phi: bool,
-    production: bool,
+    enforcing: bool,
     is_loopback_hop: bool,
     proxy_proven: bool,
     attested: bool,
@@ -543,8 +569,8 @@ def revocation_hop_disposition(
     #. ``attested`` → :attr:`~HopDisposition.ALLOW` — the operator attests a revocation-checking PKI backs
        this hop (per-connection ``tls_revocation_attested`` or the blanket ``MEFOR_TLS_REVOCATION_ATTESTED``).
     #. not ``is_phi`` (synthetic instance) → :attr:`~HopDisposition.ALLOW` — no PHI rides the hop.
-    #. ``production`` → :attr:`~HopDisposition.REFUSE` — a production PHI hop with unchecked revocation.
-    #. else (non-production PHI — dev/staging) → :attr:`~HopDisposition.WARN`.
+    #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing PHI hop with unchecked revocation.
+    #. else (non-enforcing PHI — the WARN posture) → :attr:`~HopDisposition.WARN`.
 
     Unlike :func:`insecure_hop_disposition` this carries NO global-escape (``audited_opt_out``) arm — the
     ONLY relaxations are the on-box carve-out, a declared revocation-checking terminator, an operator
@@ -559,7 +585,7 @@ def revocation_hop_disposition(
         return HopDisposition.ALLOW
     if not is_phi:
         return HopDisposition.ALLOW
-    if production:
+    if enforcing:
         return HopDisposition.REFUSE
     return HopDisposition.WARN
 
@@ -614,7 +640,7 @@ class RevocationHopGuard:
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return revocation_hop_disposition(
             is_phi=posture.is_phi,
-            production=posture.production,
+            enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
             proxy_proven=self.proxy_proven,
             attested=self.attested,
@@ -643,7 +669,7 @@ class RevocationHopGuard:
             disposition is HopDisposition.ALLOW
             and (self.attested or self.proxy_proven)
             and posture.is_phi
-            and posture.production
+            and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
             logger.warning(

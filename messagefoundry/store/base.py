@@ -40,7 +40,7 @@ from messagefoundry.store.content_search import (
     SearchTarget,
     make_spec,
 )
-from messagefoundry.store.crypto import CipherInfo, make_cipher
+from messagefoundry.store.crypto import Cipher, CipherInfo, make_cipher
 from messagefoundry.store.document_strip import StripResult
 from messagefoundry.store.keyprovider import resolve_key_provider
 from messagefoundry.store.pool_metrics import PoolStatus
@@ -100,6 +100,7 @@ __all__ = [
     "Store",
     "StoreLifecycle",
     "StreamingAttachmentsUnsupported",
+    "backend_supports_reference_sets",
     "make_spec",
     "open_store",
     "sqlite_settings",
@@ -179,10 +180,12 @@ class QueueStore(StoreLifecycle, Protocol):
 
     #: Whether this backend implements pass-through (PT) re-ingress — the ``pt_deliveries`` branch of
     #: :meth:`transform_handoff` (ConnectorType.PT, ADR 0013 generalized). **Allow-list semantics:**
-    #: ``False`` by default (this base, Postgres, SQL Server, and any future backend), ``True`` only on
-    #: the SQLite backend that ships the slice. The engine rejects a graph containing a PT inbound at
-    #: startup on any ``False`` backend (see :meth:`Engine.start`), so a Handler ``Send`` into a PT
-    #: connector can never reach the unimplemented ``transform_handoff`` branch at runtime.
+    #: ``False`` by default (this base + any future backend), but SQLite, Postgres, and SQL Server ALL
+    #: set it ``True`` today — each ships the ``pt_deliveries`` branch. A future backend that has not
+    #: implemented that branch leaves the base default and has its graph rejected at startup: the engine
+    #: rejects a graph containing a PT inbound on any ``False`` backend (see :meth:`Engine.start`), so a
+    #: Handler ``Send`` into a PT connector can never reach the unimplemented ``transform_handoff``
+    #: branch at runtime.
     supports_pt_reingress: bool = False
 
     #: Whether this backend ships the synchronous fused-handoff twins (``route_handoff_sync`` /
@@ -202,6 +205,17 @@ class QueueStore(StoreLifecycle, Protocol):
     #: streaming ops raise :class:`~messagefoundry.store.store.StreamingAttachmentsUnsupported`, so a
     #: streaming connection targeting it fails clearly rather than silently degrading.
     supports_streaming_attachments: bool = False
+
+    #: Whether this backend implements the ADR 0006 reference-set snapshot store: the ``reference`` +
+    #: ``reference_version`` tables behind :meth:`reference_view` / :meth:`write_reference_snapshot` /
+    #: :meth:`converge_reference_cache`. **Allow-list semantics** like :attr:`supports_pt_reingress`:
+    #: ``False`` by default (this base + any future backend), ``True`` on all three shipped backends —
+    #: SQLite (the reference implementation), Postgres (ported), and SQL Server (ported at parity,
+    #: BACKLOG #235). A graph declaring at least one ``Reference(...)`` is REFUSED fail-closed on a
+    #: ``False`` backend at ``messagefoundry check``, at engine start, and on reload/promote, so a
+    #: Handler's ``reference(...)`` read can never raise per-message — post-ACK, forever — on a backend
+    #: that could never materialize the set.
+    supports_reference_sets: bool = False
 
     #: A1 live cost counters (always-on, additive; surfaced via ``/stats``). ``committed_txns`` = durable
     #: **write**-path transactions committed on this handle — the *committed transactions per message*
@@ -324,6 +338,7 @@ class QueueStore(StoreLifecycle, Protocol):
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
         meta_ops: Sequence[tuple[str, str]] = (),
+        declined: Sequence[str] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
@@ -335,6 +350,14 @@ class QueueStore(StoreLifecycle, Protocol):
         atomically with the outbound rows, so a crash before commit leaves no state and a re-run applies
         them exactly-once (preserving the pure-re-run invariant). Idempotent against worker restart —
         ``False`` if the routed row was already consumed.
+
+        ``declined`` (#233, ADR 0111) names the destinations of each ``Send`` the transform addressed
+        that is present in the graph but **not deployed** — one entry per declined Send. Each is
+        recorded as a per-destination ``not_deployed`` ``message_events`` row **in this same
+        transaction**, before the finalizer runs, so it is both the count-and-log record of the skipped
+        leg and the persisted signal the finalizer uses to emit ``NOT_DEPLOYED`` (rather than
+        ``FILTERED``) for a message whose every delivery was declined. Empty ``declined`` is
+        byte-identical to the pre-feature path.
 
         ``pt_deliveries`` (ADR 0013, generalized) are ``(pass_through_inbound_name, body)`` Sends into an
         internal pass-through inbound: each produces a new INGRESS-stage child message on the PT channel
@@ -783,6 +806,32 @@ class QueueStore(StoreLifecycle, Protocol):
         :meth:`dead_letter_missing_destinations`; call once at startup. Returns the rows killed."""
         ...
 
+    # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
+    async def is_file_processed(self, *, channel_id: str, file_key: str) -> bool:
+        """True iff the leave-in-place (``after_read='leave'``) source ``channel_id`` already ingested
+        the file whose **HASHED** ``file_key`` is given. ``file_key`` is a derived id (sha256 of the
+        file's path-relative-to-root + mtime/size) — **never** a cleartext path (which can embed an MRN).
+        A single PK lookup on the ``processed_files`` table (HASHES/IDS-ONLY, stored in the clear, never
+        logged at INFO+). Implemented on SQLite, Postgres, and SQL Server at parity."""
+        ...
+
+    async def record_processed_file(
+        self, *, channel_id: str, file_key: str, now: float | None = None
+    ) -> None:
+        """Record that source ``channel_id`` has ingested the file identified by the HASHED ``file_key``
+        — called **after** a successful emit, with the **file** (not each split message) as the dedup
+        unit. Idempotent on the ``(channel_id, file_key)`` PK, so a crash-re-run is a no-op (the ledger
+        is a pure side record, invisible to the finalizer). No body/PHI is ever passed here."""
+        ...
+
+    async def prune_processed_files(
+        self, *, channel_id: str, older_than: float, keep_last: int, now: float | None = None
+    ) -> int:
+        """Bound the dedup ledger for one connection: delete rows recorded before ``older_than`` and any
+        surplus beyond the newest ``keep_last``. Returns the number deleted. A re-poll of a
+        pruned-then-re-seen file simply re-ingests it (a bounded duplicate — at-least-once)."""
+        ...
+
     # --- streaming attachments (#149, ADR 0105 Phase 0) ----------------------
     async def put_attachment(self, chunks: Iterable[str], content_type: str) -> str:
         """Store a detached very-large document as content-addressed, per-chunk-sealed rows and return
@@ -1013,13 +1062,15 @@ class QueueStore(StoreLifecycle, Protocol):
         connection: str,
         severity: str,
         reason: str | None = None,
+        escalation_tier: int = 0,
         now: float | None = None,
     ) -> None:
         """Record/fold one operator-alert occurrence into a resolvable ``alert_instance`` (ADR 0044),
         de-duped on ADR 0014's ``(event_type, connection)`` throttle key: if a live (``open`` or
         ``acknowledged``) instance for the key exists, bump ``last_seen`` + ``count`` (refresh
         ``severity``/``reason``; an acknowledged instance stays acknowledged); otherwise insert a fresh
-        ``open`` row.
+        ``open`` row. ``escalation_tier`` (#81, ADR 0133) is the notifier's occurrence-driven escalation
+        level for this fire — persisted **monotonic** within an open instance (``MAX``), reset on reopen.
 
         A **pure observer** (like :meth:`record_connection_event`): a single short upsert in its own
         transaction, touching no ``queue`` row and calling no finalizer, so it can never pin a message's
@@ -1060,6 +1111,23 @@ class QueueStore(StoreLifecycle, Protocol):
         lifecycle signal (e.g. ``connection_restored``). Returns the count resolved."""
         ...
 
+    async def suspend_alert_instance(
+        self, alert_id: int, *, until: float, now: float | None = None
+    ) -> AlertInstance | None:
+        """Windowed suspend (#143, ADR 0044 amendment): set ``suspended_until`` on a live instance so its
+        NOTIFICATIONS are muted until that epoch. **Notification-only** — status/count/visibility are
+        untouched (the open condition stays on the dashboard; only the notify is muted for the window).
+        Returns the updated instance (for the API echo + seeding the sink's suspend cache), or ``None``
+        if the id is unknown or already resolved."""
+        ...
+
+    async def resume_alert_instance(
+        self, alert_id: int, *, now: float | None = None
+    ) -> AlertInstance | None:
+        """Clear a windowed suspend (#143) so re-alerts resume immediately. Idempotent. Returns the
+        updated instance, or ``None`` if unknown / already resolved."""
+        ...
+
     async def get_alert_instance(
         self, alert_id: int, *, allowed_channels: Sequence[str] | None = None
     ) -> AlertInstance | None:
@@ -1089,6 +1157,27 @@ class QueueStore(StoreLifecycle, Protocol):
     # --- at-rest key rotation (PHI.md §3, ASVS 11.2.2) -----------------------
     async def reencrypt_to_active(self, *, batch: int = 500) -> int: ...
 
+    # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
+    async def add_cipher_invocations(self, key_id: str, count: int) -> int:
+        """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total.
+
+        The one accounting primitive behind the persisted per-key AES-GCM invocation bound: block
+        reservations, the close-time settlement, and the DR backup codec's post-run aggregate all go
+        through it. Atomic, so every process sharing this one unified store — engine shards,
+        ``[cluster]`` HA nodes, an offline ``rotate-key`` — charges the same row. See
+        :mod:`messagefoundry.store.gcm_bound`."""
+        ...
+
+    async def cipher_invocations(self, key_id: str) -> int:
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        ...
+
+    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+        """Reconcile the live cipher's spend against its persisted reserve; return the cumulative total,
+        or ``None`` when the store's cipher carries no bound (identity / ``vault_transit``). See
+        :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
+        ...
+
     # --- retention / purge + maintenance (PHI.md §8) -------------------------
     async def purge_message_bodies(
         self,
@@ -1097,10 +1186,11 @@ class QueueStore(StoreLifecycle, Protocol):
         now: float | None = None,
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
-        """Null PHI message bodies received before ``older_than`` (keeping metadata rows; the Mirth
-        Data-Pruner pattern). ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff
-        per ``channel_id`` (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff,
-        byte-identical to the prior behaviour. Returns the number purged."""
+        """Null PHI message bodies received before ``older_than`` (keeping the message ROW — the Mirth
+        Data-Pruner pattern — while blanking its PHI columns, ``metadata`` included, ASVS 14.2.7).
+        ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
+        (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
+        the prior behaviour. Returns the number purged."""
         ...
 
     async def strip_embedded_documents(
@@ -1146,6 +1236,24 @@ class QueueStore(StoreLifecycle, Protocol):
         ``[retention].connection_event_retention_hours`` override, else the message-body window."""
         ...
 
+    async def purge_search_presets(self, *, older_than: float, now: float | None = None) -> int:
+        """Delete saved-search presets (ADR 0136) last edited **or used** before ``older_than``.
+
+        The stored ``criteria`` is the operator's own content/``field_value`` needle — PHI-shaped by
+        construction (PHI.md §2, PL-2) and encrypted at rest — so it needs a window like every other
+        PHI tier (ASVS 14.2.7). The whole ROW is deleted rather than blanked: a preset's entire payload
+        IS its criteria, so nulling would leave the console listing a recallable-but-broken preset. It
+        backs no count and carries no disposition, so count-and-log does not reach it (the same
+        reasoning that already permits :meth:`purge_state` / :meth:`purge_connection_events` to delete).
+
+        Keys on **last-USED** (#306, amending ADR 0136 / ADR 0027): the cutoff is compared against the
+        LATER of ``updated_at`` (written by :meth:`upsert_search_preset`) and ``last_used_at`` (written
+        by :meth:`get_search_preset`), so a preset an operator runs daily but never re-saves is kept.
+        The greatest-of-two is null-safe on every backend — a row that predates the column
+        (``last_used_at`` NULL) still ages out on ``updated_at`` alone. Returns the number purged. Off
+        unless ``[retention].search_preset_days`` is set."""
+        ...
+
     async def wal_checkpoint(self) -> None: ...
 
     async def vacuum(self) -> None: ...
@@ -1155,6 +1263,21 @@ class QueueStore(StoreLifecycle, Protocol):
         """The **non-secret** at-rest cipher posture (M5): whether encryption is on and, if so, the
         active key's **fingerprint** (``active_key_id``) — never key bytes. The public accessor the M5
         ``GET /security/posture`` route reads instead of reaching a backend's private ``_cipher``."""
+        ...
+
+    def cipher(self) -> Cipher:
+        """This store's **live** at-rest cipher instance.
+
+        For a caller that must encrypt/decrypt under the store's DEK from OUTSIDE the store — today only
+        the ADR 0134 uploaded-logs :class:`~messagefoundry.uploads.UploadStore`. It must share THIS
+        instance rather than build a second one from the same key material: the AES-GCM invocation bound
+        (ASVS 11.3.4) is per-instance state, so a second instance would neither charge the key's
+        persisted ``cipher_meta`` row nor see the fleet cumulative — it would keep encrypting under a key
+        this cipher has already fail-closed on at 2**32. ``build_store_cipher`` remains for the
+        store-LESS construction path (tests / embedding with no engine), where there is no bound to share.
+
+        Holding the object is not itself a secret exposure: it exposes no key bytes (the DEK is zeroized
+        at construction; only the one-way fingerprint and OpenSSL's internal copy survive)."""
         ...
 
     # --- store health / metrics ----------------------------------------------
@@ -1201,8 +1324,22 @@ class AuditStore(Protocol):
         actor: str | None = None,
         channel_id: str | None = None,
         detail: str | None = None,
+        client: str | None = None,
         now: float | None = None,
-    ) -> None: ...
+    ) -> None:
+        """Append a general audit row (the PHI-access + admin-action trail).
+
+        ``client`` is the caller's network address (ADR 0150) — the "from where" an incident responder
+        needs to trace an action to a host. It is threaded EXPLICITLY from the request: API callers pass
+        ``client_ip(request)``; engine-internal writes (background workers, ``system`` actions) omit it
+        and the column is NULL. NULL means "no client was in scope", never "unknown" — an ambient
+        carrier (ContextVar) was rejected precisely because it inherits into ``asyncio.create_task``
+        workers and would stamp an unrelated operator's address onto ``system`` rows.
+
+        The address is folded into the tamper-evident hash chain as a conditional trailing element, so
+        rows written before this column existed (``client`` NULL) still verify byte-identically — see
+        :func:`~messagefoundry.store.store.audit_row_hash`."""
+        ...
 
     async def list_audit(
         self,
@@ -1402,6 +1539,34 @@ class AuthStore(Protocol):
 
     async def get_user_role_ids(self, user_id: str) -> list[str]: ...
 
+    # --- saved-search presets (ADR 0136, BACKLOG #151) — per-user, criteria encrypted at rest -----
+
+    async def upsert_search_preset(
+        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+    ) -> tuple[str, bool]:
+        """Create-or-replace a per-user preset by ``(owner, name)`` (id reused on a name collision so the
+        cell-AAD stays stable). ``criteria`` is a JSON blob encrypted at rest. Returns
+        ``(effective_id, replaced)``."""
+        ...
+
+    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+        """A user's presets (id/name/timestamps only — NEVER the criteria)."""
+        ...
+
+    async def get_search_preset(
+        self, *, preset_id: str, owner: str, now: float | None = None
+    ) -> dict[str, Any] | None:
+        """One owner-scoped preset with its criteria DECRYPTED, or ``None``.
+
+        A hit **stamps ``last_used_at``** (#306) — the only writer of that column — so
+        :meth:`purge_search_presets` can key on last-USED. Best-effort: a stamp failure is logged and
+        swallowed, never raised, so it cannot break the recall. ``now`` overrides the clock (tests)."""
+        ...
+
+    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+        """Delete an owner-scoped preset; ``True`` iff a row was removed. Idempotent."""
+        ...
+
     async def set_user_roles(
         self,
         user_id: str,
@@ -1446,6 +1611,24 @@ class AuthStore(Protocol):
     ) -> list[SessionRecord]: ...
 
     async def touch_session(self, token_hash: str, *, now: float | None = None) -> None: ...
+
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+        """Re-key a live session to ``new_token_hash``, in place (ASVS 7.2.4).
+
+        A pure re-key: every other column — ``user_id``, ``created_at``, ``expires_at``, ``client``,
+        ``reauth_at``, ``mfa_verified_at`` — is carried forward byte-identical. It stamps **nothing**,
+        deliberately, so "the session is the same session, under a new name" is the whole contract.
+        In particular ``expires_at`` is untouched, so no amount of rotation can extend the absolute
+        session lifetime, and ``mfa_verified_at`` survives, so a rotation cannot strand a caller
+        behind the ASVS 6.3.3 MFA access gate holding a token that gate has never seen verified.
+
+        Returns **True** when a row was re-keyed, **False** when there was none to re-key — the row
+        is gone, expired-and-purged, or ``revoked_at IS NOT NULL``. This is the one session UPDATE
+        that reports its rowcount: every other one is deliberately blind (a write against a dead hash
+        is a silent no-op), but a caller rotating a session is about to hand the new token to a user,
+        so it must be able to fail closed if the session died underneath it.
+        """
+        ...
 
     async def mark_session_reauthed(
         self, token_hash: str, *, now: float | None = None, client: str | None = None
@@ -1531,6 +1714,28 @@ def resolve_decrypt_keys(settings: StoreSettings) -> list[str]:
     return keyring
 
 
+def build_store_cipher(settings: StoreSettings) -> Cipher:
+    """Build the at-rest cipher for ``settings`` — the SAME construction ``open_store`` uses (active key
+    + retired decrypt-only keyring, ``write_v2=aad_bind``). Exposed so a store-DECOUPLED PHI-at-rest
+    surface — the offline uploaded-logs files (ADR 0134) — encrypts under the identical DEK / keyring /
+    rotation posture as the message store, without reaching into a live ``Store`` instance's private
+    cipher. No key configured → the identity cipher (plaintext), exactly like the store."""
+    if settings.cipher_provider == "vault_transit":
+        # ADR 0138: bulk at-rest crypto INSIDE Vault/OpenBao Transit — the plaintext DEK never enters
+        # engine heap (ASVS 13.3.3). Lazy-imported so the base install pulls no Vault SDK; fails closed at
+        # open (KeyProviderError → serve refuses) rather than degrading to plaintext.
+        from messagefoundry.store.crypto_transit import build_transit_cipher
+
+        return build_transit_cipher(settings)
+    if settings.cipher_provider != "aesgcm":
+        raise ValueError(
+            f"[store].cipher_provider={settings.cipher_provider!r} is not a known cipher provider "
+            "(expected 'aesgcm' or 'vault_transit')"
+        )
+    retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
+    return make_cipher(resolve_active_key(settings), retired, write_v2=settings.aad_bind)
+
+
 async def open_store(
     settings: StoreSettings,
     *,
@@ -1553,13 +1758,23 @@ async def open_store(
     clamps the ``MEFOR_ALLOW_INSECURE_TLS`` escape on a production-PHI hop (decision 2). ``None`` (SQLite —
     no TLS — or a backup/restore utility / test) leaves it unclamped, byte-identical to pre-#200.
     """
-    # AES-256-GCM keyring at rest when a key is set (STORE-1): active key (env or DPAPI key file) +
-    # any retired decrypt-only keys for an in-progress rotation (WP-5). No key → identity cipher.
-    retired = [k.strip() for k in settings.encryption_keys_retired.split(",") if k.strip()]
-    cipher = make_cipher(resolve_active_key(settings), retired)
+    # The at-rest cipher via the single build_store_cipher seam: ADR 0019 key sourcing + the ADR 0138
+    # cipher_provider dispatch. Default `aesgcm` is the in-process AES-256-GCM keyring (active + retired
+    # decrypt-only, write_v2=aad_bind), byte-identical at rest (CRYPTO-1). `vault_transit` runs the bulk
+    # crypto inside Vault/OpenBao Transit so the DEK never enters heap (ASVS 13.3.3). No key → identity.
+    cipher = build_store_cipher(settings)
     # #190: HKDF-derived HMAC key for the tamper-evident audit chain; None for the identity cipher (the
     # chain then stays the keyless SHA-256 chain, byte-identical to a pre-#190 store).
     audit_mac_key = cipher.audit_mac_key()
+    # ADR 0138: an isolated-module audit MAC (Vault/OpenBao Transit generate_hmac) — set only by the
+    # vault_transit cipher, so the chain is keyed even though no HMAC key ever enters heap. None for the
+    # in-process (aesgcm/identity) ciphers, keeping their audit chain byte-identical. Wired into ALL
+    # THREE backends (ASVS 13.3.3): `TransitCipher.audit_mac_key()` returns None BY DESIGN, so a server
+    # backend given only `audit_mac_key` had no keying secret at all — under vault_transit its whole
+    # chain ran UNKEYED (never even a keyless PREFIX: with no secret in hand the fresh-store watermark
+    # was never written), while the posture claimed the most isolated MAC available. Every backend now
+    # takes both and gates on "either secret present" (`_audit_keyed_capable`).
+    audit_mac_fn = cipher.audit_mac_fn()
     if settings.backend is StoreBackend.SQLITE:
         return await MessageStore.open(
             settings.path,
@@ -1568,6 +1783,7 @@ async def open_store(
             group_commit_window_ms=settings.group_commit_window_ms,
             group_commit_max_batch=settings.group_commit_max_batch,
             audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
     if settings.backend is StoreBackend.SQLSERVER:
@@ -1577,6 +1793,7 @@ async def open_store(
             settings,
             cipher=cipher,
             audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             posture=posture,
         )
@@ -1587,10 +1804,35 @@ async def open_store(
             settings,
             cipher=cipher,
             audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
             message_events=message_events,
             posture=posture,
         )
     raise NotImplementedError(f"store backend {settings.backend.value!r} is not implemented yet")
+
+
+def backend_supports_reference_sets(backend: StoreBackend) -> bool:
+    """Does ``backend`` implement the ADR 0006 reference-set snapshot store? — the OFFLINE twin of the
+    :attr:`QueueStore.supports_reference_sets` capability flag.
+
+    ``messagefoundry check`` has a DECLARED backend (``settings.store.backend``) but no live store and no
+    DB to dial, so it cannot read the flag off an instance. It reads it off the store CLASS instead —
+    lazy-imported exactly as :func:`open_store` does, which is import-safe because every backend defers its
+    DB driver (aioodbc/asyncpg/pyodbc) to ``.open``. Going through the class keeps ONE source of truth, so
+    the static gate cannot drift from the runtime gate (a backend that flips its flag flips both at once).
+
+    An unknown backend returns ``False`` — fail-closed, matching the flag's allow-list default."""
+    if backend is StoreBackend.SQLITE:
+        return bool(MessageStore.supports_reference_sets)
+    if backend is StoreBackend.POSTGRES:
+        from messagefoundry.store.postgres import PostgresStore  # lazy: driver lives in .open
+
+        return bool(PostgresStore.supports_reference_sets)
+    if backend is StoreBackend.SQLSERVER:
+        from messagefoundry.store.sqlserver import SqlServerStore  # lazy: driver lives in .open
+
+        return bool(SqlServerStore.supports_reference_sets)
+    return False
 
 
 def sqlite_settings(path: str | Path, *, synchronous: str = "NORMAL") -> StoreSettings:

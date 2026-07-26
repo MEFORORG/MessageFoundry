@@ -98,16 +98,51 @@ class AlertSink(Protocol):
         ...
 
     def secret_rotation_due(
-        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+        self,
+        name: str,
+        *,
+        secret: str,
+        last_rotated: str,
+        days_overdue: int,
+        enforced: bool = False,
     ) -> None:
         """A tracked long-lived secret is overdue (or within the warn window) for rotation (#195b, ADR
-        0019 §5). ``name`` labels the secret (e.g. ``"store data-encryption key"``); ``secret`` is the
-        secret's config/env **identifier** (e.g. ``"MEFOR_STORE_ENCRYPTION_KEY"``); ``last_rotated`` is
-        the operator-configured ISO date it was last rotated; ``days_overdue`` is positive once past the
-        max age, negative while still within the warn window. **No key material** is ever read or logged —
-        only the identifier + rotation dates (no PHI). Emitted by the
+        0019 §5; widened to keyed-MAC-fingerprinted classes in ASVS 13.3.4 / BACKLOG #282). ``name`` labels
+        the secret (e.g. ``"store data-encryption key"``); ``secret`` is the secret's config/env
+        **identifier** (e.g. ``"MEFOR_STORE_ENCRYPTION_KEY"``); ``last_rotated`` is the ISO date it was
+        last rotated (operator-configured, or the engine's auto-detected tracked/rotation stamp);
+        ``days_overdue`` is positive once past the max age, negative while still within the warn window.
+        ``enforced`` is the ASVS-13.3.4 ENFORCE escalation: ``True`` when the DEK is past ``max_age +
+        grace`` under ``[security].enforcement=ENFORCE`` at restart, so an operator can triage it at a
+        higher severity than a routine reminder. **No key material** is ever read or logged — only the
+        identifier + rotation dates + a one-way keyed-MAC fingerprint (no value, no PHI). Emitted by the
         :class:`~messagefoundry.pipeline.secret_rotation.SecretRotationRunner`. Dedicated (not reusing
         :meth:`cert_expiry`) so an operator can route a rotation reminder apart from a cert-expiry alert."""
+        ...
+
+    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
+        """The first-run **bootstrap admin** is still UNCLAIMED (never password-changed) and now sits
+        inside its retirement warn window — an operator must sign in and change the password (or stand
+        up a second administrator) before the unclaimed credential is auto-disabled (ASVS 6.4.5). ``name``
+        labels the credential (``"bootstrap-admin"``); ``expires_at`` is the ISO instant it is disabled;
+        ``hours_remaining`` is the whole hours left (``0`` in the final hour). Carries **only** the
+        deadline + hours — **never** the password or any secret, and no message content (no PHI). Emitted
+        once per process (an in-memory latch on :class:`~messagefoundry.auth.service.AuthService`) by the
+        API-lifespan reminder task. Dedicated (not reusing :meth:`secret_rotation_due`) so an operator can
+        route a first-run-credential reminder apart from a long-lived-secret rotation reminder."""
+        ...
+
+    def gcm_invocations(self, name: str, *, key_id: str, invocations: int, ceiling: int) -> None:
+        """The active store data-encryption key has crossed the AES-GCM soft invocation threshold
+        (2**31 of the 2**32 birthday ceiling) on its PERSISTED, fleet-wide cumulative count (ASVS
+        11.3.4). ``name`` labels the key's role (``"store data-encryption key"``); ``key_id`` is the
+        one-way SHA-256 fingerprint already embedded in every ciphertext marker — **never key material**;
+        ``invocations`` is the cumulative count and ``ceiling`` the fail-closed limit. Carries no PHI and
+        no key bytes. Emitted by the
+        :class:`~messagefoundry.pipeline.gcm_invocations.GcmInvocationRunner`. Dedicated (not reusing
+        :meth:`secret_rotation_due`) because this is a MEASURED exhaustion signal with a hard stop behind
+        it, not a calendar reminder — crossing the ceiling refuses further encrypts, so it warrants its
+        own routing/severity."""
         ...
 
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
@@ -156,6 +191,40 @@ class AlertSink(Protocol):
         ``rcsi_off_degraded`` gauge). ``name`` labels the source (``"pipeline"``); ``detail`` is a
         PHI-free reason. Dedicated (not reusing :meth:`connection_stopped`) so a degraded-posture signal
         is routable independently of a stalled delivery lane. No message content."""
+        ...
+
+    def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
+        """A node went **non-leader → leader** (BACKLOG #145) — an active-passive HA failover / the
+        initial election. The page-worthy edge the failover blind spot hid: an operator sees leadership
+        *move* without polling ``/cluster/status``. ``node`` is the cluster node id (also the throttle
+        key); ``role`` is ``"leader"``; ``epoch`` is the held H1 leader epoch. Carries **only**
+        node/role/epoch — cluster-topology facts, never message content (no PHI). Emitted by the cluster
+        coordinators (``DbCoordinator`` / ``SqlServerCoordinator``); :meth:`leadership_lost` is its
+        auto-resolving inverse."""
+        ...
+
+    def leadership_lost(self, node: str, *, role: str, reason: str) -> None:
+        """A node **lost / self-fenced / cleanly released** leadership (BACKLOG #145) — the **inverse** of
+        :meth:`leadership_acquired`. Emits **no** notification (a step-down needs no page); it exists so
+        durable alert-state (ADR 0044) **auto-resolves** the matching open ``leadership_acquired`` instance
+        (the open set then tracks the current leaders). ``node`` is the node id; ``role`` is ``"follower"``;
+        ``reason`` is a PHI-free cause (``"lease taken or expired"`` / ``"self-fenced"`` / ``"released"``).
+        The default :class:`LoggingAlertSink` logs it; a state-less sink treats it as a no-op."""
+        ...
+
+    def dr_activated(self, node: str, *, role: str) -> None:
+        """A third-tier DR standby was **promoted** (BACKLOG #145, ADR 0048) — the primary is down and this
+        box is now serving the priority feeds. Page-worthy. ``node`` is the DR box's host label (also the
+        throttle key); ``role`` is ``"dr_standby"``. Carries **only** node/role (no PHI). Emitted by
+        :class:`~messagefoundry.pipeline.dr.DrCoordinator` on ``activate``; :meth:`dr_released` is its
+        auto-resolving inverse."""
+        ...
+
+    def dr_released(self, node: str, *, role: str) -> None:
+        """A DR box **failed back** to the recovered primary (BACKLOG #145, ADR 0048) — the **inverse** of
+        :meth:`dr_activated`. Emits **no** notification (a fail-back needs no page); it **auto-resolves**
+        the matching open ``dr_activated`` instance (ADR 0044). ``node`` is the DR box label; ``role`` is
+        ``"primary"`` (leadership handed back). No PHI."""
         ...
 
 
@@ -232,9 +301,26 @@ class LoggingAlertSink:
             )
 
     def secret_rotation_due(
-        self, name: str, *, secret: str, last_rotated: str, days_overdue: int
+        self,
+        name: str,
+        *,
+        secret: str,
+        last_rotated: str,
+        days_overdue: int,
+        enforced: bool = False,
     ) -> None:
-        if days_overdue > 0:
+        if enforced:
+            # ASVS 13.3.4 ENFORCE escalation: past max_age + grace under strict enforcement. Logged at
+            # ERROR (vs the routine WARNING) so it is triaged at a higher severity.
+            log.error(
+                "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) past the enforced "
+                "grace (last_rotated=%s) — [security].enforcement=ENFORCE",
+                name,
+                secret,
+                days_overdue,
+                last_rotated,
+            )
+        elif days_overdue > 0:
             log.warning(
                 "ALERT secret_rotation: %r (%s) is OVERDUE for rotation by %d day(s) "
                 "(last_rotated=%s)",
@@ -251,6 +337,26 @@ class LoggingAlertSink:
                 -days_overdue,
                 last_rotated,
             )
+
+    def bootstrap_admin_expiring(self, name: str, *, expires_at: str, hours_remaining: int) -> None:
+        log.warning(
+            "ALERT bootstrap_admin_expiring: %r is UNCLAIMED and is auto-disabled in %d hour(s) "
+            "(expires %s) — sign in and change the password, or add a second admin, before then",
+            name,
+            hours_remaining,
+            expires_at,
+        )
+
+    def gcm_invocations(self, name: str, *, key_id: str, invocations: int, ceiling: int) -> None:
+        log.warning(
+            "ALERT gcm_invocations: %r (key_id=%s) has encrypted %d value(s), %.1f%% of the %d "
+            "fail-closed AES-GCM ceiling — rotate the key (`messagefoundry rotate-key`) before it stops",
+            name,
+            key_id,
+            invocations,
+            100.0 * invocations / ceiling if ceiling else 0.0,
+            ceiling,
+        )
 
     def integrity_drift(self, name: str, *, reason: str, drift_count: int) -> None:
         log.warning(
@@ -283,3 +389,26 @@ class LoggingAlertSink:
             name,
             detail,
         )
+
+    def leadership_acquired(self, node: str, *, role: str, epoch: int | None = None) -> None:
+        log.warning(
+            "ALERT leadership_acquired: node %r became %s (epoch=%s) — HA leadership moved",
+            node,
+            role,
+            epoch,
+        )
+
+    def leadership_lost(self, node: str, *, role: str, reason: str) -> None:
+        # The inverse (auto-resolve) event; informative but not a page — logged at INFO.
+        log.info("ALERT leadership_lost: node %r is now %s (%s)", node, role, reason)
+
+    def dr_activated(self, node: str, *, role: str) -> None:
+        log.warning(
+            "ALERT dr_activated: DR box %r PROMOTED (%s) — serving priority feeds (primary down)",
+            node,
+            role,
+        )
+
+    def dr_released(self, node: str, *, role: str) -> None:
+        # The inverse (auto-resolve) event; a clean fail-back — logged at INFO, no page.
+        log.info("ALERT dr_released: DR box %r released, handed back to %s", node, role)

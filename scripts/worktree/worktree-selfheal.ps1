@@ -100,5 +100,40 @@ foreach ($root in $roots) {
     }
 }
 
+# 3) Has THIS session's own LINKED worktree been SWITCHED off its home branch -- the worktree-hijack?
+#    A session with no worktree of its own runs `git checkout <a-branch>` inside somebody else's worktree,
+#    yanking its files onto another branch mid-task (docs/WORKTREES.md). The worktree gate (rule 3b) blocks
+#    that pre-emptively, but ONLY where the gate is installed -- and it is wired into ~/.claude only, not the
+#    per-account VS Code config dirs. THIS backstop is wired into every account, so it is the cross-account
+#    safety net. WARN ONLY: never auto-switch a linked worktree under the session that is using it.
+if ($cwd -and (Test-Path -LiteralPath $cwd)) {
+    # A linked worktree's private git dir is <repo>/.git/worktrees/<id>/; the main worktree's is <repo>/.git.
+    # Only a linked worktree can be hijacked away from an assigned branch, so act only on those.
+    $gitDir = "$(& git -C $cwd rev-parse --absolute-git-dir 2>$null)".Trim()
+    if ($gitDir -match '[/\\]worktrees[/\\]') {
+        # Only if this worktree's repo is a governed primary (its MAIN worktree is in the allowlist).
+        $mainWt = ''
+        $ml = @(& git -C $cwd worktree list --porcelain 2>$null) |
+            Where-Object { $_ -match '^worktree ' } | Select-Object -First 1
+        if ($ml) { $mainWt = Norm ($ml -replace '^worktree\s+', '') }
+        $governed = $false
+        foreach ($r in $roots) { if ((Norm $r) -eq $mainWt) { $governed = $true; break } }
+        if ($governed) {
+            $homeFile = Join-Path $gitDir 'mefor-home-branch'
+            $wtHead = "$(& git -C $cwd rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+            if (Test-Path -LiteralPath $homeFile) {
+                $wtHome = "$(Get-Content -LiteralPath $homeFile -Raw -ErrorAction SilentlyContinue)".Trim()
+                if ($wtHome -and $wtHead -and $wtHead -ne 'HEAD' -and $wtHead -ne $wtHome) {
+                    $notes += "This worktree ($cwd) is on branch '$wtHead' but its recorded HOME branch is '$wtHome'. Another session may have SWITCHED it onto a different branch -- a worktree-hijack (docs/WORKTREES.md), which silently swaps every file under you. If that was not intentional, restore it (commit or stash anything you want to keep FIRST), from a PLAIN terminal:`n    git -C `"$cwd`" switch $wtHome"
+                }
+            } elseif ($wtHead -and $wtHead -ne 'HEAD') {
+                # First sighting with no record yet -> remember the current branch as home (best effort).
+                # Warn-only design means a wrong bootstrap only misses/mis-fires a warning, never mutates.
+                Set-Content -LiteralPath $homeFile -Value $wtHead -Encoding utf8 -ErrorAction SilentlyContinue
+            }
+        }
+    }
+}
+
 if ($notes.Count -gt 0) { Emit-Context ($notes -join "`n`n") }
 exit 0

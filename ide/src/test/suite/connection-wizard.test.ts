@@ -5,6 +5,7 @@ import {
   buildConnObj,
   coerceSetting,
   connectionUpsertArgs,
+  planWizardSave,
   settingKeysFor,
   shouldSaveConnection,
   validateName,
@@ -12,6 +13,7 @@ import {
   validateRequired,
   type WizardState,
 } from "../../connectionWizardModel";
+import type { ConnObj } from "../../connectionMerge";
 
 // Pure new-connection wizard model (#221e) — the answer→ConnObj mapping, per-step validators, and the
 // upsert argv, exercised vscode-free (the QuickInput orchestration itself is Extension-Host-only).
@@ -161,6 +163,50 @@ suite("connectionWizardModel — buildConnObj", () => {
     assert.strictEqual(conn.name, "IB_X");
     assert.strictEqual(conn.settings, undefined);
     assert.strictEqual(conn.router, undefined);
+  });
+});
+
+suite("connectionWizardModel — create-semantics collision gate (#240 c)", () => {
+  // The keyboard wizard is always a CREATE, and `connection upsert` is a full REPLACE — so finishing
+  // the wizard on an EXISTING connection name must REFUSE (not silently overwrite), exactly as the
+  // webview form does. planWizardSave reuses connectionMerge.planSave under create semantics; it is the
+  // node-testable seam behind saveConnection's pre-upsert gate (the QuickInput orchestration itself is
+  // Extension-Host-only).
+  function entries(): ConnObj[] {
+    return [
+      { direction: "inbound", name: "IB_ACME_ADT", transport: "mllp", settings: { port: 2575 }, router: "adt_router" },
+      { direction: "outbound", name: "OB_ACME_ADT", transport: "mllp", settings: { host: "acme.example", port: 2575 } },
+    ];
+  }
+
+  test("finishing the wizard on an existing name REFUSES (collision set, no upsert)", () => {
+    const conn = buildConnObj({
+      direction: "inbound",
+      transport: "mllp",
+      name: "IB_ACME_ADT", // collides with an existing connection
+      port: "2600",
+      router: "adt_router",
+    });
+    const plan = planWizardSave(entries(), conn);
+    assert.strictEqual(plan.collision, "IB_ACME_ADT");
+  });
+
+  test("a fresh name PROCEEDS (no collision, the posted object stands)", () => {
+    const conn = buildConnObj({
+      direction: "inbound",
+      transport: "mllp",
+      name: "IB_NEW_ADT",
+      port: "2600",
+      router: "adt_router",
+    });
+    const plan = planWizardSave(entries(), conn);
+    assert.strictEqual(plan.collision, undefined);
+    assert.deepStrictEqual(plan.conn, conn);
+  });
+
+  test("an empty graph never collides", () => {
+    const conn = buildConnObj({ direction: "inbound", transport: "mllp", name: "IB_FIRST", port: "1" });
+    assert.strictEqual(planWizardSave([], conn).collision, undefined);
   });
 });
 

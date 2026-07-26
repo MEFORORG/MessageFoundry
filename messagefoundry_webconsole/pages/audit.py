@@ -16,7 +16,6 @@ from messagefoundry.api.auth_models import AuditList, SecurityEventsList
 
 from .._html import Markup, el, page, register_nav, rows_table
 
-
 __all__ = ["audit_log", "security_events"]
 
 

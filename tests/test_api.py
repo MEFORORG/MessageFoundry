@@ -9,7 +9,6 @@ a lifespan-managed app, which owns its engine on the client's own loop."""
 from __future__ import annotations
 
 import asyncio
-
 from pathlib import Path
 
 import httpx
@@ -347,7 +346,7 @@ async def test_dead_letters_replay_scoped_by_destination(
     b = await engine.store.enqueue_message(channel_id="ch1", raw=ADT, deliveries=[("d2", ADT)])
     from messagefoundry.config.models import RetryPolicy
 
-    for dest, mid in (("d1", a), ("d2", b)):
+    for dest, mid in (("d1", a), ("d2", b)):  # noqa: B007
         item = (await engine.store.claim_ready(destination_name=dest))[0]
         await engine.store.mark_failed(item.id, "boom", RetryPolicy(max_attempts=1))
 
@@ -580,9 +579,12 @@ async def test_status_kpis_rollup_combines_endpoints_and_reuses_recent_done(
 
     kpis = (await client.get("/status")).json()["kpis"]
     # Combined inbound + outbound endpoints (vs channels_*, which count inbound only).
-    assert kpis["connections_total"] == 2  # 1 inbound + 1 outbound
+    assert kpis["connections_total"] == 2  # 1 inbound + 1 outbound (both DEPLOYED)
     assert kpis["connections_running"] == 0  # runner built but not started
     assert kpis["connections_stopped"] == 2
+    assert kpis["connections_not_deployed"] == 0  # #233: none flagged deployed=false here
+    # The pinned identity survives the third bucket unchanged: not-deployed connections are excluded
+    # from total (they are in the registry but are not lanes), so stopped still == total - running.
     assert kpis["connections_stopped"] == kpis["connections_total"] - kpis["connections_running"]
     # messages_total mirrors the store-wide message count.
     assert kpis["messages_total"] == 1

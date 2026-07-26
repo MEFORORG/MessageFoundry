@@ -23,7 +23,7 @@ _describe = MLLPDestination._describe_error
 
 def test_bare_timeout_yields_the_type_name() -> None:
     # str(asyncio.TimeoutError()) == "" — exactly the empty-message case from the bench.
-    assert _describe(asyncio.TimeoutError()) == "TimeoutError"
+    assert _describe(TimeoutError()) == "TimeoutError"
 
 
 def test_oserror_text_is_kept_without_duplicating_errno() -> None:

@@ -316,7 +316,7 @@ async def test_batch_split_handshake_end_to_end(monkeypatch: pytest.MonkeyPatch)
     # (1) The engine launched one connscale engine per cell with the batch flag toggled per arm + the
     #     claim mode pinned; fusion OFF in both arms.
     assert len(eng_rec.node_envs) == len(cells)
-    for env, cell in zip(eng_rec.node_envs, cells):
+    for env, cell in zip(eng_rec.node_envs, cells):  # noqa: B905
         want = "true" if cell.batch_mode else "false"
         assert env["MEFOR_PIPELINE_BATCH_HANDOFF_STATEMENTS"] == want
         assert env["MEFOR_PIPELINE_FUSE_THREAD_HOPS"] == "false"

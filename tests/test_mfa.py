@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+from _totp_clock import fresh_totp
+
 from messagefoundry.auth import totp
 from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal
@@ -56,7 +58,7 @@ async def test_enroll_confirm_status_and_recovery_codes() -> None:
         assert (await service.mfa_status(identity)).enabled is False  # staged, not active
 
         recovery = await service.confirm_mfa_enrollment(
-            identity, totp.totp(enroll.secret), token=token
+            identity, fresh_totp(enroll.secret), token=token
         )
         assert recovery is not None and len(recovery) == 10
 
@@ -76,7 +78,7 @@ async def test_login_requires_second_factor_after_enrollment() -> None:
         service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
 
         out = await service.login("admin", password)
         assert out.ok and out.mfa_required is True and out.token is not None
@@ -86,7 +88,10 @@ async def test_login_requires_second_factor_after_enrollment() -> None:
         wrong = "000000" if code != "000000" else "111111"
         assert await service.verify_mfa(out.token, wrong) is False
         assert await service.mfa_satisfied(out.token) is False
-        assert await service.verify_mfa(out.token, code) is True
+        # Recompute the TOTP immediately before the success-path verify: the wrong-code verify above
+        # runs two argon2id recovery-code checks (~100-200 ms), long enough that a 30 s TOTP step
+        # boundary could stale the code computed at enrollment time and flake this assertion.
+        assert await service.verify_mfa(out.token, fresh_totp(enroll.secret)) is True
         assert await service.mfa_satisfied(out.token) is True
     finally:
         await store.close()
@@ -114,7 +119,7 @@ async def test_recovery_code_single_use() -> None:
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
         codes = await service.confirm_mfa_enrollment(
-            identity, totp.totp(enroll.secret), token=token
+            identity, fresh_totp(enroll.secret), token=token
         )
         assert codes is not None and len(codes) == 3
 
@@ -139,7 +144,7 @@ async def test_totp_code_is_single_use_within_its_window() -> None:
         service = AuthService(store, AuthSettings())
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
 
         code = totp.totp(enroll.secret)
         out = await service.login("admin", password)
@@ -179,7 +184,7 @@ async def test_disable_and_admin_reset_clear_mfa() -> None:
         )
         identity, token, _ = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
 
         await service.disable_mfa(identity)
         assert (await service.mfa_status(identity)).enabled is False
@@ -187,7 +192,7 @@ async def test_disable_and_admin_reset_clear_mfa() -> None:
 
         # Re-enroll, then an admin reset clears it again and revokes sessions.
         enroll2 = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll2.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll2.secret), token=token)
         await service.admin_reset_mfa(identity.user_id, actor="admin")
         assert (await service.mfa_status(identity)).enabled is False
     finally:
@@ -241,7 +246,7 @@ async def test_recovery_code_consume_is_atomic_under_concurrency() -> None:
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
         codes = await service.confirm_mfa_enrollment(
-            identity, totp.totp(enroll.secret), token=token
+            identity, fresh_totp(enroll.secret), token=token
         )
         assert codes is not None
 
@@ -264,7 +269,7 @@ async def test_mfa_failures_trip_the_per_account_lockout() -> None:
         service = AuthService(store, AuthSettings(mfa_recovery_code_count=2))  # lockout_threshold=5
         identity, token, password = await _bootstrap_login(service)
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
 
         out = await service.login("admin", password)
         good = totp.totp(enroll.secret)
@@ -273,7 +278,7 @@ async def test_mfa_failures_trip_the_per_account_lockout() -> None:
             assert await service.verify_mfa(out.token, wrong) is False
 
         # The account is now locked: even a CORRECT code is refused...
-        assert await service.verify_mfa(out.token, totp.totp(enroll.secret)) is False
+        assert await service.verify_mfa(out.token, fresh_totp(enroll.secret)) is False
         # ...and the lock is shared with the password path (a fresh login is locked too).
         relogin = await service.login("admin", password)
         assert relogin.ok is False and relogin.error == "account locked"

@@ -13,9 +13,9 @@ import pytest
 
 pytest.importorskip("PySide6")
 
-from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame  # noqa: E402
 from harness.compose import _ACCEPT, _NONE, _REJECT, ComposePanel  # noqa: E402
 from harness.mllp import SendItem, SendResult, SendWorker  # noqa: E402
+from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame  # noqa: E402
 
 _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|X1|P|2.5.1\rEVN|A01|20260101\r"
 _OK_COL = 4

@@ -37,10 +37,17 @@ def emit_audit_tee(
     channel_id: str | None,
     detail: str | None,
     ts: float,
+    client: str | None = None,
 ) -> None:
     """Tee a just-persisted ``audit_log`` record off-box as PHI-safe metadata (sec-offbox-log, ASVS
-    16.x). Emits actor / action / channel / timestamp plus a **redacted** ``detail`` to the
-    ``messagefoundry.audit`` logger.
+    16.x). Emits actor / action / channel / client address / timestamp plus a **redacted** ``detail``
+    to the ``messagefoundry.audit`` logger.
+
+    ``client`` (ADR 0150) is the caller's network address, or ``None`` for an engine-internal write. It
+    is forwarded verbatim — it is an infrastructure identifier, not message content, and the whole point
+    of the off-box copy is that attribution survives a host/DB compromise, which it cannot do if the
+    "from where" is dropped on the way out. It is emitted as a discrete field (never folded into
+    ``detail``) so a SIEM can index it without parsing the redacted blob.
 
     **Never emits a raw message body.** ``detail`` can embed raw HL7 fragments from an exception
     message (it is a cipher column at rest for exactly that reason), so it is run through
@@ -58,6 +65,7 @@ def emit_audit_tee(
         "action": action,
         "actor": actor,
         "channel_id": channel_id,
+        "client": client,
         # PHI chokepoint: redact HL7-shaped content + bound length before it ships off-box.
         "detail": safe_text(detail) if detail else None,
     }

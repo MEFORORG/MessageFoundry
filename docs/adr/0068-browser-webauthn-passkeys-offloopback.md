@@ -346,6 +346,17 @@ advisory-only, restated).
    delegate MFA to the directory (ADR 0002 option 2); an engine-side factor for AD users would
    overturn the recorded federation model.
 
+   > **Amended 2026-07-21 by [ADR 0142](0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)
+   > (BACKLOG #274) — NARROWED, not overturned.** This decision stands: WebAuthn stays local-users-only,
+   > and the engine still mints no engine-side factor for a directory identity. What changed is the
+   > *evidence* available about a directory login. ADR 0142 adds an OIDC relying party in which the
+   > engine can verify an IdP's **`amr`/`acr` MFA claim cryptographically** (`oidc_require_mfa_claim`,
+   > default on), so "MFA is delegated to the directory" is no longer necessarily evidence-free — on
+   > the federated path it is a signature-verified assertion. It remains an **assertion, not a proof**:
+   > the engine cannot show the IdP enforced anything. AD/LDAPS and Kerberos are unchanged and stay
+   > evidence-free by necessity (see BACKLOG #99(g), closed as not-buildable against on-prem AD DS).
+   > Browser SSO is also **no longer Kerberos-only**: `/ui/oidc/{start,callback}` join `/ui/sso`.
+
 ## Consequences
 
 **Positive** — Phishing-resistant MFA gates the newly exposed browser admin surface; AD browser
@@ -400,3 +411,21 @@ re-probe.
 - [ ] Kerberos preflight periodic re-probe (today boot-once; DC outage at start sticks until restart).
 - [ ] v3.0.0 `response.transports` struct path — mandatory build-time check at PR-A (recon flagged it
   uneyeballed).
+
+## Amendment (2026-07-17) — passkey instructed as the exposed-admin factor; still not serve-gated (ASVS 6.3.3 / 6.5.7 / 6.7.2, ADR 0115 / WP #243)
+
+**Status:** Doc-only — no default changed. WebAuthn passkeys stay **available / opt-in** behind the
+`[webauthn]` extra; the password leg stays mandatory and user-verification stays `PREFERRED`. This
+records the ADR 0115 treatment of the phishing-resistant factor: it is **instructed, not made
+mandatory in-engine**.
+
+[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Enrolling a
+hardware passkey as the exposed-admin factor" now instructs installing the `[webauthn]` extra,
+setting `[api].public_origin`, and enrolling a roaming hardware authenticator as the admin factor for
+an exposed console.
+
+**Residual reaffirmed:** the engine does not require a passkey — an admin can still step up with
+password + TOTP — so 6.3.3 / 6.5.7 / 6.7.2 stay **Partial at strict L3** for the instructed
+deployment. A clean Pass needs an **owner** serve gate that *requires* the `[webauthn]` extra + an
+enrolled passkey for admin at exposure (an owner decision; not landed here). ADR 0115 does not
+re-score.

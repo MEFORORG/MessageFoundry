@@ -80,8 +80,9 @@ $roots = @(
 )
 if ($roots.Count -eq 0) { exit 0 }
 
-$tool = [string]$hook.tool_name
-$cwd  = Get-ComparablePath ([string]$hook.cwd)
+$tool   = [string]$hook.tool_name
+$cwd    = Get-ComparablePath ([string]$hook.cwd)   # canonicalised: allowlist comparison only
+$cwdRaw = [string]$hook.cwd                        # original case: for `git -C` in rule 3b
 
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
@@ -95,6 +96,99 @@ function Test-Governed([string]$Candidate) {
         }
     }
     return $null
+}
+
+# ---------------------------------------------------------------------------------------------------
+# Rule 3b -- hijacking a LINKED WORKTREE by switching it onto an ALREADY-EXISTING branch. Rule 3 below
+# protects only the shared PRIMARY; this protects every OTHER governed worktree from the one move that
+# actually happened here: a session with no worktree of its own ran `git checkout <a-branch>` inside
+# somebody else's worktree, yanking that session's files onto a different branch mid-task. git permits
+# it because its native guard only blocks a branch ALREADY checked out somewhere -- a "free" branch can
+# be grabbed by any worktree.
+#
+# Deliberately narrow: only a switch onto an EXISTING LOCAL BRANCH is denied. Creating a new branch
+# (-b/-c), restoring files (`--`/pathspec), and reset/rebase/merge of the worktree's OWN branch stay
+# allowed -- a worktree owns its own history; it just may not be pulled onto another in-flight branch.
+# The gate cannot tell a worktree's rightful session from a squatter (both share the cwd), so it blocks
+# the move for both; the rightful owner's escape hatch is a PLAIN terminal (never gated) or a fresh
+# worktree for the other branch. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
+function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$CwdRaw) {
+    if ($Verb -notin @("checkout", "switch")) { return }
+
+    # Which working tree does the command act on? Keep the RAW (original-case) path -- every `git -C`
+    # below MUST use it, never a Get-ComparablePath value: that form is lowercased, and on a
+    # case-sensitive filesystem (Linux CI) `git -C /tmp/.../primary-wt` misses the real `.../Primary-wt`
+    # dir, so the whole rule silently fails open. Get-ComparablePath is for allowlist comparison ONLY.
+    # Read git's global `-C <path>` case-SENSITIVELY so a lowercase `-c <cfg>` is not taken as a path.
+    # An explicit -C wins; else a leading `cd`/`pushd`; else the session's cwd (the case that happened).
+    $wtRaw = $CwdRaw
+    if ($Cmd -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') { $wtRaw = $Matches[1] }
+    elseif ($Cmd -match '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)') {
+        $wtRaw = $Matches[1].Trim()
+    }
+    if (-not $wtRaw) { return }
+
+    # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
+    # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
+    # git's pre-verb `-C`/`-c` globals from being read as checkout's `-b` / switch's `-c`.
+    $after = ($Cmd -replace ('(?s)^.*?\b' + [regex]::Escape($Verb) + '\b'), '')
+    $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+
+    # Not a branch switch onto an existing branch? Leave it alone.
+    #   `--`                       -> pathspec / file restore (`git checkout -- f`, `git checkout r -- f`)
+    #   -b/-B (checkout) / -c/-C (switch) AFTER the verb -> creating a branch, not moving onto one
+    if ($after -cmatch '(^|\s)--(\s|$)') { return }
+    if ($after -cmatch '(^|\s)-[bBcC](?=\s|$)') { return }
+
+    # The destination ref = first positional (non-flag) token after the verb.
+    $dest = $null
+    foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+        if ($tok.StartsWith('-')) { continue }
+        $dest = $tok.Trim('"', "'")
+        break
+    }
+    if (-not $dest) { return }
+
+    # Classify $wtRaw against git itself (robust for BOTH nested .claude/worktrees and sibling
+    # worktrees): find the MAIN worktree of whatever repo it belongs to; act only if that main worktree
+    # is a governed primary AND $wtRaw is a DIFFERENT (linked) worktree of it. All git calls take the RAW
+    # path; only the results are canonicalised for comparison. Any git failure -> fail open.
+    $list = @(& git -C $wtRaw worktree list --porcelain 2>$null)
+    if ($LASTEXITCODE -ne 0 -or $list.Count -eq 0) { return }
+    $mainLine = $list | Where-Object { $_ -match '^worktree ' } | Select-Object -First 1
+    if (-not $mainLine) { return }
+    $mainWt = Get-ComparablePath ($mainLine -replace '^worktree\s+', '')
+    $gov = Test-Governed $mainWt
+    if (-not $gov) { return }                                     # repo's main tree isn't governed
+
+    $selfTopRaw = "$(& git -C $wtRaw rev-parse --show-toplevel 2>$null)".Trim()
+    $selfTop = Get-ComparablePath $selfTopRaw
+    if (-not $selfTop -or $selfTop -eq $mainWt) { return }        # $wtRaw IS the primary -- Rule 3 owns it
+
+    # Only an EXISTING local branch, and only if it is not the branch we are already on (a no-op).
+    & git -C $wtRaw rev-parse --verify --quiet ("refs/heads/" + $dest) *> $null
+    if ($LASTEXITCODE -ne 0) { return }
+    $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
+    if ($dest -eq $head) { return }
+
+    $newHint = "$($gov.Display)\scripts\worktree\new.ps1"
+    Write-Deny @"
+BLOCKED: 'git $Verb $dest' would switch a LINKED WORKTREE ($selfTopRaw) onto the existing branch '$dest'.
+
+That worktree belongs to another session, which is building on '$head' right now. Switching it swaps every
+file under that session mid-task -- silently -- and drags two sessions' work onto one branch. This is not
+hypothetical: it is exactly the hijack that happened here. A session with no worktree of its own ran a
+`git checkout` inside somebody else's worktree; git allowed it because '$dest' was not checked out anywhere.
+
+What to do instead:
+  * To BUILD on '$dest', give it its OWN worktree -- git then refuses to check that branch out twice,
+    which is the protection you actually want. The branch already exists, so reuse it by name:
+        pwsh -NoProfile -File $newHint -Name $dest
+  * To READ '$dest' without touching any working tree, use the plumbing:
+        git -C "$selfTopRaw" show $dest`:<path>        git -C "$selfTopRaw" diff HEAD..$dest
+  * If you genuinely OWN this worktree and must switch it, do it from a PLAIN terminal -- the gate governs
+    agents, not you. Do not route around this with a shell script; that only hides the collision.
+"@
 }
 
 # ---------------------------------------------------------------------------------------------------
@@ -164,10 +258,49 @@ if ($tool -in @("Bash", "PowerShell")) {
     if (-not $root) {
         $normalized = ($cmd -replace '\\', '/').ToLowerInvariant()
         foreach ($r in $roots) {
-            if ($normalized.Contains($r.Compare)) { $root = $r; break }
+            # Match the primary path only at a DIRECTORY BOUNDARY, never as a raw prefix substring. A
+            # sibling worktree is named `<primary>-<task>`, so its path CONTAINS the primary's as a prefix
+            # ('.../messagefoundry-ss-capture' starts with '.../messagefoundry'); a plain .Contains() then
+            # falsely re-flagged a legitimate `git -C "<sibling>" merge` whose -C already resolved to a
+            # NON-governed target above. The first lookahead rejects the characters that CONTINUE a
+            # directory name ([a-z0-9_-] -> messagefoundry-ss, messagefoundry2, messagefoundry_x are all
+            # different dirs): the primary substring is not a boundary there, so those siblings are allowed.
+            #
+            # `.` is the awkward case and needs the SECOND lookahead. Windows silently STRIPS a trailing
+            # dot from a path component, so `cd <primary>.` actually resolves to the primary itself and a
+            # `git checkout` there swaps the shared tree -- that MUST block. But `<primary>.old` is a
+            # genuinely different directory that must NOT. So a dot can't simply live in the first reject
+            # class (that re-introduced a FALSE NEGATIVE on the tree-swapping `<primary>.`) nor be omitted
+            # from all of it (that re-introduced the `<primary>.old` FALSE POSITIVE). `(?!\.[a-z0-9_-])`
+            # splits them: it fails the match only when the dot BEGINS a longer name component (`.old`),
+            # while a dot followed by a real terminator (quote, space, `;`, EOL) passes both lookaheads and
+            # matches -- so `<primary>.` is blocked and `<primary>.old` is allowed.
+            #
+            # Every character that genuinely TERMINATES the path in a real `cd <primary>; git checkout` --
+            # a path separator, whitespace, a quote, `;` `&` `|` `)`, a bare trailing dot, or end-of-string
+            # -- clears both lookaheads and still matches, so no real primary tree-swap slips through.
+            #
+            # THIRD lookahead (BACKLOG #308): honour the SAME `.claude/worktrees/` exemption that
+            # Test-Governed already applies. A linked worktree living UNDER the primary is not the
+            # primary -- a git verb there swaps only its own tree -- but a path separator clears both
+            # lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
+            # exactly where new.ps1 puts every worktree, so `cd <own worktree> && git rebase ...` -- the
+            # most ordinary thing a session does -- was refused as if it were swapping the shared tree,
+            # while the identical command with the path omitted was allowed: the block depended on how the
+            # command was SPELLED, not on what it touched. Only this one subpath is exempt; the primary
+            # itself and any OTHER path inside it (`<primary>/.claude/hooks`) still match and still deny.
+            $boundary = [regex]::Escape($r.Compare) +
+                '(?![a-z0-9_-])(?!\.[a-z0-9_-])(?!/\.claude/worktrees/)'
+            if ($normalized -match $boundary) { $root = $r; break }
         }
     }
-    if (-not $root) { exit 0 }   # acting on a worktree or another repo entirely -- not our business
+    if (-not $root) {
+        # Not the shared primary. It may still be a governed LINKED WORKTREE being hijacked onto an
+        # existing branch (rule 3b) -- Write-Deny + exit if so; otherwise this returns and we allow.
+        # Pass the RAW cwd: rule 3b shells `git -C` and must not use a lowercased path (Linux CI).
+        Test-WorktreeHijack $verb $cmd $cwdRaw
+        exit 0
+    }
 
     $display = $root.Display
     Write-Deny @"

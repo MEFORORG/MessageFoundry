@@ -139,8 +139,8 @@ def test_oauth2_cc_unparseable_token_response_raises_delivery_error() -> None:
 # escape set (the escape is inert for prod-PHI), non-prod / attested is permitted (as the delivery cells
 # do), and the default (unstamped → fail-closed prod-PHI, e.g. the two tests above) still refuses.
 
-_PROD_PHI = HopPosture(is_phi=True, production=True)
-_STAGING_PHI = HopPosture(is_phi=True, production=False)  # non-prod PHI
+_PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+_STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # non-prod PHI
 
 
 def test_oauth2_cleartext_token_endpoint_refused_on_prod_phi_even_with_escape(

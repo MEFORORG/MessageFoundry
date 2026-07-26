@@ -23,24 +23,34 @@ never pulls the API or console into the engine.
 from __future__ import annotations
 
 import asyncio
+import datetime
 import logging
+import ssl
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
-
-from cryptography import x509
+from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.settings import CertMonitorSettings
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
+from messagefoundry.pki import read_cert_facts
 
 if TYPE_CHECKING:
     from messagefoundry.config.wiring import Registry
 
-__all__ = ["MonitoredCert", "CertCheck", "CertExpiryRunner", "certs_from_registry"]
+__all__ = [
+    "MonitoredCert",
+    "CertCheck",
+    "CertExpiryRunner",
+    "certs_from_registry",
+    "peer_cert_expiry",
+]
 
 log = logging.getLogger(__name__)
 
+#: Day length for ``days_remaining``. Pinned equal to :mod:`messagefoundry.pki`'s own constant (a test
+#: asserts the parity) so a cert observed at the mTLS handshake and the same cert read from a PEM file
+#: report the SAME days-remaining — otherwise the two 6.4.5 monitor arms could disagree by a day.
 _SECONDS_PER_DAY = 86_400
 
 
@@ -68,16 +78,44 @@ class CertCheck:
         return self.days_remaining < 0
 
 
+def client_cert_label(path: str) -> str:
+    """The alert label for an operator-listed **service-caller** client cert (ASVS 6.4.5), namespaced so
+    it can never collide with the ``"api"`` label or a connection name.
+
+    Built from the **whole path**, not the file stem, because this label becomes the alert event's
+    ``connection`` — the key for the re-alert throttle AND the durable ``alert_instance`` row. A stem
+    is not unique across the configured list: the natural per-partner layout
+    (``…/acme/client.pem``, ``…/globex/client.pem``) collapses to one key, and since
+    :meth:`CertExpiryRunner.run_once` emits every cert in ONE synchronous pass, the second would land
+    inside the first's ``realert_seconds`` cooldown and be dropped before any transport saw it — on
+    every pass, permanently. That is invisible on the ``LoggingAlertSink`` (which never throttles) and
+    only bites where a real notifier is wired, i.e. exactly where an operator relies on being paged.
+    Full paths are injective by construction and are what an operator needs anyway (which file to
+    renew) — the same reason :meth:`AlertSink.storage_threshold` keys on the DB path."""
+    return f"api-client:{path}"
+
+
 def certs_from_registry(
-    registry: Registry | None, api_tls_cert_file: str | None
+    registry: Registry | None,
+    api_tls_cert_file: str | None,
+    client_cert_files: Sequence[str] = (),
 ) -> list[MonitoredCert]:
     """Enumerate the certs the engine serves with: the ``[api]`` TLS cert plus every wired connection
     carrying a ``tls_cert_file`` (MLLP inbound server identity / outbound mTLS client cert). A cert path
     supplied as a deferred ``env()`` reference (not yet a literal ``str``) is skipped — it is resolved
-    per-environment elsewhere and is not a readable path here."""
+    per-environment elsewhere and is not a readable path here.
+
+    ``client_cert_files`` (``[api].tls_client_cert_files``) additionally folds in the certs of **inbound
+    service callers** the operator holds copies of (ASVS 6.4.5). Those are certs the engine *verifies*
+    rather than *presents*, so they are invisible to the served-cert enumeration above; listing them here
+    closes the handshake monitor's admitted gap — a caller that simply stops connecting would otherwise
+    expire silently, since a handshake-observed cert can only be seen while that caller still calls."""
     certs: list[MonitoredCert] = []
     if isinstance(api_tls_cert_file, str) and api_tls_cert_file:
         certs.append(MonitoredCert("api", api_tls_cert_file))
+    for client_path in client_cert_files:
+        if isinstance(client_path, str) and client_path:
+            certs.append(MonitoredCert(client_cert_label(client_path), client_path))
     if registry is not None:
         # Separate loops (not a merged tuple) so each connection keeps its concrete type — mypy widens a
         # star-unpacked ``(*inbound, *outbound)`` of two different value views to ``object``.
@@ -90,6 +128,33 @@ def certs_from_registry(
             if isinstance(ob_path, str) and ob_path:
                 certs.append(MonitoredCert(ob.name, ob_path))
     return certs
+
+
+def peer_cert_expiry(peercert: Mapping[str, Any], *, now: float) -> tuple[str, int] | None:
+    """``(not_after_iso, days_remaining)`` for a verified peer certificate, or ``None`` when the cert
+    carries no parseable ``notAfter`` (ASVS 6.4.5).
+
+    Pure. Takes the ``ssl.getpeercert()`` **dict** an mTLS handshake yields — the form the API's
+    cert-identity resolver already holds — rather than PEM bytes, so a service caller's cert can be
+    checked at handshake time with no file to read and no key material touched. ``days_remaining`` is
+    negative once expired and uses the same day math as :func:`~messagefoundry.pki.read_cert_facts`, so
+    the handshake arm and the file-based monitor never disagree about the same cert.
+
+    Never raises: an absent/garbled ``notAfter`` returns ``None`` (the caller then simply does not
+    alert) — a monitoring signal must not be able to fail an authentication path."""
+    raw = peercert.get("notAfter")
+    if not isinstance(raw, str) or not raw:
+        return None
+    try:
+        # OpenSSL's own textual form ("Jun  1 12:00:00 2027 GMT") — parsed by the stdlib, never by hand.
+        epoch = float(ssl.cert_time_to_seconds(raw))
+    except (ValueError, OverflowError, OSError):
+        return None
+    try:
+        not_after_iso = datetime.datetime.fromtimestamp(epoch, tz=datetime.UTC).isoformat()
+    except (ValueError, OverflowError, OSError):
+        return None
+    return (not_after_iso, int((epoch - now) // _SECONDS_PER_DAY))
 
 
 class CertExpiryRunner:
@@ -143,7 +208,7 @@ class CertExpiryRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            try:  # noqa: SIM105
                 await task
             except asyncio.CancelledError:
                 pass
@@ -160,9 +225,9 @@ class CertExpiryRunner:
 
     async def _sleep(self, delay: float) -> None:
         """Sleep up to ``delay``, waking immediately on stop (so shutdown isn't held by the interval)."""
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     # --- one pass ------------------------------------------------------------
@@ -194,11 +259,12 @@ class CertExpiryRunner:
         return checks
 
     def _inspect(self, cert: MonitoredCert, now: float) -> CertCheck | None:
+        # The load / notAfter / days-remaining path lives once in pki.read_cert_facts; this monitor
+        # only needs notAfter + days_remaining from the returned public facts.
         try:
             with open(cert.path, "rb") as fh:
                 pem = fh.read()
-            certificate = x509.load_pem_x509_certificate(pem)
-            not_after = certificate.not_valid_after_utc  # tz-aware UTC (cryptography >= 42)
+            facts = read_cert_facts(pem, now=now)
         except FileNotFoundError:
             log.warning("cert_expiry: certificate for %r not found: %s", cert.label, cert.path)
             return None
@@ -210,10 +276,9 @@ class CertExpiryRunner:
                 exc_info=True,
             )
             return None
-        days_remaining = int((not_after.timestamp() - now) // _SECONDS_PER_DAY)
         return CertCheck(
             label=cert.label,
             path=cert.path,
-            not_after_iso=not_after.isoformat(),
-            days_remaining=days_remaining,
+            not_after_iso=facts.not_after_iso,
+            days_remaining=facts.days_remaining,
         )

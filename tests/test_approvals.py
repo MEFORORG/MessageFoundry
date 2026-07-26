@@ -9,7 +9,6 @@ The replay endpoint stands in for a gated high-value action (it needs no configu
 from __future__ import annotations
 
 import asyncio
-
 from collections.abc import AsyncIterator
 from pathlib import Path
 

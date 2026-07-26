@@ -10,6 +10,7 @@ from itertools import product
 
 import pytest
 
+from messagefoundry.config import tls_policy
 from messagefoundry.config.tls_policy import (
     APPROVED_KEX_GROUPS,
     TLS_REVOCATION_ATTESTED_ENV,
@@ -20,6 +21,7 @@ from messagefoundry.config.tls_policy import (
     active_hop_posture,
     current_hop_posture,
     enforce_insecure_hop,
+    fips_attestation,
     harden_kex_groups,
     harden_verify_flags,
     in_process_tls_revocation_refused,
@@ -46,6 +48,39 @@ from messagefoundry.config.tls_policy import (
 )
 def test_is_forward_secret(cipher: dict[str, object], expected: bool) -> None:
     assert _is_forward_secret(cipher) is expected
+
+
+# --- fips_attestation: report-only FIPS-provider read-out (#73, ADR 0120) ----------------------
+
+
+def test_fips_attestation_shape_and_never_raises() -> None:
+    # AC-1: returns (bool|None, str); on this OpenSSL build the primitive is present → a real bool. The
+    # version string is always ssl.OPENSSL_VERSION. It must never raise.
+    fips_mode, openssl_version = fips_attestation()
+    assert fips_mode in (True, False)  # get_fips_mode present on a stdlib OpenSSL CPython
+    assert isinstance(openssl_version, str) and openssl_version
+    assert openssl_version == ssl.OPENSSL_VERSION
+
+
+def test_fips_attestation_undeterminable_without_primitive(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AC-1: on an alternative / non-OpenSSL build with no _hashlib.get_fips_mode, the getattr guard
+    # yields None ("undeterminable") rather than raising. Simulate the missing primitive.
+    fake = types.SimpleNamespace()  # no get_fips_mode attribute
+    monkeypatch.setattr(tls_policy, "_hashlib", fake)
+    fips_mode, openssl_version = fips_attestation()
+    assert fips_mode is None
+    assert openssl_version == ssl.OPENSSL_VERSION
+
+
+@pytest.mark.parametrize("raw,expected", [(0, False), (1, True), (2, True)])
+def test_fips_attestation_maps_int_flag_to_bool(
+    monkeypatch: pytest.MonkeyPatch, raw: int, expected: bool
+) -> None:
+    # AC-1: the OpenSSL int flag (get_fips_mode returns int) is mapped to a plain bool.
+    fake = types.SimpleNamespace(get_fips_mode=lambda: raw)
+    monkeypatch.setattr(tls_policy, "_hashlib", fake)
+    fips_mode, _ = fips_attestation()
+    assert fips_mode is expected
 
 
 # --- validate_tls_ciphers ----------------------------------------------------------------------
@@ -199,17 +234,13 @@ def test_insecure_hop_disposition_full_precedence_table() -> None:
     ):
         got = insecure_hop_disposition(
             is_phi=is_phi,
-            production=production,
+            enforcing=production,
             is_loopback_hop=is_loopback_hop,
             hop_attested=hop_attested,
             audited_opt_out=audited_opt_out,
         )
         # Explicit early-return precedence: loopback -> attested -> synthetic -> opt-out -> prod -> else.
-        if is_loopback_hop:
-            expected = HopDisposition.ALLOW
-        elif hop_attested:
-            expected = HopDisposition.ALLOW
-        elif not is_phi:
+        if is_loopback_hop or hop_attested or not is_phi:
             expected = HopDisposition.ALLOW
         elif audited_opt_out:
             expected = HopDisposition.WARN
@@ -222,7 +253,7 @@ def test_insecure_hop_disposition_full_precedence_table() -> None:
 
 def test_insecure_hop_prod_phi_refuses_and_escape_cannot_relax() -> None:
     """The headline case: a prod-PHI hop refuses, and the (clamped-to-False on prod) escape cannot help."""
-    base = dict(is_phi=True, production=True, is_loopback_hop=False, hop_attested=False)
+    base = dict(is_phi=True, enforcing=True, is_loopback_hop=False, hop_attested=False)  # noqa: C408
     # The escape (audited_opt_out) is clamped to False on prod upstream (settings.hop_insecure_escape_
     # downgrades), so the realistic prod input is False here → REFUSE.
     assert insecure_hop_disposition(**base, audited_opt_out=False) is HopDisposition.REFUSE
@@ -230,7 +261,7 @@ def test_insecure_hop_prod_phi_refuses_and_escape_cannot_relax() -> None:
     assert (
         insecure_hop_disposition(
             is_phi=True,
-            production=True,
+            enforcing=True,
             is_loopback_hop=False,
             hop_attested=True,
             audited_opt_out=False,
@@ -245,7 +276,7 @@ def test_insecure_hop_staging_phi_still_refuses_only_when_prod() -> None:
     assert (
         insecure_hop_disposition(
             is_phi=True,
-            production=False,
+            enforcing=False,
             is_loopback_hop=False,
             hop_attested=False,
             audited_opt_out=False,
@@ -256,7 +287,7 @@ def test_insecure_hop_staging_phi_still_refuses_only_when_prod() -> None:
     assert (
         insecure_hop_disposition(
             is_phi=True,
-            production=False,
+            enforcing=False,
             is_loopback_hop=False,
             hop_attested=False,
             audited_opt_out=True,
@@ -294,21 +325,21 @@ def test_enforce_insecure_hop_allow_is_noop() -> None:
 
 
 def test_hop_posture_fail_closed_defaults_unknown_to_strict() -> None:
-    assert HopPosture.fail_closed(is_phi=None, production=None) == HopPosture(
-        is_phi=True, production=True
+    assert HopPosture.fail_closed(is_phi=None, enforcing=None) == HopPosture(
+        is_phi=True, enforcing=True
     )
     # A fully-declared posture passes through unchanged (not strictest-by-default).
-    assert HopPosture.fail_closed(is_phi=False, production=False) == HopPosture(
-        is_phi=False, production=False
+    assert HopPosture.fail_closed(is_phi=False, enforcing=False) == HopPosture(
+        is_phi=False, enforcing=False
     )
-    assert HopPosture.fail_closed(is_phi=True, production=None) == HopPosture(
-        is_phi=True, production=True
+    assert HopPosture.fail_closed(is_phi=True, enforcing=None) == HopPosture(
+        is_phi=True, enforcing=True
     )
 
 
 def test_active_hop_posture_stamps_and_restores() -> None:
     assert current_hop_posture() is None
-    posture = HopPosture(is_phi=True, production=True)
+    posture = HopPosture(is_phi=True, enforcing=True)
     with active_hop_posture(posture):
         assert current_hop_posture() is posture
         # nesting restores the outer value on exit

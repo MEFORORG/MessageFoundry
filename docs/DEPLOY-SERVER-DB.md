@@ -48,7 +48,7 @@ Configure `[store]` in the service settings (full reference: [`CONFIGURATION.md`
 The turnkey Windows/AD posture: the engine service runs under a **group Managed Service Account (gMSA)**
 and authenticates to SQL Server with **that Windows identity** (no SQL password anywhere) — set
 `[store].auth = "integrated"`, which connects with `Trusted_Connection=yes`. This is also what
-`[security].require_managed_identity = true` demands (it refuses a static `auth = "sql"` login on
+`[store].require_managed_identity = true` demands (it refuses a static `auth = "sql"` login on
 production PHI). End to end:
 
 **1. Provision the gMSA + let the engine host retrieve its password** (domain admin, once):
@@ -95,8 +95,6 @@ database = "MessageFoundry"
 auth = "integrated"                # Trusted_Connection=yes — the gMSA's identity authenticates
 encrypt = true                     # default; TLS to the DB
 trust_server_certificate = false   # default; verify the DB cert (import its CA into LocalMachine\Root, §5.2)
-
-[security]
 require_managed_identity = true    # refuse a static SQL login on production PHI (ASVS 13.2.1)
 ```
 

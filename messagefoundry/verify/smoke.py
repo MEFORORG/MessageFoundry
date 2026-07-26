@@ -30,8 +30,16 @@ def synthetic_message() -> str:
     return _core.generate_message("ADT", "A01", 0)
 
 
-def smoke_self(config_dir: str, *, inbound: str | None = None) -> CheckResult:
-    """Route a synthetic message through the box's config with no side effects (``dry_run``)."""
+def smoke_self(
+    config_dir: str, *, inbound: str | None = None, snapshot_on_send: bool = False
+) -> CheckResult:
+    """Route a synthetic message through the box's config with no side effects (``dry_run``).
+
+    ``snapshot_on_send`` (ADR 0104) selects the copy-on-Send posture the preview reproduces, matching
+    the live engine's ``[pipeline].snapshot_on_send``. It keeps the library default ``False`` here so a
+    caller that resolves no service settings previews the pre-ADR-0104 behaviour; the verify runner
+    passes the resolved setting (``True`` on a default engine) so the smoke mirrors what actually ships
+    — see :func:`messagefoundry.verify.runner.run_verify`."""
     from pathlib import Path
 
     if not Path(config_dir).is_dir():
@@ -63,7 +71,7 @@ def smoke_self(config_dir: str, *, inbound: str | None = None) -> CheckResult:
             f"could not generate a synthetic message: {exc}",
         )
     try:
-        result = dry_run(reg, msg, inbound=inbound)
+        result = dry_run(reg, msg, inbound=inbound, snapshot_on_send=snapshot_on_send)
     except ValueError as exc:  # ambiguous/unknown inbound
         return CheckResult("smoke.self", "Self smoke (dry-run routing)", Status.SKIP, str(exc))
     except Exception as exc:
@@ -92,7 +100,7 @@ def _recv_mllp(sock: socket.socket, timeout: float) -> bytes:
             if not chunk:
                 break
             buf.extend(chunk)
-    except socket.timeout:
+    except TimeoutError:
         pass
     return bytes(buf)
 

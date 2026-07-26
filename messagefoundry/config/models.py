@@ -25,7 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 from messagefoundry.config.tls_policy import TrustAnchorPolicy
 
 
-class ConnectorType(str, Enum):
+class ConnectorType(str, Enum):  # noqa: UP042
     """Built-in transport connectors. Plugins may register additional values."""
 
     MLLP = "mllp"
@@ -61,7 +61,7 @@ class ConnectorType(str, Enum):
     # An inbound DICOMweb (STOW-RS) receiver is destination-only here — it awaits the HTTP listener (ADR 0023).
 
 
-class ContentType(str, Enum):
+class ContentType(str, Enum):  # noqa: UP042
     """The payload format of an inbound connection (ADR 0004 — payload-agnostic ingress).
 
     ``HL7V2`` (the default, so every existing config is unchanged) gets the full HL7 peek / optional
@@ -95,7 +95,7 @@ class ContentType(str, Enum):
 _BINARY_CONTENT_TYPES: frozenset[ContentType] = frozenset({ContentType.BINARY, ContentType.DICOM})
 
 
-class AckMode(str, Enum):
+class AckMode(str, Enum):  # noqa: UP042
     """HL7 acknowledgement mode for MLLP/TCP sources."""
 
     ORIGINAL = "original"  # MSA generated from the inbound message
@@ -103,7 +103,7 @@ class AckMode(str, Enum):
     NONE = "none"
 
 
-class AckAfter(str, Enum):
+class AckAfter(str, Enum):  # noqa: UP042
     """**When** an inbound connection sends its ACK, in the staged pipeline (ADR 0001).
 
     ``INGEST`` (default): ACK-on-receipt — the ACK is sent as soon as the raw message is durably
@@ -118,7 +118,7 @@ class AckAfter(str, Enum):
     DELIVERED = "delivered"
 
 
-class OrderingMode(str, Enum):
+class OrderingMode(str, Enum):  # noqa: UP042
     """How an outbound connection's queue is drained.
 
     ``FIFO`` (default): strict in-order per outbound connection — the worker delivers the oldest
@@ -133,7 +133,7 @@ class OrderingMode(str, Enum):
     UNORDERED = "unordered"
 
 
-class Priority(str, Enum):
+class Priority(str, Enum):  # noqa: UP042
     """Per-connection DR / priority tier (ADR 0048, #61). Governs **when a connection runs** (whether
     its listener binds / its connector builds in a given run of the engine under a DR run-profile),
     **never what it does** — routing/filtering stays code-first in Handlers. Layered as the same
@@ -158,7 +158,7 @@ class Priority(str, Enum):
         return {"critical": 2, "normal": 1, "low": 0}[self.value]
 
 
-class InternalErrorPolicy(str, Enum):
+class InternalErrorPolicy(str, Enum):  # noqa: UP042
     """What an outbound delivery worker does when an **internal/code error** (a non-``DeliveryError``
     exception escaping a connector's ``send`` — our bug, not the partner's) hits a message.
 
@@ -402,7 +402,7 @@ class BatchConfig(BaseModel):
     max_wait_ms: int = Field(ge=1)  # head age-out (ms) that flushes a short batch
 
 
-class SignatureAlgorithm(str, Enum):
+class SignatureAlgorithm(str, Enum):  # noqa: UP042
     """JWS algorithm for opt-in per-connection outbound message signing (ASVS 4.1.5, ADR 0018) and for
     the SMART Backend Services ``client_assertion`` JWT (ADR 0024).
 
@@ -473,6 +473,63 @@ class OutboundSigning(BaseModel):
         return cls.model_validate(data)
 
 
+class WindowsCredential(BaseModel):
+    """A per-endpoint **alternate Windows / network-share credential** for a File (UNC/SMB) endpoint
+    (ADR 0132, BACKLOG #111).
+
+    A File connection may authenticate to a local/UNC share under a Windows identity **distinct from
+    the engine service account** — the Corepoint-parity gap for a site that isolates share access
+    per-feed rather than granting the service account blanket access. The credential is established via
+    ``LogonUser`` + per-thread impersonation (win32 ctypes, no pywin32, no privilege — see
+    :mod:`messagefoundry.transports.wincred`); it is **win32-only** (a non-Windows host raises a clear
+    error at construction, never a silent no-op).
+
+    ``username`` may be ``user`` (with a separate ``domain``), ``DOMAIN\\user``, or a ``user@domain``
+    UPN (leave ``domain`` unset for the last two). The ``password`` is a **secret**: supply it via
+    :func:`~messagefoundry.config.wiring.env` only — never inline in source/config (enforced by the
+    ``File(...)`` factory) — and it is never logged. Assembled from the flat ``credential_*`` connector
+    settings via :meth:`from_settings`, mirroring :meth:`OutboundSigning.from_settings`."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    username: str
+    domain: str | None = None
+    password: str  # secret — supply via env() only (never inline); never logged
+
+    @field_validator("username", "password")
+    @classmethod
+    def _non_empty(cls, value: str, info: Any) -> str:
+        if not value or not value.strip():
+            raise ValueError(f"file credential {info.field_name} must be non-empty")
+        return value
+
+    @classmethod
+    def from_settings(cls, settings: Mapping[str, Any]) -> WindowsCredential | None:
+        """Build from flat ``credential_*`` connector settings, or ``None`` when no alternate credential
+        is configured (so every existing File connection is byte-identical).
+
+        The credential is OFF (``None``) unless ``credential_username`` is present. Recognized keys:
+        ``credential_username``, ``credential_domain`` (optional), ``credential_password`` (required
+        alongside a username — its absence is a config error, since a share credential needs a
+        password). The flat keys keep each value a top-level setting that ``env()`` resolution and
+        ``connections.toml`` decoding already handle (a nested table would not resolve ``env()``)."""
+        username = settings.get("credential_username")
+        if not username:
+            return None
+        if not settings.get("credential_password"):
+            raise ValueError(
+                "file credential_username is set without credential_password — a Windows/UNC share "
+                "credential needs a password (supply it via env())"
+            )
+        data: dict[str, Any] = {
+            "username": username,
+            "password": settings["credential_password"],
+        }
+        if settings.get("credential_domain"):
+            data["domain"] = settings["credential_domain"]
+        return cls.model_validate(data)
+
+
 class Destination(BaseModel):
     """An outbound connector endpoint. Each outbound connection queues independently
     so a slow/failed one never blocks the others."""
@@ -518,6 +575,12 @@ class Destination(BaseModel):
     # policy only supplies the org internal CA to an internal hop that named none. NEVER disables
     # verification, so it composes with the connectors' fail-closed no-CA/verify-off/cleartext refusals.
     trust_anchor_policy: TrustAnchorPolicy = Field(default_factory=TrustAnchorPolicy)
+    # #136 (ADR 0065 amendment): cosmetic per-message "Waiting for Reply" display delay (seconds). The
+    # MLLP connector stamps a side-band waiting marker around its ACK read; the connection is shown
+    # "waiting for reply" only once this many seconds have elapsed since the send. DISPLAY ONLY — no
+    # runtime/delivery effect, and explicitly independent of `timeout_seconds`/pacing. Default 0.0 =
+    # show immediately (byte-identical delivery). Threaded from OutboundConnection by _dest_config.
+    waiting_display_delay: float = 0.0
 
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Destination:

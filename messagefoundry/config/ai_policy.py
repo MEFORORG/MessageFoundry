@@ -6,9 +6,10 @@ A central operator governs how much AI coding assistance is permitted across a s
 **OFF** to **PHI-safe**, expressed as two independent axes bounded by a posture ceiling:
 
 * **mode** (:class:`AiMode`) — *whether and how* assistance runs: ``off`` (none), ``byo``
-  (the user's own provider; this extension version's only working path), or the engine-brokered
-  ``managed_claude`` / ``managed_claude_baa`` (P1/P2 — not built here, but a policy may already
-  declare them so the IDE refuses rather than silently downgrading).
+  (the user's own provider), the engine-brokered ``managed_endpoint`` (a customer-managed /
+  self-hosted LLM, ADR 0135 — the built engine-broker path), or ``managed_claude`` /
+  ``managed_claude_baa`` (P1/P2 — not built here, but a policy may already declare them so the IDE
+  refuses rather than silently downgrading). Only ``managed_claude_baa`` ever unlocks ``phi``.
 * **data_scope** (:class:`AiDataScope`) — *how sensitive* the context attached to a request may be,
   ordered least→most sensitive: ``code_only`` < ``synthetic`` < ``deidentified`` < ``phi``.
 
@@ -37,16 +38,23 @@ from dataclasses import dataclass
 from enum import Enum
 
 
-class AiMode(str, Enum):
+class AiMode(str, Enum):  # noqa: UP042
     """Whether and how AI assistance runs. The value is the wire/storage string."""
 
     OFF = "off"  # no assistance at all
-    BYO = "byo"  # bring-your-own provider (the only working path in this MVP)
+    BYO = "byo"  # bring-your-own provider (the working default in this MVP)
     MANAGED_CLAUDE = "managed_claude"  # engine-brokered Claude (P1; not built here)
     MANAGED_CLAUDE_BAA = "managed_claude_baa"  # brokered Claude under a BAA (P2; unlocks phi scope)
+    # ADR 0135 (#95): engine-brokered egress to a CUSTOMER-MANAGED / self-hosted LLM endpoint. This is
+    # the mode POST /ai/chat serves. It is DELIBERATELY kept OUT of resolve_effective_policy's phi-granting
+    # branch below (only managed_claude_baa reaches phi) — a self-hosted/on-prem endpoint being on the
+    # customer's own network never by itself unlocks PHI. The MVP boundary is code_only regardless.
+    MANAGED_ENDPOINT = (
+        "managed_endpoint"  # engine-brokered customer-managed LLM (code_only; ADR 0135)
+    )
 
 
-class AiDataScope(str, Enum):
+class AiDataScope(str, Enum):  # noqa: UP042
     """How sensitive the context attached to an AI request may be. The value is the wire string."""
 
     CODE_ONLY = "code_only"  # graph names + editor code only (PHI-safe by construction)
@@ -55,7 +63,7 @@ class AiDataScope(str, Enum):
     PHI = "phi"  # real message bodies (only over a BAA + zero-retention provider)
 
 
-class DataClass(str, Enum):
+class DataClass(str, Enum):  # noqa: UP042
     """Whether an instance handles real PHI, **independent of its (free-form) environment name**.
 
     Drives the at-rest-encryption + open-egress startup advisories (a synthetic instance stays quiet;
@@ -65,6 +73,25 @@ class DataClass(str, Enum):
 
     SYNTHETIC = "synthetic"  # synthetic/sample data only — relaxed at-rest/egress posture
     PHI = "phi"  # carries real PHI — encryption + egress advisories apply
+
+
+class SecurityEnforcement(str, Enum):  # noqa: UP042
+    """How the serve-gate REFUSE/WARN dial + the ADR 0092 escape-clamp behave, **decoupled** from the
+    instance's production *tier* fact (ADR 0017 / this refactor).
+
+    * ``enforce`` (the secure default) — the posture GATES **REFUSE** a PHI weakening and the blunt
+      ``MEFOR_ALLOW_INSECURE_TLS`` / ``--allow-insecure-bind`` escapes are **clamped inert**. Byte-
+      identical to the historical ``production=True`` dial position, so a stock prod instance is
+      unchanged and a declared-PHI staging/dev instance now fails closed the same way.
+    * ``warn`` — the gates **WARN + audit + continue** and the escapes are **honored**. Byte-identical
+      to the historical ``production=False`` dial position (the non-production posture).
+
+    The *tier* fact (``[security].production_instance`` / ``[ai].production``) is retained where it
+    reflects a true property (the DEBUG-logging refusal, the AI data-scope ceiling); this enum owns
+    only the security REFUSE/WARN dial. The value is the wire/storage string."""
+
+    ENFORCE = "enforce"
+    WARN = "warn"
 
 
 #: Scope ordering, least→most sensitive. Used to take the *lower* of (requested, ceiling).

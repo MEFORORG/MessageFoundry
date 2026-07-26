@@ -23,13 +23,19 @@ from messagefoundry.api.security import _ws_origin_allowed, ws_token
 from messagefoundry.auth import passwords
 from messagefoundry.auth.ldap import LdapAuthenticator, LdapError
 from messagefoundry.auth.service import AuthService
+from messagefoundry.config.models import ContentType
 from messagefoundry.config.settings import AuthSettings, SqlAuth, StoreBackend, StoreSettings
 from messagefoundry.logging_setup import ControlCharScrubFilter, configure_logging
+from messagefoundry.parsing import sniff
+from messagefoundry.parsing.sniff import (
+    attachment_mime_agrees,
+    b64_head,
+    nontext_upload_reason,
+)
 from messagefoundry.pipeline.alert_sinks import WebhookTransport, _NoRedirectHandler
 from messagefoundry.store.sqlserver import connection_string
 from messagefoundry.store.store import MessageStore
-from messagefoundry.transports.file import _looks_like_hl7
-
+from messagefoundry.transports.file import _content_matches_declared, _looks_like_hl7
 
 # --- WP-4: argon2 parameters pinned -----------------------------------------
 
@@ -200,6 +206,162 @@ def test_looks_like_hl7_rejects_non_hl7() -> None:
     assert not _looks_like_hl7(b"")
     assert not _looks_like_hl7(b"\x00\x01\x02\x03binary")
     assert not _looks_like_hl7(b"PID|1||100")  # PID is not a leading header segment
+
+
+# --- WP245 5.2.2: accept-time magic-byte content check per declared content_type ----------
+
+
+def test_content_matches_declared_hl7v2_and_none() -> None:
+    # HL7V2 and None both use the MSH/FHS/BHS head sniff; None keeps file.py's historical None->hl7v2.
+    assert _content_matches_declared(ContentType.HL7V2, b"MSH|^~\\&|A")
+    assert not _content_matches_declared(ContentType.HL7V2, b"\x00\x01not hl7")
+    assert _content_matches_declared(None, b"MSH|^~\\&|A")  # None -> hl7v2 (file.py semantics)
+    assert not _content_matches_declared(None, b"garbage")
+
+
+def test_content_matches_declared_x12_tolerates_codec_leading_noise() -> None:
+    assert _content_matches_declared(ContentType.X12, b"ISA*00*          *00*")
+    assert _content_matches_declared(ContentType.X12, b"  \xef\xbb\xbfISA*00*")  # ws + UTF-8 BOM
+    assert _content_matches_declared(
+        ContentType.X12, b"\x0b\x0cISA*00*"
+    )  # MLLP/FF noise the codec tolerates
+    assert not _content_matches_declared(ContentType.X12, b"MSH|^~\\&|A")  # HL7 on an x12 inbound
+
+
+# --- 5.2.2 hoist: sniffers moved to parsing.sniff, re-exported from transports.file ----------
+
+
+def test_sniffers_hoisted_to_parsing_sniff_and_reexported() -> None:
+    # The pure magic-byte sniffers now live in parsing.sniff (so the leaf uploads.py can reuse them
+    # without importing a transport); transports.file re-exports the SAME objects for remotefile.py +
+    # existing tests, so an import from either path resolves to one implementation.
+    assert _looks_like_hl7 is sniff._looks_like_hl7
+    assert _content_matches_declared is sniff._content_matches_declared
+
+
+# --- 1.3.4/5.2.2 attachment MIME-vs-magic downgrade -----------------------------------------
+
+
+def test_attachment_mime_agrees_matches_and_contradicts() -> None:
+    # A sniffable family agrees only when its magic bytes lead the document.
+    assert attachment_mime_agrees("image/png", b"\x89PNG\r\n\x1a\n rest")
+    assert not attachment_mime_agrees("image/png", b"%PDF-1.7 not a png")
+    assert attachment_mime_agrees("application/pdf", b"%PDF-1.4 body")
+    assert not attachment_mime_agrees("application/pdf", b"\x89PNG\r\n\x1a\n")
+    assert attachment_mime_agrees("image/jpeg", b"\xff\xd8\xff\xe0")
+    assert attachment_mime_agrees("image/gif", b"GIF89a...")
+    assert attachment_mime_agrees("image/tiff", b"II*\x00")
+    assert attachment_mime_agrees("application/zip", b"PK\x03\x04")
+    # docx et al. are ZIP containers — a docx MIME with ZIP magic agrees; with non-ZIP bytes it does not.
+    assert not attachment_mime_agrees("application/zip", b"not a zip")
+
+
+def test_attachment_mime_agrees_structured_syntax_and_params() -> None:
+    # +xml / +json structured-syntax suffixes and explicit xml/json/svg MIMEs sniff the first non-ws byte.
+    assert attachment_mime_agrees("application/xml", b"  <?xml version='1.0'?>")
+    assert attachment_mime_agrees("image/svg+xml", b"\xef\xbb\xbf<svg/>")  # BOM + <
+    assert not attachment_mime_agrees("application/xml", b"NOT xml")
+    assert attachment_mime_agrees("application/fhir+json", b'{"resourceType":"Patient"}')
+    assert attachment_mime_agrees("application/json", b"[1,2,3]")
+    assert not attachment_mime_agrees("application/json", b"<html>")
+    # A MIME with parameters is normalized to type/subtype before the family lookup.
+    assert not attachment_mime_agrees("image/png; charset=binary", b"%PDF")
+
+
+def test_attachment_mime_agrees_accepts_unsniffable_and_blank() -> None:
+    # No reliable leading signature → accept the declared label unchecked (octet-stream, text, dicom, …).
+    assert attachment_mime_agrees("application/octet-stream", b"\x00\x01\x02")
+    assert attachment_mime_agrees("text/plain", b"\x00 anything")
+    assert attachment_mime_agrees("application/dicom", b"\x00" * 132)
+    assert attachment_mime_agrees("", b"whatever")  # nothing declared to contradict
+    assert attachment_mime_agrees(None, b"whatever")
+
+
+def test_b64_head_decodes_leading_bytes() -> None:
+    import base64 as _b64
+
+    png = b"\x89PNG\r\n\x1a\n" + b"payload" * 100
+    b64 = _b64.b64encode(png).decode("ascii")
+    assert b64_head(b64).startswith(b"\x89PNG\r\n\x1a\n")
+    # Tolerant of embedded whitespace/newlines (as OBX-5.5 base64 may carry).
+    wrapped = "\n".join(b64[i : i + 8] for i in range(0, len(b64), 8))
+    assert b64_head(wrapped).startswith(b"\x89PNG\r\n\x1a\n")
+    # An empty / whitespace-only prefix decodes to b"" (the caller then treats a claimed magic as a
+    # contradiction and downgrades — conservative).
+    assert b64_head("") == b""
+    assert b64_head("   \n\t ") == b""
+
+
+# --- 14.2.8 text-only upload gate (nontext_upload_reason) -----------------------------------
+
+
+def test_nontext_upload_reason_rejects_binary_containers() -> None:
+    # ASVS 14.2.8: metadata-bearing containers are rejected by their leading magic bytes (the reason names
+    # the family; the caller maps a non-None reason to HTTP 415). DOCX rides the ZIP magic (PK\x03\x04).
+    assert nontext_upload_reason(b"%PDF-1.7\n%stuff") is not None  # PDF
+    assert nontext_upload_reason(b"\x89PNG\r\n\x1a\n\x00\x00") is not None  # PNG
+    assert nontext_upload_reason(b"\xff\xd8\xff\xe0\x00\x10JFIF") is not None  # JPEG
+    assert nontext_upload_reason(b"PK\x03\x04\x14\x00\x00\x00word/") is not None  # ZIP / DOCX
+    assert nontext_upload_reason(b"GIF89a\x01\x00") is not None  # GIF
+    assert nontext_upload_reason(b"II*\x00\x08\x00") is not None  # TIFF
+
+
+def test_nontext_upload_reason_rejects_nul_and_control_dense() -> None:
+    # ASVS 14.2.8: a NUL byte or a high density of C0 control bytes (not the allowed terminators) is
+    # rejected even without a magic signature.
+    assert nontext_upload_reason(b"plain start\x00then binary") is not None  # NUL
+    assert nontext_upload_reason(bytes(range(1, 32)) * 40) is not None  # control-dense blob
+
+
+def test_nontext_upload_reason_accepts_text_logs() -> None:
+    # ASVS 14.2.8: the permitted text formats pass (None = admissible). HL7 leans on \r segment
+    # terminators + MLLP frame bytes, all in the allowed control set.
+    assert nontext_upload_reason(b"MSH|^~\\&|A|B|C|D|20260101||ADT^A01|1|P|2.5.1\rPID|1\r") is None
+    assert nontext_upload_reason(b"\x0bMSH|^~\\&|A\rPID|1\r\x1c\r") is None  # MLLP-framed
+    assert nontext_upload_reason(b"a plain diagnostic line\n") is None  # .txt
+    assert nontext_upload_reason(b"<root><child/></root>") is None  # .xml
+    assert nontext_upload_reason(b"\xef\xbb\xbf<root/>") is None  # UTF-8 BOM + xml
+    assert nontext_upload_reason(b"") is None  # empty body has nothing binary to reject
+
+
+def test_content_matches_declared_dicom_requires_part10_preamble() -> None:
+    # TRAP GUARD: a real Part-10 object (128-byte preamble + DICM) passes; a truncated / non-DICOM
+    # body is quarantined. Every DICOM object the engine produces/parses carries the magic.
+    assert _content_matches_declared(ContentType.DICOM, b"\x00" * 128 + b"DICM" + b"rest")
+    assert not _content_matches_declared(ContentType.DICOM, b"DICM" + b"x" * 3)  # len < 132
+    assert not _content_matches_declared(ContentType.DICOM, b"%PDF-1.7 not dicom")
+
+
+def test_content_matches_declared_json_and_xml_handle_bom_and_ws() -> None:
+    assert _content_matches_declared(ContentType.JSON, b'{"a":1}')
+    assert _content_matches_declared(ContentType.JSON, b"  [1,2]")
+    assert _content_matches_declared(ContentType.JSON, b'\xef\xbb\xbf  {"a":1}')  # BOM + ws
+    assert not _content_matches_declared(ContentType.JSON, b"<x/>")
+    assert not _content_matches_declared(ContentType.JSON, b"not json")
+    assert _content_matches_declared(ContentType.XML, b'<?xml version="1.0"?>')
+    assert _content_matches_declared(ContentType.XML, b"\xef\xbb\xbf<root/>")
+    assert not _content_matches_declared(ContentType.XML, b'{"a":1}')
+
+
+def test_content_matches_declared_signatureless_types_accept_unchecked() -> None:
+    # BINARY must stay unchecked by design (opaque bytes, ADR 0028); TEXT is arbitrary. Neither has a
+    # reliable leading signature, so both accept unchecked — the pipeline parser is the real validator.
+    assert _content_matches_declared(ContentType.BINARY, b"\x00\x01\xff arbitrary pdf")
+    assert _content_matches_declared(ContentType.TEXT, b"\x00 anything")
+
+
+def test_content_matches_declared_fhir_uses_json_sniff() -> None:
+    # FHIR is "HL7 FHIR JSON", so it shares the JSON leading-{/[ sniff (tolerating BOM + whitespace):
+    # a JSON-shaped body passes; a PDF / XML / bare-text body on a content_type=fhir inbound is rejected
+    # (quarantined at the call site) — driving ASVS 5.2.2 to full Pass over the prior unchecked accept.
+    assert _content_matches_declared(ContentType.FHIR, b'{"resourceType":"Patient"}')
+    assert _content_matches_declared(ContentType.FHIR, b"  [{}]")  # a bundle-ish array, leading ws
+    assert _content_matches_declared(
+        ContentType.FHIR, b'\xef\xbb\xbf{"resourceType":"Bundle"}'
+    )  # BOM
+    assert not _content_matches_declared(ContentType.FHIR, b"%PDF-1.7 not fhir")
+    assert not _content_matches_declared(ContentType.FHIR, b"<Patient/>")  # XML, not FHIR JSON
+    assert not _content_matches_declared(ContentType.FHIR, b"not-json-shaped")
 
 
 # --- WP-11a: refuse insecure TLS overrides ----------------------------------

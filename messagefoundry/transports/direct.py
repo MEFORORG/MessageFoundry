@@ -46,9 +46,9 @@ from __future__ import annotations
 import asyncio
 import logging
 import smtplib
+from collections.abc import Mapping
 from email.message import EmailMessage
 from pathlib import Path
-from collections.abc import Mapping
 from typing import Any
 
 from cryptography import x509

@@ -17,8 +17,8 @@ import pytest
 from messagefoundry.api import create_app
 from messagefoundry.auth import Permission, Role
 from messagefoundry.auth.permissions import (
-    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
     BUILTIN_ROLE_PERMISSIONS,
+    CUSTOM_ROLE_FORBIDDEN_PERMISSIONS,
     CustomRoleError,
     validate_custom_role_permissions,
 )
@@ -68,7 +68,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

@@ -1,0 +1,27 @@
+# Estate CI smoke (#216) — small N (50) on SQLite, hermetic + fast. Proves the harness SPINS the
+# heterogeneous estate (simple + hub feeds), the EVENT-calibrated driver holds the shape, and the
+# no-loss reconcile passes. per_conn_event_rate is scaled UP from the demo's 0.347 so a 3s hold drives
+# real traffic (~200 ev/s over 50 conns) for CI signal — the SHAPE (72/28 split, fan-out 3) matches the
+# demo; only the magnitude differs. It does NOT stand in for the full 1,500-conn / ~520 ev/s run (that
+# is operator-side on the bench rig). Synthetic + generic.
+
+[estate]
+name = "estate-smoke"
+description = "CI smoke: N=50 (~72% simple / ~28% hub, fan-out 3) on SQLite — spins + shape + no-loss"
+count = 50
+simple_fraction = 0.72
+hub_fanout = 3
+per_conn_event_rate = 4.0    # scaled up from the demo's 0.347 so a short hold has CI signal
+hold_seconds = 3.0
+connect_batch = 25
+connect_batch_pause_s = 0.02
+poll_interval_s = 0.25
+drain_timeout_s = 30.0
+base_port = 2600
+transform = "cheap"
+store_backend = "sqlite"
+corpus_count_per_trigger = 10
+correlator_capacity = 1000000
+
+[estate.slo]
+zero_loss = true

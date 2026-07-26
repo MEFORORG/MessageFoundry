@@ -109,6 +109,15 @@ export function assistantState(p: AiPolicy): { enabled: boolean; message?: strin
         "MessageFoundry AI policy could not be verified (engine unreachable) — assistance is disabled until it can be confirmed.",
     };
   }
+  if (p.mode === "managed_endpoint") {
+    // Engine-brokered path (ADR 0135): the ENGINE brokers the call to the customer-managed / self-hosted
+    // LLM under central per-use audit. Enabled when the caller holds ai:assist (or it is unknown offline);
+    // chat.ts routes this mode to the engine broker instead of the local vscode.lm model.
+    if (p.assistPermitted === false) {
+      return { enabled: false, message: "Your role does not include the ai:assist permission." };
+    }
+    return { enabled: true };
+  }
   if (p.mode === "managed_claude" || p.mode === "managed_claude_baa") {
     return {
       enabled: false,

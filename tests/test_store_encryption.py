@@ -5,6 +5,10 @@
 from __future__ import annotations
 
 import base64
+import inspect
+import json
+import logging
+import re
 import sqlite3
 from pathlib import Path
 
@@ -16,11 +20,13 @@ from messagefoundry.store.crypto import (
     AesGcmCipher,
     CipherError,
     IdentityCipher,
+    StoreKeylessError,
+    cell_aad,
+    decrypt_json_cell,
     generate_key,
     make_cipher,
 )
 from messagefoundry.store.store import MessageStore
-import logging
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
 
@@ -552,6 +558,88 @@ def test_marker_prefix_is_version_agnostic() -> None:
     assert MARKER_PREFIX == "mfenc:"
 
 
+# --- ASVS 11.3.3: cell-bound AAD on the v2 writer (ADR 0019) -----------------
+#
+# The v2 writer folds cell_aad(table, column, *pk) into the AES-GCM tag, so a ciphertext is bound to its
+# (table, column, row) cell: a blob cut-and-pasted into another cell fails the tag (CipherError) instead
+# of decrypting. v1 NEVER carries AAD (frozen, CRYPTO-1); decrypt dispatches AAD by marker version so
+# legacy v1 rows still read (dual-read). Opt-in via [store].aad_bind → write_v2 (off by default).
+
+
+def test_cell_aad_unambiguous_and_backend_agnostic() -> None:
+    # Length-prefixed → no two DISTINCT field tuples collide (the classic ("a","bc") vs ("ab","c") trap).
+    assert cell_aad("a", "bc", "x") != cell_aad("ab", "c", "x")
+    assert cell_aad("messages", "raw", "1") != cell_aad("messages", "error", "1")
+    assert cell_aad("messages", "raw", "1") != cell_aad("messages", "raw", "2")
+    # Same logical cell → identical AAD regardless of PK column type (SQLite int id vs a str id on a
+    # server-DB): str()-encoding makes 5 and "5" the same bound value, so re-encrypt/cross-backend agree.
+    assert cell_aad("attachment_chunk", "ciphertext", 5, 0) == cell_aad(
+        "attachment_chunk", "ciphertext", "5", "0"
+    )
+    # Deterministic + composite-PK aware (order matters, still collision-free).
+    assert cell_aad("state", "value", "ns", "k") == cell_aad("state", "value", "ns", "k")
+    assert cell_aad("state", "value", "ns", "k") != cell_aad("state", "value", "k", "ns")
+
+
+def test_v2_aad_round_trip() -> None:
+    cipher = make_cipher(generate_key(), write_v2=True)
+    aad = cell_aad("messages", "raw", "msg-1")
+    token = cipher.encrypt(ADT, aad=aad)
+    assert token.startswith("mfenc:v2:a256gcm:")
+    assert ADT not in token
+    assert cipher.decrypt(token, aad=aad) == ADT
+
+
+def test_v2_wrong_cell_aad_fails_closed() -> None:
+    # The security property: a v2 blob relocated to a different cell (a different AAD) fails the auth tag.
+    cipher = make_cipher(generate_key(), write_v2=True)
+    token = cipher.encrypt(ADT, aad=cell_aad("messages", "raw", "msg-1"))
+    with pytest.raises(CipherError, match="no configured key decrypts"):
+        cipher.decrypt(token, aad=cell_aad("messages", "raw", "msg-2"))  # different row
+    with pytest.raises(CipherError):
+        cipher.decrypt(token, aad=cell_aad("queue", "payload", "msg-1"))  # different table/column
+
+
+def test_v2_aad_actually_binds_not_ignored() -> None:
+    # Prove the AAD is truly bound: a value written WITH an AAD cannot be read with None (or a mismatch),
+    # so a half-threaded call site (one side passes AAD, the other doesn't) fails closed — never a silent
+    # mis-read of the wrong plaintext.
+    cipher = make_cipher(generate_key(), write_v2=True)
+    token = cipher.encrypt(ADT, aad=cell_aad("messages", "raw", "m1"))
+    with pytest.raises(CipherError):
+        cipher.decrypt(token, aad=None)
+
+
+def test_v2_unbound_is_consistent_and_mismatch_fails() -> None:
+    # A v2 value written with NO aad (unbound) reads back with no aad (dual behaviour), but reading it
+    # WITH an aad still fails — encrypt/decrypt AAD must always agree.
+    cipher = make_cipher(generate_key(), write_v2=True)
+    token = cipher.encrypt(ADT)  # aad defaults to None
+    assert cipher.decrypt(token) == ADT
+    with pytest.raises(CipherError):
+        cipher.decrypt(token, aad=cell_aad("messages", "raw", "m1"))
+
+
+def test_v1_writer_ignores_aad_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    # CRYPTO-1: passing an AAD to the v1 (default) writer changes NOTHING — v1 always binds None, so its
+    # output stays byte-identical whether or not a caller supplies aad, and it reads with aad ignored.
+    fixed_nonce = b"\x00" * 12
+    monkeypatch.setattr("messagefoundry.store.crypto.os.urandom", lambda n: fixed_nonce)
+    cipher = make_cipher(_FROZEN_V1_KEY_B64)  # default writer = v1
+    with_aad = cipher.encrypt(_FROZEN_V1_PLAINTEXT, aad=cell_aad("messages", "raw", "m1"))
+    without = cipher.encrypt(_FROZEN_V1_PLAINTEXT)
+    assert with_aad == without == _v1_blob(_FROZEN_V1_KEY_B64, _FROZEN_V1_PLAINTEXT, fixed_nonce)
+    # v1 dual-read: a legacy v1 row decrypts regardless of any aad the caller threads.
+    assert cipher.decrypt(with_aad, aad=cell_aad("wrong", "cell", "z")) == _FROZEN_V1_PLAINTEXT
+
+
+def test_identity_cipher_ignores_aad() -> None:
+    ident = IdentityCipher()
+    aad = cell_aad("messages", "raw", "m1")
+    assert ident.encrypt("x", aad=aad) == "x"
+    assert ident.decrypt("x", aad=aad) == "x"
+
+
 async def test_store_migration_skips_existing_v2_rows(tmp_path: Path) -> None:
     """A v2 ciphertext already on disk is recognised as encrypted by the version-agnostic find-all
     anchor, so the on-open migration leaves it untouched (it is NOT re-wrapped into v1-of-v2)."""
@@ -559,9 +647,12 @@ async def test_store_migration_skips_existing_v2_rows(tmp_path: Path) -> None:
     key = generate_key()
     store = await MessageStore.open(db, cipher=make_cipher(key))
     try:
-        # Hand-plant a v2 blob into a body column, bypassing the (v1-writing) store cipher.
-        v2_token = make_cipher(key, write_v2=True).encrypt(ADT)
+        # Hand-plant a v2 blob into a body column, bypassing the (v1-writing) store cipher. It must
+        # carry the cell's AAD (messages.raw, mid) so the store's cell-bound read path decrypts it.
         mid = await store.enqueue_message(channel_id="ch", raw="placeholder", deliveries=[])
+        v2_token = make_cipher(key, write_v2=True).encrypt(
+            ADT, aad=cell_aad("messages", "raw", mid)
+        )
         await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, mid))
         await store._db.commit()
     finally:
@@ -589,8 +680,11 @@ async def test_store_reads_mixed_v1_and_v2_rows(tmp_path: Path) -> None:
         other = (
             "MSH|^~\\&|S|F|R|RF|20260101||ADT^A02|MSG2|P|2.5.1\rPID|1||200^^^H^MR||ROE^RICHARD\r"
         )
-        v2_token = make_cipher(key, write_v2=True).encrypt(other)
         m2 = await store.enqueue_message(channel_id="ch", raw="ph", deliveries=[])
+        # The planted v2 blob carries its cell's AAD (messages.raw, m2) so the cell-bound read decrypts it.
+        v2_token = make_cipher(key, write_v2=True).encrypt(
+            other, aad=cell_aad("messages", "raw", m2)
+        )
         await store._db.execute("UPDATE messages SET raw=? WHERE id=?", (v2_token, m2))
         await store._db.commit()
 
@@ -765,9 +859,8 @@ def test_cipher_decrypt_failure_leaks_no_key_material(caplog: pytest.LogCaptureF
         -1
     ]  # the base64(nonce ‖ ciphertext ‖ tag) segment of mfenc:v1:<kid>:<blob>
 
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(CipherError) as excinfo:
-            make_cipher(key_b).decrypt(token)  # no configured key authenticates the GCM tag
+    with caplog.at_level(logging.DEBUG), pytest.raises(CipherError) as excinfo:
+        make_cipher(key_b).decrypt(token)  # no configured key authenticates the GCM tag
 
     for hay in (str(excinfo.value), caplog.text):
         assert body not in hay  # the plaintext body never surfaces on the failure path
@@ -823,3 +916,217 @@ def test_every_secret_buffer_is_actually_zeroized_across_the_full_cipher_path(
     # At least the DEK + the two plaintext buffers were non-empty secrets, and every one ended all-zero.
     assert len(wiped_nonempty) >= 3
     assert all(wiped_nonempty)
+
+
+# --- #241 F1: SQL Server `state` at-rest completeness + 3-backend migration parity -----------------
+
+# Every cipher-covered table that ALL THREE backends share and that the no-key -> key migration
+# (`_encrypt_existing_rows`) must seal. Backends legitimately differ on the fringes (SQLite has
+# shared_body/attachment_chunk; SQL Server has outbox/users.totp_secret nullable columns; Postgres
+# leaves shared_body schema-only), so this is deliberately the SHARED core — the id-keyed PHI bodies
+# plus every composite / IDENTITY-id table that carries PHI at rest. The finding (#241 F1) was that
+# SQL Server's migration silently skipped `state`; this list is the guard so a future cipher-covered
+# shared table added to one backend's migration but missed on another fails loudly here rather than
+# leaving PHI plaintext at rest on that backend only.
+_SHARED_MIGRATED_TABLES = (
+    "messages",  # raw / error / summary / metadata — id-keyed
+    "queue",  # payload / last_error — id-keyed
+    "state",  # ADR 0005 transform state — composite (namespace, key)
+    "reference",  # ADR 0006 / #235 reference snapshots — composite (name, version, key)
+    "response",  # ADR 0013 captured replies — composite (message_id, destination_name, response_seq)
+    "message_events",  # detail — IDENTITY id, natural-column AAD
+    "connection_event",  # reason — IDENTITY id, natural-column AAD
+    "alert_instance",  # reason — IDENTITY id, natural-column AAD
+)
+
+
+def _migration_source(store_cls: type) -> str:
+    """The combined source text of a backend's on-open encrypt migration — ``_encrypt_existing_rows``
+    plus every ``_encrypt*`` helper it delegates to (the generic composite passes, the per-event
+    passes) and the ``_CIPHER_COLUMNS`` id-keyed list. Rotation methods (``_reencrypt*`` / public
+    ``reencrypt_to_active``) are excluded — they are a different path and a table present only in
+    rotation but missing from the migration is exactly the omission this guard must catch."""
+    parts: list[str] = []
+    for name, member in inspect.getmembers(store_cls):
+        if name == "_CIPHER_COLUMNS":
+            parts.append(repr(member))
+        elif name.startswith("_encrypt") and (
+            inspect.isfunction(member) or inspect.iscoroutinefunction(member)
+        ):
+            parts.append(inspect.getsource(member))
+    return "\n".join(parts)
+
+
+def _migration_covers(src: str, table: str) -> bool:
+    """Does a migration's source seal ``table``? — the table appears either as a SQL target
+    (``FROM``/``UPDATE``, bracketed for T-SQL) or as a string-literal argument to a generic composite
+    helper / a ``_CIPHER_COLUMNS`` entry. Anchored so a bare mention in a comment does not count."""
+    patterns = (
+        rf"FROM {table}\b",
+        rf"UPDATE {table}\b",
+        rf"UPDATE \[{table}\]",
+        rf"['\"]{table}['\"]",  # string-literal arg / _CIPHER_COLUMNS entry (repr uses single quotes)
+    )
+    return any(re.search(p, src) for p in patterns)
+
+
+@pytest.mark.parametrize("backend", ["sqlite", "postgres", "sqlserver"])
+def test_migration_covers_every_shared_cipher_table_on_all_backends(backend: str) -> None:
+    """3-backend parity: each backend's `_encrypt_existing_rows` seals every shared cipher-covered
+    table. This is a SOURCE-level guard (no DB needed), so it runs on the plain pytest job and fails
+    loudly the instant a backend's migration omits a shared PHI-at-rest table — the exact class of bug
+    #241 F1 fixed (SQL Server had no `state` pass, leaking legacy state plaintext at rest)."""
+    if backend == "sqlite":
+        from messagefoundry.store.store import MessageStore as store_cls
+    elif backend == "postgres":
+        from messagefoundry.store.postgres import PostgresStore as store_cls
+    else:
+        from messagefoundry.store.sqlserver import SqlServerStore as store_cls
+    src = _migration_source(store_cls)
+    missing = [t for t in _SHARED_MIGRATED_TABLES if not _migration_covers(src, t)]
+    assert not missing, (
+        f"{backend} _encrypt_existing_rows does not migrate {missing} — legacy plaintext in "
+        f"{missing} would stay at rest after a no-key -> key transition (PHI leak, #241 F1)"
+    )
+
+
+def _state_at_rest(db_path: Path) -> str:
+    con = sqlite3.connect(db_path)
+    try:
+        return str(con.execute("SELECT value FROM state").fetchone()[0])
+    finally:
+        con.close()
+
+
+async def test_migration_encrypts_existing_state_value(tmp_path: Path) -> None:
+    """Behavioral proof on SQLite that a legacy plaintext `state` value is sealed by the no-key -> key
+    migration and still decrypts on read (the SQL Server + Postgres CI legs prove the same T-SQL/PL)."""
+    db = tmp_path / "state_mig.db"
+    plain = await MessageStore.open(db)  # create the schema with no key
+    await plain.close()
+    # Seed a legacy plaintext state row directly (as a no-key deployment's IdentityCipher would write).
+    payload = json.dumps({"mrn": "SECRETSTATEMRN"})
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+        ("ns", "k", payload, 0.0, "m1"),
+    )
+    con.commit()
+    con.close()
+    assert _state_at_rest(db) == payload  # plaintext at rest before migration
+
+    store = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # reopen → migrate
+    try:
+        at_rest = _state_at_rest(db)
+        assert at_rest.startswith(PREFIX) and "SECRETSTATEMRN" not in at_rest  # sealed on disk
+        assert store.state_view()[("ns", "k")] == {"mrn": "SECRETSTATEMRN"}  # decrypts on read
+    finally:
+        await store.close()
+
+
+async def test_state_migration_skips_already_encrypted_values(tmp_path: Path) -> None:
+    """The `NOT LIKE 'mfenc:%'` guard makes the state pass idempotent: a value already carrying the
+    ciphertext prefix is left byte-for-byte on a re-run, never re-wrapped into ciphertext-of-ciphertext."""
+    db = tmp_path / "state_idem.db"
+    key = generate_key()
+    plain = await MessageStore.open(db)  # create the schema with no key
+    await plain.close()
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+        ("ns", "k", json.dumps({"v": 1}), 0.0, "m1"),
+    )
+    con.commit()
+    con.close()
+
+    first = await MessageStore.open(db, cipher=make_cipher(key))  # migrate plaintext -> ciphertext
+    await first.close()
+    sealed = _state_at_rest(db)
+    assert sealed.startswith(PREFIX)
+
+    second = await MessageStore.open(db, cipher=make_cipher(key))  # re-run the migration
+    try:
+        assert (
+            _state_at_rest(db) == sealed
+        )  # byte-identical — the already-encrypted value is skipped
+        assert second.state_view()[("ns", "k")] == {"v": 1}
+    finally:
+        await second.close()
+
+
+# --- #241 F2: fail-closed operator-facing error on a keyless open of an encrypted store -----------
+
+
+def test_decrypt_json_cell_round_trips_under_a_key() -> None:
+    cipher = make_cipher(generate_key())
+    aad = cell_aad("state", "value", "ns", "k")
+    stored = cipher.encrypt(json.dumps({"v": 1}), aad=aad)
+    assert decrypt_json_cell(cipher, stored, aad=aad, table="state") == {"v": 1}
+
+
+def test_decrypt_json_cell_keyless_open_raises_operator_error() -> None:
+    """The keyless-open trap: an `mfenc:` value read back with NO key (identity cipher) must raise an
+    operator-facing StoreKeylessError naming the table + remedy, not a raw JSONDecodeError."""
+    aad = cell_aad("reference", "value", "n", "v", "k")
+    stored = make_cipher(generate_key()).encrypt(json.dumps({"v": 1}), aad=aad)
+    with pytest.raises(StoreKeylessError) as ei:
+        decrypt_json_cell(make_cipher(None), stored, aad=aad, table="reference")
+    msg = str(ei.value)
+    assert "reference" in msg and "MEFOR_STORE_ENCRYPTION_KEY" in msg  # names table + remedy
+
+
+def test_decrypt_json_cell_undecryptable_under_a_key_still_raises_cipher_error() -> None:
+    """A KEYED store that cannot decrypt a row (wrong/rotated key) must NOT be masked as keyless nor
+    silently skipped — CipherError propagates (the un-masked SQL Server _load_state_cache behavior)."""
+    aad = cell_aad("state", "value", "ns", "k")
+    stored = make_cipher(generate_key()).encrypt(json.dumps({"v": 1}), aad=aad)
+    with pytest.raises(CipherError):  # a DIFFERENT key — no configured key authenticates the tag
+        decrypt_json_cell(make_cipher(generate_key()), stored, aad=aad, table="state")
+
+
+def test_decrypt_json_cell_legacy_malformed_plaintext_is_not_masked_as_keyless() -> None:
+    """A non-encrypted, genuinely malformed legacy plaintext value is a real data problem — it must
+    surface as JSONDecodeError, NOT be mis-reported as a keyless open (is_encrypted is False)."""
+    with pytest.raises(json.JSONDecodeError):
+        decrypt_json_cell(make_cipher(None), "not json{", aad=None, table="state")
+
+
+async def test_keyless_open_of_encrypted_state_raises_operator_error(tmp_path: Path) -> None:
+    """End-to-end SQLite proof (the SQL Server + Postgres CI legs prove the identical seam on those
+    backends): a keyless open of a store carrying key-encrypted `state` rows fails closed."""
+    db = tmp_path / "keyless_state.db"
+    plain = await MessageStore.open(db)
+    await plain.close()
+    con = sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO state (namespace, key, value, set_at, message_id) VALUES (?,?,?,?,?)",
+        ("ns", "k", json.dumps({"mrn": "SECRETSTATEMRN"}), 0.0, "m1"),
+    )
+    con.commit()
+    con.close()
+    sealed = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # seal state at rest
+    await sealed.close()
+
+    with pytest.raises(StoreKeylessError) as ei:
+        await MessageStore.open(
+            db
+        )  # keyless open of an encrypted store — fail closed, don't crash raw
+    msg = str(ei.value)
+    assert "state" in msg and "MEFOR_STORE_ENCRYPTION_KEY" in msg
+
+
+async def test_keyless_open_of_encrypted_reference_raises_operator_error(tmp_path: Path) -> None:
+    """The reference read seam fails closed the same way — with no encrypted `state` rows present, the
+    open reaches the reference-cache warm-up and raises there."""
+    db = tmp_path / "keyless_ref.db"
+    sealed = await MessageStore.open(db, cipher=make_cipher(generate_key()))
+    try:
+        await sealed.write_reference_snapshot(
+            name="providers", version="v1", rows={"k1": {"mrn": "SECRETREFMRN"}}
+        )
+    finally:
+        await sealed.close()
+
+    with pytest.raises(StoreKeylessError) as ei:
+        await MessageStore.open(db)  # keyless open — the reference load fails closed
+    assert "reference" in str(ei.value)

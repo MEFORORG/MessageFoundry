@@ -266,13 +266,15 @@ durability (the WAN buffer) requires the store volume to **persist** like any at
 
 ## 6. Off-box log forwarding — NOT in this manifest
 
-The built `[logging]` off-box forwarder (`[logging].forward_*` → syslog/SIEM) is **plaintext** today:
-`SyslogProtocol` has UDP/TCP variants but **no TLS** ([`config/settings.py`](../messagefoundry/config/settings.py)).
-Enabling it from an ephemeral cloud pod would put PHI-adjacent log metadata on the wire in cleartext, so it
-is **deliberately omitted** from the HA manifest and is **not** turned on here. **Do not "flip it on" as-is.**
-Before any prod-HA enablement, pair it with a **TLS-forwarding sidecar / TLS collector** (or rely on the
-container runtime's log driver to a TLS-terminating collector). This is an open follow-up, tracked in ADR
-0047's "To resolve" — not a step in this runbook.
+The built `[logging]` off-box forwarder (`[logging].forward_*` → syslog/SIEM) supports **native TLS**
+(`forward_protocol = "tls"`, RFC 5425 — ADR 0080; `SyslogProtocol.TLS` alongside the UDP/TCP variants in
+[`config/settings.py`](../messagefoundry/config/settings.py), with a CA anchor via `forward_tls_*`). The
+**default is UDP**, though, so enabling forwarding from an ephemeral cloud pod *without setting the protocol*
+would put PHI-adjacent log metadata on the wire in cleartext. It is therefore **deliberately omitted** from
+the HA manifest and is **not** turned on here. **Do not "flip it on" without also setting the transport.**
+For any prod-HA enablement, set `forward_protocol = "tls"` with a pinned CA — or, if your collector cannot
+terminate TLS, pair it with a **TLS-forwarding sidecar** (or rely on the container runtime's log driver to a
+TLS-terminating collector).
 
 ---
 

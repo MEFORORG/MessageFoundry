@@ -26,6 +26,62 @@ Python/asyncio service; the console is a separate desktop application.
 > database** (PostgreSQL or SQL Server) on its own host, sized by your DBA, and keep the engine
 > host dedicated. For volume beyond one CPU core, see [Sizing by message volume](#sizing-by-message-volume).
 
+### Hardware memory encryption — required for an ASVS **Level 3** PHI deployment
+
+**Requirement.** A deployment claiming ASVS **Level 3** for PHI **must** run the engine on a host that
+provides **full memory encryption** — **AMD SEV-SNP** (EPYC 7003 "Milan" or later) or **Intel TDX**
+(5th Gen Xeon Scalable or later) — *and* must actually launch the engine's VM as a **confidential
+guest** on that platform. Capable silicon that is not running the guest in confidential mode does not
+satisfy it. This is [ASVS 11.7.1](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md)
+(*full memory encryption … protects sensitive data while it is in use*), and it exists because PHI is
+**plaintext in process memory** for as long as the engine is parsing, routing and transforming it —
+HL7 is `str` end to end, and no application-level control can encrypt the interpreter's heap.
+
+**This is a procurement decision, and we say so plainly.** MessageFoundry cannot provide the property;
+only the host can. On a host that does not provide it:
+
+- the engine **still runs** — nothing here is a functional requirement, and every other PHI control
+  (at-rest encryption, retention, audit, RBAC, transport) is unaffected;
+- ASVS 11.7.1 is capped at **Partial**, not Pass, and that cap is a **hardware fact about your
+  deployment**, not a gap in the software. Disclose it in your own assessment rather than working
+  around it;
+- an **exposed** PHI instance **warns at every start** until the decision is recorded —
+  `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
+  provides it. The engine **starts either way**: this is a host property, not a config error, and one no
+  operator can satisfy on Windows, so refusing by default would break deployments over something they
+  cannot change. An estate that has standardized on confidential-computing hosts can make the missing
+  declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
+  Loopback and synthetic instances are unaffected and silent. See
+  [CONFIGURATION.md](CONFIGURATION.md) `[security]` and
+  [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md).
+
+**What the engine does and does not tell you.** `GET /security/posture` carries a **report-only**
+platform read-out (`memory_encryption_self_reported_capability` / `..._self_reported_active` /
+`..._self_reported_mechanism` / `memory_encryption_readout_source`). On Linux it reads `/proc/cpuinfo`
+flags for *capability* and `/dev/sev-guest` / `/dev/tdx_guest` presence for *activation*; on **Windows
+every field is `null`** (see below). **No value of any of those fields satisfies 11.7.1** — they are
+values the host OS emits about itself, and 11.7.1 exists precisely because that host may be the
+adversary. Only a CPU-signed attestation report verified against the silicon vendor's root PKI would be
+evidence, and **that is not built**. The response states this itself in `memory_encryption_note`, so the
+limitation travels with any copy of the posture body. The engine measures and reports; your deployment
+determines the verdict.
+
+**Availability on today's on-premises platforms (verified 2026-07-22).** For a **Windows** engine host —
+the primary supported platform — this requirement is presently **unmeetable on-premises**, and the
+blocker is the hypervisor, not the CPU:
+
+| Platform | Confidential guest for a **Windows** engine VM |
+|---|---|
+| **Hyper-V on-premises** (Windows Server 2019–2025) | ⛔ None. Windows Server 2025 ships no confidential VM; the vNext Insider "Trusted Launch" (Secure Boot + vTPM) is **not** memory encryption. |
+| **VMware ESXi 9.0** | ⚠️ SEV-SNP is a *Limited Availability* release and its guest requirements are stated in Linux-kernel terms; Windows is not listed as a supported SEV-SNP guest. |
+| **Azure / Azure Local confidential VMs** | ✅ SEV-SNP and TDX with Windows Server guests (a Microsoft paravisor supplies what a Windows guest needs). |
+| **Linux guests on KVM / AWS / GCP / ESXi 9** | ✅ Where the host is SEV-SNP/TDX-capable and the guest is launched confidential. |
+
+So a Windows on-prem deployment is honestly capped at **Partial** today, and a Linux or Azure
+confidential-VM deployment is the route to the hardware property. Plan hardware refresh accordingly —
+SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer than much of a typical
+5–7-year hospital server refresh cycle.
+
 ## Operating systems
 
 | Platform | Status |

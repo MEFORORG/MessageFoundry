@@ -12,8 +12,11 @@ from pathlib import Path
 import pytest
 
 from messagefoundry.anon import anonymize as engine_anonymize
-from messagefoundry.generators import _core, _hl7data
-from messagefoundry.generators import all_types  # noqa: F401  (registers message types)
+from messagefoundry.generators import (
+    _core,
+    _hl7data,
+    all_types,  # noqa: F401  (registers message types)
+)
 from tee.anon import anonymize as tee_anonymize
 from tee.anon import leak as tee_leak
 

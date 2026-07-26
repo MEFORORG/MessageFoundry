@@ -58,12 +58,12 @@ jobs:
       id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
       attestations: write   # write the SLSA build-provenance attestation (actions/attest-build-provenance)
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false  # release uses GH_TOKEN env / OIDC, never the persisted git credential
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
@@ -136,17 +136,60 @@ jobs:
           cp dist/*.whl dist/*.tar.gz dist-pub/
           ls -l dist-pub/
 
-      - name: Generate CycloneDX SBOM (from the hash-locked runtime deps)
+      - name: Generate the shipped CycloneDX SBOM (license-complete, hash-locked core runtime)
         run: |
-          python -m pip install cyclonedx-bom
-          python -m cyclonedx_py requirements requirements.lock --of JSON -o messagefoundry-sbom.cdx.json
-          python -c "import json; d=json.load(open('messagefoundry-sbom.cdx.json')); print('SBOM', d['bomFormat'], d['specVersion'], '-', len(d.get('components',[])), 'components')"
+          # Build the SBOM from the ACTUAL installed core runtime (docker/locks/requirements-core.lock,
+          # hash-locked) via `cyclonedx-py environment`, NOT `requirements <lockfile>`: environment mode
+          # reads each installed dist's METADATA, so component LICENSES are populated (a draft-2025 CISA
+          # minimum element) — the requirements parser has no metadata and emits license-less components.
+          # The core lock is the honest closure a `pip install messagefoundry` pulls (the all-extras
+          # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
+          # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
+          python -m pip install --upgrade "cyclonedx-bom~=7.3"
+          python -m venv /tmp/sbomenv
+          /tmp/sbomenv/bin/pip install --upgrade pip
+          /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
+          python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
+            --pyproject pyproject.toml --mc-type application \
+            --of JSON -o messagefoundry-sbom.cdx.json
+          # Declare the SBOM's lifecycle (CISA "Build" type / draft-2025 "Generation Context") and backfill
+          # the root component's version (hatchling-dynamic, so --pyproject leaves it null). Exits non-zero
+          # on a structurally broken BOM, failing the release before it ships one.
+          python scripts/security/sbom_finalize.py messagefoundry-sbom.cdx.json \
+            --phase build --set-version-from messagefoundry/__init__.py
+
+      - name: Stage the VEX companion (from the maintained source of truth)
+        run: |
+          # Ship the maintained OpenVEX alongside the SBOM so a hospital operator's scanner can suppress
+          # vulnerabilities we've assessed as not-affected/fixed instead of chasing unreachable CVEs
+          # (CISA VEX; NTIA Consumer Playbook). Source of truth: security/vex/messagefoundry.openvex.json.
+          cp security/vex/messagefoundry.openvex.json messagefoundry-vex.openvex.json
+
+      - name: Score the SBOM quality (sbomqs — advisory, never blocks a release)
+        continue-on-error: true
+        run: |
+          # Machine-score the SBOM (0-10) and print the NTIA-minimum-elements breakdown, so a regression in
+          # SBOM completeness is visible in the release log. Advisory — SBOM quality is a signal, not a gate.
+          # Pinned + checksum-verified against the release's own goreleaser checksums.txt. ADR 0149.
+          VER=2.0.11
+          asset="sbomqs_${VER}_Linux_x86_64.tar.gz"
+          base="https://github.com/interlynk-io/sbomqs/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "${asset}"
+          curl -sSfL "${base}/checksums.txt" -o sbomqs-checksums.txt
+          grep " ${asset}$" sbomqs-checksums.txt | sha256sum -c -
+          tar -xzf "${asset}" sbomqs
+          sudo install -m 0755 sbomqs /usr/local/bin/sbomqs
+          sbomqs score -b messagefoundry-sbom.cdx.json
+          sbomqs compliance --ntia messagefoundry-sbom.cdx.json || true
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
           python -m pip install sigstore
-          python -m sigstore sign dist/*.tar.gz dist/*.whl
-          ls -l dist/
+          # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
+          # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
+          python -m sigstore sign dist/*.tar.gz dist/*.whl \
+            messagefoundry-sbom.cdx.json messagefoundry-vex.openvex.json
+          ls -l dist/ messagefoundry-sbom.cdx.json.sigstore* messagefoundry-vex.openvex.json.sigstore*
 
       # SLSA build provenance (Beyond-ASVS-L3 WP-BL3-01): a signed in-toto provenance attestation
       # (predicateType slsaprovenance v1) binding each artifact's sha256 -> this source commit + the
@@ -166,7 +209,7 @@ jobs:
         if: ${{ !github.event.repository.private }}
         uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
         with:
-          subject-path: "dist/*.tar.gz, dist/*.whl"
+          subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
@@ -181,7 +224,9 @@ jobs:
           pre=""
           case "$ver" in *-*) pre="--prerelease";; esac
           gh release create "$tag" \
-            dist/*.tar.gz dist/*.whl dist/*.sigstore* messagefoundry-sbom.cdx.json \
+            dist/*.tar.gz dist/*.whl dist/*.sigstore* \
+            messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore* \
+            messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* \
             --title "$tag" --notes-file notes.md $pre
 
       - name: Upload artifacts (dry-run / always)
@@ -192,6 +237,9 @@ jobs:
           path: |
             dist/
             messagefoundry-sbom.cdx.json
+            messagefoundry-sbom.cdx.json.sigstore*
+            messagefoundry-vex.openvex.json
+            messagefoundry-vex.openvex.json.sigstore*
           if-no-files-found: ignore
 
       # LAST step on purpose: PyPI is the one IRREVERSIBLE sink (uploads can't be replaced), so it runs
@@ -205,7 +253,7 @@ jobs:
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           packages-dir: dist-pub/
           skip-existing: true
@@ -231,12 +279,12 @@ jobs:
       contents: write   # gh release upload (attach the harness wheel)
       id-token: write   # PyPI Trusted Publishing (OIDC) for the harness wheel
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false  # gh upload uses GH_TOKEN env / OIDC, never the persisted git credential
 
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
 
@@ -276,7 +324,7 @@ jobs:
       # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           packages-dir: harness-dist/
           skip-existing: true

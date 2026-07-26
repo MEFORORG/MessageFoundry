@@ -15,6 +15,43 @@ export class HttpError extends Error {
   }
 }
 
+/** Our own code for a request the engine accepted but never answered (see {@link GET_TIMEOUT_MS}).
+ *  Distinct from Node's `ETIMEDOUT` (the TCP connect itself timing out) — "hung" and "unroutable" are
+ *  different faults with different fixes, and the status bar names them differently. */
+export const TIMEOUT_CODE = "MF_TIMEOUT";
+
+/**
+ * A transport-layer failure: no HTTP response at all. `code` carries Node's `ErrnoException.code`
+ * (`ECONNREFUSED` / `ENOTFOUND` / `ECONNRESET` / `EPROTO` / `ETIMEDOUT` / a TLS `ERR_TLS_*`), or
+ * {@link TIMEOUT_CODE} when our own read timeout fired.
+ *
+ * It exists so a caller can tell "nothing is listening" from "the name doesn't resolve" from "the
+ * engine is hung" from "you spoke http to an https port" — every one of which used to arrive as the
+ * same bare Error and rendered as one undifferentiated "unreachable". The message text is unchanged
+ * from what the plain Error carried, so existing callers that only show `e.message` are unaffected.
+ */
+export class NetworkError extends Error {
+  constructor(
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+    this.name = "NetworkError";
+  }
+}
+
+/** Fold a Node request error into a {@link NetworkError}, preserving its errno. Shared by GET/POST so
+ *  the two paths cannot drift (they had duplicate, subtly different branches before). */
+function networkError(err: NodeJS.ErrnoException, baseUrl: string): NetworkError {
+  if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
+    return new NetworkError(
+      `engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`,
+      err.code,
+    );
+  }
+  return new NetworkError(`engine request failed: ${err.message}`, err.code);
+}
+
 /**
  * POST `body` as JSON to `<baseUrl><path>` and parse the JSON response.
  *
@@ -65,13 +102,7 @@ export function postJson<T>(
         reject(new HttpError(status, httpErrorMessage(status, text)));
       });
     });
-    req.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
-        reject(new Error(`engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`));
-      } else {
-        reject(new Error(`engine request failed: ${err.message}`));
-      }
-    });
+    req.on("error", (err: NodeJS.ErrnoException) => reject(networkError(err, baseUrl)));
     req.write(payload);
     req.end();
   });
@@ -126,19 +157,23 @@ export function getJson<T>(
         reject(new HttpError(status, httpErrorMessage(status, text)));
       });
     });
-    // Fail an unanswered request (hung engine) after the cap: destroy it → the 'error' handler below
-    // fires with our timeout Error (no ErrnoException.code), rejecting as a transport failure.
-    req.setTimeout(timeoutMs, () => req.destroy(new Error(`engine request timed out after ${timeoutMs}ms`)));
-    req.on("error", (err: NodeJS.ErrnoException) => {
-      if (err.code === "ECONNREFUSED" || err.code === "ECONNRESET" || err.code === "ENOTFOUND") {
-        reject(new Error(`engine not reachable at ${baseUrl} — start it (Console or \`messagefoundry serve\`).`));
-      } else {
-        reject(new Error(`engine request failed: ${err.message}`));
-      }
-    });
+    // Fail an unanswered request (hung engine) after the cap: destroy it with a NetworkError carrying
+    // TIMEOUT_CODE → the 'error' handler below passes it straight through, so "hung" stays
+    // distinguishable from "refused" instead of collapsing into the same unreachable bucket.
+    req.setTimeout(timeoutMs, () =>
+      req.destroy(new NetworkError(`engine request timed out after ${timeoutMs}ms`, TIMEOUT_CODE)),
+    );
+    req.on("error", (err: NodeJS.ErrnoException) =>
+      reject(err instanceof NetworkError ? err : networkError(err, baseUrl)),
+    );
     req.end();
   });
 }
+
+/** How much server-supplied error text may ride along in an Error message. Whatever is listening on that
+ *  port is not necessarily our engine, and this text reaches a status-bar hover and a menu — so it is
+ *  bounded here rather than trusted to be short. (It is never logged; see engineLog.) */
+const MAX_DETAIL_CHARS = 200;
 
 /** Pull FastAPI's `{"detail": "..."}` out of an error body, else fall back to status + raw text. */
 function httpErrorMessage(status: number, text: string): string {
@@ -150,11 +185,16 @@ function httpErrorMessage(status: number, text: string): string {
         typeof parsed === "object" &&
         typeof (parsed as { detail?: unknown }).detail === "string"
       ) {
-        return (parsed as { detail: string }).detail;
+        return clamp((parsed as { detail: string }).detail);
       }
     } catch {
       // not JSON — fall through to the raw text
     }
   }
-  return `engine returned HTTP ${status}${text ? `: ${text}` : ""}`;
+  return `engine returned HTTP ${status}${text ? `: ${clamp(text)}` : ""}`;
+}
+
+function clamp(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > MAX_DETAIL_CHARS ? `${flat.slice(0, MAX_DETAIL_CHARS)}…` : flat;
 }

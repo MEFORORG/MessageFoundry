@@ -5,9 +5,11 @@ import {
   ADD_MENU_CATALOG,
   STRUCTURAL_OPS,
   addMenuGroups,
+  buildAddDestinationRequest,
   buildAddMenuRequest,
   buildRowViewModel,
   editableParamNames,
+  isReturnRow,
   isRowDeletable,
   isRowMovable,
   type AddMenuGroup,
@@ -40,10 +42,29 @@ suite("Steps Add menu — grouped catalog (ADR 0106)", () => {
   });
 
   test("every item op is a supported lens op", () => {
-    const ops = new Set(["insert_row", "template", "insert_clause", "insert_comment", "insert_code_lookup"]);
+    const ops = new Set([
+      "insert_row",
+      "template",
+      "insert_clause",
+      "insert_comment",
+      "insert_code_lookup",
+      "insert_send",
+    ]);
     for (const item of ADD_MENU_CATALOG) {
       assert.ok(ops.has(item.op), `${item.id} has an unknown op ${item.op}`);
     }
+  });
+
+  test("Add→Send emits the accumulator insert_send op, NOT the retired return-form template", () => {
+    // ADR 0104 fan-out: the palette authors `sends.append(Send(...))` scaffold, never `return Send(...)`.
+    assert.strictEqual(ADD_MENU_BY_ID.send.op, "insert_send");
+    const req = buildAddMenuRequest(ADD_MENU_BY_ID.send, anchor("action"), { destination: "OB_A" });
+    assert.deepStrictEqual(req, {
+      ...base,
+      op: "insert_send",
+      position: "after",
+      destination: "OB_A",
+    });
   });
 
   test("ADD_MENU_BY_ID is the by-id allowlist (keys == ids, no dups)", () => {
@@ -53,7 +74,14 @@ suite("Steps Add menu — grouped catalog (ADR 0106)", () => {
   });
 
   test("STRUCTURAL_OPS covers every ADR 0106 insert op (each forces re-projection)", () => {
-    for (const op of ["template", "insert_clause", "insert_comment", "insert_code_lookup"]) {
+    for (const op of [
+      "template",
+      "insert_clause",
+      "insert_comment",
+      "insert_code_lookup",
+      "insert_send",
+      "add_destination",
+    ]) {
       assert.ok(STRUCTURAL_OPS.has(op), `${op} must be structural`);
     }
   });
@@ -176,5 +204,92 @@ suite("Steps Add menu — new row kinds render + edit correctly", () => {
     const row: LensRow = { kind: "control", control: "raise", line_start: 1, line_end: 1, nesting: 0 };
     assert.strictEqual(isRowMovable(row), true);
     assert.strictEqual(isRowDeletable(row), false);
+  });
+});
+
+suite("Steps fan-out — isReturnRow, append rows, + dest (ADR 0104)", () => {
+  const at = (kind: LensRow["kind"], extra: Partial<LensRow> = {}) => ({
+    handler: "h",
+    lineStart: 6,
+    lineEnd: 6,
+    expectSrc: "x",
+    kind,
+    ...extra,
+  });
+
+  test("isReturnRow: returned send + scaffold footer are returns; a mid-body append is NOT", () => {
+    assert.strictEqual(isReturnRow({ kind: "send" }), true); // return Send(...)
+    assert.strictEqual(isReturnRow({ kind: "send", scaffold: undefined, appended: undefined }), true);
+    assert.strictEqual(isReturnRow({ kind: "code", scaffold: "return_collector" }), true); // return sends
+    assert.strictEqual(isReturnRow({ kind: "code", scaffold: "collector_init" }), false); // sends = []
+    assert.strictEqual(isReturnRow({ kind: "send", appended: true }), false); // sends.append(Send(...))
+    assert.strictEqual(isReturnRow({ kind: "action" }), false);
+  });
+
+  test("Add derives 'after' at a mid-body append anchor, 'before' at a return/footer anchor", () => {
+    const pos = (r: ReturnType<typeof buildAddMenuRequest>) => (r as { position: string }).position;
+    // an append send is a normal middle-of-body step → a new step follows it
+    assert.strictEqual(
+      pos(buildAddMenuRequest(ADD_MENU_BY_ID.set_field, at("send", { appended: true }), {})),
+      "after",
+    );
+    // a returned send / scaffold footer suppresses after → a new step precedes it
+    assert.strictEqual(pos(buildAddMenuRequest(ADD_MENU_BY_ID.set_field, at("send"), {})), "before");
+    assert.strictEqual(
+      pos(
+        buildAddMenuRequest(ADD_MENU_BY_ID.set_field, at("code", { scaffold: "return_collector" }), {}),
+      ),
+      "before",
+    );
+  });
+
+  test("buildAddDestinationRequest maps to the add_destination lens op", () => {
+    assert.deepStrictEqual(
+      buildAddDestinationRequest(at("send", { appended: true }), "OB_B"),
+      {
+        handler: "h",
+        line_start: 6,
+        line_end: 6,
+        op: "add_destination",
+        position: "after",
+        destination: "OB_B",
+        expect_src: "x",
+      },
+    );
+  });
+
+  test("an append send row renders as an editable, movable, deletable Send with a 'to' field", () => {
+    const row: LensRow = {
+      kind: "send",
+      appended: true,
+      outbounds: ["OB_A"],
+      line_start: 6,
+      line_end: 6,
+      nesting: 0,
+    };
+    assert.strictEqual(isRowMovable(row), true);
+    assert.strictEqual(isRowDeletable(row), true);
+    assert.deepStrictEqual(editableParamNames(row), ["to"]);
+    const vm = buildRowViewModel(row, 0, ["", "", "", "", "", '    sends.append(Send("OB_A", msg))']);
+    assert.strictEqual(vm.title, "Send");
+    assert.strictEqual(vm.appended, true);
+    assert.strictEqual(vm.isReturn, false);
+  });
+
+  test("a scaffold footer renders muted (Deliver) and is NOT movable/deletable/editable", () => {
+    const row: LensRow = {
+      kind: "code",
+      scaffold: "return_collector",
+      line_start: 8,
+      line_end: 8,
+      nesting: 0,
+    };
+    assert.strictEqual(isRowMovable(row), false);
+    assert.strictEqual(isRowDeletable(row), false);
+    assert.deepStrictEqual(editableParamNames(row), []);
+    const vm = buildRowViewModel(row, 0, ["", "", "", "", "", "", "", "    return sends"]);
+    assert.strictEqual(vm.title, "Deliver");
+    assert.strictEqual(vm.scaffold, "return_collector");
+    assert.strictEqual(vm.isReturn, true);
   });
 });

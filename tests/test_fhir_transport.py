@@ -17,6 +17,14 @@ import urllib.error
 import urllib.request
 
 import pytest
+from _fhir_fixtures import (
+    BUNDLE_TRANSACTION,
+    OPERATION_OUTCOME_ERROR,
+    OPERATION_OUTCOME_SUCCESS,
+    OPERATION_OUTCOME_TRANSIENT,
+    PATIENT_R4B,
+    as_json,
+)
 
 from messagefoundry.config.models import ConnectorType, Destination
 from messagefoundry.config.settings import EgressSettings
@@ -26,15 +34,6 @@ from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.fhir import FhirDestination, _capture_outcome, _classify_fhir
-
-from _fhir_fixtures import (
-    BUNDLE_TRANSACTION,
-    OPERATION_OUTCOME_ERROR,
-    OPERATION_OUTCOME_SUCCESS,
-    OPERATION_OUTCOME_TRANSIENT,
-    PATIENT_R4B,
-    as_json,
-)
 
 BASE = "https://fhir.example.org/fhir"
 PATIENT = as_json(PATIENT_R4B)  # id "synthetic-001", no meta.versionId
@@ -128,7 +127,7 @@ def test_fhir_cleartext_http_nonloopback_allowed_with_escape(
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = build_destination(
             Destination(
                 name="OB",

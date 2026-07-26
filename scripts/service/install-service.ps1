@@ -51,6 +51,16 @@ param(
     # inheritance is surprising; for production point -Config at a dedicated admin-owned dir and pass
     # this switch (see docs/SERVICE.md "Restrict the config directory").
     [switch]$LockConfigDir,
+    # Opt-in: suppress Windows Error Reporting crash dumps for the engine image MACHINE-WIDE (ADR 0152
+    # Phase 0). A WER dump of a running engine writes in-flight HL7 bodies, decrypted plaintext and the
+    # unwrapped DEK to a file outside the store's encryption, ACLs and retention sweep. The engine
+    # already applies the process-local half of this at every `serve` (SetErrorMode + WerSetFlags, see
+    # messagefoundry/crashdump.py), but HKLM LocalDumps and the WER exclusion list are MACHINE POLICY -
+    # Microsoft documents local dump collection as controlled independently of the rest of WER, so it
+    # fires even for a process that set every flag it can. Only this switch closes that half. Default
+    # OFF because it writes HKLM keys by IMAGE NAME (which affects every process of that name on the
+    # box, not just this service) - an explicit operator decision, not a side effect of installing.
+    [switch]$SuppressCrashDumps,
     [ValidateSet("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")]
     [string]$LogLevel = "INFO",
     # Active environment NAME (ADR 0017): selects environments/<name>.toml + the instance's PHI
@@ -164,6 +174,96 @@ function Set-SecureConfigAcl {
             "low-privileged principal with write would cause the engine to REFUSE to load it (SEC-003, " +
             "docs/SERVICE.md). Lock it manually or re-run elevated.")
     }
+}
+
+function Get-CrashDumpImageName {
+    <#
+      The image names whose WER behaviour must be suppressed (ADR 0152 Phase 0). Returns BOTH the
+      launcher ($AppExe, e.g. messagefoundry.exe) and the venv interpreter, because a pip console-script
+      launcher on Windows starts the interpreter as a CHILD process - so the process that actually holds
+      the PHI heap, and therefore the one WER would dump, is python.exe, not messagefoundry.exe. Naming
+      only the launcher would produce a policy that looks applied and protects nothing.
+    #>
+    param([Parameter(Mandatory)][string]$AppExe)
+    $names = @([IO.Path]::GetFileName($AppExe))
+    $interpreter = Join-Path (Split-Path -Parent $AppExe) "python.exe"
+    if (Test-Path $interpreter) { $names += [IO.Path]::GetFileName($interpreter) }
+    return ($names | Select-Object -Unique)
+}
+
+function Set-CrashDumpSuppression {
+    <#
+      Reduce Windows Error Reporting crash-dump exposure for the given image names, machine-wide
+      (ADR 0152 Phase 0). Two INDEPENDENT registry surfaces, because neither one alone is sufficient:
+
+        1. ExcludedApplications\<image> = 1  - keeps WER from reporting/queueing faults for the image.
+        2. LocalDumps\<image>               - LocalDumps is evaluated SEPARATELY from the exclusion list
+                                              and from every process-local WerSetFlags flag, so an
+                                              excluded image still gets a local dump if LocalDumps is
+                                              configured.
+
+      LOCALDUMPS IS ONLY EVER *NARROWED*, NEVER TURNED ON. WER local dump collection is OPT-IN: if the
+      LocalDumps key does not exist, no local dumps are collected for anything on this host. Creating
+      LocalDumps\<image> where the parent key was absent would therefore CONFIGURE per-image dump
+      collection where none existed - a switch called -SuppressCrashDumps that plausibly ENABLES PHI
+      dumps is worse than shipping nothing. So the per-image override is written ONLY when a LocalDumps
+      configuration already exists; otherwise the host is already in the state we want and we say so.
+
+      When it IS written, the override is DumpType=0 + CustomDumpFlags=0 (MiniDumpNormal - no heap,
+      which is the PHI-relevant part) so a host configured for full dumps stops writing the engine's
+      heap. DumpCount=0 is set as well, but note Microsoft documents DumpCount as "the maximum number
+      of dump files in the folder", NOT as a disable switch - 0 is not a documented "off", and this
+      has NOT been verified on a real box. Treat the whole per-image override as a REDUCTION (no heap),
+      never as an elimination: a MiniDumpNormal still carries thread stacks. To eliminate local dumps,
+      remove the host's LocalDumps configuration.
+
+      RESIDUAL we cannot close here: a postmortem debugger registered under AeDebug attaches ahead of
+      WER entirely. If this host has one, dumps remain possible regardless of these keys.
+
+      Best-effort: warns and continues on failure, never aborts the install.
+    #>
+    param([Parameter(Mandatory)][string[]]$ImageNames)
+    $werRoot = "HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting"
+    $localDumpsRoot = Join-Path $werRoot "LocalDumps"
+    # Probed ONCE, before any write, so our own per-image key can never be mistaken for pre-existing
+    # host configuration on the second image in the loop.
+    $localDumpsConfigured = Test-Path $localDumpsRoot
+    foreach ($image in $ImageNames) {
+        try {
+            $excluded = Join-Path $werRoot "ExcludedApplications"
+            if (-not (Test-Path $excluded)) { New-Item -Path $excluded -Force | Out-Null }
+            New-ItemProperty -Path $excluded -Name $image -Value 1 -PropertyType DWord -Force | Out-Null
+
+            if ($localDumpsConfigured) {
+                $localDumps = Join-Path $localDumpsRoot $image
+                if (-not (Test-Path $localDumps)) { New-Item -Path $localDumps -Force | Out-Null }
+                New-ItemProperty -Path $localDumps -Name "DumpCount" -Value 0 -PropertyType DWord -Force | Out-Null
+                New-ItemProperty -Path $localDumps -Name "DumpType" -Value 0 -PropertyType DWord -Force | Out-Null
+                New-ItemProperty -Path $localDumps -Name "CustomDumpFlags" -Value 0 -PropertyType DWord -Force | Out-Null
+                Write-Host ("  Dumps  : WER reporting excluded for image '$image'; this host HAS " +
+                    "LocalDumps configured, so its per-image dump was narrowed to a heap-free " +
+                    "MiniDumpNormal (a reduction, not an elimination).")
+            }
+            else {
+                Write-Host ("  Dumps  : WER reporting excluded for image '$image'; LocalDumps is not " +
+                    "configured on this host, so no local dumps are collected and NOTHING was written " +
+                    "under LocalDumps (creating it would have switched collection ON).")
+            }
+        } catch {
+            Write-Warning ("Could not suppress WER crash dumps for image '$image' " +
+                "($($_.Exception.Message)). A crash dump of the engine would contain plaintext PHI " +
+                "(docs/PHI.md); configure it manually under '$werRoot' or accept the exposure.")
+        }
+    }
+    Write-Warning ("WER crash-dump suppression is set by IMAGE NAME and is machine-wide: it affects " +
+        "every process of these names on this host, a postmortem debugger registered under AeDebug " +
+        "still bypasses it, and these keys PERSIST after uninstall-service.ps1 (deliberately - " +
+        "silently re-enabling PHI dumps on uninstall would be the more surprising default). Remove " +
+        "them by hand under '$werRoot' if you want the host's original WER behaviour back. This is " +
+        "memory HYGIENE and moves ASVS 11.7.1 by ZERO - it keeps plaintext PHI out of a fault report " +
+        "on disk, it does not encrypt memory in use. See " +
+        "docs/adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-" +
+        "asvs-11-7-1.md.")
 }
 
 function Test-LooksLikeGmsa {
@@ -445,6 +545,18 @@ if ($LockConfigDir) {
 }
 if ($ServiceAccount) {
     Write-Host "  ACLs   : granted read on '$Config'; read/write on '$DataDir' (docs/SERVICE.md)."
+}
+
+# --- WER crash-dump suppression (ADR 0152 Phase 0, opt-in) -------------------------------------------
+# The engine applies the PROCESS-LOCAL half at every `serve` unconditionally. This is the MACHINE-POLICY
+# half, which no process can set for itself; without it a LocalDumps-configured host can still write a
+# full-memory dump of the engine - plaintext PHI, on disk, outside the store's encryption and retention.
+if ($SuppressCrashDumps) {
+    Set-CrashDumpSuppression -ImageNames (Get-CrashDumpImageName -AppExe $AppExe)
+} else {
+    Write-Host ("  Dumps  : WER crash-dump suppression NOT applied (pass -SuppressCrashDumps). The " +
+        "engine suppresses what a process can suppress on its own, but if this host has WER LocalDumps " +
+        "configured, a crash dump of the engine would contain plaintext PHI (docs/PHI.md).")
 }
 
 Write-Host ""

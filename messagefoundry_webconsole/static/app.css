@@ -171,6 +171,9 @@ body.mf-col-resizing, body.mf-col-resizing * { cursor: col-resize !important; us
 .status-stopped, .status-draining { color: var(--muted); }
 .status-failed, .status-error { color: var(--bad); }
 .status-filtered, .status-stopping { color: var(--warn); }
+/* #233 (ADR 0111): present in the config but deployed=false — an intentional, benign state, so it reads
+   in the informational accent (never the muted grey of "stopped", which means it SHOULD be running). */
+.status-not_deployed { color: var(--accent); }
 
 pre.raw {
   background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
@@ -223,6 +226,28 @@ table.grid th:has(> [data-mf-conns-all]), table.grid td:has(> .rowcb) {
 }
 .rowcb { margin: 0; cursor: pointer; }
 
+/* Object-of-interest flag (#131): a per-row toggle button (TOML-managed) or a read-only glyph
+   (code-first). Amber when flagged (the brand accent), muted outline otherwise. */
+.flagbtn {
+  background: transparent; border: 0; cursor: pointer; padding: 0 0.2rem; line-height: 1;
+  color: var(--muted); font-size: 1rem; border-radius: 4px;
+}
+.flagbtn:hover { color: var(--foundry); }
+.flagbtn.flagged { color: var(--foundry); }
+.flagbtn:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+.flagform { margin: 0; }
+.flag { color: var(--muted); }
+.flag.flagged { color: var(--foundry); }
+/* Flagged-only view toggle in the toolbar. */
+.flagfilter { display: inline-flex; align-items: center; gap: 0.3rem; color: var(--muted);
+  white-space: nowrap; cursor: pointer; }
+.flagfilter input { cursor: pointer; }
+
+/* "Waiting for Reply" per-message outbound state (#136): a small accent badge beside the status pill,
+   shown while an outbound awaits an MLLP ACK past its display delay (transient — clears on the next
+   poll/ws swap). */
+.waiting { color: var(--accent); font-size: 0.75rem; margin-left: 0.4rem; white-space: nowrap; }
+
 .muted { color: var(--muted); }
 .detail-head { display: flex; align-items: center; gap: 1rem; }
 .livestats { color: var(--muted); font-variant-numeric: tabular-nums; min-height: 1.2rem;
@@ -258,3 +283,63 @@ ul.tree .tval { color: var(--ink); white-space: pre-wrap; word-break: break-word
   color: var(--warn); border: 1px solid var(--warn); border-radius: 999px;
   padding: 0.05rem 0.55rem; font-size: 0.75rem; font-weight: 600;
 }
+
+/* Flow & trends (BACKLOG #76): status-colored inline-SVG data-flow graph + queue-trend chart. All
+   colours come from the shared theme tokens; the node fill is driven by the live status CLASS (never an
+   operator-assigned colour). Wide graphs/charts scroll inside their own wrapper (the page body never
+   scrolls horizontally). */
+.flowgraph-wrap, .trendchart-wrap { overflow-x: auto; max-width: 100%; margin-top: 0.5rem; }
+.flowgraph, .trendchart { display: block; }
+.gcolhead { fill: var(--muted); font-size: 12px; font-weight: 600; }
+.gnodelabel { fill: var(--ink); font-size: 12px; }
+/* Node box: a translucent status tint + a solid status-coloured stroke (so a colour-blind operator still
+   reads the box outline + the label). "logic" = router/handler nodes (no live status). */
+.gnode { fill: var(--panel); stroke: var(--line); stroke-width: 1.5px; }
+.gnode-logic { stroke: var(--muted); }
+.gnode-running { stroke: var(--ok); }
+.gnode-stopped, .gnode-draining { stroke: var(--muted); }
+.gnode-failed, .gnode-error { stroke: var(--bad); }
+.gnode-filtered, .gnode-stopping { stroke: var(--warn); }
+.gnode-not_deployed { stroke: var(--accent); }
+.gedge { stroke: var(--line); stroke-width: 1.5px; }
+.gedge-declared, .gedge-literal { stroke: var(--muted); }
+.gedge-heuristic { stroke: var(--muted); stroke-dasharray: 4 3; opacity: 0.7; }
+/* Trend chart: axes + up-to-6 overlaid series (colour classes reused by the legend swatches). */
+.trendchart .axis { stroke: var(--line); stroke-width: 1px; }
+.trendchart .axislabel { fill: var(--muted); font-size: 11px; }
+.trendchart .series { stroke-width: 1.5px; }
+.series-0 { stroke: var(--accent); }
+.series-1 { stroke: var(--ok); }
+.series-2 { stroke: var(--warn); }
+.series-3 { stroke: var(--bad); }
+.series-4 { stroke: var(--foundry); }
+.series-5 { stroke: var(--muted); }
+.chart-legend { display: flex; flex-wrap: wrap; gap: 0.9rem; margin: 0.4rem 0; color: var(--muted);
+  font-size: 0.8rem; }
+.legend-item { display: inline-flex; align-items: center; gap: 0.35rem; }
+.legend-item .swatch { display: inline-block; width: 0.8rem; height: 0.2rem; border-radius: 2px; }
+.swatch.series-0 { background: var(--accent); }
+.swatch.series-1 { background: var(--ok); }
+.swatch.series-2 { background: var(--warn); }
+.swatch.series-3 { background: var(--bad); }
+.swatch.series-4 { background: var(--foundry); }
+.swatch.series-5 { background: var(--muted); }
+
+/* ASVS 3.7.5 — the fail-VISIBLE hardening detects. `.mf-insecure-banner` styles both the two
+   script-raised banners (insecure context, CSP not enforced) and the server-rendered
+   scripts-blocked banner below, so all three read the same. */
+.mf-insecure-banner {
+  margin: 0;
+  padding: 0.6rem 1rem;
+  background: var(--bad);
+  color: #fff;
+  font-weight: 600;
+}
+
+/* The scripts-blocked banner is rendered by the SERVER and is visible by default; the nonce'd mark
+   script in the page shell stamps `mf-scripts-ok` on <html>, which hides it before first paint. A
+   browser that enforces CSP without understanding nonce sources — or one with JavaScript disabled —
+   never runs that script, so the banner STANDS and the degradation is visible instead of silent.
+   Hiding it from CSS (not from JS) is deliberate: `style-src 'self'` keeps working on exactly the
+   clients whose `script-src` blocks everything. */
+.mf-scripts-ok #mf-scripts-blocked-banner { display: none; }

@@ -32,7 +32,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine) -> AuthService:
-    svc = AuthService(engine.store, AuthSettings())
+    svc = AuthService(engine.store, AuthSettings(require_mfa=False))
     await svc.initialize()
     return svc
 

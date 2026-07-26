@@ -94,9 +94,14 @@ def _http_error(code: int, body: bytes = b"") -> urllib.error.HTTPError:
 
 
 def _executor(
-    *, exc: Exception | None = None, body: bytes = b"", status: int = 200, conn: dict | None = None
+    *,
+    exc: Exception | None = None,
+    body: bytes = b"",
+    status: int = 200,
+    conn: dict | None = None,
+    require_structured: bool = False,
 ) -> tuple[FhirLookupExecutor, _FakeOpener]:
-    ex = FhirLookupExecutor(conn or _CONN)
+    ex = FhirLookupExecutor(conn or _CONN, require_structured=require_structured)
     opener = _FakeOpener(exc=exc, body=body, status=status)
     for name in ex.connections:  # swap the per-connection opener for the fake
         ex._opener[name] = opener  # type: ignore[attr-defined]
@@ -274,6 +279,58 @@ def test_flat_search_multi_param_still_verbatim() -> None:  # #204 (c) — no ov
     # separators; the flat form rides verbatim (per-value encoding is the author's duty).
     url = _resolve_read_url(BASE, "Patient?given=Ann&family=Lee&identifier=MRN|9")
     assert url == f"{BASE}/Patient?given=Ann&family=Lee&identifier=MRN|9"
+
+
+# --- 1.2.2: [egress].fhir_require_structured_params refuses the flat '?'-query -----------------
+
+
+def test_require_structured_rejects_flat_query() -> None:
+    # A CLEAN flat query (no control char / '#' / second '?') proves the raise fires BEFORE the
+    # defense-in-depth screen — the flat form is closed outright when the operator requires params=.
+    with pytest.raises(ValueError, match="fhir_require_structured_params") as ei:
+        _resolve_read_url(BASE, "Patient?identifier=MRN|123", require_structured=True)
+    assert "MRN" not in str(
+        ei.value
+    )  # PHI-safe: the message names the setting/shape, not the value
+
+
+def test_require_structured_allows_params() -> None:
+    # The safe structured form still works when the flag is on.
+    url = _resolve_read_url(BASE, "Patient", {"identifier": "MRN|123"}, require_structured=True)
+    assert url == f"{BASE}/Patient?identifier=MRN%7C123"
+
+
+def test_require_structured_allows_read_by_id() -> None:
+    # A read-by-id has no '?' → never enters the flat-query block → unaffected by the flag.
+    assert _resolve_read_url(BASE, "Patient/123", require_structured=True) == f"{BASE}/Patient/123"
+
+
+def test_default_flat_query_still_rides() -> None:
+    # Byte-identical guard: require_structured defaulted off leaves the flat form verbatim.
+    url = _resolve_read_url(BASE, "Patient?given=Ann&identifier=MRN|9")
+    assert url == f"{BASE}/Patient?given=Ann&identifier=MRN|9"
+
+
+async def test_executor_require_structured_rejects_flat_read() -> None:
+    ex, opener = _executor(body=PATIENT.encode(), require_structured=True)
+    with pytest.raises(FhirLookupError):
+        await ex.read("epic", "Patient?identifier=MRN|123")
+    assert len(opener.requests) == 0  # refused before any dial-out
+
+
+async def test_executor_require_structured_allows_params_read() -> None:
+    ex, opener = _executor(body=SEARCHSET.encode(), require_structured=True)
+    await ex.read("epic", "Patient", {"identifier": "MRN|123"})
+    assert len(opener.requests) == 1
+    assert opener.requests[0].full_url == f"{BASE}/Patient?identifier=MRN%7C123"
+
+
+async def test_executor_default_flat_read_unchanged() -> None:
+    # Byte-identical guard at the executor level: default False preserves the flat escape hatch.
+    ex, opener = _executor(body=PATIENT.encode())
+    await ex.read("epic", "Patient?identifier=MRN|123")
+    assert len(opener.requests) == 1
+    assert opener.requests[0].full_url == f"{BASE}/Patient?identifier=MRN|123"
 
 
 # --- error path is PHI- and secret-safe (AC-6) -------------------------------

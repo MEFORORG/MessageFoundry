@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-4
+14
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -15,6 +15,7 @@ cookie_secure
 default_scan_limit
 core
 admin
+oidc_enabled
 
 ## dataclass messagefoundry.api._ui_seam.CoreHandlers
 list_connections
@@ -39,6 +40,8 @@ dr_status
 service_status
 ack_alert
 resolve_alert
+suspend_alert
+resume_alert
 reset_statistics
 integrity_check
 dr_activate
@@ -49,6 +52,18 @@ config_provenance
 reload_config
 search_messages
 audit_channel_denied
+upload_file
+list_uploaded_files
+browse_uploaded_file
+resend_uploaded_message
+delete_uploaded_file
+list_search_presets
+create_search_preset
+delete_search_preset
+layered_search
+metrics_history
+graph_edges
+set_connection_flag
 
 ## dataclass messagefoundry.api._ui_seam.AdminHandlers
 list_roles
@@ -81,7 +96,7 @@ current_user
 ## api.security surface (imported directly by the console, outside UiDeps)
 authorize_ws: (websocket: 'WebSocket', *permissions: 'Permission') -> 'Identity | None'
 get_auth: (request: 'Request') -> 'AuthService | None'
-require: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
+require: (*permissions: 'Permission', mfa_gate: 'bool' = True) -> 'Callable[[Request], Awaitable[Identity]]'
 require_reauth_only: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
 require_step_up: (*permissions: 'Permission') -> 'Callable[[Request], Awaitable[Identity]]'
 ws_token: (websocket: 'WebSocket') -> 'str | None'
@@ -90,10 +105,13 @@ ws_token: (websocket: 'WebSocket') -> 'str | None'
 allow_login_attempt: (self, client: 'str | None') -> 'bool'
 allow_phi_read: (self, actor: 'str') -> 'bool'
 audit_kerberos_reject: (self, reason: 'str') -> 'None'
+audit_oidc_reject: (self, reason: 'str') -> 'None'
 audit_permission_denied: (self, identity: 'Identity', permission: 'Permission', path: 'str') -> 'None'
 authenticate_kerberos: (self, token: 'bytes', *, client: 'str | None' = None, seed_reauth: 'bool' = True) -> 'LoginOutcome'
+begin_oidc_login: (self, *, client: 'str | None', public_origin: 'str') -> 'tuple[str, str]'
 begin_webauthn_assertion: (self, token: 'str | None', *, rp_id: 'str') -> 'str | None'
 begin_webauthn_registration: (self, identity: 'Identity', *, token: 'str', rp_id: 'str', rp_name: 'str') -> 'str'
+complete_oidc_login: (self, *, flow_id: 'str', state: 'str', code: 'str', client: 'str | None', public_origin: 'str') -> 'LoginOutcome'
 confirm_mfa_enrollment: (self, identity: 'Identity', code: 'str', *, token: 'str', client: 'str | None' = None) -> 'list[str] | None'
 delete_webauthn_credential: (self, identity: 'Identity', credential_id_hash: 'str', *, client: 'str | None' = None) -> 'bool'
 finish_webauthn_assertion: (self, token: 'str | None', response_json: 'str', *, client: 'str | None' = None, rp_id: 'str', origin: 'str') -> 'bool'
@@ -115,6 +133,7 @@ webauthn_available: (self) -> 'bool'
 ## app.state attributes the console sets/reads
 auth
 exposure_protected
+loopback
 public_origin
 ui_connections_render
 ui_csp
@@ -122,26 +141,32 @@ ui_ws_authorize
 webauthn_rp_from_request
 
 ## api.models DTO fields rendered by the console
-AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status
+AlertInstanceInfo: acked_at, acked_by, connection, count, event_type, first_seen, id, last_seen, reason, resolved_at, severity, status, suspended_until
 AlertInstanceList: alerts
-AlertsConfig: email_configured, email_recipient_count, email_smtp_port, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
+AlertsConfig: email_body_template_configured, email_configured, email_html_template_configured, email_recipient_count, email_smtp_port, email_subject_template_configured, email_use_tls, realert_seconds, rules, smtp_allowed_hosts, webhook_allowed_hosts, webhook_configured, webhook_timeout
 AttachmentInfo: content_type, id, total_bytes
 ClusterNodeList: leader_node_id, lease_expires_at, lease_owner, nodes
 ClusterStatus: clustered, config_version, is_leader, node_id, role
 ConfigProvenance: drift, files, fingerprint, git_head, loaded
 ConnectionEventInfo: connection, direction, id, kind, message_id, peer_host, reason, transport, ts
-ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, written
+ConnectionFlagRequest: direction, flagged
+ConnectionRow: alerts_active, backlog_seconds, channel_id, channel_name, delivered_age_seconds, destination, direction, error, errored, flagged, idle_seconds, method, name, owner_shard, paused, peer, port, queue_depth, read, role, simulated, status, toml_managed, waiting_for_reply, written
 DeadLetterList: dead_letters, limit, offset, total
 DeadLetterReplayRequest: channel_id, destination_name
 DrStatus: activation_mode, active, enabled, threshold
+GraphEdge: provenance, source, source_kind, target, target_kind
+GraphNode: kind, name, status
+GraphResponse: dynamic, edges, nodes
 IntegrityResult: detail, ok
 MessageDetail: attachments, channel_id, control_id, error, event, events, id, message_type, metadata, outbox, raw, received_at, source_type, status, summary
 MessageList: limit, messages, offset, total
 MessageSearchResults: limit, matched, messages, scan_limit, scanned, truncated
+MetricsHistoryResponse: capacity, samples
+MetricsHistorySample: outbox_by_status, ts
 PendingApprovalResponse: approval_id, detail, operation, status
 ReloadRequest: config_dir, dry_run
 ReloadResult: dry_run, handlers, inbound, outbound, routers, running
-SecurityPosture: allow_unencrypted_phi, backend, data_class, encryption_enabled, environment, key_id, key_source, plaintext_columns, production, require_encryption
+SecurityPosture: allow_unencrypted_phi, backend, client_address_monoculture, client_denied_last, client_network_denials, data_class, encryption_enabled, enforcement, environment, fips_mode, key_id, key_source, loosenings, memory_encryption_note, memory_encryption_operator_declared, memory_encryption_readout_contradicts_declaration, memory_encryption_readout_source, memory_encryption_self_reported_active, memory_encryption_self_reported_capability, memory_encryption_self_reported_mechanism, openssl_version, plaintext_columns, production, require_encryption, security, synthetic_relaxation
 ServiceStatusInfo: enabled, service_name, state
 StatsResetRequest: all, targets
 StatsResetTarget: channel_id, destination, role

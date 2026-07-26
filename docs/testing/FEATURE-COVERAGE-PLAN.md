@@ -85,6 +85,26 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Entry.** P0 crypto seam green (encryption/rotation used by these rows). Gated SS/PG CI legs (`MEFOR_TEST_SQLSERVER`/`MEFOR_TEST_POSTGRES`) available.
 **Exit.** Every row below executes on SQLite + SS + PG in CI; no structural-only parity remains for these features; resend/edit-resend FIFO-under-second-writer proven on the PG advisory-lock funnel and the SS pooled-claim fan-in.
 
+> **✅ STATUS — P1 CLOSED (2026-07-13).** All 22 rows resolved: **14 closed** with executed cross-backend
+> tests (built + verified against a real SQL Server 2022 and PostgreSQL 16, not structural-only), **8 dropped**
+> after adversarial grounding against live code (already-executed on SS+PG, or a confirmed dup). Landed as one
+> branch (batches 1–4 + MLLP-20).
+> - **Closed (14):** CFG-19, INGEST-6, STOREF-15 *(fixture widening)* · STOREF-8, STOREF-9, RBAC-8, ALERT-19
+>   *(resend/edit + census + alert-lifecycle store legs; STOREF-8 FIFO-under-2nd-writer proven deterministically
+>   via a held advisory-lock, no sleep-race)* · STOREF-17, CLI-22, CLI-23, CLI-24 *(dedup-inert guard + audit/
+>   key CLI legs)* · STOREF-11, SCALE-9 *(streaming-detach pipeline-e2e on SS+PG; crash-replay at-least-once on
+>   SS-only batching)* · MLLP-20 *(inbound ACK-capture `record_ack_sent` — AA-encrypted-at-rest / NAK-no-body /
+>   sentinel-ordering on SS+PG)*.
+> - **Dropped (8), with file:line proof:** STOREF-12, CFG-17, CFG-18, DICOM-25, MLLP-19 — the backend-touching
+>   path is **already executed on SS+PG** (e.g. DICOM-25's NUL-bearing mfb64 round-trip is already covered on
+>   both servers, and no store code branches on `message_type`). API-13, API-14, SCALE-13 — **dups** of
+>   STOREF-8 / STOREF-9 / STOREF-15 (backend-agnostic API/scale wrappers over those store methods).
+> - **Corrections to the draft rows:** STOREF-17 is a *store-method* row (`transform_handoff`), not CLI as the
+>   "Recommended test type" implied; SCALE-9 is confirmed **SS-only** (the batching path exists only in
+>   `store/sqlserver.py`), so it has no PG leg. MLLP-20 (inbound ACK-capture `record_ack_sent`, ADR 0021) is a
+>   *distinct* code path from MLLP-19's `complete_with_response` — it was genuinely SQLite-only and is now
+>   closed on SS+PG (it does **not** fold into MLLP-19).
+
 | ID | Recommended test type | Note |
 |---|---|---|
 | STOREF-8 | live-backend | `resend_to` on SS+PG: PG `pg_advisory_xact_lock` lane funnel, SS pooled-claim weak fan-in (ADR 0090 §3 FIFO-under-2nd-writer). |
@@ -118,6 +138,24 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Rationale.** Several connectors are proven only with in-memory handlers, never through `RegistryRunner`/`Engine` (X12 has *no* runtime pipeline test at all), and console/parse edge branches are unverified.
 **Entry.** P1 parity harness available for any backend-touching branch.
 **Exit.** X12 flows through the staged queue to a disposition; connector error/edge branches (FILE OSError, DICOM lifecycle, probes, TLS-relax selection) exercised; parse-tree caps/custom-separator asserted; web-console results/editor/audit pages behaviorally tested.
+
+> **✅ STATUS — P2 CLOSED (2026-07-13).** All 12 rows resolved: **11 closed** + **1 dropped**. Landed as one
+> branch (batches 1–2). Each test verified on its real surface — SQLite for the connector/parse rows, the live
+> **SQL Server** container for DB-11, the **webconsole ASGI** suite for UI-12.
+> - **Closed (11):** X12-15 *(the X12 staged-pipeline e2e that had **no** runtime test — PROCESSED/UNROUTED/ERROR
+>   over a real socket)*, X12-16, X12-18 *(TA1 PHI-no-log + RTE RESPONSE-stage)*, FILE-5, FILE-13 *(FILE _move/
+>   delete OSError + _run except-guard)*, DICOM-5, DICOM-14 *(missing-extra RuntimeError; SCP off-loop 4-step
+>   teardown)*, ALERT-10 *(runner emit-site + re-alert throttle)*, X12-6 *(missing-[x12] RuntimeError + pyx12
+>   validate=True)*, DB-11 *(DATABASE **source** live poll/mark on SQL Server — was faked-pool only; SS-only, the
+>   connector is ODBC/aioodbc)*, UI-12 *(the /ui edit + edit-resend behaviors)*.
+> - **🐛 Real bug found + fixed (UI-12):** the `/ui/messages/{id}/edit-resend` POST parsed its body with
+>   `request.form()`, but the engine ships no `python-multipart` dep, so the edit-and-resubmit route **failed at
+>   runtime**. Fixed to stdlib `parse_qsl(await request.body())`, matching the sibling `/ui/login` handler.
+> - **Dropped (1):** FILE-9 — already covered end-to-end through a real `FileSource` at
+>   [test_message_split.py:214/260/293](../../tests/test_message_split.py) (multi-MSH in-order handoffs, latin-1
+>   re-encode, hand-off-K-fails → whole-file re-read); the plan's "none" citation was a draft-quality mis-cite.
+> - **Note (DB-11):** the DATABASE connector is ODBC-only, so a PostgreSQL live-source leg needs the psqlODBC OS
+>   driver (not installed); a generic-dialect PG source round-trip is a conditional follow-up (also closes DB-7).
 
 | ID | Recommended test type | Note |
 |---|---|---|
@@ -158,6 +196,19 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Entry.** P0 crypto/redaction primitives in place.
 **Exit.** Every listed refusal has a negative assertion; the grant/deny audit set is pinned exactly; RBAC-17 dual-control on config:deploy is reconciled with API-9 and either landed+tested or the discrepancy resolved.
 
+> **✅ STATUS — P3 CLOSED (2026-07-13).** 9 rows: **6 real gaps closed** with negative/audit tests (each guard
+> driven to REFUSE), **3 already-covered** with proof. RBAC-4/RBAC-16 backend legs verified on real SQL Server +
+> PostgreSQL.
+> - **Closed (6):** CFG-16 *(exhaustive secret scrub — iterates the frozensets, self-updating; + env-default-drop)*,
+>   AUTHN-18 *(spoofed-CN cannot collide with a pinned SAN; disabled account denied via cert path)*, FILE-19 *(FTPS
+>   encrypted-key missing-password RAISES, never prompts)*, HTTPFHIR-28 *(3xx refused + `_NoRedirectHandler` wired
+>   into the default opener)*, RBAC-4 *(exact grant/deny audit set; deny-audit on SS/PG)*, RBAC-16 *(startup_integrity
+>   hash-chained + off-box-teed on SS/PG)*.
+> - **Already-covered (3), with proof:** ALERT-4 (webhook http/SSRF/3xx refusals — `test_asvs_phase0.py`);
+>   **RBAC-17 — the dual-control control is BUILT and AC-5..AC-8 tested** (`test_dual_control_reload.py`): the plan's
+>   "not wired / unbuilt" rows (≈994/365) are **STALE** and reconcile with API-9's "covered"; DICOM-18
+>   (`InsecureHopGuard` — `test_hop_refusal_*` + `test_tls_expiry_relaxation`).
+
 | ID | Recommended test type | Note |
 |---|---|---|
 | ALERT-4 | security-negative | Webhook plaintext-http refusal, `allowed_hosts` SSRF refusal in `_post`, `_NoRedirectHandler` 3xx refusal. |
@@ -177,6 +228,25 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Rationale.** Pooled-mode failover duplicate/ordering is UNMEASURED (STORE-7); N-active on one unified store is not a certified topology (STORE-10/SCALE-6); the derived single-live-leader branch has zero coverage on multi-row data (HA-11); DR fail-back drain-retry and divergent-store reconciliation rest on runbooks (DR-23).
 **Entry.** Live SS+PG CI legs + the failover harness (SIGKILL-under-load) available; P1 parity green.
 **Exit.** Pooled-mode failover proven no-loss/no-overtake on SS+PG; a clean N-engine no-loss bench certifies (or explicitly withholds) N-active; multi-node leader-derivation collapses two-fresh rows correctly; acquire_delay/non-promotable proven on a real DB clock; DR scheduled loop, config-only server backup, and fail-back drain-retry tested.
+
+> **◐ STATUS — P4 PARTIAL (2026-07-13): 12 closed, 1 already-covered, 3 rig-deferred.** 12 rows closed with
+> tests verified on **real SQL Server + PostgreSQL** containers; the failover-under-load / N-active bench rows
+> are deferred because the SIGKILL failover / bench rig was **occupied this session** (dispositioned, not a
+> silent skip).
+> - **Closed (12):** STORE-10 *(PG 2-engine crash+restart end-to-end — scoped `reset_stale_inflight` re-pends
+>   exactly the restarting shard, zero-loss + exactly-once fan-out + FIFO on full drain)*, HA-8, HA-9 *(acquire_delay
+>   preferred-wins race; non-promotable warm-DR stays passive across a real handover)*, HA-16 *(config-convergence
+>   read/bump + sibling reload on the real DB)*, DR-1 *(snapshot serializes a concurrent writer; `snapshot_to`
+>   DBA-delegated + config-only fallback)*, DR-4, DR-9, DR-10 *(backup loop latch/leader-gate/sleep-cancel; preflight
+>   warns-not-raises; failed-reason PHI-scrubbed; symlink-out-of-config-dir excluded — no host-file smuggling)*,
+>   DR-14 *(backup/restore-verify CLI dispatch)*, DR-23 *(failed-drain retry stays active; release_hook non-fatal)*,
+>   DR-27 *(restore-token vintage-floor on SS+PG)*.
+> - **Already-covered (1):** HA-11 (leader-derivation collapse — existing coverage).
+> - **⏸ Rig-deferred (3) — the rig was occupied; reopen when it frees:** STORE-7 *(pooled failover dup/ordering
+>   across a leader change under load — the buildable claim/reclaim slice is already covered by
+>   `test_claim_fifo_heads.py:341`; only the live-crash measurement remains)*, SCALE-6 *(4-shard N-active
+>   zero-loss+scaling bench)*, and STORE-10's **4-engine N-active cert** remainder. These need the SIGKILL-under-load
+>   failover harness / multi-engine crash rig, not an ordinary round-trip.
 
 | ID | Recommended test type | Note |
 |---|---|---|
@@ -204,6 +274,21 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Entry.** P1/P4 backends stable; AWS/NucBox bench rigs available; falsifier-discipline code in place.
 **Exit.** A throughput baseline/gate (or an explicit "harness-only, reported-not-gated" disposition) exists for each item; the parser benchmark exists and measures single-thread + multi-core; the HTTP listener has a flood/slowloris soak; the capacity estimator ships guard-railed and synthetic-only. (Note: 45M/day stays a tracked *capability* measurement, not a unit gate.)
 
+> **◐ STATUS — P5 PARTIAL (2026-07-13): 2 buildable slices closed, 4 dispositioned.** The AWS/NucBox bench rig
+> was **occupied this session**, and several rows are measurement-only by the exit criteria above — so this phase
+> closes the local slices and records honest dispositions for the rest (no fabricated throughput passes).
+> - **Closed (2):** **API-18** — bounded DoS-guard tests (slow-loris → 408 + `idle_timeout`, listener stays live;
+>   `max_connections` flood → `at_capacity`; no-Content-Length body over cap → 413); the thousands-of-connection
+>   soak stays rig-deferred. **PARSE-15** — the previously-**missing** parser benchmark harness now exists
+>   (`tests/test_benchmark_parser.py`) + correctness/determinism/floor guards; the ≥6×/~14× AC-6 scaling gate is
+>   *measured-not-gated* (stock cp314 has the GIL on — an operator-owned cp314t bench figure).
+> - **⏸ Rig-deferred (2):** SCALE-15 (falsifier GO/NO-GO CI smoke), SCALE-18 (1,500-connection reference baseline).
+> - **Measurement-disposition (1):** SCALE-19 — 45M/day = 520.83 ev/s is a tracked capability, **NOT MET, 7.23×
+>   short** (last publishable 72.0 ev/s); the per-message **~16 msg/s delivery ceiling** (STEP-4 Arm-0) is the
+>   binding wall. Re-measure on the rig only.
+> - **🔨 needs-prod-build (1):** SCALE-16 — the `capacity` estimator **CLI subcommand does not exist yet**; flagged
+>   for an owner build decision (it is a feature to build, then unit-test — not a coverage gap to fill with a test).
+
 | ID | Recommended test type | Note |
 |---|---|---|
 | SCALE-19 | perf capability (tracked) | 45M/day = 520.83 events/s sustained; record measurement + gap (7.23x); no in-repo pass/fail — measurement, not unit test. |
@@ -220,6 +305,24 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Rationale.** PHI-relevant host controls (log/data-dir ACLs, config-dir lockdown, least-privilege virtual account) and availability controls (autostart, crash-restart, gMSA logon-right) have no per-step assertion; a miss surfaces only on an end-user box. AD LDAP/Kerberos have no automated leg against a real directory.
 **Entry.** WIN2025 host + AD-lab (per memory: gated Wave 19, #98/#187) available; `windows-service-smoke`/`docker-smoke` legs extendable.
 **Exit.** Install/uninstall/autostart/crash-restart/drain each have an assertion (CI leg or scripted check); ACL lockdowns (data/log/config) asserted non-world-readable; virtual-account default asserted (LocalSystem NOT default); gMSA preflight + SeServiceLogonRight tested; AD LDAP + Kerberos authenticate against the lab directory; k8s HA manifest passes a kubeconform/policy lint (grace > lease TTL, PDB maxUnavailable 1).
+
+> **◐ STATUS — P6 PARTIAL (2026-07-13): 8 unit slices closed, 1 already-covered, 13 infra-bound dispositions.**
+> Most P6 rows need a Windows NSSM service host, a real AD/Kerberos lab, reboot chaos, or CI-only legs — none
+> runnable in this worktree. Rather than commit unverified test code as "passing", this phase closes the genuine
+> Python-unit slices and records honest dispositions for the rest (nothing faked).
+> - **Closed (8, Python-unit, verified here):** CLI-21 *(protect-key off-Windows exit-2 + key-length/base64
+>   validation)*, AUTHN-6 *(ldap3 error/empty-password bind refusal)*, DEPLOY-17 *(mislabeled-instance fail-closed
+>   at serve start)*, DEPLOY-23 *(ShellExecuteW/net dispatch + unsafe-name/off-Windows guards)*, DEPLOY-5 *(graceful
+>   Ctrl+C drain policy lock)*, DEPLOY-7 *(Resolve-Nssm SHA-256 pin fail-closed + TLS-hardened download)*, DEPLOY-18
+>   *(release.yml trusted-publish/tag-gated/mirror-guard/sdist-only-include/leak-gate)*, DEPLOY-26 *(k8s HA manifest
+>   policy: replicas 3, PDB maxUnavailable 1, grace > lease TTL, no HPA/ingress)*.
+> - **Already-covered (1):** DEPLOY-25 (docker non-root + loopback-bind guard).
+> - **⏸ Dispositioned (13) — infra-bound, reopen with the host:**
+>   - *ci-leg-to-add (windows-service-smoke):* DEPLOY-4 (kill→restart + throttle), DEPLOY-6 (rotation excludes bodies),
+>     DEPLOY-8 (virtual-account ObjectName), DEPLOY-11 (icacls ACL + SID order).
+>   - *ps-script-only (PowerShell behavior; needs Windows):* DEPLOY-1, DEPLOY-2, DEPLOY-9, DEPLOY-12, DEPLOY-13, DEPLOY-21.
+>   - *ad-lab (real directory):* AUTHN-7 (SPNEGO/GSSAPI), DEPLOY-10 (gMSA).
+>   - *reboot-chaos:* DEPLOY-3 (post-reboot RUNNING).
 
 | ID | Recommended test type | Note |
 |---|---|---|
@@ -254,6 +357,42 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 **Entry.** P0–P6 in flight; owner input on build-vs-supersede for in-scope surfaces (streaming UI, web HA page).
 **Exit.** Each item has a recorded disposition; dormant primitives have a guard test that they stay off-by-default/unwired; declined/shelved designs are marked superseded in their ADR; genuinely in-scope surfaces (STOREF-18, HA-20) have a build+test ticket.
 
+> **✅ STATUS — P7 CLOSED (2026-07-13): all 15 rows dispositioned.** Two rows the plan listed as unbuilt turned
+> out **already built** (stale plan rows), and no owner-gated build remains in P7.
+> - **Guard tests added (stay-off tripwires):** STOREF-14 — the group-commit `window_ms` **config default is now
+>   pinned to 0.0** (`test_group_commit.py`), so a silent flip that re-enables the WITHDRAWN committer (ADR
+>   0055/0099/0107) is caught. CRIT-2 & DEPLOY-27 got **doc-drift guards** (below).
+> - **Doc-drift corrections:** CRIT-2 — the ADR 0057 inline `handoff` is **not** unwired; it is **wired but
+>   permanently default-OFF** (`wiring_runner.py:4084`, `[transform].inline=False`), already guarded by
+>   `test_inline_fast_path.py` — the stale "unwired" claim was corrected in the plan + ADR 0057 (`test_crit2_inline_doc_drift.py`).
+>   DEPLOY-27 — every setting/env token in `docs/CLOUD-PHI-HIPAA.md` resolves to a real `settings.py` field
+>   (drift-guarded), and one **factual drift was fixed**: the doc claimed no TLS-syslog variant, but
+>   `SyslogProtocol.TLS` / `[logging].forward_tls_*` exist (ADR 0080) (`test_cloud_phi_hipaa_doc_drift.py`).
+> - **ADR supersede/shelved edits (in place):** MLLP-22 + ALERT-22 (one decision) — ADR 0020's raw-frame
+>   `protocol_trace` tier marked **superseded/never-built** (the metadata subset shipped as MLLP-21/ADR 0021 §7).
+>   SCALE-17 — ADR 0039 database-tier sharding L5 marked **DECLINED** (superseded by ADR 0063; commit-wall trigger
+>   void). HA-17 — engine-managed VIP failover stays **unbuilt/declined-default** (external VRRP/WSFC/L4-LB shipped).
+> - **Recorded dispositions (no build):** HA-18 (`/cluster/stepdown` endpoint unbuilt; the `_release_leadership()`
+>   primitive is covered via HA-4), AUTHN-19 (Kerberos/IdP session-lifetime — open CISO item, build if prioritized),
+>   RBAC-18 (static-analysis accepted-risk register — doc control; mitigations already tested), SCALE-7 (cp314t
+>   re-arch is an evaluation — keep the weekly canary), UI-32 (client `app.js` has no browser toolchain — accept-by-design).
+> - **🔎 Already built (plan rows were STALE — no build needed):** **STOREF-18** — the streaming-attachment operator
+>   read/download surface shipped as ADR 0105 Phase 3b (#149 COMPLETE, 2026-07-13). **HA-20** — the web console
+>   already renders/consumes the cluster page (`messagefoundry_webconsole/routes/status.py:113`,
+>   `pages/monitoring.py:299`); the "PySide6-only" premise is stale.
+>
+> **The only genuine open feature decision from the whole P0–P7 campaign is SCALE-16** (P5): the `capacity`
+> estimator CLI subcommand does not exist yet — an owner build-or-decline call.
+>
+> ⛔ **UPDATE (2026-07-14) — SCALE-16 is now BUILD GATED.** A validity re-check of its governing
+> [ADR 0074](../adr/0074-adopter-capacity-estimator.md) against the STEP-4 Arm-0 findings returned **14 confirmed
+> blockers in the MEASUREMENT method** — the ADR's named "*only* success gate" over-reports the ceiling by **3–5.5×**
+> (`R ≤ C·(1 + D/H)`), the poller-zero failure mode **satisfies** that gate, the per-step estimand is **intake
+> acceptance, not delivery** (the exact conflation Arm 0 retracted), the aggregate-is-the-sum rule is
+> **measured-false (~11× over-report)**, and the ceiling is an unstated **instant-partner** bound. The ADR's
+> **premise, hard requirements, and fail-closed GUARD layer still hold and remain buildable** (AC-1/3/5/6). The
+> measurement layer (AC-2/AC-4) awaits owner re-ratification of the sustain gate + estimand. See the ADR Amendment.
+
 | ID | Recommended action | Note |
 |---|---|---|
 | STOREF-18 | build + test (in scope) | Streaming-attachment operator read/download UI — sole remaining ADR 0105 phase; new PHI-read surface, design-first. |
@@ -261,8 +400,8 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 | ALERT-22 | supersede decision | Duplicate of MLLP-22 (same ADR 0020) — resolve as one decision. |
 | AUTHN-19 | design/defer | Kerberos/IdP session-lifetime coordination (ADR 0079) — record open CISO item; build only if prioritized. |
 | STOREF-14 | dormant-guard | Group-commit committer WITHDRAWN (ADR 0099/0107) — guard test it stays off (window=0); no new perf tests. |
-| CRIT-2 | dormant-guard | ADR 0057 inline `handoff` primitive built+tested but unwired — guard test it stays unwired; add to inventory. |
-| SCALE-17 | record only | Database-tier sharding L5 SHELVED (ADR 0039/0063) — nothing to test unless commit-wall trigger fires. |
+| CRIT-2 | doc-drift-guard | ADR 0057 inline `handoff` is WIRED into `_router_worker` (`wiring_runner.py:4084`) but DEFAULT-OFF (`[transform].inline=False`, `wiring.py:1997`); DO-NOT-PROMOTE per ADR 0057 banner + ADR 0107 measured dead-end. Correct the stale "unwired" claim; default-OFF already guarded by `tests/test_inline_fast_path.py::test_inline_off_uses_split_path_and_processes` + the config-default guard (`tests/test_crit2_inline_doc_drift.py`). |
+| SCALE-17 | record only | Database-tier sharding L5 DECLINED by ADR 0063 (ADR 0039 status edited 2026-07-13) — the commit-wall activation trigger is VOID; no-split rule guarded by test_sharding.py. |
 | HA-17 | design/defer | Engine-managed VIP failover UNBUILT (ADR 0056) — external VRRP/WSFC/L4-LB is shipped default. |
 | HA-18 | design/defer | Planned-failover `/cluster/stepdown` UNBUILT — underlying `_release_leadership()` tested (HA-4). |
 | HA-20 | build + test (in scope) | Web-console HA/cluster page (web console is in scope; `/cluster/*` consumed only by deprecated PySide6). |
@@ -398,7 +537,7 @@ Phases run largely in order: P0 establishes trust anchors that later phases assu
 | ALERT-22 | Alerting & observability | Protocol-level capture UNBUILT (dup MLLP-22) | none | med | L | P7 |
 | AUTHN-19 | Authentication | Kerberos/IdP session-lifetime coord (design-only) | none | med | L | P7 |
 | STOREF-14 | Store operational features | Group-commit committer dormant/withdrawn guard | partial | low | S | P7 |
-| CRIT-2 | Pipeline / throughput (ADR 0057) | Inline handoff primitive dormant/unwired guard | none | low | S | P7 |
+| CRIT-2 | Pipeline / throughput (ADR 0057) | Inline handoff wired-but-default-OFF (doc-drift) guard | partial | low | S | P7 |
 | SCALE-17 | Sharding / throughput | Database-tier sharding L5 SHELVED (record only) | none | low | S | P7 |
 | HA-17 | HA / clustering | Engine-managed VIP failover UNBUILT | none | low | L | P7 |
 | HA-18 | HA / clustering | Planned-failover /cluster/stepdown UNBUILT | none | low | M | P7 |
@@ -421,7 +560,7 @@ Enumerated all 108 `docs/adr/*.md` (0001–0107; 0097 & 0106 absent, 0013 duplic
 | Subsystem | Missing | Risk | Why it matters |
 |---|---|---|---|
 | Crypto / key management (**ADR 0019**) | Pluggable **KeyProvider** seam (auto/env/dpapi/**vault** envelope decryption of the store DEK), `crypto.py` AEAD primitives, DEK rotation/legacy-migrate, and the connector **SecretProvider** (AD-bind + SMTP credential sourcing). Code: `store/keyprovider.py`, `config/secretprovider.py`, `config/secretprovider_vault.py`, `pipeline/secret_rotation.py`. Tests: `test_keyprovider`, `test_keyprovider_vault`, `test_secretprovider`, `test_secret_rotation`, `test_secrets_dpapi`, `test_backup_crypto`. | **high** | Root of trust for all at-rest PHI encryption + live credential sourcing. Only ever named as an "overlap" (STORE-19) or "not covered here" (ALERT-5). No row owns Vault/KMS/HSM decryption, DPAPI unwrap, or SecretProvider fail-closed. |
-| Pipeline / throughput (**ADR 0057**) | Dormant `handoff` inline Step-A fast-path (ingress→outbound single-txn): built + 3-backend-mirrored, **wired into nothing** (only tests call `.handoff(`). | low | Same dormant-shipped hazard as group-commit (STOREF-14). Needs a dormant/withdrawn marker + a stays-unwired guard, not perf tests — but it's absent from the inventory entirely. |
+| Pipeline / throughput (**ADR 0057**) | `handoff` inline Step-A fast-path (ingress→outbound single-txn): built + 3-backend-mirrored, **WIRED into `_router_worker`** (`wiring_runner.py:4084`) but **DEFAULT-OFF** (`[transform].inline=False`, `wiring.py:1997`); DO-NOT-PROMOTE per the ADR 0057 banner + ADR 0107 (measured dead-end). | low | NOT a stays-unwired hazard — the earlier "wired into nothing / only tests call `.handoff(`" claim was **stale**: the primitive IS wired, gated permanently OFF by the config default. Guarded by the default-OFF path test (`tests/test_inline_fast_path.py::test_inline_off_uses_split_path_and_processes`) + a config-default/doc-drift guard (`tests/test_crit2_inline_doc_drift.py`); no perf tests. |
 | Secret-rotation alerting (**ADR 0019 §5.1 / #195b**) | `secret_rotation` reminder emitter only glancingly folded into ALERT-12 (partial); `test_secret_rotation.py` unattributed. | med | If it stops emitting (the `_ALERT_EVENT_TYPES` membership defect ALERT-12 flags for siblings), DEK/credential rotation reminders vanish with no coverage owner. |
 
 ### Disputes (coverage claims that look wrong)
@@ -443,7 +582,7 @@ Enumerated all 108 `docs/adr/*.md` (0001–0107; 0097 & 0106 absent, 0013 duplic
 
 **Scope.** MLLP inbound/outbound + raw TCP + the shared delimiter-framing codec, ACK/NAK build & classify, TLS (server/mTLS/verify posture), per-outbound encoding-character override, persistent outbound connections (ADR 0067), inbound ACK capture and the pre-ingress connection-event log (ADR 0021), plus the designed-but-unbuilt protocol diagnostic capture (ADR 0020). Code: `messagefoundry/transports/{mllp.py,tcp.py,framing.py,signing.py,base.py}`.
 
-**Coverage summary.** Functional coverage is broad and in several places exhaustive (ADR 0067 ships all 12 ACs as named tests; TLS, encoding-override, framing, DoS guards, cleartext-hop refusal, and peer-IP allowlist are all well tested). The concrete gaps for the plan are: (1) ADR 0020 protocol-diagnostic capture is unbuilt; (2) persistent-MLLP has no automated perf/throughput regression (bench-harness only); (3) the store-touching capture features (response/ack/connection-event) are asserted on SQLite only, so SQL Server / Postgres parity is unproven; (4) AckMode=NONE end-to-end suppression and ack_after crash-recovery are only indirectly covered; (5) no negative mTLS-handshake-rejection assertion on the accept path.
+**Coverage summary.** Functional coverage is broad and in several places exhaustive (ADR 0067 ships all 12 ACs as named tests; TLS, encoding-override, framing, DoS guards, cleartext-hop refusal, and peer-IP allowlist are all well tested). The concrete gaps for the plan are: (1) ADR 0020 protocol-diagnostic capture is unbuilt; (2) persistent-MLLP has no automated perf/throughput regression (bench-harness only); (3) the connection-event log (ADR 0021 §7) is asserted on SQLite only, so SQL Server / Postgres parity is unproven for that one store-touching capture feature (`record_connection_event`/`list_connection_events` are implemented on all three backends, but `tests/test_connection_event_*.py` is SQLite-only) — **response + ack capture parity ARE pinned on both server backends** (`test_sqlserver_store.py::test_complete_with_response_captures_and_finalizes` + `test_postgres_store.py::test_complete_with_response_parity`, each asserting the `ack_sent` rows, plus the end-to-end capture/re-ingress loop in `test_x12_rte.py`); (4) AckMode=NONE end-to-end suppression and ack_after crash-recovery are only indirectly covered; (5) no negative mTLS-handshake-rejection assertion on the accept path.
 
 | ID | Feature / sub-feature | ADR | Existing evidence | Coverage | Gaps (by dimension) | Risk | Effort |
 |---|---|---|---|---|---|---|---|
@@ -1096,7 +1235,7 @@ Recommended tests to close gaps:
 | SCALE-14 | Group-commit committer (SQLite; ADR 0055 WITHDRAWN as lever) | 0055 | test_group_commit.py | covered | superseded/withdrawn; default off; PHI ACK-durability covered | low | S |
 | SCALE-15 | Falsifier-discipline harness (GO/NO-GO, reconcile, CPU attribution) | 0101,0098,0107 | test_connscale_fuse/batch/compare/fuse_replay, shardcert_ladder, shardcert_multiproc, multishard_record, connscale_cpu_probe | partial | verdict/reconcile CODE tested; live rig runs + artifacts off-repo | med | M |
 | SCALE-16 | Adopter capacity estimator (`messagefoundry capacity`) | 0074 | (harness/load via connscale suite only) | none | subcommand + AC-1..6 UNBUILT; isolated-store/backend-labels/synthetic-only untested | med | L |
-| SCALE-17 | Database-tier sharding L5 (K clusters + read-offload) | 0039,0063 | — | none | SHELVED / declined; no code, nothing to test | low | S |
+| SCALE-17 | Database-tier sharding L5 (K clusters + read-offload) | 0039,0063 | — | none | DECLINED by ADR 0063; commit-wall trigger VOID; no code; no-split rule guarded by test_sharding.py | low | S |
 | SCALE-18 | Connection-scale harness / 1,500-conn axis | 0052,0066 | test_connscale_config/driver/smoke/postgres/profile/report/cpu_probe | partial | perf: ADR 0052 AC-2 (1,500 conns live) not in CI | med | M |
 | SCALE-19 | Enterprise target end-to-end (45M/day sustained) | 0052,0098,0107 | — | none | perf: NOT met (72.0 ev/s publishable, 7.23x short); wall UNNAMED; #40 pending | high | L |
 
@@ -1104,7 +1243,7 @@ Recommended tests to close gaps:
 - SCALE-9: add the ADR-0075 AC-2 node — a batched-handoff (`batch_handoff_statements=ON`) crash/`reset_stale_inflight` replay on the SQL Server leg asserting zero loss + zero duplicate next-stage rows (the one hole in an otherwise strong lever).
 - SCALE-6: promote the two-box shardcert N-active bench to a gated leg (even a small 2–4 engine, one server-DB, zero-loss + per-lane-FIFO reconcile) so the "unified store under real multi-shard load is UNMEASURED" risk has a reproducible in-repo gate; add a Postgres N-active recovery leg to complement SCALE-5's SS-only coverage.
 - SCALE-13: parametrize `test_outbound_batch.py` / `test_batch_completion.py` fixtures to add a Postgres leg (currently SQLite+SS only) so `mark_batch_done/failed/dead_letter_batch` atomicity is verified on all three backends.
-- SCALE-16: build + test the capacity estimator's fail-closed guards first (isolated-store refusal AC-1, synthetic-only AC-5, sink-cap AC-6, poller-zero knee AC-4, backend-aware labels AC-3) — these are correctness/PHI-safety assertions independent of any live number.
+- SCALE-16: ⛔ **BUILD GATED (2026-07-14)** — see the [ADR 0074 Amendment](../adr/0074-adopter-capacity-estimator.md). Build + test the fail-closed guards first (isolated-store refusal **AC-1**, synthetic-only **AC-5**, backend-aware labels **AC-3**, sink-cap **AC-6** *— but AC-6 must gain an `INCONCLUSIVE` outcome*): these are correctness/PHI-safety assertions independent of any live number and remain buildable. ⚠️ **CORRECTION — `AC-4` (poller-zero knee) is NOT in that set and must NOT be built as written: it is CIRCULAR.** `/stats` returns `in_pipeline = 0` under overload, and the drain gate *requires* `in_pipeline == 0`, so the poller-zero failure mode **satisfies** the gate — an overloaded rung reads as a clean drain, and AC-4's remedy is to fall back to a knee read from the same zeroed fields. The **measurement layer** (AC-2/AC-4) is gated pending owner re-ratification of the sustain gate + estimand.
 - SCALE-15/19: land the pre-registered handoff/handback rig artifacts (redacted) under `docs/benchmarks/results/` per ADR 0101's open question, so the measurement conclusions are auditable from the repo; add the engine-side per-PID CPU falsifier once the collector fix (#861) is confirmed live (ADR 0107 frontier).
 - SCALE-7: no new tests until the H1a DB-owner-loop re-arch (#90) is built — the canary is the correct current artifact; do not treat free-threading as a testable shipped feature yet.
 
@@ -1264,7 +1403,7 @@ Recommended tests to close gaps:
 | CFG-19 | Credential-fault lane stop (retain rows un-errored) | 0095 | test_credential_fault_stop | partial | backend: release_claimed retain-un-errored SQLite-only | med | M |
 | CFG-20 | Timer-scheduled source (interval/run_once, leader-gate) | 0011 | test_timer_source | covered | ha: leader-gate via injected gate, not real cluster | low | S |
 | CFG-21 | Auto-start (#115) | 0095 | test_auto_start | covered | — | low | S |
-| CFG-22 | Deterministic Corepoint import → code-first handlers | 0086 | test_corepoint_import, test_lens_parse | partial | func: input schema synthetic-until-validated; routing not derived | low | M |
+| CFG-22 | Deterministic Corepoint import → code-first handlers | 0086 | test_corepoint_import, test_lens_parse | partial | func: schema validated (XML `<Package>`, 2026-07-24) but the verb mapping is narrow; routing + connection subtrees not derived | low | M |
 | CFG-23 | Reference-set / live-lookup declaration surface | 0006/0010/0043 | test_reference_sets, test_accepts_seam | covered | runtime is a sibling subsystem (overlap noted) | low | S |
 
 **Recommended tests to close gaps**

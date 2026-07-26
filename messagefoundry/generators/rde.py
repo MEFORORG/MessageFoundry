@@ -13,10 +13,10 @@ from __future__ import annotations
 
 import random
 
-from messagefoundry.parsing import validate
 from messagefoundry.generators import _core
 from messagefoundry.generators import _hl7data as d
 from messagefoundry.generators._core import Ctx, MessageSpec, next_seq, seg
+from messagefoundry.parsing import validate
 
 
 def _build_rxe(rng: random.Random, ctx: Ctx) -> str:

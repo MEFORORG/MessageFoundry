@@ -13,15 +13,18 @@ import pytest
 pytest.importorskip("fhir.resources")
 pytest.importorskip("fhirpathpy")
 
-from messagefoundry.parsing import FhirPeek, FhirResource  # noqa: E402  (after importorskip, by design)
-from messagefoundry.parsing.fhir import FhirError, FhirValidationError  # noqa: E402
-
 from _fhir_fixtures import (  # noqa: E402
     INVALID_PATIENT_WITH_CANARY,
     PATIENT_R4B,
     PHI_CANARY,
     as_json,
 )
+
+from messagefoundry.parsing import (  # noqa: E402  (after importorskip, by design)
+    FhirPeek,
+    FhirResource,
+)
+from messagefoundry.parsing.fhir import FhirError, FhirValidationError  # noqa: E402
 
 
 def test_peek_evaluate_fhirpath() -> None:

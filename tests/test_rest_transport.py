@@ -151,7 +151,7 @@ def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPat
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200 (ADR 0092): the global escape now only DOWNGRADES REFUSE→WARN on a NON-production instance
     # (decision 2). Under a non-prod PHI posture it warns-and-builds; on production it would refuse.
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
     assert dest._opener is not None
 
@@ -174,7 +174,7 @@ def test_rest_credentials_over_cleartext_http_allowed_with_escape(
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = build_destination(
             Destination(
                 name="OB",
@@ -229,7 +229,7 @@ def test_rest_cleartext_http_nonloopback_allowed_with_escape(
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = build_destination(
             Destination(
                 name="OB",
@@ -335,6 +335,44 @@ async def test_rest_dynamic_headers_dont_clobber_authorization() -> None:
     await dest.send("x", metadata={"http.header.Authorization": "Bearer attacker"})
     req = opener.requests[0]
     assert req.get_header("Authorization") == "Bearer tok"
+
+
+# --- ASVS 15.3.2: HTTP redirects are refused, never followed (HTTPFHIR-28) -------------------------
+
+
+@pytest.mark.parametrize("code", [301, 302, 303, 307, 308])
+async def test_rest_3xx_redirect_is_refused_permanent_never_followed(code: int) -> None:
+    # A 3xx could divert a PHI-bearing POST to an unintended host. _NoRedirectHandler makes urllib
+    # raise the redirect as an HTTPError; send() must classify it PERMANENT (dead-lettered), never
+    # follow it and never retry it (a retry would keep re-offering the PHI body to the divert target).
+    dest = _dest()
+    dest._opener = _FakeOpener(_http_error(code))  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as ei:
+        await dest.send("x")
+    assert ei.value.permanent is True  # dead-lettered, not retried
+    assert ei.value.code == str(code)  # classified as this exact redirect status
+    # It is NOT a transient DeliveryError (which the retry loop would re-attempt).
+    assert isinstance(ei.value, NegativeAckError)
+
+
+def test_no_redirect_handler_refuses_redirect_and_is_wired_into_default_opener() -> None:
+    from messagefoundry.transports import rest
+
+    # The handler itself returns None (→ urllib raises the 3xx instead of following it to `newurl`,
+    # here a hostile off-host target that would receive the PHI POST).
+    handler = rest._NoRedirectHandler()
+    result = handler.redirect_request(
+        urllib.request.Request("https://api.example.com/x"),
+        None,
+        302,
+        "Found",
+        email.message.Message(),
+        "https://evil.example/y",
+    )
+    assert result is None  # refuses to build a follow-up request → no redirect
+
+    # And the refusal is wired into the shared verifying opener, so every REST delivery inherits it.
+    assert any(isinstance(h, rest._NoRedirectHandler) for h in rest._NO_REDIRECT_OPENER.handlers)
 
 
 def test_outbound_headers_from_metadata_is_pure_and_sanitizing() -> None:

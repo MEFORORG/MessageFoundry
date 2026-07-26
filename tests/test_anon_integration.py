@@ -10,12 +10,12 @@ import json
 
 import pytest
 
-from messagefoundry.anon import anonymize
-from messagefoundry.transports.mllp import frame
 from harness.load.corpus import corpus_from_file
 from harness.load.ids import ControlIds
 from harness.load.profile import LoadProfileError, TypeMix
 from harness.reconcile.capture import CaptureSink
+from messagefoundry.anon import anonymize
+from messagefoundry.transports.mllp import frame
 from tee.__main__ import main as tee_main
 from tee.store import RelayStore
 

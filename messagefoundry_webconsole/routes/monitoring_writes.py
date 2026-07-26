@@ -13,6 +13,7 @@ from pydantic import ValidationError
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
+    AlertSuspendRequest,
     StatsResetRequest,
     StatsResetTarget,
 )
@@ -43,7 +44,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.MONITORING_DIAGNOSE)),
     ) -> Response:
         assert_same_origin(request)
-        await core.ack_alert(alert_id, engine=engine, identity=identity)
+        await core.ack_alert(alert_id, engine=engine, identity=identity, request=request)
         return RedirectResponse("/ui/alerts", status_code=303)
 
     @app.post("/ui/alerts/{alert_id}/resolve")
@@ -54,7 +55,39 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui(Permission.MONITORING_DIAGNOSE)),
     ) -> Response:
         assert_same_origin(request)
-        await core.resolve_alert(alert_id, engine=engine, identity=identity)
+        await core.resolve_alert(alert_id, request=request, engine=engine, identity=identity)
+        return RedirectResponse("/ui/alerts", status_code=303)
+
+    @app.post("/ui/alerts/{alert_id}/suspend")
+    async def ui_suspend_alert(
+        alert_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MONITORING_DIAGNOSE)),
+    ) -> Response:
+        # #143 windowed suspend: the mute duration arrives as a `minutes` hidden/select form field; build
+        # the typed request and reuse the single audited JSON handler (scope check + store + notifier cache
+        # + audit). An out-of-range/undecodable value falls back to 60 minutes; core 404s an unknown id.
+        assert_same_origin(request)
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        try:
+            body = AlertSuspendRequest(minutes=float(form.get("minutes") or "60"))
+        except (ValueError, ValidationError):
+            body = AlertSuspendRequest(minutes=60.0)
+        await core.suspend_alert(
+            alert_id, body=body, request=request, engine=engine, identity=identity
+        )
+        return RedirectResponse("/ui/alerts", status_code=303)
+
+    @app.post("/ui/alerts/{alert_id}/resume")
+    async def ui_resume_alert(
+        alert_id: int,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.MONITORING_DIAGNOSE)),
+    ) -> Response:
+        assert_same_origin(request)
+        await core.resume_alert(alert_id, request=request, engine=engine, identity=identity)
         return RedirectResponse("/ui/alerts", status_code=303)
 
     @app.post("/ui/statistics/reset")
@@ -65,7 +98,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     ) -> Response:
         assert_same_origin(request)
         # The status-page "Reset statistics" button zeroes ALL cumulative counters.
-        await core.reset_statistics(StatsResetRequest(all=True), engine=engine, identity=identity)
+        await core.reset_statistics(
+            StatsResetRequest(all=True), engine=engine, identity=identity, request=request
+        )
         return RedirectResponse("/ui/status", status_code=303)
 
     @app.post("/ui/statistics/reset-one")
@@ -97,7 +132,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         except ValidationError:
             return RedirectResponse("/ui", status_code=303)
         await core.reset_statistics(
-            StatsResetRequest(targets=[target]), engine=engine, identity=identity
+            StatsResetRequest(targets=[target]), engine=engine, identity=identity, request=request
         )
         return RedirectResponse("/ui", status_code=303)
 
@@ -135,7 +170,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             except ValidationError:
                 continue
         await core.reset_statistics(
-            StatsResetRequest(targets=targets), engine=engine, identity=identity
+            StatsResetRequest(targets=targets), engine=engine, identity=identity, request=request
         )
         return RedirectResponse("/ui", status_code=303)
 

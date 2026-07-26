@@ -28,7 +28,9 @@ import asyncio
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from messagefoundry.config.settings import StoreSettings
 from messagefoundry.store.store import (
     MessageStatus,
     MessageStore,
@@ -146,7 +148,8 @@ async def test_group_rollback_reruns_all_via_store_api(store: MessageStore) -> N
         )
 
     results = await asyncio.gather(
-        *(do_handoff(m, it) for m, it in zip(mids, items)), return_exceptions=True
+        *(do_handoff(m, it) for m, it in zip(mids, items)),  # noqa: B905
+        return_exceptions=True,  # noqa: B905
     )
     # Every co-batched caller was rejected (rolled back together) — not just the failing one.
     assert all(isinstance(r, Exception) for r in results), results
@@ -164,7 +167,7 @@ async def test_group_rollback_reruns_all_via_store_api(store: MessageStore) -> N
     armed["boom"] = False
     store._event = real_event  # type: ignore[method-assign]
     assert await store.reset_stale_inflight(stage=Stage.INGRESS.value) == 3
-    for mid in mids:
+    for mid in mids:  # noqa: B007
         item = await _claim_ingress(store, "IB")
         assert item is not None
         assert await store.route_handoff(
@@ -451,7 +454,7 @@ async def test_committer_resolves_each_member_with_its_own_result(tmp_path: Path
     try:
         gc = s._group_commit
         assert gc is not None
-        out = await asyncio.gather(*(gc.submit((lambda n=n: _ret(n))) for n in range(5)))
+        out = await asyncio.gather(*(gc.submit(lambda n=n: _ret(n)) for n in range(5)))
         assert out == [0, 1, 2, 3, 4]
     finally:
         await s.close()
@@ -623,3 +626,42 @@ async def test_disabled_path_has_no_committer_and_publishes_state(tmp_path: Path
         assert ("ns", "k_rb_disabled") not in s.state_view()  # rolled back → never published
     finally:
         await s.close()
+
+
+# --- dormant guard: group-commit is WITHDRAWN (ADR 0055/0099/0107) and MUST stay off by default ---
+#
+# The committer above is reliability-core code that ships DORMANT: it only spins when
+# `group_commit_window_ms > 0`, and the measured verdict (ADR 0107, elasticity −0.115) withdrew the
+# lever as a dead end. `test_disabled_path_has_no_committer_and_publishes_state` already pins the
+# MessageStore.open constructor default (no arg → `._group_commit is None`). What was UNGUARDED is the
+# StoreSettings config-field default that GATES that constructor: a silent flip of settings.py's
+# `group_commit_window_ms` to a >0 window would re-enable the withdrawn lever undetected. These pin it.
+
+
+def test_group_commit_window_config_default_is_off() -> None:
+    """The StoreSettings config default MUST stay 0.0 (group-commit disabled). This is the field that
+    gates the committer — flipping it to >0 would silently re-enable a WITHDRAWN reliability-core lever
+    (ADR 0055 SUPERSEDED/WITHDRAWN, ADR 0099 Decision 1, ADR 0107 closes Phase 4 as a dead end)."""
+    settings = StoreSettings()
+    assert settings.group_commit_window_ms == 0.0  # 0 == disabled: the off-by-default gate
+    assert settings.group_commit_max_batch == 64  # batch cap unchanged (only relevant once enabled)
+
+
+async def test_open_with_config_default_window_constructs_no_committer(tmp_path: Path) -> None:
+    """End-to-end dormancy: opening a store with the StoreSettings default window constructs NO
+    committer coroutine. Ties the config-field default to the runtime effect the field governs, so the
+    withdrawn lever stays wholly off along the real open() path, not just in the constructor default."""
+    s = await MessageStore.open(
+        tmp_path / "cfg_default.db", group_commit_window_ms=StoreSettings().group_commit_window_ms
+    )
+    try:
+        assert s._group_commit is None  # dormant: no committer when the config default gates it off
+    finally:
+        await s.close()
+
+
+def test_negative_group_commit_window_rejected() -> None:
+    """The validator still rejects a negative window (an always-flush committer with no coalescing
+    benefit) — so the only reachable states remain 0 (disabled, default) or a deliberate >0 opt-in."""
+    with pytest.raises(ValidationError, match="group_commit_window_ms must be >= 0"):
+        StoreSettings(group_commit_window_ms=-1.0)

@@ -12,8 +12,9 @@ dead-letter). Verified on **both** SQLite and (gated) SQL Server.
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -34,12 +35,34 @@ async def _open_sqlserver() -> Any:
     return store
 
 
-@pytest.fixture(params=["sqlite", "sqlserver"])
+async def _open_postgres() -> Any:
+    from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.postgres import PostgresStore
+
+    store = await PostgresStore.open(load_settings(environ=os.environ).store)
+    # Canonical Postgres clean-slate (test_postgres_store.py): one TRUNCATE ... CASCADE, then reload the
+    # read-through caches from the empty tables. Postgres has no separate `outbox` table (the SS list's
+    # `outbox` is a SQL Server artifact) — the staged queue is the unified `queue` table.
+    async with store._pool.acquire() as conn:
+        await conn.execute(
+            "TRUNCATE message_events, state, queue, response, delivered_keys, messages"
+            " RESTART IDENTITY CASCADE"
+        )
+    await store._load_state_cache()
+    await store._load_reference_cache()
+    return store
+
+
+@pytest.fixture(params=["sqlite", "sqlserver", "postgres"])
 async def store(request: Any, tmp_path: Path) -> AsyncIterator[Any]:
     if request.param == "sqlserver":
         if not os.getenv("MEFOR_TEST_SQLSERVER"):
             pytest.skip("set MEFOR_TEST_SQLSERVER=1 (+ MEFOR_STORE_* env) for the SQL Server leg")
         s = await _open_sqlserver()
+    elif request.param == "postgres":
+        if not os.getenv("MEFOR_TEST_POSTGRES"):
+            pytest.skip("set MEFOR_TEST_POSTGRES=1 (+ MEFOR_STORE_* env) for the Postgres leg")
+        s = await _open_postgres()
     else:
         s = await MessageStore.open(tmp_path / "batch.db")
     yield s
@@ -148,7 +171,7 @@ async def test_dead_letter_batch_skips_vanished(store: Any) -> None:
 def _descending(mids: list[str], ids: list[str]) -> list[str]:
     """Outbox ids ordered so their message_ids DESCEND — the worst case for the pre-fix code, and
     deterministic: for n>=2 distinct ids, descending can never coincide with ascending."""
-    return [i for _m, i in sorted(zip(mids, ids), reverse=True)]
+    return [i for _m, i in sorted(zip(mids, ids), reverse=True)]  # noqa: B905
 
 
 async def _finalize_order(store: Any, monkeypatch: pytest.MonkeyPatch) -> list[str]:

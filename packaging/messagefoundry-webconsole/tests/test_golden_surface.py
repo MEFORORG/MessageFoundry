@@ -22,12 +22,11 @@ from pathlib import Path
 import httpx
 from starlette.routing import Mount
 
+import messagefoundry_webconsole._auth as ui_auth
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-
-import messagefoundry_webconsole._auth as ui_auth
 
 _GOLDEN = Path(__file__).resolve().parent / "golden"
 

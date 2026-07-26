@@ -19,17 +19,23 @@ address, (2) puts TLS in front of it, and (3) browses to the `https://…/ui` UR
 
 ## 1. Engine side — bind off-loopback, with TLS
 
-By default `[api].host = 127.0.0.1`. To accept remote connections, set it to a specific NIC address
-or `0.0.0.0`, and configure TLS — an off-loopback bind without TLS is **refused at startup** (the
-bearer token and PHI would cross the network in cleartext).
+By default the engine is loopback-only. To accept remote connections, turn
+`[security].local_access_only` off and name the bind address in `[security].listen_address`, then
+configure TLS — an off-loopback bind without TLS is **refused at startup** (the bearer token and PHI
+would cross the network in cleartext). (`[api].host` was the old spelling; [ADR
+0118](adr/0118-secure-by-default-security-configuration-section.md) moved the bind/console/origin
+switches to `[security]` and setting them in `[api]` is now **refused at config load**.)
 
 ### Option A — in-process TLS (simplest for a single engine host)
 
 The engine (uvicorn) terminates TLS itself and serves `https`/`wss`. Configure in `messagefoundry.toml`:
 
 ```toml
+[security]
+local_access_only = false        # reachable from off this machine
+listen_address = "0.0.0.0"       # or a specific NIC, e.g. "10.0.0.12"
+
 [api]
-host = "0.0.0.0"                 # or a specific NIC, e.g. "10.0.0.12"
 port = 8765
 tls_cert_file = "C:/mefor/tls/engine-cert.pem"   # PEM cert (chain); PEM paths, not secrets
 tls_key_file  = "C:/mefor/tls/engine-key.pem"    # may be omitted if the key is bundled in the cert PEM
@@ -42,16 +48,37 @@ Use a cert whose SAN matches the hostname/IP the console will dial. An internal/
 
 ### Option B — TLS terminated upstream (reverse proxy / load balancer)
 
-A proxy (nginx, IIS/ARR, HAProxy, a k8s ingress) terminates TLS and forwards plaintext to the engine
-on loopback. Tell the engine a terminator is in front so the off-loopback gate is satisfied and the
+A proxy (nginx, IIS/ARR, HAProxy, a k8s ingress) terminates TLS and forwards plaintext to the engine.
+Tell the engine a terminator is in front so the off-loopback gate is satisfied and the
 audit/rate-limit source IP is the real client:
 
 ```toml
+[security]
+local_access_only = false        # or keep the engine on loopback if the proxy is on this same host
+listen_address = "0.0.0.0"
+
 [api]
-host = "0.0.0.0"
 tls_terminated_upstream = true
 trusted_proxies = ["10.0.0.5"]   # the proxy's address(es) — REQUIRED; empty trusts nothing
+# Posture-B attestations. The engine terminates NO browser TLS here, so it can observe neither the
+# proxy->engine hop nor the TLS floor the proxy offers browsers — both are operator DECLARATIONS,
+# and a PHI instance on an off-loopback bind REFUSES to start without them.
+proxy_intra_service_auth = "network"   # "mtls" | "network" | "shared_secret"
+# ASVS 12.1.1 — the browser-facing TLS floor. This line is an ATTESTATION worth exactly what your
+# proxy config says: pin the floor in the PROXY (the reference fences linked below pin TLSv1.2 +
+# TLSv1.3) and declare here the LOWEST version that fence still permits. Declaring "1.3" in front
+# of a proxy that still accepts TLS 1.2 is a false attestation the engine cannot catch.
+proxy_tls_min_version = "1.2"
 ```
+
+**The `proxy_tls_min_version` line is not the control — your proxy configuration is.** Copy a
+reference terminator config whole from
+[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+(nginx, Caddy, or IIS + ARR — each pins an explicit protocol floor plus forward-secret ciphers and
+key-exchange groups) and keep the fence and this declaration in step: narrow the proxy to TLS 1.3
+only and you must raise `proxy_tls_min_version` to `"1.3"` in the same change. That page also
+carries the recommended hardening for an exposed console (client-certificate device posture,
+`web_console_public_address`, the full startup ladder).
 
 ### Authentication at exposure
 
@@ -122,7 +149,7 @@ present one so the console authenticates by certificate as well as the bearer to
 |---|---|
 | `CERTIFICATE_VERIFY_FAILED` / "not trusted by the trust provider" | The engine cert isn't trusted by this PC. Use `--cacert <pem>`, or install the issuing CA into the OS trust store. |
 | `refusing to use plaintext http to non-loopback host …` | You used an `http://` URL to a remote host. Use `https://` (configure engine TLS), or `--insecure` only for a trusted dev network. |
-| Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[api].host` without TLS. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` (Option B). |
+| Engine won't start: `refusing to serve … on non-loopback host` | An off-loopback `[security].listen_address` without TLS. Configure `tls_cert_file` (Option A) or `tls_terminated_upstream` + `trusted_proxies` (Option B). |
 | Hostname mismatch on connect | The engine cert's SAN doesn't include the host/IP in `--url`. Reissue the cert with the right SAN. |
 
 The console reads over HTTP polling (no WebSocket client), so "live" views refresh at the poll

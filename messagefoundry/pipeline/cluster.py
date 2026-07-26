@@ -69,6 +69,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol, runtime_checkable
 from uuid import uuid4
 
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.redaction import safe_exc
 
 log = logging.getLogger(__name__)
@@ -367,9 +368,14 @@ class DbCoordinator:
         promotable: bool = True,
         db_schema: str | None = None,
         monotonic: Callable[[], float] = time.monotonic,
+        alert_sink: AlertSink | None = None,
     ) -> None:
         self._pool = pool
         self.node_id = node_id
+        # #145: emit an alert on every leadership transition (acquire / lose / self-fence / release) so a
+        # failover is never silent. None → the default LoggingAlertSink (logs the transition). Threaded in
+        # lockstep with SqlServerCoordinator; NullCoordinator (single node) never transitions, so byte-identical.
+        self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._heartbeat_seconds = heartbeat_seconds
         # A node is considered dead when its last_seen is older than this. Consulted by
         # cluster_members() (Step 7) as the freshness filter that discards a crashed ex-leader's stale
@@ -639,7 +645,7 @@ class DbCoordinator:
         uses for its own schema DDL, so two nodes opening at once can't race the CREATE. The lock key is
         schema-namespaced (see :attr:`_lock_key`), matching :meth:`PostgresStore._lock_key`, so two
         deployments sharing one database via different schemas don't contend on it."""
-        async with self._pool.acquire() as conn:
+        async with self._pool.acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 await conn.execute(
                     "SELECT pg_advisory_xact_lock($1, hashtext($2))",
@@ -796,7 +802,7 @@ class DbCoordinator:
                 # Wake immediately on stop() instead of sleeping out the full interval — cooperative
                 # cancellation without relying on Task.cancel alone.
                 await asyncio.wait_for(self._stop.wait(), timeout=self._heartbeat_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue  # interval elapsed — beat again
 
     # --- leader election: self-fencing lease (Track B Step 4 / Workstream A2) ----
@@ -818,6 +824,8 @@ class DbCoordinator:
             if not self._is_leader:
                 self._is_leader = True
                 log.info("cluster: node %s acquired leadership (lease)", self.node_id)
+                # #145: a non-leader→leader transition is a failover / election edge — alert (never-raise).
+                self._alert_leadership_acquired()
         elif self._is_leader:
             # The lease is held by another node (or expired and taken over) — we are no longer leader.
             self._is_leader = False
@@ -827,6 +835,7 @@ class DbCoordinator:
             # honest.
             self._leader_epoch = None
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
+            self._alert_leadership_lost("lease taken or expired")  # #145 (inverse → auto-resolves)
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire OR renew the leadership lease and return whether this node now holds it.
@@ -900,7 +909,7 @@ class DbCoordinator:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._fence_tick)
                 return  # stop requested
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             self._check_fence()
 
@@ -923,6 +932,7 @@ class DbCoordinator:
                 self._fence_timeout,
                 self._lease_ttl,
             )
+            self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
 
     async def _release_leadership(self) -> None:
         """Best-effort clean release: demote the cached gate first (so a concurrent is_leader() reader
@@ -934,6 +944,7 @@ class DbCoordinator:
         self._leader_epoch = None  # released: no longer a fenced leader
         if not was_leader:
             return
+        self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
             # Expire the lease (set it to the epoch) only if we still own it, so a standby's next
             # acquire tick takes over at once instead of waiting out the full TTL.
@@ -950,8 +961,31 @@ class DbCoordinator:
                 safe_exc(exc),
             )
 
+    # --- #145 leadership-transition alerts (never-raise) ---------------------
 
-def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
+    def _alert_leadership_acquired(self) -> None:
+        """Emit a ``leadership_acquired`` alert (this node became leader). Never-raise: an alert failure
+        must never break the maintenance loop. The emit itself is synchronous + non-blocking (the
+        NotifierAlertSink only enqueues); the epoch is the H1 token this node just cached."""
+        try:
+            self._alert_sink.leadership_acquired(
+                self.node_id, role="leader", epoch=self._leader_epoch
+            )
+        except Exception:  # pragma: no cover - defensive; a sink must never break leadership
+            log.warning("cluster: leadership_acquired alert failed", exc_info=True)
+
+    def _alert_leadership_lost(self, reason: str) -> None:
+        """Emit a ``leadership_lost`` inverse (this node is no longer leader) — auto-resolves the open
+        ``leadership_acquired`` instance. Never-raise (as :meth:`_alert_leadership_acquired`)."""
+        try:
+            self._alert_sink.leadership_lost(self.node_id, role="follower", reason=reason)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("cluster: leadership_lost alert failed", exc_info=True)
+
+
+def build_coordinator(
+    store: Any, cluster_settings: Any, *, alert_sink: AlertSink | None = None
+) -> ClusterCoordinator:
     """Pick the coordinator for ``store`` + ``cluster_settings`` — defensively.
 
     Returns a :class:`NullCoordinator` (the byte-identical single-node default) whenever
@@ -1006,6 +1040,7 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
             ),
             acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
             promotable=getattr(cluster_settings, "promotable", True),
+            alert_sink=alert_sink,  # #145: failover-transition alerts (lockstep with DbCoordinator)
         )
     return DbCoordinator(
         pool,
@@ -1019,4 +1054,5 @@ def build_coordinator(store: Any, cluster_settings: Any) -> ClusterCoordinator:
         acquire_delay_seconds=getattr(cluster_settings, "acquire_delay_seconds", 0.0),
         promotable=getattr(cluster_settings, "promotable", True),
         db_schema=db_schema,
+        alert_sink=alert_sink,  # #145: failover-transition alerts
     )

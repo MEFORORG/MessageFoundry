@@ -51,6 +51,7 @@ import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
+from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cluster import ClusterMember, default_node_id
 from messagefoundry.redaction import safe_exc
 
@@ -61,7 +62,7 @@ __all__ = ["SqlServerCoordinator"]
 if TYPE_CHECKING:
     from messagefoundry.pipeline.cluster import ClusterCoordinator
 
-    def _assert_satisfies_protocol(c: "SqlServerCoordinator") -> "ClusterCoordinator":
+    def _assert_satisfies_protocol(c: SqlServerCoordinator) -> ClusterCoordinator:
         # Compile-time guard (mypy, every PR): SqlServerCoordinator MUST satisfy the ClusterCoordinator
         # Protocol owned by cluster.py. If a future increment adds a contract method (as #257 added
         # leadership_lease), this assignment fails mypy until it's implemented here too.
@@ -98,9 +99,13 @@ class SqlServerCoordinator:
         acquire_delay_seconds: float = 0.0,
         promotable: bool = True,
         monotonic: Callable[[], float] = time.monotonic,
+        alert_sink: AlertSink | None = None,
     ) -> None:
         self._store = store
         self.node_id = node_id
+        # #145: leadership-transition alerts, IN LOCKSTEP with DbCoordinator (same events, same fire
+        # points). None → the default LoggingAlertSink. See cluster.py DbCoordinator._alert_sink.
+        self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
         self._heartbeat_seconds = heartbeat_seconds
         self._node_timeout_seconds = node_timeout_seconds
         self._lease_ttl = leader_lease_ttl_seconds
@@ -410,7 +415,7 @@ class SqlServerCoordinator:
                     )
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._heartbeat_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
     async def _maintain_leadership(self) -> None:
@@ -420,10 +425,12 @@ class SqlServerCoordinator:
             if not self._is_leader:
                 self._is_leader = True
                 log.info("cluster: node %s acquired leadership (lease)", self.node_id)
+                self._alert_leadership_acquired()  # #145 (lockstep with DbCoordinator)
         elif self._is_leader:
             self._is_leader = False
             self._leader_epoch = None  # no longer a fenced leader (H1)
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
+            self._alert_leadership_lost("lease taken or expired")  # #145 (inverse → auto-resolves)
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
@@ -482,7 +489,7 @@ class SqlServerCoordinator:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._fence_tick)
                 return  # stop requested
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             self._check_fence()
 
@@ -502,6 +509,7 @@ class SqlServerCoordinator:
                 self._fence_timeout,
                 self._lease_ttl,
             )
+            self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
 
     async def _release_leadership(self) -> None:
         was_leader = self._is_leader
@@ -510,6 +518,7 @@ class SqlServerCoordinator:
         self._leader_epoch = None  # released: no longer a fenced leader (H1)
         if not was_leader:
             return
+        self._alert_leadership_lost("released")  # #145: clean step-down (inverse → auto-resolves)
         try:
             await self._store._execute(
                 "UPDATE leader_lease SET lease_expires_at = 0 WHERE lease_key = ? AND owner = ?",
@@ -522,6 +531,22 @@ class SqlServerCoordinator:
                 self.node_id,
                 safe_exc(exc),
             )
+
+    # --- #145 leadership-transition alerts (never-raise; lockstep with DbCoordinator) ----
+
+    def _alert_leadership_acquired(self) -> None:
+        try:
+            self._alert_sink.leadership_acquired(
+                self.node_id, role="leader", epoch=self._leader_epoch
+            )
+        except Exception:  # pragma: no cover - defensive; a sink must never break leadership
+            log.warning("cluster: leadership_acquired alert failed", exc_info=True)
+
+    def _alert_leadership_lost(self, reason: str) -> None:
+        try:
+            self._alert_sink.leadership_lost(self.node_id, role="follower", reason=reason)
+        except Exception:  # pragma: no cover - defensive
+            log.warning("cluster: leadership_lost alert failed", exc_info=True)
 
 
 def default_sqlserver_node_id() -> str:

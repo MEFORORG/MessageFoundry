@@ -45,14 +45,31 @@ Converting copies to durable bytes requires three multipliers this module does n
 
 Multiplying (1) and (2) by the copy count gives a *lower bound* on body bytes, not durable bytes. A
 confident `bytes/msg` published from that product would be exactly the kind of plausible-but-wrong number
-this programme keeps producing. The real figure is a `db.size_bytes` delta over a live run at a known
-message count — which the harness already samples as `EngineSample.db_size_bytes`.
+this programme keeps producing.
+
+## What the harness publishes instead (ADR 0141, #207 loose end 2)
+
+**Copies per message**, not bytes: `harness/load/report.py` self-differences the live `body_copies` store
+counter over a run and divides by the message count, rendering `copies/msg (<backend>; NOT bytes)`. That is
+the LIVE counterpart of the `2 + H + N` model pinned above, so the two are welded together by
+`test_the_rendered_copies_per_message_matches_the_2_H_N_model` below: a wrong counter no longer agrees with
+the model, and the model can no longer drift from what the harness prints.
+
+The **byte** figure stays refused. A `db.size_bytes`-delta ÷ acked number — the "real figure" this docstring
+used to point at — is not a body-bytes measurement: it also carries row/page/index overhead, the transaction
+log, and any autogrowth or checkpoint that happened to land inside the window, and it is deflated or inflated
+by (1) and (2) besides. Publishing it as `bytes/msg` would be the same plausible-but-wrong class this module
+was written to refuse, so no `bytes_per_message` key exists in the report.
 """
 
 from __future__ import annotations
 
 import pytest
 
+from harness.load.enginepoll import EnginePoller, EngineSample
+from harness.load.metrics import Counters, Histogram
+from harness.load.profile import load_profile_text
+from harness.load.report import PhaseRecord, RunReport, build_report
 from tests.adr0075_batch_harness import AsyncRecCursor, RecConn, bare_store, drive_async
 
 pytestmark = pytest.mark.asyncio
@@ -164,3 +181,93 @@ async def test_a_high_fanout_hub_is_storage_bound_by_H_not_by_N() -> None:
 
     # The routed rows alone are 20 of the 26 copies: 77% of the body bytes this message writes.
     assert 20 / hub == pytest.approx(0.769, abs=0.001)
+
+
+# --- the published figure, welded to the model (ADR 0141) ---------------------------------------
+
+_LOAD_PROFILE = """
+[load]
+name = "amp"
+[[load.target]]
+name = "hub"
+types = ["ADT"]
+[load.mix]
+"ADT^A05" = 1.0
+[[load.phase]]
+name = "steady"
+kind = "sustained"
+loop = "open"
+rate_start = 50.0
+duration_s = 10.0
+"""
+
+
+def _report(*, messages: int, body_copies: int, backend: str) -> RunReport:
+    """A run report whose engine samples carry ``body_copies`` — the counter the harness publishes as
+    ``copies/msg``. The baseline sample reads 0, so the run delta is exactly ``body_copies``."""
+    profile = load_profile_text(_LOAD_PROFILE)
+    (phase,) = profile.phases
+    end = Counters(sent=messages, acked=messages)
+    records = [PhaseRecord(phase, Counters(), end, Histogram(), Histogram(), 10.0)]
+    poller = EnginePoller("http://x", None, origin=0.0)
+    poller._samples.extend(
+        [
+            EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", None, 1.0),
+            EngineSample(
+                10.0,
+                0,
+                0,
+                messages,
+                0,
+                messages,
+                messages,
+                0,
+                0,
+                0,
+                5000,
+                "wal",
+                None,
+                11.0,
+                body_copies=body_copies,
+            ),
+        ]
+    )
+    return build_report(profile, "http://x", records, end, poller, 2.0, db_backend=backend)
+
+
+@pytest.mark.parametrize(("handlers", "destinations"), [(1, 1), (8, 8), (20, 4)])
+async def test_the_rendered_copies_per_message_matches_the_2_H_N_model(
+    handlers: int, destinations: int
+) -> None:
+    """WELD the published figure to the model, so a wrong counter is caught.
+
+    The harness (`harness/load/report.py`, ADR 0141) publishes ``copies/msg`` — the live ``body_copies``
+    delta over the run's message count. At the shapes pinned above, a correct counter on SQL Server must
+    reproduce ``2 + H + N`` exactly. If the counter under-counts (say it misses the ``messages.raw``
+    copy) or the model drifts, this fails.
+    """
+    expected = body_copies_per_message(handlers, destinations)
+    messages = 105
+    report = _report(messages=messages, body_copies=messages * expected, backend="sqlserver")
+
+    assert report.engine.copies_per_message == pytest.approx(float(expected))
+    console = report.render_console()
+    # The reading is named by BACKEND and labelled NOT bytes: SQLite would store an identical fan-out
+    # once (`shared_body`), so the same traffic reads lower there — the backend is part of the number.
+    assert f"copies/msg (sqlserver; NOT bytes): {expected:.2f}/msg" in console
+
+
+async def test_no_bytes_per_message_figure_is_published() -> None:
+    """A2's refusal STANDS (ADR 0141): the report carries a copy COUNT and no byte figure.
+
+    ``db_growth_bytes`` is still emitted as a raw observation, but nothing divides it by the message
+    count — a `db_size_bytes`-delta ÷ acked number conflates index/row overhead, the transaction log,
+    NVARCHAR UTF-16 (x2) and cipher expansion, and would be exactly the plausible-but-wrong publication
+    this module was written to refuse.
+    """
+    report = _report(messages=105, body_copies=420, backend="sqlserver")
+    engine_side = report.to_json_dict()["engine_side"]
+    assert isinstance(engine_side, dict)
+    assert not any("bytes_per_message" in key for key in engine_side)
+    assert engine_side["copies_per_message_unit"] == "body copies (NOT bytes)"
+    assert "bytes/msg" not in report.render_console()

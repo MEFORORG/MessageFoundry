@@ -230,6 +230,63 @@ async def test_failed_outbound_isolated_retries_and_recovers(
         await runner.stop()
 
 
+def _file_inbound_validate(inbox: Path, *, validate: bool) -> InboundConnection:
+    return InboundConnection(
+        "file_in",
+        ConnectionSpec(
+            ConnectorType.FILE,
+            {
+                "directory": str(inbox),
+                "pattern": "*.hl7",
+                "poll_seconds": 0.02,
+                "validate_directory": validate,
+            },
+        ),
+        router="r",
+    )
+
+
+async def test_file_validate_directory_isolates_missing_dir(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # #114 (ADR 0031 amendment): an inbound File source with validate_directory=true, pointed at a
+    # MISSING directory, is reported `failed` at start (isolated) — the engine stays up, the source
+    # never binds, and the probe never fabricates the dir. The opt-in fail-fast alternative to deferral.
+    missing = tmp_path / "nope"
+    reg = Registry()
+    reg.add_inbound(_file_inbound_validate(missing, validate=True))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    await runner.start()
+    try:
+        assert runner.running  # isolated, not fatal
+        assert "file_in" in runner.degraded_connections()
+        assert "SourceStartupError" in (runner.connection_failed("file_in") or "")
+        assert not runner.inbound_running("file_in")
+        assert not missing.exists()  # the no-mkdir probe never created it
+    finally:
+        await runner.stop()
+
+
+async def test_file_validate_directory_off_defers_missing_dir(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # Default off: a missing directory does NOT fail startup — the source binds and defers to run time,
+    # byte-identical to before #114 (start() creates the poll dir via its .processed/.error mkdir).
+    missing = tmp_path / "nope"
+    reg = Registry()
+    reg.add_inbound(_file_inbound_validate(missing, validate=False))
+    reg.add_router("r", lambda m: [])
+    runner = RegistryRunner(reg, store, poll_interval=0.02)
+    await runner.start()
+    try:
+        assert runner.running
+        assert runner.degraded_connections() == {}
+        assert runner.inbound_running("file_in")  # bound; validation deferred to run time
+    finally:
+        await runner.stop()
+
+
 async def test_valid_graph_starts_without_degradation(store: MessageStore, tmp_path: Path) -> None:
     # Regression: a fully-valid graph is unaffected — no degraded connections, and it delivers.
     inbox, outdir = tmp_path / "in", tmp_path / "out"
@@ -285,7 +342,7 @@ async def test_connections_api_reports_degraded_outbound(tmp_path: Path) -> None
     engine = await Engine.create(tmp_path / "api.db", poll_interval=0.02)
     engine.add_registry(reg)
     try:
-        service = AuthService(engine.store, AuthSettings())
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         uid = await service.create_local_user(
             username="vw",

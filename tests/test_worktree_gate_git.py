@@ -6,7 +6,9 @@ directory silently found itself reading a different commit's files. Rules 1 and 
 command is a SHELL call, not an Edit, so no amount of tool-argument inspection catches it.
 
 The rule is narrow on purpose. Only verbs that change WHICH COMMIT the primary's tree reflects, or that
-discard work, are denied — and only for the primary. A worktree may switch its own branch freely.
+discard work, are denied — and only for the primary. A linked worktree switching onto an EXISTING branch
+(the hijack that this whole guard grew out of) is the separate, narrower rule 3b — see
+tests/test_worktree_gate_hijack.py; everything else a worktree does to its own branch stays free.
 """
 
 from __future__ import annotations
@@ -118,11 +120,43 @@ def test_reads_and_safe_verbs_are_allowed_in_the_primary(
     assert run_gate(shell(command, cwd=primary), repos_file) is None
 
 
-def test_a_worktree_may_switch_its_own_branch(tmp_path: Path, repos_file: Path) -> None:
-    """Only the SHARED primary is protected — a worktree's own tree is its own business."""
+def test_non_hijacking_git_verbs_in_a_worktree_are_allowed(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """A worktree owns its own history: creating a new branch (-b) and resetting its own branch stay
+    free. Only switching onto an EXISTING branch is denied, and that is rule 3b -- it needs a real
+    worktree git can classify, so it lives in tests/test_worktree_gate_hijack.py."""
     worktree = tmp_path / "Repo-alerts"
     assert run_gate(shell("git checkout -b feature/x", cwd=worktree), repos_file) is None
     assert run_gate(shell("git reset --hard HEAD~1", cwd=worktree), repos_file) is None
+
+
+def test_a_nested_worktree_naming_its_own_path_is_allowed(tmp_path: Path, repos_file: Path) -> None:
+    """BACKLOG #308. `Test-Governed` EXEMPTS ``<primary>/.claude/worktrees/<name>`` -- a linked worktree
+    living under the primary is not the primary, and a git verb there swaps only its own tree. Rule 3's
+    in-text fallback must honour the SAME exemption.
+
+    It did not: a path separator clears both boundary lookaheads, so any command whose TEXT contained the
+    nested worktree's own path matched the primary and was denied. That is where ``new.ps1`` puts every
+    worktree, so `cd <own worktree> && git rebase ...` -- the most ordinary thing a session does -- was
+    refused as if it were swapping the shared tree, while the identical command with the path omitted was
+    allowed. The block therefore depended on how the command was SPELLED, not on what it touched."""
+    nested = tmp_path / "Repo" / ".claude" / "worktrees" / "alerts"
+    assert (
+        run_gate(shell(f"cd {nested} && git switch -c feature/x", cwd=nested), repos_file) is None
+    )
+    assert run_gate(shell(f"git -C {nested} rebase origin/main", cwd=nested), repos_file) is None
+
+
+def test_reaching_into_the_primary_is_still_denied_around_the_nested_exemption(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """The #308 exemption must not open a hole: only ``/.claude/worktrees/`` is exempt, so the primary
+    itself -- and any OTHER path inside it, including its own ``.claude/hooks`` -- still deny."""
+    primary = tmp_path / "Repo"
+    assert_denied(run_gate(shell(f"cd {primary} && git checkout main", cwd=primary), repos_file))
+    hooks = primary / ".claude" / "hooks"
+    assert_denied(run_gate(shell(f"cd {hooks} && git checkout main", cwd=hooks), repos_file))
 
 
 def test_a_different_repo_is_untouched(tmp_path: Path, repos_file: Path) -> None:

@@ -16,6 +16,18 @@ pass/fail. Run `python -m harness --list-profiles` to list the built-ins.
 | `sustained-overload`| Hold offered rate above the ceiling, then drain — backpressure (S4.7).   | On-demand   |
 | `malformed-load`    | Well-formed background load; bad input GUI-injected concurrently (S4.8). | On-demand   |
 
+## Other profile schemas in this directory
+Some `.toml`s here are **not** `[load]` profiles and are driven by their own harness flags, not
+`--load`:
+- `connscale*` / `pooled*` / `fuse*` / `batch*` — `[connscale]` schema, the connection-scale sweep
+  (`python -m harness --connscale <name>`; [../connscale/profile.py](../connscale/profile.py)).
+- `estate*` — `[estate]` schema, the heterogeneous demo-shape driver
+  (`python -m harness --estate <name>`; [../estate/profile.py](../estate/profile.py)): a majority of
+  simple pass-through feeds + a minority of fan-out hubs, driven at a calibrated per-connection *event*
+  rate so the aggregate hits a target total ev/s (`estate-demo` ≈ 520.5 ev/s; `estate-smoke` = the CI
+  smoke). Run `python -m harness --list-estate-profiles` to list them. See
+  [../../../docs/LOAD-TESTING.md](../../../docs/LOAD-TESTING.md) §"Estate demo shape".
+
 ## Phases and loop models
 - **Phase kinds:** `warmup`, `ramp`, `sustained`, `spike`, `soak`. Only `sustained`/`soak` phases are
   *measured* — SLOs are evaluated against them; warmup/ramp/spike are transient.

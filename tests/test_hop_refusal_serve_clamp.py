@@ -34,9 +34,9 @@ from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 from messagefoundry.store.sqlserver import connection_string
 
-PROD_PHI = HopPosture(is_phi=True, production=True)
-STAGING_PHI = HopPosture(is_phi=True, production=False)
-SYNTHETIC = HopPosture(is_phi=False, production=False)  # dev / synthetic instance (no PHI)
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # dev / synthetic instance (no PHI)
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as off-box)
 
 
@@ -129,9 +129,8 @@ def test_mllp_verify_off_refuses_prod_phi_even_with_escape(monkeypatch: pytest.M
         settings={"host": REMOTE, "port": 5000, "tls": True, "tls_verify": False},
     )
     # Finding 5: the escape must NOT silence a production-PHI verify-off hop.
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="tls_verify=false"):
-            MLLPDestination(cfg)
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="tls_verify=false"):
+        MLLPDestination(cfg)
     # Non-production PHI + escape still crosses (escape clamp only bites production-PHI).
     with active_hop_posture(STAGING_PHI):
         MLLPDestination(cfg)
@@ -151,9 +150,8 @@ def test_ftps_verify_off_refuses_prod_phi_even_with_escape(monkeypatch: pytest.M
             "tls_verify": False,
         },
     )
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="tls_verify=false"):
-            RemoteFileDestination(cfg)
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="tls_verify=false"):
+        RemoteFileDestination(cfg)
     with active_hop_posture(STAGING_PHI):
         RemoteFileDestination(cfg)  # crosses with the escape on non-prod
 
@@ -177,9 +175,8 @@ def test_credentialed_ftp_refuses_prod_phi_even_with_escape(
     )
     # Finding 4: the strictly-worse credential-on-the-wire hop now gets the same clamp the sibling
     # anonymous-ftp guard already applied — the escape can't cross it on production-PHI.
-    with active_hop_posture(PROD_PHI):
-        with pytest.raises(ValueError, match="CLEARTEXT"):
-            RemoteFileDestination(cfg)
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="CLEARTEXT"):
+        RemoteFileDestination(cfg)
     with active_hop_posture(STAGING_PHI):
         RemoteFileDestination(cfg)  # crosses with the escape on non-prod
 

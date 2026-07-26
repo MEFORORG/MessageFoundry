@@ -7,15 +7,15 @@ posture is enforced by the runner (AC-3/AC-4). The key_id fingerprint matches th
 
 from __future__ import annotations
 
+import base64
 import io
+import logging
 import os
 
 import pytest
 
 from messagefoundry.store import backup_codec as bc
 from messagefoundry.store.crypto import AesGcmCipher
-import base64
-import logging
 
 
 def _roundtrip(payload: bytes, *, chunk_size: int, key: bytes | None = None) -> bytes:
@@ -161,9 +161,8 @@ def test_key_mismatch_leaks_no_key_material(caplog: pytest.LogCaptureFixture) ->
     enc = io.BytesIO()
     bc.encrypt_stream(io.BytesIO(plaintext), enc, seal_key)
 
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(bc.BackupKeyMismatch) as excinfo:
-            bc.decrypt_stream(io.BytesIO(enc.getvalue()), io.BytesIO(), wrong_key)
+    with caplog.at_level(logging.DEBUG), pytest.raises(bc.BackupKeyMismatch) as excinfo:
+        bc.decrypt_stream(io.BytesIO(enc.getvalue()), io.BytesIO(), wrong_key)
 
     seal_b64 = base64.b64encode(seal_key).decode()
     wrong_b64 = base64.b64encode(wrong_key).decode()
@@ -181,9 +180,8 @@ def test_auth_failure_leaks_no_key_material(caplog: pytest.LogCaptureFixture) ->
     blob = bytearray(enc.getvalue())
     blob[-50] ^= 0x01  # flip a byte inside the final ciphertext frame → GCM tag fails (correct key)
 
-    with caplog.at_level(logging.DEBUG):
-        with pytest.raises(bc.BackupCodecError) as excinfo:
-            bc.decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), key)
+    with caplog.at_level(logging.DEBUG), pytest.raises(bc.BackupCodecError) as excinfo:
+        bc.decrypt_stream(io.BytesIO(bytes(blob)), io.BytesIO(), key)
 
     key_b64 = base64.b64encode(key).decode()
     for hay in (str(excinfo.value), caplog.text):

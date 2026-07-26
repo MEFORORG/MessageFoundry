@@ -158,3 +158,52 @@ touch this feature adds.
    `openConnectionSettings` → edit, refresh + promote.
 4. **Decomposition convention** (routers/transformers in their own files) + re-port the deferred
    multi-destination fan-out feeds as the first multi-`Send` users.
+
+---
+
+## Amendment (2026-07-19) — Console-settable object flag + the FIRST console→connections.toml write seam (BACKLOG #131)
+
+- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #131](../BACKLOG.md) "object flagging +
+  a Flagged Objects filter" (lane `dg-s8a`, Wave 6). Additive to the accepted read/CLI-write design.
+
+**What it adds.**
+
+1. **A `flagged` field** (default `False`) on `InboundConnection` / `OutboundConnection` — authored
+   code-first (`inbound(..., flagged=True)` / `outbound(..., flagged=True)`) **and** via
+   `connections.toml` (joins `_INBOUND_KEYS`/`_OUTBOUND_KEYS`, the write schema, and the key-parity
+   test). Purely a display/annotation marker — the operator's "object of interest" flag; **no runtime
+   path reads it**. Surfaced additively on `ConnectionRow.flagged` and rendered in the console (a flag
+   glyph + a **Flagged-only** filter over the connections dashboard).
+
+2. **The FIRST console→`connections.toml` write seam.** Until now the ADR-0007 style-preserving writer
+   (`config/connections_edit.py`) was wired **only** into the `connection` CLI — there was **no**
+   console→TOML write path. The object-flag toggle builds it: a new **`POST /connections/{name}/flag`**
+   JSON endpoint (RBAC `config:deploy`, deny-by-default, audited) and its console route
+   (`routes/connection_writes.py`) drive `Engine.set_connection_flag`, which (a) round-trips the target
+   TOML entry through `connections_edit.upsert_connection` — **validate-before-persist**, atomic
+   temp+replace, **comments/formatting preserved** by the existing tomlkit writer — and (b) updates the
+   live in-memory `Registry` entry in place (a `dataclasses.replace` of the cosmetic field only; **no**
+   connector rebuild, **no** graph reload, **no** delivery-path change) so the dashboard reflects it
+   immediately. The write reuses the CLI's exact validate callback shape (`load_config` +
+   `build_check_registry` against this instance's `[egress]`/env/posture).
+
+**SCOPE FORK — code-first connections are out of scope (records the `store_schema=false` decision).**
+The flag is scoped to **`connections.toml`-managed connections ONLY**. A flag on a *code-first*
+(`.py`-authored) connection has no TOML home to persist to, and giving *every* object a durable,
+console-settable flag would require a **new name-keyed annotation table across all three store
+backends** — which would make S8a **store-serialized** (`store_schema=true`). That is deliberately
+**NOT built** here: `set_connection_flag` **refuses (409)** a connection that is not in
+`connections.toml`, so this lane makes **no store schema change**. The universal-object-flag branch is
+left for a future, owner-chosen, store-serialized effort.
+
+- **AC-1 (amend)** — WHEN `POST /connections/{name}/flag` targets a `connections.toml`-managed
+  connection, THE SYSTEM SHALL persist `flagged` via the comment-preserving validate-before-persist
+  writer AND reflect it on the live `ConnectionRow.flagged`, constructing no channel/route object and
+  making no store schema change.
+  → `tests/test_connection_flag.py::test_flag_toggle_persists_and_reflects`
+- **AC-2 (amend)** — WHEN the flag toggle targets a code-first connection (not in `connections.toml`),
+  THE SYSTEM SHALL refuse it (409) and leave `connections.toml` untouched.
+  → `tests/test_connection_flag.py::test_flag_toggle_refuses_code_first`
+- **AC-3 (amend)** — THE `connections_edit` write schema SHALL stay set-equal to the loader's read
+  schema per direction (the `flagged` key is in both), so the #234 key-parity test stays green.
+  → `tests/test_connections_file.py::test_write_schema_matches_read_schema_per_direction`

@@ -11,13 +11,23 @@ validation, and the ``Timer(...)`` factory / wiring.
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, ContentType, Source
 from messagefoundry.config.wiring import Timer, build_inbound_connection
 from messagefoundry.transports import build_source
-from messagefoundry.transports.timer import TimerSource
+from messagefoundry.transports.timer import TimerSource, _CronSchedule
+
+
+class _FastCron:
+    """A stand-in schedule whose next fire is always ~20 ms out, so the cron loop can be exercised
+    end-to-end in a test without waiting a real wall-clock minute."""
+
+    def next_after(self, dt: datetime) -> datetime:
+        return dt + timedelta(milliseconds=20)
 
 
 def _timer(**settings: object) -> TimerSource:
@@ -48,7 +58,7 @@ async def test_timer_interval_fires_repeatedly() -> None:
     finally:
         await src.stop()
     assert len(fired) >= 3
-    assert fired[0] == "MSH|^~\\&|TIMER\r".encode()  # body emitted verbatim, first fire at t=0
+    assert fired[0] == b"MSH|^~\\&|TIMER\r"  # body emitted verbatim, first fire at t=0
 
 
 async def test_timer_run_once_fires_exactly_once() -> None:
@@ -235,11 +245,184 @@ def test_timer_rejects_nonpositive_interval() -> None:
         TimerSource(Source(type=ConnectorType.TIMER, settings={"body": "X", "interval_seconds": 0}))
 
 
-def test_timer_cron_is_not_yet_implemented() -> None:
-    with pytest.raises(ValueError, match="cron_expression' is not yet implemented"):
+# --- cron / calendar schedule (ADR 0011 amendment, BACKLOG #160) --------------
+
+
+def test_cron_next_after_is_strictly_future_never_t0() -> None:
+    # Unlike the interval heartbeat, cron does NOT fire at t=0: next_after is always strictly after the
+    # given time (so a fire is never scheduled "now" or in the past — no busy-loop).
+    sched = _CronSchedule.parse("* * * * *")  # every minute
+    base = datetime(2026, 7, 17, 10, 30, 15)
+    assert sched.next_after(base) == datetime(2026, 7, 17, 10, 31, 0)
+    # On an exact minute boundary it advances to the NEXT minute (never re-fires the same minute).
+    assert sched.next_after(datetime(2026, 7, 17, 10, 31, 0)) == datetime(2026, 7, 17, 10, 32, 0)
+
+
+def test_cron_calendar_schedule() -> None:
+    # 08:00 on weekdays. From Fri 2026-07-17 the next fire is Mon 2026-07-20 08:00.
+    sched = _CronSchedule.parse("0 8 * * 1-5")
+    assert sched.next_after(datetime(2026, 7, 17, 10, 0, 0)) == datetime(2026, 7, 20, 8, 0, 0)
+
+
+def test_cron_step_and_list_and_range() -> None:
+    assert _CronSchedule.parse("*/15 * * * *").next_after(datetime(2026, 7, 17, 10, 7)) == datetime(
+        2026, 7, 17, 10, 15
+    )
+    sched = _CronSchedule.parse("0,30 9-17 * * *")  # top & half hour, 9am-5pm
+    assert sched.matches(datetime(2026, 7, 17, 9, 30))
+    assert sched.matches(datetime(2026, 7, 17, 17, 0))
+    assert not sched.matches(datetime(2026, 7, 17, 18, 0))
+    assert not sched.matches(datetime(2026, 7, 17, 9, 15))
+
+
+def test_cron_dom_dow_or_semantics() -> None:
+    # Vixie rule: when BOTH day-of-month and day-of-week are restricted, a match on EITHER fires.
+    sched = _CronSchedule.parse("0 0 1 * 1")  # midnight on the 1st OR any Monday
+    assert sched.matches(datetime(2026, 7, 1, 0, 0))  # the 1st (a Wednesday)
+    assert sched.matches(datetime(2026, 7, 6, 0, 0))  # a Monday (not the 1st) → OR fires
+    assert not sched.matches(datetime(2026, 7, 7, 0, 0))  # neither
+
+
+def test_cron_sunday_is_zero_or_seven() -> None:
+    zero = _CronSchedule.parse("0 0 * * 0")  # Sunday = 0
+    seven = _CronSchedule.parse("0 0 * * 7")  # Sunday = 7 (accepted)
+    sunday = datetime(2026, 7, 19, 0, 0)  # a Sunday
+    assert zero.matches(sunday)
+    assert seven.matches(sunday)
+
+
+def test_cron_next_after_is_dst_aware() -> None:
+    # With an explicit IANA zone the schedule is DST-aware: the same wall-clock cron resolves to a
+    # different UTC offset in winter (EST -05:00) vs summer (EDT -04:00).
+    ny = ZoneInfo("America/New_York")
+    sched = _CronSchedule.parse("0 12 * * *")  # noon daily
+    winter = sched.next_after(datetime(2026, 1, 15, 0, 0, tzinfo=ny))
+    summer = sched.next_after(datetime(2026, 7, 15, 0, 0, tzinfo=ny))
+    assert winter.utcoffset() == timedelta(hours=-5)
+    assert summer.utcoffset() == timedelta(hours=-4)
+
+
+def test_cron_rejects_unsatisfiable_expression() -> None:
+    with pytest.raises(ValueError, match="no fire time|unsatisfiable"):
+        _CronSchedule.parse("* * 30 2 *")  # Feb 30 never exists
+
+
+@pytest.mark.parametrize(
+    "bad",
+    ["* * * *", "* * * * * *", "61 * * * *", "* 24 * * *", "* * * * 8", "x * * * *", "*/0 * * * *"],
+)
+def test_cron_rejects_invalid_fields(bad: str) -> None:
+    with pytest.raises(ValueError):
+        _CronSchedule.parse(bad)
+
+
+def test_timer_cron_exclusive_with_interval() -> None:
+    with pytest.raises(ValueError, match="exclusive"):
         TimerSource(
-            Source(type=ConnectorType.TIMER, settings={"body": "X", "cron_expression": "* * * * *"})
+            Source(
+                type=ConnectorType.TIMER,
+                settings={"body": "X", "cron_expression": "* * * * *", "interval_seconds": 5},
+            )
         )
+
+
+def test_timer_cron_exclusive_with_run_once() -> None:
+    with pytest.raises(ValueError, match="exclusive"):
+        TimerSource(
+            Source(
+                type=ConnectorType.TIMER,
+                settings={"body": "X", "cron_expression": "* * * * *", "run_once": True},
+            )
+        )
+
+
+def test_timer_rejects_unknown_timezone() -> None:
+    with pytest.raises(ValueError, match="IANA zone"):
+        TimerSource(
+            Source(
+                type=ConnectorType.TIMER,
+                settings={"body": "X", "cron_expression": "0 8 * * *", "timezone": "Nowhere/Bad"},
+            )
+        )
+
+
+def test_timer_timezone_requires_cron() -> None:
+    with pytest.raises(ValueError, match="only applies"):
+        TimerSource(
+            Source(
+                type=ConnectorType.TIMER,
+                settings={"body": "X", "interval_seconds": 5, "timezone": "America/New_York"},
+            )
+        )
+
+
+async def test_timer_cron_does_not_fire_immediately() -> None:
+    # With a real cron the first fire is the next scheduled minute — never t=0. Over a short window the
+    # every-minute cron must not have fired (its next fire is up to ~60s away).
+    fired: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        fired.append(raw)
+
+    src = _timer(body="X", cron_expression="* * * * *")
+    await src.start(handler)
+    try:
+        await asyncio.sleep(0.1)
+        assert fired == []  # never fires at t=0
+    finally:
+        await src.stop()
+
+
+async def test_timer_cron_fires_when_due() -> None:
+    # Exercise the cron loop end-to-end without waiting a real minute by injecting a fast schedule.
+    fired: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        fired.append(raw)
+
+    src = _timer(body="TICK", cron_expression="* * * * *")
+    src._cron = _FastCron()  # next fire is always ~20 ms out
+    await src.start(handler)
+    try:
+        await _until(lambda: len(fired) >= 2)
+    finally:
+        await src.stop()
+    assert fired[0] == b"TICK"
+
+
+async def test_timer_cron_respects_leader_gate() -> None:
+    # A follower advances the schedule without emitting (the fire is leader-gated like the interval path).
+    fired: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        fired.append(raw)
+
+    src = _timer(body="X", cron_expression="* * * * *")
+    src._cron = _FastCron()
+    await src.start(handler, leader_gate=lambda: False)
+    try:
+        await asyncio.sleep(0.15)  # many fast ticks
+        assert fired == []  # never fired as a follower
+    finally:
+        await src.stop()
+
+
+async def test_timer_cron_stop_joins_promptly() -> None:
+    async def handler(raw: bytes) -> None:
+        return None
+
+    src = _timer(body="X", cron_expression="* * * * *")
+    src._cron = _FastCron()
+    await src.start(handler)
+    await _until(lambda: src._task is not None)
+    await asyncio.wait_for(src.stop(), timeout=2.0)
+    assert src._task is None
+
+
+def test_timer_cron_factory_wiring() -> None:
+    spec = Timer(body="PING", cron_expression="0 8 * * 1-5", timezone="America/New_York")
+    assert spec.settings["cron_expression"] == "0 8 * * 1-5"
+    assert spec.settings["timezone"] == "America/New_York"
 
 
 # --- factory + wiring --------------------------------------------------------

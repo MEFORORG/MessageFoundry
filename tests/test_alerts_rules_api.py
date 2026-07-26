@@ -175,7 +175,7 @@ async def test_alerts_rules_defaults_when_unset(engine: Engine) -> None:
 
 
 async def _auth_service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

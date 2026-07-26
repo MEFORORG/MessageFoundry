@@ -21,8 +21,9 @@ the mixed-version hazard) are SQLite-only + driver-free — they need no server 
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 
@@ -257,7 +258,7 @@ async def test_fresh_db_has_seq_index_not_old(store: Any) -> None:
     """A brand-new store carries ONLY the seq-trailing ix_queue_fifo_*_seq; the old created_at-trailing
     ix_queue_fifo_in/out are never created, and no FIFO index keys on created_at."""
     names = await _fifo_index_names(store)
-    assert _NEW_NAMES <= names, names
+    assert names >= _NEW_NAMES, names
     assert not (_OLD_NAMES & names), f"stale old-named FIFO index on a fresh DB: {names}"
     assert not await _any_fifo_index_carries_created_at(store)
 
@@ -282,12 +283,12 @@ async def test_upgraded_db_migrates_and_preserves_fifo(store: Any) -> None:
     before = await _queue_fingerprint(store)
 
     await _downgrade_to_old_indexes(store)
-    assert _OLD_NAMES <= await _fifo_index_names(store)  # precondition: looks pre-B10
+    assert await _fifo_index_names(store) >= _OLD_NAMES  # precondition: looks pre-B10
 
     reopened = await _reopen(store)
     try:
         names = await _fifo_index_names(reopened)
-        assert _NEW_NAMES <= names, names
+        assert names >= _NEW_NAMES, names
         assert not (_OLD_NAMES & names), f"old-named index survived the migration: {names}"
         assert not await _any_fifo_index_carries_created_at(reopened)
         # The row set is byte-identical — the migration touched only indexes, never rows.
@@ -427,7 +428,7 @@ async def test_mixed_version_stale_index_reappears(tmp_path: Path) -> None:
     await s._db.commit()
     both = await _fifo_index_names(s)
     await s.close()
-    assert _OLD_NAMES <= both and _NEW_NAMES <= both, (
+    assert both >= _OLD_NAMES and both >= _NEW_NAMES, (
         "the mixed-version hazard must reproduce (stale index reappears next to the new one): "
         f"{both}"
     )

@@ -45,8 +45,17 @@ class RateGovernor:
     def _emit_one(self, sampler: Sampler) -> None:
         out = self._corpus.next(sampler)
         pool = self._dispatcher.route(out.code)
-        if pool is None or not pool.submit_nowait(out):
-            self._counters.deferred += 1  # no target / pool buffers full — offered but not sent
+        if pool is None:
+            # No target for this message type — a RIG/config fault. Nothing was offered to any engine.
+            self._counters.deferred += 1
+            self._counters.deferred_schedule += 1
+        elif not pool.submit_nowait(out):
+            # The pool's per-connection buffer is FULL. The write loop drains before it pops the next job,
+            # so a full buffer means the ENGINE stopped reading the socket — this is BACKPRESSURE, i.e. an
+            # engine signal, NOT evidence that the load generator was too small. Counting it as one
+            # undifferentiated `deferred` is what let an engine intake bind masquerade as a drive shortfall.
+            self._counters.deferred += 1
+            self._counters.deferred_backpressure += 1
 
     async def _run_open(self, phase: Phase, mix: TypeMix, stop: asyncio.Event) -> None:
         sampler = self._corpus.sampler(mix)
@@ -69,10 +78,12 @@ class RateGovernor:
                 next_due += interval
                 emitted += 1
             if next_due <= now:
-                # Still behind after the batch cap: the harness/engine couldn't absorb the offered
-                # rate this tick. Account the shortfall as deferred and resync the schedule.
+                # Still behind after the batch cap: the GENERATOR could not even schedule the sends this
+                # tick (it never reached a pool, so no engine ever saw them). This is the genuinely
+                # RIG-side deferral — the one a DRIVE SHORTFALL verdict may honestly rest on.
                 behind = int((now - next_due) / interval) + 1
                 self._counters.deferred += behind
+                self._counters.deferred_schedule += behind
                 next_due = now + interval
             await asyncio.sleep(max(0.0, min(next_due - loop.time(), _MAX_TICK_SLEEP)))
 
@@ -94,6 +105,7 @@ class RateGovernor:
             pool = self._dispatcher.route(out.code)
             if pool is None:
                 self._counters.deferred += 1
+                self._counters.deferred_schedule += 1  # no target — a RIG/config fault
                 slots.release()
                 continue
             # The slot is released when this message completes (ACK or timeout), holding exactly
@@ -105,5 +117,8 @@ class RateGovernor:
                     pool.submit(out, on_done=slots.release), timeout=_ACQUIRE_POLL
                 )
             except TimeoutError:
+                # Every per-connection buffer stayed full for the whole poll — the ENGINE is not reading.
+                # BACKPRESSURE, not a rig limit.
                 self._counters.deferred += 1
+                self._counters.deferred_backpressure += 1
                 slots.release()

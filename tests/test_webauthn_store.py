@@ -58,7 +58,6 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
     Guards against a well-meaning future change silently cipher-wrapping the column and breaking
     the rekey-loop exclusion assumption."""
     from messagefoundry.store.crypto import generate_key, make_cipher
-
     from tests._webauthn_store_contract import _cred
 
     db = tmp_path / "enc.db"
@@ -80,5 +79,17 @@ async def test_webauthn_public_key_plaintext_under_cipher(tmp_path: Path) -> Non
             cur = await conn.execute("SELECT totp_secret FROM users WHERE id='u1'")
             row = await cur.fetchone()
         assert row["totp_secret"] != "JBSWY3DPEHPK3PXP"  # encrypted at rest
+    finally:
+        await store.close()
+
+
+async def test_session_rotation_contract_sqlite(tmp_path: Path) -> None:
+    """SQLite leg of the ASVS 7.2.4 rotate_session contract — same shared assertions the live
+    Postgres / SQL Server suites run, so a backend that drifts is caught on whichever leg runs."""
+    store = await MessageStore.open(tmp_path / "rot.db")
+    try:
+        from tests._session_rotation_contract import assert_session_rotation_contract
+
+        await assert_session_rotation_contract(store)
     finally:
         await store.close()

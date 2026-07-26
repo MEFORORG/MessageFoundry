@@ -479,6 +479,159 @@ is now **built**, mirroring the KeyProvider pattern one-for-one:
 `[store].key_provider`; connector creds via `[secrets].provider`) remain distinct backends that happen to
 reuse the same `hvac` extra.
 
+## Amendment 2026-07-17 — cell-bound AES-GCM AAD at rest is now BUILT, opt-in (ASVS 11.3.3, ADR 0115 / WP #244)
+
+**BUILT (opt-in, default off) — supersedes the deferred-hardening posture below.** ASVS 11.3.3 (bind
+associated data into the at-rest AEAD tag) is now a shipped, tested control on the `mfenc:v2` writer,
+gated by a new `[store].aad_bind` knob (env `MEFOR_STORE_AAD_BIND`; default **off**, so the at-rest
+format stays byte-identical `mfenc:v1` — CRYPTO-1 unchanged). When enabled, every at-rest AES-256-GCM
+value is bound to the `(table, column, primary-key)` **cell** it lives in via a canonical `cell_aad`
+folded into the GCM tag, so a ciphertext cut-and-pasted into another row/column/table fails the auth tag
+(fail-closed `CipherError`) instead of silently decrypting — driving **11.3.3 Partial → Pass(B)** for a
+Posture-B (at-rest-encryption-on) deployment.
+
+Design + build:
+
+- **`cell_aad(table, column, *pk)`** ([store/crypto.py](../../messagefoundry/store/crypto.py)) is the
+  single AAD builder — **length-prefixed** (4-byte big-endian per field, so distinct field tuples never
+  collide), **versioned** (`mfenc-aad/v1`), and **backend-agnostic** (`str(pk)`, so a SQLite `INTEGER`
+  id and a Postgres/SQL Server `BIGINT` for the same logical row yield identical AAD — a cross-backend
+  backup/restore of a v2 value stays decryptable).
+- **v1 stays FROZEN (CRYPTO-1).** AAD rides ONLY the additive `mfenc:v2` writer; `decrypt` dispatches AAD
+  by marker version (v1 → `None`, v2 → the caller's `aad`), so legacy v1 rows still read (**dual-read**)
+  and `messagefoundry rotate-key` upgrades a row v1 → cell-bound v2 in place under `[store].aad_bind`.
+- **Threaded through all three backends.** `cell_aad(...)` is folded at every encrypt/decrypt site in
+  [store/store.py](../../messagefoundry/store/store.py) (SQLite),
+  [store/postgres.py](../../messagefoundry/store/postgres.py), and
+  [store/sqlserver.py](../../messagefoundry/store/sqlserver.py) — messages, the staged `queue`, `response`
+  (bodies bound after the `response_seq` is known), `state`/`reference`, `message_events`/
+  `connection_event`/`alert_instance` (bound to insert-time-known **natural** columns, since their id is
+  autoincrement/upserted), `users.totp_secret`, `shared_body`, and `attachment_chunk` — plus the on-open
+  plaintext→v2 migration and the key-rotation re-encrypt loops (which rebind the SAME AAD on decrypt-old +
+  encrypt-new). The `_enc`/`_dec` wrappers take a **required** `aad` keyword so mypy-strict flags any
+  un-threaded site; correctness is additionally netted by re-running the store suites with the AAD forced
+  on (`MEFOR_TEST_FORCE_AAD_BIND`) plus targeted wrong-cell/relocation/dual-read/rotate tests
+  ([tests/test_store_aad_binding.py](../../tests/test_store_aad_binding.py)).
+- **The Pass(B) needle-mover is still at-rest encryption ON** — `[ai].data_class = "phi"` + a configured
+  `[store].encryption_key` (WP #243). With no key (`IdentityCipher`) there is no AEAD tag to bind, so
+  `aad_bind` is a no-op; it is the **hardened (Posture-B) setting** layered on top of encryption-on (see
+  [docs/security/OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md)).
+
+**Status: 11.3.3 → Pass(B) — cell-bound AAD BUILT and tested, opt-in via `[store].aad_bind` (off by
+default; A stays Partial because encryption is off by default).** This ADR owns the `mfenc` crypto-seam
+format contract (per ADR 0115, which names "0019 AAD/nonce" as the 11.3.3 owner); it records the build
+but does not itself re-score — ADR 0115 / the ASVS-L3 rescore governs the sweep.
+
+## Amendment 2026-07-17 — per-key AES-GCM invocation ceiling already ships (ASVS 11.3.4, ADR 0115 / WP #244)
+
+**Doc-only — no default changed; nothing new built.** This records that ASVS 11.3.4 (bound the number of
+AEAD invocations per key) is **already satisfied in code** and accepted as-is — no new counter is
+proposed. The at-rest AES-GCM cipher ([store/crypto.py](../../messagefoundry/store/crypto.py), #190-F)
+counts encrypts under the active key and emits:
+
+- a **soft WARNING** once at `2**31` encrypts (`_GCM_SOFT_WARN_INVOCATIONS`) — *plan a key rotation
+  before the fail-closed ceiling*; then
+- a **fail-closed** `CipherError` at `2**32` (`_GCM_MAX_INVOCATIONS`) — `encrypt` refuses to encrypt
+  further until the store key is rotated (`messagefoundry rotate-key`) and the process restarted.
+
+This is the birthday-bound tripwire on top of a fresh 96-bit `os.urandom` nonce drawn per encrypt —
+NIST-conservative for random-nonce AES-GCM. The counter is **per-process / in-memory by design** (it
+resets on restart; a restart re-derives the same key, so the true lifetime bound is a deployment/rotation
+concern, not this process) — accepted as intentional, **not** a gap to close with a persistent counter.
+The behaviour is pinned by the existing
+`tests/test_audit_integrity.py::test_gcm_soft_warn_then_fail_closed`.
+
+**Status: 11.3.4 accepted — the ceiling ships and is tested.** It is **A → Partial** only because at-rest
+encryption is **off by default** (the `IdentityCipher` never encrypts, so the counter is dormant until
+`[ai].data_class = "phi"` + a store key turn encryption on — the same WP #243 needle-mover); once on, the
+ceiling is live (B → Pass). This ADR does not re-score; ADR 0115 governs the sweep.
+
+> **SUPERSEDED by the 2026-07-22 amendment below.** The reasoning above ("not a gap to close with a
+> persistent counter") did not survive re-assessment: a counter that resets every restart bounds a
+> *process*, not a *key*, so across a deployment's lifetime the 2^32 ceiling was unreachable and the
+> 2^31 warning could not fire. The count is now persisted per `key_id`.
+
+## Amendment 2026-07-22 — the invocation bound is PERSISTED per key_id (ASVS 11.3.4)
+
+**Supersedes the 2026-07-17 amendment's "no persistent counter" conclusion.** The re-assessment's finding
+was *"generation is correct; the failure is the BOUND, not the method"* — nonce generation stays exactly
+as above (a fresh 96-bit `os.urandom` per encrypt, one per DR frame, never a counter). What changed is
+that the count now **survives restarts and aggregates across processes**, so the ceiling is a property of
+the KEY rather than of whichever process happens to be running.
+
+**What was actually wrong.** Three concrete defects, all of which made the shipped bound smaller than it
+looked:
+
+1. **Restart reset.** `AesGcmCipher._invocations` started at 0 in `__init__`. A service restarted weekly
+   could never approach 2^31, so neither threshold was reachable in practice.
+2. **Per-INSTANCE, not per-key.** `build_store_cipher` is not a singleton — the ADR 0134 uploaded-logs
+   store constructs a *second* `AesGcmCipher` over the same DEK, with its own zeroed counter — and
+   `rotate-key` runs in a separate process entirely, performing the largest single encrypt burst in the
+   product against a counter nothing else could see.
+3. **The DR backup codec bypassed the counter completely.** `store/backup_codec.py::encrypt_stream`
+   builds its own `AESGCM` from the raw DEK and encrypts one frame per chunk without ever reaching
+   `_count_invocation`. A 10 GB store at the 1 MiB default chunk is ~10k uncounted invocations *per run*
+   under the same DEK — an under-count in exactly the unsafe direction.
+
+**What ships — and which of the three defects above each part closes.**
+
+- A `cipher_meta` table (identical shape on SQLite / Postgres / SQL Server) holding one row per `key_id`:
+  the cumulative invocations RESERVED under that key, loaded at every open. **Closes (1)** — the count is
+  a property of the KEY, so a restart no longer resets it.
+- **Reserve-then-spend.** A process atomically adds a block of 2^16 and only then spends it, so an
+  UNCLEAN exit can only ever OVER-count: it forfeits the unspent remainder of its block, bounded slack in
+  the conservative direction — the opposite bias to a spend-then-flush checkpoint. A CLEAN close
+  **settles the exact figure** instead (charging an overspend, refunding an unspent reserve), because
+  forfeiting a whole block per open does not survive arithmetic: ~65k opens would exhaust a key on paper
+  alone, and a crash-looping service under NSSM auto-restart (~8.6k opens/day at a 10 s restart) would
+  reach the fail-closed 2^32 in about a week with no cryptographic cause.
+- **Long bursts are charged as they run, not at the end.** `reencrypt_to_active` and the on-open at-rest
+  migration re-encrypt every stored value inside one process and one write lock; each charges the bound
+  after every committed batch, so the durable count trails actual spend by at most one batch and a kill
+  mid-rotation cannot lose what was already re-encrypted. The engine's reserve refill is likewise
+  **demand-driven** — the cipher signals the moment its reserve crosses the half-block watermark — rather
+  than purely periodic, which a fixed poll cannot keep up with above ~6.5k encrypts/s.
+- **Multi-process aggregation for free.** The atomic add *is* the aggregation: engine shards
+  (`serve --shard`) and `[cluster]` HA nodes all sit on the ONE unified store (>1 shard already requires
+  a server DB), and the offline `rotate-key` charges the same row. **Closes (2), the cross-process half.**
+- **One cipher INSTANCE per DEK per process. Closes (2), the per-instance half:** the ADR 0134
+  uploaded-logs store is handed the live store's cipher (`Store.cipher()`) instead of building its own
+  over the same key material, so its encrypts charge the same row and obey the same fail-closed ceiling.
+  `build_store_cipher` remains only for the store-LESS construction path (embedding / tests), where there
+  is no bound to share and nothing durable to charge.
+- **The DR codec is charged. Closes (3).** `encrypt_stream` reports its frame count and `BackupRunner`
+  performs a post-run aggregate add against the same `key_id`.
+- **2^31 is alarmed, not just logged.** `GcmInvocationRunner` (engine-side, on the `cert_expiry` runner
+  pattern) checkpoints the reserve and raises a routable `gcm_invocations` AlertSink event. The runner
+  lives in `pipeline/` because `store/` may not import it (one-way dependency rule).
+- **The hot path pays one DB write per ~2^15 encrypts**, never one per encrypt.
+
+**Rotation semantics — the one thing not to get wrong.** `key_id` is a one-way SHA-256 fingerprint of the
+DEK, so a NEW key has no row and starts at zero automatically; that is the whole of "rotate-key resets the
+counter". A "zero the active key's counter" operation is **deliberately not implemented**: it would let an
+operator refresh the birthday budget of a key they never changed, which defeats the control entirely.
+Re-supplying a retired key resolves to its existing row and inherits its accumulated count.
+
+**Operational consequence, stated plainly.** The 2^32 refusal is now CUMULATIVE for the key, and no write
+path catches `CipherError` — crossing it stops ingest rather than degrading gracefully. That is what
+"fail closed" means here, and it is the intended behaviour: past the birthday bound, continuing to encrypt
+under the same key is the greater harm. Operators get the 2^31 alert with **half** the budget still
+available. Between checkpoints up to 2^16 invocations of slack exist, biased conservative by the
+reserve-ahead round-up.
+
+**The residual, stated precisely.** The over-count guarantee is a property of the *reservation*, so it
+holds exactly where a reservation leads the spend: a hard kill loses at most the unspent remainder of one
+block per process, plus at most one batch of an in-flight rotation/migration burst. What it is NOT is a
+guarantee about a process that keeps encrypting after its final settlement — nothing does that today
+(`close()` settles, then the handle stops writing), and any code that did would be charged at the next
+open's checkpoint rather than never, but the invariant is worth naming rather than overclaiming.
+
+**Out of scope: `vault_transit`.** That cipher draws no local nonce and constructs no local `AESGCM`; key
+lifetime is Vault's to version. The bound is a no-op there and for the identity cipher, by design.
+
+**Status: 11.3.4 — the bound is persisted, aggregated, alarmed and enforced.** As before, this ADR records
+the build and does not itself re-score; ADR 0115 / the ASVS-L3 re-score governs the sweep.
+
 ## To resolve on acceptance
 
 1. **Wrapped-DEK storage location** — where the wrapped DEK lives for each provider (a file path? a

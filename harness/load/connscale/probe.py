@@ -53,14 +53,21 @@ class ProcSample:
     * ``handles`` — open-handle count (Windows) / open-fd count (POSIX): wall #4 FD pressure.
     * ``cpu_seconds`` — CUMULATIVE process CPU-seconds since the process started (monotonic); the
       runner differences consecutive readings for CPU utilisation and totals.
-    * ``working_set_bytes`` — resident working set (RSS) in bytes."""
+    * ``working_set_bytes`` — resident working set (RSS) in bytes.
+    * ``cpu_pids`` — the exact set of PIDs whose CPU-seconds were summed into ``cpu_seconds`` this
+      tick (``None`` **iff** ``cpu_seconds`` is ``None``). The runner differences consecutive readings
+      to derive utilisation, and that difference is only a clean CPU delta when the summed-over PID set
+      is unchanged — A3's periodic subtree re-resolution can add a joining ``serve --shard`` worker or
+      drop a departing one mid-window, so the runner uses this set to sum only same-set intervals and
+      degrade the rest to a gap (BACKLOG #220)."""
 
     handles: int | None
     cpu_seconds: float | None
     working_set_bytes: int | None
+    cpu_pids: frozenset[int] | None = None
 
 
-_EMPTY_PROC = ProcSample(handles=None, cpu_seconds=None, working_set_bytes=None)
+_EMPTY_PROC = ProcSample(handles=None, cpu_seconds=None, working_set_bytes=None, cpu_pids=None)
 
 
 class FdSampler:
@@ -232,7 +239,8 @@ class FdSampler:
         idlist = ",".join(str(p) for p in pids)
         command = (
             "Get-Process -Id " + idlist + " -ErrorAction SilentlyContinue | ForEach-Object "
-            "{ '{0} {1} {2}' -f $_.HandleCount, $_.TotalProcessorTime.Ticks, $_.WorkingSet64 }"
+            "{ '{0} {1} {2} {3}' -f $_.HandleCount, $_.TotalProcessorTime.Ticks, "
+            "$_.WorkingSet64, $_.Id }"
         )
         try:
             out = subprocess.run(
@@ -250,16 +258,23 @@ class FdSampler:
         cpu_ticks = 0
         rss = 0
         rows = 0
+        cpu_pids: set[int] = set()  # the exact PIDs summed into cpu_ticks this tick (#220)
         for line in out.stdout.splitlines():
             parts = line.split()
-            if len(parts) != 3:
+            if len(parts) != 4:
                 continue
-            h, t, w = _as_int(parts[0]), _as_int(parts[1]), _as_int(parts[2])
-            if h is None or t is None or w is None:
+            h, t, w, pid = (
+                _as_int(parts[0]),
+                _as_int(parts[1]),
+                _as_int(parts[2]),
+                _as_int(parts[3]),
+            )
+            if h is None or t is None or w is None or pid is None:
                 continue
             handles += h
             cpu_ticks += t
             rss += w
+            cpu_pids.add(pid)
             rows += 1
         if rows == 0:
             return _EMPTY_PROC
@@ -267,6 +282,7 @@ class FdSampler:
             handles=handles,
             cpu_seconds=cpu_ticks / _WIN_CPU_TICKS_PER_S,
             working_set_bytes=rss,
+            cpu_pids=frozenset(cpu_pids),
         )
 
     def _sample_posix(self, pids: list[int]) -> ProcSample:
@@ -274,6 +290,7 @@ class FdSampler:
         cpu_sum = 0.0
         rss_sum = 0
         h_seen = c_seen = r_seen = 0
+        cpu_pids: set[int] = set()  # the exact PIDs summed into cpu_sum this tick (#220)
         for pid in pids:
             h = self._posix_handles(pid)
             if h is not None:
@@ -283,6 +300,7 @@ class FdSampler:
             if c is not None:
                 cpu_sum += c
                 c_seen += 1
+                cpu_pids.add(pid)
             r = self._posix_rss_bytes(pid)
             if r is not None:
                 rss_sum += r
@@ -291,6 +309,7 @@ class FdSampler:
             handles=handles_sum if h_seen else None,
             cpu_seconds=cpu_sum if c_seen else None,
             working_set_bytes=rss_sum if r_seen else None,
+            cpu_pids=frozenset(cpu_pids) if c_seen else None,
         )
 
     def _posix_handles(self, pid: int) -> int | None:

@@ -50,9 +50,19 @@ def _hist(value_ms: float, n: int) -> Histogram:
     return h
 
 
-def _poller(read: int, written: int, *, backlog: int = 0) -> EnginePoller:
+def _poller(
+    read: int,
+    written: int,
+    *,
+    backlog: int = 0,
+    committed_txns: int = 0,
+    body_copies: int = 0,
+) -> EnginePoller:
     p = EnginePoller("http://x", None, origin=0.0)
     base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1000, "wal", "normal", 1.0)
+    # ``committed_txns``/``body_copies`` are the FINAL readings; the baseline stays 0, so the run delta
+    # == the value passed (#207). Left 0 (the default) they exercise the Postgres "unwired counter"
+    # path — the figure must render "not measured", never a fabricated 0/msg.
     final = EngineSample(
         10.0,
         backlog,
@@ -68,6 +78,8 @@ def _poller(read: int, written: int, *, backlog: int = 0) -> EnginePoller:
         "wal",
         "normal",
         11.0,
+        committed_txns=committed_txns,
+        body_copies=body_copies,
     )
     p._samples.extend([base, final])
     return p
@@ -160,7 +172,8 @@ def test_json_is_metrics_only_no_phi() -> None:
         profile, "http://x", _records(sent, sent), counters, _poller(sent, 300), 2.0
     )
     text = report.to_json()
-    assert '"schema_version": 1' in text
+    # 2→3: engine_side gained body_copies + copies_per_message (#207 loose end 2, ADR 0141).
+    assert '"schema_version": 3' in text
     # No raw HL7 / control ids / PHI tokens ever reach the artifact.
     for forbidden in ("MSH|", "PID|", "\r", "MEFOR", "^~"):
         assert forbidden not in text
@@ -224,6 +237,103 @@ def test_baseline_compare_flags_throughput_regression() -> None:
     regressions = compare_to_baseline(slow, base, tolerance=0.1)
     assert any("throughput regressed" in r for r in regressions)
     assert compare_to_baseline(base, base, tolerance=0.1) == []  # identical → no regression
+
+
+def test_measured_txn_per_message_rendered() -> None:
+    # #207 loose end 1: committed_txns self-differences to the run delta and divides by the message
+    # count (Counters.acked) to render the MEASURED txn/msg beside the analytical 3+2H+2N model.
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    # 105 messages, 735 committed transactions ⇒ exactly 7.0/msg (the (H=1, N=1) simple-feed model).
+    poller = _poller(read=sent, written=300, committed_txns=735)
+    report = build_report(profile, "http://x", _records(sent, sent), counters, poller, 2.0)
+    assert report.engine.committed_txns == 735
+    assert report.engine.txn_per_message_measured == 7.0
+    d = report.to_json_dict()
+    engine_side = d["engine_side"]
+    assert isinstance(engine_side, dict)
+    assert engine_side["committed_txns"] == 735
+    assert engine_side["txn_per_message_measured"] == 7.0
+    console = report.render_console()
+    assert "txn/msg (measured): 7.00/msg" in console
+    assert "committed_txns=735" in console
+
+
+def test_unwired_committed_txns_renders_not_measured_never_zero() -> None:
+    # Postgres never wired the counter → it reads a flat 0. The per-message figure MUST be None /
+    # "not measured", NEVER a fabricated 0/msg — even though 105 messages were acked. This guard fails
+    # loud if a division ever renders 0.0 for an unwired counter.
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    poller = _poller(read=sent, written=300, committed_txns=0)  # unwired (Postgres)
+    report = build_report(profile, "http://x", _records(sent, sent), counters, poller, 2.0)
+    assert report.engine.committed_txns == 0
+    assert report.engine.txn_per_message_measured is None  # NOT 0.0
+    d = report.to_json_dict()
+    engine_side = d["engine_side"]
+    assert isinstance(engine_side, dict)
+    assert engine_side["txn_per_message_measured"] is None
+    console = report.render_console()
+    assert "txn/msg (measured): not measured" in console
+    # Belt-and-braces: the fabricated "0.00/msg" string never appears.
+    assert "0.00/msg" not in console
+
+
+def test_measured_copies_per_message_rendered_named_by_backend_and_not_as_bytes() -> None:
+    # #207 loose end 2 (ADR 0141): body_copies self-differences to the run delta and divides by the
+    # message count to render the MEASURED body copies/msg — the live counterpart of the analytical
+    # 2+H+N amplification model. It is a COPY COUNT and it is backend-dependent, so both facts are
+    # rendered WITH the number, and NO bytes/msg figure is published anywhere in the report.
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    # 105 messages x 4 copies each (the 2+H+N simple feed, H=N=1) = 420.
+    poller = _poller(read=sent, written=300, body_copies=420)
+    report = build_report(
+        profile, "http://x", _records(sent, sent), counters, poller, 2.0, db_backend="sqlserver"
+    )
+    assert report.engine.body_copies == 420
+    assert report.engine.copies_per_message == 4.0
+    d = report.to_json_dict()
+    engine_side = d["engine_side"]
+    assert isinstance(engine_side, dict)
+    assert engine_side["body_copies"] == 420
+    assert engine_side["copies_per_message"] == 4.0
+    # The unit and the backend travel WITH the number — a consumer can never read it as bytes, nor
+    # carry a SQL Server reading over to SQLite (which dedups an identical fan-out to one copy).
+    assert engine_side["copies_per_message_backend"] == "sqlserver"
+    assert engine_side["copies_per_message_unit"] == "body copies (NOT bytes)"
+    # A2's refusal to publish a bytes/msg number STANDS: no such key exists (ADR 0141).
+    assert not any("bytes_per_message" in k for k in engine_side)
+    console = report.render_console()
+    assert "copies/msg (sqlserver; NOT bytes): 4.00/msg" in console
+    assert "body_copies=420" in console
+
+
+def test_unwired_body_copies_renders_not_measured_never_zero() -> None:
+    # Postgres never wired the counter → it reads a flat 0. The per-message figure MUST be None /
+    # "not measured", NEVER a fabricated 0/msg — even though 105 messages were acked, each of which
+    # writes at least its `messages.raw` + ingress `queue.payload` copies. Red-first guard: a division
+    # that renders 0.00/msg for an unwired counter is exactly the plausible-but-wrong publication
+    # ADR 0141 forbids.
+    profile = load_profile_text(_PROFILE)
+    sent = 105
+    counters = Counters(sent=sent, acked=sent, sink_received=300)
+    poller = _poller(read=sent, written=300, body_copies=0)  # unwired (Postgres)
+    report = build_report(
+        profile, "http://x", _records(sent, sent), counters, poller, 2.0, db_backend="postgres"
+    )
+    assert report.engine.body_copies == 0
+    assert report.engine.copies_per_message is None  # NOT 0.0
+    d = report.to_json_dict()
+    engine_side = d["engine_side"]
+    assert isinstance(engine_side, dict)
+    assert engine_side["copies_per_message"] is None
+    console = report.render_console()
+    assert "copies/msg (postgres; NOT bytes): not measured" in console
+    assert "0.00/msg" not in console
 
 
 def test_engine_poller_parses_sample_from_client() -> None:

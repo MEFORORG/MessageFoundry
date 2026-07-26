@@ -80,7 +80,7 @@ class SaturationDetector:
         depths = [d for _, d in window]
         if depths[-1] <= depths[0]:
             return None  # no net rise across the window → not becoming overloaded
-        for prev, cur in zip(depths, depths[1:]):
+        for prev, cur in zip(depths, depths[1:]):  # noqa: B905
             if cur < prev:
                 # A decrease anywhere in the window = the lane drained during it. That is a
                 # bursty-but-DRAINING lane, not saturation — do not fire (the key property).

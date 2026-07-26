@@ -22,16 +22,19 @@ Synthetic HL7 only (fabricated ids/names — no PHI).
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
 from messagefoundry.config.db_lookup import DbLookupError, db_lookup
 from messagefoundry.config.fhir_lookup import FhirLookupError, fhir_lookup
+from messagefoundry.config.response import response_get
 from messagefoundry.config.run_context import RunContext, run_contexts
+from messagefoundry.config.state import state_get
 from messagefoundry.config.wiring import (
     ConnectionSpec,
     ConnectorType,
@@ -53,8 +56,6 @@ from messagefoundry.pipeline.sandbox import (
 from messagefoundry.pipeline.sharding import filter_registry_for_shard
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxItem, OutboxStatus, Stage
-from messagefoundry.config.response import response_get
-from messagefoundry.config.state import state_get
 
 # A conformant synthetic ADT^A01 (fabricated MRN/name).
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||900001||DOE^JANE\r"
@@ -411,9 +412,8 @@ def test_accepts_lookup_raises(tmp_path: Path) -> None:
     )
     ic = reg.inbound["IB"]
     # Run under the live router phase, exactly as the router worker does.
-    with run_contexts(RunContext(), phase="router"):
-        with pytest.raises(DbLookupError):
-            route_only(reg, ic, ADT)
+    with run_contexts(RunContext(), phase="router"), pytest.raises(DbLookupError):
+        route_only(reg, ic, ADT)
 
     reg2 = _reg(
         tmp_path,
@@ -421,9 +421,8 @@ def test_accepts_lookup_raises(tmp_path: Path) -> None:
         accepts={"f": _fhir},
         router=lambda m: ["f"],
     )
-    with run_contexts(RunContext(), phase="router"):
-        with pytest.raises(FhirLookupError):
-            route_only(reg2, reg2.inbound["IB"], ADT)
+    with run_contexts(RunContext(), phase="router"), pytest.raises(FhirLookupError):
+        route_only(reg2, reg2.inbound["IB"], ADT)
 
 
 async def test_accepts_lookup_dead_letters_on_the_live_path(

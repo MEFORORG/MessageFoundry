@@ -47,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
@@ -127,6 +128,10 @@ class DrCoordinator:
         self._deactivate_profile = deactivate_profile
         self._config_fingerprint = config_fingerprint
         self._alert_sink: AlertSink = alert_sink or LoggingAlertSink()
+        # #145: the DR box label carried in dr_activated / dr_released alerts (also the throttle /
+        # auto-resolve key). The hostname is stable across an activate/release pair (same box), so the
+        # fail-back resolves the promotion instance. PHI-free (a host label only).
+        self._node = socket.gethostname()
         self._clock = clock
         # ADR 0073: the engine's ownership scope for the activation recovery reset. On a SHARDED DR
         # fleet the shards activate one by one against the SAME restored store, so a global reset on
@@ -271,6 +276,9 @@ class DrCoordinator:
                 _basename(seed),
                 verify.status,
             )
+            # #145: page on the promotion — the primary is down and this box is now serving. Never-raise:
+            # a sink failure must not undo a completed activation. dr_released is the auto-resolving inverse.
+            self._alert_dr("dr_activated")
             return DrResult(
                 action="activate",
                 active=True,
@@ -329,6 +337,8 @@ class DrCoordinator:
                 "recovered primary resumes (cross-store reconciliation is operator-verified per the runbook)",
                 actor,
             )
+            # #145: the inverse — auto-resolves the open dr_activated instance (no page on a clean fail-back).
+            self._alert_dr("dr_released")
             return DrResult(
                 action="release",
                 active=False,
@@ -349,7 +359,7 @@ class DrCoordinator:
                 run_restore_verify(archive, store_settings=self._store_settings),
                 timeout=self._settings.takeover_timeout_seconds,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # AC-14: a configured KeyProvider endpoint (KMS/Vault/HSM) reachable only from the PRIMARY site
             # hangs the key resolution; bound it and fail closed — no hang, no silent retry-forever, no
             # plaintext fallback. Distinct from the in-archive decrypt failure (KEY_MISMATCH/FAIL).
@@ -535,7 +545,7 @@ class DrCoordinator:
         indexed ``list_audit`` query); the archive filename is PHI-free (instance + UTC only)."""
         rows = await self._store.list_audit(action="dr_backup", limit=50)
         for row in rows:
-            if "detail" not in row.keys():
+            if "detail" not in row.keys():  # noqa: SIM118
                 continue
             raw = row["detail"]
             if not isinstance(raw, str):
@@ -588,7 +598,7 @@ class DrCoordinator:
             ok = await asyncio.wait_for(
                 _run_command(command), timeout=self._settings.takeover_timeout_seconds
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             ok = False
             reason = (
                 f"VIP {phase} hook timed out after {self._settings.takeover_timeout_seconds:g}s"
@@ -630,6 +640,19 @@ class DrCoordinator:
             log.warning("DR: could not record the dr_activation_aborted audit row", exc_info=True)
         log.warning("DR activation ABORTED (%s): %s", kind, message)
         raise DrActivationError(kind, message)
+
+    def _alert_dr(self, event: str) -> None:
+        """Emit a #145 DR transition alert (``dr_activated`` on promotion / ``dr_released`` on fail-back)
+        on the injected sink. Never-raise: a notification failure must never undo a completed
+        activate/release. The emit is synchronous + non-blocking (the notifier only enqueues); the payload
+        carries only the box label + role (no PHI)."""
+        try:
+            if event == "dr_activated":
+                self._alert_sink.dr_activated(self._node, role="dr_standby")
+            else:
+                self._alert_sink.dr_released(self._node, role="primary")
+        except Exception:  # pragma: no cover - defensive; a sink must never break DR
+            log.warning("DR: %s alert failed", event, exc_info=True)
 
 
 async def _run_command(command: str) -> bool:

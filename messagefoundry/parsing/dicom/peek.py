@@ -25,6 +25,7 @@ from io import BytesIO
 from typing import TYPE_CHECKING
 
 from messagefoundry.parsing.dicom._deps import load_dcmread, parse_error_types
+from messagefoundry.parsing.dicom._inflate import guard_part10_deflate
 from messagefoundry.parsing.dicom._util import SR_SOP_CLASS_UIDS, object_bytes, str_or_none
 from messagefoundry.parsing.dicom.errors import DicomPeekError
 
@@ -77,6 +78,11 @@ class DicomPeek:
         parseable DICOM Part-10 object (PHI-safe: names the failure, never the bytes). Requires the
         optional ``[dicom]`` extra; a missing extra raises :class:`RuntimeError` (not a data error)."""
         data = object_bytes(raw)
+        # ASVS 5.2.3: a Deflated Explicit VR LE object inflates unbounded inside dcmread (deflate can't
+        # be read incrementally, so stop_before_pixels/specific_tags don't bound it). Pre-check the
+        # inflate in bounded memory and reject an over-cap object (as a DicomBombError → dead-letter)
+        # BEFORE dcmread ever touches it. A no-op for a non-deflated object.
+        guard_part10_deflate(data)
         dcmread = load_dcmread()
         try:
             ds = dcmread(

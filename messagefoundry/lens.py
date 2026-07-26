@@ -309,6 +309,15 @@ def parse_source(source: str, *, module: str = "<source>") -> list[dict[str, Any
         # The def body is the top suite; its id is the def line (unique per module, so sibling handlers
         # never share a suite id in the flat webview row list).
         rows = _partition_suite(node.body, body_start, body_end, 0, source, lines, str(node.lineno))
+        # ADR 0104 fan-out: an append-send only counts when its collector is a DELIVERING accumulator;
+        # demote the orphans to code rows BEFORE merge (so they coalesce), then (post-merge) tag the
+        # ``sends = []`` init + ``return sends`` footer of the accumulators that kept a visible append.
+        delivering = _delivering_accumulators(node)
+        used = _demote_orphan_appends(rows, node, delivering)
+        # Tag scaffold BEFORE merge (the init/footer are still their own single-statement code rows), then
+        # merge — which leaves scaffold rows standalone — so a `sends = []` preceded by another statement
+        # still renders as its own muted row instead of blending into a code block.
+        _tag_scaffold(rows, node, used)
         rows = _merge_code_rows(rows)
         entry: dict[str, Any] = {
             "handler": name,
@@ -686,6 +695,29 @@ def _classify_simple(s: ast.stmt, nesting: int, source: str) -> dict[str, Any] |
             }
         return None
 
+    # ``sends.append(Send(...))`` — an accumulator fan-out send (ADR 0104 copy-on-Send). It is the SAME
+    # editable ``send`` row as a returned ``Send``, but positioned AT the append statement, not at the
+    # return — so a handler can deliver to several outbounds and interleave transforms between sends
+    # ("send earlier"). Owner: the ``Send`` is never authored inside a ``return`` (the accumulator's
+    # ``sends = []`` init and bare ``return sends`` footer are read-only scaffold, tagged post-partition).
+    # Sits AFTER the Return block so ``return Send``/``return [..]``/``return []`` still match first and
+    # are byte-identical; it strictly upgrades what is otherwise a ``code`` row (``append`` is in no
+    # vocabulary set and the receiver is not ``msg``, so the generic path below already yields None).
+    append_outbounds = _append_send_outbounds(s)
+    if append_outbounds is not None:
+        return {
+            "kind": "send",
+            "outbounds": append_outbounds,
+            # An additive discriminator: this send is a mid-body ``sends.append(...)`` action, NOT a
+            # terminal ``return Send(...)``. The webview keys insert-after / return-ness on it (an append
+            # is a normal middle-of-body step; a returned send suppresses insert-after). Absent on every
+            # returned send + older contract, so estate rows are byte-identical.
+            "appended": True,
+            "line_start": line_start,
+            "line_end": line_end,
+            "nesting": nesting,
+        }
+
     # A vocabulary/lookup call — as a bare expression statement (mutating action / code_lookup) or as an
     # assignment whose value is a lookup call (db_lookup/fhir_lookup return a value).
     call: ast.Call | None = None
@@ -777,6 +809,99 @@ def _send_outbounds(value: ast.expr) -> list[str] | None:
         ):
             outbounds.append(call.args[0].value)
     return outbounds
+
+
+def _match_append_send(s: ast.stmt) -> tuple[str, ast.Call] | None:
+    """``(receiver_name, inner Send call)`` for a ``NAME.append(Send(...))`` statement, or None.
+
+    Recognizes the accumulator copy-on-Send fan-out idiom (ADR 0104): a bare
+    ``sends.append(Send("OB", msg))`` expression statement whose receiver is a **plain name** (never
+    ``self.sends`` / ``d["k"]`` — matched TIGHTLY so an escaped/aliased collector honestly degrades to a
+    ``code`` row), with a single positional argument that is a ``Send(...)`` call and no keyword args.
+    Returns None for anything outside that shape."""
+    if not isinstance(s, ast.Expr):
+        return None
+    call = s.value
+    if not isinstance(call, ast.Call):
+        return None
+    func = call.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "append"):
+        return None
+    if not isinstance(func.value, ast.Name):  # bare-name receiver only (no subscript/attribute)
+        return None
+    if call.keywords or len(call.args) != 1 or isinstance(call.args[0], ast.Starred):
+        return None
+    send = call.args[0]
+    if not (isinstance(send, ast.Call) and _callee_name(send.func) == "Send"):
+        return None
+    return func.value.id, send
+
+
+def _append_send_outbounds(s: ast.stmt) -> list[str] | None:
+    """Destination names for a ``NAME.append(Send(...))`` accumulator send, or None (→ ``code`` row).
+
+    A literal string destination yields ``[dest]``; a non-literal (dynamic) destination yields ``[]`` —
+    the SAME literal check as :func:`_send_outbounds`, so a constructed send has parity with a returned
+    one. Returns the list (never None) once the append-Send shape matches; None for any non-match."""
+    match = _match_append_send(s)
+    if match is None:
+        return None
+    send = match[1]
+    if send.args and isinstance(send.args[0], ast.Constant) and isinstance(send.args[0].value, str):
+        return [send.args[0].value]
+    return []
+
+
+def _own_scope_nodes(node: ast.AST) -> list[ast.AST]:
+    """Every descendant of ``node`` in its OWN scope — recursing through control blocks (if/for/while/
+    with/try) but NOT into nested ``def``/``lambda`` scopes (a different scope). Mirrors what the
+    partitioner classifies, so accumulator analysis matches the visible rows (a closure-local append is
+    neither a visible send row nor evidence of the handler's own accumulator)."""
+    out: list[ast.AST] = []
+    for child in ast.iter_child_nodes(node):
+        out.append(child)
+        if not isinstance(child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda):
+            out.extend(_own_scope_nodes(child))
+    return out
+
+
+def _delivering_accumulators(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
+    """Names that form a clean, DELIVERING fan-out accumulator in this handler's own scope: exactly one
+    top-level ``NAME = []`` init, a top-level bare ``return NAME``, ``NAME`` assigned nowhere else in the
+    own scope, and not a parameter. Only such a name genuinely delivers what is appended to it — so only
+    its appends are recognized as send rows and only its init/footer are tagged scaffold; an append into a
+    discarded, aliased, rebound, or closure-local list honestly degrades to a read-only code row (ADR 0089
+    §4). Purely static (never imports/executes)."""
+    inits: dict[str, int] = {}
+    returned: set[str] = set()
+    for s in node.body:
+        if (
+            isinstance(s, ast.Assign)
+            and len(s.targets) == 1
+            and isinstance(s.targets[0], ast.Name)
+            and isinstance(s.value, ast.List)
+            and not s.value.elts
+        ):
+            inits[s.targets[0].id] = inits.get(s.targets[0].id, 0) + 1
+        elif isinstance(s, ast.Return) and isinstance(s.value, ast.Name):
+            returned.add(s.value.id)
+    if not inits:
+        return set()
+    a = node.args
+    params = {
+        arg.arg
+        for arg in (*a.posonlyargs, *a.args, *a.kwonlyargs, a.vararg, a.kwarg)
+        if arg is not None
+    }
+    assigned: dict[str, int] = {}
+    for n in _own_scope_nodes(node):
+        if isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store):
+            assigned[n.id] = assigned.get(n.id, 0) + 1
+    return {
+        name
+        for name, count in inits.items()
+        if count == 1 and name in returned and name not in params and assigned.get(name, 0) == 1
+    }
 
 
 # --- parameter rendering -----------------------------------------------------
@@ -1127,6 +1252,10 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         if (
             merged
             and row["kind"] == "code"
+            # ADR 0104: keep a tagged fan-out scaffold row (sends = [] / return sends) standalone so it stays
+            # muted — never coalesce it with an adjacent code statement.
+            and "scaffold" not in row
+            and "scaffold" not in merged[-1]
             and merged[-1]["kind"] == "code"
             and merged[-1]["nesting"] == row["nesting"]
             and merged[-1]["line_end"] + 1 == row["line_start"]
@@ -1135,6 +1264,89 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         else:
             merged.append(row)
     return merged
+
+
+def _is_collector_init(s: ast.stmt, collectors: set[str]) -> bool:
+    """Whether ``s`` is a ``NAME = []`` accumulator init for a NAME in ``collectors``.
+
+    A LIST only (never ``()``): a tuple has no ``.append`` and the runtime's ``_partition`` keys on
+    ``isinstance(result, list)``, so a tuple collector is not a valid accumulator — it stays a plain
+    code row."""
+    return (
+        isinstance(s, ast.Assign)
+        and len(s.targets) == 1
+        and isinstance(s.targets[0], ast.Name)
+        and s.targets[0].id in collectors
+        and isinstance(s.value, ast.List)
+        and not s.value.elts
+    )
+
+
+def _is_return_collector(s: ast.stmt, collectors: set[str]) -> bool:
+    """Whether ``s`` is a bare ``return NAME`` footer for a NAME in ``collectors``."""
+    return isinstance(s, ast.Return) and isinstance(s.value, ast.Name) and s.value.id in collectors
+
+
+def _demote_orphan_appends(
+    rows: list[dict[str, Any]],
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    delivering: set[str],
+) -> set[str]:
+    """Demote append-send rows whose collector is NOT a delivering accumulator to read-only code rows;
+    return the delivering names that keep at least one visible append (their scaffold is taggable).
+
+    A ``NAME.append(Send(...))`` is only an honest send row when NAME actually delivers what is appended
+    (:func:`_delivering_accumulators`). An append into a discarded / aliased / rebound / closure-local
+    list constructs a Send that never leaves the handler, so it degrades to a ``code`` row — mutated in
+    place (kind→code, drop the send fields), BEFORE :func:`_merge_code_rows` so it coalesces with its
+    neighbours. The row's span/nesting/suite are preserved, so the coverage partition is untouched."""
+    stmt_by_span: dict[tuple[int, int], ast.stmt] = {}
+    for n in _own_scope_nodes(node):
+        if isinstance(n, ast.stmt):
+            stmt_by_span.setdefault((n.lineno, n.end_lineno or n.lineno), n)
+    used: set[str] = set()
+    for row in rows:
+        if row["kind"] != "send" or not row.get("appended"):
+            continue
+        stmt = stmt_by_span.get((row["line_start"], row["line_end"]))
+        match = _match_append_send(stmt) if isinstance(stmt, ast.stmt) else None
+        if match is not None and match[0] in delivering:
+            used.add(match[0])
+            continue
+        ls, le, nest, suite = row["line_start"], row["line_end"], row["nesting"], row.get("suite")
+        row.clear()
+        row.update(_code_row(ls, le, nest))
+        if suite is not None:
+            row["suite"] = suite
+    return used
+
+
+def _tag_scaffold(
+    rows: list[dict[str, Any]],
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+    used: set[str],
+) -> None:
+    """Tag the accumulator's ``sends = []`` init and bare ``return sends`` footer as read-only scaffold.
+
+    An additive ``scaffold`` marker (``'collector_init'`` / ``'return_collector'``) on the code row so the
+    webview renders it muted; the ``kind`` stays ``code`` (already read-only — no rewrite path). Scoped to
+    ``used`` — delivering accumulators (:func:`_delivering_accumulators`) that carry a visible append — so a
+    discarded ``buf = []``, a ``return other``, or an accumulator whose only append is closure-local stays
+    an untagged code row. Runs BEFORE :func:`_merge_code_rows` (on the still-single-statement init/footer
+    rows, matched by exact span) — merge then keeps a tagged scaffold row standalone, so a ``sends = []``
+    preceded by another statement stays its own muted row; the coverage partition is untouched (ADR 0076
+    §6, spans never change)."""
+    if not used:
+        return
+    code_by_span = {(r["line_start"], r["line_end"]): r for r in rows if r["kind"] == "code"}
+    for s in node.body:
+        row = code_by_span.get((s.lineno, s.end_lineno or s.lineno))
+        if row is None or "scaffold" in row:
+            continue
+        if _is_collector_init(s, used):
+            row["scaffold"] = "collector_init"
+        elif _is_return_collector(s, used):
+            row["scaffold"] = "return_collector"
 
 
 # =============================================================================
@@ -1178,6 +1390,8 @@ _SUPPORTED_OPS = frozenset(
         "insert_clause",
         "insert_comment",
         "insert_code_lookup",
+        "insert_send",
+        "add_destination",
     }
 )
 
@@ -1262,7 +1476,7 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
     # ``set_params``/``delete_row`` MUTATE the row, so they refuse a non-editable kind — EXCEPT that
     # ``delete_row`` additionally accepts a whole ``if``/``for`` control BLOCK (its header row removes the
     # block, the ADR 0089 block-cut a Steps CUT reuses); ``set_params`` and code/elif/else rows stay refused.
-    if op in ("set_params", "delete_row") and kind not in _EDITABLE_KINDS:
+    if op in ("set_params", "delete_row") and kind not in _EDITABLE_KINDS:  # noqa: SIM102
         if not (op == "delete_row" and kind == "control" and row.get("control") in ("if", "for")):
             raise LensRewriteError(
                 f"row at lines {line_start}-{line_end} is a {kind!r} row — only action/lookup/send/"
@@ -1299,6 +1513,12 @@ def rewrite_source(source: str, edit: dict[str, Any], *, module: str = "<source>
         # ADR 0106 Code Lookup — insert code_lookup(msg, path, VAR) AND inject the module-level
         # ``VAR = code_set("<name>")`` capture (ADR 0033 tables); position-only, anchors any row kind.
         result = _apply_insert_code_lookup(src, tree, handler_node, line_start, line_end, edit)
+    elif op in ("insert_send", "add_destination"):
+        # ADR 0104 fan-out — add a ``sends.append(Send(dest, msg))`` accumulator send: lay the scaffold
+        # in a fresh handler, append into an existing accumulator, or convert a legacy ``return Send(...)``
+        # up to the accumulator idiom. Never authors a Send inside a ``return``. Position-only anchor
+        # (any row kind), so it flows here rather than through the set_params/delete_row edit gate.
+        result = _apply_add_send(src, tree, handler_node, edit, line_start, line_end)
     else:  # move_row
         _check_to_suite(edit, contracts, row["_handler"])
         result = _apply_move_row(src, handler_node, edit, line_start, line_end)
@@ -1471,12 +1691,21 @@ def _editable_slots(stmt: ast.stmt, kind: str) -> dict[str, ast.expr] | None:
         if isinstance(stmt, ast.Return) and isinstance(stmt.value, ast.Call):
             send = stmt.value
             return {_SEND_TO: send.args[0]} if send.args else {}
+        # ``sends.append(Send(dest, msg))`` — edit the INNER Send's destination (arg0), NOT the append's
+        # own argument; the byte-splice then replaces only the destination literal.
+        match = _match_append_send(stmt)
+        if match is not None:
+            send = match[1]
+            return {_SEND_TO: send.args[0]} if send.args else {}
         return None
     # action / lookup — a bare call, or an assignment whose value is the call.
     call: ast.Call | None = None
-    if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
-        call = stmt.value
-    elif isinstance(stmt, ast.Assign | ast.AnnAssign) and isinstance(stmt.value, ast.Call):
+    if (
+        isinstance(stmt, ast.Expr)
+        and isinstance(stmt.value, ast.Call)
+        or isinstance(stmt, ast.Assign | ast.AnnAssign)
+        and isinstance(stmt.value, ast.Call)
+    ):
         call = stmt.value
     if call is None:
         return None
@@ -1962,6 +2191,294 @@ def _apply_insert_row(
     return "".join(lines)
 
 
+# The accumulator collector variable name (ADR 0104 fan-out). Hard-coded (owner fork): it is the estate
+# convention (``test_graph_static.py`` / ``config/graph.py``) and the runtime never reads the name, so a
+# fixed name keeps recognition tight and codegen deterministic.
+_ACCUMULATOR = "sends"
+
+
+def _accumulator_footer(
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> ast.Return | None:
+    """The top-level ``return sends`` footer of an accumulator handler, or None."""
+    for s in handler_node.body:
+        if (
+            isinstance(s, ast.Return)
+            and isinstance(s.value, ast.Name)
+            and s.value.id == _ACCUMULATOR
+        ):
+            return s
+    return None
+
+
+def _accumulator_init(
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> ast.Assign | None:
+    """The top-level ``sends = []`` init of an accumulator handler, or None."""
+    for s in handler_node.body:
+        if _is_collector_init(s, {_ACCUMULATOR}):
+            assert isinstance(s, ast.Assign)  # narrowed by _is_collector_init
+            return s
+    return None
+
+
+def _is_send_return(s: ast.Return) -> bool:
+    """Whether ``s`` is a send-row return the fan-out can convert up: ``return Send(...)``,
+    ``return [Send, ...]``, or the ``return []`` / ``return ()`` filter.
+
+    Excludes ``return sends`` (a bare name), ``return None``, and ``return <other>`` — none of which is a
+    send construct, so a handler carrying one is refused rather than mis-extended into a fan-out."""
+    v = s.value
+    if v is None:
+        return False
+    if isinstance(v, ast.List | ast.Tuple) and not v.elts:
+        return True  # `return []` / `return ()` — the filter, converts to an accumulator with just the new send
+    if isinstance(v, ast.Tuple):
+        # A NON-empty tuple return is dropped by the runtime ``_partition`` (it keys on
+        # ``isinstance(result, list)``), so it already delivers nothing; converting it to a list-building
+        # accumulator would silently flip 0→N deliveries. Refuse it — leave it a code row / edit-as-text.
+        return False
+    return _send_outbounds(v) is not None
+
+
+def _render_append_line(indent: str, dest: str, term: str) -> str:
+    """A ``sends.append(Send("dest", msg))`` physical line, refused over the ruff column limit."""
+    physical = f"{indent}{_ACCUMULATOR}.append(Send({_str_lit(dest)}, msg))"
+    if len(physical) > _MAX_LINE_LENGTH:
+        raise LensRewriteError(
+            f"the appended send would be {len(physical)} columns — over the {_MAX_LINE_LENGTH}-column "
+            "limit (ruff would wrap it); add it as text"
+        )
+    return physical + term
+
+
+def _maybe_inject_send(lines: list[str], module_tree: ast.Module, term: str) -> None:
+    """Inject ``from messagefoundry import Send`` after the LEADING import block iff ``Send`` is not in
+    scope.
+
+    Uses :func:`_leading_import_end` (the end of the leading contiguous import block, above every handler
+    body) — NOT ``_last_import_line`` (the last import ANYWHERE): a stray top-level import BELOW the edited
+    handler would make ``_last_import_line`` point below the body splices, and injecting there (after the
+    splices grew ``lines``) would land the import mid-file (E402 / not ruff-clean). The leading-block index
+    is unaffected by the body splices, so injecting LAST still lands correctly (ADR 0106 §6 H — the same
+    index-stable anchor the code-set capture injection uses)."""
+    if not _name_in_scope(module_tree, "Send"):
+        lines.insert(_leading_import_end(module_tree), f"from messagefoundry import Send{term}")
+
+
+def _apply_add_send(
+    src: str,
+    module_tree: ast.Module,
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    edit: dict[str, Any],
+    line_start: int,
+    line_end: int,
+) -> str:
+    """Add a ``sends.append(Send(dest, msg))`` accumulator send (ADR 0104 fan-out) — ``insert_send`` and
+    ``add_destination`` both route here.
+
+    Four handler states, dispatched (never authoring a ``Send`` inside a ``return``):
+    - **accumulator** (a ``sends = []`` init + ``return sends`` footer present) → insert one append at the
+      anchor position, clamped to sit after the init and before the footer (never dead-code / pre-init);
+    - **one returned send** (``return Send(...)`` / ``return [Send, ...]``) → convert it UP to the
+      accumulator idiom in place, preserving each existing Send verbatim, then add the new destination;
+    - **>1 returned send** (a Send from more than one branch) → refuse (converting would change control
+      flow); edit as text;
+    - **fresh** (no send construct) → lay down ``sends = []`` (body top), one append (at the anchor), and
+      ``return sends`` (body end); refuse if ``sends`` is already an unrelated local.
+
+    Every untouched line is byte-preserved (gate 2); the caller's ``_assert_reparses`` + the per-line
+    ≤``_MAX_LINE_LENGTH`` guards keep the result valid and ``ruff format``-clean (gate 3)."""
+    dest = edit.get("destination")
+    if not isinstance(dest, str) or not dest:
+        raise LensRewriteError("insert_send / add_destination requires a non-empty 'destination'")
+    position = edit.get("position", "after")
+    if position not in ("before", "after"):
+        raise LensRewriteError(
+            "insert_send / add_destination 'position' must be 'before' or 'after'"
+        )
+
+    # Take the accumulator path ONLY when ``sends`` is a clean, DELIVERING accumulator (single ``[]``
+    # init, returned, bound nowhere else) — so an append is never spliced into a rebound/aliased ``sends``
+    # that is not a list at runtime (an AttributeError the Steps view would never surface).
+    footer = _accumulator_footer(handler_node)
+    init = _accumulator_init(handler_node)
+    if (
+        footer is not None
+        and init is not None
+        and _ACCUMULATOR in _delivering_accumulators(handler_node)
+    ):
+        return _add_to_accumulator(
+            src, module_tree, handler_node, dest, init, footer, line_start, line_end, position
+        )
+
+    # A non-accumulator handler: convert its single send/filter return up to the accumulator idiom. This
+    # is the ONLY safe way to add a footer without stranding an existing terminal ``return`` (a fresh
+    # ``return sends`` appended AFTER an existing ``return []`` would be unreachable — and the appends
+    # would never deliver). Require exactly ONE return in the handler's own scope, that it is a send/filter
+    # return, AND that it is a TOP-LEVEL terminal statement — converting a NESTED guard/early-exit return
+    # (e.g. ``if bad: return []``) in place would move the fan-out into that branch and leave the main path
+    # returnless. Anything else (``return None`` / ``return msg`` / a nested or multi-branch return) is
+    # refused rather than mis-extended.
+    all_returns = [n for n in _own_scope_nodes(handler_node) if isinstance(n, ast.Return)]
+    send_returns = [s for s in all_returns if _is_send_return(s)]
+    if (
+        len(all_returns) == 1
+        and len(send_returns) == 1
+        and send_returns[0]
+        in handler_node.body  # a top-level terminal statement, not a nested guard
+    ):
+        return _convert_return_to_accumulator(src, module_tree, dest, send_returns[0])
+    if all_returns:
+        raise LensRewriteError(
+            "the handler's return can't be extended into a fan-out — it needs a single top-level "
+            "`return Send(...)`, `return [...]`, or `return []` (or no return at all); edit it as text"
+        )
+    # No return at all: lay a fresh accumulator with its own footer (nothing to strand).
+    if _function_binds(handler_node, _ACCUMULATOR):
+        raise LensRewriteError(
+            f"the handler already binds a local {_ACCUMULATOR!r} that is not a fan-out accumulator — "
+            "rename it or edit as text"
+        )
+    return _lay_fresh_accumulator(
+        src, module_tree, handler_node, dest, line_start, line_end, position
+    )
+
+
+def _add_to_accumulator(
+    src: str,
+    module_tree: ast.Module,
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    dest: str,
+    init: ast.Assign,
+    footer: ast.Return,
+    line_start: int,
+    line_end: int,
+    position: str,
+) -> str:
+    """Insert one ``sends.append(Send(dest, msg))`` into an existing accumulator, before the footer.
+
+    The append lands at the accumulator's OWN (top-level) suite indent — never the anchor's. The anchor
+    position is honored only for a TOP-LEVEL anchor (a direct body statement); a nested anchor (inside an
+    if/for) would otherwise put the append at the wrong indent or inside a block (per-iteration/conditional
+    delivery), so it lands just before the footer instead. The index is always clamped after the init line
+    and before the footer (never dead code / pre-init)."""
+    lines = _physical_lines_keepends(src)
+    term = _dominant_terminator(src)
+    indent = _leading_ws(lines[init.lineno - 1])  # the accumulator's own (top-level) suite indent
+    append_line = _render_append_line(indent, dest, term)
+    top_level = any(
+        s.lineno == line_start and (s.end_lineno or s.lineno) == line_end for s in handler_node.body
+    )
+    idx = (line_end if position == "after" else line_start - 1) if top_level else footer.lineno - 1
+    idx = max(init.lineno, min(idx, footer.lineno - 1))
+    lines.insert(idx, append_line)
+    _maybe_inject_send(lines, module_tree, term)
+    return "".join(lines)
+
+
+def _convert_return_to_accumulator(
+    src: str,
+    module_tree: ast.Module,
+    dest: str,
+    ret: ast.Return,
+) -> str:
+    """Convert a ``return Send(...)`` / ``return [Send, ...]`` up to the accumulator idiom, add ``dest``.
+
+    Each existing Send's verbatim source is preserved (destination string, ``occurrence=`` kwarg, the
+    ``msg`` arg byte-exact). Refuses a list carrying a non-Send element (e.g. ``SetState`` — not a pure
+    fan-out) or a multi-line Send (its append can't stay a single clean line); edit those as text."""
+    value = ret.value
+    if isinstance(value, ast.Call):
+        sends = [value]
+    elif isinstance(value, ast.List | ast.Tuple):
+        sends = []
+        for elt in value.elts:
+            if not (isinstance(elt, ast.Call) and _callee_name(elt.func) == "Send"):
+                raise LensRewriteError(
+                    "the returned list has a non-Send element (e.g. SetState) — converting to an "
+                    "accumulator fan-out would drop it; edit it as text"
+                )
+            sends.append(elt)
+    else:  # pragma: no cover — caller only reaches here for a recognized send return
+        raise LensRewriteError("internal: return is not a Send construct")
+    for s in sends:
+        if (s.end_lineno or s.lineno) != s.lineno:
+            raise LensRewriteError(
+                "a Send in the return spans multiple physical lines — converting it to an append is out "
+                "of scope; edit it as text"
+            )
+
+    lines = _physical_lines_keepends(src)
+    term = _dominant_terminator(src)
+    ret_ls = ret.lineno
+    ret_le = ret.end_lineno or ret.lineno
+    indent = _leading_ws(lines[ret_ls - 1])
+    block: list[str] = [f"{indent}{_ACCUMULATOR} = []{term}"]
+    for s in sends:
+        physical = f"{indent}{_ACCUMULATOR}.append({_src(s, src)})"
+        if len(physical) > _MAX_LINE_LENGTH:
+            raise LensRewriteError(
+                f"a converted append would be {len(physical)} columns — over the {_MAX_LINE_LENGTH}-"
+                "column limit (ruff would wrap it); edit it as text"
+            )
+        block.append(physical + term)
+    block.append(_render_append_line(indent, dest, term))
+    block.append(f"{indent}return {_ACCUMULATOR}{term}")
+    lines[ret_ls - 1 : ret_le] = block
+    _maybe_inject_send(lines, module_tree, term)
+    return "".join(lines)
+
+
+def _lay_fresh_accumulator(
+    src: str,
+    module_tree: ast.Module,
+    handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
+    dest: str,
+    line_start: int,
+    line_end: int,
+    position: str,
+) -> str:
+    """Lay down a fresh accumulator: ``sends = []`` at body top, one append at the anchor, ``return sends``
+    at body end. The three inserts apply in DESCENDING index so earlier indices stay valid."""
+    lines = _physical_lines_keepends(src)
+    term = _dominant_terminator(src)
+    body_indent = _leading_ws(lines[handler_node.body[0].lineno - 1])
+    # The append lands at the handler's top-level body indent (like the init/footer). The anchor position
+    # is honored only for a TOP-LEVEL anchor; a nested anchor (inside an if/for) would put a top-level-
+    # indented line inside a block (invalid) or make the send per-iteration, so the append lands at the
+    # body end (just before the footer) instead — one delivery per message.
+    append_line = _render_append_line(body_indent, dest, term)
+    init_line = f"{body_indent}{_ACCUMULATOR} = []{term}"
+    footer_line = f"{body_indent}return {_ACCUMULATOR}{term}"
+
+    first_body = handler_node.body[0].lineno
+    last = handler_node.body[-1]
+    body_end = last.end_lineno or last.lineno
+    top_level = any(
+        s.lineno == line_start and (s.end_lineno or s.lineno) == line_end for s in handler_node.body
+    )
+    idx_init = first_body - 1
+    idx_append = (line_end if position == "after" else line_start - 1) if top_level else body_end
+    idx_footer = body_end
+    # Descending index (footer, then append, then init) — a stable sort keeps footer before append when
+    # both land on the last-statement index, so the final order is …last-stmt, append, return sends.
+    inserts = sorted(
+        [(idx_footer, footer_line), (idx_append, append_line), (idx_init, init_line)],
+        key=lambda t: t[0],
+        reverse=True,
+    )
+    for idx, line in inserts:
+        if idx >= len(lines):
+            if lines and _line_terminator(lines[-1]) == "":
+                lines[-1] = lines[-1] + term  # terminate a no-trailing-newline last line first
+            lines.append(line)
+        else:
+            lines.insert(idx, line)
+    _maybe_inject_send(lines, module_tree, term)
+    return "".join(lines)
+
+
 def _apply_move_row(
     src: str,
     handler_node: ast.FunctionDef | ast.AsyncFunctionDef,
@@ -2273,8 +2790,16 @@ def _apply_paste_block(src: str, line_start: int, line_end: int, edit: dict[str,
 
 
 def _str_lit(value: object) -> str:
-    """A double-quoted Python string literal (ruff's preferred quote style) for template rendering."""
-    return '"' + str(value).replace("\\", "\\\\").replace('"', '\\"') + '"'
+    """A Python string literal in ruff's preferred quote style — double quotes, but SINGLE quotes when the
+    value contains a ``"`` and no ``'`` (ruff drops to single quotes to avoid escaping the double quote).
+
+    Matching ruff's escape-avoidance keeps a rendered literal ``ruff format --check``-clean (gate 3): a
+    naive ``"a\\"b"`` would be reflowed by ruff to ``'a"b'``. (A value with both quote kinds stays double-
+    quoted-with-escape, which IS ruff-canonical.)"""
+    s = str(value)
+    if '"' in s and "'" not in s:
+        return "'" + s.replace("\\", "\\\\") + "'"
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
 def _render_if_test(edit: dict[str, Any]) -> str:
@@ -2359,8 +2884,10 @@ def _apply_insert_template(
     # at the right insertion point in ``result``.
     if edit.get("template") == "send" and not _name_in_scope(module_tree, "Send"):
         lines = _physical_lines_keepends(result)
+        # _leading_import_end (not _last_import_line): a stray top-level import BELOW the edited handler
+        # would otherwise place the injected import mid-file after the body splice (E402 / not ruff-clean).
         lines.insert(
-            _last_import_line(module_tree),
+            _leading_import_end(module_tree),
             f"from messagefoundry import Send{_dominant_terminator(src)}",
         )
         result = "".join(lines)

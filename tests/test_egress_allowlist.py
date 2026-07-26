@@ -13,6 +13,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
     ConnectionSpec,
+    FhirLookupSpec,
     InboundConnection,
     OutboundConnection,
     Registry,
@@ -156,5 +157,38 @@ async def test_build_check_deny_by_default_refuses_unlisted(tmp_path: Path) -> N
             egress=EgressSettings(deny_by_default=True, allowed_mllp=["good.partner.org:2575"]),
         )
         allowed.build_check(allowed.registry)  # no raise
+    finally:
+        await store.close()
+
+
+# --- 1.2.2: [egress].fhir_require_structured_params threads onto the live FHIR executor --------------
+
+
+def test_egress_fhir_require_structured_default_off() -> None:
+    assert EgressSettings().fhir_require_structured_params is False
+
+
+async def test_runner_threads_require_structured_into_fhir_executor(tmp_path: Path) -> None:
+    # Guards the load-bearing wiring_runner._build_fhir_lookup_executor thread of
+    # [egress].fhir_require_structured_params onto the LIVE executor that serves reads (ASVS 1.2.2).
+    store = await MessageStore.open(tmp_path / "x.db")
+    try:
+        reg = Registry()
+        reg.add_fhir_lookup(
+            FhirLookupSpec(name="epic", settings={"url": "https://fhir.example.org/fhir"})
+        )
+        on = RegistryRunner(
+            reg,
+            store,
+            egress=EgressSettings(
+                allowed_http=["fhir.example.org"], fhir_require_structured_params=True
+            ),
+        )
+        ex_on = on._build_fhir_lookup_executor()
+        assert ex_on is not None and ex_on._require_structured is True
+        # Default off → not threaded (byte-identical).
+        off = RegistryRunner(reg, store, egress=EgressSettings(allowed_http=["fhir.example.org"]))
+        ex_off = off._build_fhir_lookup_executor()
+        assert ex_off is not None and ex_off._require_structured is False
     finally:
         await store.close()

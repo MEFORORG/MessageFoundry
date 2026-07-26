@@ -80,6 +80,12 @@ _STORE_MEMBER = "store.db"
 _CONFIG_PREFIX = "config/"
 _MANIFEST_MEMBER = "manifest.json"
 
+#: ASVS 5.2.3 restore-extract bound: refuse to stream a single tar member larger than this out of an
+#: archive during restore-verify (defends the temp-dir extract against a forged archive that declares — or
+#: streams — an absurd member size). Generous enough for a real single-box SQLite store snapshot; the
+#: :func:`_extract_member` ``max_member_bytes`` parameter overrides it (tests pass a small cap).
+_MAX_RESTORE_MEMBER_BYTES = 16 * 1024 * 1024 * 1024  # 16 GiB
+
 
 class BackupError(RuntimeError):
     """A backup run failed at a named phase (``snapshot``/``encrypt``/``write``/``verify``/
@@ -162,6 +168,10 @@ class BackupRunner:
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._last_backup_day: str | None = None
+        # ASVS 11.3.4: AES-GCM frame counts reported by the codec from the worker thread, drained and
+        # charged to the key's persisted invocation bound after each run. Backup is a leader-only
+        # singleton with one run in flight at a time, so a plain list is sufficient.
+        self._frames: list[int] = []
 
     @property
     def enabled(self) -> bool:
@@ -194,7 +204,7 @@ class BackupRunner:
         self._task = None
         if task is not None:
             task.cancel()
-            try:
+            try:  # noqa: SIM105
                 await task
             except asyncio.CancelledError:
                 pass
@@ -215,9 +225,9 @@ class BackupRunner:
             await self._sleep(60.0)  # check the daily clock once a minute
 
     async def _sleep(self, delay: float) -> None:
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), delay)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     def _backup_due(self, now: float) -> bool:
@@ -330,6 +340,7 @@ class BackupRunner:
             except (OSError, BackupCodecError) as exc:
                 kind = "write" if isinstance(exc, OSError) else "encrypt"
                 raise BackupError(kind, safe_exc(exc)) from exc
+            await self._charge_archive_invocations(key_id)
 
         verify: VerifyResult | None = None
         if s.verify_after_backup:
@@ -341,6 +352,7 @@ class BackupRunner:
                 archive_path=str(archive_path),
                 keys=[key] if key is not None else [],
                 full=s.full_restore_verify,
+                allow_unencrypted=s.allow_unencrypted,
             )
             if not verify.ok:
                 # A verify FAIL means the archive is unusable — but it must NOT be counted as the latest
@@ -368,6 +380,28 @@ class BackupRunner:
             pruned=pruned,
             encrypted=key is not None,
         )
+
+    async def _charge_archive_invocations(self, key_id: str | None) -> None:
+        """Charge this run's DR-frame AES-GCM invocations to the key's PERSISTED invocation bound
+        (ASVS 11.3.4) — a post-run aggregate add, since the frames are written on a worker thread that
+        holds no store handle.
+
+        Without this the bound under-counts by every backup run: ``backup_codec`` constructs its own
+        ``AESGCM`` from the raw DEK and never reaches ``AesGcmCipher._count_invocation``, yet a 10 GB
+        store at the 1 MiB default chunk is ~10k invocations per run under that same key. Best-effort —
+        an accounting failure must never fail an otherwise-successful backup."""
+        frames = sum(self._frames)
+        self._frames.clear()
+        if not frames or key_id is None:
+            return
+        try:
+            await self._store.add_cipher_invocations(key_id, frames)
+        except Exception:  # noqa: BLE001 — advisory accounting; never fail a good backup
+            log.warning(
+                "DR backup: could not charge %d archive frame(s) to the AES-GCM invocation bound",
+                frames,
+                exc_info=True,
+            )
 
     # --- archive build (worker thread; no event loop, no store await) --------
 
@@ -425,7 +459,10 @@ class BackupRunner:
             archive_path.parent.mkdir(parents=True, exist_ok=True)
             with open(tar_path, "rb") as src, open(archive_path, "wb") as dst:
                 if key is not None:
-                    encrypt_stream(src, dst, key)
+                    # ASVS 11.3.4: every DR frame is an AES-GCM invocation under the SAME store DEK, so
+                    # it consumes the same birthday budget. Record the count here (the worker thread
+                    # holds no store) and charge it to the key's persisted bound after the run.
+                    encrypt_stream(src, dst, key, on_frames=self._frames.append)
                 else:
                     # No key + allow_unencrypted: write the plaintext tar verbatim (synthetic/no-PHI box).
                     while True:
@@ -607,12 +644,20 @@ def _select_decrypt_key(keys: list[bytes], header_key_id: str) -> bytes | None:
     return None
 
 
-def _verify_archive_blocking(*, archive_path: str, keys: list[bytes], full: bool) -> VerifyResult:
+def _verify_archive_blocking(
+    *, archive_path: str, keys: list[bytes], full: bool, allow_unencrypted: bool = False
+) -> VerifyResult:
     """Lightweight (or full) restore-verify of a ``.mfbak`` archive — runs OFF the event loop.
 
     ``keys`` is the decrypt-capable keyring (active + retired, ADR 0049 AC-5 "incl. retired keys") — the
     archive is matched against the whole set so one taken under a now-retired key still verifies after a
     rotation; an empty list means "no key configured" (only valid for a plaintext archive).
+
+    ASVS 5.2.3 (symmetric ``allow_unencrypted``): the write path refuses to *write* a plaintext archive
+    when no key is configured unless ``[backup].allow_unencrypted`` is set; symmetrically, when a store key
+    IS configured a **plaintext** archive is a downgrade signal (an attacker swapping the AEAD-sealed
+    archive for an unauthenticated one) and is refused here as ``KEY_MISMATCH`` — unless ``allow_unencrypted``
+    is set for a synthetic/no-PHI box.
 
     Steps (ADR 0049): (1) key-fingerprint precheck — a mismatch is a clean ``KEY_MISMATCH`` BEFORE any
     decrypt; (2) decrypt the archive; (3) extract + open ``store.db`` read-only, run
@@ -623,6 +668,16 @@ def _verify_archive_blocking(*, archive_path: str, keys: list[bytes], full: bool
         # archive (no codec header) there is no key to mismatch.
         match_key: bytes | None = None
         encrypted = _looks_encrypted(archive_path)
+        if not encrypted and keys and not allow_unencrypted and Path(archive_path).is_file():
+            # A store key is configured but the archive is plaintext — refuse (possible downgrade/tamper),
+            # symmetric to the write-side fail-closed. allow_unencrypted opts a synthetic/no-PHI box back in.
+            # is_file() gates this to a real plaintext archive (a MISSING file also has no MAGIC, but that
+            # is a plain FAIL, not a downgrade).
+            return VerifyResult(
+                "KEY_MISMATCH",
+                reason="archive is plaintext but a store key is configured; refusing to verify a "
+                "plaintext archive (possible downgrade). Set [backup].allow_unencrypted to accept it.",
+            )
         if encrypted:
             with open(archive_path, "rb") as fh:
                 header_key_id = read_header(fh).key_id
@@ -717,13 +772,21 @@ def _verify_archive_blocking(*, archive_path: str, keys: list[bytes], full: bool
 
 
 async def run_restore_verify(
-    archive_path: str, *, store_settings: object, full: bool = False
+    archive_path: str,
+    *,
+    store_settings: object,
+    full: bool = False,
+    allow_unencrypted: bool = False,
 ) -> VerifyResult:
     """Verify an existing ``.mfbak`` archive WITHOUT activating it (ADR 0049 — 0049's owned primitive,
     which ADR 0048's cold-seed activation *calls*). Resolves the store's decrypt-capable keyring (active
     + retired, AC-5 "incl. retired keys"), runs the key-fingerprint precheck → decrypt → integrity_check
     → row-count compare, and returns a structured ``PASS``/``FAIL``/``KEY_MISMATCH``
-    :class:`VerifyResult`. All heavy work runs off the event loop."""
+    :class:`VerifyResult`. All heavy work runs off the event loop.
+
+    ``allow_unencrypted`` (``[backup].allow_unencrypted``, default off) mirrors the write-side fail-closed:
+    with it off, a plaintext archive is refused (``KEY_MISMATCH``) when a store key is configured (ASVS
+    5.2.3 downgrade guard)."""
     import base64
 
     # The decrypt-capable keyring, NOT just the active key: a backup taken under a key that has since
@@ -734,7 +797,11 @@ async def run_restore_verify(
         for k in resolve_decrypt_keys(store_settings)  # type: ignore[arg-type]
     ]
     return await asyncio.to_thread(
-        _verify_archive_blocking, archive_path=archive_path, keys=keys, full=full
+        _verify_archive_blocking,
+        archive_path=archive_path,
+        keys=keys,
+        full=full,
+        allow_unencrypted=allow_unencrypted,
     )
 
 
@@ -817,7 +884,10 @@ def _full_open_check(snap: Path) -> tuple[bool, str]:
 
 
 def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
-    with tarfile.open(tar_path, "r") as tar:
+    # ASVS 5.2.3: pin the UNCOMPRESSED reader ("r:", not "r"). The writer only ever writes an
+    # uncompressed tar, so auto-detecting/decompressing gzip/bz2/xz here is pure attack surface (a
+    # decompression-bomb vector) — "r:" refuses a compressed archive with tarfile.ReadError.
+    with tarfile.open(tar_path, "r:") as tar:
         member = tar.extractfile(_MANIFEST_MEMBER)
         if member is None:
             return {}
@@ -826,7 +896,13 @@ def _read_manifest_from_tar(tar_path: Path) -> dict[str, object]:
     return obj if isinstance(obj, dict) else {}
 
 
-def _extract_member(tar_path: Path, name: str, dest_dir: Path) -> Path | None:
+def _extract_member(
+    tar_path: Path,
+    name: str,
+    dest_dir: Path,
+    *,
+    max_member_bytes: int = _MAX_RESTORE_MEMBER_BYTES,
+) -> Path | None:
     """Extract a single archive member to ``dest_dir`` and return its path, or ``None`` when absent.
 
     Path-traversal-safe by construction, NOT by an after-the-fact check: the member's *stored name* is
@@ -834,21 +910,39 @@ def _extract_member(tar_path: Path, name: str, dest_dir: Path) -> Path | None:
     output path (``dest_dir/extracted_store.db``). So a tampered tar whose member name is
     ``../../etc/passwd`` cannot escape ``dest_dir`` (the classic tar-extract CVE), because we never call
     ``tar.extract``/``extractall`` with the member's path. Keep it that way: if a future change extracts
-    by the member's own name, add an explicit ``resolved.is_relative_to(dest_dir)`` guard first."""
+    by the member's own name, add an explicit ``resolved.is_relative_to(dest_dir)`` guard first.
+
+    ASVS 5.2.3 bound: the reader is pinned to the UNCOMPRESSED format (``"r:"``, never ``"r"`` — a
+    compressed archive is refused rather than decompressed), the member's declared ``size`` is rejected
+    *before* any streaming when it exceeds ``max_member_bytes``, and the bytes actually streamed are
+    counted and enforced against the same cap — so neither a lying header nor a lying stream can exhaust
+    the extract temp dir. An over-cap member raises :class:`tarfile.TarError` (surfaced by the caller as a
+    restore-verify ``FAIL``)."""
     out = (dest_dir / "extracted_store.db").resolve()
-    with tarfile.open(tar_path, "r") as tar:
+    with tarfile.open(tar_path, "r:") as tar:
         try:
             member = tar.getmember(name)
         except KeyError:
             return None
+        if member.size > max_member_bytes:
+            raise tarfile.TarError(
+                f"archive member exceeds the restore extract cap ({max_member_bytes} bytes)"
+            )
         src = tar.extractfile(member)
         if src is None:
             return None
+        streamed = 0
         with open(out, "wb") as fh:
             while True:
                 buf = src.read(1024 * 1024)
                 if not buf:
                     break
+                streamed += len(buf)
+                if streamed > max_member_bytes:
+                    raise tarfile.TarError(
+                        "archive member stream exceeds the restore extract cap "
+                        f"({max_member_bytes} bytes)"
+                    )
                 fh.write(buf)
     return out
 

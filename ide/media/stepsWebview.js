@@ -56,6 +56,9 @@
         expectSrc: el.dataset.expectSrc,
         draggable: el.getAttribute('draggable') === 'true',
         isControlHeader: el.dataset.kind === 'control' && el.getAttribute('draggable') === 'true',
+        // ADR 0104 fan-out: the precomputed isReturnRow (a terminal return / scaffold footer). A mid-body
+        // append send is NOT a return, so it is a normal two-zone drop target that emits an after-slot.
+        isReturn: el.dataset.isReturn === 'true',
       }));
     }
     // ---- Steps block copy/cut/paste mirrors (source of truth: stepsModel.blockExtent / captureBlock) ----
@@ -112,7 +115,7 @@
             emit(String(R.lineStart));
             for (let j = i + 1; j < ch.length && cont(ch[j]); j++) { emit(String(ch[j].lineStart)); }
             slots.push({ anchorLineStart: R.lineStart, anchorLineEnd: R.lineEnd, toPosition: 'after', toSuite: suiteId, landingDepth: R.nesting });
-          } else if (R.kind !== 'send') {
+          } else if (!R.isReturn) {
             slots.push({ anchorLineStart: R.lineStart, anchorLineEnd: R.lineEnd, toPosition: 'after', toSuite: suiteId, landingDepth: R.nesting });
           }
         }
@@ -206,6 +209,18 @@
             lineEnd: Number(b.dataset.lineEnd), expectSrc: b.dataset.expectSrc });
           return;
         }
+        if (op === 'addDestination') {
+          // ADR 0104 fan-out "＋ dest": add another destination to this send. The provider runs the
+          // destination picker then rides the SAME byte-stable applyStructural path. Carry the anchor's
+          // fan-out flags (from the <li>) so the provider derives the insert position (isReturnRow).
+          const li = b.closest('li.row');
+          vscode.postMessage({ command: 'addDestination', handler: b.dataset.handler, lineStart,
+            lineEnd: Number(b.dataset.lineEnd), expectSrc: b.dataset.expectSrc,
+            kind: li ? li.dataset.kind : undefined,
+            appended: !!(li && li.dataset.appended === 'true'),
+            scaffold: li ? (li.dataset.scaffold || undefined) : undefined });
+          return;
+        }
         if (op === 'moveUp' || op === 'moveDown') {
           const res = walkMove(stepsCtxRows(), lineStart, op === 'moveUp' ? 'up' : 'down');
           if (!res) { return; } // at the top/bottom of the handler, or the sole statement of its block — a no-op
@@ -260,6 +275,9 @@
         expectSrc: el.dataset.expectSrc,
         kind: el.dataset.kind,
         control: el.dataset.control,
+        // ADR 0104 fan-out: the precomputed isReturnRow — the toolbar Add derives its insert position from
+        // it (a return / scaffold footer → before; a mid-body append → after).
+        isReturn: el.dataset.isReturn === 'true',
       };
       updateAddState();
     }
@@ -401,7 +419,9 @@
         if (!first) { return null; }
         return { anchorEl: first, position: 'before', toSuite: bodySuiteId, landingDepth: nesting + 1 };
       }
-      const position = target.dataset.kind === 'send' ? 'before' : (frac > 0.5 ? 'after' : 'before');
+      // A terminal return / scaffold footer clamps to 'before' (no dead code after the return); a mid-body
+      // append send is a normal two-zone target (ADR 0104).
+      const position = target.dataset.isReturn === 'true' ? 'before' : (frac > 0.5 ? 'after' : 'before');
       return { anchorEl: target, position, toSuite: target.dataset.suite, landingDepth: nesting };
     }
     // Mirror of insertionBarAnchor (stepsModel.ts, the source of truth): which ROW + edge the bar sits on.
@@ -529,7 +549,9 @@
     sel.addEventListener('change', updateAddState);
     addBtn.addEventListener('click', () => {
       if (sel.value === '' || !selected) { return; }
-      const position = selected.kind === 'send' ? 'before' : 'after';
+      // ADR 0104 fan-out: insert BEFORE a terminal return / scaffold footer (no dead code), AFTER a
+      // mid-body append send or any other step.
+      const position = selected.isReturn ? 'before' : 'after';
       // Remember what to select after the insert re-projects (the new neighbour of the anchor row).
       vscode.setState(Object.assign({}, vscode.getState() || {}, {
         selectAfterInsert: { handler: selected.handler, anchorExpectSrc: selected.expectSrc, position },
@@ -537,6 +559,9 @@
       vscode.postMessage({
         command: 'insertItem',
         itemId: sel.value,
+        // Pass the isReturn-aware position (a mid-body append → after, a return/footer → before) so the
+        // provider does not have to re-derive it from `kind` alone (which can't tell an append from a return).
+        position: position,
         handler: selected.handler,
         lineStart: selected.lineStart,
         lineEnd: selected.lineEnd,
@@ -593,6 +618,16 @@
         toLineStart: res.anchorLineStart, toLineEnd: res.anchorLineEnd,
         toPosition: res.toPosition, toSuite: res.toSuite, expectSrc: selectedEl.dataset.expectSrc });
     }
+    function menuAddDestination() {
+      // ADR 0104 fan-out: the same message the per-row "＋ dest" button posts — the provider runs the
+      // destination picker then rides applyStructural. Carry the anchor's fan-out flags for the position.
+      if (!selectedEl) { return; }
+      vscode.postMessage({ command: 'addDestination', handler: selectedEl.dataset.handler,
+        lineStart: Number(selectedEl.dataset.lineStart), lineEnd: Number(selectedEl.dataset.lineEnd),
+        expectSrc: selectedEl.dataset.expectSrc, kind: selectedEl.dataset.kind,
+        appended: selectedEl.dataset.appended === 'true',
+        scaffold: selectedEl.dataset.scaffold || undefined });
+    }
 
     // Wrapped in try/catch → stepsDiag so a throw in the menu wiring can NEVER silently kill the row
     // selection / toolbar wiring above it (the class of bug this whole file guards against).
@@ -605,6 +640,7 @@
         const delItem = itemByCmd('deleteRow');
         const upItem = itemByCmd('moveUp');
         const downItem = itemByCmd('moveDown');
+        const addDestItem = itemByCmd('addDestination');
         let open = false;
 
         function closeSubmenus() {
@@ -639,15 +675,19 @@
         }
         function openMenu(el, x, y) {
           const kind = el.dataset.kind;
+          const isReturn = el.dataset.isReturn === 'true';
           const ls = Number(el.dataset.lineStart);
           const ctxRows = stepsCtxRows();
-          // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after not on a send
-          // (dead code after the return); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
+          // Mirrors stepsModel.contextMenuEnablement: Insert before always; Insert after suppressed on a
+          // terminal RETURN / scaffold footer (dead code after the return) but ALLOWED on a mid-body append
+          // send (ADR 0104); Delete only on an editable action/lookup/send row; ↑/↓ per walk.
           for (const p of insertParents) {
-            setDisabled(p, p.dataset.sub === 'after' && kind === 'send');
+            setDisabled(p, p.dataset.sub === 'after' && isReturn);
           }
           const control = el.dataset.control;
           setDisabled(delItem, !(kind === 'action' || kind === 'lookup' || kind === 'send' || kind === 'diagnostic'));
+          // ADR 0104 fan-out: "Add destination" only on a real send row (never the `return []` filter).
+          setDisabled(addDestItem, !(kind === 'send' && el.dataset.filtered !== 'true'));
           // ADR 0106: Else / Else If (data-anchor="if_chain") only apply to an if-chain anchor (an if/elif row).
           const isIfChain = kind === 'control' && (control === 'if' || control === 'elif');
           for (const c of menu.querySelectorAll('.ctx-item[data-anchor="if_chain"]')) {
@@ -716,6 +756,7 @@
           const cmd = item.dataset.cmd;
           if (cmd === 'insert') { menuInsert(item.dataset.itemId, item.dataset.position); }
           else if (cmd === 'deleteRow') { menuDelete(); }
+          else if (cmd === 'addDestination') { menuAddDestination(); }
           else if (cmd === 'moveUp') { menuMove('up'); }
           else if (cmd === 'moveDown') { menuMove('down'); }
           else { return; } // an Insert PARENT — its submenu opens on hover/focus, a click is not an action

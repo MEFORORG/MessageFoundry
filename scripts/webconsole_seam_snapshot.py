@@ -64,10 +64,13 @@ _AUTH_SERVICE_METHODS: tuple[str, ...] = (
     "allow_login_attempt",
     "allow_phi_read",
     "audit_kerberos_reject",
+    "audit_oidc_reject",
     "audit_permission_denied",
     "authenticate_kerberos",
+    "begin_oidc_login",
     "begin_webauthn_assertion",
     "begin_webauthn_registration",
+    "complete_oidc_login",
     "confirm_mfa_enrollment",
     "delete_webauthn_credential",
     "finish_webauthn_assertion",
@@ -88,15 +91,19 @@ _AUTH_SERVICE_METHODS: tuple[str, ...] = (
 )
 
 # app.state attributes the console SETS in mount_ui (ui_*) and READS via get_auth / _auth.py.
-# ``exposure_protected`` is a READ-ONLY, backward-compatible SOFT dependency: the console reads it
-# via ``getattr(app.state, "exposure_protected", False)`` in ``_auth.effective_https`` (proxy-TLS
-# cookie-name + /ui hardening keying), so an engine lacking it degrades gracefully rather than
-# breaking. It is curated here so a future engine RENAME becomes a reviewed seam change — but it
-# does NOT bump ``ENGINE_UI_SEAM``: a graceful-default read stays compatible with every seam, and a
-# bump would make a newer engine REFUSE an older console wheel (``SUPPORTED_ENGINE_SEAMS == {1}``).
+# ``exposure_protected`` and ``loopback`` are READ-ONLY, backward-compatible SOFT dependencies: the
+# console reads them via ``getattr(app.state, "<attr>", False)`` in ``_auth.effective_https`` /
+# ``_auth.security_headers_context`` (proxy-TLS cookie-name keying + the ADR 0143 loopback secure-
+# context /ui header hardening), so an engine lacking either degrades gracefully rather than breaking.
+# They are curated here so a future engine RENAME becomes a reviewed seam change — but they do NOT bump
+# ``ENGINE_UI_SEAM``: a graceful-default read cannot break on a missing attribute, and a bump would
+# make a newer engine REFUSE this console wheel outright — ``SUPPORTED_ENGINE_SEAMS`` holds exactly
+# one seam (BACKLOG #279), so any bump is a hard refusal, which is precisely why a merely-additive
+# app.state read must not trigger one.
 _APP_STATE_ATTRS: tuple[str, ...] = (
     "auth",
     "exposure_protected",
+    "loopback",
     "public_origin",
     "ui_connections_render",
     "ui_csp",
@@ -115,14 +122,20 @@ _API_MODELS_DTOS: tuple[str, ...] = (
     "ClusterStatus",
     "ConfigProvenance",
     "ConnectionEventInfo",
+    "ConnectionFlagRequest",
     "ConnectionRow",
     "DeadLetterList",
     "DeadLetterReplayRequest",
     "DrStatus",
+    "GraphEdge",
+    "GraphNode",
+    "GraphResponse",
     "IntegrityResult",
     "MessageDetail",
     "MessageList",
     "MessageSearchResults",
+    "MetricsHistoryResponse",
+    "MetricsHistorySample",
     "PendingApprovalResponse",
     "ReloadRequest",
     "ReloadResult",

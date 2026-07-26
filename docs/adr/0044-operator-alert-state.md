@@ -260,3 +260,63 @@ escalation chains (still deferred, ADR 0014 §3). The cross-node durable dedup o
   pass + one audit row (never an open/acknowledged instance).
 - [ ] **Console scope.** Confirm the Alerts tab ships **with** #22 (deferred Alerts/Event-Log console work),
   not as a standalone page, and consumes only `api/` models + the HTTP client.
+
+## Amendment (2026-07-18) — windowed suspend / mute of alert instances (+ per-rule mute) (BACKLOG #143)
+
+**Status:** Built — additive. A new `alert_instance.suspended_until` column on all three backends
+(SQLite additive `ALTER`, Postgres `ADD COLUMN IF NOT EXISTS`, SQL Server `COL_LENGTH`-gated `ADD`),
+`suspend_alert_instance` / `resume_alert_instance` store methods + the `QueueStore` Protocol, a
+synchronous **suspend gate** in `NotifierAlertSink._emit`, an `AlertRule.mute` config field, and
+`POST /alerts/{id}/suspend` + `POST /alerts/{id}/resume` API routes (+ the `/ui` suspend/resume
+control). Off by default: no suspension = byte-identical to pre-#143.
+
+**Context — the gap.** #56 gave operators **ack / resolve** but no way to **silence** an alert for a
+window while the underlying condition is *known and being worked* (a planned downstream maintenance).
+The only pre-#143 mechanisms were (a) a static per-rule `transports=[]` suppression — a config edit +
+engine reload, awkward and permanent — and (b) `ack`, which is a triage state, not a mute (an
+ack'd-but-re-firing alert still notifies each cooldown). Corepoint's operator model has a **windowed
+suspend**: mute re-alerts for a chosen window, the connection keeps running and queuing, and the alert
+auto-un-mutes when the window elapses.
+
+**Decision — a durable per-instance suspend window + a config per-rule mute, both gating NOTIFICATION
+only.**
+
+- **Per-instance windowed suspend (operator action).** `POST /alerts/{id}/suspend` (body:
+  `minutes`) sets `alert_instance.suspended_until = now + minutes·60`; `POST /alerts/{id}/resume`
+  clears it. Both are `MONITORING_DIAGNOSE`-gated (the ack/resolve tier), per-channel-RBAC scoped
+  exactly like ack/resolve, and each writes one metadata-only `alert_suspend` / `alert_resume` audit
+  row (no message content). The window is **durable** in the store (survives restart; the dashboard
+  shows "suspended until T"), and the value is a plain epoch — expiry is automatic (`now >= T` ⇒ not
+  suspended), so **no timer / sweep is introduced** (§ AC-3 / the ADR 0014 §3 timed-escalation decline
+  is untouched).
+
+- **Per-rule mute (config).** `AlertRule.mute: bool = False`. A matching rule with `mute=true`
+  suppresses the **notification** (the decision's transports collapse to `()`), reading as intent
+  without having to enumerate/clear `transports`. It is the config-static twin of the operator's
+  windowed suspend; like `transports=[]` it **still records the instance** (AC-3) and still permits a
+  quiet #144 control action.
+
+- **The suspend gate is NOTIFICATION-only (AC-3, do not break).** `NotifierAlertSink` keeps an
+  **in-memory** `_suspended: dict["type:connection", until_epoch]` — the *same per-node, advisory
+  posture* as the existing `_last_sent` throttle (ADR 0014 §4). `_emit` records the durable instance
+  **first** (so the open condition/count is never hidden — a suspended alert stays on the dashboard
+  and in `alerts_active`), then, after the throttle + any control-action dispatch, if the key is
+  suspended for the window it **skips the transport enqueue only**. The durable `suspended_until`
+  seeds the cache at startup (the lifespan primes it from `list_active_alert_instances` after
+  `set_store`), and the API suspend/resume routes update the running sink's cache immediately (via
+  `app.state.notifier`) so a suspend takes effect without waiting for a re-observation. A suspend
+  **never** changes the instance's status, count, or visibility — only whether a transport fires.
+
+**PHI / secret posture.** Unchanged — no new at-rest tier. `suspended_until` is a metadata epoch;
+suspend/resume carry only the alert id + (for suspend) a duration. The `alert_suspend` / `alert_resume`
+audit rows record the actor + alert id only, never message content (the §D3 metadata-only audit
+discipline). Per-node suspend state mirrors the ADR 0014 §4 per-node throttle — a multi-node cluster
+mutes on the node that observes the condition (each connection's alerts are emitted by the node that
+owns it), with the durable `suspended_until` as the cross-restart record.
+
+**Consequences.** Operators can silence an alert-storm during planned maintenance without stopping the
+feed or editing+reloading config, and it auto-un-mutes at the window end. Cost: one nullable column on
+three backends (the ADR 0064 `_schema_hash` bumps automatically on the server backends) and a small
+in-memory map per sink. Deliberately **notification-only**: suspend/mute never hides the open condition
+(that is what `resolve` is for) and — matching "gates notification only" — a suspended alert's #144
+control action still fires (a windowed mute is not a control-action mute; disable the rule for that).

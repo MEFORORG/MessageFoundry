@@ -87,7 +87,7 @@ async def _http(
             data = b""  # a refused connection may reset mid-read on the Windows Proactor loop
     finally:
         writer.close()
-        try:
+        try:  # noqa: SIM105
             await writer.wait_closed()
         except OSError:
             pass
@@ -343,7 +343,7 @@ async def test_stop_is_bounded(store: MessageStore) -> None:
         await asyncio.wait_for(src.stop(), 8.0)  # must not hang on the established client
     finally:
         writer.close()
-        try:
+        try:  # noqa: SIM105
             await writer.wait_closed()
         except OSError:
             pass
@@ -462,3 +462,128 @@ def test_build_response_shape() -> None:
     assert b"Content-Length: 8\r\n" in out
     assert b"Connection: close\r\n" in out
     assert out.endswith(b'{"ok":1}')
+
+
+# --- API-18: bounded functional DoS-guard tests (slow-loris / max_connections / body-flood) ------
+#
+# Each proves ONE HTTP guard refuses under a SMALL flood or slow client — a functional pass/fail, NOT
+# a scale/soak measurement (the sustained thousands-of-connection flood + throughput-under-load run is
+# rig-deferred). Modeled on the MLLP analogs test_emits_at_capacity / test_idle_timeout_close_reason
+# (tests/test_connection_event_emit.py) and the in-file _http() raw client + events=[] sink wiring.
+# GOTCHA (carried from this suite): a refused/reset connection on the Windows Proactor loop may reset
+# before its 4xx flushes, so the load-bearing assertion is the connection_event kind + the ABSENT
+# ingress row (status is asserted with the same (4xx, 0) tolerance the file already uses).
+
+
+async def _wait_for(predicate, timeout: float = 2.0) -> bool:  # type: ignore[no-untyped-def]
+    """Poll ``predicate`` until true or ``timeout`` — mirrors the MLLP analog rather than sleeping."""
+    loop = asyncio.get_event_loop()
+    deadline = loop.time() + timeout
+    while loop.time() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return False
+
+
+async def test_slow_loris_refused_and_listener_stays_live(store: MessageStore) -> None:
+    """A client that dribbles a partial request head (never sends the CRLFCRLF terminator) must be cut
+    off by ``receive_timeout`` with a 408 + an ``idle_timeout`` connection_event, write NO ingress row,
+    and leave the listener LIVE — a follow-on well-formed POST still commits + 202s."""
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(
+            port=0, receive_timeout=0.2
+        ),  # bound the whole-request read to 0.2s (slow-loris guard)
+        router="r",
+        content_type=ContentType.JSON,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        # Partial head, no terminating blank line: _read_request blocks in readuntil until the guard trips.
+        resp = await _http(
+            src.sockport, raw_override=b"POST /ingest HTTP/1.1\r\nHost: localhost\r\n"
+        )
+        assert resp.status in (
+            408,
+            0,
+        )  # 408 when flushed; 0 = reset before flush (Windows Proactor)
+        assert await _wait_for(lambda: any(k == "idle_timeout" for k, *_ in events))
+        cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+        assert (await cur.fetchone())["n"] == 0  # slow-loris refused pre-ingress: no row
+
+        # Listener stays live: a follow-on well-formed POST is accepted + committed.
+        ok = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
+        assert ok.status == 202
+        cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+        assert (await cur.fetchone())["n"] == 1  # only the good POST reached ingress
+    finally:
+        await asyncio.wait_for(src.stop(), timeout=8.0)
+
+
+async def test_max_connections_flood_refused_and_event(store: MessageStore) -> None:
+    """With ``max_connections=2``, hold 2 clients open (established, mid-read) then a 3rd is refused with
+    an ``at_capacity`` connection_event (503, or a Proactor reset) and writes NO ingress row."""
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(
+            port=0, max_connections=2
+        ),  # receive_timeout default (60s) keeps the 2 holders established
+        router="r",
+        content_type=ContentType.JSON,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    holders: list[asyncio.StreamWriter] = []
+    try:
+        # Open 2 clients that connect but never send a full request — each occupies a slot mid-read.
+        for _ in range(2):
+            _reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
+            holders.append(writer)
+        assert await _wait_for(lambda: src._active == 2)  # both established (at the cap)
+
+        # The 3rd client is over the cap: refused at accept, before any request is read.
+        resp = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
+        assert resp.status in (
+            503,
+            0,
+        )  # 503 when flushed; 0 = reset before flush (Windows Proactor)
+        assert await _wait_for(lambda: any(k == "at_capacity" for k, *_ in events))
+        cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+        assert (await cur.fetchone())["n"] == 0  # capacity refusal never reaches ingress
+    finally:
+        for writer in holders:
+            writer.close()
+        await asyncio.wait_for(src.stop(), timeout=8.0)
+
+
+async def test_body_flood_no_content_length_refused(store: MessageStore) -> None:
+    """A POST with NO Content-Length streams its body to EOF; a body past ``max_body_bytes`` is refused
+    with 413 + ``frame_oversize`` on the read-to-EOF path (complements the declared-CL socket test)."""
+    events: list[tuple] = []
+    ic = build_inbound_connection(
+        "IB_HTTP",
+        Http(port=0, max_body_bytes=16),  # tiny cap; the flood body is 64 bytes
+        router="r",
+        content_type=ContentType.TEXT,
+        capture_connection_errors=True,
+    )
+    src = await _start_source(store, ic, events=events)
+    try:
+        # No Content-Length header -> the read-to-EOF path; body 64 bytes trips the 16-byte cap.
+        resp = await _http(
+            src.sockport,
+            raw_override=b"POST /ingest HTTP/1.1\r\nHost: localhost\r\n\r\n" + b"x" * 64,
+        )
+        assert resp.status in (
+            413,
+            0,
+        )  # 413 when flushed; 0 = reset before flush (Windows Proactor)
+        assert await _wait_for(lambda: any(k == "frame_oversize" for k, *_ in events))
+        cur = await store._db.execute("SELECT COUNT(*) AS n FROM messages")
+        assert (await cur.fetchone())["n"] == 0  # oversize body refused before any ingress row
+    finally:
+        await asyncio.wait_for(src.stop(), timeout=8.0)

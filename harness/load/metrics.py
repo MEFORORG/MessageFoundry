@@ -184,7 +184,22 @@ class Counters:
     nak: int = 0  # ACKs whose MSA-1 is a reject/error (AE/AR/CE/CR)
     errors: int = 0  # transport failures (connection drop, write error)
     timeouts: int = 0  # in-flight at a connection close with no ACK seen
-    deferred: int = 0  # open-loop offers the pool could not accept (engine lagging)
+    deferred: int = 0  # open-loop offers the pool could not accept (TOTAL = the two causes below)
+    #: ⭐ THE TWO CAUSES OF A DEFERRAL, WHICH ARE OPPOSITE FINDINGS AND WERE THE SAME COUNTER.
+    #:
+    #: ``deferred`` is incremented at two SEMANTICALLY OPPOSITE sites, and a consumer could not tell them
+    #: apart. That is not a cosmetic gap: ``sent`` is only incremented AFTER a job is popped from a BOUNDED
+    #: queue (``sender.py``), and the write loop ``await writer.drain()``s before popping the next — so when
+    #: the ENGINE stops reading its socket, the TCP window fills, ``drain()`` blocks, the queue fills,
+    #: ``submit_nowait()`` starts returning False, and the message is NEVER SENT. ``offered - sent`` is
+    #: therefore **ENGINE-PACED**, not a rig-only quantity, and any gate that reads a ``sent`` shortfall as
+    #: "the load generator is too small" will classify a REAL ENGINE INTAKE BIND as a rig failure.
+    #:
+    #: Split at the two sites so the cause is RECORDED rather than assumed:
+    deferred_backpressure: int = (
+        0  # the pool's buffer was FULL ⇒ the ENGINE would not take the bytes
+    )
+    deferred_schedule: int = 0  # no target, or the generator fell behind its own tick ⇒ THE RIG
     sink_received: int = (
         0  # frames the correlation sink absorbed (one per delivery, fan-out included)
     )

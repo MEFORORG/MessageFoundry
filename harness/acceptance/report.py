@@ -15,6 +15,11 @@ from collections import Counter
 from pathlib import Path
 from typing import Sequence
 
+from harness._spreadsheet import (
+    SPREADSHEET_FORMULA_TRIGGERS,
+    spreadsheet_safe,
+    xlsx_cell_text,
+)
 from harness.acceptance.matrix import SECTIONS, Status
 from harness.acceptance.runner import RowResult
 
@@ -23,16 +28,16 @@ _FAILING = (Status.FAIL, Status.ERROR)
 
 # CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
 # these as a formula. A leading "'" forces it to be read as literal text on open. The acceptance CSV
-# is a report artifact (never re-parsed as data), so escaping its free-text cells is loss-free.
-# Mirrors harness/load/report.py:_spreadsheet_safe.
-_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+# is a report artifact (never re-parsed as data), so escaping its free-text cells is loss-free. The
+# rule is the shared one (harness/_spreadsheet.py) — this module used to carry its own copy.
+_CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
 
 
 def _spreadsheet_safe(value: str) -> str:
     """Neutralize a leading formula trigger so a free-text cell (title/detail/evidence) can't execute
     when the CSV is opened in Excel/Sheets. Applied only to the free-text columns of
     :func:`render_csv`; the structured columns (id/section/status/coverage) are controlled vocab."""
-    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+    return spreadsheet_safe(value)
 
 
 def summarize(results: Sequence[RowResult]) -> Counter[Status]:
@@ -118,6 +123,10 @@ def write_xlsx_status(results: Sequence[RowResult], xlsx_path: Path) -> int:
 
     Returns the number of rows updated. Raises ``RuntimeError`` if openpyxl is unavailable or the
     workbook has no recognisable ``ID`` / ``Status`` header.
+
+    ASVS 1.2.10 covers "CSV **or other spreadsheet formats (such as XLS, XLSX, or ODF)**", so the
+    free-text detail is neutralized on the way in (:func:`~harness._spreadsheet.xlsx_cell_text`) and
+    the written cell is additionally pinned to the string type — see below.
     """
     try:
         from openpyxl import load_workbook
@@ -153,9 +162,15 @@ def write_xlsx_status(results: Sequence[RowResult], xlsx_path: Path) -> int:
         result = by_id.get(str(cell.value).strip()) if cell.value is not None else None
         if result is None:
             continue
+        # Status is a controlled vocabulary (the Status str-enum), so it needs no neutralization.
         ws.cell(row=cell.row, column=status_col, value=result.status.value)
         if result_col is not None:
-            ws.cell(row=cell.row, column=result_col, value=result.detail)
+            written = ws.cell(row=cell.row, column=result_col, value=xlsx_cell_text(result.detail))
+            if isinstance(written.value, str):
+                # Defence in depth against openpyxl's formula inference changing shape: pinning the
+                # cell to the string type emits <is><t>…</t></is>, which has no formula element for a
+                # spreadsheet to evaluate, whatever the text happens to start with.
+                written.data_type = "s"
         updated += 1
 
     wb.save(xlsx_path)

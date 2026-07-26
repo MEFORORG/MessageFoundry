@@ -140,6 +140,28 @@ class ChallengeCache:
             return None
         return entry
 
+    def rekey(self, old_token_hash: str, new_token_hash: str) -> int:
+        """Move every pending ceremony from one session token hash to another (ASVS 7.2.4).
+
+        Ceremonies are keyed ``(token_hash, purpose)``. When a session is rotated mid-ceremony the
+        store row is re-keyed atomically, but this cache is process-local — so without this move a
+        registration or assertion started before the rotation could never be finished. That is a dead
+        end for the user, not a retry: the challenge is single-use and the ceremony has to be
+        restarted from the beginning.
+
+        **Deadlines are carried, never refreshed** — a session rotation must not extend the TTL of an
+        in-flight ceremony. Returns the number of entries moved (0 is the normal case).
+
+        Public rather than a reach into the internals from ``AuthService``: the caller has no business
+        knowing this cache is a dict keyed by tuples, and an attribute-level reach would break
+        silently the day that changes.
+        """
+        moved = [(k, e) for k, e in self._entries.items() if k[0] == old_token_hash]
+        for key, entry in moved:
+            del self._entries[key]
+            self._entries[(new_token_hash, key[1])] = entry
+        return len(moved)
+
 
 @dataclass(frozen=True, slots=True)
 class RegistrationResult:

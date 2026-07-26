@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry import BatchConfig, File, MLLP
+from messagefoundry import MLLP, BatchConfig, File
 from messagefoundry.config.connections_file import load_connections_file
 from messagefoundry.config.wiring import Registry, WiringError, build_outbound_connection
 
@@ -52,9 +52,9 @@ def test_batch_rejected_with_reingress_to() -> None:
 
 
 def test_numeric_guards() -> None:
-    with pytest.raises(Exception):  # pydantic: max_count >= 2
+    with pytest.raises(Exception):  # pydantic: max_count >= 2  # noqa: B017
         BatchConfig(max_count=1, max_wait_ms=200)
-    with pytest.raises(Exception):  # pydantic: max_wait_ms >= 1
+    with pytest.raises(Exception):  # pydantic: max_wait_ms >= 1  # noqa: B017
         BatchConfig(max_count=5, max_wait_ms=0)
 
 

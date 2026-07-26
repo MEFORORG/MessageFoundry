@@ -104,11 +104,11 @@ revocation), and explicitly debunk **(c)** as a TLS bypass.
 The guards are network-posture checks, blind to whether they run in a container — so the in-container
 bind host is all that matters.
 
-| Topology | `[api].host` in container | API gate outcome | Required config |
+| Topology | Bind address in container (`[security].listen_address`) | API gate outcome | Required config |
 |---|---|---|---|
-| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `auth.enabled=true` |
+| (a) in-process TLS | `0.0.0.0` (off-loopback) | **allow** — `tls_enabled` branch | `tls_cert_file` (+ `tls_key_file`); `[security].require_sign_in = true` |
 | (b) same-pod sidecar | `127.0.0.1` (loopback) | **gate not triggered** (`is_loopback`) | `trusted_proxies=[127.0.0.1]` (for correct client IP); no in-process cert needed |
-| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing) |
+| (b) separate proxy container | `0.0.0.0` (off-loopback) | **allow** — upstream branch | `tls_terminated_upstream=true` **and** `trusted_proxies=[<proxy>]` (validator enforces the pairing); on a PHI instance also the Posture-B attestation pair `proxy_intra_service_auth` + `proxy_tls_min_version` (ladder row 1b — **refused** without them) |
 | (c) loopback publish, no shared netns | `0.0.0.0` (forced — see §1) | same as (a)/(b-separate); `127.0.0.1` bind would be unreachable | same as (a) or (b-separate) |
 
 MLLP gate (`check_mllp_tls_exposure`), per inbound's resolved host (`[inbound].bind_host`, typically
@@ -127,33 +127,75 @@ warnings. It is **never** a production setting and must not be baked into the sh
 command. (It also does **not** override the auth-disabled refusal or the production-PHI MFA refusal —
 those stay fail-closed.)
 
-**Exact required config per topology:**
+**Exact required config per topology** — one self-contained block each ([ADR
+0118](adr/0118-secure-by-default-security-configuration-section.md) moved the bind / console / auth
+switches into `[security]`; the old `[api].host` / `[auth].enabled` / `[auth].require_mfa` spellings
+are **refused at config load**, so copy these, not the pre-0118 shapes):
 
 ```toml
 # (a) in-process TLS — the default shipped posture
+[security]
+local_access_only = false
+listen_address = "0.0.0.0"
+require_sign_in = true
+require_mfa = true                            # required on a production PHI instance with local admins
+
 [api]
-host = "0.0.0.0"
 port = 8443
 tls_cert_file = "/etc/mefor/tls/api.crt"
 tls_key_file  = "/etc/mefor/tls/api.key"     # tls_key_password via MEFOR_API_TLS_KEY_PASSWORD if encrypted
 # tls_client_ca_file = "/etc/mefor/tls/console-ca.crt"  # opt-in mTLS for the console
-[auth]
-enabled = true
-require_mfa = true                            # required on a production PHI instance with local admins
+```
 
+```toml
 # (b) separate proxy container terminates TLS
+[security]
+local_access_only = false
+listen_address = "0.0.0.0"
+
 [api]
-host = "0.0.0.0"
 port = 8765
 tls_terminated_upstream = true
-trusted_proxies = ["10.0.0.0/8"]              # the proxy/ingress addresses ONLY
+trusted_proxies = ["10.4.2.7"]                # the proxy's EXACT address(es) — see the warning below
+# Posture-B attestations. TLS terminates in the proxy container, so the engine observes neither the
+# proxy->engine hop nor the floor the proxy offers browsers; both are operator DECLARATIONS and an
+# off-loopback PHI instance REFUSES to start without them.
+# "network": the engine port is on the internal Docker network and is NOT published to the host —
+# that unpublished, proxy-only segment is the isolation this value names. Use "mtls" if the proxy
+# reaches the engine across anything wider.
+proxy_intra_service_auth = "network"
+# ASVS 12.1.1 — the browser-facing TLS floor, declared. Pin it in the PROXY container's own config
+# (the reference fences linked below pin TLSv1.2 + TLSv1.3) and declare the LOWEST version that
+# fence still permits; "1.3" in front of a proxy that still accepts TLS 1.2 is a false attestation
+# and nothing in the engine can catch it.
+proxy_tls_min_version = "1.2"
+```
 
+```toml
 # (b) same-pod sidecar (shared netns) — engine stays loopback
+[security]
+local_access_only = true                      # the sidecar faces the network; the engine does not
+
 [api]
-host = "127.0.0.1"
 port = 8765
 trusted_proxies = ["127.0.0.1"]               # so XFF from the sidecar gives the real client IP
 ```
+
+**The floor declared in (b) is worth exactly what the proxy container's config says.** Copy a
+reference terminator whole from
+[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+— nginx, Caddy or IIS + ARR, each pinning an explicit protocol floor plus forward-secret ciphers and
+key-exchange groups — and move the fence and `proxy_tls_min_version` together, never one alone. The
+same-pod sidecar block needs no attestation pair: it is a loopback bind, so the exposure ladder's
+Posture-B refusal never fires (the engine still warns if you *declare* a terminator without them).
+
+> **⚠ Keep `trusted_proxies` to the proxy's exact address(es).** Every host inside a `trusted_proxies`
+> entry may set `X-Forwarded-For` to any value, and the engine hands that value on as the client
+> address — so a broad range like `10.0.0.0/8` on a LAN numbered out of 10/8 lets *any* workstation
+> forge its own source IP, poisoning the audit trail, the per-IP login limiter, and the new-client-IP
+> step-up signal. A CIDR is accepted (for a genuine proxy pool), but scope it to the pool and nothing
+> more. `"*"` and unparseable entries are **refused at config load** — the latter because uvicorn would
+> otherwise silently treat them as a literal that never matches, collapsing every client to the proxy.
 
 ```python
 # MLLP inbound in a container (data plane) — required when bind_host is off-loopback
@@ -272,9 +314,10 @@ The console stays a **host-side process**; only its target URL changes.
   never leak into a production image/compose. Give the production DB a CA-trusted cert instead.
 - **Logs.** Keep the service at INFO (never raise to DEBUG in a PHI container — full-body logging risk
   per the PHI rules). **Off-box log + audit forwarding is built** (`[logging].forward_*` → syslog/SIEM);
-  enable it so a container's logs + PHI-redacted audit rows reach the org pipeline. Residual: the syslog
-  transport is plaintext — front it with a local TLS-forwarding agent (or rely on the container
-  runtime's log driver to a TLS collector).
+  enable it so a container's logs + PHI-redacted audit rows reach the org pipeline, and set
+  `forward_protocol = "tls"` for the native RFC 5425 TLS hop (ADR 0080; port 6514). Residual: the
+  transport **default** is UDP, so TLS is a per-deployment opt-in — set it, front the hop with a local
+  TLS-forwarding agent, or rely on the container runtime's log driver to a TLS collector.
 
 ---
 

@@ -10,8 +10,9 @@ idempotency, and input validation.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -123,8 +124,7 @@ def test_unmapped_capture_provider_keys_by_message_id() -> None:
 def test_providers_unwind_on_exception() -> None:
     log: list[str] = []
     register_run_context("probe", _order_probe("p", log), phases={TRANSFORM})
-    with pytest.raises(RuntimeError):
-        with run_contexts(RunContext(), phase=TRANSFORM):
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError), run_contexts(RunContext(), phase=TRANSFORM):
+        raise RuntimeError("boom")
     # The ExitStack still unwound the provider despite the body raising.
     assert log == ["enter:p", "exit:p"]

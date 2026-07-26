@@ -114,3 +114,49 @@ is documented as the deliberate live exception.
 1. Confirm the MVP scope = `interval_seconds` + `run_once`, cron deferred. *(Confirmed.)*
 2. Confirm `run_once` = once-per-leadership-term is acceptable for the MVP. *(Confirmed.)*
 3. Confirm `body` is a literal (no templating) for the MVP. *(Confirmed.)*
+
+## Amendment (2026-07-17) — cron / calendar next-fire (the reserved setting is LIFTED, BACKLOG #160)
+
+§2 deferred `cron_expression` behind a **reserved-setting** `ValueError` ("not yet implemented"). This
+amendment **lifts that deferral and builds it** — a scheduled poll can now fire on a
+time-of-day/weekday/month **calendar** a fixed `interval_seconds` cannot express (BACKLOG #160). The
+reserved-setting raise is **removed**; `transports/timer.py` gains a pure evaluator + a cron loop, and
+`Timer(...)` (`config/wiring.py`) gains a `cron_expression` (+ optional `timezone`) kwarg.
+
+**Pure-stdlib, no new dependency.** A standard **5-field** cron evaluator (`minute hour
+day-of-month month day-of-week`) is implemented in-module with `datetime`/`zoneinfo` only — the same
+`tzdata`-backed `zoneinfo` the timestamp helpers already use (`messagefoundry/timezone.py`). `croniter`
+was **considered and rejected for the MVP**: it is a NEW locked dep needing an owner-approved DEP-1 lock
+refresh (§7), and the stdlib subset covers the parity gap. Recorded here per the "record the choice in
+the amendment" instruction. Supported field syntax: `*`, lists (`1,3,5`), ranges (`1-5`), and steps
+(`*/5`, `0-30/10`). Day-of-week is `0-6` with **Sunday = 0** (and `7` accepted as Sunday). The classic
+Vixie **OR** semantics apply when **both** day-of-month and day-of-week are restricted (a match on
+either fires); otherwise **AND**. Named months/weekdays are **out of scope** for the MVP (numeric only).
+
+**DST-awareness.** With **no** `timezone` setting the timer matches against the **system local wall
+clock** (`datetime.now()`), so the OS handles DST for the local zone and the path needs no `tzdata`. An
+explicit `timezone="Area/City"` matches against that IANA zone via `zoneinfo.ZoneInfo` (aware
+datetimes), so a feed pinned to a partner's zone fires correctly across that zone's DST transitions. Do
+**not** conflate this with [ADR 0095](0095-connection-lifecycle-scheduler-and-credential-fault-stop.md)'s
+`ActiveWindow` (a run/maintenance *window* gate) — cron here is the timer **source's** own fire schedule.
+
+**Loop semantics (the two hard invariants).** Unlike the interval heartbeat, cron **does NOT fire at
+`t=0`**: the first fire is `next_after(now)`, strictly in the future. And it **never busy-loops** when a
+computed fire time is in the past — `next_after` always returns a strictly-future minute, and after each
+fire the next fire is recomputed from the current time, so `remaining > 0` always holds; the per-tick
+sleep is `min(remaining, cap)` and **recomputed every tick** (the cap re-evaluates against the wall
+clock so a clock/DST change is picked up promptly). The fire is still **leader-gated** (`_may_fire`,
+§3): a follower advances the schedule without emitting; a node that wins leadership fires the next slot.
+`cron_expression` is **mutually exclusive** with `interval_seconds`/`run_once` (a config setting more
+than one raises `ValueError` at construction). At-least-once / re-run purity (§5) is unchanged — cron
+only changes **when** a fire happens, not the frozen body it commits.
+
+**Tests:** `tests/test_timer_source.py` (cron cadence, `next_after` strictly-future / no-t0 / no
+busy-loop, field parsing incl. steps/ranges/lists + OR-semantics, DST via an explicit IANA zone,
+exclusivity validation, invalid-expression rejection) + the `Timer(cron_expression=...)` factory/wiring.
+
+**Consequence deltas.** The §Consequences "Cron is not in the MVP" negative is now **resolved**. New,
+small residual: the explicit-IANA path enumerates **wall-clock minutes**, so at a spring-forward gap a
+non-existent local time (e.g. `2:30` on the skip day) is resolved via `zoneinfo`'s fold rules rather
+than skipped — an accepted once-a-year edge for the MVP, documented rather than special-cased. The
+system-local (default) path is unaffected (the OS clock never presents a non-existent local minute).

@@ -26,12 +26,11 @@ import socket
 import ssl
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
 import hl7
-from dataclasses import dataclass
-
 from hl7.containers import Component, Field, Repetition
 
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
@@ -59,7 +58,6 @@ from messagefoundry.config.tls_policy import (
 from messagefoundry.parsing.message import emit_raw_separators
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize
 from messagefoundry.redaction import safe_exc
-from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -72,6 +70,7 @@ from messagefoundry.transports.base import (
     register_destination,
     register_source,
 )
+from messagefoundry.transports.framing import MLLP_CODEC, FrameDecoder, FrameError
 
 __all__ = [
     "SB",
@@ -171,12 +170,12 @@ class InsecureHopGuard:
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return insecure_hop_disposition(
             is_phi=posture.is_phi,
-            production=posture.production,
+            enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
             hop_attested=self.attested,
-            # The global escape is CLAMPED to non-production upstream (settings.hop_insecure_escape_
-            # downgrades), so on production this is always False and can never satisfy a prod-PHI hop.
-            audited_opt_out=hop_insecure_escape_downgrades(production=posture.production),
+            # The global escape is CLAMPED to non-enforcing upstream (settings.hop_insecure_escape_
+            # downgrades), so under ENFORCE this is always False and can never satisfy an enforcing PHI hop.
+            audited_opt_out=hop_insecure_escape_downgrades(enforcing=posture.enforcing),
         )
 
     def _detail(self) -> str:
@@ -197,7 +196,7 @@ class InsecureHopGuard:
             disposition is HopDisposition.ALLOW
             and self.attested
             and posture.is_phi
-            and posture.production
+            and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
             logger.warning(
@@ -612,6 +611,13 @@ class MLLPDestination(DestinationConnector):
         self.idle_timeout_seconds: float | None = float(it) if it else None
         ma = s.get("max_connection_age_seconds")
         self.max_connection_age_seconds: float | None = float(ma) if ma else None
+        # BACKLOG #117 (ADR 0124): fire-and-forward. When True, send() writes + drains and finalizes
+        # the delivery on the successful TCP write — it reads NO ACK and validates NO MSA-1
+        # (at-most-once-confirmation; there is no NAK-/timeout-driven retry). Default False = today's
+        # ACK-waiting behavior, byte-identical. Composes with persistent (the no-ack persistent path
+        # is SIMPLER — no reply frame to read, no desync guard). Mutually exclusive with
+        # capture_response/reingress_to (nothing to capture) and MLLP-only — both rejected at wiring.
+        self.no_ack: bool = bool(s.get("no_ack", False))
         # The cached connection + freshness stamps (monotonic clock — a wall-clock jump must not
         # expire a healthy socket). Cached only after a FULLY successful transaction (including a
         # NAK — a complete request/response on a healthy transport); any transport failure discards
@@ -625,6 +631,13 @@ class MLLPDestination(DestinationConnector):
         self._closed = False
         #: Reconnects observed (stale-detect, post-error discard, desync guard) — log-only in v1.
         self.reconnects: int = 0
+        # #136 (ADR 0065 amendment): the cosmetic "Waiting for Reply" side-band marker + its pre-display
+        # delay. `_waiting_since` (monotonic) is stamped around the ACK read and cleared when it resolves;
+        # `waiting_for_reply(now)` reports True only once `waiting_display_delay` has elapsed. DISPLAY ONLY
+        # — no delivery-path effect, and stamped ONLY around an ACK read that actually happens (so a
+        # future no-ack mode, #117, never sets it). The delay is independent of `timeout_seconds`/pacing.
+        self.waiting_display_delay: float = config.waiting_display_delay
+        self._waiting_since: float | None = None
         # Per-outbound delimiter override (Corepoint -override parity): None = ship the payload as-is
         # (byte-identical, the default). A set value is validated NOW (at build) so a malformed override
         # fails at dry-run / `check`, not per delivery; it is applied in send() before framing.
@@ -642,6 +655,12 @@ class MLLPDestination(DestinationConnector):
         # byte-identical. A *read* failure (peer-close, frame-size) is never captured — it stays a
         # retryable DeliveryError; only a read-but-unparseable ACK becomes outcome='unparseable'.
         self.capture_response: bool = bool(s.get("capture_response", False))
+        # BACKLOG #82: when True, a positive ACK (MSA-1 AA/CA) is accepted only if its MSA-2 echoes the
+        # sent message's MSH-10 — a mismatched control id is a correlation failure (retryable). Default
+        # False → no correlation, byte-identical (the sent control id is never threaded to _check_ack).
+        # The sent MSH-10 is read defensively in send() (a non-HL7 / unreadable payload → skip, deliver
+        # as before); MSA-2 is read separator-aware via Peek, never hardcoded delimiters.
+        self.verify_ack_control_id: bool = bool(s.get("verify_ack_control_id", False))
         # WP-13b: per-connection outbound TLS (verify the peer). Built once here so a bad cert/CA fails
         # at build (dry-run/check), not per delivery. None when tls is off → plaintext, byte-identical.
         # #190 (ADR 0093): thread the instance [tls] internal-CA trust-anchor policy so an internal hop
@@ -709,6 +728,15 @@ class MLLPDestination(DestinationConnector):
         name = type(exc).__name__
         return f"{name}: {' '.join(extras)}" if extras else name
 
+    def waiting_for_reply(self, now: float) -> bool:
+        """#136 (ADR 0065 amendment): whether this outbound is currently AWAITING an MLLP ACK and at
+        least ``waiting_display_delay`` has elapsed since the send began. DISPLAY ONLY — read off the
+        event loop by the API's connections view via ``RegistryRunner.outbound_waiting_for_reply``.
+        ``now`` is a monotonic clock (the same clock ``_waiting_since`` was stamped with). False whenever
+        no ACK read is in flight (including a future no-ack mode that never stamps the marker)."""
+        since = self._waiting_since
+        return since is not None and (now - since) >= self.waiting_display_delay
+
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> DeliveryResponse | None:  # metadata (#68): unused — no per-message header knob here
@@ -748,9 +776,28 @@ class MLLPDestination(DestinationConnector):
                     raise DeliveryError(
                         f"MLLP hl7_raw_separators emit failed (payload not parseable HL7): {exc}"
                     ) from exc
+            if self.no_ack:
+                # BACKLOG #117 (ADR 0124): fire-and-forward — write + drain, no ACK read, deliver on
+                # the successful TCP write. Composes with persistent (reuse the cached connection).
+                # Deliberately BEFORE the #82 peek below: with no ACK to read there is no MSA-2 to
+                # correlate, so the outgoing-MSH-10 read would be pure waste (the two knobs are also
+                # rejected together at wiring — see build_outbound_connection).
+                if not self.persistent:
+                    return await self._send_once_no_ack(payload)
+                return await self._send_persistent_no_ack(payload)
+            # BACKLOG #82: read the OUTGOING control id (MSH-10) once, off the final on-wire payload
+            # (after any delimiter/raw-separator rewrite), so _check_ack can correlate it to the reply's
+            # MSA-2. Off → None → no correlation (byte-identical). Defensive: a non-HL7 / unparseable
+            # payload has no MSH-10 to correlate, so we skip (deliver as before) rather than fail.
+            sent_control_id: str | None = None
+            if self.verify_ack_control_id:
+                try:
+                    sent_control_id = Peek.parse(payload).control_id
+                except HL7PeekError:
+                    sent_control_id = None
             if not self.persistent:
-                return await self._send_once(payload)
-            return await self._send_persistent(payload)
+                return await self._send_once(payload, sent_control_id)
+            return await self._send_persistent(payload, sent_control_id)
         finally:
             self._sending = False
 
@@ -771,7 +818,7 @@ class MLLPDestination(DestinationConnector):
                 ),
                 self.connect_timeout,
             )
-        except (OSError, asyncio.TimeoutError) as exc:
+        except (TimeoutError, OSError) as exc:
             raise DeliveryError(
                 f"MLLP connect to {self.host}:{self.port} failed: {self._describe_error(exc)}"
             ) from exc
@@ -781,7 +828,9 @@ class MLLPDestination(DestinationConnector):
         _set_tcp_nodelay(writer)
         return reader, writer
 
-    async def _send_once(self, payload: str) -> DeliveryResponse | None:
+    async def _send_once(
+        self, payload: str, sent_control_id: str | None = None
+    ) -> DeliveryResponse | None:
         """The historical connect-per-send path (``persistent=false``) — one connection per delivery,
         closed in a finally, error text unchanged. Two deliberate deltas from the pre-ADR-0067 code,
         both hardening (ADR 0067 §2.1/AC-2): the close is *bounded* (the #55 Proactor-wedge pattern —
@@ -791,16 +840,43 @@ class MLLPDestination(DestinationConnector):
         try:
             writer.write(frame(payload, self.encoding))
             await asyncio.wait_for(writer.drain(), self.timeout)
-            ack_bytes = await asyncio.wait_for(self._read_ack(reader), self.timeout)
-        except asyncio.TimeoutError as exc:
+            # #136: stamp the side-band "waiting for reply" marker around the ACK read only (cleared in
+            # the finally). Purely observational — the read itself is unchanged.
+            self._waiting_since = time.monotonic()
+            try:
+                ack_bytes = await asyncio.wait_for(self._read_ack(reader), self.timeout)
+            finally:
+                self._waiting_since = None
+        except TimeoutError as exc:
             raise DeliveryError("MLLP timed out waiting for ACK") from exc
         except OSError as exc:
             raise DeliveryError(f"MLLP I/O error: {self._describe_error(exc)}") from exc
         finally:
             await self._close_bounded(writer)
-        return self._check_ack(ack_bytes)
+        return self._check_ack(ack_bytes, sent_control_id)
 
-    async def _send_persistent(self, payload: str) -> DeliveryResponse | None:
+    async def _send_once_no_ack(self, payload: str) -> DeliveryResponse | None:
+        """Connect-per-send fire-and-forward (``no_ack`` + ``persistent=false``, BACKLOG #117 / ADR
+        0124): dial → write → drain → bounded close, with **no ACK read** and no MSA-1 validation. The
+        delivery is confirmed on the successful TCP write (at-most-once-confirmation). A connect/drain
+        failure is still a charged :class:`DeliveryError` (at-least-once for the write; the retry may
+        duplicate — receivers stay idempotent). Returns ``None`` — there is no ACK to capture
+        (``capture_response`` is rejected at wiring for a no-ack outbound)."""
+        _reader, writer = await self._dial()
+        try:
+            writer.write(frame(payload, self.encoding))
+            await asyncio.wait_for(writer.drain(), self.timeout)
+        except TimeoutError as exc:
+            raise DeliveryError("MLLP timed out draining the write (no-ack)") from exc
+        except OSError as exc:
+            raise DeliveryError(f"MLLP I/O error (no-ack): {self._describe_error(exc)}") from exc
+        finally:
+            await self._close_bounded(writer)
+        return None
+
+    async def _send_persistent(
+        self, payload: str, sent_control_id: str | None = None
+    ) -> DeliveryResponse | None:
         """One delivery over the cached connection (ADR 0067): reuse-time liveness check →
         reconnect-before-first-byte (uncharged) → write/drain/ACK-read (any failure after ``write()``
         is charged, names its phase, and discards the connection) → re-cache on a fully-successful
@@ -841,7 +917,7 @@ class MLLPDestination(DestinationConnector):
             try:
                 writer.write(frame(payload, self.encoding))
                 await asyncio.wait_for(writer.drain(), self.timeout)
-            except (OSError, asyncio.TimeoutError) as exc:
+            except (TimeoutError, OSError) as exc:
                 # Payload bytes were (at least partially) written: the peer may have processed the
                 # message even though we saw no ACK — the documented at-least-once duplicate window.
                 # Name the phase so an operator can distinguish it from a pre-write failure.
@@ -849,11 +925,14 @@ class MLLPDestination(DestinationConnector):
                     "MLLP send failed in the drain phase (payload written — delivery "
                     f"indeterminate): {self._describe_error(exc)}"
                 ) from exc
+            # #136: stamp the side-band "waiting for reply" marker around the ACK read only (cleared in
+            # the finally). Purely observational — the read itself is unchanged.
+            self._waiting_since = time.monotonic()
             try:
                 ack_bytes, leftover = await asyncio.wait_for(
                     self._read_ack_reuse(reader), self.timeout
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise DeliveryError(
                     "MLLP timed out waiting for ACK (ACK-read phase — delivery indeterminate)"
                 ) from exc
@@ -862,6 +941,8 @@ class MLLPDestination(DestinationConnector):
                     "MLLP I/O error in the ACK-read phase (delivery indeterminate): "
                     f"{self._describe_error(exc)}"
                 ) from exc
+            finally:
+                self._waiting_since = None
         except DeliveryError as exc:
             # ANY failed transaction discards the connection — a socket in an unknown framing state
             # must never bleed a late/partial ACK into the next send. Charged; the next send re-dials.
@@ -907,7 +988,7 @@ class MLLPDestination(DestinationConnector):
         else:
             self._last_used = time.monotonic()
         try:
-            response = self._check_ack(ack_bytes)
+            response = self._check_ack(ack_bytes, sent_control_id)
         except NegativeAckError:
             raise  # complete transaction on a healthy transport — the connection stays cached
         except DeliveryError:
@@ -922,6 +1003,83 @@ class MLLPDestination(DestinationConnector):
             # ("one ACK read *and parsed*") fails the same way in both modes.
             await self._discard_unparseable(conn, writer)
         return response
+
+    async def _send_persistent_no_ack(self, payload: str) -> DeliveryResponse | None:
+        """One fire-and-forward delivery over the cached connection (``no_ack`` + ``persistent=true``,
+        BACKLOG #117 / ADR 0124). Simpler than :meth:`_send_persistent`: **no ACK frame is read** and
+        **no desync/leftover guard runs** — no reply is expected, so any bytes a misbehaving peer
+        sends are caught as "unsolicited bytes" by the reuse-time :meth:`_stale_reason` veto (a
+        reconnect, never a mis-parse). Reuse-time liveness → reconnect-before-first-byte (uncharged) →
+        write/drain → re-cache on drain success; any failure after ``write()`` discards the connection
+        (charged; the next send re-dials)."""
+        if self._closed:
+            # aclose() already ran (engine stop / reload swap) — never re-establish a socket the
+            # lifecycle can no longer close. Fail loud; the retry lands on the replacement connector.
+            raise DeliveryError(
+                f"MLLP destination {self.host}:{self.port} is closed (stop/reload); "
+                "delivery retries on the replacement connector"
+            )
+        conn = self._conn
+        if conn is not None:
+            reason = self._stale_reason(*conn)
+            if reason is not None:
+                # Reconnect-before-first-byte: zero payload bytes touched this socket during THIS send,
+                # so a fresh dial provably cannot duplicate — not charged (no attempts consumed). Exactly
+                # one dial follows; if it fails, _dial raises the normal charged DeliveryError.
+                self._conn = None
+                self.reconnects += 1
+                logger.info(
+                    "MLLP %s:%d persistent connection not reused (%s); reconnecting",
+                    self.host,
+                    self.port,
+                    reason,
+                )
+                await self._close_bounded(conn[1])
+                conn = None
+        if conn is None:
+            conn = await self._dial()
+            self._established_at = time.monotonic()
+        _reader, writer = conn
+        # Keep the in-flight connection visible so a concurrent aclose() (the documented reload race)
+        # closes it under us — this send then fails loud and is retried.
+        self._conn = conn
+        try:
+            writer.write(frame(payload, self.encoding))
+            await asyncio.wait_for(writer.drain(), self.timeout)
+        except (TimeoutError, OSError) as exc:
+            # Payload bytes were (at least partially) written: the peer may have processed the message
+            # even though there is no ACK to confirm it — the documented at-least-once duplicate window.
+            # ANY failed transaction discards the connection (a socket in an unknown state must never be
+            # reused); charged, the next send re-dials.
+            self._conn = None
+            self.reconnects += 1
+            logger.warning(
+                "MLLP %s:%d persistent connection discarded after no-ack delivery failure: %s",
+                self.host,
+                self.port,
+                self._describe_error(exc),  # transport/OS metadata only — never payload bytes
+            )
+            await self._close_bounded(writer)
+            raise DeliveryError(
+                "MLLP no-ack send failed in the drain phase (payload written — delivery "
+                f"indeterminate): {self._describe_error(exc)}"
+            ) from exc
+        except BaseException:
+            # Cancellation (or any non-DeliveryError escape) mid-transaction is still a failed
+            # transaction — discard synchronously (never await inside cancellation).
+            self._conn = None
+            self.reconnects += 1
+            writer.close()
+            raise
+        # Write drained: the transaction is complete (no ACK expected). Re-cache unless aclose() raced.
+        if self._closed:
+            # aclose() raced this send after the write drained — don't cache past the connector's death
+            # (the delivery itself succeeded on the write).
+            self._conn = None
+            await self._close_bounded(writer)
+        else:
+            self._last_used = time.monotonic()
+        return None
 
     async def _discard_unparseable(
         self,
@@ -979,9 +1137,9 @@ class MLLPDestination(DestinationConnector):
         which would wedge the delivery worker/aclose forever. Abandoning after the grace is safe
         (the socket is already closed)."""
         writer.close()
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-        except (OSError, asyncio.TimeoutError):
+        except (TimeoutError, OSError):
             pass
 
     async def aclose(self) -> None:
@@ -1031,7 +1189,12 @@ class MLLPDestination(DestinationConnector):
             if messages:
                 return messages[0], len(messages) > 1 or decoder.in_frame
 
-    def _check_ack(self, ack_bytes: bytes) -> DeliveryResponse | None:
+    def _check_ack(
+        self, ack_bytes: bytes, sent_control_id: str | None = None
+    ) -> DeliveryResponse | None:
+        # ``sent_control_id`` (BACKLOG #82) is the outgoing MSH-10 threaded by send() when
+        # verify_ack_control_id is on; None (the default, and whenever the flag is off or our own MSH-10
+        # was unreadable) → no correlation, byte-identical to the pre-#82 behaviour.
         try:
             ack = Peek.parse(ack_bytes)
         except HL7PeekError as exc:
@@ -1048,6 +1211,21 @@ class MLLPDestination(DestinationConnector):
             raise DeliveryError(f"unparseable ACK: {exc}") from exc
         msa1 = ack.field("MSA-1")
         if msa1 in ("AA", "CA"):
+            if sent_control_id:
+                # BACKLOG #82: correlate the reply to the send. A positive ACK whose MSA-2 does not echo
+                # the sent MSH-10 is NOT a valid accept for THIS message (a stale/mis-framed reply, or a
+                # peer that answered a different send) — raise a retryable DeliveryError so the pipeline
+                # retries per the at-least-once path (on the persistent lane this also discards the cached
+                # connection via _discard_unparseable, correct since a mis-correlated reply implies socket
+                # desync). Control ids only in the exception text — never a full payload, never a raised
+                # log level. Read separator-aware via Peek. Note: the `if sent_control_id` guard means an
+                # unreadable OWN MSH-10 skips correlation (nothing to correlate), per the design decision.
+                ack_control_id = ack.field("MSA-2")
+                if ack_control_id != sent_control_id:
+                    raise DeliveryError(
+                        f"ACK control-id mismatch: MSA-2={ack_control_id!r} "
+                        f"!= sent MSH-10={sent_control_id!r}"
+                    )
             if self.capture_response:
                 return DeliveryResponse(
                     body=ack_bytes.decode(self.encoding, errors="replace"),
@@ -1163,7 +1341,7 @@ class MLLPSource(SourceConnector):
         if self._server is not None:
             try:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("MLLP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
@@ -1217,7 +1395,7 @@ class MLLPSource(SourceConnector):
                     if self.receive_timeout:
                         try:
                             chunk = await asyncio.wait_for(reader.read(4096), self.receive_timeout)
-                        except asyncio.TimeoutError:
+                        except TimeoutError:
                             close_reason = "idle_timeout"
                             break  # idle past receive_timeout — close the connection
                     else:
@@ -1264,13 +1442,13 @@ class MLLPSource(SourceConnector):
             if task is not None:
                 self._client_tasks.discard(task)
             writer.close()
-            try:
+            try:  # noqa: SIM105
                 # Bound the close (see stop()): an unbounded writer.wait_closed() on the Windows
                 # Proactor can never complete on a pending overlapped op, and the per-client task then
                 # never finishes — so stop()'s `asyncio.wait(pending, ...)` grace never sees it done and
                 # the whole shutdown wedges. Bounding it here makes the task always terminate (#55).
                 await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 pass
             # Pair every `established` with one `closed` (clean EOF / idle). Emitted last (after the
             # socket is closed) so a cancel during shutdown can't skip the writer cleanup.

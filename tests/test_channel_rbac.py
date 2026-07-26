@@ -187,6 +187,112 @@ async def test_scoped_user_cannot_test_or_read_shared_outbound(engine: Engine) -
         assert any(a["action"] == "auth.channel_denied" for a in await engine.store.list_audit())
 
 
+async def test_scoped_user_graph_edges_hides_shared_outbound(engine: Engine) -> None:
+    """#76 review (SECURITY): GET /graph/edges must NOT leak shared-outbound topology or live status to a
+    channel-scoped user — an outbound spans channels, so its state can reflect ANOTHER channel's
+    downstream. Mirroring the connections dashboard (which shows a scoped user NO destination rows), a
+    scoped caller sees ONLY the inbound→router→handler subgraph for their accessible inbounds: no shared-
+    outbound node, no status, no handler→outbound edge, and no other channel's inbound/router/handler."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection("IB_A", ConnectionSpec(ConnectorType.MLLP, {"port": 2601}), router="r_a")
+    )
+    reg.add_inbound(
+        InboundConnection("IB_B", ConnectionSpec(ConnectorType.MLLP, {"port": 2602}), router="r_b")
+    )
+    reg.add_outbound(
+        OutboundConnection("OB_SHARED", ConnectionSpec(ConnectorType.FILE, {"directory": "./out"}))
+    )
+    reg.add_router("r_a", lambda m: ["h_a"])
+    reg.add_router("r_b", lambda m: ["h_b"])
+    reg.add_handler("h_a", lambda m: Send("OB_SHARED", m))
+    reg.add_handler("h_b", lambda m: Send("OB_SHARED", m))
+    engine.add_registry(reg)
+    service = await _service(engine)
+    scoped_uid = await _add(service, "op", Role.OPERATOR)
+    await service.set_channel_scope(scoped_uid, ["IB_A"], actor="admin")
+    await _add(service, "boss", Role.OPERATOR)  # NO channel scope → unscoped
+
+    async with _client(engine, service) as c:
+        scoped = (await c.get("/graph/edges", headers=await _login(c, "op"))).json()
+        full = (await c.get("/graph/edges", headers=await _login(c, "boss"))).json()
+
+    # Scoped: only IB_A's subgraph (its router + handler). No IB_B, no shared outbound, no status leak.
+    scoped_nodes = {(n["kind"], n["name"]) for n in scoped["nodes"]}
+    assert ("inbound", "IB_A") in scoped_nodes
+    assert ("router", "r_a") in scoped_nodes
+    assert ("handler", "h_a") in scoped_nodes
+    assert ("inbound", "IB_B") not in scoped_nodes  # another channel's inbound is hidden
+    assert ("router", "r_b") not in scoped_nodes
+    assert all(n["kind"] != "outbound" for n in scoped["nodes"])  # NO shared-outbound node/status
+    # No edge touches a shared outbound (no handler→outbound edge, so no cross-channel state disclosure).
+    assert all(
+        e["source_kind"] != "outbound" and e["target_kind"] != "outbound" for e in scoped["edges"]
+    )
+    scoped_edges = {
+        (e["source_kind"], e["source"], e["target_kind"], e["target"]) for e in scoped["edges"]
+    }
+    assert ("inbound", "IB_A", "router", "r_a") in scoped_edges
+    assert ("router", "r_a", "handler", "h_a") in scoped_edges
+    assert ("handler", "h_a", "outbound", "OB_SHARED") not in scoped_edges
+
+    # Unscoped (no channel scope): the WHOLE estate, including the shared outbound + both channels.
+    full_nodes = {(n["kind"], n["name"]) for n in full["nodes"]}
+    assert ("outbound", "OB_SHARED") in full_nodes
+    assert ("inbound", "IB_B") in full_nodes
+    full_edges = {
+        (e["source_kind"], e["source"], e["target_kind"], e["target"]) for e in full["edges"]
+    }
+    assert ("handler", "h_a", "outbound", "OB_SHARED") in full_edges
+
+
+async def test_credential_test_route_authorizes_before_disclosing_config(engine: Engine) -> None:
+    # Review follow-up (BACKLOG #111, ADR 0132): POST /connections/{name}/test-credential must AUTHORIZE
+    # before revealing anything about a connection's type / alt-credential config. A channel-scoped
+    # CONNECTIONS_TEST caller probing an OUT-OF-SCOPE name must get a UNIFORM 403 — a File endpoint WITH
+    # an alt credential and a non-File / no-credential endpoint must be INDISTINGUISHABLE (no 400 that
+    # leaks "this is a File endpoint with a credential"). Mirrors the sibling /test route's ordering.
+    reg = Registry()
+    reg.add_inbound(  # IN scope, File, NO credential -> an AUTHORIZED caller gets a 400 (proves the guard passed)
+        InboundConnection(
+            "IB_A", ConnectionSpec(ConnectorType.FILE, {"directory": "./a"}), router="r"
+        )
+    )
+    reg.add_inbound(  # OUT of scope, File WITH an alt credential
+        InboundConnection(
+            "IB_CRED",
+            ConnectionSpec(
+                ConnectorType.FILE,
+                {"directory": "./b", "credential_username": "svc", "credential_password": "pw"},
+            ),
+            router="r",
+        )
+    )
+    reg.add_inbound(  # OUT of scope, NOT a File / no credential
+        InboundConnection("IB_MLLP", ConnectionSpec(ConnectorType.MLLP, {"port": 2576}), router="r")
+    )
+    reg.add_router("r", lambda m: [])
+    engine.add_registry(reg)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)  # OPERATOR holds CONNECTIONS_TEST
+    await service.set_channel_scope(uid, ["IB_A"], actor="admin")
+    async with _client(engine, service) as c:
+        h = await _login(c, "op")
+        # Out-of-scope: the File-with-credential and the non-File connection return the SAME 403 — the
+        # caller cannot tell them apart, so the route discloses no pre-auth config/topology.
+        r_cred = await c.post("/connections/IB_CRED/test-credential", headers=h)
+        r_mllp = await c.post("/connections/IB_MLLP/test-credential", headers=h)
+        assert r_cred.status_code == 403
+        assert r_mllp.status_code == 403
+        assert (
+            r_cred.status_code == r_mllp.status_code
+        )  # indistinguishable to an unauthorized caller
+        # In scope: authorization passes, so an authorized caller does get the (config-disclosing) 400
+        # for a File endpoint that has no alt credential — and a 404 for a truly unknown name.
+        assert (await c.post("/connections/IB_A/test-credential", headers=h)).status_code == 400
+        assert (await c.post("/connections/IB_NOPE/test-credential", headers=h)).status_code == 404
+
+
 async def test_unscoped_user_and_admin_have_full_access(engine: Engine) -> None:
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)  # no scope set → NULL → all channels

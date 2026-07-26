@@ -212,7 +212,7 @@ def test_vault_malformed_reference_fails_closed(monkeypatch: pytest.MonkeyPatch)
 
 
 def _ad_settings(**over: Any) -> AuthSettings:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         ad_enabled=True,
         ad_server="ldaps://dc.example.com",
         ad_domain="example.com",
@@ -265,7 +265,7 @@ def test_ldap_authenticator_unresolvable_reference_fails_closed() -> None:
 
 
 def _smtp_settings(**over: Any) -> AlertsSettings:
-    base: dict[str, Any] = dict(
+    base: dict[str, Any] = dict(  # noqa: C408
         email_smtp_host="smtp.example.com",
         email_from="alerts@example.com",
         email_to=["ops@example.com"],

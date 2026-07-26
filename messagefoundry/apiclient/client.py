@@ -84,7 +84,7 @@ class ApiError(RuntimeError):
 _Model = TypeVar("_Model", bound=BaseModel)
 
 
-def _decode(response: httpx.Response, model: type[_Model]) -> _Model:
+def _decode(response: httpx.Response, model: type[_Model]) -> _Model:  # noqa: UP047
     """Validate a 2xx JSON body into ``model``, mapping schema/JSON errors to :class:`ApiError`.
 
     Preserves the client's contract that every call raises only ``ApiError``: a malformed or
@@ -96,7 +96,7 @@ def _decode(response: httpx.Response, model: type[_Model]) -> _Model:
         raise ApiError(f"invalid response from engine: {exc}") from exc
 
 
-def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:
+def _decode_list(response: httpx.Response, model: type[_Model]) -> list[_Model]:  # noqa: UP047
     """List form of :func:`_decode` (the body must be a JSON array of ``model`` objects)."""
     try:
         return [model.model_validate(item) for item in response.json()]
@@ -216,7 +216,7 @@ class EngineClient:
         #: prompts for a TOTP / recovery code, calls verify_mfa(), and returns True iff verified.
         self._mfa_handler: Callable[[], bool] | None = None
 
-    def __enter__(self) -> "EngineClient":
+    def __enter__(self) -> EngineClient:
         return self
 
     def __exit__(
@@ -230,7 +230,7 @@ class EngineClient:
     def close(self) -> None:
         self._http.close()
 
-    def for_polling(self) -> "EngineClient":
+    def for_polling(self) -> EngineClient:
         """A second client dedicated to **background (off-thread) reads** — the nav health poll, the
         Engine Status refresh, and the per-page auto-refresh.
 

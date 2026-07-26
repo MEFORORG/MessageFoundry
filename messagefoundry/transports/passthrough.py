@@ -33,7 +33,7 @@ active-passive graph gating that already runs the whole graph on the leader only
 from __future__ import annotations
 
 import logging
-from typing import Callable
+from collections.abc import Callable
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.transports.base import InboundHandler, SourceConnector, register_source

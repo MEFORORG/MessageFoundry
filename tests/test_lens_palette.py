@@ -219,7 +219,7 @@ def test_template_send_does_not_double_inject_an_existing_import() -> None:
 
 
 def test_template_send_requires_a_destination() -> None:
-    with pytest.raises(Exception):  # LensRewriteError — no destination given
+    with pytest.raises(Exception):  # LensRewriteError — no destination given  # noqa: B017
         _template(INSERT_SOURCE, _anchor(), template="send")
 
 
@@ -313,13 +313,15 @@ def test_clause_else_from_elif_anchor_appends_to_whole_chain() -> None:
 
 
 def test_clause_else_refused_when_else_already_exists() -> None:
-    with pytest.raises(Exception):  # LensRewriteError — duplicate else
+    with pytest.raises(Exception):  # LensRewriteError — duplicate else  # noqa: B017
         _clause(IF_ELSE_SOURCE, _if_row(IF_ELSE_SOURCE), clause="else")
 
 
 def test_clause_refused_when_anchor_is_not_an_if() -> None:
     body_row = next(r for r in parse_source(IF_SOURCE)[0]["rows"] if r.get("action") == "set_field")
-    with pytest.raises(Exception):  # LensRewriteError — anchor is a body row, not an if header
+    with pytest.raises(  # noqa: B017
+        Exception
+    ):  # LensRewriteError — anchor is a body row, not an if header  # noqa: B017
         _clause(IF_SOURCE, body_row, clause="else")
 
 
@@ -399,7 +401,7 @@ def test_insert_code_lookup_bare_round_trips_as_lookup_row() -> None:
 
 def test_insert_code_lookup_refuses_assign_to() -> None:
     # code_lookup mutates in place / returns None (ADR 0106 §5 J) — assigning it is refused
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         _insert_edit(
             INSERT_SOURCE,
             _anchor(),
@@ -449,7 +451,7 @@ def test_insert_checkpoint_round_trips_as_diagnostic_row() -> None:
 
 
 def test_insert_log_note_refuses_assign_to() -> None:
-    with pytest.raises(Exception):  # log_note returns None
+    with pytest.raises(Exception):  # log_note returns None  # noqa: B017
         _insert_edit(
             INSERT_SOURCE, _anchor(), action="log_note", assign_to="x", params={"template": "t"}
         )
@@ -525,7 +527,7 @@ def test_insert_add_repetition_round_trips() -> None:
 
 
 def test_insert_add_segment_refuses_assign_to() -> None:
-    with pytest.raises(Exception):  # add_segment returns None
+    with pytest.raises(Exception):  # add_segment returns None  # noqa: B017
         _insert_edit(
             INSERT_SOURCE, _anchor(), action="add_segment", assign_to="x", params={"line": "NTE"}
         )
@@ -596,7 +598,7 @@ def test_insert_occurrence_literal_is_read_only() -> None:
 
 
 def test_insert_add_repetition_refuses_repetition() -> None:
-    with pytest.raises(Exception):  # Message.add_repetition has no 'repetition' kwarg
+    with pytest.raises(Exception):  # Message.add_repetition has no 'repetition' kwarg  # noqa: B017
         _insert_edit(
             INSERT_SOURCE,
             _anchor(),
@@ -606,7 +608,9 @@ def test_insert_add_repetition_refuses_repetition() -> None:
 
 
 def test_insert_delete_segment_refuses_occurrence() -> None:
-    with pytest.raises(Exception):  # not silently dropped — delete_segments takes no occurrence
+    with pytest.raises(  # noqa: B017
+        Exception
+    ):  # not silently dropped — delete_segments takes no occurrence  # noqa: B017
         _insert_edit(
             INSERT_SOURCE,
             _anchor(),
@@ -684,7 +688,7 @@ def test_log_note_edit_is_byte_stable_outside_row() -> None:
 
 
 def test_log_note_operand_not_editable() -> None:
-    with pytest.raises(Exception):  # the *values operand is never a slot
+    with pytest.raises(Exception):  # the *values operand is never a slot  # noqa: B017
         _edit_params(SOURCE, _diag_row(SOURCE, "log_note"), {"values": "x"})
 
 
@@ -699,7 +703,7 @@ def test_diagnostic_literal_operand_not_advertised() -> None:
 def test_diagnostic_expr_template_refuses_scalar_edit() -> None:
     src = '@handler("H")\ndef h(msg):\n    log_note(NOTE, msg.field("PID-3.1"))\n'
     r = _diag_row(src, "log_note")
-    with pytest.raises(Exception):  # template is an expression (NOTE), not a literal
+    with pytest.raises(Exception):  # template is an expression (NOTE), not a literal  # noqa: B017
         _edit_params(src, r, {"template": "x"})
 
 
@@ -759,12 +763,12 @@ def test_insert_comment_normalizes_single_space_after_hash() -> None:
 
 
 def test_insert_comment_refuses_embedded_newline() -> None:
-    with pytest.raises(Exception):  # a newline could add lines / inject code
+    with pytest.raises(Exception):  # a newline could add lines / inject code  # noqa: B017
         _comment(INSERT_SOURCE, _anchor(), text="ok\nimport os")
 
 
 def test_insert_comment_refuses_over_column_limit() -> None:
-    with pytest.raises(Exception):  # ruff would wrap it
+    with pytest.raises(Exception):  # ruff would wrap it  # noqa: B017
         _comment(INSERT_SOURCE, _anchor(), text="x" * 200)
 
 
@@ -860,20 +864,20 @@ def test_insert_code_lookup_refuses_var_bound_to_a_different_set() -> None:
         "from messagefoundry import handler, set_field",
         "from messagefoundry import code_set, handler, set_field",
     ).replace('@handler("H")', 'GENDER = code_set("other")\n\n\n@handler("H")')
-    with pytest.raises(Exception):  # GENDER already -> code_set("other")
+    with pytest.raises(Exception):  # GENDER already -> code_set("other")  # noqa: B017
         _code_lookup(src, _set_field_row(src), code_set="gender", path="PID-8")
 
 
 def test_insert_code_lookup_refuses_non_codeset_var_collision() -> None:
     src = INSERT_SOURCE.replace('@handler("H")', 'GENDER = 5\n\n\n@handler("H")')
-    with pytest.raises(Exception):  # GENDER is a non-code-set name
+    with pytest.raises(Exception):  # GENDER is a non-code-set name  # noqa: B017
         _code_lookup(src, _set_field_row(src), code_set="gender", path="PID-8")
 
 
 def test_insert_code_lookup_requires_code_set_and_path() -> None:
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         _code_lookup(INSERT_SOURCE, _anchor(), path="PID-8")  # no code_set
-    with pytest.raises(Exception):
+    with pytest.raises(Exception):  # noqa: B017
         _code_lookup(INSERT_SOURCE, _anchor(), code_set="gender")  # no path
 
 
@@ -928,7 +932,7 @@ def test_insert_code_lookup_binding_lands_above_a_trailing_import() -> None:
 
 def test_insert_code_lookup_refuses_handler_local_shadow() -> None:
     anchor = next(r for r in parse_source(LOCAL_SHADOW_SRC)[0]["rows"] if r["kind"] == "action")
-    with pytest.raises(
+    with pytest.raises(  # noqa: B017
         Exception
     ):  # 'row' is a handler-local → the module binding would be shadowed
         _code_lookup(LOCAL_SHADOW_SRC, anchor, code_set="gender", var="row", path="PID-8")

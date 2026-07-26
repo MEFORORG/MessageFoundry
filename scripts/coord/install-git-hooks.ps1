@@ -50,27 +50,42 @@ if ($hooksPath) {
 }
 $preCommit = Join-Path $hooksDir "pre-commit"
 $marker = "MessageFoundry ledger gate"
+# BACKLOG #309: the claim gate must be a COMMIT-MSG hook, not pre-commit -- pre-commit never receives the
+# commit message, so a claim check bolted onto it would look installed and silently never fire.
+$commitMsg = Join-Path $hooksDir "commit-msg"
+$claimMarker = "MessageFoundry claim gate"
 
 if ($Status) {
     $installed = (Test-Path $preCommit) -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match [regex]::Escape($marker))
+    $claimInstalled = (Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw -EA SilentlyContinue) -match [regex]::Escape($claimMarker))
     Write-Host "hooks dir  : $hooksDir"
     Write-Host "pre-commit : $(if ($installed) { 'INSTALLED (ledger gate)' } elseif (Test-Path $preCommit) { 'present, but NOT ours' } else { 'not installed' })"
+    Write-Host "commit-msg : $(if ($claimInstalled) { 'INSTALLED (claim gate)' } elseif (Test-Path $commitMsg) { 'present, but NOT ours' } else { 'not installed' })"
     Write-Host "worktrees  : $(@(& git -C $RepoRoot worktree list).Count) share this hook"
     return
 }
 
 if ($Uninstall) {
+    $removed = $false
     if ((Test-Path $preCommit) -and ((Get-Content $preCommit -Raw) -match [regex]::Escape($marker))) {
         Remove-Item -LiteralPath $preCommit -Force
         Write-Host "Ledger pre-commit hook REMOVED." -ForegroundColor Yellow
-    } else {
-        Write-Host "Nothing to remove (no ledger hook installed)."
+        $removed = $true
     }
+    if ((Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw) -match [regex]::Escape($claimMarker))) {
+        Remove-Item -LiteralPath $commitMsg -Force
+        Write-Host "Claim commit-msg hook REMOVED." -ForegroundColor Yellow
+        $removed = $true
+    }
+    if (-not $removed) { Write-Host "Nothing to remove (no MessageFoundry hooks installed)." }
     return
 }
 
 if ((Test-Path $preCommit) -and ((Get-Content $preCommit -Raw) -notmatch [regex]::Escape($marker))) {
     throw "A pre-commit hook that is not ours already exists at $preCommit. Refusing to overwrite it -- merge them by hand."
+}
+if ((Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw) -notmatch [regex]::Escape($claimMarker))) {
+    throw "A commit-msg hook that is not ours already exists at $commitMsg. Refusing to overwrite it -- merge them by hand."
 }
 
 New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
@@ -99,15 +114,44 @@ exec "$PY" "$HOOK_DIR/ledger_check.py"
 
 [System.IO.File]::WriteAllText($preCommit, $hook, (New-Object System.Text.UTF8Encoding $false))
 
+# --- claim gate (BACKLOG #309) -------------------------------------------------------------------
+# A commit-msg hook, because only commit-msg is handed the message file (as $1). The claim gate keys off
+# the SUBJECT declaring `BACKLOG #N`, so on pre-commit it would have nothing to read.
+Copy-Item (Join-Path $RepoRoot "scripts\hooks\claim_check.py") (Join-Path $hooksDir "claim_check.py") -Force
+
+$claimHook = @'
+#!/bin/sh
+# MessageFoundry claim gate -- INSTALLED COPY. Source: scripts/hooks/claim_check.py
+# commit-msg (NOT pre-commit): only this hook receives the message file, and the gate reads the subject.
+# Re-install after changing the source:  pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1
+HOOK_DIR=$(dirname "$0")
+PY=python
+command -v python >/dev/null 2>&1 || PY=python3
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "MessageFoundry: python not found -- THE CLAIM GATE IS OFF for this commit." >&2
+  exit 0
+fi
+exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
+'@ -replace "`r`n", "`n"
+
+[System.IO.File]::WriteAllText($commitMsg, $claimHook, (New-Object System.Text.UTF8Encoding $false))
+
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
-if ($IsLinux -or $IsMacOS) { & chmod +x $preCommit }
+if ($IsLinux -or $IsMacOS) { & chmod +x $preCommit; & chmod +x $commitMsg }
 
 Write-Host ""
-Write-Host "Ledger pre-commit hook INSTALLED." -ForegroundColor Green
-Write-Host "  hook      : $preCommit"
-Write-Host "  checker   : $(Join-Path $hooksDir 'ledger_check.py')"
+Write-Host "MessageFoundry git hooks INSTALLED." -ForegroundColor Green
+Write-Host "  pre-commit: $preCommit"
+Write-Host "              $(Join-Path $hooksDir 'ledger_check.py')  (ledger gate)"
+Write-Host "  commit-msg: $commitMsg"
+Write-Host "              $(Join-Path $hooksDir 'claim_check.py')   (claim gate, BACKLOG #309)"
 Write-Host "  governs   : all $(@(& git -C $RepoRoot worktree list).Count) worktree(s) of this repo, immediately"
 Write-Host ""
-Write-Host "It blocks a commit that reuses an ADR/BACKLOG number, or adds an ADR with no index row."
+Write-Host "Ledger gate: blocks a commit that reuses an ADR/BACKLOG number, or adds an ADR with no index row."
+Write-Host "Claim gate : blocks a CODE commit whose subject says 'BACKLOG #N' unless THIS worktree claims N,"
+Write-Host "             so two sessions cannot build the same item in parallel. Docs-only commits pass."
+Write-Host ""
 Write-Host "Allocate numbers with:  pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title `"<title>`""
+Write-Host "Claim work with:        pwsh -NoProfile -File scripts\coord\claim.ps1 -Take <key> -Note `"<what>`""
+Write-Host "See who holds what:     pwsh -NoProfile -File scripts\coord\claim.ps1 -List"
 Write-Host "Remove with:            pwsh -NoProfile -File scripts\coord\install-git-hooks.ps1 -Uninstall"

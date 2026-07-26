@@ -27,7 +27,6 @@ from dataclasses import dataclass, field
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import ec
-
 from webauthn.helpers import bytes_to_base64url, encode_cbor
 
 _FLAG_UP = 0x01  # user present — verify_registration_response requires it by default

@@ -341,7 +341,7 @@ class HttpSource(SourceConnector):
         if self._server is not None:
             try:
                 await asyncio.wait_for(self._server.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 logger.warning("HTTP server.wait_closed() exceeded shutdown grace; abandoning")
             self._server = None
 
@@ -403,11 +403,11 @@ class HttpSource(SourceConnector):
             if task is not None:
                 self._client_tasks.discard(task)
             writer.close()
-            try:
+            try:  # noqa: SIM105
                 # Bound the close (see stop()): an unbounded Proactor writer.wait_closed() would never
                 # let the per-client task finish, so stop()'s grace never sees it done (#55).
                 await asyncio.wait_for(writer.wait_closed(), timeout=_CLIENT_SHUTDOWN_GRACE)
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 pass
             if established and not failed:
                 await self._emit_event("closed", peer_host=peer_host, reason="eof")
@@ -435,7 +435,7 @@ class HttpSource(SourceConnector):
                     max_header_bytes=self.max_header_bytes,
                     max_body_bytes=self.max_body_bytes,
                 )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Slow-loris: the request didn't fully arrive within receive_timeout. Pre-ingress refuse.
             await self._emit_event("idle_timeout", peer_host=peer_host)
             await self._write_safely(writer, build_response(408, '{"error":"request timeout"}'))
@@ -481,7 +481,7 @@ class HttpSource(SourceConnector):
         try:
             writer.write(data)
             await asyncio.wait_for(writer.drain(), _CLIENT_SHUTDOWN_GRACE)
-        except (OSError, asyncio.TimeoutError):
+        except (TimeoutError, OSError):
             pass
 
 

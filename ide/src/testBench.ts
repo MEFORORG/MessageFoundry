@@ -5,11 +5,23 @@
 // Router/Handler lines ran + per-line time, from `dryrun --trace json`, see traceView.ts) and optional
 // step-through under the debugger.
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import * as vscode from "vscode";
 import { configDir, messageSetsDir, pythonPath, runJson, workspaceDir } from "./cli";
+import { hexdump } from "./hexdump";
 import { diffMessages } from "./hl7diff";
 import { buildTraceDetail, type TraceDetail, type TraceEntry } from "./traceView";
+import {
+  compareCase,
+  type DeliveryComparison,
+  type TestCase,
+  type TestCollection,
+} from "./testCollections";
+
+// Saved regression collections (BACKLOG #168, ADR 0121) live in machine-local workspaceState — NEVER a
+// repo file, and NEVER globalState (Settings-Sync-eligible → could carry PHI off-box). Keyed map.
+const COLLECTIONS_KEY = "messagefoundry.testBench.collections";
 
 interface Delivery {
   to: string;
@@ -34,7 +46,12 @@ type Incoming =
   | { command: "load" }
   | { command: "diff"; index: number }
   | { command: "trace"; index: number }
-  | { command: "debug"; index: number };
+  | { command: "debug"; index: number }
+  | { command: "hex"; index: number }
+  | { command: "listCollections" }
+  | { command: "saveCollection" }
+  | { command: "runCollection"; name: string }
+  | { command: "deleteCollection"; name: string };
 
 function nonce(): string {
   let s = "";
@@ -99,7 +116,186 @@ export class TestBench {
       await this.showTrace(m.index);
     } else if (m.command === "debug") {
       await this.debugRow(m.index);
+    } else if (m.command === "hex") {
+      await this.showHex(m.index);
+    } else if (m.command === "listCollections") {
+      await this.postCollections();
+    } else if (m.command === "saveCollection") {
+      await this.saveCollection();
+    } else if (m.command === "runCollection") {
+      await this.runCollection(m.name);
+    } else if (m.command === "deleteCollection") {
+      await this.deleteCollection(m.name);
     }
+  }
+
+  // ---- Saved regression collections (BACKLOG #168, ADR 0121) -----------------------------------
+  // All persistence is machine-local workspaceState (not globalState — that is Settings-Sync-eligible
+  // and could carry PHI off-box). Case bodies are PHI; authors are steered to synthetic cases.
+
+  private loadCollections(): Record<string, TestCollection> {
+    return this.context.workspaceState.get<Record<string, TestCollection>>(COLLECTIONS_KEY, {});
+  }
+
+  private async storeCollections(map: Record<string, TestCollection>): Promise<void> {
+    await this.context.workspaceState.update(COLLECTIONS_KEY, map);
+  }
+
+  /** Post the current collection list (name + case count only — bodies stay in the host) to the webview. */
+  private async postCollections(): Promise<void> {
+    if (!this.panel) {
+      return;
+    }
+    const map = this.loadCollections();
+    const items = Object.values(map)
+      .map((c) => ({ name: c.name, cases: c.cases.length }))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    await this.panel.webview.postMessage({ type: "collections", items });
+  }
+
+  /** Snapshot the currently-loaded rows as a named collection: input `raw` + the current deliveries. */
+  private async saveCollection(): Promise<void> {
+    if (this.rows.length === 0) {
+      void vscode.window.showInformationMessage(
+        "MessageFoundry: load a message set first, then save it as a collection.",
+      );
+      return;
+    }
+    const name = (
+      await vscode.window.showInputBox({
+        prompt: "Name this regression collection",
+        placeHolder: "e.g. ADT smoke suite",
+        validateInput: (v) => (v.trim() ? undefined : "Enter a name"),
+      })
+    )?.trim();
+    if (!name) {
+      return;
+    }
+    const map = this.loadCollections();
+    if (map[name]) {
+      const overwrite = await vscode.window.showWarningMessage(
+        `A collection named "${name}" already exists. Overwrite it?`,
+        { modal: true },
+        "Overwrite",
+      );
+      if (overwrite !== "Overwrite") {
+        return;
+      }
+    }
+    const cases: TestCase[] = this.rows.map((r) => ({
+      name: r.source,
+      input: r.raw,
+      expected: r.deliveries.map((d) => ({ to: d.to, payload: d.payload })),
+    }));
+    map[name] = { name, cases };
+    await this.storeCollections(map);
+    await this.postCollections();
+    void vscode.window.showInformationMessage(
+      `MessageFoundry: saved collection "${name}" (${cases.length} case${cases.length === 1 ? "" : "s"}).`,
+    );
+  }
+
+  private async deleteCollection(name: string): Promise<void> {
+    const map = this.loadCollections();
+    if (!map[name]) {
+      return;
+    }
+    const ok = await vscode.window.showWarningMessage(
+      `Delete regression collection "${name}"?`,
+      { modal: true },
+      "Delete",
+    );
+    if (ok !== "Delete") {
+      return;
+    }
+    delete map[name];
+    await this.storeCollections(map);
+    await this.postCollections();
+  }
+
+  /**
+   * Rerun a saved collection and flag pass/fail per case. The `dryrun` CLI takes only file paths, so
+   * each case's stored input is materialized to a FRESH per-run temp dir, dry-run (`--show-phi`), and
+   * the temp dir is deleted in `finally` — transient PHI, always cleaned. Cases align to rows by the
+   * unique temp basename the CLI echoes back in `row.path` (robust to a case that yields no row).
+   */
+  private async runCollection(name: string): Promise<void> {
+    if (!this.panel) {
+      return;
+    }
+    const coll = this.loadCollections()[name];
+    const cwd = workspaceDir();
+    if (!coll || !cwd) {
+      return;
+    }
+    let tmpDir: string | undefined;
+    try {
+      tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "mefor-testbench-"));
+      const files = coll.cases.map((c, i) => {
+        const file = path.join(tmpDir as string, `case_${String(i).padStart(4, "0")}.hl7`);
+        fs.writeFileSync(file, c.input, "utf8");
+        return file;
+      });
+      const rows = await runJson<DryRunRow[]>(
+        ["dryrun", "--config", configDir(), "--show-phi", "--messages", ...files],
+        cwd,
+      );
+      const byBase = new Map<string, DryRunRow>();
+      for (const row of rows) {
+        if (row.path) {
+          byBase.set(path.basename(row.path), row);
+        }
+      }
+      const results = coll.cases.map((c, i) => {
+        const row = byBase.get(`case_${String(i).padStart(4, "0")}.hl7`);
+        const actual = row ? row.deliveries.map((d) => ({ to: d.to, payload: d.payload })) : [];
+        const cmp = compareCase(c.expected, actual);
+        return {
+          name: c.name,
+          pass: row ? cmp.pass : false,
+          disposition: row?.disposition ?? "NO RESULT",
+          error: row?.error ?? (row ? null : "no dry-run row produced for this case"),
+          deliveries: cmp.deliveries as DeliveryComparison[],
+        };
+      });
+      const passed = results.filter((r) => r.pass).length;
+      await this.panel.webview.postMessage({
+        type: "collectionRun",
+        name,
+        passed,
+        total: results.length,
+        results,
+      });
+    } catch (e) {
+      void vscode.window.showErrorMessage(`MessageFoundry: collection run failed — ${String(e)}`);
+    } finally {
+      if (tmpDir) {
+        // Best-effort cleanup of the transient PHI temp dir; never let a cleanup error mask the run.
+        try {
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+        } catch {
+          /* OS temp reaping bounds any residue */
+        }
+      }
+    }
+  }
+
+  /**
+   * UTF-8 byte hex pane over the received body (BACKLOG #84, ADR 0119). `row.raw` is the string the
+   * dry-run already decoded (UTF-8/replace), so this dumps ITS UTF-8 bytes — not the original wire
+   * bytes, and not an mfb64/base64 decode. Computed host-side by the pure `hexdump()` (mirroring the
+   * diff/trace panes) and posted; the render is capped and lives only in the webview (no disk, no log).
+   */
+  private async showHex(index: number): Promise<void> {
+    const row = this.rows[index];
+    if (!row || !this.panel) {
+      return;
+    }
+    await this.panel.webview.postMessage({
+      type: "hex",
+      source: row.source,
+      dump: hexdump(row.raw),
+    });
   }
 
   private async loadSet(): Promise<void> {
@@ -267,6 +463,7 @@ export class TestBench {
           <td>${outs}</td>
           <td class="actions">
             <button data-act="diff" data-i="${i}">Before/After</button>
+            <button data-act="hex" data-i="${i}">Hex</button>
             <button data-act="trace" data-i="${i}">Coverage / Profile</button>
             <button data-act="debug" data-i="${i}">Debug</button>
           </td>
@@ -352,11 +549,37 @@ export class TestBench {
     table.prof th:last-child, table.prof td:last-child { text-align: left; width: 40%; }
     .pbar { display: inline-block; height: 9px; border-radius: 2px; background: var(--vscode-progressBar-background, #3794ff); vertical-align: middle; }
     .pbartrack { display: inline-block; width: 100%; background: rgba(127,127,127,0.15); border-radius: 2px; }
+    /* Hex pane (#84, ADR 0119): offset gutter · hex bytes · ASCII gutter, monospace. */
+    pre.hex { margin: 0; padding: 8px; background: var(--vscode-textCodeBlock-background, rgba(127,127,127,0.1));
+              border: 1px solid var(--vscode-panel-border); border-radius: 3px; overflow: auto;
+              font-family: var(--vscode-editor-font-family, monospace); font-size: 12px; line-height: 1.5; }
+    pre.hex .row { display: flex; white-space: pre; }
+    pre.hex .off { flex: 0 0 auto; color: var(--vscode-descriptionForeground); user-select: none; opacity: 0.8; padding-right: 12px; }
+    pre.hex .bytes { flex: 1 1 auto; }
+    pre.hex .txt { flex: 0 0 auto; padding-left: 12px; color: var(--vscode-descriptionForeground); }
+    /* Regression collections (#168, ADR 0121). */
+    .phi { color: var(--vscode-list-warningForeground, #d29922); font-size: 12px; margin: 6px 0 10px;
+           border-left: 3px solid var(--vscode-list-warningForeground, #d29922); padding-left: 8px; }
+    .coll { display: flex; align-items: center; gap: 10px; padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+    .coll .nm { font-weight: 600; }
+    .coll .ct { color: var(--vscode-descriptionForeground); font-size: 12px; flex: 1 1 auto; }
+    .badge { padding: 1px 7px; border-radius: 3px; font-size: 12px; font-weight: 600; }
+    .badge.pass { color: var(--vscode-testing-iconPassed, #3fb950); }
+    .badge.fail { color: var(--vscode-testing-iconFailed, #f85149); }
+    .case { padding: 6px 0; border-bottom: 1px solid var(--vscode-panel-border); }
+    .case .hd { display: flex; align-items: baseline; gap: 8px; }
+    .case .hd .cn { font-size: 13px; }
+    .case .diffs { margin: 4px 0 0 12px; font-size: 12px; color: var(--vscode-descriptionForeground); }
+    .case .diffs code { font-family: var(--vscode-editor-font-family, monospace); }
+    .case .diffs .del { color: var(--vscode-testing-iconFailed, #f85149); }
+    .case .diffs .ins { color: var(--vscode-testing-iconPassed, #3fb950); }
   </style>
 </head>
 <body>
   <div class="bar">
     <button id="load">Load Message Set</button>
+    <button id="savecoll" ${this.rows.length ? "" : "hidden"}>Save as Collection…</button>
+    <button id="collections">Collections</button>
     <button id="back" hidden>← Back to results</button>
     <button id="layout" hidden>Side by side</button>
     <button id="tracetoggle" hidden>Show Profiling</button>
@@ -464,9 +687,90 @@ export class TestBench {
         (t.invocations.length ? inner : '<div class="note">No Router/Handler ran for this message.</div>');
     }
 
+    // HEX (#84): render the posted UTF-8 byte dump — offset gutter, space-joined hex pairs (padded so
+    // the ASCII gutter stays aligned on a short final row), then the printable-ASCII gutter.
+    function renderHex(source, dump){
+      const per = dump.bytesPerRow || 16;
+      const rows = dump.lines.map((l) => {
+        const off = l.offset.toString(16).padStart(8, '0');
+        const pairs = l.hex.join(' ');
+        const pad = ' '.repeat(Math.max(0, (per - l.hex.length) * 3));
+        return '<div class="row"><span class="off">' + off + '</span>' +
+          '<span class="bytes">' + pairs + pad + '</span>' +
+          '<span class="txt">' + esc(l.ascii) + '</span></div>';
+      }).join('');
+      const note = dump.truncated
+        ? '<div class="note">Showing the first ' + dump.renderedBytes + ' of ' + dump.totalBytes + ' bytes (render capped).</div>'
+        : '<div class="note">' + dump.totalBytes + ' bytes.</div>';
+      const subtitle = '<div class="note">UTF-8 bytes of the message as the dry-run decoded it (not the original wire bytes).</div>';
+      detail.innerHTML = '<h3>Hex — ' + esc(source) + '</h3>' + subtitle + note +
+        (dump.lines.length ? '<pre class="hex">' + rows + '</pre>' : '<div class="note">Empty body.</div>');
+    }
+
+    // COLLECTIONS (#168): the saved-collection list with Run / Delete, plus a machine-local PHI notice.
+    function showDetailView(){
+      results.style.display = 'none'; detail.style.display = 'block';
+      back.hidden = false; layout.hidden = true; tracetoggle.hidden = true; lastTrace = null;
+    }
+    let collNames = []; // index → collection name; the DOM keys on the index, never the raw name (a name
+                        // is user text and esc() here does not escape attribute quotes — avoid injection).
+    function renderCollections(items){
+      collNames = items.map((c) => c.name);
+      const notice = '<div class="phi">Cases (input + expected output bodies) are stored machine-locally in this workspace only ' +
+        '(never synced, never committed). Use synthetic, de-identified messages — not real PHI.</div>';
+      const list = items.length
+        ? items.map((c, i) =>
+            '<div class="coll"><span class="nm">' + esc(c.name) + '</span>' +
+            '<span class="ct">' + c.cases + ' case' + (c.cases === 1 ? '' : 's') + '</span>' +
+            '<button data-coll-run="' + i + '">Run</button>' +
+            '<button data-coll-del="' + i + '">Delete</button></div>'
+          ).join('')
+        : '<div class="note">No saved collections yet. Load a message set, then <b>Save as Collection…</b>.</div>';
+      detail.innerHTML = '<h3>Regression collections</h3>' + notice + list;
+      showDetailView();
+      for (const b of detail.querySelectorAll('button[data-coll-run]')) {
+        b.addEventListener('click', () => vscode.postMessage({ command: 'runCollection', name: collNames[Number(b.dataset.collRun)] }));
+      }
+      for (const b of detail.querySelectorAll('button[data-coll-del]')) {
+        b.addEventListener('click', () => vscode.postMessage({ command: 'deleteCollection', name: collNames[Number(b.dataset.collDel)] }));
+      }
+    }
+
+    function diffLine(d){
+      if (d.index < 0) {
+        // whole added/removed segment
+        return d.before
+          ? '<div><code>' + esc(d.seg) + '</code> removed: <span class="del">' + esc(d.before) + '</span></div>'
+          : '<div><code>' + esc(d.seg) + '</code> added: <span class="ins">' + esc(d.after) + '</span></div>';
+      }
+      return '<div><code>' + esc(d.seg) + '[' + d.index + ']</code>: ' +
+        '<span class="del">' + (esc(d.before) || '∅') + '</span> &rarr; ' +
+        '<span class="ins">' + (esc(d.after) || '∅') + '</span></div>';
+    }
+    function renderCollectionRun(msg){
+      const cases = msg.results.map((r) => {
+        const badge = r.pass ? '<span class="badge pass">PASS</span>' : '<span class="badge fail">FAIL</span>';
+        const failNotes = r.pass ? '' : r.deliveries.map((d) => {
+          if (d.status === 'missing') return '<div class="diffs">Expected delivery to <code>' + esc(d.to) + '</code> was not produced.</div>';
+          if (d.status === 'unexpected') return '<div class="diffs">Unexpected delivery to <code>' + esc(d.to) + '</code>.</div>';
+          if (d.status === 'mismatch') return '<div class="diffs">To <code>' + esc(d.to) + '</code>:' + d.differences.map(diffLine).join('') + '</div>';
+          return '';
+        }).join('');
+        const err = r.error ? '<div class="diffs">' + esc(r.error) + '</div>' : '';
+        return '<div class="case"><div class="hd">' + badge + '<span class="cn">' + esc(r.name) +
+          '</span><span class="note">' + esc(r.disposition) + '</span></div>' + err + failNotes + '</div>';
+      }).join('');
+      const allPass = msg.passed === msg.total;
+      const summary = '<span class="badge ' + (allPass ? 'pass' : 'fail') + '">' + msg.passed + ' / ' + msg.total + ' passed</span>';
+      detail.innerHTML = '<h3>Run — ' + esc(msg.name) + ' &nbsp; ' + summary + '</h3>' + cases;
+      showDetailView();
+    }
+
     function saveState(){ vscode.setState({ sbs, traceMode }); }
 
     document.getElementById('load').addEventListener('click', () => vscode.postMessage({ command: 'load' }));
+    document.getElementById('collections').addEventListener('click', () => vscode.postMessage({ command: 'listCollections' }));
+    document.getElementById('savecoll').addEventListener('click', () => vscode.postMessage({ command: 'saveCollection' }));
     back.addEventListener('click', () => {
       detail.style.display='none'; results.style.display=''; lastTrace=null;
       back.hidden=true; layout.hidden=true; tracetoggle.hidden=true;
@@ -510,6 +814,18 @@ export class TestBench {
         layout.hidden = true;
         tracetoggle.hidden = false;
         traceToggleLabel();
+      } else if (m.type === 'hex') {
+        renderHex(m.source, m.dump);
+        lastTrace = null;
+        results.style.display = 'none';
+        detail.style.display = 'block';
+        back.hidden = false;
+        layout.hidden = true;
+        tracetoggle.hidden = true;
+      } else if (m.type === 'collections') {
+        renderCollections(m.items);
+      } else if (m.type === 'collectionRun') {
+        renderCollectionRun(m);
       }
     });
   </script>

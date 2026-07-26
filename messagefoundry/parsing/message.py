@@ -35,7 +35,12 @@ from defusedxml.ElementTree import fromstring as _xml_fromstring
 import messagefoundry.parsing._backend as _backend
 import messagefoundry.parsing._builtin_hl7 as _builtin_hl7
 import messagefoundry.parsing.binary as _binary
-from messagefoundry.parsing.peek import normalize, parse_path
+from messagefoundry.parsing.peek import (
+    HL7PeekError,
+    enforce_expansion_budget,
+    normalize,
+    parse_path,
+)
 from messagefoundry.timezone import age_from_dob, length_of_stay
 
 logger = logging.getLogger(__name__)
@@ -66,6 +71,11 @@ class Message:
         # the built-ins path narrows it back via :meth:`_pm`.
         self._m: Any = message
         self._builtin: bool = isinstance(message, dict)
+        # Copy-on-write flag (ADR 0104): True while this message shares its backing tree with a
+        # :meth:`copy` snapshot/clone. A mutator calls :meth:`_ensure_owned` first, which deepcopies the
+        # tree the first time either side is mutated — so a snapshot that is never further changed (the
+        # common copy-on-Send path) is zero-copy.
+        self._shared: bool = False
 
     @classmethod
     def parse(cls, raw: str | bytes) -> Message:
@@ -74,8 +84,13 @@ class Message:
         Uses the built-ins parser (ADR 0054) when ``_backend.USE_BUILTIN`` is on (the default); an
         unexpected internal built-ins fault falls back to python-hl7 and is logged (Phase-1 fallback
         guard), so a connection is never crashed by a parser bug — the proven path takes over.
+
+        Raises :class:`~messagefoundry.parsing.peek.HL7PeekError` when the message's HL7 escapes
+        could expand past the aggregate budget (ASVS 1.3.3) — the same check, on the same normalized
+        text, that :meth:`Peek.parse` runs, so the two surfaces can never disagree about a body.
         """
         norm = normalize(raw)
+        enforce_expansion_budget(norm)
         if _backend.use_builtin():
             try:
                 return cls(_builtin_hl7.parse(norm))
@@ -83,6 +98,9 @@ class Message:
                 # The no-MSH-leading rejection is the built-ins parser deliberately matching
                 # python-hl7's contract (not an internal fault), so re-raise it as-is rather than
                 # falling back — the python-hl7 path would only raise the identical error again.
+                raise
+            except HL7PeekError:
+                # Likewise a contract error: never fall back to python-hl7's unbounded unescape.
                 raise
             except Exception:  # noqa: BLE001 — fallback guard: any unexpected built-ins error
                 logger.warning(
@@ -382,6 +400,7 @@ class Message:
         # bare id to a settable empty segment (id + one empty field) — identical to add_segment("TXA|").
         if len(tokens) == 1:
             tokens.append("")
+        self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         if self._builtin:
             seg_count = len(_builtin_hl7.segment_ids(self._m))
             if index is not None and (index < 1 or index > seg_count):
@@ -408,6 +427,7 @@ class Message:
         :meth:`add_segment`."""
         if segment_id == "MSH":
             raise ValueError("refusing to delete the MSH segment")
+        self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         removed = 0
         if self._builtin:
             ids = _builtin_hl7.segment_ids(self._m)
@@ -430,6 +450,7 @@ class Message:
         position, not by id (an ``OBX`` may belong to any order), so id-based
         :meth:`delete_segments` can't target one order's segments. Deleting MSH (position 0) is
         refused so the header always survives. Raises ``ValueError`` on an out-of-range position."""
+        self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         if self._builtin:
             seg_count = len(_builtin_hl7.segment_ids(self._m))
             if position < 1 or position >= seg_count:
@@ -497,8 +518,24 @@ class Message:
         :meth:`__init__` re-derives ``self._builtin`` from the *clone*, so the clone keeps the source's own
         backend with no branch here. Pure: no clock/RNG/I/O, and the ingress raw is never touched. Note it
         does **not** re-run the hl7apy strict tier — a clone of a strict-validated inbound is not
-        re-validated (by design)."""
-        return Message(copy.deepcopy(self._m))
+        re-validated (by design).
+
+        **Copy-on-write (ADR 0104):** the clone SHARES the backing tree until either side is first
+        mutated, at which point the mutator (:meth:`_ensure_owned`) takes the private deepcopy. Still an
+        independent, mutable clone — a later mutation of either message never leaks into the other — but a
+        clone that is never further changed (the common copy-on-Send snapshot) costs **no** deepcopy."""
+        self._shared = True
+        clone = Message(self._m)
+        clone._shared = True
+        return clone
+
+    def _ensure_owned(self) -> None:
+        """Copy-on-write hook — every mutator calls this before touching ``self._m``. If the backing tree
+        is still shared with a :meth:`copy` snapshot/clone, take a private deepcopy now (and clear the
+        flag) so the mutation lands only on this message; if already owned it is a cheap no-op."""
+        if self._shared:
+            self._m = copy.deepcopy(self._m)
+            self._shared = False
 
     def __str__(self) -> str:
         return self.encode()
@@ -551,6 +588,7 @@ class Message:
         occurrence is written on its segment object directly, padding empty fields up to ``fld``
         first (a bare index assignment past the end raises). The string content (components,
         repetitions) round-trips verbatim and re-parses into structure either way."""
+        self._ensure_owned()  # copy-on-write before mutating (ADR 0104)
         if self._builtin:
             # The built-ins backend stores the raw field verbatim and auto-extends the field list,
             # for any occurrence, mirroring python-hl7's auto-extend on assignment.

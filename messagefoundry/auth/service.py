@@ -13,19 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import http.client
 import ipaddress
 import json
 import logging
 import os
 import secrets
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, TypeVar
 from uuid import uuid4
 
-from messagefoundry.auth import totp
-from messagefoundry.auth import webauthn
+from messagefoundry.auth import oidc, reconcile, totp, webauthn
 from messagefoundry.auth.identity import AuthProvider, Identity
 from messagefoundry.auth.ldap import AdPrincipal, LdapAuthenticator, LdapError, kerberos_principal
 from messagefoundry.auth.notifications import (
@@ -43,6 +43,8 @@ from messagefoundry.auth.notifications import (
     SecurityEvent,
     SecurityNotifier,
 )
+from messagefoundry.auth.oidc import PendingFlow
+from messagefoundry.auth.oidc_http import build_idp_opener, jwks_fetcher
 from messagefoundry.auth.passwords import hash_password, needs_rehash, verify_password
 from messagefoundry.auth.permissions import (
     CUSTOM_ROLE_ID_PREFIX,
@@ -56,7 +58,8 @@ from messagefoundry.auth.permissions import (
 from messagefoundry.auth.policy import PasswordPolicy, _operator_corpus
 from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
-from messagefoundry.config.secretprovider import SecretProvider
+from messagefoundry.config.models import SignatureAlgorithm
+from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
@@ -107,14 +110,17 @@ _NEW_IP_DEDUP_MAX = 4096
 # (fail-safe: a dropped grant just re-prompts, never a bypass), mirroring `_new_ip_seen`'s self-eviction.
 _ACTION_STEP_UP_GRANT_MAX = 4096
 
-# Action identifiers for the per-action step-up grants (ADR 0077). Named constants so the JSON API deps
-# and the tests all reference the SAME grant string (a typo would only ever fail closed — an unmatched
-# grant re-prompts — but the shared constants keep the wiring legible). Only the JSON factor-binding
-# routes that are actually gated are defined here; WebAuthn register/verify and the browser /ui twins
-# stay on the legacy session-window step-up (deferred to a Wave-1 follow-on, see ADR 0077 residuals).
+# Action identifiers for the per-action step-up grants (ADR 0077). Named constants so the JSON API deps,
+# the /ui twins, and the tests all reference the SAME grant string (a typo would only ever fail closed —
+# an unmatched grant re-prompts — but the shared constants keep the wiring legible). WP245 (ASVS 7.5.1)
+# wired the browser /ui factor-binding lanes onto these (mfa enroll/confirm/disable + webauthn
+# enroll/delete) and bound the JSON admin-user-update PATCH, retiring the ADR 0077 deferral.
 STEP_UP_ACTION_MFA_ENROLL = "mfa_enroll"
 STEP_UP_ACTION_MFA_CONFIRM = "mfa_confirm"
 STEP_UP_ACTION_MFA_DISABLE = "mfa_disable"
+STEP_UP_ACTION_WEBAUTHN_ENROLL = "webauthn_enroll"
+STEP_UP_ACTION_WEBAUTHN_DELETE = "webauthn_delete"
+STEP_UP_ACTION_ADMIN_USER_UPDATE = "admin_user_update"
 
 _T = TypeVar("_T")
 
@@ -132,6 +138,10 @@ class LoginOutcome:
     #: before it may perform step-up (sensitive) operations — the client should prompt for a code and
     #: call ``POST /auth/mfa-verify`` (WP-14, ASVS 6.3.3). Always False for an MFA-delegated AD login.
     mfa_required: bool = False
+    #: A CLOSED-SET reject slug for the federated path (ADR 0142), so the browser layer can pick an
+    #: allow-listed error code without parsing ``error`` (free prose) or seeing any IdP-supplied text.
+    #: Always ``None`` on the local/AD/Kerberos paths, which have no such mapping.
+    reason: str | None = None
 
 
 @dataclass(frozen=True)
@@ -164,6 +174,10 @@ class BootstrapAdmin:
 
     username: str
     password: str
+    # ASVS 6.4.5: the instant an unclaimed bootstrap credential is auto-disabled
+    # (created_at + [auth].bootstrap_expiry_hours), or None when expiry is off (hours=0). Surfaced at
+    # issuance so the renewal instruction ("claim it before <ISO>") ships WITH the credential.
+    expires_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -224,10 +238,18 @@ class AuthService:
         ldap: LdapAuthenticator | None = None,
         security_notifier: SecurityNotifier | None = None,
         secret_provider: SecretProvider | None = None,
+        enforcing: bool = True,
     ) -> None:
         self._store = store
         self._settings = settings
         self.enabled = settings.enabled
+        # #285 (ASVS 6.7.1): the ADR 0148 [security].enforcement dial, threaded in by the caller
+        # (the lifespan passes trust_anchors_enforcing). It gates the OIDC anchor's construction-site
+        # ACL preflight in build_idp_opener below so a group/world-writable anchor WARNS (not refuses)
+        # in warn mode — matching the central run_anchor_preflight and build_api_ssl_context, which is
+        # the only place AuthService needs the dial. AuthSettings carries no [security] block, so the
+        # dial cannot be read off settings here; it must be passed. Defaults enforce (fail-closed).
+        self._trust_anchors_enforcing = enforcing
         # Out-of-band security-event push (ASVS 6.3.5/6.3.7), injected by the API lifespan. None = no
         # email push (the audited /me/security-events feed still records everything). Best-effort.
         self._security_notifier = security_notifier
@@ -287,6 +309,25 @@ class AuthService:
             if settings.admin_write_rate_limit_enabled
             else None
         )
+        # Per-ACTOR budget for the POST-session credential ceremonies (re-auth, password change, MFA
+        # enrolment confirm). These used to draw on _login_limiter, whose `glob` is a single budget
+        # shared with the UNAUTHENTICATED sign-in surface — so anyone able to reach the login page
+        # could exhaust it and lock every signed-in operator out of re-authenticating (and therefore
+        # out of every step-up action) without holding a credential. Same knobs as login (no new
+        # config), but keyed on the acting USER and glob=0: one account's ceremony burst can never
+        # throttle another's, and an unauthenticated flood can no longer reach these at all.
+        # Entry-to-session ceremonies (login, negotiate, SSO/OIDC, the mid-login MFA challenge)
+        # deliberately STAY on _login_limiter — throttling sign-in during a sign-in flood is the
+        # intended behaviour.
+        self._reauth_limiter: SlidingWindowRateLimiter | None = (
+            SlidingWindowRateLimiter(
+                per_key=settings.login_rate_limit_per_ip,
+                glob=0,
+                window_seconds=settings.login_rate_limit_window_seconds,
+            )
+            if settings.login_rate_limit_enabled
+            else None
+        )
         # Per-process dedup of the WP-L3-13 new-client-IP audit/notify side effects: token_hash → the
         # last new client address already flagged for that session. Bounded (_NEW_IP_DEDUP_MAX).
         self._new_ip_seen: dict[str, str] = {}
@@ -302,6 +343,54 @@ class AuthService:
         # Boot-time Kerberos acceptor preflight outcome (ADR 0068 §9): None = usable (or the
         # preflight never ran); a reason string = browser SSO degraded until restart.
         self._kerberos_unavailable_reason: str | None = None
+        # Directory session reconciliation (ADR 0079 mechanism 2). Process-local, like the rate
+        # limiters and the action step-up grants above — a restart resets the strike counts, which
+        # costs at most one extra interval of exposure and is biased toward NOT revoking.
+        #: user_id -> consecutive passes the principal failed to resolve.
+        self._reconcile_strikes: dict[str, int] = {}
+        #: user_id -> monotonic clock of its last probe; orders the per-pass bind budget.
+        self._reconcile_last_probed: dict[str, float] = {}
+        #: Latched mass-revoke circuit-breaker trip, cleared by the next clean pass.
+        self._reconcile_alert: str | None = None
+        #: ASVS 6.4.5 arm 2: once-per-process latch so the bootstrap-expiry reminder fires exactly once
+        #: while the unclaimed bootstrap sits inside its warn window (see :meth:`bootstrap_expiry_warning`).
+        self._bootstrap_expiry_warned = False
+        # Advisory, NON-STICKY federated-IdP health (ADR 0142 AC-8) — see the oidc_available docstring.
+        self._oidc_unavailable_reason: str | None = None
+        self._oidc_client_secret: str | None = None
+        self._oidc_jwks: oidc.JwksCache | None = None
+        self._oidc_flows: oidc.FlowCache | None = None
+        if settings.oidc_enabled:
+            # A SEPARATE branch from the ldap one above: secret_provider is otherwise consumed only
+            # inside `elif settings.ad_enabled`, so every test that injects ldap= would skip secret
+            # resolution entirely and the reference would be dead in tests but live in production.
+            self._oidc_client_secret = resolve_connector_secret(
+                secret_provider,
+                ref=settings.oidc_client_secret_ref,
+                literal=settings.oidc_client_secret,
+                label="[auth].oidc_client_secret",
+            )
+            # Eager: a bad CA path or an unresolvable secret must refuse startup, exactly as the AD
+            # bind password does. NO network I/O happens here — JwksCache opens no socket until its
+            # first get_key — so an UNREACHABLE IdP still constructs cleanly (AC-8).
+            # #285 (ASVS 6.7.1): thread the pin + the enforcement dial so the construction-site anchor
+            # preflight honors [security].enforcement (warn ≠ refuse) — a pin mismatch always refuses,
+            # a group/world-writable DACL refuses only at enforce. Without the dial this seam would
+            # hardcode enforce and make warn-mode startup unreachable for the OIDC anchor.
+            self._oidc_opener = build_idp_opener(
+                settings.oidc_tls_ca_cert_file,
+                pin=settings.oidc_tls_ca_cert_pin,
+                enforcing=self._trust_anchors_enforcing,
+            )
+            self._oidc_jwks = oidc.JwksCache(
+                jwks_fetcher(settings.oidc_jwks_uri or "", self._oidc_opener),
+                ttl_seconds=settings.oidc_jwks_ttl_seconds,
+                min_refetch_seconds=settings.oidc_jwks_min_refetch_seconds,
+            )
+            self._oidc_flows = oidc.FlowCache(
+                ttl_seconds=settings.oidc_flow_ttl_seconds,
+                global_cap=settings.oidc_flow_cache_max,
+            )
 
     async def _argon2(self, fn: Callable[..., _T], *args: Any) -> _T:
         """Run a (CPU-heavy) argon2 hash/verify off-thread under the concurrency cap."""
@@ -313,6 +402,17 @@ class AuthService:
         if self._login_limiter is None:
             return True
         return self._login_limiter.allow(client or "unknown")
+
+    def allow_reauth_attempt(self, actor: str) -> bool:
+        """Rate-limit gate for the POST-session credential ceremonies, keyed on the acting user.
+
+        Distinct from :meth:`allow_login_attempt`, whose global budget is shared with the
+        unauthenticated sign-in surface: an attacker who can reach the login page must not be able to
+        exhaust it and deny re-authentication (and hence every step-up action) to signed-in operators.
+        True = proceed; always True when the limiter is disabled."""
+        if self._reauth_limiter is None:
+            return True
+        return self._reauth_limiter.allow(actor)
 
     def allow_phi_read(self, actor: str) -> bool:
         """Per-actor anti-automation gate for the PHI-read endpoints (WP-8, ASVS 2.4.1). True =
@@ -365,7 +465,42 @@ class AuthService:
         """AUTH-K-AUDIT for route-level SSO rejects that never reach ``authenticate_kerberos``
         (cross-site hygiene, rate-limit exhaustion, malformed base64) — every reject path of a
         Windows-SSO attempt must be visible to a defender."""
-        await self._kerberos_reject_audit("<kerberos>", reason)
+        await self._directory_reject_audit("<kerberos>", "kerberos", reason)
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """Static config: federation is on AND a directory exists to resolve roles against. This is
+        the gate the route registrar reads, so ``oidc_enabled=false`` means the ``/ui/oidc/*`` routes
+        are never registered at all (ADR 0142 AC-1)."""
+        return self._settings.oidc_enabled and self._ldap is not None
+
+    @property
+    def oidc_available(self) -> bool:
+        """``oidc_enabled`` AND the last IdP interaction did not fail.
+
+        **Deliberately NOT the same shape as** :attr:`kerberos_available`, which is boot-once and
+        sticky-until-restart (ADR 0068 §9). This flag is **advisory and non-sticky**: it is set by a
+        failed login and cleared by the next successful one, and *no login path gates on it* — the
+        start leg always attempts. That is what satisfies AC-8's "SHALL recover without an engine
+        restart"; a copy of the Kerberos latch would leave one IdP blip disabling federated login
+        until a restart, which is exactly what AC-8 forbids. It exists to drive the login-page link
+        and ``/auth/providers``, nothing more. Do not "fix" the asymmetry with the Kerberos twin.
+        """
+        return self.oidc_enabled and self._oidc_unavailable_reason is None
+
+    def mark_oidc_unavailable(self, reason: str) -> None:
+        """Record that an IdP interaction failed. Advisory only — see :attr:`oidc_available`."""
+        self._oidc_unavailable_reason = reason
+
+    def clear_oidc_unavailable(self) -> None:
+        """Record that the IdP answered. This is the half that makes recovery restart-free (AC-8)."""
+        self._oidc_unavailable_reason = None
+
+    async def audit_oidc_reject(self, reason: str) -> None:
+        """Route-level federated-login rejects that never reach :meth:`authenticate_oidc` (flow-cookie
+        binding failures, rate-limit exhaustion, a non-navigation fetch). ``reason`` must be a
+        closed-set slug chosen by the route — never IdP-supplied text."""
+        await self._directory_reject_audit("<oidc>", "oidc", reason)
 
     # --- lifecycle -----------------------------------------------------------
 
@@ -401,7 +536,15 @@ class AuthService:
             user_id, [Role.ADMINISTRATOR.value], assigned_by="bootstrap"
         )
         await self._audit("auth.bootstrap_admin_created", actor="bootstrap")
-        return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password)
+        # ASVS 6.4.5: derive the expiry from the STORED created_at (the same base
+        # _retire_superseded_bootstrap uses), so the surfaced deadline is exactly the retirement instant.
+        expiry_hours = self._settings.bootstrap_expiry_hours
+        expires_at: float | None = None
+        if expiry_hours > 0:
+            created = await self._store.get_user(user_id)
+            if created is not None:
+                expires_at = created.created_at + expiry_hours * 3600
+        return BootstrapAdmin(username=BOOTSTRAP_USERNAME, password=password, expires_at=expires_at)
 
     def _generate_policy_password(self) -> str:
         """A random password that satisfies the active policy — so the printed bootstrap credential
@@ -447,6 +590,36 @@ class AuthService:
             detail=_json({"reason": "superseded" if superseded else "expired"}),
         )
 
+    async def bootstrap_expiry_warning(self, now: float | None = None) -> tuple[float, int] | None:
+        """ASVS 6.4.5 arm 2: if the first-run bootstrap admin is STILL UNCLAIMED and ``now`` sits inside
+        its warn window ``[expires_at - bootstrap_warn_hours, expires_at)``, return the retirement instant
+        + whole hours remaining ONCE — an in-memory latch means a periodic caller emits exactly one
+        reminder per process. Returns ``None`` when time-expiry is off, the bootstrap is
+        gone/disabled/claimed, ``now`` is before the window (or already at/past it — retirement itself has
+        taken over by then), or a reminder already fired this process. Advisory only: the actual
+        auto-disable is :meth:`_retire_superseded_bootstrap`; this nudges an operator BEFORE it happens.
+
+        ``expires_at`` is derived from the STORED ``created_at`` — the same base
+        :meth:`_retire_superseded_bootstrap` uses — so the surfaced deadline is exactly the retirement
+        instant, not a fresh clock. The caller (the API-lifespan reminder) turns it into an ISO string +
+        the PHI-free ``bootstrap_admin_expiring`` AlertSink event; the password is never surfaced."""
+        if self._bootstrap_expiry_warned:
+            return None
+        expiry_hours = self._settings.bootstrap_expiry_hours
+        if expiry_hours <= 0:
+            return None  # no time-expiry configured → nothing to warn about
+        boot = await self._store.get_user_by_username(BOOTSTRAP_USERNAME)
+        if boot is None or boot.disabled or not boot.must_change_password:
+            return None  # gone, already disabled, or claimed (a real account now)
+        now = time.time() if now is None else now
+        expires_at = boot.created_at + expiry_hours * 3600
+        warn_start = expires_at - max(0, self._settings.bootstrap_warn_hours) * 3600
+        if not (warn_start <= now < expires_at):
+            return None  # not yet in the window, or already at/past the retirement instant
+        self._bootstrap_expiry_warned = True  # latch: exactly one reminder per process
+        hours_remaining = max(0, int((expires_at - now) // 3600))
+        return (expires_at, hours_remaining)
+
     # --- login ---------------------------------------------------------------
 
     async def login(
@@ -479,12 +652,13 @@ class AuthService:
                 "auth.login_failed",
                 actor=username,
                 detail=_json({"provider": "local", "reason": "unknown_or_disabled"}),
+                client=client,
             )
             return LoginOutcome(ok=False, error="invalid credentials")
         now = time.time()
         if user.locked_until is not None and now < user.locked_until:
             await self._argon2(verify_password, _DUMMY_PASSWORD_HASH, password)
-            await self._audit("auth.login_locked", actor=username)
+            await self._audit("auth.login_locked", actor=username, client=client)
             return LoginOutcome(ok=False, error="account locked")
         if user.password_hash is None or not await self._argon2(
             verify_password, user.password_hash, password
@@ -494,6 +668,7 @@ class AuthService:
                 "auth.login_failed",
                 actor=username,
                 detail=_json({"provider": "local", "reason": "bad_password"}),
+                client=client,
             )
             if just_locked:
                 await self._notify_security(
@@ -503,6 +678,27 @@ class AuthService:
                     client=client,
                     detail={"failed_attempts": attempts},
                 )
+            return LoginOutcome(ok=False, error="invalid credentials")
+        # ASVS 6.4.1: an admin-issued initial/reset credential that was never claimed EXPIRES — the
+        # password verified, but a `must_change_password` temp that is older than
+        # `initial_password_expiry_hours` is refused like any other invalid login (a generic error, so
+        # it is indistinguishable from a wrong password) and audited. The bootstrap admin has its own
+        # expiry path (handled above) and is carved out; a user who set their own password has
+        # `must_change_password=False` and is never gated here.
+        expiry_hours = self._settings.initial_password_expiry_hours
+        if (
+            username != BOOTSTRAP_USERNAME
+            and user.must_change_password
+            and expiry_hours > 0
+            and user.password_changed_at is not None
+            and now - user.password_changed_at > expiry_hours * 3600.0
+        ):
+            await self._audit(
+                "auth.temp_password_expired",
+                actor=username,
+                detail=_json({"provider": "local", "expiry_hours": expiry_hours}),
+                client=client,
+            )
             return LoginOutcome(ok=False, error="invalid credentials")
         if await asyncio.to_thread(needs_rehash, user.password_hash):
             await self._store.set_password(
@@ -524,6 +720,7 @@ class AuthService:
             "auth.login_success",
             actor=user.username,
             detail=_json({"provider": "local", "mfa_required": mfa_required}),
+            client=client,
         )
         if prior_failures >= SUSPICIOUS_LOGIN_FAILURE_THRESHOLD:
             # A successful login right after a run of failures is the classic compromised/attacked
@@ -575,12 +772,20 @@ class AuthService:
                 "auth.login_error",
                 actor=username,
                 detail=_json({"provider": "ad", "error": str(exc)}),
+                client=client,
             )
             return LoginOutcome(ok=False, error="directory unavailable")
         if principal is None:
-            await self._audit("auth.login_failed", actor=username, detail=_json({"provider": "ad"}))
+            await self._audit(
+                "auth.login_failed", actor=username, detail=_json({"provider": "ad"}), client=client
+            )
             return LoginOutcome(ok=False, error="invalid credentials")
-        return await self._complete_ad_login(principal, client)
+        # Signed relaxation (ASVS 6.3.4): a SIMPLE bind proves the password only — it carries no
+        # assertion about what the directory enforced — so strength is delegated to Entra Conditional
+        # Access / the MFA proxy. Minting at the MINIMUM instead is 6.8.4 arm 3, deferred to #296:
+        # an AD identity has no enrollable engine factor, so flipping it here locks directory admins
+        # out. This parameter is the seam that flip uses.
+        return await self._complete_ad_login(principal, client, mfa_verified=True)
 
     async def authenticate_kerberos(
         self, token: bytes, *, client: str | None = None, seed_reauth: bool = True
@@ -588,12 +793,12 @@ class AuthService:
         # Audit every reject path so blocked/failed Windows-SSO attempts are not invisible to a
         # defender (AUTH-K-AUDIT). A sentinel actor is used until the principal is known.
         if self._ldap is None or not self._settings.kerberos_enabled:
-            await self._kerberos_reject_audit("<kerberos>", "not_configured")
+            await self._directory_reject_audit("<kerberos>", "kerberos", "not_configured")
             return LoginOutcome(ok=False, error="Windows SSO is not configured")
         try:
             username = await asyncio.to_thread(kerberos_principal, token, self._settings)
             if username is None:
-                await self._kerberos_reject_audit("<kerberos>", "no_principal")
+                await self._directory_reject_audit("<kerberos>", "kerberos", "no_principal")
                 return LoginOutcome(ok=False, error="SSO authentication failed")
             principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
         except LdapError as exc:
@@ -601,22 +806,262 @@ class AuthService:
                 "auth.login_error",
                 actor="<kerberos>",
                 detail=_json({"provider": "ad", "mech": "kerberos", "error": str(exc)}),
+                client=client,
             )
             return LoginOutcome(ok=False, error="directory unavailable")
         if principal is None:
-            await self._kerberos_reject_audit(username, "not_in_directory")
+            await self._directory_reject_audit(username, "kerberos", "not_in_directory")
             return LoginOutcome(ok=False, error="user not found in directory")
-        return await self._complete_ad_login(principal, client, seed_reauth=seed_reauth)
+        # Same signed relaxation as the simple-bind leg (ASVS 6.3.4): a Kerberos service ticket carries
+        # no factor-strength assertion that pyspnego surfaces, so directory delegation stands.
+        return await self._complete_ad_login(
+            principal, client, mfa_verified=True, seed_reauth=seed_reauth
+        )
 
-    async def _kerberos_reject_audit(self, actor: str, reason: str) -> None:
+    def _oidc_policy(self, nonce: str) -> oidc.OidcClaimPolicy:
+        s = self._settings
+        return oidc.OidcClaimPolicy(
+            issuer=s.oidc_issuer or "",
+            client_id=s.oidc_client_id or "",
+            signing_algorithms=[SignatureAlgorithm(a) for a in s.oidc_signing_algorithms],
+            nonce=nonce,
+            username_claim=s.oidc_username_claim,
+            username_strip_domain=s.oidc_username_strip_domain,
+            allowed_username_domains=frozenset(s.effective_oidc_username_domains),
+            require_mfa_claim=s.oidc_require_mfa_claim,
+            mfa_amr_values=s.oidc_mfa_amr_values,
+            required_acr_values=s.oidc_required_acr_values,
+            clock_skew_seconds=s.oidc_clock_skew_seconds,
+        )
+
+    def _exchange_and_validate(
+        self, code: str, flow: PendingFlow, redirect_uri: str
+    ) -> oidc.FederatedPrincipal:
+        """The whole synchronous IdP interaction, run in ONE ``to_thread`` hop.
+
+        Both halves live here so the authorization ``code`` and the ``id_token`` never cross back
+        into route code (AC-10): every extra frame holding one is another place a future debug log or
+        an exception repr could leak it.
+        """
+        assert self._oidc_jwks is not None  # guarded by oidc_enabled at the call site
+        payload = oidc.exchange_code(
+            token_endpoint=self._settings.oidc_token_endpoint or "",
+            client_id=self._settings.oidc_client_id or "",
+            client_secret=self._oidc_client_secret,
+            code=code,
+            redirect_uri=redirect_uri,
+            code_verifier=flow.code_verifier,
+            opener=self._oidc_opener,
+        )
+        id_token = payload["id_token"]
+        if not isinstance(id_token, str):
+            raise oidc.FlowError("token endpoint returned a non-string id_token")
+        return oidc.validate_id_token(id_token, self._oidc_policy(flow.nonce), self._oidc_jwks)
+
+    @property
+    def oidc_flow_ttl_seconds(self) -> int:
+        """The staged-flow lifetime, so the browser cookie's max-age matches the server-side TTL."""
+        return self._settings.oidc_flow_ttl_seconds
+
+    def _oidc_redirect_uri(self, public_origin: str) -> str:
+        return public_origin.rstrip("/") + self._settings.oidc_redirect_path
+
+    async def begin_oidc_login(self, *, client: str | None, public_origin: str) -> tuple[str, str]:
+        """Stage a federated flow and return ``(flow_id, authorization_url)``.
+
+        The PKCE verifier, ``state`` and ``nonce`` are minted here and stay SERVER-side in the flow
+        cache; only the opaque ``flow_id`` goes to the browser. Raises
+        :class:`~messagefoundry.auth.oidc.FlowCacheFullError` when the bounded cache is full — the
+        caller must treat that as a flood signal, not an error to audit per request.
+        """
+        if not self.oidc_enabled or self._oidc_flows is None:
+            raise oidc.FlowError("federated sign-in is not configured")
+        flow_id, flow = oidc.start_flow(
+            self._oidc_flows,
+            return_to="/ui",
+            client_ip=client or "",
+            ttl_seconds=self._settings.oidc_flow_ttl_seconds,
+        )
+        challenge = oidc.pkce_challenge(flow.code_verifier)
+        url = oidc.build_authorization_url(
+            authorization_endpoint=self._settings.oidc_authorization_endpoint or "",
+            client_id=self._settings.oidc_client_id or "",
+            redirect_uri=self._oidc_redirect_uri(public_origin),
+            state=flow.state,
+            nonce=flow.nonce,
+            code_challenge=challenge,
+            scopes=self._settings.oidc_scopes,
+            acr_values=self._settings.oidc_acr_values,
+            prompt=self._settings.oidc_prompt,
+        )
+        return flow_id, url
+
+    async def complete_oidc_login(
+        self,
+        *,
+        flow_id: str,
+        state: str,
+        code: str,
+        client: str | None,
+        public_origin: str,
+    ) -> LoginOutcome:
+        """Redeem a staged flow: pop it (single-use), constant-time-compare ``state``, then run the
+        full exchange + verification through :meth:`authenticate_oidc`.
+
+        The flow cache stays private to the service, so route code never holds the PKCE verifier or
+        the nonce. A missing/expired flow and a ``state`` mismatch are both audited with closed-set
+        slugs and are deliberately indistinguishable to the caller.
+        """
+        if not self.oidc_enabled or self._oidc_flows is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            return LoginOutcome(
+                ok=False, error="federated sign-in is not configured", reason="not_configured"
+            )
+        flow = self._oidc_flows.pop(flow_id)
+        if flow is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "state_unknown")
+            return LoginOutcome(
+                ok=False, error="federated sign-in expired; start again", reason="state_unknown"
+            )
+        if not oidc.state_matches(flow.state, state):
+            await self._directory_reject_audit("<oidc>", "oidc", "state_mismatch")
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason="state_mismatch")
+        return await self.authenticate_oidc(
+            code,
+            flow,
+            redirect_uri=self._oidc_redirect_uri(public_origin),
+            client=client,
+        )
+
+    async def authenticate_oidc(
+        self,
+        code: str,
+        flow: PendingFlow,
+        *,
+        redirect_uri: str,
+        client: str | None = None,
+        seed_reauth: bool = False,
+    ) -> LoginOutcome:
+        """Complete a federated login: exchange the code, verify the ``id_token``, then resolve the
+        principal against on-prem AD and hand off to the shared directory-login path.
+
+        ``seed_reauth`` defaults **False**, unlike :meth:`authenticate_kerberos`: a federated proof is
+        ambient (the browser was redirected back holding a token), so the session must not be born
+        with a free step-up window — the first sensitive action forces an explicit re-auth. This
+        mirrors browser Kerberos SSO's explicit ``seed_reauth=False``, not its default.
+
+        Roles come from ``resolve_principal`` — the same password-free LDAP lookup Kerberos uses —
+        and NEVER from a token claim, so a claims-parsing bug degrades to wrong-user login rather
+        than privilege escalation.
+        """
+        if not self.oidc_enabled or self._ldap is None:
+            await self._directory_reject_audit("<oidc>", "oidc", "not_configured")
+            return LoginOutcome(
+                ok=False, error="federated sign-in is not configured", reason="not_configured"
+            )
+        try:
+            principal_claims = await asyncio.to_thread(
+                self._exchange_and_validate, code, flow, redirect_uri
+            )
+        except oidc.ClaimsError as exc:
+            # A verification-rung failure: the token was reachable but did not satisfy the ladder.
+            # exc.reason is closed-set, so nothing IdP-influenced reaches the audit row.
+            await self._directory_reject_audit("<oidc>", "oidc", exc.reason)
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason=exc.reason)
+        except (OSError, ValueError, http.client.HTTPException) as exc:
+            # IdP unreachable / non-2xx / malformed response. JwksCache's injected fetch raises RAW
+            # urllib errors (it is not wrapped in JwksError), so a narrow `except JwksError` here
+            # would let an IdP outage escape as an unhandled 500 instead of a degraded login.
+            # http.client.HTTPException is neither an OSError nor a ValueError: a proxy answering the
+            # token POST with a non-HTTP status line raises BadStatusLine, which would otherwise
+            # escape uncaught — a 500 with the IdP's bytes rendered into the traceback log, no audit
+            # row, and oidc_available left stale. The exception TYPE is audited, never str(exc).
+            self.mark_oidc_unavailable(type(exc).__name__)
+            await self._audit(
+                "auth.login_error",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "error": type(exc).__name__}),
+                client=client,
+            )
+            return LoginOutcome(
+                ok=False, error="identity provider unavailable", reason="idp_unavailable"
+            )
+
+        username = principal_claims.username
+        try:
+            principal = await asyncio.to_thread(self._ldap.resolve_principal, username)
+        except LdapError as exc:
+            await self._audit(
+                "auth.login_error",
+                actor="<oidc>",
+                detail=_json({"provider": "ad", "mech": "oidc", "error": str(exc)}),
+                client=client,
+            )
+            return LoginOutcome(
+                ok=False, error="directory unavailable", reason="directory_unavailable"
+            )
+        if principal is None:
+            # Hybrid-only by design: a federated principal with no on-prem AD object is refused.
+            await self._directory_reject_audit(username, "oidc", "not_in_directory")
+            return LoginOutcome(
+                ok=False, error="user not found in directory", reason="not_in_directory"
+            )
+
+        max_expires_at = principal_claims.expires_at
+        if self._settings.oidc_session_max_hours:
+            max_expires_at = min(
+                max_expires_at, time.time() + self._settings.oidc_session_max_hours * 3600
+            )
+        if max_expires_at <= time.time():
+            # The ladder accepts an exp up to clock_skew_seconds in the PAST, so a token inside the
+            # grace window would otherwise mint an already-dead session: the user "logs in" and is
+            # revoked on their first request, with no audited reason. Refuse loudly instead.
+            await self._directory_reject_audit(username, "oidc", "expired")
+            return LoginOutcome(ok=False, error="federated sign-in failed", reason="expired")
+
+        self.clear_oidc_unavailable()
+        # ASVS 6.3.4, the one directory leg the engine can actually verify. Keyed on the SETTING, not
+        # on mech == "oidc": when the claim gate is on (default), _check_mfa_gate has already refused
+        # any token lacking a configured amr/acr, so a principal reaching this line provably carried
+        # one and the grant is engine-verified. When the operator opted out, the engine verified
+        # nothing, the session mints unverified, and mfa_satisfied refuses it (see :mfa_satisfied).
+        # A load-time validator guarantees the gate can never be on-but-unmatchable, so the flag
+        # alone is a sound predicate.
+        mfa_verified = self._settings.oidc_require_mfa_claim
+        return await self._complete_ad_login(
+            principal,
+            client,
+            mfa_verified=mfa_verified,
+            seed_reauth=seed_reauth,
+            mech="oidc",
+            evidence={
+                "amr": list(principal_claims.amr),
+                "acr": principal_claims.acr,
+                "sub": principal_claims.subject,
+                "mfa_verified": mfa_verified,
+            },
+            max_expires_at=max_expires_at,
+        )
+
+    async def _directory_reject_audit(self, actor: str, mech: str, reason: str) -> None:
+        """Audit a rejected directory-SSO attempt. ``mech`` is the mechanism slug ("kerberos" /
+        "oidc"); ``reason`` must come from a closed set so no IdP-influenced text is ever stored."""
         await self._audit(
             "auth.login_failed",
             actor=actor,
-            detail=_json({"provider": "ad", "mech": "kerberos", "reason": reason}),
+            detail=_json({"provider": "ad", "mech": mech, "reason": reason}),
         )
 
     async def _complete_ad_login(
-        self, principal: AdPrincipal, client: str | None, *, seed_reauth: bool = True
+        self,
+        principal: AdPrincipal,
+        client: str | None,
+        *,
+        mfa_verified: bool,
+        seed_reauth: bool = True,
+        mech: str | None = None,
+        evidence: Mapping[str, object] | None = None,
+        max_expires_at: float | None = None,
     ) -> LoginOutcome:
         existing = await self._store.get_user_by_username(principal.username)
         if existing is not None and existing.auth_provider != AuthProvider.AD.value:
@@ -625,6 +1070,7 @@ class AuthService:
                 "auth.login_failed",
                 actor=principal.username,
                 detail=_json({"provider": "ad", "reason": "local_account_conflict"}),
+                client=client,
             )
             return LoginOutcome(ok=False, error="account conflict")
         user = await self._upsert_ad_user(principal)
@@ -640,6 +1086,7 @@ class AuthService:
                 "auth.ad_roles_resynced",
                 actor=user.username,
                 detail=_json({"from": sorted(previous), "to": role_ids}),
+                client=client,
             )
             # A directory-pushed privilege change is the same privilege change to the same user as a
             # local one, so notify the affected user out-of-band too (ASVS 6.3.7), matching set_roles().
@@ -663,15 +1110,27 @@ class AuthService:
             allowed_channels=_allowed_channels(user, ad_roles),
             extra_permissions=ad_custom_permissions,
         )
-        # AD/Kerberos MFA is delegated to the directory (Entra Conditional Access / MFA proxy), so the
-        # session is MFA-satisfied at issuance — an engine TOTP is never prompted for a directory login.
+        # ASVS 6.3.4: the second-factor grant is the CALLER's per-mechanism decision, not a blanket
+        # literal. AD simple-bind and Kerberos pass True under the owner-signed delegated-directory-MFA
+        # relaxation (the bind/ticket teaches the engine nothing about directory-side strength); the
+        # federated leg passes the engine-verified amr/acr result. See the callers for each rationale.
         token = await self._issue_session(
-            user.id, client, mfa_verified=True, seed_reauth=seed_reauth
+            user.id,
+            client,
+            mfa_verified=mfa_verified,
+            seed_reauth=seed_reauth,
+            max_expires_at=max_expires_at,
         )
+        # The password-AD and Kerberos paths must keep emitting EXACTLY {"provider","roles"}: _json is
+        # json.dumps(sort_keys=True), so a null-valued key is a different stored string, not a no-op.
+        # Only the federated path passes mech/evidence, so it alone grows the row.
+        detail: dict[str, object] = {"provider": "ad", "roles": role_ids}
+        if mech is not None:
+            detail["mech"] = mech
+        if evidence:
+            detail["evidence"] = dict(evidence)
         await self._audit(
-            "auth.login_success",
-            actor=user.username,
-            detail=_json({"provider": "ad", "roles": role_ids}),
+            "auth.login_success", actor=user.username, detail=_json(detail), client=client
         )
         return LoginOutcome(ok=True, token=token, identity=identity)
 
@@ -722,6 +1181,209 @@ class AuthService:
         assert user is not None  # just upserted
         return user
 
+    # --- directory session reconciliation (ADR 0079 mechanism 2) --------------
+
+    @property
+    def directory_reconcile_enabled(self) -> bool:
+        """Whether a reconciliation pass would do anything: the interval is set AND a directory is
+        wired. Drives whether the API lifespan creates the loop at all — at the default
+        ``ad_session_recheck_seconds = 0`` no task exists and the upgrade is byte-identical."""
+        return bool(self._settings.ad_session_recheck_seconds) and self._ldap is not None
+
+    @property
+    def directory_reconcile_alert(self) -> str | None:
+        """The last mass-revoke circuit-breaker trip, or ``None``. Latches until a pass completes
+        without tripping, so an operator who missed the log line still sees the standing condition."""
+        return self._reconcile_alert
+
+    async def _probe_principal(self, user: UserRecord) -> reconcile.Probe:
+        """One directory probe, off the event loop (``ldap3`` is blocking).
+
+        ``resolve_principal`` is the password-free service-account lookup the Kerberos path uses; it
+        already rejects a disabled account (``userAccountControl & 0x2``) by returning ``None``, and
+        returns the group set, so the role re-diff below costs no extra round trip.
+        """
+        assert self._ldap is not None  # guarded by directory_reconcile_enabled
+        try:
+            principal = await asyncio.to_thread(self._ldap.resolve_principal, user.username)
+        except LdapError as exc:
+            # FAIL OPEN. An unreachable DC must never revoke: a fail-closed re-check would turn a
+            # directory blip into a total console outage during exactly the incident when operators
+            # need the console. Debug-level — a flapping DC must not flood the log at one line per
+            # user per pass; the pass-level summary below reports the count at WARNING.
+            _log.debug("directory reconcile: probe failed for %s: %s", user.username, exc)
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.UNAVAILABLE)
+        if principal is None:
+            return reconcile.Probe(user.id, user.username, reconcile.ProbeOutcome.ABSENT)
+        return reconcile.Probe(
+            user.id, user.username, reconcile.ProbeOutcome.PRESENT, groups=principal.groups
+        )
+
+    async def reconcile_directory_sessions(self) -> reconcile.ReconcilePlan:
+        """Run one reconciliation pass and apply it; return what it did (for the loop + tests).
+
+        Re-resolves every directory-backed principal that still holds a **live** session and revokes
+        the sessions of accounts that have been disabled or deleted, so an AD disable takes effect
+        within one interval instead of at the 12-hour absolute cap. Safe by construction:
+
+        * a probe that could not reach the directory contributes nothing (fail-open);
+        * a principal must come back absent ``ad_session_recheck_strikes`` passes running;
+        * a pass that would revoke too many at once aborts wholesale and alerts.
+
+        The pass is **planned in full before anything is written**, so an abort leaves the store
+        byte-identical — including the role re-diff.
+        """
+        if not self.directory_reconcile_enabled:
+            return reconcile.ReconcilePlan()
+        settings = self._settings
+
+        # Candidates: AD-provider users that are not already locally disabled AND still hold at least
+        # one live session. Nobody signed in => zero binds. Derived from list_users + list_sessions
+        # rather than a new store method, so this control needs no schema change on any backend.
+        candidates: list[tuple[str, str]] = []
+        users: dict[str, UserRecord] = {}
+        for user in await self._store.list_users():
+            if user.auth_provider != AuthProvider.AD.value or user.disabled:
+                continue
+            if not await self._store.list_sessions(user.id):
+                continue
+            candidates.append((user.id, user.username))
+            users[user.id] = user
+        reconcile.prune_ledger(self._reconcile_strikes, users)
+        reconcile.prune_ledger(self._reconcile_last_probed, users)
+        if not candidates:
+            # Nobody signed in: a no-op pass. A latched breaker alert is deliberately NOT cleared
+            # here — this pass learned nothing about the directory, and clearing a standing alarm on
+            # an absence of information would hide a misconfiguration that is still there.
+            return reconcile.ReconcilePlan()
+
+        selected = reconcile.select_candidates(
+            candidates,
+            last_probed=self._reconcile_last_probed,
+            budget=settings.ad_session_recheck_max_users,
+        )
+        now = time.monotonic()
+        probes: list[reconcile.Probe] = []
+        for user_id, _username in selected:
+            probes.append(await self._probe_principal(users[user_id]))
+            self._reconcile_last_probed[user_id] = now
+
+        # Resolve the role sets for the role re-diff. Store reads only — no extra directory traffic.
+        current_roles: dict[str, frozenset[str]] = {}
+        target_roles: dict[str, frozenset[str]] = {}
+        for probe in probes:
+            if probe.outcome is not reconcile.ProbeOutcome.PRESENT:
+                continue
+            current_roles[probe.user_id] = frozenset(
+                await self._store.get_user_role_ids(probe.user_id)
+            )
+            target_roles[probe.user_id] = frozenset(
+                await self._store.roles_for_ad_groups(probe.groups)
+            )
+
+        plan = reconcile.plan_pass(
+            probes,
+            prior_strikes=self._reconcile_strikes,
+            current_roles=current_roles,
+            target_roles=target_roles,
+            strike_threshold=settings.ad_session_recheck_strikes,
+            max_absolute=settings.ad_session_revoke_max,
+            max_fraction=settings.ad_session_revoke_max_fraction,
+        )
+        # Strike bookkeeping is process-local, not store state, so it is recorded even for an aborted
+        # pass — that is what makes a standing misconfiguration trip the breaker on EVERY pass rather
+        # than oscillating. Merge, never replace: an UNAVAILABLE probe is absent from plan.strikes,
+        # so the user keeps whatever strike they already carried rather than having an outage clear it.
+        self._reconcile_strikes.update(plan.strikes)
+        if plan.aborted is not None:
+            await self._abort_reconcile_pass(plan)
+            return plan
+
+        self._reconcile_alert = None
+        if plan.unavailable:
+            _log.warning(
+                "directory reconcile: %d of %d principals could not be resolved (directory "
+                "unreachable) — those sessions were left alone (fail-open)",
+                plan.unavailable,
+                plan.probed,
+            )
+        for revocation in plan.revocations:
+            await self._apply_reconcile_revocation(revocation)
+        return plan
+
+    async def _abort_reconcile_pass(self, plan: reconcile.ReconcilePlan) -> None:
+        """Record an aborted pass. Applies NOTHING — the point of the abort."""
+        if plan.aborted == "directory_unavailable":
+            # Not a breaker trip: the accounts are fine, the directory is not. Loud but not latched.
+            _log.warning(
+                "directory reconcile: ALL %d probes failed — the directory is unreachable. No "
+                "session was revoked (fail-open).",
+                plan.probed,
+            )
+            await self._audit(
+                "auth.ad_reconcile_skipped",
+                actor="<reconciler>",
+                detail=_json({"reason": plan.aborted, "probed": plan.probed}),
+            )
+            return
+        ceiling = reconcile.breaker_ceiling(
+            probed=plan.probed,
+            max_absolute=self._settings.ad_session_revoke_max,
+            max_fraction=self._settings.ad_session_revoke_max_fraction,
+        )
+        self._reconcile_alert = (
+            f"mass-revoke circuit breaker TRIPPED: a directory reconciliation pass would have "
+            f"revoked more than {ceiling} of {plan.probed} signed-in directory principals. No "
+            f"session was revoked. Check [auth].ad_user_search_base, the OU layout, and the "
+            f"ad_bind_dn service account's read rights."
+        )
+        _log.error("directory reconcile: %s", self._reconcile_alert)
+        await self._audit(
+            "auth.ad_reconcile_aborted",
+            actor="<reconciler>",
+            detail=_json({"reason": plan.aborted, "probed": plan.probed, "ceiling": ceiling}),
+        )
+
+    async def _apply_reconcile_revocation(self, revocation: reconcile.SessionRevocation) -> None:
+        """Apply one planned revocation: persist a role re-diff (when that is why), drop the user's
+        live sessions, audit, and notify the affected user out-of-band (ASVS 6.3.7)."""
+        user = await self._store.get_user(revocation.user_id)
+        if revocation.role_ids is not None:
+            await self._store.set_user_roles(
+                revocation.user_id, list(revocation.role_ids), assigned_by="ad-reconcile"
+            )
+        revoked = await self._store.revoke_user_sessions(revocation.user_id)
+        await self._audit(
+            "auth.ad_session_revoked",
+            actor=revocation.username,
+            detail=_json(
+                {
+                    "reason": revocation.reason,
+                    "sessions": revoked,
+                    **(
+                        {"roles": list(revocation.role_ids)}
+                        if revocation.role_ids is not None
+                        else {}
+                    ),
+                }
+            ),
+        )
+        _log.info(
+            "directory reconcile: revoked %d session(s) for %s (%s)",
+            revoked,
+            revocation.username,
+            revocation.reason,
+        )
+        # A directory-pushed disable or demotion is the same event to the user as a local one, so it
+        # gets the same out-of-band notice the login-path re-sync sends (best-effort).
+        if user is not None:
+            await self._notify_security(
+                ACCOUNT_DISABLED if revocation.role_ids is None else ROLES_CHANGED,
+                username=user.username,
+                email=user.email,
+                detail={"reason": revocation.reason},
+            )
+
     # --- sessions ------------------------------------------------------------
 
     async def _issue_session(
@@ -731,10 +1393,16 @@ class AuthService:
         *,
         mfa_verified: bool,
         seed_reauth: bool | None = None,
+        max_expires_at: float | None = None,
     ) -> str:
         token = mint_token()
         token_hash = hash_token(token)
         expires_at = time.time() + self._settings.session_absolute_hours * 3600
+        if max_expires_at is not None:
+            # ADR 0079 mechanism 1 / ADR 0142 AC-6: an externally-asserted deadline (today only the
+            # signature-verified federated `id_token.exp`) caps the local absolute lifetime, never
+            # extends it. Local and AD/Kerberos callers pass nothing and are byte-identical.
+            expires_at = min(expires_at, max_expires_at)
         await self._store.create_session(
             token_hash=token_hash,
             user_id=user_id,
@@ -759,6 +1427,50 @@ class AuthService:
             # Evict the oldest sessions beyond the cap (the just-created one is newest, so survives).
             await self._store.enforce_session_cap(user_id, keep=cap)
         return token
+
+    def _rekey_token_state(self, old_hash: str, new_hash: str) -> None:
+        """Move every PROCESS-LOCAL entry keyed on a session's token hash onto the new hash.
+
+        The store row is re-keyed atomically by ``rotate_session``; these three in-memory maps are
+        not, and each strands differently if missed — so the set is enumerated here rather than
+        handled at each call site:
+
+        * ``_action_step_up_grants`` — a single-use ADR 0077 grant. Stranded ⇒ the ceremony the user
+          just completed silently no-ops and the next route demands another step-up.
+        * ``_webauthn_challenges`` — a live ceremony. Stranded ⇒ a passkey registration/assertion
+          started before the rotation can never be finished, which is a dead end, not a retry.
+        * ``_new_ip_seen`` — the WP-L3-13 dedupe. Stranded ⇒ a *second* new-IP step-up + audit row
+          for an address the session already re-verified from.
+
+        Deadlines and values are carried, never refreshed: a rotation must not extend anything.
+        """
+        for (h, action), deadline in list(self._action_step_up_grants.items()):
+            if h == old_hash:
+                del self._action_step_up_grants[(h, action)]
+                self._action_step_up_grants[(new_hash, action)] = deadline
+        self._webauthn_challenges.rekey(old_hash, new_hash)
+        seen = self._new_ip_seen.pop(old_hash, None)
+        if seen is not None:
+            self._new_ip_seen[new_hash] = seen
+
+    async def _rotate_session_token(self, token: str) -> str | None:
+        """Re-key the caller's session to a FRESH token (ASVS 7.2.4); returns the new token.
+
+        Returns ``None`` when the row could not be re-keyed — revoked or gone underneath us — so
+        every caller fails CLOSED rather than handing back a token that authenticates nothing.
+
+        **Ordering is the whole control** (see each call site): every store stamp for this elevation
+        must already have been written against the OLD hash before this runs, because the re-key
+        carries those columns forward, and every session UPDATE except ``revoke_session`` and
+        ``rotate_session`` is rowcount-blind — a stamp issued *after* the rotation silently writes
+        nothing. Any purpose-bound grant must be minted AFTER, against the NEW hash.
+        """
+        old_hash = hash_token(token)
+        new_token = mint_token()
+        if not await self._store.rotate_session(old_hash, new_token_hash=hash_token(new_token)):
+            return None
+        self._rekey_token_state(old_hash, hash_token(new_token))
+        return new_token
 
     async def identity_for_token(
         self, token: str | None, *, activity: bool = True
@@ -950,7 +1662,7 @@ class AuthService:
             # Re-anchor the session to the address it re-verified from, so a forced step-up triggered
             # by a roamed/new client IP (WP-L3-13) clears once the caller re-proves from there.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
-            if purpose is not None:
+            if purpose is not None and not await self._factor_binding_is_blocked(token, purpose):
                 # Bind THIS fresh proof to the single action named by `purpose` (single-use), so a broad
                 # login-seeded window can never authorize a factor-binding action (ASVS 7.5.1 / 8.2.4).
                 self._grant_action_step_up(hash_token(token), purpose)
@@ -958,8 +1670,47 @@ class AuthService:
             "auth.reauth",
             actor=identity.username,
             detail=_json({"ok": ok, "provider": identity.auth_provider.value, "purpose": purpose}),
+            client=client,
         )
         return ok
+
+    #: The step-up actions that BIND A NEW SECOND FACTOR. Reaching one from an MFA-pending session is
+    #: legitimate only while the account has no factor at all — that is the bootstrap escape the MFA
+    #: gate's carve-out exists for. For an account that already HAS a factor it is a promotion path,
+    #: because both ceremonies mark the session MFA-satisfied on success.
+    _FACTOR_BINDING_ACTIONS = frozenset(
+        {STEP_UP_ACTION_MFA_ENROLL, STEP_UP_ACTION_MFA_CONFIRM, STEP_UP_ACTION_WEBAUTHN_ENROLL}
+    )
+
+    async def _factor_binding_is_blocked(self, token: str, purpose: str) -> bool:
+        """Whether a factor-binding step-up grant must be REFUSED for this session (ASVS 6.3.3).
+
+        Closes a bypass the 6.3.3 access gate would otherwise leave open. The gate's carve-out
+        (``mfa_gate=False`` on the ``*_reauth_only*`` factories, plus ``POST /me/reauth`` being
+        MFA-exempt) is justified solely by "an un-enrolled user cannot satisfy a gate standing in
+        front of the only route that enrolls them" — a condition that is FALSE for an account that
+        already has a factor. Without this check, an attacker holding only the password could take a
+        pending session, re-auth with the password alone, enrol a NEW authenticator, and be promoted
+        to MFA-satisfied by ``confirm_mfa_enrollment`` / ``finish_webauthn_registration`` — defeating
+        the second factor entirely and durably binding an attacker-controlled authenticator.
+
+        So: if the session has not satisfied its second factor and the account already has one, the
+        existing factor must be proven first (``POST /auth/mfa-verify``). Bootstrap is untouched — an
+        account with NO factor still enrols freely from a password-only session, which is exactly the
+        deadlock carve-out. Disable/delete actions are NOT listed: they run behind
+        ``require_step_up_action``, which keeps its own ``mfa_satisfied`` check.
+        """
+        if purpose not in self._FACTOR_BINDING_ACTIONS:
+            return False
+        if await self.mfa_satisfied(token):
+            return False
+        session = await self._store.get_session(hash_token(token))
+        if session is None:
+            return True  # no session to bind a factor to — fail closed
+        user = await self._store.get_user(session.user_id)
+        if user is None:
+            return True
+        return await self._second_factor_enrolled(user)
 
     def _grant_action_step_up(self, token_hash: str, action: str) -> None:
         """Mint a single-use per-action step-up grant (ADR 0077), bounded + TTL'd, process-local.
@@ -1115,7 +1866,7 @@ class AuthService:
             must_change_password=must_change,
         )
         await self._store.revoke_user_sessions(identity.user_id)
-        await self._audit("auth.password_changed", actor=identity.username)
+        await self._audit("auth.password_changed", actor=identity.username, client=client)
         user = await self._store.get_user(identity.user_id)
         await self._notify_security(
             PASSWORD_CHANGED,
@@ -1135,17 +1886,28 @@ class AuthService:
     def _mfa_required_for(
         self, user: UserRecord, roles: frozenset[Role], *, second_factor_enrolled: bool
     ) -> bool:
-        """Whether ``user`` must satisfy a second factor. **Local accounts only** — AD/Kerberos MFA is
-        delegated to the directory. An enrolled user (either factor — the caller pre-resolves
-        ``second_factor_enrolled`` via :meth:`_second_factor_enrolled`, keeping this hot boolean
-        logic sync and the store round-trip visible at each call site) always must; an un-enrolled
-        user must when ``[auth].require_mfa`` is on and they hold the Administrator role (the chosen
-        enforcement target — regular users opt in by enrolling)."""
-        if user.auth_provider != AuthProvider.LOCAL.value:
+        """Whether ``user`` must satisfy a second factor. An enrolled user (either factor — the caller
+        pre-resolves ``second_factor_enrolled`` via :meth:`_second_factor_enrolled`, keeping this hot
+        boolean logic sync and the store round-trip visible at each call site) always must; an
+        un-enrolled user must when ``[auth].require_mfa`` is on and ``[auth].require_mfa_scope``
+        covers them — ``every_local_account`` (default, ASVS 6.3.3) or, under ``administrators``,
+        only the Administrator role.
+
+        **AD is an ALLOW-LIST exemption, not a denylist.** Directory MFA is delegated to the directory
+        (Entra Conditional Access / an MFA proxy) under the owner-signed relaxation, so an ``ad`` user
+        is exempt — but any OTHER provider value falls through to the local rules and is REQUIRED.
+        Failing closed matters because :meth:`_identity_for_user` maps an unrecognized provider back to
+        ``LOCAL`` when building the :class:`Identity`; a denylist (``!= LOCAL``) would let such a row
+        present as local everywhere else while silently skipping the second factor here."""
+        if user.auth_provider == AuthProvider.AD.value:
             return False
         if second_factor_enrolled:
             return True
-        return self._settings.require_mfa and Role.ADMINISTRATOR in roles
+        if not self._settings.require_mfa:
+            return False
+        return (
+            self._settings.require_mfa_scope == "every_local_account" or Role.ADMINISTRATOR in roles
+        )
 
     async def mfa_satisfied(self, token: str | None) -> bool:
         """Whether the caller's session has met its second-factor requirement — True when the session
@@ -1162,6 +1924,21 @@ class AuthService:
         user = await self._store.get_user(session.user_id)
         if user is None:
             return False
+        if user.auth_provider == AuthProvider.AD.value:
+            # ASVS 6.3.4 — the directory leg, decided per SESSION rather than per user. Reaching here
+            # means the session was minted WITHOUT an engine-verified factor (:_issue_session stamps
+            # mfa_verified_at only when mfa_verified was True). AD simple-bind and Kerberos ALWAYS
+            # mint verified under the owner-signed delegated-MFA relaxation, so the ONLY way to be
+            # here is a FEDERATED (OIDC) session issued while [auth].oidc_require_mfa_claim was off —
+            # i.e. the engine verified nothing about the IdP's factor strength.
+            #
+            # Deciding it here, not in _mfa_required_for, is deliberate: that helper is keyed on the
+            # USER and is also consulted by mfa_status / the last-factor-delete guard, where "is this
+            # person exempt" is the right question. Only the session knows what was actually proven.
+            # Without this, making the OIDC mint conditional would move a timestamp and gate nothing.
+            # [auth].require_mfa remains the global off-switch so an operator who has deliberately
+            # opted out of the claim gate is not left without one.
+            return not self._settings.require_mfa
         roles = _roles_from_ids(await self._store.get_user_role_ids(user.id))
         # The extra store read only executes for sessions not already MFA-verified (the
         # mfa_verified_at early-return above short-circuits the common case).
@@ -1201,14 +1978,17 @@ class AuthService:
         # login (the mismatch surfaces at enroll time instead).
         if not totp.verify_totp(secret, code.strip(), window=self._settings.totp_skew_steps):
             await self._audit(
-                "auth.mfa_failed", actor=identity.username, detail=_json({"phase": "enroll"})
+                "auth.mfa_failed",
+                actor=identity.username,
+                detail=_json({"phase": "enroll"}),
+                client=client,
             )
             return None
         plain = totp.generate_recovery_codes(self._settings.mfa_recovery_code_count)
         hashes = [await self._argon2(hash_password, c) for c in plain]
         await self._store.enable_totp(identity.user_id, recovery_code_hashes=hashes)
         await self._store.mark_session_mfa_verified(hash_token(token))
-        await self._audit("auth.mfa_enrolled", actor=identity.username)
+        await self._audit("auth.mfa_enrolled", actor=identity.username, client=client)
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.email, client=client
         )
@@ -1232,7 +2012,10 @@ class AuthService:
         # limiter (which IP-rotation can sidestep). A locked account is refused before any verify.
         if user.locked_until is not None and now < user.locked_until:
             await self._audit(
-                "auth.mfa_failed", actor=user.username, detail=_json({"reason": "locked"})
+                "auth.mfa_failed",
+                actor=user.username,
+                detail=_json({"reason": "locked"}),
+                client=client,
             )
             return False
         if await self._verify_second_factor(user, code):
@@ -1245,12 +2028,12 @@ class AuthService:
             # one credential proof rather than being forced into a separate password step-up.
             await self._store.mark_session_reauthed(hash_token(token), client=client)
             await self._store.record_login_success(user.id, now=now)
-            await self._audit("auth.mfa_verified", actor=user.username)
+            await self._audit("auth.mfa_verified", actor=user.username, client=client)
             return True
         # Wrong code: register the failure through the SAME machinery the password path uses, so the
         # per-account lockout + ACCOUNT_LOCKED notification fire on sustained MFA guessing.
         attempts, just_locked = await self._register_failure(user, now)
-        await self._audit("auth.mfa_failed", actor=user.username)
+        await self._audit("auth.mfa_failed", actor=user.username, client=client)
         if just_locked:
             await self._notify_security(
                 ACCOUNT_LOCKED,
@@ -1303,7 +2086,10 @@ class AuthService:
         user = await self._store.get_user(identity.user_id)
         await self._store.disable_totp(identity.user_id)
         await self._audit(
-            "auth.mfa_disabled", actor=identity.username, detail=_json({"scope": "self"})
+            "auth.mfa_disabled",
+            actor=identity.username,
+            detail=_json({"scope": "self"}),
+            client=client,
         )
         await self._notify_security(
             MFA_DISABLED,
@@ -1448,7 +2234,10 @@ class AuthService:
             )
         except webauthn.WebAuthnVerificationError:
             await self._audit(
-                "auth.webauthn_failed", actor=identity.username, detail=_json({"phase": "enroll"})
+                "auth.webauthn_failed",
+                actor=identity.username,
+                detail=_json({"phase": "enroll"}),
+                client=client,
             )
             return False
         credential_id_hash = hash_bytes(result.credential_id)
@@ -1483,7 +2272,10 @@ class AuthService:
         # proved possession of the freshly-bound authenticator).
         await self._store.mark_session_mfa_verified(hash_token(token))
         await self._audit(
-            "auth.webauthn_enrolled", actor=identity.username, detail=_json({"label": label})
+            "auth.webauthn_enrolled",
+            actor=identity.username,
+            detail=_json({"label": label}),
+            client=client,
         )
         await self._notify_security(
             MFA_ENABLED, username=user.username, email=user.email, client=client
@@ -1545,20 +2337,29 @@ class AuthService:
         # A locked account is refused BEFORE any verify (verify_mfa parity).
         if user.locked_until is not None and now < user.locked_until:
             await self._audit(
-                "auth.webauthn_failed", actor=user.username, detail=_json({"reason": "locked"})
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "locked"}),
+                client=client,
             )
             return False
         pending = self._webauthn_challenges.pop((hash_token(token), "assert"))
         if pending is None or pending.user_id != user.id:
             await self._audit(
-                "auth.webauthn_failed", actor=user.username, detail=_json({"reason": "expired"})
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "expired"}),
+                client=client,
             )
             return False
         try:
             raw_id = webauthn.credential_id_from_response(response_json)
         except webauthn.WebAuthnVerificationError:
             await self._audit(
-                "auth.webauthn_failed", actor=user.username, detail=_json({"reason": "malformed"})
+                "auth.webauthn_failed",
+                actor=user.username,
+                detail=_json({"reason": "malformed"}),
+                client=client,
             )
             return False
         cred = await self._store.get_webauthn_credential(hash_bytes(raw_id))
@@ -1569,6 +2370,7 @@ class AuthService:
                 "auth.webauthn_failed",
                 actor=user.username,
                 detail=_json({"reason": "unknown_credential"}),
+                client=client,
             )
             return False
         try:
@@ -1587,6 +2389,7 @@ class AuthService:
                 "auth.webauthn_clone_suspected" if clone else "auth.webauthn_failed",
                 actor=user.username,
                 detail=_json({"label": cred.label}) if clone else None,
+                client=client,
             )
             return False
         if not await self._store.update_webauthn_sign_count(
@@ -1597,10 +2400,11 @@ class AuthService:
                 "auth.webauthn_clone_suspected",
                 actor=user.username,
                 detail=_json({"label": cred.label}),
+                client=client,
             )
             return False
         await self._store.mark_session_mfa_verified(hash_token(token))
-        await self._audit("auth.webauthn_verified", actor=user.username)
+        await self._audit("auth.webauthn_verified", actor=user.username, client=client)
         return True
 
     async def delete_webauthn_credential(
@@ -1629,7 +2433,10 @@ class AuthService:
         if not await self._store.delete_webauthn_credential(identity.user_id, credential_id_hash):
             return False  # pragma: no cover - raced with a concurrent delete of the same row
         await self._audit(
-            "auth.webauthn_removed", actor=identity.username, detail=_json({"label": target.label})
+            "auth.webauthn_removed",
+            actor=identity.username,
+            detail=_json({"label": target.label}),
+            client=client,
         )
         if last_second_factor:
             await self._notify_security(
@@ -1936,6 +2743,20 @@ class AuthService:
             detail=_json({"permission": permission.value, "path": path}),
         )
 
+    async def audit_mfa_denied(self, identity: Identity, path: str) -> None:
+        """Audit an access refused because the session's second factor is still PENDING (ASVS 6.3.3).
+
+        Needed because the MFA gate sits ABOVE the permission loop: without its own row, a stolen
+        password-only token could enumerate the whole authenticated surface and leave the audit log
+        completely silent — :meth:`audit_permission_denied` never fires, since the request is refused
+        before any permission is evaluated. The gate must stay above the loop (below it, the refusal
+        would leak whether the caller holds the permission), so the audit row is the fix."""
+        await self._audit(
+            "auth.mfa_denied",
+            actor=identity.username,
+            detail=_json({"path": path}),
+        )
+
     async def audit_permission_granted(
         self, identity: Identity, permission: Permission, path: str
     ) -> None:
@@ -1951,9 +2772,18 @@ class AuthService:
         )
 
     async def _audit(
-        self, action: str, *, actor: str | None = None, detail: str | None = None
+        self,
+        action: str,
+        *,
+        actor: str | None = None,
+        detail: str | None = None,
+        client: str | None = None,
     ) -> None:
-        await self._store.record_audit(action, actor=actor, detail=detail)
+        """``client`` (ADR 0150) is the caller's address where the calling flow has one — the login,
+        MFA, reauth and credential paths already receive it for ``sessions.client`` / the out-of-band
+        notice, so the audit row now records the SAME address those use. Flows with no address in hand
+        (token-only or engine-internal) leave it NULL rather than inheriting an unrelated one."""
+        await self._store.record_audit(action, actor=actor, detail=detail, client=client)
 
     async def _notify_security(
         self,

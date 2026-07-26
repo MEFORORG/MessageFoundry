@@ -39,7 +39,7 @@ class TreeNode:
 
     label: str
     value: str = ""
-    children: list["TreeNode"] = field(default_factory=list)
+    children: list[TreeNode] = field(default_factory=list)
 
 
 def parse_tree(raw: str | bytes) -> list[TreeNode]:

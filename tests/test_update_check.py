@@ -156,7 +156,7 @@ async def test_notifier_sink_update_available_phi_free() -> None:
             self.name = "t"
             self.events: list[dict] = []
 
-        async def send(self, event: dict) -> None:
+        async def send(self, event: dict, **_kw: object) -> None:
             self.events.append(event)
 
     t = _RecordingTransport()

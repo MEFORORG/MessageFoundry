@@ -23,8 +23,8 @@ from typing import Any
 
 from hl7apy import v2_5_1 as _ref
 
-from messagefoundry.parsing import validate
 from messagefoundry.generators import _hl7data as d
+from messagefoundry.parsing import validate
 
 _MESSAGES = _ref.MESSAGES
 _SEGMENTS = _ref.SEGMENTS

@@ -32,8 +32,8 @@ from messagefoundry.config.wiring import (
     build_inbound_connection,
     build_outbound_connection,
 )
-from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.dryrun import transform_one
+from messagefoundry.pipeline.engine import Engine
 from messagefoundry.pipeline.wiring_runner import build_check_registry
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
 from messagefoundry.transports.passthrough import PassThroughSource
@@ -121,7 +121,7 @@ def test_transform_one_accepts_pt_target_and_tags_it() -> None:
         return [Send(to="OB_REAL", message="A"), Send(to="PT_NEXT", message="B")]
 
     reg.add_handler("h", h)
-    deliveries, _, _ = transform_one(reg, "h", "MSH|x", ContentType.HL7V2.value)
+    deliveries, _, _, _ = transform_one(reg, "h", "MSH|x", ContentType.HL7V2.value)
     by_to = {d.to: d for d in deliveries}
     assert by_to["OB_REAL"].is_passthrough is False
     assert by_to["PT_NEXT"].is_passthrough is True
@@ -387,11 +387,13 @@ async def test_transform_handoff_no_pt_is_byte_identical(store: MessageStore) ->
 
 # --------------------------------------------------------- backend allow-list (fail-fast at start)
 #
-# PT re-ingress (the pt_deliveries branch of transform_handoff) ships SQLite-only; Postgres/SQL Server
-# raise NotImplementedError there. The engine ALLOW-LISTS PT to a backend whose supports_pt_reingress is
-# True and rejects a graph with a PT inbound on any other backend at startup, BEFORE any listener accepts
-# — so the runtime NotImplementedError (after the inbound is already ACKed) can never surface. These
-# fake the backend on a real SQLite store (no Postgres/SQL Server stood up).
+# PT re-ingress (the pt_deliveries branch of transform_handoff) ships on ALL THREE backends today —
+# SQLite, Postgres, and SQL Server each set supports_pt_reingress=True. The gate is an ALLOW-LIST, not a
+# block-list: the engine permits PT only on a backend that opts in, and rejects a graph with a PT inbound
+# on any other backend at startup, BEFORE any listener accepts — so a runtime NotImplementedError (after
+# the inbound was already ACKed) can never surface on a FUTURE backend that hasn't implemented the branch.
+# No shipped backend is PT-incapable, so these tests SIMULATE one: they monkeypatch supports_pt=False onto
+# a real SQLite store. What is under test is the GUARD, not any real backend's limits.
 
 
 def _pt_graph() -> Registry:
@@ -421,11 +423,15 @@ async def _engine_on_backend(
 
 
 @pytest.mark.parametrize("backend", [StoreBackend.POSTGRES, StoreBackend.SQLSERVER])
-async def test_engine_rejects_pt_on_non_sqlite_backend(
+async def test_engine_rejects_pt_on_backend_without_pt_support(
     tmp_path: Any, backend: StoreBackend
 ) -> None:
     # A PT inbound on a backend that doesn't implement PT re-ingress is rejected at start with a clear
     # config error naming the PT connection AND the backend — before any inbound listener binds.
+    #
+    # The parametrized backends are COUNTERFACTUAL: real Postgres/SQL Server both support PT today, so
+    # supports_pt=False fakes a backend that does not. The name says "without PT support", not "non-
+    # SQLite", because the gate keys on the CAPABILITY, never on which backend it is.
     engine, s = await _engine_on_backend(
         tmp_path, backend=backend, supports_pt=False, registry=_pt_graph()
     )
@@ -435,7 +441,10 @@ async def test_engine_rejects_pt_on_non_sqlite_backend(
         msg = str(exc.value)
         assert "'PT_FOO'" in msg  # names the offending PT connection
         assert backend.value in msg  # ...and the backend
-        assert "SQLite" in msg
+        # Assert the CAPABILITY is named, not a backend. The old `"SQLite" in msg` assert silently froze
+        # the error message into "PT requires the SQLite store backend" — a claim that was false the day
+        # Postgres and SQL Server shipped PT, and that this assert would have kept true forever.
+        assert "PT re-ingress" in msg
     finally:
         await s.close()
 

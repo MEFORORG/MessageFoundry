@@ -11,17 +11,17 @@ from __future__ import annotations
 import socket
 import threading
 import time
+from collections.abc import Iterator
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Iterator
 
 import pytest
 import uvicorn
 
-from messagefoundry.api import create_managed_app
-from messagefoundry.apiclient import EngineClient
 from harness.__main__ import main
 from harness.scenarios import Scenario, _verify_dead_letter, _verify_disposition, run_scenario
+from messagefoundry.api import create_managed_app
+from messagefoundry.apiclient import EngineClient
 
 
 def _free_port() -> int:

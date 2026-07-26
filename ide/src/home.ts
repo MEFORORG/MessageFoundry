@@ -70,14 +70,20 @@ export class HomeView implements vscode.WebviewViewProvider {
 
   // `onFilter` drives the Connections tree filter live from the persistent search box (the always-
   // visible sibling of the funnel command — a TreeView can't host an input, so it lives here at the top
-  // of the sidebar). `currentFilter` seeds the box with any filter already active.
+  // of the sidebar). `currentFilter` seeds the box with any filter already active. `version` is the
+  // extension's build, surfaced as the Home view's title description ("HOME  v0.0.30") so the loaded
+  // build is visible in the sidebar header (the About/Version command still shows it on demand).
   constructor(
     private readonly onFilter: (text: string) => void = () => {},
     private readonly currentFilter: () => string = () => "",
+    private readonly version: string = "",
   ) {}
 
   resolveWebviewView(view: vscode.WebviewView): void {
     this.view = view;
+    // Dimmed build tag next to the "HOME" title — the container title ("MessageFoundry") is a static
+    // contribution, so a view's `description` is where a dynamic version can live in this header.
+    view.description = this.version ? `v${this.version}` : undefined;
     view.webview.options = { enableScripts: true };
     view.webview.onDidReceiveMessage((m: { command?: string; id?: string; text?: string }) => {
       if (m?.command === "run" && typeof m.id === "string") {

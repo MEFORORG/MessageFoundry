@@ -180,7 +180,7 @@ def _is_editable_install(dist: metadata.Distribution, record: dict[str, bytes]) 
         if name.startswith("__editable__") or name.endswith(".pth") or "_editable_impl" in name:
             return True
     # A wheel install records the package source; an editable one records none of it.
-    if not any(
+    if not any(  # noqa: SIM103
         rel.startswith(f"{_DIST_NAME}/") and rel.endswith(_ATTESTED_SUFFIX) for rel in record
     ):
         return True
@@ -293,8 +293,8 @@ def attest_engine() -> AttestationResult:
 
 
 async def run_startup_attestation(
-    store: "Store",
-    alert_sink: "AlertSink",
+    store: Store,
+    alert_sink: AlertSink,
     *,
     fail_closed_on_drift: bool,
 ) -> AttestationResult:

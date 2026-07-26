@@ -14,6 +14,7 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.store import (
     MessageStore,
     OutboxStatus,
@@ -90,7 +91,7 @@ async def _seed_inflight_response(store: MessageStore, loopback: str) -> str:
     # with the outbound-lane seeds' FIFO claims on OB_X/OB_Y.
     mid = await store.enqueue_message(channel_id="IB_REAL", raw=RAW, deliveries=[("OB_RESP", RAW)])
     rid = f"resp-{loopback}"
-    ref = store._enc(f"{mid}\x1fOB_RESP\x1f1")
+    ref = store._enc(f"{mid}\x1fOB_RESP\x1f1", aad=cell_aad("queue", "payload", rid))
     await store._db.execute(
         "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
         " payload, status, attempts, next_attempt_at, created_at, updated_at)"

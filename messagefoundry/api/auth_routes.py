@@ -60,8 +60,10 @@ from messagefoundry.api.auth_models import (
 )
 from messagefoundry.api.security import (
     bearer_token,
+    client_ip,
     get_auth,
     require,
+    require_reauth_only,
     require_reauth_only_action,
     require_step_up,
     require_step_up_action,
@@ -76,12 +78,14 @@ from messagefoundry.auth import (
 )
 from messagefoundry.auth.permissions import CustomRoleError
 from messagefoundry.auth.service import (
+    STEP_UP_ACTION_ADMIN_USER_UPDATE,
     STEP_UP_ACTION_MFA_CONFIRM,
     STEP_UP_ACTION_MFA_DISABLE,
     STEP_UP_ACTION_MFA_ENROLL,
     AuthService,
 )
 from messagefoundry.auth.tokens import hash_token
+from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from messagefoundry.store.store import SessionRecord, UserRecord
 
 _VALID_ROLE_IDS = {role.value for role in Role}
@@ -89,25 +93,13 @@ _VALID_ROLE_IDS = {role.value for role in Role}
 _log = logging.getLogger(__name__)
 
 
-# Leading characters that make a spreadsheet treat a CSV cell as a formula (=, +, -, @) or that can
-# smuggle one past a leading-whitespace trim (TAB/CR/LF). See OWASP "CSV Injection" / CWE-1236.
-_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\n")
-
-
-def _csv_safe(value: object) -> object:
-    """Neutralize spreadsheet formula injection (CWE-1236) in a CSV cell.
-
-    A compliance officer opening ``audit-export.csv`` in Excel/Sheets would otherwise let a
-    user-influenced field (actor/detail/…) starting with ``= + - @`` — or a leading TAB/CR/LF ahead of
-    one — execute as a formula/DDE payload. If the (whitespace-stripped) string begins with such a
-    trigger, prefix a single apostrophe so the spreadsheet renders it as literal text. Non-strings and
-    benign strings pass through unchanged."""
-    if not isinstance(value, str) or not value:
-        return value
-    # A raw leading TAB/CR/LF is itself a trigger; ``=+-@`` count even behind ordinary leading spaces.
-    if value[0] in _CSV_FORMULA_TRIGGERS or value.lstrip()[:1] in _CSV_FORMULA_TRIGGERS:
-        return "'" + value
-    return value
+# CSV formula injection (CWE-1236 / ASVS 1.2.10). The audit export is the ONE attacker-influenced
+# spreadsheet writer in the tree — actor / action / client / detail come from authenticated user input
+# and request headers, and it is the file a compliance officer actually opens in Excel — so it keeps
+# no local variant of the rule. It was previously the writer missing NUL from its trigger set; both
+# names below now alias the canonical rule, byte-for-byte the one every other writer uses.
+_CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
+_csv_safe = spreadsheet_safe
 
 
 def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInfo:
@@ -120,6 +112,20 @@ def _session_info(session: SessionRecord, current_token_hash: str) -> SessionInf
         client=session.client,
         current=session.token_hash == current_token_hash,
     )
+
+
+def _externally_managed(provider: AuthProvider | str) -> bool:
+    """True when an account's credentials/roles come from an external directory (anything but LOCAL).
+
+    Mirrors the service layer's ``!= AuthProvider.LOCAL.value`` gate (``auth/service.py``). The API
+    previously spot-checked ``is AuthProvider.AD`` / ``== AuthProvider.AD.value`` here, which diverges
+    the instant a third provider exists: an ``== AD`` test would wave a non-LOCAL, non-AD account
+    *through* a LOCAL-only ceremony (change engine password, enroll an engine TOTP, get engine-managed
+    roles) that the service then rejects. Gating on ``!= LOCAL`` keeps every provider consistent.
+    Accepts either the ``AuthProvider`` enum (``Identity.auth_provider``) or its stored string value
+    (``UserRecord.auth_provider``)."""
+    value = provider.value if isinstance(provider, AuthProvider) else provider
+    return value != AuthProvider.LOCAL.value
 
 
 def _rate_limited(request: Request, label: str) -> HTTPException:
@@ -223,7 +229,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     ) -> ProvidersInfo:
         # kerberos reflects AVAILABILITY (enabled AND the boot preflight passed, ADR 0068 §9)
         # so a native client can hide its SSO affordance when the acceptor is degraded.
-        return ProvidersInfo(local=True, ad=service.ad_enabled, kerberos=service.kerberos_available)
+        return ProvidersInfo(
+            local=True,
+            ad=service.ad_enabled,
+            kerberos=service.kerberos_available,
+            oidc=service.oidc_available,
+        )
 
     @app.post("/auth/login", response_model=LoginResponse)
     async def login(
@@ -285,14 +296,21 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require()),
     ) -> SimpleMessage:
-        if not service.allow_login_attempt(_client(request)):
+        # Post-session ceremony: per-ACTOR budget, not the shared unauthenticated sign-in one.
+        if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "password-change")
-        if identity.auth_provider is AuthProvider.AD:
+        if _externally_managed(identity.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD passwords are managed in Active Directory"
             )
         if not await service.verify_current_password(identity, body.current_password):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "current password is incorrect")
+        # ASVS 6.4.1: a "change" that reuses the current password is not a change — it would leave an
+        # expired/temp credential in place (and defeats the must_change_password claim step).
+        if body.new_password == body.current_password:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST, "new password must differ from the current password"
+            )
         violations = await service.change_password(
             identity, body.new_password, client=_client(request)
         )
@@ -312,7 +330,9 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Step-up re-verification (ASVS 7.5.3): re-prove the current credential to refresh this
         session's step-up window so it may perform highly sensitive operations for the configured
         period. Rate-limited like the password change; a failure is a 403 and performs nothing."""
-        if not service.allow_login_attempt(_client(request)):
+        # Post-session ceremony: per-ACTOR budget. Sharing the sign-in global budget let an
+        # unauthenticated flood deny step-up to every signed-in operator.
+        if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "reauth")
         token = bearer_token(request)
         if token is None or not await service.reauth(
@@ -370,7 +390,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         Gated by a fresh **password** step-up BOUND to this enroll action (ADR 0077 — not MFA, you may
         have none yet; and not the shared login window, so a hijacked session can't bind a factor); not
         active until confirmed via ``/me/mfa/confirm``."""
-        if identity.auth_provider is AuthProvider.AD:
+        if _externally_managed(identity.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD accounts use directory MFA, not an engine TOTP"
             )
@@ -390,7 +410,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         """Confirm a staged enrollment by proving a live TOTP code; activates MFA and returns the
         single-use recovery codes (shown **once** — save them). A wrong code is a 400. Gated by a fresh
         password step-up BOUND to this confirm action (ADR 0077), independent of the enroll grant."""
-        if not service.allow_login_attempt(_client(request)):
+        # Post-session ceremony (enrolling a factor while signed in): per-ACTOR budget.
+        if not service.allow_reauth_attempt(identity.user_id):
             raise _rate_limited(request, "mfa-confirm")
         token = bearer_token(request)
         if token is None:
@@ -446,7 +467,10 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_session(
         session_id: str,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require()),
+        # 7.5.2 (ASVS): terminating a session needs a fresh PASSWORD re-proof (require_reauth_only —
+        # NOT the MFA gate: a no-factor user must still be able to revoke). The gate runs before the
+        # body and 403s identically for owned AND foreign ids, so it leaks no ownership.
+        identity: Identity = Depends(require_reauth_only()),
     ) -> SimpleMessage:
         # Ownership-checked in the service: a 404 (not 403) avoids confirming another user's session id.
         if not await service.revoke_own_session(identity, session_id, actor=identity.username):
@@ -457,7 +481,8 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
     async def revoke_my_other_sessions(
         request: Request,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require()),
+        # 7.5.2 (ASVS): password re-proof before mass-terminating the user's other sessions.
+        identity: Identity = Depends(require_reauth_only()),
     ) -> SimpleMessage:
         current = hash_token(bearer_token(request) or "")
         revoked = await service.revoke_other_sessions(identity, current, actor=identity.username)
@@ -637,7 +662,12 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         user_id: str,
         body: UserUpdateRequest,
         service: AuthService = Depends(_service),
-        identity: Identity = Depends(require_step_up(Permission.USERS_MANAGE)),
+        # 7.5.1 (ASVS): the one broad-admin route promoted to ACTION-binding (fresh single-use grant
+        # bound to admin_user_update, not the shared login window). The other USERS_MANAGE routes keep
+        # the session window (7.5.3). Falls back to the window under require_action_step_up=False.
+        identity: Identity = Depends(
+            require_step_up_action(STEP_UP_ACTION_ADMIN_USER_UPDATE, Permission.USERS_MANAGE)
+        ),
     ) -> SimpleMessage:
         current = await service.store.get_user(user_id)
         if current is None:
@@ -709,7 +739,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
         user = await service.store.get_user(user_id)
         if user is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "no such user")
-        if user.auth_provider == AuthProvider.AD.value:
+        if _externally_managed(user.auth_provider):
             raise HTTPException(
                 status.HTTP_400_BAD_REQUEST, "AD users get roles from the AD-group map"
             )
@@ -858,6 +888,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     ts=r["ts"],
                     actor=r["actor"],
                     action=r["action"],
+                    client=r["client"],
                     channel_id=r["channel_id"],
                     detail=r["detail"],
                 )
@@ -893,6 +924,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
     @app.get("/audit/export")
     async def export_audit(
+        request: Request,
         service: AuthService = Depends(_service),
         identity: Identity = Depends(require(Permission.AUDIT_EXPORT)),
         format: str = Query("csv", pattern="^csv$"),
@@ -911,7 +943,7 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
 
         Same filters and the same parameterized store query as ``GET /audit``, gated by the dedicated
         ``audit:export`` permission. Only PHI-safe audit metadata is emitted — ``ts, actor, action,
-        channel_id, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
+        channel_id, client, detail`` — the exact columns ``GET /audit`` already returns; the audit writers store
         only filter shapes / counts / ids in ``detail`` (never a raw message body), so no PHI leaves on
         this path. The export itself is recorded as an ``audit.export`` event (who, which filter, how
         many rows)."""
@@ -936,12 +968,13 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                     },
                 }
             ),
+            client=client_ip(request),
         )
 
         def _iter_csv() -> Iterator[str]:
             buf = io.StringIO()
             writer = csv.writer(buf)
-            writer.writerow(["ts", "actor", "action", "channel_id", "detail"])
+            writer.writerow(["ts", "actor", "action", "channel_id", "client", "detail"])
             yield buf.getvalue()
             for r in rows:
                 buf.seek(0)
@@ -950,7 +983,14 @@ def add_auth_routes(app: FastAPI) -> AdminHandlers:
                 # reaches the CSV a compliance officer may open in Excel/Sheets.
                 writer.writerow(
                     _csv_safe(c)
-                    for c in (r["ts"], r["actor"], r["action"], r["channel_id"], r["detail"])
+                    for c in (
+                        r["ts"],
+                        r["actor"],
+                        r["action"],
+                        r["channel_id"],
+                        r["client"],
+                        r["detail"],
+                    )
                 )
                 yield buf.getvalue()
 

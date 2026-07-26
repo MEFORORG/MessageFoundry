@@ -169,7 +169,7 @@ def main() -> int:
         _apply_resource_caps(float(boot.get("cpu_seconds", 2.0)), boot.get("mem_mb"))
         _install_import_guard(tuple(boot.get("forbidden", ())))
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
-        try:
+        try:  # noqa: SIM105
             _write_frame(stdout, {"ready": False, "error": f"{type(exc).__name__}: {exc}"})
         except (OSError, SandboxError):
             pass

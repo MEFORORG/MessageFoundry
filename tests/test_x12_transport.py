@@ -18,12 +18,12 @@ import pytest
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
 from messagefoundry.config.settings import EgressSettings
 from messagefoundry.config.wiring import (
+    X12,
     ConnectionSpec,
     InboundConnection,
     OutboundConnection,
     Registry,
     WiringError,
-    X12,
     inbound,
     outbound,
 )

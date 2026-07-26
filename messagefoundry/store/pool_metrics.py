@@ -128,6 +128,20 @@ class AcquireWaitSummary:
 
 
 @dataclass(frozen=True)
+class ClaimPoolStatus:
+    """The ADR 0114 sub-lever B dedicated-claim-connection holder snapshot (SQL Server only,
+    ``fifo_claim_prepared``). Additive sibling of the main pool figures so the B11 acquire-wait
+    wall signal stays honest — these connections live OUTSIDE the aioodbc pool (a pool cannot
+    retain a cursor across acquire/release), so without this field they would be invisible to the
+    connection-budget arithmetic."""
+
+    open: int  # holders currently open (borrowed + idle)
+    idle: int  # holders sitting in the per-stage free lists
+    opened_total: int  # lifetime opens (a reopen after a discard counts again)
+    discarded_total: int  # lifetime discards (cancellation / unclassified errors ONLY)
+
+
+@dataclass(frozen=True)
 class PoolStatus:
     """A server-store connection-pool snapshot — the **server-only** ``/status`` field (B11).
 
@@ -143,3 +157,7 @@ class PoolStatus:
     size: int  # connections currently open in the pool (asyncpg get_size / aioodbc size)
     idle: int  # currently-free connections (asyncpg get_idle_size / aioodbc freesize)
     acquire_wait: AcquireWaitSummary  # PRIMARY: perf_counter-measured acquire() wait percentiles
+    # ADR 0114 sub-lever B: the dedicated claim holders (None unless fifo_claim_prepared is
+    # effectively active on SQL Server) — additive + defaulted so every existing constructor and
+    # consumer is untouched.
+    claim_pool: ClaimPoolStatus | None = None

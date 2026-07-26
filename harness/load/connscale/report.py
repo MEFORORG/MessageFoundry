@@ -21,6 +21,8 @@ import json
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
+from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
+
 if TYPE_CHECKING:
     from harness.load.connscale.compare import (
         ClaimModeComparison,
@@ -33,13 +35,15 @@ EXIT_SLO_VIOLATION = 1
 
 SCHEMA_VERSION = 1
 
-_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+# The shared rule (harness/_spreadsheet.py) — this module used to carry its own copy, and was the one
+# writer with no formula-injection test at all, which is how the copies drifted unnoticed.
+_CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
 
 
 def _spreadsheet_safe(value: str) -> str:
     """Neutralize a leading formula trigger so a text cell can't execute when the CSV opens in
     Excel/Sheets (CSV formula injection, ASVS 1.2.10)."""
-    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+    return spreadsheet_safe(value)
 
 
 @dataclass(frozen=True)

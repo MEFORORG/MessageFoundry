@@ -49,7 +49,7 @@ _FINAL = _sample(read=2200, written=2140)  # post-hold flush + drain spill (the 
 
 
 def _record(**overrides: object) -> object:
-    kwargs: dict[str, object] = dict(
+    kwargs: dict[str, object] = dict(  # noqa: C408
         engines=2,
         count_per_engine=15,
         per_conn_rate=13.0,

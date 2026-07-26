@@ -246,9 +246,59 @@ async def test_action_grant_is_single_use_and_bound(engine: Engine) -> None:
         )
 
 
+async def test_admin_user_update_is_action_bound(engine: Engine) -> None:
+    """AC-9 (7.5.1): PATCH /users/{id} needs a fresh single-use grant bound to admin_user_update, not
+    the shared login window; the grant is consumed once, so a second PATCH re-prompts."""
+    service = await _service(engine)
+    await _add_admin(service, "boss")
+    target_id = await service.create_local_user(
+        username="target",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        body = {"display_name": "Renamed"}
+        # Inside the login window: 403 naming the action to reauth (login seeds no per-action grant).
+        blocked = await c.patch(f"/users/{target_id}", headers=_auth(token), json=body)
+        assert blocked.status_code == 403
+        assert blocked.headers.get("X-Step-Up-Required") == "1"
+        assert blocked.headers.get("X-Step-Up-Action") == "admin_user_update"
+        # A per-action reauth unlocks exactly one PATCH (single-use).
+        assert (await _reauth(c, token, purpose="admin_user_update")).status_code == 200
+        ok = await c.patch(f"/users/{target_id}", headers=_auth(token), json=body)
+        assert ok.status_code == 200, ok.text
+        # Consumed → a second PATCH re-prompts for the same action.
+        again = await c.patch(f"/users/{target_id}", headers=_auth(token), json=body)
+        assert again.status_code == 403
+        assert again.headers.get("X-Step-Up-Action") == "admin_user_update"
+
+
+async def test_admin_user_update_opt_out_uses_window(engine: Engine) -> None:
+    # With require_action_step_up=False the PATCH falls back to the session window (fresh login unlocks).
+    service = await _service(engine, AuthSettings(require_action_step_up=False, require_mfa=False))
+    await _add_admin(service, "boss")
+    target_id = await service.create_local_user(
+        username="target",
+        password=PW,
+        display_name=None,
+        email=None,
+        roles=[Role.VIEWER.value],
+        actor="test",
+    )
+    async with _client(engine, service) as c:
+        token = await _login(c, "boss")
+        r = await c.patch(f"/users/{target_id}", headers=_auth(token), json={"display_name": "X"})
+        assert r.status_code == 200, r.text
+
+
 async def test_login_and_verify_mfa_never_grant_an_action(engine: Engine) -> None:
     """AC-3: neither login nor verify_mfa mints a per-action grant — only reauth(purpose=…) does."""
-    from messagefoundry.auth import totp
+
+    from _totp_clock import fresh_totp
 
     service = await _service(engine)
     await _add_admin(service, "boss")
@@ -261,11 +311,11 @@ async def test_login_and_verify_mfa_never_grant_an_action(engine: Engine) -> Non
         assert await service.has_action_step_up(token, "mfa_enroll") is False
         # Enroll + confirm TOTP (drives the service directly, past the HTTP step-up).
         enroll = await service.begin_mfa_enrollment(identity)
-        await service.confirm_mfa_enrollment(identity, totp.totp(enroll.secret), token=token)
+        await service.confirm_mfa_enrollment(identity, fresh_totp(enroll.secret), token=token)
         # A fresh MFA-required login, then verify_mfa: it seeds the session window but NOT an action grant.
         token2 = (await service.login("boss", PW)).token
         assert token2 is not None
-        assert await service.verify_mfa(token2, totp.totp(enroll.secret)) is True
+        assert await service.verify_mfa(token2, fresh_totp(enroll.secret)) is True
         assert await service.has_recent_step_up(token2) is True  # verify_mfa re-anchored the window
         assert await service.has_action_step_up(token2, "mfa_disable") is False  # but no grant
         # Only reauth(purpose=…) mints one — and it is single-use.

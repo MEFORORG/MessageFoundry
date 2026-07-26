@@ -17,12 +17,12 @@ from pathlib import Path
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.run_context import (
     RunContext,
     registered_providers,
     run_contexts,
 )
-from messagefoundry.config.models import ConnectorType
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.config.wiring import (
     ConnectionSpec,
@@ -76,7 +76,7 @@ def test_divergent_fanout_snapshots_per_send_fused_shape() -> None:
     ``Send`` ever read the flag from an argument instead of the ContextVar."""
     reg = _fanout_registry()
     with run_contexts(RunContext(snapshot_on_send=True), phase="transform"):
-        deliveries, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2")
+        deliveries, _, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2")
     assert _delivered_msh5(deliveries) == {"OB_A": "SYS_A", "OB_B": "SYS_B"}
 
 
@@ -86,7 +86,7 @@ def test_divergent_fanout_snapshots_per_send_split_shape() -> None:
     reg = _fanout_registry()
     rc = RunContext(snapshot_on_send=True)
     with run_contexts(rc, phase="transform"):
-        deliveries, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2", run_context=rc)
+        deliveries, _, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2", run_context=rc)
     assert _delivered_msh5(deliveries) == {"OB_A": "SYS_A", "OB_B": "SYS_B"}
 
 
@@ -124,7 +124,7 @@ def test_flag_off_collapses_to_last_write() -> None:
     """AC-11: with no active run-context (flag OFF, the default) a divergent fan-out collapses to the
     final write for BOTH destinations — byte-identical to the pre-ADR-0104 deferred-encode behaviour."""
     reg = _fanout_registry()
-    deliveries, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2")
+    deliveries, _, _, _ = transform_one(reg, "fanout", _ADT, "hl7v2")
     assert _delivered_msh5(deliveries) == {"OB_A": "SYS_B", "OB_B": "SYS_B"}
 
 
@@ -201,3 +201,44 @@ def test_provider_registered_before_unmapped_capture() -> None:
     assert provs[:5] == ["code_sets", "reference", "state", "response", "environment"]
     assert "snapshot_on_send" in provs
     assert provs.index("snapshot_on_send") < provs.index("unmapped_capture")
+
+
+_ADT_CoW = "MSH|^~\\&|A|B|C|D|20200101||ADT^A01|1|P|2.5\rPID|1||100||DOE^JANE\r"
+
+
+def test_message_copy_is_copy_on_write() -> None:
+    """``Message.copy()`` shares the backing tree until a mutation, then splits it (deepcopy-on-write) —
+    so a copy-on-Send snapshot that is never further mutated is zero-copy, and a divergent one never leaks
+    the later mutation. Covers all four ``Message`` mutators."""
+    m = Message.parse(_ADT_CoW)
+    snap = m.copy()
+    assert m._shared and snap._shared and snap._m is m._m  # zero-copy: shared until a write
+    m.set("MSH-3", "CHANGED")
+    assert (not m._shared) and (snap._m is not m._m)  # copy-on-write: split on the first mutation
+    assert snap.field("MSH-3") == "A" and m.field("MSH-3") == "CHANGED"
+
+    for mutate in (
+        lambda x: x.set("PID-5.1", "X"),
+        lambda x: x.add_repetition("PID-3", "999"),
+        lambda x: x.add_segment("NK1|1|DOE^JOHN"),
+        lambda x: x.delete_segments("PID"),
+    ):
+        base = Message.parse(_ADT_CoW)
+        s = base.copy()
+        frozen = s.encode()
+        mutate(base)
+        assert s.encode() == frozen, "the snapshot leaked a later mutation"
+        assert base.encode() != frozen, "the mutation did not take on the original"
+
+
+def test_message_copy_sugar_is_independent() -> None:
+    """The explicit ``msg.copy()`` sugar is an independent clone under copy-on-write — mutating either
+    side never touches the other, in BOTH directions."""
+    m = Message.parse(_ADT_CoW)
+    c = m.copy()
+    c.set("PID-5.1", "COPYONLY")
+    assert m.field("PID-5.1") != "COPYONLY" and c.field("PID-5.1") == "COPYONLY"
+    m2 = Message.parse(_ADT_CoW)
+    c2 = m2.copy()
+    m2.set("PID-5.1", "ORIGONLY")
+    assert c2.field("PID-5.1") != "ORIGONLY" and m2.field("PID-5.1") == "ORIGONLY"

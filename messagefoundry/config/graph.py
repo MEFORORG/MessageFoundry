@@ -214,9 +214,12 @@ def _count_module_bindings(node: ast.AST, counts: dict[str, int]) -> None:
         elif isinstance(child, ast.alias):
             base = (child.asname or child.name).split(".")[0]
             counts[base] = counts.get(base, 0) + 1
-        elif isinstance(child, ast.ExceptHandler) and child.name is not None:
-            counts[child.name] = counts.get(child.name, 0) + 1
-        elif isinstance(child, ast.MatchAs | ast.MatchStar) and child.name is not None:
+        elif (
+            isinstance(child, ast.ExceptHandler)
+            and child.name is not None
+            or isinstance(child, ast.MatchAs | ast.MatchStar)
+            and child.name is not None
+        ):
             counts[child.name] = counts.get(child.name, 0) + 1
         elif isinstance(child, ast.MatchMapping) and child.rest is not None:
             counts[child.rest] = counts.get(child.rest, 0) + 1
@@ -479,13 +482,10 @@ def _binding_poisons(node: ast.FunctionDef | ast.AsyncFunctionDef) -> set[str]:
             poisoned.add(sub.name)
         elif isinstance(sub, ast.alias):
             poisoned.add((sub.asname or sub.name).split(".")[0])
-        elif isinstance(sub, ast.ExceptHandler):
+        elif isinstance(sub, ast.ExceptHandler) or isinstance(sub, ast.MatchAs | ast.MatchStar):  # noqa: SIM101
             if sub.name is not None:
                 poisoned.add(sub.name)
-        elif isinstance(sub, ast.MatchAs | ast.MatchStar):
-            if sub.name is not None:
-                poisoned.add(sub.name)
-        elif isinstance(sub, ast.MatchMapping):
+        elif isinstance(sub, ast.MatchMapping):  # noqa: SIM102
             if sub.rest is not None:
                 poisoned.add(sub.rest)
     return poisoned

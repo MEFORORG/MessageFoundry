@@ -12,8 +12,9 @@ from __future__ import annotations
 import importlib.metadata
 import re
 
-import messagefoundry
 from packaging.version import Version
+
+import messagefoundry
 
 _SEMVER = re.compile(r"\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)?")
 

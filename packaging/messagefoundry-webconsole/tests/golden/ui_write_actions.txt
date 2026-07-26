@@ -1,6 +1,8 @@
 ^/ui/account/mfa/confirm$
 ^/ui/account/mfa/disable$
 ^/ui/account/mfa/enroll$
+^/ui/account/sessions/[^/?#]+/revoke$
+^/ui/account/sessions/revoke-others$
 ^/ui/account/webauthn/[^/?#]+/delete$
 ^/ui/account/webauthn/enroll$
 ^/ui/ad-groups$
@@ -12,9 +14,12 @@
 ^/ui/messages/[^/?#]+/edit$
 ^/ui/messages/[^/?#]+/replay$
 ^/ui/messages/search$
+^/ui/messages/search/layered$
 ^/ui/roles/[^/?#]+/edit$
 ^/ui/roles/custom/[^/?#]+/delete$
 ^/ui/roles/new$
+^/ui/uploaded-logs/file/[^/?#]+$
+^/ui/uploaded-logs/file/[^/?#]+/delete$
 ^/ui/users/[^/?#]+$
 ^/ui/users/[^/?#]+/(reset-password|reset-mfa|revoke-sessions|delete)$
 ^/ui/users/new$

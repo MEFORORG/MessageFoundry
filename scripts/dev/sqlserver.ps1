@@ -17,10 +17,10 @@
     (SQL Server Evaluation edition) and creates the MessageFoundry database, ready for
     this script. The ODBC Driver 18 + aioodbc above still install on the host.
 
-    NOTE: the SQL Server backend is EXPERIMENTAL. The parity tests (enqueue / claim /
-    deliver / auth) run, but the staged ingress->routed->outbound pipeline is not yet
-    implemented on this backend (BACKLOG #1), so there are no staged-pipeline tests
-    here yet - unlike the Postgres suite.
+    NOTE: the SQL Server backend is a production server-DB backend. The full staged
+    ingress->routed->outbound pipeline plus ADR-0013 response capture are implemented and
+    CI-verified against a real SQL Server (2022 and 2025) by the gated service-container
+    job - on par with the Postgres suite.
 
     Loopback DEV convenience: sets trust_server_certificate=true + MEFOR_ALLOW_INSECURE_TLS=1
     so the store's weakened-TLS guard permits the local self-signed connection. Do NOT

@@ -41,7 +41,7 @@ Where a session *sits* is irrelevant; only where it *writes* matters.
 
 Installed by [`scripts/worktree/install-gate.ps1`](../scripts/worktree/install-gate.ps1), the
 [`PreToolUse`](https://code.claude.com/docs/en/hooks) hook
-[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) denies exactly two things, and only
+[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1) denies the following, and only
 for the checkouts named in its allowlist:
 
 1. **A `Write` / `Edit` / `MultiEdit` / `NotebookEdit` whose target path is inside the primary's working
@@ -66,13 +66,30 @@ for the checkouts named in its allowlist:
    tool-argument inspection catches it. The rule is scoped tightly to verbs that change *which commit the
    tree reflects* or that *discard work*. Reads (`status`, `log`, `diff`, `show`, `fetch`, `branch`,
    `worktree`, `merge-base`, `merge-tree`, …) are untouched, and so are `add` / `commit` / `push` and a
-   `pull --ff-only`. A **worktree may switch its own branch freely** — only the shared primary is
-   protected. It also catches `git -C <primary> checkout …` and `cd <primary> && git checkout …` from a
-   session sitting elsewhere, which a cwd-only check would miss.
+   `pull --ff-only`. Within a linked worktree everything a worktree does to its *own* branch stays free —
+   only switching it onto *another existing branch* is denied (rule 3b, next). It also catches
+   `git -C <primary> checkout …` and `cd <primary> && git checkout …` from a session sitting elsewhere,
+   which a cwd-only check would miss.
 
    To read another branch without touching any tree, the deny message points at the plumbing
    (`git show <ref>:<path>`, `git ls-tree`, `git diff <ref>..<ref>`). To *repair* a primary that is already
    detached or on the wrong branch — which an agent is still allowed to do — see below.
+
+3b. **A git command that hijacks a *linked worktree* onto an already-existing branch** — `checkout <branch>`
+   / `switch <branch>` in a worktree, where `<branch>` names a branch that already exists. This is the move
+   that actually keeps happening: a session with no worktree of its own runs `git checkout <a-branch>`
+   inside **someone else's** worktree, yanking that session's files onto a different branch mid-task. git
+   permits it because its native guard only blocks a branch that is *already checked out somewhere* — a
+   "free" branch can be grabbed by any worktree. Rule 3 protects only the shared primary; 3b protects every
+   other governed worktree.
+
+   Deliberately narrow: only a switch onto an **existing local branch** is denied. Creating a new branch
+   (`-b` / `-c`), restoring files (`checkout -- <path>`), and `reset` / `rebase` / `merge` of the
+   worktree's *own* branch stay allowed. The gate can't tell a worktree's rightful session from a squatter
+   (both share the cwd), so it blocks the move for both; the rightful owner's escape hatch is a **plain
+   terminal** (never gated) or a fresh worktree for the other branch (git then refuses the second checkout,
+   which is the protection you wanted). This closes the gap the old rule left open — that a worktree "may
+   switch its own branch freely."
 
 **Everything else is allowed.** Reads are never gated — asking a question or planning in the primary stays
 frictionless. Writes into any worktree, the scratchpad, or any other repo are allowed **from a session
@@ -137,18 +154,32 @@ pwsh -NoProfile -File scripts\worktree\install-gate.ps1 -Status
 ```
 
 The installer **refuses to run when `$env:CLAUDECODE` is set**: a session that can install its own gate can
-also remove it, so installation stays a human act.
+also remove it, so installation stays a human act. After installing, run `install-gate.ps1 -Status` to
+confirm every config dir shows hook entries.
 
 Two structural choices worth understanding:
 
-- **User scope, not project scope.** The hook is registered in `~/.claude/settings.json`, not in the repo's
-  `.claude/settings.json`. A project-scoped hook is git-tracked, so it lives on **one branch** and does not
-  exist in the other worktrees until each of them merges it — it would protect nothing on day one.
+- **Every config dir, not just `~/.claude`.** The hook is registered into `~/.claude/settings.json` **and**
+  every `~/.claude-account-*/settings.json` (the VS Code launchers that set `CLAUDE_CONFIG_DIR`), mirroring
+  what `install-selfheal.ps1` already does. This is not a detail: the gate originally wired only
+  `~/.claude`, which left every account-N session **ungated** — and those are where the parallel VS Code
+  chats run. A session under an ungoverned account then checked its own branch out inside another session's
+  linked worktree (rule 3b's exact scenario) and the gate that would have blocked it simply wasn't there.
+  Override the set with `-ConfigDir`. The gate **script** and its allowlist still live once, shared, under
+  `~/.claude/hooks/`, referenced by absolute path from each account — one copy, one kill switch, all
+  accounts. (User scope, not the repo's `.claude/settings.json`: a project-scoped hook is git-tracked, so it
+  lives on **one branch** and would protect nothing in the other worktrees until each merged it.)
 
 - **An installed copy, not a path into a working tree.** The registered command points at
   `~/.claude/hooks/worktree_gate.ps1`. If it pointed into a checkout, a `git checkout` would delete the
   script; a hook whose script is missing exits non-zero-but-not-2, which means **the tool call runs anyway,
   silently** — the gate would be off in every session with nothing to say so.
+
+- **A SessionStart drift-detector backstop.** Because the gate is a guardrail (it inspects tool arguments,
+  so a checkout routed through an indirect script slips past), `worktree-selfheal.ps1` — wired into *every*
+  account already — also **warns** at session start when this session's own linked worktree has drifted off
+  its recorded home branch (recorded by `new.ps1` at creation). Warn-only: it never switches a worktree
+  under the session using it.
 
 ## Backing it out
 

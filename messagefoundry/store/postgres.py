@@ -48,8 +48,9 @@ lazily in :meth:`PostgresStore.open` so SQLite-only installs never touch it. Pla
 from __future__ import annotations
 
 import asyncio
-import json
 import hashlib
+import hmac
+import json
 import logging
 import os
 import socket
@@ -80,24 +81,32 @@ from messagefoundry.redaction import safe_text
 from messagefoundry.store.audit_tee import emit_audit_tee
 from messagefoundry.store.base import Row, warm_pool_connections, warm_pool_target
 from messagefoundry.store.content_search import SearchSpec, row_matches
+from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
+from messagefoundry.store.crypto import (
+    AesGcmCipher,
+    AuditMacFn,
+    Cipher,
+    CipherError,
+    CipherInfo,
+    IdentityCipher,
+    cell_aad,
+    cipher_info,
+    decrypt_json_cell,
+    rotation_fingerprint_key,
+)
 from messagefoundry.store.document_strip import StripResult, cutoff_for
+from messagefoundry.store.gcm_bound import checkpoint_invocations
 from messagefoundry.store.metadata import (
     decode_response_headers,
     encode_response_headers,
     merge_user_metadata,
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
-from messagefoundry.store.crypto import MARKER_PREFIX as _ENC_MARKER_PREFIX
-from messagefoundry.store.crypto import (
-    AesGcmCipher,
-    Cipher,
-    CipherError,
-    CipherInfo,
-    IdentityCipher,
-    cipher_info,
-)
 from messagefoundry.store.store import (
+    NOT_DEPLOYED_EVENT,
+    REINGRESS_TARGET_PREFIX,
     AlertInstance,
+    CapturedResponse,
     ClaimedHeads,
     ConnectionEvent,
     ConnectionMetrics,
@@ -105,7 +114,6 @@ from messagefoundry.store.store import (
     DestinationMetrics,
     InboundMetrics,
     LatencyHistogram,
-    CapturedResponse,
     MessageSearchResult,
     MessageStatus,
     MessageStore,
@@ -114,22 +122,24 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
-    REINGRESS_TARGET_PREFIX,
     ResendKeyConflict,
     ResendOutcome,
     ResendSourceAmbiguous,
     ResendSourceEmpty,
     ResendSourceNotFound,
+    SecretRotationMetaRow,
     SessionRecord,
     Stage,
     UserRecord,
     WebAuthnCredential,
+    _finite_cutoff,  # backlog #106: keep-forever cutoff clamp
+    audit_mac_bytes,
     audit_row_hash,
     delivery_key,
+    not_deployed_detail,
     owned_lane_scope,
     should_record_event,
 )
-from messagefoundry.store.store import _finite_cutoff  # backlog #106: keep-forever cutoff clamp
 
 log = logging.getLogger(__name__)
 
@@ -342,6 +352,19 @@ _SCHEMA: list[str] = [
         created_at       DOUBLE PRECISION NOT NULL
     )""",
     "CREATE INDEX IF NOT EXISTS ix_resend_message ON resend_log(message_id)",
+    # Process-in-place dedup ledger (ADR 0129, BACKLOG #142) — one row per source file a leave-in-place
+    # (after_read='leave') File/RemoteFile source has ALREADY ingested, so a read-only share can be
+    # polled without moving/deleting files and a left file is ingested once. HASHES + IDS ONLY, no
+    # body/PHI (not part of the cipher seam). file_key = sha256 of the file identity — a DERIVED id,
+    # NEVER a cleartext filename (which can embed an MRN) and never logged at INFO+; channel_id (the
+    # inbound connection name, non-PHI) scopes the dedup + the age/count prune. Recorded AFTER emit.
+    """CREATE TABLE IF NOT EXISTS processed_files (
+        channel_id   TEXT NOT NULL,
+        file_key     TEXT NOT NULL,
+        processed_at DOUBLE PRECISION NOT NULL,
+        PRIMARY KEY (channel_id, file_key)
+    )""",
+    "CREATE INDEX IF NOT EXISTS ix_processed_files_channel ON processed_files(channel_id, processed_at)",
     # Connection/transport event log (Corepoint-style #46) — METADATA-ONLY: inbound lifecycle +
     # pre-ingress failures + outbound lane transitions. id-keyed (NOT a queue stage → invisible to the
     # finalizer's `FROM queue` scan); message_id is NULLABLE with NO FK (correlation hint only) so a
@@ -376,8 +399,17 @@ _SCHEMA: list[str] = [
         reason      TEXT,
         acked_by    TEXT,
         acked_at    DOUBLE PRECISION,
-        resolved_at DOUBLE PRECISION
+        resolved_at DOUBLE PRECISION,
+        suspended_until DOUBLE PRECISION,
+        escalation_tier INTEGER NOT NULL DEFAULT 0
     )""",
+    # #143: windowed NOTIFICATION-mute end-epoch (NULL/past = not suspended). ADD COLUMN IF NOT EXISTS
+    # for a pre-existing (from #56) alert_instance table; a no-op on a fresh DB (the CREATE above has it).
+    # Lives in _SCHEMA (hash-gated, ADR 0064) so it runs once per schema version, not on every open.
+    "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS suspended_until DOUBLE PRECISION",
+    # #81 (ADR 0133): highest occurrence-driven escalation tier reached (0=base). ADD COLUMN IF NOT EXISTS
+    # for a pre-existing alert_instance; NOT NULL DEFAULT 0 backfills existing rows. No-op on a fresh DB.
+    "ALTER TABLE alert_instance ADD COLUMN IF NOT EXISTS escalation_tier INTEGER NOT NULL DEFAULT 0",
     """CREATE UNIQUE INDEX IF NOT EXISTS ux_alert_instance_open
         ON alert_instance(event_type, connection) WHERE status <> 'resolved'""",
     "CREATE INDEX IF NOT EXISTS ix_alert_instance_status ON alert_instance(status, connection)",
@@ -388,14 +420,28 @@ _SCHEMA: list[str] = [
         action     TEXT NOT NULL,
         channel_id TEXT,
         detail     TEXT,
+        client     TEXT,
         row_hash   TEXT
     )""",
+    # ADR 0150 client attribution for a pre-existing audit_log. Nullable with NO default: NULL on every
+    # existing row is CORRECT (their address was never captured) and is exactly what preserves their
+    # row_hash — audit_row_hash omits the conditional 7th element when client is None, so the legacy
+    # digest reproduces byte-for-byte and the chain verifies across the upgrade. No-op on a fresh DB.
+    "ALTER TABLE audit_log ADD COLUMN IF NOT EXISTS client TEXT",
     "CREATE INDEX IF NOT EXISTS ix_audit_ts ON audit_log(ts)",
     # Audit-chain keying watermark (#190) — single row (id=1). keyed_from_id = the first audit_log.id
     # hashed with the HMAC key; NULL/no row = the whole chain is keyless (byte-identical to pre-#190).
     """CREATE TABLE IF NOT EXISTS audit_chain_meta (
         id             INTEGER PRIMARY KEY CHECK (id = 1),
         keyed_from_id  BIGINT
+    )""",
+    # Per-key AES-GCM invocation bound (ASVS 11.3.4) — see the SQLite `_SCHEMA` for the
+    # reserve-then-spend rationale. One row per key_id; non-secret (a one-way fingerprint
+    # plus a counter).
+    """CREATE TABLE IF NOT EXISTS cipher_meta (
+        key_id      TEXT PRIMARY KEY,
+        invocations BIGINT NOT NULL DEFAULT 0,
+        updated_at  DOUBLE PRECISION NOT NULL
     )""",
     """CREATE TABLE IF NOT EXISTS pending_approvals (
         id           TEXT PRIMARY KEY,
@@ -490,6 +536,41 @@ _SCHEMA: list[str] = [
     )""",
     "CREATE INDEX IF NOT EXISTS ix_webauthn_credentials_user ON webauthn_credentials(user_id)",
     "CREATE UNIQUE INDEX IF NOT EXISTS ux_webauthn_label ON webauthn_credentials(user_id, label)",
+    # Saved-search presets (ADR 0136, BACKLOG #151): per-user; the `criteria` JSON is PHI-shaped and
+    # AES-256-GCM-encrypted at rest (id-keyed cell-AAD, in _CIPHER_COLUMNS). Adding this DDL moves
+    # _schema_hash() automatically — the ADR 0064 bump.
+    """CREATE TABLE IF NOT EXISTS search_presets (
+        id         TEXT PRIMARY KEY,
+        owner      TEXT NOT NULL,
+        name       TEXT NOT NULL,
+        criteria   TEXT,
+        created_at DOUBLE PRECISION NOT NULL,
+        updated_at DOUBLE PRECISION NOT NULL,
+        last_used_at DOUBLE PRECISION
+    )""",
+    # #306: last RECALL stamp (get_search_preset), so the retention window keys on last-USED and not
+    # only last-edited. ADD COLUMN IF NOT EXISTS for a pre-existing (from #151) search_presets table; a
+    # no-op on a fresh DB (the CREATE above has it). Nullable with NO default: NULL on every existing
+    # row is CORRECT (they were never recall-stamped) and the purge's COALESCE falls those rows back to
+    # `updated_at`, so their window is byte-identical to pre-#306. Lives in _SCHEMA (hash-gated, ADR
+    # 0064) so it runs once per schema version rather than taking ACCESS EXCLUSIVE on every open, and
+    # so adding it moves _schema_hash() automatically — the ADR 0064 bump.
+    "ALTER TABLE search_presets ADD COLUMN IF NOT EXISTS last_used_at DOUBLE PRECISION",
+    # UNIQUE(owner, name) covers the owner-scoped list + the upsert; get/delete use the id PK (no
+    # separate owner index needed — ADR 0136, review follow-up).
+    "CREATE UNIQUE INDEX IF NOT EXISTS ux_search_presets_owner_name ON search_presets(owner, name)",
+    # Secret-rotation watch state (ASVS 13.3.4, BACKLOG #282) — mirrors the SQLite `secret_rotation_meta`
+    # table (store/store.py). One row per tracked secret CLASS. EVERY column is NON-SECRET: `fingerprint`
+    # is a keyed MAC (DEK-derived HMAC subkey) OR the DEK's one-way key-id — never the value; the dates are
+    # the tracked-since age floor + the auto-detected last-rotation stamp. Adding this DDL moves
+    # _schema_hash() automatically — the ADR 0064 bump — so the table is created at open on Postgres too,
+    # engaging the engine's `isinstance(store, SecretRotationMetaStore)` reconcile on this backend.
+    """CREATE TABLE IF NOT EXISTS secret_rotation_meta (
+        secret_key    TEXT PRIMARY KEY,
+        fingerprint   TEXT NOT NULL,
+        tracked_since TEXT NOT NULL,
+        last_rotated  TEXT NOT NULL
+    )""",
     # Track B Step 6: the cluster-wide CONFIG-RELOAD version token. A single-row table (id always 1)
     # holding a monotonically-increasing config_version: an operator reload on one node bumps it, and
     # every other node's config-convergence loop sees the higher version and reloads its OWN (identically
@@ -529,6 +610,15 @@ def _schema_hash() -> str:
     automatically; a change to ``_migrate_lease_columns`` must bump ``_MIGRATION_REV``."""
     payload = "\n".join(_SCHEMA) + f"\nmigration_rev={_MIGRATION_REV}"
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def _delete_count(status: object) -> int:
+    """The affected-row count from an asyncpg command tag (``'DELETE 5'`` → ``5``); ``0`` for anything
+    unexpected. Used by :meth:`PostgresStore.prune_processed_files` to total the two prune deletes."""
+    try:
+        return int(str(status).split()[-1])
+    except (ValueError, IndexError):
+        return 0
 
 
 def _build_ssl(settings: StoreSettings, *, posture: HopPosture | None = None) -> Any:
@@ -600,7 +690,7 @@ def _refuse_store_revocation(*, host: str, posture: HopPosture | None) -> None:
         return
     disposition = revocation_hop_disposition(
         is_phi=posture.is_phi,
-        production=posture.production,
+        enforcing=posture.enforcing,
         is_loopback_hop=is_loopback_hop_host(host),
         proxy_proven=False,
         attested=tls_revocation_attested(),
@@ -650,28 +740,31 @@ class PostgresStore:
     # mfenc seal, dedup, refcount + GC-at-0, two-object ingress commit, retention decref/dead-row split,
     # key-rotation re-seal). Go-live parity met across all three backends.
     supports_streaming_attachments = True
+
+    # ADR 0006 reference sets are PORTED here, not stubbed: `write_reference_snapshot` writes the
+    # `reference` / `reference_version` tables (created in the schema alongside the queue) under the same
+    # build-new-then-atomic-flip contract as SQLite, and `converge_reference_cache` implements the real
+    # multi-node follower read-through. A graph declaring a Reference(...) is therefore accepted here.
+    supports_reference_sets = True
     backend = StoreBackend.POSTGRES
 
     #: Every (table, column) the store cipher covers — raw bodies plus the PHI-bearing nullable text
     #: columns (error/last_error/detail), and summary/metadata (MRN + patient name) added in EF-3.
     #: Used by the on-open migration and rotate-key (mirrors MessageStore._CIPHER_COLUMNS).
+    # Cipher-covered columns keyed by a single `id` — they ride the generic id-keyed migration/rotation
+    # loops binding cell_aad(table, column, id) (ASVS 11.3.3, ADR 0019). message_events/connection_event/
+    # alert_instance are cipher-covered too, but their `id` is BIGSERIAL (unknown at INSERT; alert_instance
+    # also upserts), so they bind to insert-time-known natural columns instead and ride their own composite
+    # passes — see _encrypt_existing_rows / reencrypt_to_active (mirrors MessageStore._CIPHER_COLUMNS).
     _CIPHER_COLUMNS = (
         ("messages", "raw"),
         ("queue", "payload"),
         ("messages", "error"),
         ("queue", "last_error"),
-        ("message_events", "detail"),
         ("messages", "summary"),  # EF-3: ingest-derived MRN/name — PHI, not just metadata
         ("messages", "metadata"),  # EF-3: code/operator-attached values
         ("users", "totp_secret"),  # MFA secret (WP-14) — id-keyed, rides the migration + rotation
-        (
-            "connection_event",
-            "reason",
-        ),  # #46: scrubbed event reason — id-keyed (BIGSERIAL), rides the loops
-        (
-            "alert_instance",
-            "reason",
-        ),  # #56 (ADR 0044): scrubbed alert reason — id-keyed (BIGSERIAL), rides the loops
+        ("search_presets", "criteria"),  # saved-search preset (ADR 0136) — id-keyed, PHI-shaped
         # NB: the `response` table (ADR 0013) is cipher-covered (body, detail) but has a COMPOSITE PK,
         # so it rides the composite helpers below, not this id-keyed list (like state/reference).
         # The `shared_body` table (store-once-deliver-many) is cipher-covered (`body`, hash-keyed) on the
@@ -686,6 +779,7 @@ class PostgresStore:
         *,
         cipher: Cipher | None = None,
         audit_mac_key: bytes | None = None,
+        audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
     ) -> None:
         self._pool = pool
@@ -700,6 +794,12 @@ class PostgresStore:
         self.body_copies = 0
         # #190 audit-chain HMAC key (HKDF-derived; None → keyless chain) + keying watermark.
         self._audit_mac_key = audit_mac_key
+        # ADR 0138: an isolated-module MAC provider (Vault/OpenBao Transit ``generate_hmac``) keying the
+        # audit chain WITHOUT an in-heap key — set only in `vault_transit` mode (from Cipher.audit_mac_fn),
+        # where audit_mac_key() is None BY DESIGN. Before this was threaded here, a vault_transit +
+        # server-DB deployment ran its audit chain fully UNKEYED under the posture meant to be the most
+        # isolated one (ASVS 13.3.3).
+        self._audit_mac_fn = audit_mac_fn
         self._audit_keyed_from: int | None = None
         # #63 message_events verbosity gate ("all"/"errors"/"off"); floor always retained.
         self._message_events = message_events
@@ -749,9 +849,10 @@ class PostgresStore:
         *,
         cipher: Cipher | None = None,
         audit_mac_key: bytes | None = None,
+        audit_mac_fn: AuditMacFn | None = None,
         message_events: str = "all",
         posture: HopPosture | None = None,
-    ) -> "PostgresStore":
+    ) -> PostgresStore:
         try:
             import asyncpg
         except ImportError as exc:  # pragma: no cover - exercised only without the extra
@@ -783,9 +884,15 @@ class PostgresStore:
             settings,
             cipher=cipher,
             audit_mac_key=audit_mac_key,
+            audit_mac_fn=audit_mac_fn,
             message_events=message_events,
         )
         await store._ensure_schema()
+        # ASVS 11.3.4: enable the PERSISTED per-key AES-GCM invocation bound and reserve the first block
+        # BEFORE anything on this handle encrypts — the at-rest migration below included, since on a
+        # store that is having a key enabled for the first time it is itself a large burst. A no-op when
+        # the cipher carries no bound (keyless / `vault_transit`).
+        await store.checkpoint_cipher_invocations()
         await store._encrypt_existing_rows()  # one-time PHI-at-rest migration when a key is set
         await store._backfill_audit_chain()  # chain any pre-existing (unhashed) audit rows
         await store._load_audit_chain_meta()  # load/auto-init the #190 keying watermark
@@ -980,6 +1087,14 @@ class PostgresStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
 
     async def close(self) -> None:
+        # ASVS 11.3.4: charge whatever this process spent BEYOND its reserved block before the store
+        # goes away, so a long burst that outran the refill cadence (`rotate-key` re-encrypting a whole
+        # store in one offline process is the extreme case) is accounted rather than lost. Best-effort:
+        # a failing settlement must never turn a clean shutdown into an error.
+        try:
+            await self.checkpoint_cipher_invocations(settle=True)
+        except Exception:  # noqa: BLE001 — shutdown best-effort; log and continue
+            log.warning("could not settle the AES-GCM invocation bound at close", exc_info=True)
         await self._pool.close()
 
     async def warm_pool(self) -> None:
@@ -1008,27 +1123,85 @@ class PostgresStore:
 
     # --- PHI-at-rest cipher seam for nullable text columns (WP-5) -------------
 
-    def _enc(self, value: str | None) -> str | None:
+    # Cell-bound AAD (ASVS 11.3.3, ADR 0019): `aad` is REQUIRED so mypy-strict flags any un-threaded
+    # site; the caller passes cell_aad(table, column, *pk). Ignored while aad_bind is off (v1 writer +
+    # v1 dual-read), so passing it is always safe. Mirrors MessageStore._enc/_dec.
+
+    def _enc(self, value: str | None, *, aad: bytes) -> str | None:
         if not value:  # None or "" → leave blank (covers purged/empty values)
             return value
-        return self._cipher.encrypt(value)
+        return self._cipher.encrypt(value, aad=aad)
 
-    def _dec(self, value: str | None) -> str | None:
+    def _dec(self, value: str | None, *, aad: bytes) -> str | None:
         if value is None:
             return value
-        return self._cipher.decrypt(value)  # '' and legacy plaintext pass through unchanged
+        return self._cipher.decrypt(value, aad=aad)  # '' / legacy plaintext pass through unchanged
 
     def cipher_info(self) -> CipherInfo:
         """The non-secret at-rest cipher posture (M5): on/off + key fingerprint, never key bytes."""
         return cipher_info(self._cipher)
 
-    def _decode_record(self, record: Any, *columns: str) -> dict[str, Any]:
-        """Materialize an ``asyncpg.Record`` as a dict and decrypt the named cipher-covered text
-        columns (mirrors MessageStore._decode_row)."""
+    def cipher(self) -> Cipher:
+        """This store's LIVE at-rest cipher — see :meth:`messagefoundry.store.base.Store.cipher`."""
+        return self._cipher
+
+    # --- secret-rotation watch meta (ASVS 13.3.4, BACKLOG #282) ---------------
+    # NON-SECRET at-rest state: keyed-MAC / DEK-key-id fingerprints + ISO dates only, never a value.
+    # Implementing the narrow SecretRotationMetaStore protocol here engages the engine's structural
+    # `isinstance(store, SecretRotationMetaStore)` reconcile on the Postgres backend (mirrors
+    # MessageStore's SQLite implementation).
+
+    def secret_rotation_fingerprint_key(self) -> bytes | None:
+        """The DEK-derived HMAC subkey the rotation watcher fingerprints tracked secret values with
+        (ASVS 13.3.4). Derived off THIS store's live cipher; ``None`` when keyless / DEK not in heap, in
+        which case the watcher tracks only the non-secret DEK key-id stamp. Never returns the DEK."""
+        return rotation_fingerprint_key(self._cipher)
+
+    async def get_secret_rotation_meta(self) -> dict[str, SecretRotationMetaRow]:
+        """Every persisted secret-rotation watch record, keyed by ``secret_key`` (non-secret dates +
+        keyed-MAC fingerprints)."""
+        rows = await self._pool.fetch(
+            "SELECT secret_key, fingerprint, tracked_since, last_rotated FROM secret_rotation_meta"
+        )
+        return {
+            r["secret_key"]: SecretRotationMetaRow(
+                secret_key=r["secret_key"],
+                fingerprint=r["fingerprint"],
+                tracked_since=r["tracked_since"],
+                last_rotated=r["last_rotated"],
+            )
+            for r in rows
+        }
+
+    async def upsert_secret_rotation_meta(
+        self, secret_key: str, *, fingerprint: str, tracked_since: str, last_rotated: str
+    ) -> None:
+        """Insert or replace one NON-SECRET watch record. Idempotent via ``ON CONFLICT (secret_key) DO
+        UPDATE`` (MVCC-atomic — the Postgres equivalent of SQLite's INSERT OR REPLACE), so a re-run —
+        or a second cluster node — writing an identical fingerprint/date is a no-op."""
+        await self._pool.execute(
+            "INSERT INTO secret_rotation_meta (secret_key, fingerprint, tracked_since, last_rotated)"
+            " VALUES ($1,$2,$3,$4)"
+            " ON CONFLICT (secret_key) DO UPDATE SET"
+            " fingerprint=excluded.fingerprint, tracked_since=excluded.tracked_since,"
+            " last_rotated=excluded.last_rotated",
+            secret_key,
+            fingerprint,
+            tracked_since,
+            last_rotated,
+        )
+
+    def _decode_record(
+        self, record: Any, table: str, pk: tuple[object, ...], *columns: str
+    ) -> dict[str, Any]:
+        """Materialize an ``asyncpg.Record`` as a dict and decrypt the named cipher-covered text columns,
+        each bound to its cell ``cell_aad(table, column, *pk)`` (ASVS 11.3.3; mirrors
+        MessageStore._decode_row). All ``columns`` here share one ``(table, pk)`` — a join that mixes
+        columns from different tables decrypts them explicitly at the call site (see ``list_dead``)."""
         d = dict(record)
         for col in columns:
             if col in d:
-                d[col] = self._dec(d[col])
+                d[col] = self._dec(d[col], aad=cell_aad(table, col, *pk))
         return d
 
     # --- advisory-lock helpers -----------------------------------------------
@@ -1124,7 +1297,14 @@ class PostgresStore:
         rows = await self._fetchall("SELECT namespace, key, value FROM state")
         cache: dict[tuple[str, str], Any] = {}
         for r in rows:
-            cache[(r["namespace"], r["key"])] = json.loads(self._cipher.decrypt(r["value"]))
+            # #241 F2: fail closed (StoreKeylessError) on a keyless open of an encrypted store, rather
+            # than a raw JSONDecodeError from feeding an mfenc: blob straight to json.loads.
+            cache[(r["namespace"], r["key"])] = decrypt_json_cell(
+                self._cipher,
+                r["value"],
+                aad=cell_aad("state", "value", r["namespace"], r["key"]),
+                table="state",
+            )
         self._state_cache = cache
         vrows = await self._fetchall("SELECT namespace, version FROM state_version")
         self._state_versions = {r["namespace"]: int(r["version"]) for r in vrows}
@@ -1160,7 +1340,13 @@ class PostgresStore:
             entry = cache.setdefault(r["name"], {})
             versions[r["name"]] = r["version"]
             if r["key"] is not None:  # NULL key = the LEFT-JOIN miss of an empty snapshot
-                entry[r["key"]] = json.loads(self._cipher.decrypt(r["value"]))
+                # #241 F2: fail closed on a keyless open of an encrypted store (see _load_state_cache).
+                entry[r["key"]] = decrypt_json_cell(
+                    self._cipher,
+                    r["value"],
+                    aad=cell_aad("reference", "value", r["name"], r["version"], r["key"]),
+                    table="reference",
+                )
         return cache, versions
 
     async def converge_reference_cache(self) -> list[str]:
@@ -1218,7 +1404,14 @@ class PostgresStore:
             seen = self._state_versions.get(ns)
             if seen != version:
                 rows = await self._fetchall("SELECT key, value FROM state WHERE namespace=$1", ns)
-                fresh = {r["key"]: json.loads(self._cipher.decrypt(r["value"])) for r in rows}
+                fresh = {
+                    r["key"]: json.loads(
+                        self._cipher.decrypt(
+                            r["value"], aad=cell_aad("state", "value", ns, r["key"])
+                        )
+                    )
+                    for r in rows
+                }
                 pending.append((ns, version, seen, fresh))
         refreshed: list[str] = []
         for ns, version, seen, fresh in pending:
@@ -1246,32 +1439,30 @@ class PostgresStore:
         """Fill ``row_hash`` for audit rows written before hash-chaining (idempotent; fills only
         NULLs, chained from the prior row). H-7: takes the audit-chain advisory lock first so a
         concurrent ``record_audit`` can't fork the chain while this backfills."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-                rows = await conn.fetch(
-                    "SELECT id, ts, actor, action, channel_id, detail, row_hash FROM audit_log"
-                    " ORDER BY id"
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            rows = await conn.fetch(
+                "SELECT id, ts, actor, action, channel_id, detail, client, row_hash FROM audit_log"
+                " ORDER BY id"
+            )
+            prev = ""
+            updates: list[tuple[str, int]] = []
+            for r in rows:
+                if r["row_hash"]:
+                    prev = r["row_hash"]
+                    continue
+                prev = audit_row_hash(
+                    prev,
+                    ts=r["ts"],
+                    actor=r["actor"],
+                    action=r["action"],
+                    channel_id=r["channel_id"],
+                    detail=r["detail"],
+                    client=r["client"],
                 )
-                prev = ""
-                updates: list[tuple[str, int]] = []
-                for r in rows:
-                    if r["row_hash"]:
-                        prev = r["row_hash"]
-                        continue
-                    prev = audit_row_hash(
-                        prev,
-                        ts=r["ts"],
-                        actor=r["actor"],
-                        action=r["action"],
-                        channel_id=r["channel_id"],
-                        detail=r["detail"],
-                    )
-                    updates.append((prev, r["id"]))
-                for row_hash, rid in updates:
-                    await conn.execute(
-                        "UPDATE audit_log SET row_hash=$1 WHERE id=$2", row_hash, rid
-                    )
+                updates.append((prev, r["id"]))
+            for row_hash, rid in updates:
+                await conn.execute("UPDATE audit_log SET row_hash=$1 WHERE id=$2", row_hash, rid)
 
     async def _load_audit_chain_meta(self) -> None:
         """Load the #190 audit-chain keying watermark; auto-enable keying from row 1 for a FRESH
@@ -1282,8 +1473,8 @@ class PostgresStore:
             if row is not None and row["keyed_from_id"] is not None:
                 self._audit_keyed_from = int(row["keyed_from_id"])
                 return
-            if self._audit_mac_key is None:
-                return
+            if not self._audit_keyed_capable():
+                return  # keyless store — the chain stays byte-identical to pre-#190
             cnt = await conn.fetchrow("SELECT COUNT(*) AS n FROM audit_log")
             if cnt is not None and int(cnt["n"]) == 0:
                 await conn.execute(
@@ -1292,19 +1483,29 @@ class PostgresStore:
                 )
                 self._audit_keyed_from = 1
 
-    def _audit_append_key(self) -> bytes | None:
-        """The key a NEW ``audit_log`` row is hashed with (#190): keyed once the watermark is set.
+    def _audit_append_mac(self) -> tuple[bytes | None, AuditMacFn | None]:
+        """The ``(key, mac)`` a NEW ``audit_log`` row is hashed with (#190 / ADR 0138) — see the SQLite
+        twin :meth:`~messagefoundry.store.store.MessageStore._audit_append_mac`.
 
-        Fail-closed when keyed but the DEK is absent — appending a keyless row above the watermark would
-        read as tampered under a later keyed verify, a FALSE break (review major-1; see SQLite twin)."""
+        Prefers the isolated-module MAC (Vault/OpenBao Transit) when present, else the in-heap HMAC key.
+        Fail-closed when the chain is keyed but NEITHER secret is in hand: appending a keyless row above
+        the watermark would make a legitimately-written row read as tampered under a later keyed
+        verify — a FALSE break defeating the #190 guarantee (review major-1; see the SQLite twin)."""
         if self._audit_keyed_from is None:
-            return None
-        if self._audit_mac_key is None:
-            raise RuntimeError(
-                f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key "
-                "is configured; refusing to append a keyless audit row above the keying watermark"
-            )
-        return self._audit_mac_key
+            return None, None  # keyless chain — byte-identical to pre-#190
+        if self._audit_mac_fn is not None:
+            return None, self._audit_mac_fn  # keyed inside the isolated module (Transit)
+        if self._audit_mac_key is not None:
+            return self._audit_mac_key, None  # keyed with the in-heap HMAC key
+        raise RuntimeError(
+            f"audit chain is keyed (from id={self._audit_keyed_from}) but no store encryption key or "
+            "isolated-module MAC is configured; refusing to append a keyless audit row above the watermark"
+        )
+
+    def _audit_keyed_capable(self) -> bool:
+        """Is a keying secret available? — an in-heap HMAC key (``aesgcm`` mode) OR an isolated-module MAC
+        provider (``vault_transit`` mode, ADR 0138). Either keys the chain; neither leaves it keyless."""
+        return self._audit_mac_key is not None or self._audit_mac_fn is not None
 
     async def rekey_audit_chain(
         self, *, expected_anchor: tuple[int, str] | None = None
@@ -1312,23 +1513,22 @@ class PostgresStore:
         """Non-silent #190-D migration — enable HMAC keying on an existing keyless chain. Refuses
         without a DEK, no-op if already keyed, verifies the existing chain first (refusing on any break),
         then sets the watermark to the next id (never rewrites existing hashes). See the SQLite twin."""
-        if self._audit_mac_key is None:
-            return False, "no store encryption key configured; cannot key the audit chain"
+        if not self._audit_keyed_capable():
+            return False, "no store encryption key/MAC configured; cannot key the audit chain"
         if self._audit_keyed_from is not None:
             return True, f"audit chain already keyed from id={self._audit_keyed_from}"
         ok, msg = await self.verify_audit_chain(expected_anchor=expected_anchor)
         if not ok:
             return False, f"refusing to key a broken audit chain: {msg}"
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-                row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
-                watermark = (int(row["m"]) if row is not None else 0) + 1
-                await conn.execute(
-                    "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, $1) "
-                    "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id",
-                    watermark,
-                )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            row = await conn.fetchrow("SELECT COALESCE(MAX(id), 0) AS m FROM audit_log")
+            watermark = (int(row["m"]) if row is not None else 0) + 1
+            await conn.execute(
+                "INSERT INTO audit_chain_meta (id, keyed_from_id) VALUES (1, $1) "
+                "ON CONFLICT (id) DO UPDATE SET keyed_from_id = EXCLUDED.keyed_from_id",
+                watermark,
+            )
         self._audit_keyed_from = watermark
         return True, f"audit chain keyed from id={watermark}"
 
@@ -1351,14 +1551,14 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                async with self._timed_acquire() as conn:
-                    async with conn.transaction():
-                        for r in rows:
-                            await conn.execute(
-                                f"UPDATE {table} SET {column}=$1 WHERE id=$2",
-                                self._cipher.encrypt(r["v"]),
-                                r["id"],
-                            )
+                async with self._timed_acquire() as conn, conn.transaction():
+                    for r in rows:
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE id=$2",
+                            self._cipher.encrypt(r["v"], aad=cell_aad(table, column, r["id"])),
+                            r["id"],
+                        )
+                await self._charge_bound_batch()
                 total += len(rows)
         total += await self._encrypt_existing_composite(
             "state", ("namespace", "key"), like, encrypt=True
@@ -1376,25 +1576,59 @@ class PostgresStore:
                 encrypt=True,
                 value_col=col,
             )
+        # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True; see
+        # _CIPHER_COLUMNS) — their own composite migration passes (ASVS 11.3.3).
+        total += await self._encrypt_existing_composite(
+            "message_events",
+            ("message_id", "ts", "event"),
+            like,
+            encrypt=True,
+            value_col="detail",
+            id_keyed=True,
+        )
+        total += await self._encrypt_existing_composite(
+            "connection_event",
+            ("connection", "ts", "kind"),
+            like,
+            encrypt=True,
+            value_col="reason",
+            id_keyed=True,
+        )
+        total += await self._encrypt_existing_composite(
+            "alert_instance",
+            ("event_type", "connection"),
+            like,
+            encrypt=True,
+            value_col="reason",
+            id_keyed=True,
+        )
         if total:
             log.info("encrypted %d existing value(s) at rest", total)
 
     async def _encrypt_existing_composite(
         self,
         table: str,
-        pk_cols: tuple[str, ...],
+        aad_cols: tuple[str, ...],
         like: str,
         *,
         encrypt: bool,
         value_col: str = "value",
+        id_keyed: bool = False,
     ) -> int:
-        """Encrypt the ``value_col`` of a composite-PK table (``state``/``reference``/``response``) in
-        place — the migration loop for tables that can't ride the id-keyed loop. ``encrypt=True`` is the
-        on-open plaintext→active migration (this method's only caller; rotation uses
-        :meth:`_reencrypt_composite`). ``value_col`` defaults to ``value`` (state/reference);
-        ``response`` passes ``body``/``detail``."""
+        """Encrypt the ``value_col`` of a non-id-keyed table in place — the migration loop for tables that
+        can't ride the id-keyed loop. Each value binds to ``cell_aad(table, value_col, *aad_cols)`` (ASVS
+        11.3.3). ``encrypt=True`` is the on-open plaintext→active migration (this method's only caller;
+        rotation uses :meth:`_reencrypt_composite`). ``value_col`` defaults to ``value`` (state/reference);
+        ``response`` passes ``body``/``detail``. ``aad_cols`` are the composite PK for state/reference/
+        response; for the BIGSERIAL-id tables (``message_events``/``connection_event``/``alert_instance``)
+        set ``id_keyed=True`` — the AAD then comes from ``aad_cols`` (insert-time-known natural columns)
+        while the UPDATE targets ``id`` (so a natural-column collision can never re-write the wrong row)."""
         rotated = 0
-        pk_select = ", ".join(pk_cols)
+        select_cols = ("id", *aad_cols) if id_keyed else aad_cols
+        pk_select = ", ".join(select_cols)
+        where = (
+            "id=$2" if id_keyed else " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(aad_cols))
+        )
         while True:
             rows = await self._fetchall(
                 f"SELECT {pk_select}, {value_col} AS v FROM {table}"
@@ -1403,15 +1637,16 @@ class PostgresStore:
             )
             if not rows:
                 break
-            where = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(pk_cols))
-            async with self._timed_acquire() as conn:
-                async with conn.transaction():
-                    for r in rows:
-                        await conn.execute(
-                            f"UPDATE {table} SET {value_col}=$1 WHERE {where}",
-                            self._cipher.encrypt(r["v"]),
-                            *[r[c] for c in pk_cols],
-                        )
+            async with self._timed_acquire() as conn, conn.transaction():
+                for r in rows:
+                    aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
+                    where_vals = [r["id"]] if id_keyed else [r[c] for c in aad_cols]
+                    await conn.execute(
+                        f"UPDATE {table} SET {value_col}=$1 WHERE {where}",
+                        self._cipher.encrypt(r["v"], aad=aad),
+                        *where_vals,
+                    )
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
 
@@ -1441,15 +1676,22 @@ class PostgresStore:
                 )
                 if not rows:
                     break
-                # decrypt (via the keyring) → encrypt (active) up front so a CipherError (a prior key
-                # not supplied) propagates before any UPDATE — the batch is all-or-nothing.
-                updates = [(cipher.encrypt(cipher.decrypt(r["v"])), r["id"]) for r in rows]
-                async with self._timed_acquire() as conn:
-                    async with conn.transaction():
-                        for new_value, rid in updates:
-                            await conn.execute(
-                                f"UPDATE {table} SET {column}=$1 WHERE id=$2", new_value, rid
-                            )
+                # decrypt (via the keyring) → encrypt (active), rebinding the same cell AAD (ASVS 11.3.3),
+                # up front so a CipherError (a prior key not supplied) propagates before any UPDATE — the
+                # batch is all-or-nothing.
+                updates = [
+                    (
+                        self._reencrypt_value(cipher, r["v"], cell_aad(table, column, r["id"])),
+                        r["id"],
+                    )
+                    for r in rows
+                ]
+                async with self._timed_acquire() as conn, conn.transaction():
+                    for new_value, rid in updates:
+                        await conn.execute(
+                            f"UPDATE {table} SET {column}=$1 WHERE id=$2", new_value, rid
+                        )
+                await self._charge_bound_batch()
                 total += len(rows)
         total += await self._reencrypt_composite(
             cipher, "state", ("namespace", "key"), active_like, batch
@@ -1478,6 +1720,35 @@ class PostgresStore:
             batch,
             value_col="ciphertext",
         )
+        # BIGSERIAL-id tables bind to insert-time-known natural columns (id_keyed=True) — their own
+        # composite rotation passes rebind the same AAD across a v1→v2 or retired→active rotation.
+        total += await self._reencrypt_composite(
+            cipher,
+            "message_events",
+            ("message_id", "ts", "event"),
+            active_like,
+            batch,
+            value_col="detail",
+            id_keyed=True,
+        )
+        total += await self._reencrypt_composite(
+            cipher,
+            "connection_event",
+            ("connection", "ts", "kind"),
+            active_like,
+            batch,
+            value_col="reason",
+            id_keyed=True,
+        )
+        total += await self._reencrypt_composite(
+            cipher,
+            "alert_instance",
+            ("event_type", "connection"),
+            active_like,
+            batch,
+            value_col="reason",
+            id_keyed=True,
+        )
         if total:
             log.info("re-encrypted %d value(s) under the active key (rotation)", total)
         return total
@@ -1486,18 +1757,23 @@ class PostgresStore:
         self,
         cipher: AesGcmCipher,
         table: str,
-        pk_cols: tuple[str, ...],
+        aad_cols: tuple[str, ...],
         active_like: str,
         batch: int,
         value_col: str = "value",
+        id_keyed: bool = False,
     ) -> int:
-        """Re-encrypt the ``value_col`` of a composite-PK table under the active key (the rotation
-        parallel of :meth:`_encrypt_existing_composite`). Decrypt→encrypt up front; a value no key can
-        decrypt raises before any UPDATE. ``value_col`` defaults to ``value``; ``response`` rotates
-        ``body``/``detail``."""
+        """Re-encrypt the ``value_col`` of a non-id-keyed table under the active key (the rotation parallel
+        of :meth:`_encrypt_existing_composite`), rebinding the SAME cell AAD (ASVS 11.3.3) so a retired-key
+        v2 value decrypts, and a v1 value upgrades, under the exact AAD its write/read path uses. Decrypt→
+        encrypt up front; a value no key can decrypt raises before any UPDATE. ``aad_cols``/``id_keyed`` as
+        in :meth:`_encrypt_existing_composite`."""
         rotated = 0
-        pk_select = ", ".join(pk_cols)
-        where = " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(pk_cols))
+        select_cols = ("id", *aad_cols) if id_keyed else aad_cols
+        pk_select = ", ".join(select_cols)
+        where = (
+            "id=$2" if id_keyed else " AND ".join(f"{c}=${i + 2}" for i, c in enumerate(aad_cols))
+        )
         while True:
             rows = await self._fetchall(
                 f"SELECT {pk_select}, {value_col} AS v FROM {table}"
@@ -1507,17 +1783,26 @@ class PostgresStore:
             )
             if not rows:
                 break
-            updates = [
-                (cipher.encrypt(cipher.decrypt(r["v"])), [r[c] for c in pk_cols]) for r in rows
-            ]
-            async with self._timed_acquire() as conn:
-                async with conn.transaction():
-                    for new_value, pk_vals in updates:
-                        await conn.execute(
-                            f"UPDATE {table} SET {value_col}=$1 WHERE {where}", new_value, *pk_vals
-                        )
+            updates = []
+            for r in rows:
+                aad = cell_aad(table, value_col, *[r[c] for c in aad_cols])
+                where_vals = [r["id"]] if id_keyed else [r[c] for c in aad_cols]
+                updates.append((self._reencrypt_value(cipher, r["v"], aad), where_vals))
+            async with self._timed_acquire() as conn, conn.transaction():
+                for new_value, where_vals in updates:
+                    await conn.execute(
+                        f"UPDATE {table} SET {value_col}=$1 WHERE {where}", new_value, *where_vals
+                    )
+            await self._charge_bound_batch()
             rotated += len(rows)
         return rotated
+
+    @staticmethod
+    def _reencrypt_value(cipher: AesGcmCipher, stored: str, aad: bytes) -> str:
+        """Decrypt (keyring — any key) then re-encrypt under the active key, rebinding the SAME cell AAD
+        (ASVS 11.3.3) — the single seam every rotation loop funnels through so none can accidentally pair a
+        mismatched decrypt/encrypt AAD. Mirrors MessageStore._reencrypt_value."""
+        return cipher.encrypt(cipher.decrypt(stored, aad=aad), aad=aad)
 
     # --- internal write helpers ----------------------------------------------
 
@@ -1543,7 +1828,7 @@ class PostgresStore:
             now,
             event,
             destination,
-            self._enc(detail),
+            self._enc(detail, aad=cell_aad("message_events", "detail", message_id, now, event)),
         )
 
     async def _record_delivered_key(
@@ -1623,11 +1908,12 @@ class PostgresStore:
             source_type,
             control_id,
             message_type,
-            self._cipher.encrypt(raw),
+            self._cipher.encrypt(raw, aad=cell_aad("messages", "raw", mid)),
             status,
-            self._enc(error),
-            self._enc(summary),  # EF-3: MRN/name is PHI — ciphered at rest like the body
-            self._enc(metadata),
+            self._enc(error, aad=cell_aad("messages", "error", mid)),
+            # EF-3: MRN/name is PHI — ciphered at rest like the body
+            self._enc(summary, aad=cell_aad("messages", "summary", mid)),
+            self._enc(metadata, aad=cell_aad("messages", "metadata", mid)),
         )
 
     async def _insert_outbound_row(
@@ -1649,7 +1935,7 @@ class PostgresStore:
             Stage.OUTBOUND.value,
             channel_id,
             dest_name,
-            self._cipher.encrypt(payload),
+            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -1663,17 +1949,19 @@ class PostgresStore:
         """Insert one ``stage='routed'`` queue row (one handler assignment awaiting transform)."""
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
+        # Hoist the row id so the payload binds to its own (queue, payload, id) cell (ASVS 11.3.3).
+        row_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue"
             " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
             "  status, attempts, next_attempt_at, created_at, updated_at)"
             " VALUES ($1,$2,$3,$4,NULL,$5,$6,$7,0,$8,$9,$10)",
-            uuid4().hex,
+            row_id,
             mid,
             Stage.ROUTED.value,
             channel_id,
             handler_name,
-            self._cipher.encrypt(payload),
+            self._cipher.encrypt(payload, aad=cell_aad("queue", "payload", row_id)),
             OutboxStatus.PENDING.value,
             now,
             created_at,
@@ -1693,7 +1981,7 @@ class PostgresStore:
             " value=excluded.value, set_at=excluded.set_at, message_id=excluded.message_id",
             namespace,
             key,
-            self._cipher.encrypt(value_json),
+            self._cipher.encrypt(value_json, aad=cell_aad("state", "value", namespace, key)),
             now,
             message_id,
         )
@@ -1760,15 +2048,17 @@ class PostgresStore:
             )
             # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
             ingress_created = now
+            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+            pt_ingress_id = uuid4().hex
             await conn.execute(
                 "INSERT INTO queue (id, message_id, stage, channel_id, destination_name,"
                 " handler_name, payload, status, attempts, next_attempt_at, created_at,"
                 " updated_at) VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
-                uuid4().hex,
+                pt_ingress_id,
                 new_mid,
                 Stage.INGRESS.value,
                 pt_channel,
-                self._cipher.encrypt(body),
+                self._cipher.encrypt(body, aad=cell_aad("queue", "payload", pt_ingress_id)),
                 OutboxStatus.PENDING.value,
                 now,
                 ingress_created,
@@ -1806,16 +2096,18 @@ class PostgresStore:
         status = OutboxStatus.DONE.value if produced else OutboxStatus.DEAD.value
         # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq (BIGSERIAL) — ADR 0059.
         created_at = now
+        # Hoist the row id so the (empty) marker payload binds to its own (queue, payload, id) cell.
+        marker_id = uuid4().hex
         await conn.execute(
             "INSERT INTO queue (id, message_id, stage, channel_id, destination_name, handler_name,"
             " payload, status, attempts, next_attempt_at, created_at, updated_at)"
             " VALUES ($1,$2,$3,$4,$5,NULL,$6,$7,0,$8,$9,$10)",
-            uuid4().hex,
+            marker_id,
             parent_id,
             Stage.OUTBOUND.value,
             pt_name,
             pt_name,
-            self._cipher.encrypt(""),
+            self._cipher.encrypt("", aad=cell_aad("queue", "payload", marker_id)),
             status,
             now,
             created_at,
@@ -1857,29 +2149,26 @@ class PostgresStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         status = MessageStatus.ROUTED.value if deliveries else MessageStatus.UNROUTED.value
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                # ADR 0090 writer-funnel (same as the handoff paths).
-                await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
-                await self._insert_message(
-                    conn,
-                    mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=status,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=None,
-                    now=now,
-                )
-                for dest_name, payload in deliveries:
-                    await self._insert_outbound_row(conn, mid, channel_id, dest_name, payload, now)
-                await self._event(
-                    conn, mid, "received", None, f"{len(deliveries)} destination(s)", now
-                )
+        async with self._timed_acquire() as conn, conn.transaction():
+            # ADR 0090 writer-funnel (same as the handoff paths).
+            await self._lock_outbound_lanes(conn, (d for d, _ in deliveries))
+            await self._insert_message(
+                conn,
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=status,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=None,
+                now=now,
+            )
+            for dest_name, payload in deliveries:
+                await self._insert_outbound_row(conn, mid, channel_id, dest_name, payload, now)
+            await self._event(conn, mid, "received", None, f"{len(deliveries)} destination(s)", now)
         return mid
 
     async def record_received(
@@ -1902,23 +2191,22 @@ class PostgresStore:
         now = time.time() if now is None else now
         mid = uuid4().hex
         event = "error" if status is MessageStatus.ERROR else "filtered"
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._insert_message(
-                    conn,
-                    mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=status.value,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=error,
-                    now=now,
-                )
-                await self._event(conn, mid, event, None, error, now)
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._insert_message(
+                conn,
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=status.value,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=error,
+                now=now,
+            )
+            await self._event(conn, mid, event, None, error, now)
         return mid
 
     async def enqueue_ingress(
@@ -1950,57 +2238,58 @@ class PostgresStore:
         # Distinct refs only: a skeleton naming the same content-addressed document twice increfs it once
         # (== its live join rows), so a later release decrefs by the same count.
         refs = list(dict.fromkeys(attachment_refs or ()))
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._insert_message(
-                    conn,
-                    mid,
-                    channel_id=channel_id,
-                    raw=raw,
-                    status=MessageStatus.RECEIVED.value,
-                    control_id=control_id,
-                    message_type=message_type,
-                    source_type=source_type,
-                    summary=summary,
-                    metadata=metadata,
-                    error=None,
-                    now=now,
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._insert_message(
+                conn,
+                mid,
+                channel_id=channel_id,
+                raw=raw,
+                status=MessageStatus.RECEIVED.value,
+                control_id=control_id,
+                message_type=message_type,
+                source_type=source_type,
+                summary=summary,
+                metadata=metadata,
+                error=None,
+                now=now,
+            )
+            # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
+            ingress_created_at = now
+            # Hoist the row id so the ingress payload binds to its own (queue, payload, id) cell.
+            ingress_row_id = uuid4().hex
+            await conn.execute(
+                "INSERT INTO queue"
+                " (id, message_id, stage, channel_id, destination_name, payload,"
+                "  status, attempts, next_attempt_at, created_at, updated_at)"
+                " VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7,$8,$9)",
+                ingress_row_id,
+                mid,
+                Stage.INGRESS.value,
+                channel_id,
+                self._cipher.encrypt(raw, aad=cell_aad("queue", "payload", ingress_row_id)),
+                OutboxStatus.PENDING.value,
+                now,
+                ingress_created_at,
+                now,
+            )
+            await self._event(conn, mid, "received", None, "ingress", now)
+            # #149 two-object commit: incref each detached attachment AND record its
+            # message→attachment linkage row in THIS transaction (same commit as the skeleton row).
+            # put_attachment already committed the chunks at refcount 0; a missing row here means it
+            # was GC'd/never stored, so fail loud (the transaction rolls back → no ACK). `refs` is
+            # de-duplicated, so the message_attachment PK never conflicts and the refcount is bumped
+            # once per distinct ref (== its live join rows).
+            for ref in refs:
+                result = await conn.execute(
+                    "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
                 )
-                # ingest-time (ADR 0009) + metrics only; FIFO orders by seq (BIGSERIAL) — ADR 0059.
-                ingress_created_at = now
+                if _rowcount(result) == 0:
+                    raise KeyError(f"attachment {ref!r} not found for ingress incref")
                 await conn.execute(
-                    "INSERT INTO queue"
-                    " (id, message_id, stage, channel_id, destination_name, payload,"
-                    "  status, attempts, next_attempt_at, created_at, updated_at)"
-                    " VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7,$8,$9)",
-                    uuid4().hex,
+                    "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
                     mid,
-                    Stage.INGRESS.value,
-                    channel_id,
-                    self._cipher.encrypt(raw),
-                    OutboxStatus.PENDING.value,
-                    now,
-                    ingress_created_at,
-                    now,
+                    ref,
                 )
-                await self._event(conn, mid, "received", None, "ingress", now)
-                # #149 two-object commit: incref each detached attachment AND record its
-                # message→attachment linkage row in THIS transaction (same commit as the skeleton row).
-                # put_attachment already committed the chunks at refcount 0; a missing row here means it
-                # was GC'd/never stored, so fail loud (the transaction rolls back → no ACK). `refs` is
-                # de-duplicated, so the message_attachment PK never conflicts and the refcount is bumped
-                # once per distinct ref (== its live join rows).
-                for ref in refs:
-                    result = await conn.execute(
-                        "UPDATE attachment SET refcount = refcount + 1 WHERE id=$1", ref
-                    )
-                    if _rowcount(result) == 0:
-                        raise KeyError(f"attachment {ref!r} not found for ingress incref")
-                    await conn.execute(
-                        "INSERT INTO message_attachment (message_id, attachment_id) VALUES ($1,$2)",
-                        mid,
-                        ref,
-                    )
         return mid
 
     async def handoff(
@@ -2018,7 +2307,7 @@ class PostgresStore:
         post-router ``disposition``. Idempotent: ``False`` (no-op) if the ingress row was already
         consumed by a prior run."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 # ADR 0090 writer-funnel: lock every destination lane this txn writes (sorted, before seq
                 # assignment) so commit-order == seq-order and a concurrent resend can't be claimed ahead.
@@ -2069,25 +2358,24 @@ class PostgresStore:
         order), set the intermediate ``disposition`` (``ROUTED``/``UNROUTED``). Idempotent: ``False``
         if the ingress row was already consumed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                deleted = await conn.fetchval(
-                    "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
-                    ingress_id,
-                    Stage.INGRESS.value,
-                    OutboxStatus.INFLIGHT.value,
+        async with self._timed_acquire() as conn, conn.transaction():
+            deleted = await conn.fetchval(
+                "DELETE FROM queue WHERE id=$1 AND stage=$2 AND status=$3 RETURNING id",
+                ingress_id,
+                Stage.INGRESS.value,
+                OutboxStatus.INFLIGHT.value,
+            )
+            if deleted is None:
+                return False  # already handed off (crash-restart) — idempotent no-op
+            for handler_name, payload in handlers:
+                await self._insert_routed_row(
+                    conn, message_id, channel_id, handler_name, payload, now
                 )
-                if deleted is None:
-                    return False  # already handed off (crash-restart) — idempotent no-op
-                for handler_name, payload in handlers:
-                    await self._insert_routed_row(
-                        conn, message_id, channel_id, handler_name, payload, now
-                    )
-                await conn.execute(
-                    "UPDATE messages SET status=$1 WHERE id=$2", disposition.value, message_id
-                )
-                event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
-                await self._event(conn, message_id, event, None, f"{len(handlers)} handler(s)", now)
+            await conn.execute(
+                "UPDATE messages SET status=$1 WHERE id=$2", disposition.value, message_id
+            )
+            event = "routed" if disposition is MessageStatus.ROUTED else "unrouted"
+            await self._event(conn, message_id, event, None, f"{len(handlers)} handler(s)", now)
         return True
 
     async def transform_handoff(
@@ -2100,6 +2388,7 @@ class PostgresStore:
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
         meta_ops: Sequence[tuple[str, str]] = (),
+        declined: Sequence[str] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> bool:
@@ -2121,7 +2410,7 @@ class PostgresStore:
         empty. Mirrors :class:`MessageStore` (SQLite) exactly."""
         now = time.time() if now is None else now
         applied: list[tuple[tuple[str, str], Any]] = []
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 # ADR 0090 writer-funnel: lock the outbound lanes this txn writes (sorted, before seq
                 # assignment, before the later finalize lock) so commit-order == seq-order per lane.
@@ -2148,7 +2437,13 @@ class PostgresStore:
                     prow = await conn.fetchrow(
                         "SELECT metadata FROM messages WHERE id=$1", message_id
                     )
-                    pmeta_json = self._dec(prow["metadata"]) if prow else None
+                    pmeta_json = (
+                        self._dec(
+                            prow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                        )
+                        if prow
+                        else None
+                    )
                 if pt_deliveries:
                     parent_meta: dict[str, Any] = {}
                     if pmeta_json:
@@ -2178,7 +2473,9 @@ class PostgresStore:
                 if meta_ops:
                     merged = merge_user_metadata(pmeta_json, meta_ops)
                     await conn.execute(
-                        "UPDATE messages SET metadata=$1 WHERE id=$2", self._enc(merged), message_id
+                        "UPDATE messages SET metadata=$1 WHERE id=$2",
+                        self._enc(merged, aad=cell_aad("messages", "metadata", message_id)),
+                        message_id,
                     )
                 # Track B Step 6b: bump each DISTINCT namespace's version IN THE SAME txn as its writes —
                 # atomic, so a follower that sees the new version is guaranteed the rows are committed.
@@ -2208,6 +2505,14 @@ class PostgresStore:
                     f"{total_targets} destination(s)",
                     now,
                 )
+                # #233 (ADR 0111): one not_deployed event per Send declined because its target is
+                # present-but-not-deployed — written HERE, in the same transaction and BEFORE the
+                # finalizer, so it is both the durable count-and-log record of the skipped leg and the
+                # persisted signal the finalizer reads to emit NOT_DEPLOYED rather than FILTERED.
+                for dest in declined:
+                    await self._event(
+                        conn, message_id, NOT_DEPLOYED_EVENT, dest, not_deployed_detail(dest), now
+                    )
                 # H-8: serialize per-message finalize on the advisory lock, then recompute on a fresh
                 # snapshot. The lock is taken inside this txn, so it auto-releases at commit.
                 await self._maybe_finalize_message(conn, message_id, now)
@@ -2238,30 +2543,37 @@ class PostgresStore:
         encrypted), and upsert the ``reference_version`` pointer. The read cache swaps only after
         commit, so a failed sync leaves the last-good snapshot live. Ported, not stubbed."""
         encrypted = [
-            (name, version, k, self._cipher.encrypt(json.dumps(v))) for k, v in rows.items()
+            (
+                name,
+                version,
+                k,
+                self._cipher.encrypt(
+                    json.dumps(v), aad=cell_aad("reference", "value", name, version, k)
+                ),
+            )
+            for k, v in rows.items()
         ]
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM reference WHERE name=$1", name)
-                for n, ver, k, v in encrypted:
-                    await conn.execute(
-                        "INSERT INTO reference (name, version, key, value) VALUES ($1,$2,$3,$4)",
-                        n,
-                        ver,
-                        k,
-                        v,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM reference WHERE name=$1", name)
+            for n, ver, k, v in encrypted:
                 await conn.execute(
-                    "INSERT INTO reference_version (name, version, synced_at, row_count)"
-                    " VALUES ($1,$2,$3,$4)"
-                    " ON CONFLICT (name) DO UPDATE SET"
-                    " version=excluded.version, synced_at=excluded.synced_at,"
-                    " row_count=excluded.row_count",
-                    name,
-                    version,
-                    time.time(),
-                    len(encrypted),
+                    "INSERT INTO reference (name, version, key, value) VALUES ($1,$2,$3,$4)",
+                    n,
+                    ver,
+                    k,
+                    v,
                 )
+            await conn.execute(
+                "INSERT INTO reference_version (name, version, synced_at, row_count)"
+                " VALUES ($1,$2,$3,$4)"
+                " ON CONFLICT (name) DO UPDATE SET"
+                " version=excluded.version, synced_at=excluded.synced_at,"
+                " row_count=excluded.row_count",
+                name,
+                version,
+                time.time(),
+                len(encrypted),
+            )
         # Commit succeeded → swap the active snapshot in the read cache (plaintext, decoded form) and
         # record the active version so a follower's converge_reference_cache() (Track B Step 6) can tell
         # this node already reflects it (no needless re-load on the node that just wrote it).
@@ -2383,7 +2695,7 @@ class PostgresStore:
             " owner=$6, lease_expires_at=$7"
             f" FROM head WHERE q.id=head.id AND head.next_attempt_at<=$5{epoch_guard} RETURNING q.*"
         )
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 # FIRST recover this lane's stranded head: a crashed/fenced predecessor's claimed rows
                 # are still inflight under an expired ROW lease, and the PENDING-only head SELECT below
@@ -2529,22 +2841,21 @@ class PostgresStore:
             " owner=$6, lease_expires_at=$7"
             f" FROM head WHERE q.id=head.id{epoch_guard} RETURNING q.*"
         )
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                # FIRST recover this lane's stranded head (identical to the single claim) so the oldest
-                # recovered row is reconsidered as the (now-due) prefix head and blocks the lane.
-                await conn.execute(
-                    f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
-                    f" next_attempt_at=$4, updated_at=$4"
-                    f" WHERE stage=$1 AND {lane_col}=$2 AND status=$5"
-                    f" AND lease_expires_at IS NOT NULL AND lease_expires_at < $4",
-                    stage,
-                    name,
-                    OutboxStatus.PENDING.value,
-                    now,
-                    OutboxStatus.INFLIGHT.value,
-                )
-                rows = await conn.fetch(prefix_sql, *claim_args)
+        async with self._timed_acquire() as conn, conn.transaction():
+            # FIRST recover this lane's stranded head (identical to the single claim) so the oldest
+            # recovered row is reconsidered as the (now-due) prefix head and blocks the lane.
+            await conn.execute(
+                f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
+                f" next_attempt_at=$4, updated_at=$4"
+                f" WHERE stage=$1 AND {lane_col}=$2 AND status=$5"
+                f" AND lease_expires_at IS NOT NULL AND lease_expires_at < $4",
+                stage,
+                name,
+                OutboxStatus.PENDING.value,
+                now,
+                OutboxStatus.INFLIGHT.value,
+            )
+            rows = await conn.fetch(prefix_sql, *claim_args)
         # Decode AFTER the claim txn. RETURNING does not guarantee order across the UPDATE, so sort by
         # `seq` (seq-only per-lane FIFO, ADR 0059 — one serial writer per lane assigns BIGSERIAL seq in
         # insert-commit order) to be certain the worker iterates oldest-first. This is the THIRD of the
@@ -2656,59 +2967,58 @@ class PostgresStore:
         )
         rearm: set[str] = set()
         kept_rows: list[Any] = []
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                # (i) multi-lane stranded-head lease reclaim, same txn, FIRST (the multi-lane twin
-                # of the single claim's): bounded to the requested lanes and to already-expired
-                # leases, so it never steals a live node's own actively-leased rows.
-                await conn.execute(
-                    f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
-                    f" next_attempt_at=$4, updated_at=$4"
-                    f" WHERE stage=$1 AND {lane_col} = ANY($2::text[]) AND status=$5"
-                    f" AND lease_expires_at IS NOT NULL AND lease_expires_at < $4",
-                    stage,
-                    lane_list,
-                    OutboxStatus.PENDING.value,
-                    now,
-                    OutboxStatus.INFLIGHT.value,
-                )
-                rows = await conn.fetch(claim_sql, *claim_args)
-                # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
-                # advisory lock for SEVERAL messages in this one txn, and a monotone subsequence
-                # of the sorted order can never form a lock cycle with _lock_finalize_batch
-                # callers (or a sibling pooled claim) — RETURNING order is nondeterministic and
-                # would re-open the multi-message deadlock the sorted discipline exists to
-                # prevent. kept_rows are regrouped and seq-sorted per lane below, so iteration
-                # order is otherwise immaterial.
-                for row in sorted(rows, key=lambda r: r["message_id"]):
-                    # H2 SKIP-AND-COMPLETE in the SAME claim txn — code-identical to
-                    # claim_next_fifo's (the only _maybe_finalize call site in this primitive; the
-                    # fence still gates this completion). The consumed head is completed DONE in
-                    # place (NO reorder), dropped from the results, and its lane re-armed.
-                    if row["destination_name"] is not None:
-                        already = await conn.fetchval(
-                            "SELECT 1 FROM delivered_keys WHERE outbox_id=$1 LIMIT 1", row["id"]
+        async with self._timed_acquire() as conn, conn.transaction():
+            # (i) multi-lane stranded-head lease reclaim, same txn, FIRST (the multi-lane twin
+            # of the single claim's): bounded to the requested lanes and to already-expired
+            # leases, so it never steals a live node's own actively-leased rows.
+            await conn.execute(
+                f"UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
+                f" next_attempt_at=$4, updated_at=$4"
+                f" WHERE stage=$1 AND {lane_col} = ANY($2::text[]) AND status=$5"
+                f" AND lease_expires_at IS NOT NULL AND lease_expires_at < $4",
+                stage,
+                lane_list,
+                OutboxStatus.PENDING.value,
+                now,
+                OutboxStatus.INFLIGHT.value,
+            )
+            rows = await conn.fetch(claim_sql, *claim_args)
+            # Iterate in CANONICAL message_id order: H2 may take the per-message finalize
+            # advisory lock for SEVERAL messages in this one txn, and a monotone subsequence
+            # of the sorted order can never form a lock cycle with _lock_finalize_batch
+            # callers (or a sibling pooled claim) — RETURNING order is nondeterministic and
+            # would re-open the multi-message deadlock the sorted discipline exists to
+            # prevent. kept_rows are regrouped and seq-sorted per lane below, so iteration
+            # order is otherwise immaterial.
+            for row in sorted(rows, key=lambda r: r["message_id"]):
+                # H2 SKIP-AND-COMPLETE in the SAME claim txn — code-identical to
+                # claim_next_fifo's (the only _maybe_finalize call site in this primitive; the
+                # fence still gates this completion). The consumed head is completed DONE in
+                # place (NO reorder), dropped from the results, and its lane re-armed.
+                if row["destination_name"] is not None:
+                    already = await conn.fetchval(
+                        "SELECT 1 FROM delivered_keys WHERE outbox_id=$1 LIMIT 1", row["id"]
+                    )
+                    if already is not None:
+                        await conn.execute(
+                            "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                            " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                            OutboxStatus.DONE.value,
+                            now,
+                            row["id"],
                         )
-                        if already is not None:
-                            await conn.execute(
-                                "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
-                                " owner=NULL, lease_expires_at=NULL WHERE id=$3",
-                                OutboxStatus.DONE.value,
-                                now,
-                                row["id"],
-                            )
-                            await self._event(
-                                conn,
-                                row["message_id"],
-                                "delivered",
-                                row["destination_name"],
-                                "idempotent skip (already delivered)",
-                                now,
-                            )
-                            await self._maybe_finalize_message(conn, row["message_id"], now)
-                            rearm.add(row[lane_col])
-                            continue
-                    kept_rows.append(row)
+                        await self._event(
+                            conn,
+                            row["message_id"],
+                            "delivered",
+                            row["destination_name"],
+                            "idempotent skip (already delivered)",
+                            now,
+                        )
+                        await self._maybe_finalize_message(conn, row["message_id"], now)
+                        rearm.add(row[lane_col])
+                        continue
+                kept_rows.append(row)
         # Group by lane and sort by `seq` in memory (RETURNING does not guarantee order), then
         # decode AFTER the claim txn: an undecryptable row is dead-lettered (its own txn) and
         # DROPPED; the surviving tail keeps its order.
@@ -2774,19 +3084,18 @@ class PostgresStore:
         id_list = list(dict.fromkeys(ids))
         if not id_list:
             return
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                for i in range(0, len(id_list), _RELEASE_CHUNK):
-                    chunk = id_list[i : i + _RELEASE_CHUNK]
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, attempts=GREATEST(attempts - 1, 0),"
-                        " updated_at=$2, owner=NULL, lease_expires_at=NULL"
-                        " WHERE id = ANY($3::text[]) AND status=$4",
-                        OutboxStatus.PENDING.value,
-                        now,
-                        chunk,
-                        OutboxStatus.INFLIGHT.value,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            for i in range(0, len(id_list), _RELEASE_CHUNK):
+                chunk = id_list[i : i + _RELEASE_CHUNK]
+                await conn.execute(
+                    "UPDATE queue SET status=$1, attempts=GREATEST(attempts - 1, 0),"
+                    " updated_at=$2, owner=NULL, lease_expires_at=NULL"
+                    " WHERE id = ANY($3::text[]) AND status=$4",
+                    OutboxStatus.PENDING.value,
+                    now,
+                    chunk,
+                    OutboxStatus.INFLIGHT.value,
+                )
 
     async def reschedule_claimed(
         self, ids: Sequence[str], next_attempt_at: float, now: float | None = None
@@ -2801,20 +3110,19 @@ class PostgresStore:
         id_list = list(dict.fromkeys(ids))
         if not id_list:
             return
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                for i in range(0, len(id_list), _RELEASE_CHUNK):
-                    chunk = id_list[i : i + _RELEASE_CHUNK]
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, attempts=GREATEST(attempts - 1, 0),"
-                        " next_attempt_at=$2, updated_at=$3, owner=NULL, lease_expires_at=NULL"
-                        " WHERE id = ANY($4::text[]) AND status=$5",
-                        OutboxStatus.PENDING.value,
-                        next_attempt_at,
-                        now,
-                        chunk,
-                        OutboxStatus.INFLIGHT.value,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            for i in range(0, len(id_list), _RELEASE_CHUNK):
+                chunk = id_list[i : i + _RELEASE_CHUNK]
+                await conn.execute(
+                    "UPDATE queue SET status=$1, attempts=GREATEST(attempts - 1, 0),"
+                    " next_attempt_at=$2, updated_at=$3, owner=NULL, lease_expires_at=NULL"
+                    " WHERE id = ANY($4::text[]) AND status=$5",
+                    OutboxStatus.PENDING.value,
+                    next_attempt_at,
+                    now,
+                    chunk,
+                    OutboxStatus.INFLIGHT.value,
+                )
 
     async def _fifo_item_or_dead_letter(self, row: Any) -> OutboxItem | None:
         """Decode a claimed FIFO head into an :class:`OutboxItem`, or dead-letter an undecryptable head
@@ -2839,7 +3147,11 @@ class PostgresStore:
             message_id=row["message_id"],
             channel_id=row["channel_id"],
             destination_name=row["destination_name"],
-            payload=self._cipher.decrypt(row["payload"]),
+            # Inline body bound to its own queue cell (ASVS 11.3.3); Postgres keeps bodies inline
+            # (body_ref always NULL this increment), so there is no shared_body deref here.
+            payload=self._cipher.decrypt(
+                row["payload"], aad=cell_aad("queue", "payload", row["id"])
+            ),
             attempts=row["attempts"],
             stage=row["stage"],
             handler_name=row["handler_name"],
@@ -2853,32 +3165,66 @@ class PostgresStore:
             error
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is None:
-                    return
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    OutboxStatus.DEAD.value,
-                    now,
-                    self._enc(error),
-                    now,
-                    outbox_id,
-                )
-                await self._event(
-                    conn, row["message_id"], "dead", row["destination_name"], error, now
-                )
-                await self._maybe_finalize_message(conn, row["message_id"], now)
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+            if row is None:
+                return
+            await conn.execute(
+                "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                OutboxStatus.DEAD.value,
+                now,
+                self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                now,
+                outbox_id,
+            )
+            await self._event(conn, row["message_id"], "dead", row["destination_name"], error, now)
+            await self._maybe_finalize_message(conn, row["message_id"], now)
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+            if row is None:
+                return
+            await conn.execute(
+                "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                OutboxStatus.DONE.value,
+                now,
+                outbox_id,
+            )
+            # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
+            await self._record_delivered_key(
+                conn,
+                outbox_id=outbox_id,
+                message_id=row["message_id"],
+                destination_name=row["destination_name"],
+                handler_name=row["handler_name"],
+                now=now,
+            )
+            await self._event(
+                conn,
+                row["message_id"],
+                "delivered",
+                row["destination_name"],
+                f"attempt {row['attempts']}",
+                now,
+            )
+            await self._maybe_finalize_message(conn, row["message_id"], now)
+
+    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
+        """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
+        :meth:`mark_done` (ADR 0082). All N flip ``DONE`` together; each writes its H2 ledger row +
+        ``delivered`` event, and the finalizer runs once per distinct ``message_id``. A vanished member
+        is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            finalize: dict[str, None] = {}
+            for outbox_id in outbox_ids:
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
-                    return
+                    continue  # vanished member — idempotent no-op
                 await conn.execute(
                     "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
                     " owner=NULL, lease_expires_at=NULL WHERE id=$3",
@@ -2886,7 +3232,6 @@ class PostgresStore:
                     now,
                     outbox_id,
                 )
-                # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
                 await self._record_delivered_key(
                     conn,
                     outbox_id=outbox_id,
@@ -2903,47 +3248,9 @@ class PostgresStore:
                     f"attempt {row['attempts']}",
                     now,
                 )
-                await self._maybe_finalize_message(conn, row["message_id"], now)
-
-    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
-        """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
-        :meth:`mark_done` (ADR 0082). All N flip ``DONE`` together; each writes its H2 ledger row +
-        ``delivered`` event, and the finalizer runs once per distinct ``message_id``. A vanished member
-        is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
-        now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                    if row is None:
-                        continue  # vanished member — idempotent no-op
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$3",
-                        OutboxStatus.DONE.value,
-                        now,
-                        outbox_id,
-                    )
-                    await self._record_delivered_key(
-                        conn,
-                        outbox_id=outbox_id,
-                        message_id=row["message_id"],
-                        destination_name=row["destination_name"],
-                        handler_name=row["handler_name"],
-                        now=now,
-                    )
-                    await self._event(
-                        conn,
-                        row["message_id"],
-                        "delivered",
-                        row["destination_name"],
-                        f"attempt {row['attempts']}",
-                        now,
-                    )
-                    finalize[row["message_id"]] = None
-                for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                    await self._maybe_finalize_message(conn, message_id, now)
+                finalize[row["message_id"]] = None
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                await self._maybe_finalize_message(conn, message_id, now)
 
     async def complete_with_response(
         self,
@@ -2964,7 +3271,7 @@ class PostgresStore:
         finalizer (it scans ``queue`` only). When ``reingress_to`` is set (Increment 2) the same
         transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
@@ -2993,10 +3300,18 @@ class PostgresStore:
                     message_id,
                     destination_name,
                     seq,
-                    self._enc(body),
+                    self._enc(
+                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
+                    ),
                     outcome,
-                    self._enc(detail),
-                    self._enc(headers_json),
+                    self._enc(
+                        detail,
+                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                    ),
+                    self._enc(
+                        headers_json,
+                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
+                    ),
                     now,
                 )
                 if reingress_to is not None:
@@ -3005,16 +3320,18 @@ class PostgresStore:
                     artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
                     # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
                     work_created = now
+                    # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                    work_row_id = uuid4().hex
                     await conn.execute(
                         "INSERT INTO queue"
                         " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
                         "  status, attempts, next_attempt_at, created_at, updated_at)"
                         " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
-                        uuid4().hex,
+                        work_row_id,
                         message_id,
                         Stage.RESPONSE.value,
                         reingress_to,
-                        self._enc(artifact_ref),
+                        self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
                         OutboxStatus.PENDING.value,
                         now,
                         work_created,
@@ -3060,7 +3377,7 @@ class PostgresStore:
 
         now = time.time() if now is None else now
         try:
-            async with self._timed_acquire() as conn:
+            async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
                     wr = await conn.fetchrow(
                         "SELECT message_id, payload FROM queue WHERE id=$1 AND stage=$2 AND status=$3",
@@ -3072,7 +3389,13 @@ class PostgresStore:
                         raise _Noop()  # already consumed by a committed prior run
                     origin_id = wr["message_id"]
                     try:
-                        ref = self._dec(wr["payload"]) or ""
+                        ref = (
+                            self._dec(
+                                wr["payload"],
+                                aad=cell_aad("queue", "payload", response_row_id),
+                            )
+                            or ""
+                        )
                         origin_msg_id, dest, seq_s = ref.split("\x1f")
                         seq = int(seq_s)
                     except Exception:  # noqa: BLE001 - any decrypt/parse failure = an unrecoverable ref
@@ -3084,7 +3407,10 @@ class PostgresStore:
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
                             " updated_at=$4 WHERE id=$5",
                             OutboxStatus.DEAD.value,
-                            self._enc("re-ingress work-row reference is corrupt/unparseable"),
+                            self._enc(
+                                "re-ingress work-row reference is corrupt/unparseable",
+                                aad=cell_aad("queue", "last_error", response_row_id),
+                            ),
                             now,
                             now,
                             response_row_id,
@@ -3101,13 +3427,25 @@ class PostgresStore:
                         dest,
                         seq,
                     )
-                    body = self._dec(art["body"]) if (art and art["body"] is not None) else ""
+                    body = (
+                        self._dec(
+                            art["body"],
+                            aad=cell_aad("response", "body", origin_msg_id, dest, seq),
+                        )
+                        if (art and art["body"] is not None)
+                        else ""
+                    )
                     body = body or ""
                     mrow = await conn.fetchrow(
                         "SELECT metadata FROM messages WHERE id=$1", origin_id
                     )
                     origin_meta: dict[str, Any] = {}
-                    meta_json = self._dec(mrow["metadata"]) if mrow else None  # EF-3: ciphered
+                    # EF-3: ciphered, bound to the origin message's metadata cell
+                    meta_json = (
+                        self._dec(mrow["metadata"], aad=cell_aad("messages", "metadata", origin_id))
+                        if mrow
+                        else None
+                    )
                     if meta_json:
                         loaded = json.loads(meta_json)
                         if isinstance(loaded, dict):
@@ -3121,7 +3459,8 @@ class PostgresStore:
                             OutboxStatus.DEAD.value,
                             self._enc(
                                 f"re-ingress correlation depth exceeded "
-                                f"({child_depth} > {correlation_depth_cap})"
+                                f"({child_depth} > {correlation_depth_cap})",
+                                aad=cell_aad("queue", "last_error", response_row_id),
                             ),
                             now,
                             now,
@@ -3169,16 +3508,20 @@ class PostgresStore:
                         if not peek_failed:
                             # ingest-time (ADR 0009) + metrics only; FIFO orders by seq — ADR 0059.
                             ingress_created = now
+                            # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                            reingress_row_id = uuid4().hex
                             await conn.execute(
                                 "INSERT INTO queue (id, message_id, stage, channel_id,"
                                 " destination_name, handler_name, payload, status, attempts,"
                                 " next_attempt_at, created_at, updated_at)"
                                 " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
-                                uuid4().hex,
+                                reingress_row_id,
                                 new_mid,
                                 Stage.INGRESS.value,
                                 loopback_channel_id,
-                                self._cipher.encrypt(body),
+                                self._cipher.encrypt(
+                                    body, aad=cell_aad("queue", "payload", reingress_row_id)
+                                ),
                                 OutboxStatus.PENDING.value,
                                 now,
                                 ingress_created,
@@ -3223,7 +3566,7 @@ class PostgresStore:
         )
         if row is None:
             return None
-        ref = self._dec(row["payload"]) or ""
+        ref = self._dec(row["payload"], aad=cell_aad("queue", "payload", response_row_id)) or ""
         try:
             mid, dest, seq_s = ref.split("\x1f")
         except ValueError:
@@ -3234,7 +3577,11 @@ class PostgresStore:
             dest,
             int(seq_s),
         )
-        return self._dec(art["body"]) if (art and art["body"] is not None) else ""
+        return (
+            self._dec(art["body"], aad=cell_aad("response", "body", mid, dest, int(seq_s)))
+            if (art and art["body"] is not None)
+            else ""
+        )
 
     async def correlate_response(self, message_id: str) -> list[CapturedResponse]:
         """Every captured reply for ``message_id`` (ADR 0013), ordered by destination then
@@ -3252,13 +3599,42 @@ class PostgresStore:
                 destination_name=r["destination_name"],
                 response_seq=r["response_seq"],
                 outcome=r["outcome"],
-                detail=self._dec(r["detail"]),
+                detail=self._dec(
+                    r["detail"],
+                    aad=cell_aad(
+                        "response",
+                        "detail",
+                        r["message_id"],
+                        r["destination_name"],
+                        r["response_seq"],
+                    ),
+                ),
                 captured_at=r["captured_at"],
-                body=self._dec(r["body"]),
+                body=self._dec(
+                    r["body"],
+                    aad=cell_aad(
+                        "response",
+                        "body",
+                        r["message_id"],
+                        r["destination_name"],
+                        r["response_seq"],
+                    ),
+                ),
                 kind=r["kind"],
                 ack_code=r["ack_code"],
                 ack_phase=r["ack_phase"],
-                headers=decode_response_headers(self._dec(r["resp_headers"])),
+                headers=decode_response_headers(
+                    self._dec(
+                        r["resp_headers"],
+                        aad=cell_aad(
+                            "response",
+                            "resp_headers",
+                            r["message_id"],
+                            r["destination_name"],
+                            r["response_seq"],
+                        ),
+                    )
+                ),
             )
             for r in rows
         ]
@@ -3279,32 +3655,43 @@ class PostgresStore:
         # (seq SELECT + INSERT); finalizer-invisible; NAK body NULL; AA body only when encrypted.
         now = time.time() if now is None else now
         dest = "\x1fack:" + inbound_name
-        enc_body = self._enc(ack_body) if (ack_body and self._cipher.encrypts) else None
-        enc_detail = self._enc(safe_text(detail)[:200]) if detail else None
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                seq = await conn.fetchval(
-                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
-                    " WHERE message_id=$1 AND destination_name=$2 AND kind='ack_sent'",
-                    message_id,
-                    dest,
+        async with self._timed_acquire() as conn, conn.transaction():
+            seq = await conn.fetchval(
+                "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                " WHERE message_id=$1 AND destination_name=$2 AND kind='ack_sent'",
+                message_id,
+                dest,
+            )
+            # Encrypt AFTER seq is known so body/detail bind to the (message_id, dest, seq) cell.
+            enc_body = (
+                self._enc(ack_body, aad=cell_aad("response", "body", message_id, dest, seq))
+                if (ack_body and self._cipher.encrypts)
+                else None
+            )
+            enc_detail = (
+                self._enc(
+                    safe_text(detail)[:200],
+                    aad=cell_aad("response", "detail", message_id, dest, seq),
                 )
-                await conn.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail,"
-                    "  captured_at, kind, ack_code, ack_phase)"
-                    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
-                    message_id,
-                    dest,
-                    seq,
-                    enc_body,
-                    outcome,
-                    enc_detail,
-                    now,
-                    "ack_sent",
-                    ack_code,
-                    ack_phase,
-                )
+                if detail
+                else None
+            )
+            await conn.execute(
+                "INSERT INTO response"
+                " (message_id, destination_name, response_seq, body, outcome, detail,"
+                "  captured_at, kind, ack_code, ack_phase)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)",
+                message_id,
+                dest,
+                seq,
+                enc_body,
+                outcome,
+                enc_detail,
+                now,
+                "ack_sent",
+                ack_code,
+                ack_phase,
+            )
 
     # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
     async def record_connection_event(
@@ -3320,9 +3707,17 @@ class PostgresStore:
         now: float | None = None,
     ) -> None:
         # Pure observer: a single short INSERT in its own statement — no queue row, no finalizer, never
-        # inside a handoff txn. reason rides the safe_text PHI chokepoint (#120) + the cipher.
+        # inside a handoff txn. reason rides the safe_text PHI chokepoint (#120) + the cipher. Bound to
+        # (connection, ts, kind) — the id is BIGSERIAL, unknown here (ASVS 11.3.3).
         now = time.time() if now is None else now
-        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        reason_enc = (
+            self._enc(
+                safe_text(reason)[:200],
+                aad=cell_aad("connection_event", "reason", connection, now, kind),
+            )
+            if reason
+            else None
+        )
         await self._pool.execute(
             "INSERT INTO connection_event"
             " (ts, connection, transport, direction, kind, peer_host, message_id, reason)"
@@ -3336,6 +3731,131 @@ class PostgresStore:
             message_id,
             reason_enc,
         )
+
+    # --- process-in-place dedup ledger (ADR 0129, BACKLOG #142) --------------
+    async def is_file_processed(self, *, channel_id: str, file_key: str) -> bool:
+        row = await self._pool.fetchval(
+            "SELECT 1 FROM processed_files WHERE channel_id=$1 AND file_key=$2 LIMIT 1",
+            channel_id,
+            file_key,
+        )
+        return row is not None
+
+    async def record_processed_file(
+        self, *, channel_id: str, file_key: str, now: float | None = None
+    ) -> None:
+        now = time.time() if now is None else now
+        await self._pool.execute(
+            "INSERT INTO processed_files (channel_id, file_key, processed_at)"
+            " VALUES ($1,$2,$3) ON CONFLICT (channel_id, file_key) DO NOTHING",
+            channel_id,
+            file_key,
+            now,
+        )
+
+    async def prune_processed_files(
+        self,
+        *,
+        channel_id: str,
+        older_than: float,
+        keep_last: int,
+        now: float | None = None,
+    ) -> int:
+        del now  # age/count-driven, not clock-arg (signature parity with the other writers)
+        deleted = _delete_count(
+            await self._pool.execute(
+                "DELETE FROM processed_files WHERE channel_id=$1 AND processed_at < $2",
+                channel_id,
+                older_than,
+            )
+        )
+        # Count-cap: keep the newest `keep_last`; OFFSET n (no LIMIT) returns the surplus to delete.
+        deleted += _delete_count(
+            await self._pool.execute(
+                "DELETE FROM processed_files WHERE channel_id=$1 AND file_key IN ("
+                " SELECT file_key FROM processed_files WHERE channel_id=$2"
+                " ORDER BY processed_at DESC, file_key DESC OFFSET $3)",
+                channel_id,
+                channel_id,
+                max(0, keep_last),
+            )
+        )
+        return deleted
+
+    # --- saved-search presets (ADR 0136, BACKLOG #151) -----------------------
+
+    async def upsert_search_preset(
+        self, *, preset_id: str, owner: str, name: str, criteria: str, now: float | None = None
+    ) -> tuple[str, bool]:
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            existing = await conn.fetchval(
+                "SELECT id FROM search_presets WHERE owner=$1 AND name=$2", owner, name
+            )
+            effective_id = str(existing) if existing is not None else preset_id
+            enc = self._enc(criteria, aad=cell_aad("search_presets", "criteria", effective_id))
+            if existing is not None:
+                await conn.execute(
+                    "UPDATE search_presets SET criteria=$1, updated_at=$2 WHERE id=$3",
+                    enc,
+                    now,
+                    effective_id,
+                )
+                return effective_id, True
+            await conn.execute(
+                "INSERT INTO search_presets (id, owner, name, criteria, created_at, updated_at)"
+                " VALUES ($1,$2,$3,$4,$5,$6)",
+                effective_id,
+                owner,
+                name,
+                enc,
+                now,
+                now,
+            )
+            return effective_id, False
+
+    async def list_search_presets(self, owner: str) -> list[dict[str, Any]]:
+        rows = await self._pool.fetch(
+            "SELECT id, name, created_at, updated_at FROM search_presets"
+            " WHERE owner=$1 ORDER BY name",
+            owner,
+        )
+        return [dict(r) for r in rows]
+
+    async def get_search_preset(
+        self, *, preset_id: str, owner: str, now: float | None = None
+    ) -> dict[str, Any] | None:
+        row = await self._pool.fetchrow(
+            "SELECT id, name, criteria, created_at, updated_at, last_used_at FROM search_presets"
+            " WHERE id=$1 AND owner=$2",
+            preset_id,
+            owner,
+        )
+        if row is None:
+            return None
+        out = dict(row)
+        out["criteria"] = self._dec(
+            row["criteria"], aad=cell_aad("search_presets", "criteria", preset_id)
+        )
+        # #306: stamp last-USED, best-effort and AFTER the read — a usage hint must never fail the
+        # recall it annotates (SQLite parity). The returned dict carries the PRE-stamp value.
+        try:
+            await self._pool.execute(
+                "UPDATE search_presets SET last_used_at=$1 WHERE id=$2",
+                time.time() if now is None else now,
+                preset_id,
+            )
+        except Exception:  # noqa: BLE001 — a usage hint must never fail the recall it annotates
+            log.warning("failed to stamp search-preset last_used_at", exc_info=True)
+        return out
+
+    async def delete_search_preset(self, *, preset_id: str, owner: str) -> bool:
+        deleted = _delete_count(
+            await self._pool.execute(
+                "DELETE FROM search_presets WHERE id=$1 AND owner=$2", preset_id, owner
+            )
+        )
+        return deleted > 0
 
     async def list_connection_events(
         self,
@@ -3381,7 +3901,10 @@ class PostgresStore:
                 kind=r["kind"],
                 peer_host=r["peer_host"],
                 message_id=r["message_id"],
-                reason=self._dec(r["reason"]),
+                reason=self._dec(
+                    r["reason"],
+                    aad=cell_aad("connection_event", "reason", r["connection"], r["ts"], r["kind"]),
+                ),
             )
             for r in rows
         ]
@@ -3395,27 +3918,41 @@ class PostgresStore:
         connection: str,
         severity: str,
         reason: str | None = None,
+        escalation_tier: int = 0,
         now: float | None = None,
     ) -> None:
         # Pure observer (ADR 0044 D2): no queue row, no finalizer. De-dup grain = ADR 0014's
         # (event_type, connection) key. ON CONFLICT on the partial unique index folds a re-fire into the
         # live instance (bump last_seen + count, refresh severity/reason); an acknowledged instance stays
         # acknowledged (COALESCE keeps acked_*). Atomic upsert in one statement. reason rides safe_text +
-        # the cipher. The caller wraps it fail-soft.
+        # the cipher. escalation_tier (#81, ADR 0133) is kept monotonic via GREATEST. The caller wraps it
+        # fail-soft.
         now = time.time() if now is None else now
-        reason_enc = self._enc(safe_text(reason)[:200]) if reason else None
+        # Bound to (event_type, connection) — the de-dup grain the upsert keys on, so the SAME AAD covers
+        # the INSERT and the ON CONFLICT UPDATE that never sees the BIGSERIAL id (ASVS 11.3.3).
+        reason_enc = (
+            self._enc(
+                safe_text(reason)[:200],
+                aad=cell_aad("alert_instance", "reason", event_type, connection),
+            )
+            if reason
+            else None
+        )
         await self._pool.execute(
             "INSERT INTO alert_instance"
-            " (event_type, connection, severity, status, first_seen, last_seen, count, reason)"
-            " VALUES ($1,$2,$3,'open',$4,$4,1,$5)"
+            " (event_type, connection, severity, status, first_seen, last_seen, count, reason,"
+            " escalation_tier)"
+            " VALUES ($1,$2,$3,'open',$4,$4,1,$5,$6)"
             " ON CONFLICT (event_type, connection) WHERE status <> 'resolved' DO UPDATE SET"
             " last_seen=EXCLUDED.last_seen, count=alert_instance.count+1,"
-            " severity=EXCLUDED.severity, reason=EXCLUDED.reason",
+            " severity=EXCLUDED.severity, reason=EXCLUDED.reason,"
+            " escalation_tier=GREATEST(alert_instance.escalation_tier, EXCLUDED.escalation_tier)",
             event_type,
             connection,
             severity,
             now,
             reason_enc,
+            escalation_tier,
         )
 
     async def list_active_alert_instances(
@@ -3433,7 +3970,8 @@ class PostgresStore:
         params.append(limit)
         rows = await self._pool.fetch(
             "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
-            f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}"
+            " reason, acked_by, acked_at, resolved_at, suspended_until, escalation_tier"
+            f" FROM alert_instance{clause}"
             f" ORDER BY last_seen DESC, id DESC LIMIT ${len(params)}",
             *params,
         )
@@ -3449,7 +3987,8 @@ class PostgresStore:
         clause = " WHERE " + " AND ".join(where)
         row = await self._pool.fetchrow(
             "SELECT id, event_type, connection, severity, status, first_seen, last_seen, count,"
-            f" reason, acked_by, acked_at, resolved_at FROM alert_instance{clause}",
+            " reason, acked_by, acked_at, resolved_at, suspended_until, escalation_tier"
+            f" FROM alert_instance{clause}",
             *params,
         )
         return self._alert_instance_row(row) if row is not None else None
@@ -3464,10 +4003,15 @@ class PostgresStore:
             first_seen=r["first_seen"],
             last_seen=r["last_seen"],
             count=int(r["count"]),
-            reason=self._dec(r["reason"]),
+            reason=self._dec(
+                r["reason"],
+                aad=cell_aad("alert_instance", "reason", r["event_type"], r["connection"]),
+            ),
             acked_by=r["acked_by"],
             acked_at=r["acked_at"],
             resolved_at=r["resolved_at"],
+            suspended_until=r["suspended_until"],
+            escalation_tier=int(r["escalation_tier"]),
         )
 
     async def ack_alert_instance(
@@ -3506,6 +4050,32 @@ class PostgresStore:
         )
         return _rowcount(result)
 
+    async def suspend_alert_instance(
+        self, alert_id: int, *, until: float, now: float | None = None
+    ) -> AlertInstance | None:
+        # #143 windowed suspend (NOTIFICATION-only): set suspended_until on a live instance. Refuses a
+        # resolved one; returns the updated row (for the API echo + seeding the sink cache) or None.
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET suspended_until=$1 WHERE id=$2 AND status<>'resolved'",
+            until,
+            alert_id,
+        )
+        if _rowcount(result) == 0:
+            return None
+        return await self.get_alert_instance(alert_id)
+
+    async def resume_alert_instance(
+        self, alert_id: int, *, now: float | None = None
+    ) -> AlertInstance | None:
+        # #143: clear a windowed suspend. Idempotent; returns the row or None (unknown/already resolved).
+        result = await self._pool.execute(
+            "UPDATE alert_instance SET suspended_until=NULL WHERE id=$1 AND status<>'resolved'",
+            alert_id,
+        )
+        if _rowcount(result) == 0:
+            return None
+        return await self.get_alert_instance(alert_id)
+
     async def count_open_alerts_by_connection(self) -> dict[str, int]:
         rows = await self._pool.fetch(
             "SELECT connection, COUNT(*) AS n FROM alert_instance"
@@ -3531,42 +4101,41 @@ class PostgresStore:
         arms the per-lane retry wake on a float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is None:
-                    return None
-                attempts = row["attempts"]
-                # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
-                if retry.max_attempts is not None and attempts >= retry.max_attempts:
-                    status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
-                else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
-                    )
-                    status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    status,
-                    next_at,
-                    self._enc(error),
-                    now,
-                    outbox_id,
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+            if row is None:
+                return None
+            attempts = row["attempts"]
+            # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
+            if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
+            else:
+                backoff = min(
+                    retry.max_backoff_seconds,
+                    retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
                 )
-                await self._event(
-                    conn,
-                    row["message_id"],
-                    event,
-                    row["destination_name"],
-                    f"attempt {attempts}: {error}",
-                    now,
-                )
-                if status == OutboxStatus.DEAD.value:
-                    await self._maybe_finalize_message(conn, row["message_id"], now)
-                    return None
-                return next_at
+                status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+            await conn.execute(
+                "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                status,
+                next_at,
+                self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                now,
+                outbox_id,
+            )
+            await self._event(
+                conn,
+                row["message_id"],
+                event,
+                row["destination_name"],
+                f"attempt {attempts}: {error}",
+                now,
+            )
+            if status == OutboxStatus.DEAD.value:
+                await self._maybe_finalize_message(conn, row["message_id"], now)
+                return None
+            return next_at
 
     async def mark_batch_failed(
         self,
@@ -3581,48 +4150,47 @@ class PostgresStore:
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                present = []
-                for outbox_id in outbox_ids:
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                    if row is not None:
-                        present.append((outbox_id, row))
-                if not present:
-                    return None
-                head_attempts = present[0][1]["attempts"]
-                if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
-                    status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
-                else:
-                    backoff = min(
-                        retry.max_backoff_seconds,
-                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
-                    )
-                    status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-                finalize: dict[str, None] = {}
-                for outbox_id, row in present:
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                        status,
-                        next_at,
-                        self._enc(error),
-                        now,
-                        outbox_id,
-                    )
-                    await self._event(
-                        conn,
-                        row["message_id"],
-                        event,
-                        row["destination_name"],
-                        f"attempt {row['attempts']}: {error}",
-                        now,
-                    )
-                    if status == OutboxStatus.DEAD.value:
-                        finalize[row["message_id"]] = None
-                for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                    await self._maybe_finalize_message(conn, message_id, now)
-                return None if status == OutboxStatus.DEAD.value else next_at
+        async with self._timed_acquire() as conn, conn.transaction():
+            present = []
+            for outbox_id in outbox_ids:
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                if row is not None:
+                    present.append((outbox_id, row))
+            if not present:
+                return None
+            head_attempts = present[0][1]["attempts"]
+            if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
+                status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
+            else:
+                backoff = min(
+                    retry.max_backoff_seconds,
+                    retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                )
+                status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+            finalize: dict[str, None] = {}
+            for outbox_id, row in present:
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    status,
+                    next_at,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                )
+                await self._event(
+                    conn,
+                    row["message_id"],
+                    event,
+                    row["destination_name"],
+                    f"attempt {row['attempts']}: {error}",
+                    now,
+                )
+                if status == OutboxStatus.DEAD.value:
+                    finalize[row["message_id"]] = None
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                await self._maybe_finalize_message(conn, message_id, now)
+            return None if status == OutboxStatus.DEAD.value else next_at
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -3631,28 +4199,27 @@ class PostgresStore:
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                finalize: dict[str, None] = {}
-                for outbox_id in outbox_ids:
-                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                    if row is None:
-                        continue
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error),
-                        now,
-                        outbox_id,
-                    )
-                    await self._event(
-                        conn, row["message_id"], "dead", row["destination_name"], error, now
-                    )
-                    finalize[row["message_id"]] = None
-                for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                    await self._maybe_finalize_message(conn, message_id, now)
+        async with self._timed_acquire() as conn, conn.transaction():
+            finalize: dict[str, None] = {}
+            for outbox_id in outbox_ids:
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                if row is None:
+                    continue
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                )
+                await self._event(
+                    conn, row["message_id"], "dead", row["destination_name"], error, now
+                )
+                finalize[row["message_id"]] = None
+            for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                await self._maybe_finalize_message(conn, message_id, now)
 
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -3715,27 +4282,26 @@ class PostgresStore:
             " WHERE status=$3 AND stage=$4"
         )
         recovered = 0
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                for st in stages:
-                    if owned is None:
-                        result = await conn.execute(
-                            sql, OutboxStatus.PENDING.value, now, OutboxStatus.INFLIGHT.value, st
-                        )
-                        recovered += _rowcount(result)
-                        continue
-                    lane_col, names = owned_lane_scope(st, owned)
-                    if not names:
-                        continue
+        async with self._timed_acquire() as conn, conn.transaction():
+            for st in stages:
+                if owned is None:
                     result = await conn.execute(
-                        f"{sql} AND {lane_col} = ANY($5::text[])",
-                        OutboxStatus.PENDING.value,
-                        now,
-                        OutboxStatus.INFLIGHT.value,
-                        st,
-                        sorted(names),
+                        sql, OutboxStatus.PENDING.value, now, OutboxStatus.INFLIGHT.value, st
                     )
                     recovered += _rowcount(result)
+                    continue
+                lane_col, names = owned_lane_scope(st, owned)
+                if not names:
+                    continue
+                result = await conn.execute(
+                    f"{sql} AND {lane_col} = ANY($5::text[])",
+                    OutboxStatus.PENDING.value,
+                    now,
+                    OutboxStatus.INFLIGHT.value,
+                    st,
+                    sorted(names),
+                )
+                recovered += _rowcount(result)
         return recovered
 
     # --- streaming attachments (#149, ADR 0105 Phase 4 — Postgres parity) ----------------------------
@@ -3750,34 +4316,39 @@ class PostgresStore:
         same ref and writes nothing). The fresh attachment sits at ``refcount=0`` until increffed."""
         hasher = hashlib.sha256()
         total = 0
-        sealed: list[str] = []
+        # Cell-bound AAD (ASVS 11.3.3) binds each chunk to (attachment_id, seq), and the attachment_id is
+        # the content hash — known only after the full plaintext is hashed. Buffer the verbatim slices,
+        # hash, then seal each under (ref, seq); the source is an already-materialized OBX-5.5 value, so
+        # this adds no order-of-magnitude memory and each seal still consumes one chunk. Mirrors SQLite.
+        plaintext_chunks: list[str] = []
         for chunk in chunks:
             data = chunk.encode("utf-8")
             hasher.update(data)
             total += len(data)
-            sealed.append(
-                self._cipher.encrypt(chunk)
-            )  # bounded plaintext window: one chunk per seal
+            plaintext_chunks.append(chunk)
         ref = hasher.hexdigest()
+        sealed: list[str] = [
+            self._cipher.encrypt(c, aad=cell_aad("attachment_chunk", "ciphertext", ref, seq))
+            for seq, c in enumerate(plaintext_chunks)
+        ]
         now = time.time()
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
-                    return ref  # dedup: identical content already stored — write nothing
-                await conn.execute(
-                    "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
-                    " VALUES ($1,$2,$3,0,$4)",
-                    ref,
-                    content_type,
-                    total,
-                    now,
+        async with self._timed_acquire() as conn, conn.transaction():
+            if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is not None:
+                return ref  # dedup: identical content already stored — write nothing
+            await conn.execute(
+                "INSERT INTO attachment (id, content_type, total_bytes, refcount, created_at)"
+                " VALUES ($1,$2,$3,0,$4)",
+                ref,
+                content_type,
+                total,
+                now,
+            )
+            if sealed:
+                await conn.executemany(
+                    "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
+                    " VALUES ($1,$2,$3)",
+                    [(ref, seq, ct) for seq, ct in enumerate(sealed)],
                 )
-                if sealed:
-                    await conn.executemany(
-                        "INSERT INTO attachment_chunk (attachment_id, seq, ciphertext)"
-                        " VALUES ($1,$2,$3)",
-                        [(ref, seq, ct) for seq, ct in enumerate(sealed)],
-                    )
         return ref
 
     async def read_attachment(self, ref: str) -> AsyncIterator[str]:
@@ -3788,10 +4359,13 @@ class PostgresStore:
             if await conn.fetchval("SELECT 1 FROM attachment WHERE id=$1", ref) is None:
                 raise KeyError(f"attachment {ref!r} not found")
             rows = await conn.fetch(
-                "SELECT ciphertext FROM attachment_chunk WHERE attachment_id=$1 ORDER BY seq", ref
+                "SELECT seq, ciphertext FROM attachment_chunk WHERE attachment_id=$1 ORDER BY seq",
+                ref,
             )
         for r in rows:
-            yield self._cipher.decrypt(r["ciphertext"])
+            yield self._cipher.decrypt(
+                r["ciphertext"], aad=cell_aad("attachment_chunk", "ciphertext", ref, r["seq"])
+            )
 
     async def attachments_for(self, message_id: str) -> list[dict[str, Any]]:
         """The distinct attachments ``message_id`` holds — the operator read surface (#149, ADR 0105
@@ -3839,9 +4413,8 @@ class PostgresStore:
     async def attachment_decref(self, ref: str) -> None:
         """Drop one reference and **GC the attachment + all its chunks at refcount 0** (store-once
         retention). Clamped at 0; tolerant of a missing ref (a no-op), so a purge re-run is idempotent."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._decref_attachment(conn, ref, 1)
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._decref_attachment(conn, ref, 1)
 
     async def _release_message_attachments(self, conn: Any, where: str, params: list[Any]) -> None:
         """Release every attachment held by the messages matching ``where`` (#149, ADR 0105 Phase 4 — the
@@ -3929,16 +4502,15 @@ class PostgresStore:
         transaction — the standalone form of the retention decref (#149, ADR 0105). Idempotent: a re-run
         finds the join rows gone and decrefs nothing (no underflow, no premature GC of an attachment a
         sibling message still references)."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._release_message_attachments(conn, "message_id = $1", [message_id])
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._release_message_attachments(conn, "message_id = $1", [message_id])
 
     async def sweep_orphan_attachments(self) -> int:
         """Reclaim orphaned attachment storage at startup so **no PHI chunk accumulates at rest** (#149,
         ADR 0105). Two disjoint classes: refcount-0 attachments (header + chunks deleted) and header-less
         incomplete-write chunk groups (a future incremental writer that crashed before finalizing the
         header). Returns the number of attachments reclaimed. Idempotent: a second run finds nothing."""
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 # Count header-less chunk groups BEFORE any delete (while refcount-0 headers still exist,
                 # so their chunks don't miscount — those are reclaimed as the refcount-0 class).
@@ -4021,17 +4593,16 @@ class PostgresStore:
         whose rows this could steal — the SAME interlock the shipping SQL Server on-promotion
         ``reset_stale_inflight`` relies on. Returns the number of queue rows re-pended."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                result = await conn.execute(
-                    "UPDATE queue SET status=$1, owner=NULL, lease_expires_at=NULL,"
-                    " next_attempt_at=$2, updated_at=$2"
-                    " WHERE status=$3 AND owner IS DISTINCT FROM $4",
-                    OutboxStatus.PENDING.value,
-                    now,
-                    OutboxStatus.INFLIGHT.value,
-                    self._owner,
-                )
+        async with self._timed_acquire() as conn, conn.transaction():
+            result = await conn.execute(
+                "UPDATE queue SET status=$1, owner=NULL, lease_expires_at=NULL,"
+                " next_attempt_at=$2, updated_at=$2"
+                " WHERE status=$3 AND owner IS DISTINCT FROM $4",
+                OutboxStatus.PENDING.value,
+                now,
+                OutboxStatus.INFLIGHT.value,
+                self._owner,
+            )
         return _rowcount(result)
 
     async def dead_letter_missing_destinations(
@@ -4040,40 +4611,39 @@ class PostgresStore:
         """Dead-letter every non-terminal **outbound** row whose ``destination_name`` left the
         registry. Scoped to ``stage='outbound'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    "SELECT id, message_id, destination_name FROM queue"
-                    " WHERE stage=$1 AND status = ANY($2::text[])",
-                    Stage.OUTBOUND.value,
-                    [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id, message_id, destination_name FROM queue"
+                " WHERE stage=$1 AND status = ANY($2::text[])",
+                Stage.OUTBOUND.value,
+                [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            )
+            orphans = [r for r in rows if r["destination_name"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "destination removed from outbound registry"
+            # Pre-lock all affected messages' finalize locks in canonical order before the loop
+            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
+            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            for row in orphans:
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                    now,
+                    row["id"],
                 )
-                orphans = [r for r in rows if r["destination_name"] not in valid_names]
-                if not orphans:
-                    return 0
-                error = "destination removed from outbound registry"
-                # Pre-lock all affected messages' finalize locks in canonical order before the loop
-                # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
-                await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
-                for row in orphans:
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error),
-                        now,
-                        row["id"],
-                    )
-                    await self._event(
-                        conn,
-                        row["message_id"],
-                        "dead",
-                        row["destination_name"],
-                        error,
-                        now,
-                    )
-                    await self._maybe_finalize_message(conn, row["message_id"], now)
+                await self._event(
+                    conn,
+                    row["message_id"],
+                    "dead",
+                    row["destination_name"],
+                    error,
+                    now,
+                )
+                await self._maybe_finalize_message(conn, row["message_id"], now)
         log.warning(
             "dead-lettered %d orphaned outbox row(s) at startup for missing destination(s): %s",
             len(orphans),
@@ -4087,33 +4657,32 @@ class PostgresStore:
         """Dead-letter every non-terminal **routed** row whose ``handler_name`` left the registry
         (no transform worker can run it). Scoped to ``stage='routed'``. Returns the rows killed."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    "SELECT id, message_id, handler_name FROM queue"
-                    " WHERE stage=$1 AND status = ANY($2::text[])",
-                    Stage.ROUTED.value,
-                    [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT id, message_id, handler_name FROM queue"
+                " WHERE stage=$1 AND status = ANY($2::text[])",
+                Stage.ROUTED.value,
+                [OutboxStatus.PENDING.value, OutboxStatus.INFLIGHT.value],
+            )
+            orphans = [r for r in rows if r["handler_name"] not in valid_names]
+            if not orphans:
+                return 0
+            error = "handler removed from registry"
+            # Pre-lock all affected messages' finalize locks in canonical order before the loop
+            # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
+            await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
+            for row in orphans:
+                await conn.execute(
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", row["id"])),
+                    now,
+                    row["id"],
                 )
-                orphans = [r for r in rows if r["handler_name"] not in valid_names]
-                if not orphans:
-                    return 0
-                error = "handler removed from registry"
-                # Pre-lock all affected messages' finalize locks in canonical order before the loop
-                # finalizes any, so concurrent multi-message sweeps/cancels can't deadlock.
-                await self._lock_finalize_batch(conn, (r["message_id"] for r in orphans))
-                for row in orphans:
-                    await conn.execute(
-                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                        " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                        OutboxStatus.DEAD.value,
-                        now,
-                        self._enc(error),
-                        now,
-                        row["id"],
-                    )
-                    await self._event(conn, row["message_id"], "dead", None, error, now)
-                    await self._maybe_finalize_message(conn, row["message_id"], now)
+                await self._event(conn, row["message_id"], "dead", None, error, now)
+                await self._maybe_finalize_message(conn, row["message_id"], now)
         log.warning(
             "dead-lettered %d orphaned routed row(s) at startup for missing handler(s): %s",
             len(orphans),
@@ -4126,51 +4695,50 @@ class PostgresStore:
         any ``dead``/``pending`` row (never a ``done`` sibling — the M-2 hazard), else **re-send** the
         ``done`` rows. ``cancelled`` rows are never touched. Returns rows requeued."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                stuck_row = await conn.fetchrow(
-                    "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND status = ANY($2::text[])",
+        async with self._timed_acquire() as conn, conn.transaction():
+            stuck_row = await conn.fetchrow(
+                "SELECT COUNT(*) AS n FROM queue WHERE message_id=$1 AND status = ANY($2::text[])",
+                message_id,
+                [OutboxStatus.DEAD.value, OutboxStatus.PENDING.value],
+            )
+            stuck = int(stuck_row["n"]) if stuck_row else 0
+            replay_from = (
+                [OutboxStatus.DEAD.value, OutboxStatus.PENDING.value]
+                if stuck
+                else [OutboxStatus.DONE.value]
+            )
+            if not stuck:
+                # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE
+                # rows (the exact set re-pended below) so a deliberate re-send is NOT skip-and-
+                # completed as a crash-re-run duplicate. Scoped to this message only.
+                await conn.execute(
+                    "DELETE FROM delivered_keys WHERE outbox_id IN"
+                    " (SELECT id FROM queue WHERE message_id=$1 AND status=$2)",
                     message_id,
-                    [OutboxStatus.DEAD.value, OutboxStatus.PENDING.value],
+                    OutboxStatus.DONE.value,
                 )
-                stuck = int(stuck_row["n"]) if stuck_row else 0
-                replay_from = (
-                    [OutboxStatus.DEAD.value, OutboxStatus.PENDING.value]
-                    if stuck
-                    else [OutboxStatus.DONE.value]
-                )
-                if not stuck:
-                    # RE-SEND branch (H2): drop the idempotency-ledger entries of THIS message's DONE
-                    # rows (the exact set re-pended below) so a deliberate re-send is NOT skip-and-
-                    # completed as a crash-re-run duplicate. Scoped to this message only.
-                    await conn.execute(
-                        "DELETE FROM delivered_keys WHERE outbox_id IN"
-                        " (SELECT id FROM queue WHERE message_id=$1 AND status=$2)",
-                        message_id,
-                        OutboxStatus.DONE.value,
-                    )
-                result = await conn.execute(
-                    "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                    " updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])",
+            result = await conn.execute(
+                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
+                " updated_at=$2 WHERE message_id=$3 AND status = ANY($4::text[])",
+                OutboxStatus.PENDING.value,
+                now,
+                message_id,
+                replay_from,
+            )
+            count = _rowcount(result)
+            if count:
+                pre = await conn.fetchrow(
+                    "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
+                    " AND status=$3 LIMIT 1",
+                    message_id,
+                    [Stage.INGRESS.value, Stage.ROUTED.value],
                     OutboxStatus.PENDING.value,
-                    now,
-                    message_id,
-                    replay_from,
                 )
-                count = _rowcount(result)
-                if count:
-                    pre = await conn.fetchrow(
-                        "SELECT 1 FROM queue WHERE message_id=$1 AND stage = ANY($2::text[])"
-                        " AND status=$3 LIMIT 1",
-                        message_id,
-                        [Stage.INGRESS.value, Stage.ROUTED.value],
-                        OutboxStatus.PENDING.value,
-                    )
-                    status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value
-                    await conn.execute(
-                        "UPDATE messages SET status=$1, error=NULL WHERE id=$2", status, message_id
-                    )
-                    await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
+                status = MessageStatus.RECEIVED.value if pre else MessageStatus.ROUTED.value
+                await conn.execute(
+                    "UPDATE messages SET status=$1, error=NULL WHERE id=$2", status, message_id
+                )
+                await self._event(conn, message_id, "replayed", None, f"{count} row(s)", now)
         return count
 
     async def resend_to(
@@ -4190,7 +4758,7 @@ class PostgresStore:
         SKIP-LOCKED/MVCC. Idempotency: the ``resend_log`` INSERT (ON CONFLICT DO NOTHING) runs FIRST and
         the outbound row is created only when it returned a row (ADR 0090 §4)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 await self._lock_outbound_lanes(conn, (to,))
                 # Idempotency gate FIRST: claim the key; proceed only if we created the row.
@@ -4253,7 +4821,9 @@ class PostgresStore:
                             f"message {message_id} edited body is empty -- cannot resend"
                         )
                     # Correlate the child to the origin (mirrors `reingress`).
-                    raw_meta = self._dec(orow["metadata"])
+                    raw_meta = self._dec(
+                        orow["metadata"], aad=cell_aad("messages", "metadata", message_id)
+                    )
                     try:
                         parent_meta = json.loads(raw_meta) if raw_meta else {}
                     except (ValueError, TypeError):
@@ -4307,7 +4877,7 @@ class PostgresStore:
                         src_where += " AND destination_name=$3"
                         src_args.append(from_)
                     src_rows = await conn.fetch(
-                        "SELECT q.destination_name, q.channel_id,"
+                        "SELECT q.id, q.body_ref, q.destination_name, q.channel_id,"
                         " COALESCE(sb.body, q.payload) AS _body_ciphertext"
                         " FROM queue q LEFT JOIN shared_body sb ON sb.hash = q.body_ref"
                         f" WHERE {src_where} ORDER BY q.destination_name",
@@ -4327,7 +4897,13 @@ class PostgresStore:
                     src = src_rows[0]
                     src_channel = str(src["channel_id"])
                     src_dest = str(src["destination_name"])
-                    decoded = self._dec(src["_body_ciphertext"])
+                    # The body's cell depends on its source (store-once shared body vs inline payload).
+                    body_aad = (
+                        cell_aad("shared_body", "body", src["body_ref"])
+                        if src["body_ref"] is not None
+                        else cell_aad("queue", "payload", src["id"])
+                    )
+                    decoded = self._dec(src["_body_ciphertext"], aad=body_aad)
                     if not decoded:
                         raise ResendSourceEmpty(
                             f"message {message_id} source body was purged by retention -- cannot resend"
@@ -4376,7 +4952,7 @@ class PostgresStore:
         (ADR 0013) the fresh INGRESS row lands at the channel's ingress tail — a new logged receipt, not
         re-inserted into any historical outbound-lane position, so no outbound writer-funnel applies."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 orow = await conn.fetchrow(
                     "SELECT channel_id, source_type, message_type, metadata FROM messages WHERE id=$1",
@@ -4418,7 +4994,9 @@ class PostgresStore:
                         new_message_id=(prior["outbox_id"] if prior else "") or "",
                         channel_id=channel_id,
                     )
-                raw_meta = self._dec(orow["metadata"])
+                raw_meta = self._dec(
+                    orow["metadata"], aad=cell_aad("messages", "metadata", origin_message_id)
+                )
                 try:
                     parent_meta = json.loads(raw_meta) if raw_meta else {}
                 except (ValueError, TypeError):
@@ -4452,16 +5030,20 @@ class PostgresStore:
                         error=None,
                         now=now,
                     )
+                    # Hoist the row id so the payload binds to its own (queue, payload, id) cell.
+                    resubmit_row_id = uuid4().hex
                     await conn.execute(
                         "INSERT INTO queue"
                         " (id, message_id, stage, channel_id, destination_name, payload,"
                         "  status, attempts, next_attempt_at, created_at, updated_at)"
                         " VALUES ($1,$2,$3,$4,NULL,$5,$6,0,$7,$8,$9)",
-                        uuid4().hex,
+                        resubmit_row_id,
                         new_mid,
                         Stage.INGRESS.value,
                         channel_id,
-                        self._cipher.encrypt(raw),
+                        self._cipher.encrypt(
+                            raw, aad=cell_aad("queue", "payload", resubmit_row_id)
+                        ),
                         OutboxStatus.PENDING.value,
                         now,
                         now,
@@ -4501,41 +5083,40 @@ class PostgresStore:
         ``pending`` with attempts reset, revert each affected message from ``error`` to ``routed``.
         Scoped to ``stage='outbound'`` to match the dead-letter view. Returns rows requeued."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                ids = await conn.fetch(
-                    "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
-                    " AND ($3::text IS NULL OR channel_id=$3)"
-                    " AND ($4::text IS NULL OR destination_name=$4)",
-                    Stage.OUTBOUND.value,
-                    OutboxStatus.DEAD.value,
-                    channel_id,
-                    destination_name,
+        async with self._timed_acquire() as conn, conn.transaction():
+            ids = await conn.fetch(
+                "SELECT DISTINCT message_id FROM queue WHERE stage=$1 AND status=$2"
+                " AND ($3::text IS NULL OR channel_id=$3)"
+                " AND ($4::text IS NULL OR destination_name=$4)",
+                Stage.OUTBOUND.value,
+                OutboxStatus.DEAD.value,
+                channel_id,
+                destination_name,
+            )
+            message_ids = [r["message_id"] for r in ids]
+            if not message_ids:
+                return 0
+            result = await conn.execute(
+                "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
+                " updated_at=$2 WHERE stage=$3 AND status=$4"
+                " AND ($5::text IS NULL OR channel_id=$5)"
+                " AND ($6::text IS NULL OR destination_name=$6)",
+                OutboxStatus.PENDING.value,
+                now,
+                Stage.OUTBOUND.value,
+                OutboxStatus.DEAD.value,
+                channel_id,
+                destination_name,
+            )
+            count = _rowcount(result)
+            for message_id in message_ids:
+                await conn.execute(
+                    "UPDATE messages SET status=$1, error=NULL WHERE id=$2 AND status=$3",
+                    MessageStatus.ROUTED.value,
+                    message_id,
+                    MessageStatus.ERROR.value,
                 )
-                message_ids = [r["message_id"] for r in ids]
-                if not message_ids:
-                    return 0
-                result = await conn.execute(
-                    "UPDATE queue SET status=$1, attempts=0, next_attempt_at=$2, last_error=NULL,"
-                    " updated_at=$2 WHERE stage=$3 AND status=$4"
-                    " AND ($5::text IS NULL OR channel_id=$5)"
-                    " AND ($6::text IS NULL OR destination_name=$6)",
-                    OutboxStatus.PENDING.value,
-                    now,
-                    Stage.OUTBOUND.value,
-                    OutboxStatus.DEAD.value,
-                    channel_id,
-                    destination_name,
-                )
-                count = _rowcount(result)
-                for message_id in message_ids:
-                    await conn.execute(
-                        "UPDATE messages SET status=$1, error=NULL WHERE id=$2 AND status=$3",
-                        MessageStatus.ROUTED.value,
-                        message_id,
-                        MessageStatus.ERROR.value,
-                    )
-                    await self._event(conn, message_id, "replayed", None, "dead-letter replay", now)
+                await self._event(conn, message_id, "replayed", None, "dead-letter replay", now)
         return count
 
     async def cancel_queued(
@@ -4560,34 +5141,31 @@ class PostgresStore:
         )
         if top_only:
             query += " LIMIT 1"
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    query, destination_name, OutboxStatus.PENDING.value, channel_id
-                )
-                if not rows:
-                    return 0
-                ids = [r["id"] for r in rows]
-                await conn.execute(
-                    "UPDATE queue SET status=$1, updated_at=$2 WHERE id = ANY($3::text[])",
-                    OutboxStatus.CANCELLED.value,
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(query, destination_name, OutboxStatus.PENDING.value, channel_id)
+            if not rows:
+                return 0
+            ids = [r["id"] for r in rows]
+            await conn.execute(
+                "UPDATE queue SET status=$1, updated_at=$2 WHERE id = ANY($3::text[])",
+                OutboxStatus.CANCELLED.value,
+                now,
+                ids,
+            )
+            for r in rows:
+                await self._event(
+                    conn,
+                    r["message_id"],
+                    "cancelled",
+                    destination_name,
+                    "manual purge",
                     now,
-                    ids,
                 )
-                for r in rows:
-                    await self._event(
-                        conn,
-                        r["message_id"],
-                        "cancelled",
-                        destination_name,
-                        "manual purge",
-                        now,
-                    )
-                # Pre-lock every affected message's finalize lock in canonical order before finalizing
-                # any, so two concurrent multi-message cancels can't form a lock cycle (deadlock).
-                await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
-                for message_id in {r["message_id"] for r in rows}:
-                    await self._maybe_finalize_message(conn, message_id, now)
+            # Pre-lock every affected message's finalize lock in canonical order before finalizing
+            # any, so two concurrent multi-message cancels can't form a lock cycle (deadlock).
+            await self._lock_finalize_batch(conn, (r["message_id"] for r in rows))
+            for message_id in {r["message_id"] for r in rows}:
+                await self._maybe_finalize_message(conn, message_id, now)
         return len(ids)
 
     # --- read helpers (API / console) ----------------------------------------
@@ -4597,10 +5175,14 @@ class PostgresStore:
         if record is None:
             return None
         d = dict(record)
-        d["raw"] = self._cipher.decrypt(d["raw"])  # decrypt the body for display
-        d["error"] = self._dec(d["error"])  # error may embed raw HL7 fragments (WP-5)
-        d["summary"] = self._dec(d["summary"])  # EF-3: MRN/name PHI, ciphered at rest
-        d["metadata"] = self._dec(d["metadata"])  # EF-3
+        mid = d["id"]
+        # decrypt the body for display, bound to the messages cell (ASVS 11.3.3)
+        d["raw"] = self._cipher.decrypt(d["raw"], aad=cell_aad("messages", "raw", mid))
+        # error may embed raw HL7 fragments (WP-5)
+        d["error"] = self._dec(d["error"], aad=cell_aad("messages", "error", mid))
+        # EF-3: MRN/name PHI, ciphered at rest
+        d["summary"] = self._dec(d["summary"], aad=cell_aad("messages", "summary", mid))
+        d["metadata"] = self._dec(d["metadata"], aad=cell_aad("messages", "metadata", mid))  # EF-3
         return d
 
     async def message_metadata_json(self, message_id: str) -> str | None:
@@ -4609,7 +5191,7 @@ class PostgresStore:
         record = await self._fetchone("SELECT metadata FROM messages WHERE id=$1", message_id)
         if record is None:
             return None
-        return self._dec(record["metadata"])
+        return self._dec(record["metadata"], aad=cell_aad("messages", "metadata", message_id))
 
     async def list_messages(
         self,
@@ -4648,7 +5230,10 @@ class PostgresStore:
             limit,
             offset,
         )
-        return [self._decode_record(r, "error", "summary", "metadata") for r in rows]
+        return [
+            self._decode_record(r, "messages", (r["id"],), "error", "summary", "metadata")
+            for r in rows
+        ]
 
     async def count_messages(
         self,
@@ -4715,10 +5300,11 @@ class PostgresStore:
                 truncated = True
                 break
             scanned += 1
-            raw = self._dec(cand["raw"])
-            summary = self._dec(cand["summary"])
+            cid = cand["id"]
+            raw = self._dec(cand["raw"], aad=cell_aad("messages", "raw", cid))
+            summary = self._dec(cand["summary"], aad=cell_aad("messages", "summary", cid))
             if row_matches(spec, raw=raw, summary=summary):
-                d = self._decode_record(cand, "error", "summary", "metadata")
+                d = self._decode_record(cand, "messages", (cid,), "error", "summary", "metadata")
                 d.pop("raw", None)
                 out.append(d)
                 if len(out) >= limit:
@@ -4748,7 +5334,16 @@ class PostgresStore:
             limit,
             offset,
         )
-        return [self._decode_record(r, "last_error", "summary") for r in rows]
+        # Mixed-table join: last_error is queue's (o.id, aliased outbox_id), summary is the joined
+        # messages row's (keyed by message_id) — each binds to its own cell (ASVS 11.3.3).
+        out: list[dict[str, Any]] = []
+        for r in rows:
+            d = self._decode_record(r, "queue", (r["outbox_id"],), "last_error")
+            d["summary"] = self._dec(
+                r["summary"], aad=cell_aad("messages", "summary", r["message_id"])
+            )
+            out.append(d)
+        return out
 
     async def count_dead(
         self,
@@ -4821,7 +5416,7 @@ class PostgresStore:
         )
         # Only last_error is decrypted here; the encrypted `payload` body is left as-is on purpose —
         # bodies come through get_message (audited). Don't add `payload` to this projection's decrypt.
-        return [self._decode_record(r, "last_error") for r in rows]
+        return [self._decode_record(r, "queue", (r["id"],), "last_error") for r in rows]
 
     async def outbox_payloads_for(self, message_id: str) -> list[dict[str, Any]]:
         """Like :meth:`outbox_for`, but also decrypts the transformed ``payload`` (PHI body) for the
@@ -4832,13 +5427,20 @@ class PostgresStore:
             message_id,
             Stage.OUTBOUND.value,
         )
-        return [self._decode_record(r, "last_error", "payload") for r in rows]
+        # Postgres keeps bodies inline (body_ref always NULL this increment), so payload is decoded as
+        # queue.payload directly — no shared_body deref (mirrors _outbox_item). Both cols key on queue.id.
+        return [self._decode_record(r, "queue", (r["id"],), "last_error", "payload") for r in rows]
 
     async def events_for(self, message_id: str) -> list[dict[str, Any]]:
         rows = await self._fetchall(
             "SELECT * FROM message_events WHERE message_id=$1 ORDER BY id", message_id
         )
-        return [self._decode_record(r, "detail") for r in rows]
+        return [
+            self._decode_record(
+                r, "message_events", (r["message_id"], r["ts"], r["event"]), "detail"
+            )
+            for r in rows
+        ]
 
     async def stats(self) -> dict[str, int]:
         """Outbound-queue depth by status (scoped to outbound rows — the delivery backlog)."""
@@ -4867,9 +5469,8 @@ class PostgresStore:
     ) -> None:
         """Append a ``viewed`` audit event (called whenever a message body / PHI is opened)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._event(conn, message_id, "viewed", None, actor or "", now)
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._event(conn, message_id, "viewed", None, actor or "", now)
 
     async def record_audit(
         self,
@@ -4878,44 +5479,53 @@ class PostgresStore:
         actor: str | None = None,
         channel_id: str | None = None,
         detail: str | None = None,
+        client: str | None = None,
         now: float | None = None,
     ) -> None:
         """Append a row to the audit hash chain. H-7: takes the audit-chain advisory lock first, so
         concurrent writers serialize on the read-tail + insert and can't fork the chain.
 
+        ``client`` is the caller's network address (ADR 0150), NULL for engine-internal writes; see
+        :meth:`~messagefoundry.store.base.AuditStore.record_audit`.
+
         After the row commits, a **PHI-safe metadata copy** is teed off-box via the shared
         :func:`~messagefoundry.store.audit_tee.emit_audit_tee` (sec-offbox-log) — the same redaction
         path the SQLite and SQL Server backends use."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
-                last = await conn.fetchrow(
-                    "SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1"
-                )
-                prev = last["row_hash"] if last and last["row_hash"] else ""
-                row_hash = audit_row_hash(
-                    prev,
-                    ts=now,
-                    actor=actor,
-                    action=action,
-                    channel_id=channel_id,
-                    detail=detail,
-                    key=self._audit_append_key(),  # keyed once the #190 watermark is set, else keyless
-                )
-                await conn.execute(
-                    "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
-                    " VALUES ($1,$2,$3,$4,$5,$6)",
-                    now,
-                    actor,
-                    action,
-                    channel_id,
-                    detail,
-                    row_hash,
-                )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._advisory_lock(conn, _LOCK_CLASS_AUDIT, _AUDIT_LOCK)
+            last = await conn.fetchrow("SELECT row_hash FROM audit_log ORDER BY id DESC LIMIT 1")
+            prev = last["row_hash"] if last and last["row_hash"] else ""
+            # Keyed (in-heap HMAC key or isolated-module Transit MAC) once the #190
+            # watermark is set, else keyless.
+            _key, _mac = self._audit_append_mac()
+            row_hash = audit_row_hash(
+                prev,
+                ts=now,
+                actor=actor,
+                action=action,
+                channel_id=channel_id,
+                detail=detail,
+                client=client,
+                key=_key,
+                mac=_mac,
+            )
+            await conn.execute(
+                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, client, row_hash)"
+                " VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                now,
+                actor,
+                action,
+                channel_id,
+                detail,
+                client,
+                row_hash,
+            )
         # Tee off-box AFTER the transaction commits + the connection is released (only forward what
         # truly persisted; never hold the advisory lock / a pooled connection across a syslog send).
-        emit_audit_tee(action=action, actor=actor, channel_id=channel_id, detail=detail, ts=now)
+        emit_audit_tee(
+            action=action, actor=actor, channel_id=channel_id, detail=detail, client=client, ts=now
+        )
 
     async def list_audit(
         self,
@@ -5018,6 +5628,44 @@ class PostgresStore:
         )
         return _rowcount(result) > 0
 
+    # --- per-key AES-GCM invocation bound (ASVS 11.3.4) ----------------------
+
+    async def _charge_bound_batch(self) -> None:
+        """Top the AES-GCM invocation reserve up mid-burst — called after EVERY committed batch of a
+        rotation / at-rest-migration loop (ASVS 11.3.4; the SQLite twin documents why).
+
+        Runs on its own pooled connection, OUTSIDE the batch transaction: the batch is already committed,
+        and an accounting write must never be rolled back with a retried batch."""
+        await self.checkpoint_cipher_invocations()
+
+    async def add_cipher_invocations(self, key_id: str, count: int) -> int:
+        """Atomically add ``count`` invocations to ``key_id``'s persisted total; return the new total (a
+        NEGATIVE ``count`` refunds an unspent reserve at settlement). See the SQLite twin — one row per
+        key_id, reserve-then-spend, aggregating every process on this one unified store (engine shards
+        and `[cluster]` HA nodes alike)."""
+        row = await self._fetchone(
+            "INSERT INTO cipher_meta (key_id, invocations, updated_at) VALUES ($1,$2,$3)"
+            " ON CONFLICT (key_id) DO UPDATE SET"
+            " invocations = cipher_meta.invocations + EXCLUDED.invocations,"
+            " updated_at = EXCLUDED.updated_at"
+            " RETURNING invocations",
+            key_id,
+            int(count),
+            time.time(),
+        )
+        return int(row["invocations"]) if row is not None else int(count)
+
+    async def cipher_invocations(self, key_id: str) -> int:
+        """``key_id``'s persisted cumulative invocation total (0 when the key has no row yet)."""
+        row = await self._fetchone("SELECT invocations FROM cipher_meta WHERE key_id = $1", key_id)
+        return int(row["invocations"]) if row is not None else 0
+
+    async def checkpoint_cipher_invocations(self, *, settle: bool = False) -> int | None:
+        """See :func:`messagefoundry.store.gcm_bound.checkpoint_invocations`."""
+        return await checkpoint_invocations(
+            self._cipher, self.add_cipher_invocations, settle=settle
+        )
+
     async def audit_anchor(self) -> tuple[int, str]:
         """The audit log's external anchor — ``(row_count, head_hash)`` (head ``""`` when empty)."""
         row = await self._fetchone(
@@ -5038,24 +5686,35 @@ class PostgresStore:
         self, *, expected_anchor: tuple[int, str] | None = None
     ) -> tuple[bool, str | None]:
         """Recompute the audit hash-chain in order; returns ``(ok, message)``. Pass ``expected_anchor``
-        from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation."""
-        if self._audit_keyed_from is not None and self._audit_mac_key is None:
+        from :meth:`audit_anchor` (held out-of-band) to also detect tail-truncation.
+
+        Constant-time, full-walk (ASVS 11.2.4) — see the SQLite twin
+        (:meth:`~messagefoundry.store.store.MessageStore.verify_audit_chain`): every row MAC and the
+        anchor head are compared with :func:`hmac.compare_digest` over
+        :func:`~messagefoundry.store.store.audit_mac_bytes`, and the walk always completes before the
+        first divergent row id is reported."""
+        if self._audit_keyed_from is not None and not self._audit_keyed_capable():
             return (
                 False,
                 "audit chain is keyed (from id="
-                f"{self._audit_keyed_from}) but no store encryption key is configured to verify it",
+                f"{self._audit_keyed_from}) but no store encryption key/MAC is configured to verify it",
             )
         rows = await self._fetchall(
-            "SELECT id, ts, actor, action, channel_id, detail, row_hash FROM audit_log ORDER BY id"
+            "SELECT id, ts, actor, action, channel_id, detail, client, row_hash"
+            " FROM audit_log ORDER BY id"
         )
         prev = ""
         count = 0
+        first_break: int | None = None
         for r in rows:
-            key = (
-                self._audit_mac_key
-                if self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
-                else None
+            # Per-row secret: keyless below the #190 watermark, keyed at/above it — in-heap HMAC key OR
+            # isolated-module Transit MAC (ADR 0138), mirroring the SQLite twin so a keyless prefix and a
+            # keyed suffix both verify across an enabled-keying migration.
+            keyed_row = (
+                self._audit_keyed_from is not None and int(r["id"]) >= self._audit_keyed_from
             )
+            key = self._audit_mac_key if (keyed_row and self._audit_mac_fn is None) else None
+            mac = self._audit_mac_fn if keyed_row else None
             expected = audit_row_hash(
                 prev,
                 ts=r["ts"],
@@ -5063,15 +5722,27 @@ class PostgresStore:
                 action=r["action"],
                 channel_id=r["channel_id"],
                 detail=r["detail"],
+                # NULL on every pre-ADR-0150 row → the conditional 7th element is omitted and the
+                # legacy digest reproduces exactly, so a mixed old/new chain verifies end to end.
+                client=r["client"],
                 key=key,
+                mac=mac,
             )
-            if r["row_hash"] != expected:
-                return False, f"audit chain broken at row id={r['id']}"
-            prev = r["row_hash"]
+            # ASVS 11.2.4: constant-time compare, no data-dependent early return — record the first
+            # divergent row and report it AFTER the full walk (see the SQLite twin).
+            # Bind the compare first so it is ALWAYS evaluated: folding it behind the
+            # `first_break is None` test would short-circuit the comparator once a break is known.
+            row_ok = hmac.compare_digest(audit_mac_bytes(r["row_hash"]), audit_mac_bytes(expected))
+            if not row_ok and first_break is None:
+                first_break = int(r["id"])
+            prev = r["row_hash"] or ""
             count += 1
+        if first_break is not None:
+            return False, f"audit chain broken at row id={first_break}"
         if expected_anchor is not None:
             exp_count, exp_head = expected_anchor
-            if count < exp_count or prev != exp_head:
+            head_ok = hmac.compare_digest(audit_mac_bytes(prev), audit_mac_bytes(exp_head))
+            if count < exp_count or not head_ok:
                 return (
                     False,
                     f"audit log diverges from recorded anchor (have {count} row(s) head {prev[:12]!r}, "
@@ -5152,7 +5823,7 @@ class PostgresStore:
         now = time.time() if now is None else now
         await self._execute(
             "UPDATE users SET totp_secret=$1, updated_at=$2 WHERE id=$3",
-            self._enc(secret),
+            self._enc(secret, aad=cell_aad("users", "totp_secret", user_id)),
             now,
             user_id,
         )
@@ -5161,7 +5832,7 @@ class PostgresStore:
         d = await self._fetchone("SELECT totp_secret FROM users WHERE id=$1", user_id)
         if not d or d["totp_secret"] is None:
             return None
-        return self._dec(d["totp_secret"])
+        return self._dec(d["totp_secret"], aad=cell_aad("users", "totp_secret", user_id))
 
     async def enable_totp(
         self, user_id: str, *, recovery_code_hashes: list[str], now: float | None = None
@@ -5197,42 +5868,40 @@ class PostgresStore:
         + ``UPDATE`` run in one transaction, so concurrent verifications (even cross-node) can't
         double-spend a single-use recovery code (WP-14)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT totp_recovery_codes FROM users WHERE id=$1 FOR UPDATE", user_id
-                )
-                if row is None or row["totp_recovery_codes"] is None:
-                    return False
-                hashes = [str(h) for h in json.loads(row["totp_recovery_codes"])]
-                if code_hash not in hashes:
-                    return False  # already consumed by a concurrent caller
-                hashes.remove(code_hash)
-                await conn.execute(
-                    "UPDATE users SET totp_recovery_codes=$1, updated_at=$2 WHERE id=$3",
-                    json.dumps(hashes),
-                    now,
-                    user_id,
-                )
-                return True
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT totp_recovery_codes FROM users WHERE id=$1 FOR UPDATE", user_id
+            )
+            if row is None or row["totp_recovery_codes"] is None:
+                return False
+            hashes = [str(h) for h in json.loads(row["totp_recovery_codes"])]
+            if code_hash not in hashes:
+                return False  # already consumed by a concurrent caller
+            hashes.remove(code_hash)
+            await conn.execute(
+                "UPDATE users SET totp_recovery_codes=$1, updated_at=$2 WHERE id=$3",
+                json.dumps(hashes),
+                now,
+                user_id,
+            )
+            return True
 
     async def consume_totp_step(self, user_id: str, step: int) -> bool:
         """Atomically record ``step`` as the user's highest consumed TOTP time-step; ``True`` iff newly
         consumed (strictly greater than any prior step). A code replayed inside its ±1-step verify
         window resolves to a non-greater step and returns ``False`` — single-use per ASVS 6.5.1. The
         ``SELECT ... FOR UPDATE`` + ``UPDATE`` run in one transaction (no cross-node double-spend)."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT last_totp_step FROM users WHERE id=$1 FOR UPDATE", user_id
-                )
-                if row is None:
-                    return False
-                last = row["last_totp_step"]
-                if last is not None and last >= step:
-                    return False  # already consumed (or an older step) — replay within the window
-                await conn.execute("UPDATE users SET last_totp_step=$1 WHERE id=$2", step, user_id)
-                return True
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT last_totp_step FROM users WHERE id=$1 FOR UPDATE", user_id
+            )
+            if row is None:
+                return False
+            last = row["last_totp_step"]
+            if last is not None and last >= step:
+                return False  # already consumed (or an older step) — replay within the window
+            await conn.execute("UPDATE users SET last_totp_step=$1 WHERE id=$2", step, user_id)
+            return True
 
     async def set_user_disabled(
         self, user_id: str, *, disabled: bool, now: float | None = None
@@ -5339,31 +6008,29 @@ class PostgresStore:
         concurrent assertion consumed the same counter — the caller treats it as a clone signal
         (ADR 0068 §4). The ``SELECT ... FOR UPDATE`` + guarded ``UPDATE`` run in one transaction
         (no cross-node double-spend)."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow(
-                    "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"
-                    " FOR UPDATE",
-                    credential_id_hash,
-                )
-                if row is None or row["sign_count"] != expected:
-                    return False  # consumed by a concurrent assertion — clone signal
-                await conn.execute(
-                    "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
-                    " WHERE credential_id_hash=$3",
-                    new,
-                    used_at,
-                    credential_id_hash,
-                )
-                return True
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT sign_count FROM webauthn_credentials WHERE credential_id_hash=$1"
+                " FOR UPDATE",
+                credential_id_hash,
+            )
+            if row is None or row["sign_count"] != expected:
+                return False  # consumed by a concurrent assertion — clone signal
+            await conn.execute(
+                "UPDATE webauthn_credentials SET sign_count=$1, last_used_at=$2"
+                " WHERE credential_id_hash=$3",
+                new,
+                used_at,
+                credential_id_hash,
+            )
+            return True
 
     async def delete_user(self, user_id: str) -> None:
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-                await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
-                await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
-                await conn.execute("DELETE FROM users WHERE id=$1", user_id)
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM sessions WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM webauthn_credentials WHERE user_id=$1", user_id)
+            await conn.execute("DELETE FROM users WHERE id=$1", user_id)
 
     async def record_login_success(self, user_id: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
@@ -5423,15 +6090,14 @@ class PostgresStore:
     async def delete_custom_role(self, role_id: str) -> bool:
         """Delete a custom (``builtin=FALSE``) role and its user/AD-group assignments in one
         transaction (ADR 0045 D4); never touches a built-in row. Returns ``True`` if removed."""
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
-                if row is None or bool(row["builtin"]):
-                    return False
-                await conn.execute("DELETE FROM user_roles WHERE role_id=$1", role_id)
-                await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
-                await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
-                return True
+        async with self._timed_acquire() as conn, conn.transaction():
+            row = await conn.fetchrow("SELECT builtin FROM roles WHERE id=$1", role_id)
+            if row is None or bool(row["builtin"]):
+                return False
+            await conn.execute("DELETE FROM user_roles WHERE role_id=$1", role_id)
+            await conn.execute("DELETE FROM ad_group_role_map WHERE role_id=$1", role_id)
+            await conn.execute("DELETE FROM roles WHERE id=$1", role_id)
+            return True
 
     async def get_user_role_ids(self, user_id: str) -> list[str]:
         rows = await self._fetchall(
@@ -5448,18 +6114,17 @@ class PostgresStore:
         now: float | None = None,
     ) -> None:
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
-                for role_id in role_ids:
-                    await conn.execute(
-                        "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
-                        " VALUES ($1,$2,$3,$4)",
-                        user_id,
-                        role_id,
-                        now,
-                        assigned_by,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM user_roles WHERE user_id=$1", user_id)
+            for role_id in role_ids:
+                await conn.execute(
+                    "INSERT INTO user_roles (user_id, role_id, assigned_at, assigned_by)"
+                    " VALUES ($1,$2,$3,$4)",
+                    user_id,
+                    role_id,
+                    now,
+                    assigned_by,
+                )
 
     async def set_user_channel_scope(
         self, user_id: str, scope_json: str | None, *, now: float | None = None
@@ -5487,15 +6152,14 @@ class PostgresStore:
 
     async def set_ad_group_role_map(self, entries: Iterable[tuple[str, str]]) -> None:
         pairs = sorted({(g.strip().lower(), r) for g, r in entries if g.strip()})
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM ad_group_role_map")
-                for ad_group, role_id in pairs:
-                    await conn.execute(
-                        "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES ($1,$2)",
-                        ad_group,
-                        role_id,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM ad_group_role_map")
+            for ad_group, role_id in pairs:
+                await conn.execute(
+                    "INSERT INTO ad_group_role_map (ad_group, role_id) VALUES ($1,$2)",
+                    ad_group,
+                    role_id,
+                )
 
     async def channels_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
         normalized = sorted({g.strip().lower() for g in groups if g.strip()})
@@ -5516,15 +6180,14 @@ class PostgresStore:
         pairs = sorted(
             {(g.strip().lower(), c.strip()) for g, c in entries if g.strip() and c.strip()}
         )
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                await conn.execute("DELETE FROM ad_group_scope_map")
-                for ad_group, channel in pairs:
-                    await conn.execute(
-                        "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES ($1,$2)",
-                        ad_group,
-                        channel,
-                    )
+        async with self._timed_acquire() as conn, conn.transaction():
+            await conn.execute("DELETE FROM ad_group_scope_map")
+            for ad_group, channel in pairs:
+                await conn.execute(
+                    "INSERT INTO ad_group_scope_map (ad_group, channel) VALUES ($1,$2)",
+                    ad_group,
+                    channel,
+                )
 
     async def create_session(
         self,
@@ -5590,6 +6253,18 @@ class PostgresStore:
             "UPDATE sessions SET mfa_verified_at=$1 WHERE token_hash=$2", now, token_hash
         )
 
+    async def rotate_session(self, token_hash: str, *, new_token_hash: str) -> bool:
+        """Re-key a live session in place (ASVS 7.2.4). See :meth:`AuthStore.rotate_session`.
+
+        Uses ``self._pool.execute`` rather than ``self._execute``: only the former returns asyncpg's
+        status tag, and this op's contract is its rowcount."""
+        result = await self._pool.execute(
+            "UPDATE sessions SET token_hash=$1 WHERE token_hash=$2 AND revoked_at IS NULL",
+            new_token_hash,
+            token_hash,
+        )
+        return _rowcount(result) > 0
+
     async def revoke_session(self, token_hash: str, *, now: float | None = None) -> None:
         now = time.time() if now is None else now
         await self._execute(
@@ -5645,9 +6320,11 @@ class PostgresStore:
         connection_cutoffs: Mapping[str, float] | None = None,
     ) -> int:
         """Null the PHI **bodies** of fully-resolved messages received before ``older_than`` while
-        keeping their metadata rows (the Mirth Data-Pruner pattern). Eligible only when the message has
+        keeping the message ROW (the Mirth Data-Pruner pattern). Eligible only when the message has
         no queue row still ``pending``/``inflight``. Ported, not stubbed — Postgres supports retention.
-        Returns the number of messages whose body was nulled.
+        ``metadata`` is blanked in the SAME statement as the body (ASVS 14.2.7), guarded on
+        ``raw <> '' OR metadata IS NOT NULL`` so rows purged by a pre-upgrade engine are swept — and
+        counted — on the first pass after upgrade. Returns the number of messages purged.
 
         ``connection_cutoffs`` (#34, ADR 0027) optionally overrides the cutoff per ``channel_id``
         (``float('-inf')`` = keep forever); default empty ⇒ a single global cutoff, byte-identical to
@@ -5672,11 +6349,11 @@ class PostgresStore:
             f" AND q.status = ANY(${inflight_ph}::text[]))"
         )
         lead = [*cutoff_params, inflight]
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
-                    f"UPDATE messages SET raw='', summary=NULL, error=NULL"
-                    f" WHERE raw <> '' AND id IN ({eligible})",
+                    f"UPDATE messages SET metadata=NULL, raw='', summary=NULL, error=NULL"
+                    f" WHERE (raw <> '' OR metadata IS NOT NULL) AND id IN ({eligible})",
                     *lead,
                 )
                 purged = _rowcount(result)
@@ -5756,7 +6433,7 @@ class PostgresStore:
                 cutoff = cutoff_for(row["channel_id"], older_than, connection_cutoffs)
                 if row["received_at"] >= cutoff:
                     continue
-                raw = self._cipher.decrypt(row["raw"])
+                raw = self._cipher.decrypt(row["raw"], aad=cell_aad("messages", "raw", row["id"]))
                 new_raw, n_docs, n_bytes = _strip_documents(
                     raw,
                     pruned_at=now,
@@ -5765,7 +6442,13 @@ class PostgresStore:
                 )
                 if n_docs == 0:
                     continue
-                updates.append((self._cipher.encrypt(new_raw), now, row["id"]))
+                updates.append(
+                    (
+                        self._cipher.encrypt(new_raw, aad=cell_aad("messages", "raw", row["id"])),
+                        now,
+                        row["id"],
+                    )
+                )
                 msgs += 1
                 docs += n_docs
                 reclaimed += n_bytes
@@ -5781,6 +6464,21 @@ class PostgresStore:
     async def purge_connection_events(self, *, older_than: float, now: float | None = None) -> int:
         # #46: metadata-only rows (no body/FK) — age-DELETE on their own window (RetentionRunner-driven).
         result = await self._pool.execute("DELETE FROM connection_event WHERE ts < $1", older_than)
+        return _rowcount(result)
+
+    async def purge_search_presets(self, *, older_than: float, now: float | None = None) -> int:
+        # ADR 0136 saved searches: `criteria` is a PHI-shaped needle (PHI.md §2) with no window until
+        # ASVS 14.2.7. Whole-row DELETE — the criteria IS the payload and the row backs no count.
+        # `updated_at`/`last_used_at` are DOUBLE PRECISION epochs here (as on SQLite/SQL Server), so the
+        # comparison needs no timestamptz handling. #306: key on the LATER of last-edited and last-used.
+        # Postgres' GREATEST already ignores NULL arguments (unlike SQLite's max()), so the COALESCE is
+        # belt-and-braces + dialect-parity — either way a pre-#306 row (last_used_at NULL) purges on
+        # `updated_at` alone.
+        result = await self._pool.execute(
+            "DELETE FROM search_presets"
+            " WHERE GREATEST(updated_at, COALESCE(last_used_at, updated_at)) < $1",
+            older_than,
+        )
         return _rowcount(result)
 
     async def purge_dead_letters(
@@ -5802,7 +6500,7 @@ class PostgresStore:
         cutoff_sql, cutoff_params, _ = _pg_cutoff_case(
             "destination_name", older_than, connection_cutoffs, start=3
         )
-        async with self._timed_acquire() as conn:
+        async with self._timed_acquire() as conn:  # noqa: SIM117
             async with conn.transaction():
                 result = await conn.execute(
                     "UPDATE queue SET payload='', last_error=NULL"
@@ -5833,29 +6531,28 @@ class PostgresStore:
         keys (the version-scan reload re-seeds the surviving rows, leaving the purged keys gone). Gated, so
         single-node writes no state_version rows and stays byte-identical."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:
-            async with conn.transaction():
-                rows = await conn.fetch(
-                    "SELECT namespace, key FROM state WHERE set_at < $1", older_than
-                )
-                purged_keys = [(r["namespace"], r["key"]) for r in rows]
-                if not purged_keys:
-                    return 0
-                await conn.execute("DELETE FROM state WHERE set_at < $1", older_than)
-                bumped: list[tuple[str, int]] = []
-                if self._cluster_state_convergence:
-                    for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable
-                        vrow = await conn.fetchrow(
-                            "INSERT INTO state_version (namespace, version, updated_at) "
-                            "VALUES ($1, 1, $2) "
-                            "ON CONFLICT (namespace) DO UPDATE SET "
-                            "version = state_version.version + 1, updated_at = excluded.updated_at "
-                            "RETURNING version",
-                            ns,
-                            now,
-                        )
-                        assert vrow is not None, "state_version upsert returned no row"
-                        bumped.append((ns, int(vrow["version"])))
+        async with self._timed_acquire() as conn, conn.transaction():
+            rows = await conn.fetch(
+                "SELECT namespace, key FROM state WHERE set_at < $1", older_than
+            )
+            purged_keys = [(r["namespace"], r["key"]) for r in rows]
+            if not purged_keys:
+                return 0
+            await conn.execute("DELETE FROM state WHERE set_at < $1", older_than)
+            bumped: list[tuple[str, int]] = []
+            if self._cluster_state_convergence:
+                for ns in dict.fromkeys(n for n, _ in purged_keys):  # distinct, order-stable
+                    vrow = await conn.fetchrow(
+                        "INSERT INTO state_version (namespace, version, updated_at) "
+                        "VALUES ($1, 1, $2) "
+                        "ON CONFLICT (namespace) DO UPDATE SET "
+                        "version = state_version.version + 1, updated_at = excluded.updated_at "
+                        "RETURNING version",
+                        ns,
+                        now,
+                    )
+                    assert vrow is not None, "state_version upsert returned no row"
+                    bumped.append((ns, int(vrow["version"])))
         # Commit succeeded → evict the purged keys from the read-through cache.
         for ck in purged_keys:
             self._state_cache.pop(ck, None)
@@ -6021,8 +6718,9 @@ class PostgresStore:
         The message is **not** finalized while ANY row at ANY stage is still pending/inflight. Once
         nothing is in flight, in strict precedence: any **dead** row anywhere → ``ERROR``; else any
         **outbound** row exists → ``PROCESSED``; else **no rows remain** and the message is still
-        ``ROUTED`` → ``FILTERED`` (every selected handler ran and produced zero deliveries); else leave
-        the disposition the handoff set."""
+        ``ROUTED`` → ``FILTERED`` (every selected handler ran and produced zero deliveries), or
+        ``NOT_DEPLOYED`` when a ``not_deployed`` event (#233) shows those zero deliveries were declines
+        to present-but-not-deployed targets; else leave the disposition the handoff set."""
         await self._advisory_lock(
             conn, _LOCK_CLASS_FINALIZE, f"{_FINALIZE_LOCK_PREFIX}{message_id}"
         )
@@ -6044,7 +6742,17 @@ class PostgresStore:
             msg = await conn.fetchrow("SELECT status FROM messages WHERE id=$1", message_id)
             if msg is None or msg["status"] != MessageStatus.ROUTED.value:
                 return
-            status = MessageStatus.FILTERED.value
+            # #233 (ADR 0111): NOT_DEPLOYED rather than FILTERED when every zero-delivery reason was a
+            # decline to a present-but-not-deployed target — persisted as a not_deployed event in the
+            # SAME handoff transaction, so it is visible here (mirrors MessageStore exactly).
+            nd = await conn.fetchrow(
+                "SELECT 1 FROM message_events WHERE message_id=$1 AND event=$2 LIMIT 1",
+                message_id,
+                NOT_DEPLOYED_EVENT,
+            )
+            status = (
+                MessageStatus.NOT_DEPLOYED.value if nd is not None else MessageStatus.FILTERED.value
+            )
         else:
             return  # only terminal non-dead non-outbound rows (shouldn't occur) — leave as-is
         await conn.execute("UPDATE messages SET status=$1 WHERE id=$2", status, message_id)

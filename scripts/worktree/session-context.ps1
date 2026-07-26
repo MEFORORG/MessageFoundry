@@ -65,6 +65,30 @@ if ($root) {
             $lines += "       scripts\worktree\prune-merged.ps1        (dry-run; add -Apply to remove)"
         }
 
+        # BACKLOG #309: what the OTHER sessions are building, before you start building it too. The commit-msg
+        # claim gate only enforces NUMBERED items; this banner is the whole mechanism for ad-hoc work -- and
+        # ad-hoc work is what actually collided (three sessions, one npm advisory, two duplicate PRs).
+        $claimDir = Join-Path (& git rev-parse --path-format=absolute --git-common-dir 2>$null).Trim() "mefor-coord/claims"
+        $claimFiles = @(Get-ChildItem $claimDir -Filter *.json -EA SilentlyContinue | Sort-Object Name)
+        if ($claimFiles.Count -gt 0) {
+            $meNorm = ($root -replace '\\', '/').TrimEnd('/')
+            $lines += ""
+            $lines += "Active work claims ($($claimFiles.Count)) -- do NOT start one held by another session:"
+            foreach ($cf in $claimFiles) {
+                try { $c = Get-Content $cf.FullName -Raw | ConvertFrom-Json } catch { continue }
+                $heldNorm = ($c.worktree -replace '\\', '/').TrimEnd('/')
+                $who = if ($heldNorm -ieq $meNorm) { "THIS session" } else { $c.worktree }
+                $stale = ""
+                try {
+                    $hrs = ((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
+                    if ($hrs -ge 12) { $stale = "  [stale ~$([int]$hrs)h]" }
+                } catch { }
+                $lines += "  $($c.key) -- $($c.note)"
+                $lines += "      held by $who [$($c.branch)]$stale"
+            }
+            $lines += "  Claim yours first:  scripts\coord\claim.ps1 -Take <key> -Note `"<what>`""
+        }
+
         $lines += ""
         $lines += "Coordination rules for parallel sessions (see docs/WORKTREES.md):"
         $lines += "  - Keep ALL changes on this worktree's branch ('$branch'); never edit files in a sibling worktree."

@@ -18,7 +18,7 @@ fully-offline path that a no-AI builder uses instead.
 | `/review` | `messagefoundry check` + `validate` (Problems panel, on-save) | ✅ shipped | `ide/src/validate.ts`, `checks.py` |
 | `/test` | **Test Bench** (dry-run, disposition, before/after) + **Generate Samples** (synthetic corpora) | ✅ shipped; deepening | `ide/src/testBench.ts`, `generate.ts` + PLAN-7 **L4/L7** |
 | `/explain` | **Cookbook + Walkthrough** — searchable "solved problems" gallery that inserts editable Python + `contributes.walkthroughs` onboarding + HL7-schema hover/autocomplete | ✅ shipped (Cookbook gallery + walkthrough) | BACKLOG **#104** + PLAN-7 **L3** |
-| `/migrate` | **Deterministic Corepoint import** — `messagefoundry import corepoint <export> --out <dir>` scaffolds one editable `@router`/`@handler` module per channel ([`corepoint_import.py`](../messagefoundry/corepoint_import.py)) | ✅ shipped (synthetic schema) | BACKLOG **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md) |
+| `/migrate` | **Deterministic Corepoint import** — `messagefoundry import corepoint <export> --out <dir>` scaffolds one editable `@router`/`@handler` module per channel ([`corepoint_import.py`](../messagefoundry/corepoint_import.py)) | ✅ shipped (validated `<Package>` XML schema, 2026-07-24) | BACKLOG **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md) |
 
 **The immediacy an interactive AI loop would give** is supplied deterministically by the **#92 live-debug
 loop** (PLAN-7 L2 v1 + L6 v2): edit → save → watch per-line values + disposition update inline, no
@@ -31,10 +31,12 @@ breakpoints, no AI, fully offline. That is the deterministic analogue of "ask th
   except discoverability-of-examples, which the now-shipped **#104 Cookbook** (gallery + walkthrough) closes.
 - **The former `/migrate` gap is closed** — the deterministic Corepoint import shipped 2026-07-10 (BACKLOG
   **#105**, [ADR 0086](adr/0086-deterministic-corepoint-import.md)): `messagefoundry import corepoint`
-  scaffolds editable `@router`/`@handler` Python from a Corepoint action-list export. The export **schema is
-  synthetic-until-validated** (no real Corepoint export exists in-repo, #87 recon is git-ignored), so it
-  needs reconciliation against a real export before it is trusted on production channels — but the AI-off
-  migrator now has a deterministic starting point instead of leaning on the AI `/migrate` subcommand.
+  scaffolds editable `@router`/`@handler` Python from a Corepoint action-list export. The export **schema
+  was reconciled against a real export on 2026-07-24** (ADR 0086 §2(a′)) — it is `<Package>` **XML**, a
+  recursive control-flow tree with rich-text-wrapped statements — so the parse is no longer speculative.
+  What still needs hand-finishing is the *mapping*: only a few verbs have an honest vocabulary equivalent
+  and endpoint wiring is a `deployed=False` placeholder, so the AI-off migrator gets a deterministic,
+  fully-accounted scaffold rather than a runnable transform.
 
 ## Guardrail (why "deterministic sibling" is safe where "no-code" is not)
 Every sibling above **emits editable Python** (or is pure validation/visualization/testing). None is a

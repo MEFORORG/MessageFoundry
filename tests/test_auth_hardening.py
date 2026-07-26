@@ -23,6 +23,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from _totp_clock import fresh_totp
 from pydantic import ValidationError
 
 from messagefoundry.api import create_app
@@ -46,7 +47,10 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine, settings: AuthSettings | None = None) -> AuthService:
-    service = AuthService(engine.store, settings or AuthSettings())
+    # require_mfa=False by default: every test here pins an RBAC / redaction / audit fix, none of them
+    # the second factor, so the ASVS 6.3.3 access gate would only stand between the fixture and the
+    # behaviour under test. The tests that DO exercise the gate build their own AuthSettings.
+    service = AuthService(engine.store, settings or AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 
@@ -78,6 +82,16 @@ async def _login(c: httpx.AsyncClient, username: str, password: str = PW, provid
     return await c.post(
         "/auth/login", json={"username": username, "password": password, "provider": provider}
     )
+
+
+async def _reauth(
+    c: httpx.AsyncClient, token: str, *, purpose: str | None = None, password: str = PW
+) -> httpx.Response:
+    """POST /me/reauth; ``purpose`` mints the single-use per-action grant (ADR 0077)."""
+    body: dict[str, str] = {"password": password}
+    if purpose is not None:
+        body["purpose"] = purpose
+    return await c.post("/me/reauth", json=body, headers=_auth(token))
 
 
 def _auth(token: str) -> dict[str, str]:
@@ -144,7 +158,12 @@ def test_ad_requires_ldaps_unless_overridden() -> None:
 
 
 async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None:
-    service = AuthService(engine.store, AuthSettings())
+    # M2 + ASVS 6.3.3. A bootstrap admin is must_change AND (since 6.3.3) mfa_pending at the same
+    # instant, so this pins BOTH the refusal ORDER and the fact that the pair is escapable — the
+    # bricked-fresh-account regression. Order is load-bearing: GET /me/mfa is MFA-exempt but NOT
+    # must-change-exempt, so leading with MFA would send this account to /auth/mfa-verify, which it
+    # cannot satisfy before rotating. The account must be told to rotate FIRST.
+    service = AuthService(engine.store, AuthSettings(login_rate_limit_enabled=False))
     boot = await service.initialize()
     assert boot is not None
     async with _client(engine, service) as c:
@@ -152,7 +171,11 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
         assert login.status_code == 200 and login.json()["must_change_password"] is True
         h = _auth(login.json()["token"])
         # a rotation-required session may not reach protected routes...
-        assert (await c.get("/users", headers=h)).status_code == 403
+        blocked = await c.get("/users", headers=h)
+        assert blocked.status_code == 403
+        # ...and it is the PASSWORD refusal, not the MFA one, even though both apply.
+        assert blocked.headers.get("X-MFA-Required") is None
+        assert "password change required" in blocked.text
         # ...but the self-service routes stay reachable
         assert (await c.get("/auth/me", headers=h)).status_code == 200
         rotated = await c.post(
@@ -161,9 +184,28 @@ async def test_must_change_password_blocks_until_rotated(engine: Engine) -> None
             json={"current_password": boot.password, "new_password": "a-rotated-passphrase-99"},
         )
         assert rotated.status_code == 200
-        # a fresh login after rotation is unblocked
-        h2 = _auth((await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"])
-        assert (await c.get("/users", headers=h2)).status_code == 200
+
+        # Rotating clears must_change, but the second factor is still owed: the fresh session is
+        # MFA-pending and now carries the OTHER refusal.
+        tok = (await _login(c, "admin", "a-rotated-passphrase-99")).json()["token"]
+        pending = await c.get("/users", headers=_auth(tok))
+        assert pending.status_code == 403 and pending.headers.get("X-MFA-Required") == "1"
+
+        # The account is NOT bricked: enrollment rides require_reauth_only_action, which opts out of
+        # the access gate, so the escape path is reachable from the pending session itself.
+        assert (
+            await _reauth(c, tok, purpose="mfa_enroll", password="a-rotated-passphrase-99")
+        ).status_code == 200
+        secret = (await c.post("/me/mfa/enroll", headers=_auth(tok))).json()["secret"]
+        assert (
+            await _reauth(c, tok, purpose="mfa_confirm", password="a-rotated-passphrase-99")
+        ).status_code == 200
+        confirmed = await c.post(
+            "/me/mfa/confirm", json={"code": fresh_totp(secret)}, headers=_auth(tok)
+        )
+        assert confirmed.status_code == 200
+        # Confirming satisfies THIS session's factor, so the estate is reachable again.
+        assert (await c.get("/users", headers=_auth(tok))).status_code == 200
 
 
 # --- M3: bootstrap one-time password goes to a file, not the log -------------
@@ -182,6 +224,36 @@ def test_bootstrap_password_written_to_file_not_log(
     # the credential must never appear in the (NSSM-captured) log
     assert "S3cret-One-Time-Value" not in caplog.text
     assert "bootstrap-admin.txt" in caplog.text
+
+
+def test_bootstrap_file_and_log_state_the_expiry_deadline(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # ASVS 6.4.5 arm 1: the renewal deadline ships WITH the credential — the file body and the log line
+    # both carry the ISO instant, so "claim it before <ISO>" is not an out-of-band assumption.
+    import datetime
+
+    exp = 1_800_000_000.0
+    iso = datetime.datetime.fromtimestamp(exp, tz=datetime.UTC).isoformat()
+    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
+    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=exp)
+    with caplog.at_level(logging.WARNING):
+        _emit_bootstrap_admin(boot, store_settings)
+    body = (tmp_path / "bootstrap-admin.txt").read_text()
+    assert iso in body and "expires" in body
+    assert iso in caplog.text  # the deadline is not a secret — safe to log
+    assert "one-time-value" not in caplog.text  # ...the password still is not
+
+
+def test_bootstrap_states_no_deadline_when_expiry_is_off(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    # expires_at=None (bootstrap_expiry_hours=0) → no deadline line; byte-compatible with pre-6.4.5.
+    store_settings = StoreSettings(path=str(tmp_path / "mf.db"))
+    boot = BootstrapAdmin(username="admin", password="one-time-value", expires_at=None)
+    with caplog.at_level(logging.WARNING):
+        _emit_bootstrap_admin(boot, store_settings)
+    assert "expires" not in (tmp_path / "bootstrap-admin.txt").read_text()
 
 
 # --- M4: AD login cannot adopt a like-named local account --------------------
@@ -356,7 +428,7 @@ def test_find_user_rejects_disabled_ad_account() -> None:
         def __contains__(self, k: str) -> bool:
             return k in self._a
 
-        def __getitem__(self, k: str) -> "_Attr":
+        def __getitem__(self, k: str) -> _Attr:
             return _Attr(self._a[k])
 
     class _Conn:
@@ -399,7 +471,7 @@ async def test_unknown_user_login_runs_password_verify(
         return real(stored_hash, password)
 
     monkeypatch.setattr(svc, "verify_password", counting)
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     out = await service.login("ghost-user-does-not-exist", "whatever")
     assert not out.ok
@@ -496,7 +568,7 @@ async def test_must_change_password_blocks_websocket(engine: Engine) -> None:
     from messagefoundry.api.security import authorize_ws
     from messagefoundry.auth import Permission
 
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     boot = await service.initialize()
     assert boot is not None
     boot_token = (await service.login("admin", boot.password)).token
@@ -515,7 +587,7 @@ async def test_ws_permission_denied_is_audited(engine: Engine) -> None:
     from messagefoundry.api.security import authorize_ws
     from messagefoundry.auth import Permission
 
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     assert await service.initialize() is not None
     await _add(service, "vw", Role.VIEWER)
     vw_token = (await service.login("vw", PW)).token
@@ -533,7 +605,7 @@ async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engin
     from messagefoundry.api.security import authorize_ws
     from messagefoundry.auth import Permission
 
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     assert await service.initialize() is not None
     await _add(service, "adm", Role.ADMINISTRATOR)
     await _add(service, "vw", Role.VIEWER)
@@ -553,3 +625,209 @@ async def test_ws_permission_granted_is_audited_for_sensitive_only(engine: Engin
     assert len(rows) == 1
     assert rows[-1]["actor"] == "adm" and "config:deploy" in (rows[-1]["detail"] or "")
     assert "/ws/stats" in (rows[-1]["detail"] or "")
+
+
+# --- RBAC-4: HTTP require() grant/deny audit precision ------------------------
+# The HTTP twin of the WS grant/deny tests above (:513/:529). authorize_ws has no method guard, so the
+# WS tests can't prove the HTTP `method != "GET"` deviation (ASVS 16.3.2): a sensitive-permission READ
+# (GET /approvals, which carries APPROVALS_APPROVE) must NOT be grant-audited even though the permission
+# IS in _GRANT_AUDIT_PERMISSIONS. These pin the exact HTTP set: sensitive-READ → zero, sensitive-WRITE →
+# one grant, under-privileged WRITE → 403 + one deny. Backend-agnostic so the SS/PG store suites re-run
+# it and prove the row lands server-side, not just on SQLite.
+
+
+class _FakeReqURL:
+    def __init__(self, path: str) -> None:
+        self.path = path
+
+
+class _FakeRequest:
+    """Minimal ASGI-shaped Request for driving ``api.security.require()`` directly — the HTTP sibling of
+    :class:`_FakeWS`. ``require()`` reads only ``.app.state.auth``, ``.headers``, ``.url.path`` and
+    ``.method`` (``allow_no_auth`` is absent → fail-closed, matching a served app)."""
+
+    def __init__(self, auth: object, token: str | None, *, method: str, path: str) -> None:
+        self.app = _FakeApp(auth)
+        self.method = method
+        self.headers: dict[str, str] = {"Authorization": f"Bearer {token}"} if token else {}
+        self.url = _FakeReqURL(path)
+
+
+async def _assert_http_grant_deny_precision(store: object) -> None:
+    """RBAC-4 (ASVS 16.3.2): the HTTP ``require()`` grant/deny audit set is EXACT and the ``method !=
+    "GET"`` guard REFUSES to audit a sensitive-permission READ. Driven against any Store so the SS/PG
+    legs prove the deny/grant row is actually written on the server backend (``record_audit`` /
+    ``list_audit``), not merely on SQLite. The assertions are negative: each proves a guard refuses."""
+    from fastapi import HTTPException
+
+    from messagefoundry.api.security import require
+    from messagefoundry.auth import Permission
+
+    # require_mfa=False: this asserts the GRANT/DENY audit set precisely, and the 6.3.3 access gate
+    # sits ABOVE the permission loop — leaving it on would refuse every request with auth.mfa_denied
+    # before any grant/deny row could be written, testing the wrong guard.
+    service = AuthService(store, AuthSettings(require_mfa=False))  # type: ignore[arg-type]
+    assert await service.initialize() is not None
+    await _add(service, "adm", Role.ADMINISTRATOR)  # holds approvals:approve + messages:purge
+    await _add(service, "op", Role.OPERATOR)  # holds messages:purge, NOT approvals:approve
+    await _add(service, "vw", Role.VIEWER)  # holds neither
+    adm = (await service.login("adm", PW)).token
+    op = (await service.login("op", PW)).token
+    vw = (await service.login("vw", PW)).token
+
+    async def _rows(action: str, permission: str) -> list[dict[str, object]]:
+        return [
+            a
+            for a in await store.list_audit()  # type: ignore[attr-defined]
+            if a["action"] == action and permission in str(a["detail"] or "")
+        ]
+
+    # (1) NEGATIVE method guard (the 16.3.2 read-polling deviation): a sensitive-permission READ — GET
+    # /approvals, carrying APPROVALS_APPROVE — must leave ZERO grant rows. require()'s `method != "GET"`
+    # guard REFUSES to audit it, so console polling of the sensitive read surface can't flood the chain.
+    ident = await require(Permission.APPROVALS_APPROVE)(
+        _FakeRequest(service, adm, method="GET", path="/approvals")  # type: ignore[arg-type]
+    )
+    assert (
+        ident.username == "adm"
+    )  # the request itself is AUTHORIZED — only the grant-audit is withheld
+    assert await _rows("auth.permission_granted", "approvals:approve") == []
+    # Contrast — proves it was the METHOD guard, not the permission set: the SAME permission on a
+    # NON-GET request DOES record exactly one grant. Without the method!=GET line this pair is identical.
+    await require(Permission.APPROVALS_APPROVE)(
+        _FakeRequest(service, adm, method="POST", path="/approvals/r1/approve")  # type: ignore[arg-type]
+    )
+    assert len(await _rows("auth.permission_granted", "approvals:approve")) == 1
+
+    # (2) A sensitive-WRITE grant (messages:purge on a POST) records EXACTLY ONE row — no more, no less.
+    await require(Permission.MESSAGES_PURGE)(
+        _FakeRequest(service, op, method="POST", path="/connections/IB_X/purge")  # type: ignore[arg-type]
+    )
+    assert len(await _rows("auth.permission_granted", "messages:purge")) == 1
+
+    # (3) An under-privileged caller (VIEWER lacks messages:purge) is REFUSED: require() raises 403 AND
+    # writes EXACTLY ONE permission_denied row naming the permission + path. Nothing is grant-audited.
+    with pytest.raises(HTTPException) as exc:
+        await require(Permission.MESSAGES_PURGE)(
+            _FakeRequest(service, vw, method="POST", path="/connections/IB_X/purge")  # type: ignore[arg-type]
+        )
+    assert exc.value.status_code == 403
+    denied = await _rows("auth.permission_denied", "messages:purge")
+    assert len(denied) == 1
+    assert denied[0]["actor"] == "vw"
+    assert "/connections/IB_X/purge" in str(denied[0]["detail"] or "")
+    # The refused caller left NO grant row — deny-by-default really denied (belt-and-braces).
+    purge_grants = await _rows("auth.permission_granted", "messages:purge")
+    assert [g for g in purge_grants if g["actor"] == "vw"] == []
+
+
+async def test_http_grant_deny_audit_precision(engine: Engine) -> None:
+    # RBAC-4 (ASVS 16.3.2), SQLite half: HTTP require() grant/deny audit precision. The method!=GET guard
+    # refuses to audit a sensitive READ (GET /approvals w/ approvals:approve), a sensitive WRITE grants
+    # exactly once, and an under-privileged WRITE is denied + audited exactly once. The SS/PG store suites
+    # re-run the same helper to prove the row is written on the real server backend.
+    await _assert_http_grant_deny_precision(engine.store)
+
+
+async def test_audit_all_authz_audits_every_grant_but_never_phi_view(engine: Engine) -> None:
+    # BACKLOG #244 (ASVS 16.3.2): with [diagnostics].audit_all_authz ON (threaded onto app.state),
+    # require()/authorize_ws audit EVERY authorization grant — including a read-permission GET that the
+    # shipped deviation withholds — but the PHI-view grants stay excluded even under 'all' (the PHI-access
+    # audit path already records those; no double row). Default OFF is byte-identical (the precision test
+    # above proves the withheld read grants).
+    from messagefoundry.api.security import authorize_ws, require
+    from messagefoundry.auth import Permission
+
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+    assert await service.initialize() is not None
+    await _add(
+        service, "adm", Role.ADMINISTRATOR
+    )  # holds read + view_summary + purge + monitoring:read
+    adm = (await service.login("adm", PW)).token
+
+    async def _grants(permission: str) -> list[dict[str, object]]:
+        return [
+            a
+            for a in await engine.store.list_audit()
+            if a["action"] == "auth.permission_granted" and permission in str(a["detail"] or "")
+        ]
+
+    def _on(method: str, path: str) -> _FakeRequest:
+        r = _FakeRequest(service, adm, method=method, path=path)
+        r.app.state.audit_all_authz = True  # gate ON
+        return r
+
+    # (1) OFF (default app.state has no audit_all_authz attr → getattr default False): a read-permission
+    # GET leaves NO grant row — the shipped 16.3.2 read-polling deviation is unchanged when the gate is off.
+    await require(Permission.MONITORING_READ)(
+        _FakeRequest(service, adm, method="GET", path="/stats")  # type: ignore[arg-type]
+    )
+    assert await _grants("monitoring:read") == []
+
+    # (2) ON: the SAME read-permission GET now writes EXACTLY ONE grant row.
+    await require(Permission.MONITORING_READ)(_on("GET", "/stats"))  # type: ignore[arg-type]
+    assert len(await _grants("monitoring:read")) == 1
+
+    # (3) ON: a PHI-view GET is STILL not grant-audited (excluded even under 'all' — the PHI-access audit
+    # path records that view; a grant row here would be a double.)
+    await require(Permission.MESSAGES_VIEW_SUMMARY)(_on("GET", "/messages"))  # type: ignore[arg-type]
+    assert await _grants("messages:view_summary") == []
+
+    # (4) ON: a sensitive non-GET route still records EXACTLY ONE grant (the sensitive path is unchanged).
+    await require(Permission.MESSAGES_PURGE)(_on("POST", "/connections/IB_X/purge"))  # type: ignore[arg-type]
+    assert len(await _grants("messages:purge")) == 1
+
+    # (5) ON: authorize_ws honors the same gate — the /ws/stats MONITORING_READ read grant is now audited
+    # (bringing the monitoring:read total to 2: the HTTP grant from (2) + this WS grant).
+    ws = _FakeWS(service, adm)
+    ws.app.state.audit_all_authz = True
+    ok = await authorize_ws(ws, Permission.MONITORING_READ)  # type: ignore[arg-type]
+    assert ok is not None and ok.username == "adm"
+    assert len(await _grants("monitoring:read")) == 2
+
+
+# --- AUTHN-6: LDAP connectivity failures map to LdapError; empty pw is fail-closed ---
+
+
+def _ldaps_authenticator() -> LdapAuthenticator:
+    # a fully-configured LDAPS + service-account authenticator (no live AD is contacted below)
+    return LdapAuthenticator(
+        AuthSettings(
+            ad_enabled=True,
+            ad_server="ldaps://x",
+            ad_user_search_base="DC=x",
+            ad_bind_dn="CN=svc,DC=x",
+            ad_bind_password="x",
+        )
+    )
+
+
+def test_ldap_connectivity_failure_maps_to_ldap_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AUTHN-6: a real connectivity failure (LDAPSocketOpenError, an LDAPException subclass) on the
+    # service-account bind must surface as LdapError from BOTH the password and Kerberos lookup paths —
+    # exercises the pragma:no-cover except arms in authenticate()/resolve_principal(). Offline: no AD.
+    from ldap3.core.exceptions import LDAPSocketOpenError
+
+    auth = _ldaps_authenticator()
+
+    def boom() -> object:
+        raise LDAPSocketOpenError("cannot reach the domain controller")
+
+    monkeypatch.setattr(auth, "_service_conn", boom)
+    with pytest.raises(LdapError):
+        auth.authenticate("someuser", "some-passphrase")
+    with pytest.raises(LdapError):
+        auth.resolve_principal("someuser")
+
+
+def test_ldap_empty_password_never_binds(monkeypatch: pytest.MonkeyPatch) -> None:
+    # AUTHN-6: an empty password would trigger an anonymous LDAP bind (which many DCs accept),
+    # silently authenticating anyone — so authenticate() must fail closed BEFORE any bind. We prove
+    # no bind is attempted by making _service_conn explode if it is ever reached.
+    auth = _ldaps_authenticator()
+
+    def must_not_be_called() -> object:
+        raise AssertionError("empty password must not reach the service-account bind")
+
+    monkeypatch.setattr(auth, "_service_conn", must_not_be_called)
+    assert auth.authenticate("someuser", "") is None

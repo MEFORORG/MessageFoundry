@@ -182,7 +182,7 @@ def test_managed_claude_non_baa_phi_production_capped() -> None:
 
 def test_effective_policy_is_frozen() -> None:
     eff = _resolve(AiMode.BYO, AiDataScope.CODE_ONLY, production=True)
-    with pytest.raises(Exception):  # frozen dataclass -> FrozenInstanceError
+    with pytest.raises(Exception):  # frozen dataclass -> FrozenInstanceError  # noqa: B017
         eff.mode = AiMode.OFF  # type: ignore[misc]
 
 
@@ -216,13 +216,14 @@ def test_ai_settings_default_on_service_settings(
 @pytest.mark.parametrize(
     ("name", "expected"),
     [
-        ("dev", (DataClass.SYNTHETIC, False)),
+        ("dev", (DataClass.PHI, False)),
         ("staging", (DataClass.PHI, False)),
         ("prod", (DataClass.PHI, True)),
     ],
 )
 def test_known_name_posture_derived(name: str, expected: tuple[DataClass, bool]) -> None:
-    # The built-in names keep their original posture tiers when data_class/production are unset.
+    # GIVEN 1 (ADR 0148): the built-in names now all derive PHI when data_class is unset (dev is
+    # PHI-by-default too); only the production tier still differs (prod alone is production=True).
     ai = AiSettings(environment=name)
     assert ai.derived_posture() == expected
     assert ai.require_posture() == expected
@@ -263,8 +264,9 @@ def test_ai_env_vars_load(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
             "MEFOR_AI_MODE": "managed_claude_baa",
             "MEFOR_AI_DATA_SCOPE": "phi",
             "MEFOR_AI_ENVIRONMENT": "test",  # a custom name parses fine
-            "MEFOR_AI_DATA_CLASS": "phi",
-            "MEFOR_AI_PRODUCTION": "true",
+            # Posture moved to [security] (ADR 0118); env keys desugar into ai.data_class/ai.production.
+            "MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA": "true",
+            "MEFOR_SECURITY_PRODUCTION_INSTANCE": "true",
             "MEFOR_AI_BAA_ATTESTED": "true",
             "MEFOR_AI_ENDPOINT": "https://broker.example/internal",
         }
@@ -311,7 +313,8 @@ def _client(app: object) -> httpx.AsyncClient:
 
 async def test_ai_policy_open_app_reflects_settings_and_grants_assist(engine: Engine) -> None:
     # allow_no_auth -> the system identity holds every permission, so assist_permitted is True, and
-    # the policy reflects the attached [ai] settings (a non-production 'dev' instance).
+    # the policy reflects the attached [ai] settings (a non-production 'dev' instance). GIVEN 1
+    # (ADR 0148): dev now derives data_class=phi (PHI-by-default), while production stays False.
     ai = AiSettings(mode=AiMode.BYO, data_scope=AiDataScope.SYNTHETIC, environment="dev")
     app = create_app(engine, ai_settings=ai, allow_no_auth=True)
     async with _client(app) as c:
@@ -319,7 +322,7 @@ async def test_ai_policy_open_app_reflects_settings_and_grants_assist(engine: En
     assert body["mode"] == "byo"
     assert body["data_scope"] == "synthetic"
     assert body["environment"] == "dev"
-    assert body["data_class"] == "synthetic"
+    assert body["data_class"] == "phi"
     assert body["production"] is False
     assert body["assist_permitted"] is True
     assert body["reason"] is None

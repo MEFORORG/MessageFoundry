@@ -139,7 +139,7 @@ async def engine(tmp_path: Path) -> AsyncIterator[Engine]:
 
 
 async def _service(engine: Engine) -> AuthService:
-    service = AuthService(engine.store, AuthSettings())
+    service = AuthService(engine.store, AuthSettings(require_mfa=False))
     await service.initialize()
     return service
 

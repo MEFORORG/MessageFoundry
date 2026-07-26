@@ -2,7 +2,7 @@
   "name": "messagefoundry",
   "displayName": "MessageFoundry",
   "description": "Author, test, and monitor MessageFoundry HL7 v2 interfaces in VS Code.",
-  "version": "0.0.25",
+  "version": "0.0.34",
   "publisher": "messagefoundry",
   "icon": "media/icon.png",
   "license": "SEE LICENSE IN LICENSE",
@@ -30,6 +30,18 @@
     }
   },
   "contributes": {
+    "colors": [
+      {
+        "id": "messagefoundry.itemIcon",
+        "description": "Color of MessageFoundry item icons in the sidebar trees (Components + Translation Tables) \u00e2\u20ac\u201d a complementary blue to the signature amber (orange) action icons.",
+        "defaults": {
+          "dark": "#3b82f6",
+          "light": "#2563eb",
+          "highContrast": "#5aa2ff",
+          "highContrastLight": "#1d4ed8"
+        }
+      }
+    ],
     "commands": [
       {
         "command": "messagefoundry.validate",
@@ -43,17 +55,17 @@
       },
       {
         "command": "messagefoundry.refreshGraph",
-        "title": "MessageFoundry: Refresh Connections",
+        "title": "MessageFoundry: Refresh Components",
         "icon": "media/refresh-amber.svg"
       },
       {
         "command": "messagefoundry.filterConnections",
-        "title": "MessageFoundry: Filter Connections",
+        "title": "MessageFoundry: Filter Components",
         "icon": "media/filter-amber.svg"
       },
       {
         "command": "messagefoundry.groupConnections",
-        "title": "MessageFoundry: Group Connections",
+        "title": "MessageFoundry: Group Components",
         "icon": "media/list-tree-amber.svg"
       },
       {
@@ -117,6 +129,10 @@
         "title": "MessageFoundry: Alert Wizard"
       },
       {
+        "command": "messagefoundry.editSecurity",
+        "title": "MessageFoundry: Edit Security Settings"
+      },
+      {
         "command": "messagefoundry.generateSamples",
         "title": "MessageFoundry: Generate Samples"
       },
@@ -130,7 +146,7 @@
       },
       {
         "command": "messagefoundry.promote",
-        "title": "MessageFoundry: Stage → Promote",
+        "title": "MessageFoundry: Stage \u00e2\u2020\u2019 Promote",
         "icon": "media/rocket-amber.svg"
       },
       {
@@ -182,11 +198,55 @@
       {
         "command": "messagefoundry.openSteps",
         "title": "MessageFoundry: View as Steps",
-        "icon": "media/list-tree-amber.svg"
+        "icon": "media/list-ordered-amber.svg"
       },
       {
         "command": "messagefoundry.engineStatusClicked",
         "title": "MessageFoundry: Engine Status Actions"
+      },
+      {
+        "command": "messagefoundry.engineSignIn",
+        "title": "MessageFoundry: Sign In to the Engine"
+      },
+      {
+        "command": "messagefoundry.engineSignOut",
+        "title": "MessageFoundry: Sign Out of the Engine"
+      },
+      {
+        "command": "messagefoundry.engineRecheck",
+        "title": "MessageFoundry: Re-check the Engine"
+      },
+      {
+        "command": "messagefoundry.engineShowLog",
+        "title": "MessageFoundry: Show the Engine Log"
+      },
+      {
+        "command": "messagefoundry.engineOpenConsole",
+        "title": "MessageFoundry: Open the Web Console"
+      },
+      {
+        "command": "messagefoundry.engineCopyStartCommand",
+        "title": "MessageFoundry: Copy the Engine Start Command"
+      },
+      {
+        "command": "messagefoundry.startEngine",
+        "title": "MessageFoundry: Start the Engine"
+      },
+      {
+        "command": "messagefoundry.stopEngine",
+        "title": "MessageFoundry: Stop the Engine"
+      },
+      {
+        "command": "messagefoundry.restartEngine",
+        "title": "MessageFoundry: Restart the Engine"
+      },
+      {
+        "command": "messagefoundry.setupEnvironment",
+        "title": "MessageFoundry: Set Up Python Environment"
+      },
+      {
+        "command": "messagefoundry.openEngineSetup",
+        "title": "MessageFoundry: Set Up an Engine"
       },
       {
         "command": "messagefoundry.openWiringMap",
@@ -197,6 +257,11 @@
         "command": "messagefoundry.showInWiringMap",
         "title": "Show in Wiring Map",
         "icon": "media/type-hierarchy-amber.svg"
+      },
+      {
+        "command": "messagefoundry.openStepsFromNode",
+        "title": "View as Steps",
+        "icon": "media/list-ordered-amber.svg"
       }
     ],
     "viewsContainers": {
@@ -217,7 +282,7 @@
         },
         {
           "id": "messagefoundry.graph",
-          "name": "Connections"
+          "name": "Components"
         },
         {
           "id": "messagefoundry.codesets",
@@ -236,7 +301,7 @@
       "editor/title": [
         {
           "command": "messagefoundry.openSteps",
-          "when": "messagefoundry.isConfigFile && activeCustomEditorId != messagefoundry.stepsEditor",
+          "when": "messagefoundry.isConfigFile && messagefoundry.activeFileHasHandler && activeCustomEditorId != messagefoundry.stepsEditor",
           "group": "navigation@1"
         },
         {
@@ -286,6 +351,7 @@
         },
         {
           "command": "messagefoundry.openSteps",
+          "when": "messagefoundry.activeFileHasHandler",
           "group": "3_view@1"
         }
       ],
@@ -358,13 +424,18 @@
           "group": "2_view"
         },
         {
-          "command": "messagefoundry.showInWiringMap",
-          "when": "view == messagefoundry.graph && viewItem == meforElement",
-          "group": "inline"
+          "command": "messagefoundry.openStepsFromNode",
+          "when": "view == messagefoundry.graph && viewItem == meforElementHandler",
+          "group": "inline@1"
         },
         {
           "command": "messagefoundry.showInWiringMap",
-          "when": "view == messagefoundry.graph && viewItem == meforElement",
+          "when": "view == messagefoundry.graph && (viewItem == meforElement || viewItem == meforElementHandler)",
+          "group": "inline@2"
+        },
+        {
+          "command": "messagefoundry.showInWiringMap",
+          "when": "view == messagefoundry.graph && (viewItem == meforElement || viewItem == meforElementHandler)",
           "group": "2_view"
         },
         {
@@ -395,6 +466,10 @@
         },
         {
           "command": "messagefoundry.showInWiringMap",
+          "when": "false"
+        },
+        {
+          "command": "messagefoundry.openStepsFromNode",
           "when": "false"
         },
         {
@@ -486,7 +561,7 @@
         "id": "messagefoundry.chat",
         "name": "messagefoundry",
         "fullName": "MessageFoundry",
-        "description": "Ask about Connections, Routers, and Handlers (PHI-safe — code & schema only).",
+        "description": "Ask about Connections, Routers, and Handlers (PHI-safe \u00e2\u20ac\u201d code & schema only).",
         "isSticky": true,
         "commands": [
           {
@@ -520,7 +595,7 @@
       {
         "id": "messagefoundry.gettingStarted",
         "title": "Get Started with MessageFoundry",
-        "description": "Wire your first Connection, Route, and Handler — then test it, without touching a real engine.",
+        "description": "Wire your first Connection, Route, and Handler \u00e2\u20ac\u201d then test it, without touching a real engine.",
         "steps": [
           {
             "id": "pointAtEngine",
@@ -536,7 +611,7 @@
           {
             "id": "openConfigDir",
             "title": "Open the config dir",
-            "description": "Your Connections, Routers, and Handlers live as Python under the config dir — open it to browse them.\n[Open Config Folder](command:messagefoundry.openConfigDir)",
+            "description": "Your Connections, Routers, and Handlers live as Python under the config dir \u00e2\u20ac\u201d open it to browse them.\n[Open Config Folder](command:messagefoundry.openConfigDir)",
             "media": {
               "markdown": "media/walkthrough/open-config-dir.md"
             },
@@ -547,7 +622,7 @@
           {
             "id": "newConnection",
             "title": "Create a Connection",
-            "description": "Wire an inbound or outbound endpoint (MLLP, file, …).\n[Open Connection Wizard](command:messagefoundry.newConnection)",
+            "description": "Wire an inbound or outbound endpoint (MLLP, file, \u00e2\u20ac\u00a6).\n[Open Connection Wizard](command:messagefoundry.newConnection)",
             "media": {
               "markdown": "media/walkthrough/new-connection.md"
             },
@@ -558,7 +633,7 @@
           {
             "id": "newRoute",
             "title": "Wire a Route",
-            "description": "Bind a Router + Handler(s) between two Connections — no bundled \"channel\" element, just named pieces.\n[Open Route Wizard](command:messagefoundry.newRoute)",
+            "description": "Bind a Router + Handler(s) between two Connections \u00e2\u20ac\u201d no bundled \"channel\" element, just named pieces.\n[Open Route Wizard](command:messagefoundry.newRoute)",
             "media": {
               "markdown": "media/walkthrough/new-route.md"
             },
@@ -580,7 +655,7 @@
           {
             "id": "testBench",
             "title": "Dry-run in the Test Bench",
-            "description": "Load a message set and see disposition + before/after — no engine, no sending.\n[Open Test Bench](command:messagefoundry.openTestBench)",
+            "description": "Load a message set and see disposition + before/after \u00e2\u20ac\u201d no engine, no sending.\n[Open Test Bench](command:messagefoundry.openTestBench)",
             "media": {
               "markdown": "media/walkthrough/test-bench.md"
             },
@@ -591,7 +666,7 @@
           {
             "id": "liveDebug",
             "title": "Watch it run live",
-            "description": "Toggle Live Debug: every save re-runs a dry-run over a synthetic sample and annotates your code — redacted by default.\n[Toggle Live Debug](command:messagefoundry.toggleLiveDebug)",
+            "description": "Toggle Live Debug: every save re-runs a dry-run over a synthetic sample and annotates your code \u00e2\u20ac\u201d redacted by default.\n[Toggle Live Debug](command:messagefoundry.toggleLiveDebug)",
             "media": {
               "markdown": "media/walkthrough/live-debug.md"
             },
@@ -602,7 +677,7 @@
           {
             "id": "cookbook",
             "title": "Browse the Cookbook",
-            "description": "Search solved problems — crosswalks, batch splits, enrichment, fan-out — and insert the editable Python.\n[Open Cookbook](command:messagefoundry.openCookbook)",
+            "description": "Search solved problems \u00e2\u20ac\u201d crosswalks, batch splits, enrichment, fan-out \u00e2\u20ac\u201d and insert the editable Python.\n[Open Cookbook](command:messagefoundry.openCookbook)",
             "media": {
               "markdown": "media/walkthrough/cookbook.md"
             },
@@ -612,8 +687,8 @@
           },
           {
             "id": "promote",
-            "title": "Stage → Promote",
-            "description": "Ship the validated graph to a running engine — staged, pre-flighted against the target's env() values, then an atomic swap.\n[Stage → Promote](command:messagefoundry.promote)",
+            "title": "Stage \u00e2\u2020\u2019 Promote",
+            "description": "Ship the validated graph to a running engine \u00e2\u20ac\u201d staged, pre-flighted against the target's env() values, then an atomic swap.\n[Stage \u00e2\u2020\u2019 Promote](command:messagefoundry.promote)",
             "media": {
               "markdown": "media/walkthrough/promote.md"
             },
@@ -647,13 +722,13 @@
           "type": "string",
           "default": "http://127.0.0.1:8765",
           "scope": "machine",
-          "description": "Engine API URL used by Stage → Promote when no named environments are configured (see messagefoundry.environments). Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token."
+          "description": "Engine API URL used by Stage \u00e2\u2020\u2019 Promote when no named environments are configured (see messagefoundry.environments). Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token."
         },
         "messagefoundry.environments": {
           "type": "array",
           "default": [],
           "scope": "machine",
-          "markdownDescription": "Named promote targets for Stage → Promote (e.g. DEV/PROD). When set, promote asks which to target; when empty, it uses `messagefoundry.engineUrl`. Each engine resolves its own environment values, so the same config promotes to each. Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token.",
+          "markdownDescription": "Named promote targets for Stage \u00e2\u2020\u2019 Promote (e.g. DEV/PROD). When set, promote asks which to target; when empty, it uses `messagefoundry.engineUrl`. Each engine resolves its own environment values, so the same config promotes to each. Machine-scoped: a checked-in workspace .vscode/settings.json cannot retarget promote to an attacker host that would then receive your credentials and session token.",
           "items": {
             "type": "object",
             "required": [
@@ -671,7 +746,7 @@
               },
               "shards": {
                 "type": "array",
-                "markdownDescription": "Optional engine instances (shards/replicas) within this environment. When 2 or more are listed, Stage → Promote asks WHICH instance to deploy to and uses that shard's `url`; with 0 or 1 it behaves exactly as a shard-less environment (no extra prompt). Additive — omit it to keep today's single-target behavior.",
+                "markdownDescription": "Optional engine instances (shards/replicas) within this environment. When 2 or more are listed, Stage \u00e2\u2020\u2019 Promote asks WHICH instance to deploy to and uses that shard's `url`; with 0 or 1 it behaves exactly as a shard-less environment (no extra prompt). Additive \u00e2\u20ac\u201d omit it to keep today's single-target behavior.",
                 "items": {
                   "type": "object",
                   "required": [
@@ -707,7 +782,7 @@
           "type": "integer",
           "default": 8000,
           "minimum": 0,
-          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names — never message bodies/PHI — so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
+          "markdownDescription": "Maximum characters of the active editor's code attached to a `@messagefoundry` AI chat request. The assistant only ever sends code + your config graph's names \u00e2\u20ac\u201d never message bodies/PHI \u00e2\u20ac\u201d so this bounds how much of your *own* code leaves to your chosen model provider. Files larger than the limit are truncated on a line boundary with a visible marker; `0` sends only the graph names (no editor code)."
         },
         "messagefoundry.liveDebug.debounceMs": {
           "type": "integer",
@@ -718,7 +793,7 @@
         "messagefoundry.liveStatus.enabled": {
           "type": "boolean",
           "default": false,
-          "markdownDescription": "Decorate Inbound/Outbound rows in the CONNECTIONS view with live runtime status and message counts polled from the engine's monitoring API (`GET /connections`). Reuses the session Stage → Promote signed in with — the poll itself never prompts; without a session (on an auth-required engine) rows simply stay undecorated. Shows status words and counts only — never message content."
+          "markdownDescription": "Decorate Inbound/Outbound rows in the CONNECTIONS view with live runtime status and message counts polled from the engine's monitoring API (`GET /connections`). Reuses the session Stage \u00e2\u2020\u2019 Promote signed in with \u00e2\u20ac\u201d the poll itself never prompts; without a session (on an auth-required engine) rows simply stay undecorated. Shows status words and counts only \u00e2\u20ac\u201d never message content."
         },
         "messagefoundry.liveStatus.intervalSeconds": {
           "type": "integer",
@@ -742,7 +817,9 @@
     "pretest": "npm run compile && npm run compile-tests",
     "test": "node ./out/test/runTest.js",
     "package": "vsce package",
-    "vscode:prepublish": "node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npm run compile"
+    "vscode:prepublish": "node -e \"require('fs').copyFileSync('../LICENSE','LICENSE')\" && npm run compile",
+    "pretest:unit": "npm run compile-tests",
+    "test:unit": "mocha \"out/test/suite/**/*.test.js\" --ui tdd --ignore \"out/test/suite/ai-policy.test.js\" --ignore \"out/test/suite/chat.test.js\" --ignore \"out/test/suite/editor-toolbar.test.js\" --ignore \"out/test/suite/extension.test.js\" --ignore \"out/test/suite/insert-element.test.js\" --ignore \"out/test/suite/live-debug.test.js\" --ignore \"out/test/suite/promote-target.test.js\" --ignore \"out/test/suite/pythonpath.test.js\""
   },
   "devDependencies": {
     "@types/mocha": "^10.0.10",
@@ -757,6 +834,10 @@
   },
   "overrides": {
     "serialize-javascript": ">=7.0.5",
-    "diff": ">=8.0.3"
+    "diff": ">=8.0.3",
+    "fast-uri": "^3.1.3",
+    "linkify-it": "^5.0.2",
+    "brace-expansion": "^5.0.8",
+    "minimatch": ">=10.2.5"
   }
 }

@@ -21,9 +21,11 @@ from messagefoundry.pipeline.cert_expiry import (
     CertExpiryRunner,
     MonitoredCert,
     certs_from_registry,
+    client_cert_label,
+    peer_cert_expiry,
 )
 
-_UTC = datetime.timezone.utc
+_UTC = datetime.UTC
 # A fixed reference instant so the cert windows + the runner's clock are deterministic.
 _REF = datetime.datetime(2026, 6, 15, 12, 0, tzinfo=_UTC)
 _REF_TS = _REF.timestamp()
@@ -189,6 +191,127 @@ def test_certs_from_registry_none_registry_yields_only_api() -> None:
     assert certs_from_registry(None, None) == []
 
 
+# --- ASVS 6.4.5 arm 3: service-caller (inbound mTLS client) cert monitoring ----------------------
+
+
+def test_certs_from_registry_folds_in_client_cert_files() -> None:
+    # [api].tls_client_cert_files are certs the engine VERIFIES, not ones it presents — they are invisible
+    # to the served-cert enumeration, so folding them in is what catches a caller that stopped connecting.
+    certs = certs_from_registry(None, "/c/api.pem", ["/c/svc-billing.pem", "/c/svc-labs.pem"])
+    assert [(c.label, c.path) for c in certs] == [
+        ("api", "/c/api.pem"),
+        ("api-client:/c/svc-billing.pem", "/c/svc-billing.pem"),
+        ("api-client:/c/svc-labs.pem", "/c/svc-labs.pem"),
+    ]
+    # Default (omitted) is byte-identical to before — no client certs watched.
+    assert certs_from_registry(None, "/c/api.pem") == [MonitoredCert("api", "/c/api.pem")]
+
+
+def test_client_cert_label_is_namespaced_and_never_collides_with_api() -> None:
+    # The label is the alert's throttle/routing key: it must never collide with the "api" served cert
+    # or a connection name, even for a file literally named api.pem.
+    assert client_cert_label("/c/api.pem") != "api"
+    assert client_cert_label("/c/api.pem").startswith("api-client:")
+
+
+def test_same_basename_client_certs_get_DISTINCT_labels() -> None:
+    """REGRESSION: the label is the alert's throttle key, so it MUST be injective over the list.
+
+    A stem-derived label collapsed the natural per-partner layout (`…/acme/client.pem`,
+    `…/globex/client.pem`) onto ONE key. `run_once` emits every cert in a single synchronous pass, so
+    the second landed inside the first's `realert_seconds` cooldown and was dropped before any
+    transport saw it — on every pass, forever. Invisible under LoggingAlertSink (no throttle); it bit
+    only where a real notifier was wired, i.e. exactly where an operator relies on being paged. That
+    silently defeats the one arm covering a caller that has STOPPED connecting.
+    """
+    paths = ["/certs/acme/client.pem", "/certs/globex/client.pem"]
+    labels = [c.label for c in certs_from_registry(None, None, paths)]
+    assert len(set(labels)) == 2, f"labels collapsed onto one throttle key: {labels}"
+
+
+def test_both_same_basename_certs_actually_reach_a_transport(tmp_path: Path) -> None:
+    """The end-to-end half of the regression, through the sink that really throttles.
+
+    Driven with the DEFAULT realert cooldown (not 0), because the defect was precisely that the second
+    cert's alert died inside that cooldown — a test using realert_seconds=0 would pass either way.
+    """
+
+    class _RecordTransport:
+        name = "t"
+
+        def __init__(self) -> None:
+            self.events: list[dict[str, object]] = []
+
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
+            self.events.append(event)
+
+    acme = tmp_path / "acme" / "client.pem"
+    globex = tmp_path / "globex" / "client.pem"
+    for p in (acme, globex):
+        p.parent.mkdir(parents=True, exist_ok=True)
+        _write_cert(p, not_after=_REF + datetime.timedelta(days=5))  # inside the 30-day warn window
+
+    async def _go() -> None:
+        t = _RecordTransport()
+        sink = NotifierAlertSink([t])  # default realert_seconds (300s) — the throttle under test
+        sink.start()
+        runner = CertExpiryRunner(
+            lambda: certs_from_registry(None, None, [str(acme), str(globex)]),
+            CertMonitorSettings(warn_days=30),
+            alert_sink=sink,
+            clock=lambda: _REF_TS,
+        )
+        runner.run_once()  # ONE synchronous pass emits both certs microseconds apart
+        await asyncio.sleep(0.02)
+        await sink.aclose()
+        fired = {e["connection"] for e in t.events if e["type"] == "cert_expiry"}
+        assert len(fired) == 2, (
+            f"only {sorted(fired)} reached a transport — a same-basename sibling was swallowed by the "
+            "re-alert cooldown, which is the whole failure this arm must not have"
+        )
+
+    asyncio.run(_go())
+
+
+def _peercert_expiring(*, in_days: float, now: float) -> dict[str, object]:
+    """A synthetic ``getpeercert()`` dict whose notAfter is ``in_days`` from ``now``, in OpenSSL's own
+    textual form (the shape ``ssl.cert_time_to_seconds`` parses)."""
+    when = datetime.datetime.fromtimestamp(now + in_days * 86_400, tz=_UTC)
+    return {"notAfter": when.strftime("%b %d %H:%M:%S %Y GMT")}
+
+
+def test_peer_cert_expiry_reports_iso_and_days_remaining() -> None:
+    cert = _peercert_expiring(in_days=10, now=_REF_TS)
+    got = peer_cert_expiry(cert, now=_REF_TS)
+    assert got is not None
+    not_after_iso, days_remaining = got
+    assert days_remaining == 10
+    # The ISO instant round-trips to the same second the textual notAfter named.
+    assert datetime.datetime.fromisoformat(not_after_iso).timestamp() == _REF_TS + 10 * 86_400
+
+
+def test_peer_cert_expiry_is_negative_once_expired() -> None:
+    got = peer_cert_expiry(_peercert_expiring(in_days=-3, now=_REF_TS), now=_REF_TS)
+    assert got is not None and got[1] == -3
+
+
+def test_peer_cert_expiry_none_when_absent_or_unparseable() -> None:
+    # A monitoring signal must degrade to "say nothing", never raise onto the auth path it hangs off.
+    assert peer_cert_expiry({}, now=_REF_TS) is None
+    assert peer_cert_expiry({"notAfter": ""}, now=_REF_TS) is None
+    assert peer_cert_expiry({"notAfter": "not a date at all"}, now=_REF_TS) is None
+    assert peer_cert_expiry({"notAfter": 12345}, now=_REF_TS) is None  # type: ignore[dict-item]
+
+
+def test_peer_cert_expiry_day_math_matches_the_pem_path() -> None:
+    # The handshake arm and the file arm must never disagree about the SAME cert by a day, so the day
+    # length is pinned equal to pki's (which read_cert_facts / the file monitor use).
+    from messagefoundry import pki
+    from messagefoundry.pipeline import cert_expiry as ce
+
+    assert ce._SECONDS_PER_DAY == pki._SECONDS_PER_DAY
+
+
 # --- enabled / lifecycle ----------------------------------------------------
 
 
@@ -239,7 +362,7 @@ def test_notifier_sink_emits_cert_expiry_event() -> None:
         def __init__(self) -> None:
             self.events: list[dict[str, object]] = []
 
-        async def send(self, event: dict[str, object]) -> None:
+        async def send(self, event: dict[str, object], **_kw: object) -> None:
             self.events.append(event)
 
     async def _go() -> None:

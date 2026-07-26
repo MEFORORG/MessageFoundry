@@ -20,12 +20,15 @@ from __future__ import annotations
 import asyncio
 import importlib
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import RetryPolicy
 from messagefoundry.store import ClaimedHeads, MessageStore, OutboxStatus, Stage
+from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.store import MessageStatus
 
 RAW = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01|MSG1|P|2.5.1\r"
@@ -174,6 +177,43 @@ async def _make_not_due(store: Any, stage: str, message_id: str, until: float) -
     )
 
 
+# ADR 0066 §9: claim_fifo_heads' SQL Server path opens with SET LOCK_TIMEOUT 0, so a transient
+# server-internal lock surfaces as error 1222 and the WHOLE batch fail-closes to EMPTY-all — by_lane
+# AND rearm both empty, the claim rolled back, nothing consumed/incremented. That never-block YIELD is
+# contract-legal (the pooled caller re-arms and re-claims next tick — it "self-heals on retry", see the
+# drainer in test_batch_claim_locking.py) but makes a single-shot assertion flaky: it was observed as a
+# 1-in-40-CI KeyError on `res.by_lane["IB_HT"]` in test_interior_not_due_… on the SQL Server leg. These
+# tests assert a claim OUTCOME, not the yield, so re-issue past a transient EMPTY-all. This masks nothing:
+# EMPTY-all is a full roll-back (a retry cannot double-claim), and a GENUINELY unclaimable head stays
+# EMPTY-all every pass and still fails after the cap. SQLite serializes and Postgres SKIP-LOCKs, so
+# neither yields here — the first call already returns and the loop is a no-op on those backends.
+_CLAIM_YIELD_RETRIES = 16
+_CLAIM_YIELD_BACKOFF = 0.01
+
+
+async def _claim_heads(
+    store: Any,
+    stage: str,
+    lanes: list[str],
+    *,
+    now: float | None = None,
+    per_lane_limit: int = 1,
+) -> ClaimedHeads:
+    """``claim_fifo_heads`` re-issued past a transient SQL Server never-block EMPTY-all yield (ADR 0066
+    §9; see the note above). Returns as soon as the claim did ANYTHING — a non-empty ``by_lane`` (rows
+    claimed) or ``rearm`` (a head consumed in-txn). A 1222 rolls the entire batch back to both-empty, so
+    this never observes a partial claim. Use it wherever a test asserts a NON-empty outcome; call
+    ``store.claim_fifo_heads`` directly where EMPTY-all is itself the assertion (a not-due head, an
+    unknown/empty lane) — that answer is already EMPTY-all and so is immune to the yield."""
+    res = await store.claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
+    for _ in range(_CLAIM_YIELD_RETRIES):
+        if res.by_lane or res.rearm:
+            break
+        await asyncio.sleep(_CLAIM_YIELD_BACKOFF)
+        res = await store.claim_fifo_heads(stage, lanes, now=now, per_lane_limit=per_lane_limit)
+    return res
+
+
 # --- basic multi-lane contract ------------------------------------------------
 
 
@@ -182,8 +222,8 @@ async def test_multi_lane_contiguous_due_prefix_one_call(store: Any) -> None:
     POST-increment attempts (G6); the claimed rows are INFLIGHT so a second call claims nothing."""
     a = await _seed_ingress(store, "IB_HA", [100.0, 101.0, 102.0])
     b = await _seed_ingress(store, "IB_HB", [100.5, 101.5])
-    res = await store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_HA", "IB_HB"], now=200.0, per_lane_limit=8
+    res = await _claim_heads(
+        store, Stage.INGRESS.value, ["IB_HA", "IB_HB"], now=200.0, per_lane_limit=8
     )
     assert isinstance(res, ClaimedHeads)
     assert set(res.by_lane) == {"IB_HA", "IB_HB"}
@@ -209,8 +249,8 @@ async def test_duplicate_lanes_deduped(store: Any) -> None:
     """A duplicated lane name claims its prefix once (the request set is de-duplicated — on SQL
     Server a duplicate would otherwise violate the @heads PRIMARY KEY)."""
     mids = await _seed_ingress(store, "IB_HDUP", [100.0])
-    res = await store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_HDUP", "IB_HDUP"], now=200.0, per_lane_limit=8
+    res = await _claim_heads(
+        store, Stage.INGRESS.value, ["IB_HDUP", "IB_HDUP"], now=200.0, per_lane_limit=8
     )
     assert [it.message_id for it in res.by_lane["IB_HDUP"]] == mids
 
@@ -241,8 +281,8 @@ async def test_multi_lane_isolation_not_due_head(store: Any) -> None:
     a = await _seed_ingress(store, "IB_HIA", [100.0, 101.0])
     b = await _seed_ingress(store, "IB_HIB", [100.0])
     await _make_not_due(store, Stage.INGRESS.value, a[0], until=10_000.0)
-    res = await store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_HIA", "IB_HIB"], now=200.0, per_lane_limit=8
+    res = await _claim_heads(
+        store, Stage.INGRESS.value, ["IB_HIA", "IB_HIB"], now=200.0, per_lane_limit=8
     )
     assert set(res.by_lane) == {"IB_HIB"}
     assert [it.message_id for it in res.by_lane["IB_HIB"]] == b
@@ -255,7 +295,7 @@ async def test_interior_not_due_truncates_prefix_tail_untouched(store: Any) -> N
     cutoff are never UPDATEd (status pending, attempts 0)."""
     mids = await _seed_ingress(store, "IB_HT", [100.0, 101.0, 102.0])
     await _make_not_due(store, Stage.INGRESS.value, mids[1], until=10_000.0)
-    res = await store.claim_fifo_heads(Stage.INGRESS.value, ["IB_HT"], now=200.0, per_lane_limit=8)
+    res = await _claim_heads(store, Stage.INGRESS.value, ["IB_HT"], now=200.0, per_lane_limit=8)
     assert [it.message_id for it in res.by_lane["IB_HT"]] == [mids[0]]
     for mid in mids[1:]:
         row = (
@@ -273,11 +313,9 @@ async def test_interior_not_due_truncates_prefix_tail_untouched(store: Any) -> N
 
 async def test_per_lane_limit_gt1_claims_prefix_then_rest(store: Any) -> None:
     mids = await _seed_ingress(store, "IB_HK", [100.0 + i for i in range(5)])
-    first = await store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_HK"], now=200.0, per_lane_limit=3
-    )
+    first = await _claim_heads(store, Stage.INGRESS.value, ["IB_HK"], now=200.0, per_lane_limit=3)
     assert [it.message_id for it in first.by_lane["IB_HK"]] == mids[:3]
-    rest = await store.claim_fifo_heads(Stage.INGRESS.value, ["IB_HK"], now=200.0, per_lane_limit=3)
+    rest = await _claim_heads(store, Stage.INGRESS.value, ["IB_HK"], now=200.0, per_lane_limit=3)
     assert [it.message_id for it in rest.by_lane["IB_HK"]] == mids[3:]
 
 
@@ -290,7 +328,7 @@ async def test_outbound_per_lane_limit_clamped_to_one(store: Any) -> None:
     m2 = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB_H1", "p2")], now=101.0
     )
-    res = await store.claim_fifo_heads(Stage.OUTBOUND.value, ["OB_H1"], now=200.0, per_lane_limit=8)
+    res = await _claim_heads(store, Stage.OUTBOUND.value, ["OB_H1"], now=200.0, per_lane_limit=8)
     assert [it.message_id for it in res.by_lane["OB_H1"]] == [m1]
     row = (
         await _query(
@@ -315,7 +353,7 @@ async def test_h2_delivered_then_repended_completed_in_txn_and_rearmed(store: An
     m2 = await store.enqueue_message(
         channel_id="IB", raw=RAW, deliveries=[("OB_H2", "p2")], now=101.0
     )
-    first = await store.claim_fifo_heads(Stage.OUTBOUND.value, ["OB_H2"], now=200.0)
+    first = await _claim_heads(store, Stage.OUTBOUND.value, ["OB_H2"], now=200.0)
     item = first.by_lane["OB_H2"][0]
     assert item.message_id == m1
     await store.mark_done(item.id, now=300.0)  # commits the H2 ledger row
@@ -324,13 +362,13 @@ async def test_h2_delivered_then_repended_completed_in_txn_and_rearmed(store: An
         "UPDATE queue SET status=?, next_attempt_at=?, updated_at=? WHERE id=?",
         (OutboxStatus.PENDING.value, 300.0, 300.0, item.id),
     )
-    res = await store.claim_fifo_heads(Stage.OUTBOUND.value, ["OB_H2"], now=400.0)
+    res = await _claim_heads(store, Stage.OUTBOUND.value, ["OB_H2"], now=400.0)
     assert res.by_lane == {}  # consumed in-store, never handed to a worker
     assert res.rearm == frozenset({"OB_H2"})
     row = (await _query(store, "SELECT status FROM queue WHERE id=?", (item.id,)))[0]
     assert row["status"] == OutboxStatus.DONE.value
     assert (await store.get_message(m1))["status"] == MessageStatus.PROCESSED.value
-    nxt = await store.claim_fifo_heads(Stage.OUTBOUND.value, ["OB_H2"], now=401.0)
+    nxt = await _claim_heads(store, Stage.OUTBOUND.value, ["OB_H2"], now=401.0)
     assert [it.message_id for it in nxt.by_lane["OB_H2"]] == [m2]  # the lane advanced, in order
 
 
@@ -344,7 +382,7 @@ async def test_release_claimed_restores_attempts_keeps_schedule(store: Any) -> N
     mids = await _seed_ingress(store, "IB_HR", [100.0, 101.0])
     before = await _lane_rows(store, "channel_id", "IB_HR", Stage.INGRESS.value)
     schedule = {r["id"]: r["next_attempt_at"] for r in before}
-    res = await store.claim_fifo_heads(Stage.INGRESS.value, ["IB_HR"], now=200.0, per_lane_limit=8)
+    res = await _claim_heads(store, Stage.INGRESS.value, ["IB_HR"], now=200.0, per_lane_limit=8)
     items = res.by_lane["IB_HR"]
     assert [it.attempts for it in items] == [1, 1]
     await store.release_claimed([it.id for it in items], now=210.0)
@@ -353,11 +391,57 @@ async def test_release_claimed_restores_attempts_keeps_schedule(store: Any) -> N
         assert r["status"] == OutboxStatus.PENDING.value
         assert r["attempts"] == 0  # the increment undone exactly (attempts-neutral)
         assert r["next_attempt_at"] == schedule[r["id"]]  # UNCHANGED — no backoff consumed
-    again = await store.claim_fifo_heads(
-        Stage.INGRESS.value, ["IB_HR"], now=220.0, per_lane_limit=8
+    # A never-failed release leaves last_error NULL — a release is not a failure, so it must not
+    # invent an error string (nor does it clear a pre-set one; that path is the next test).
+    errs = await _query(
+        store,
+        "SELECT id, last_error FROM queue WHERE stage=? AND channel_id=?",
+        (Stage.INGRESS.value, "IB_HR"),
     )
+    assert [r["last_error"] for r in errs] == [None, None]
+    again = await _claim_heads(store, Stage.INGRESS.value, ["IB_HR"], now=220.0, per_lane_limit=8)
     assert [it.message_id for it in again.by_lane["IB_HR"]] == mids
     assert [it.attempts for it in again.by_lane["IB_HR"]] == [1, 1]
+
+
+async def test_release_claimed_is_error_neutral(store: Any) -> None:
+    """release_claimed is ERROR-neutral: it re-pends without touching ``last_error``. A prior
+    ``mark_failed`` set a (ciphered) error on the row; after a subsequent claim + release the column
+    survives byte-unchanged — the release rewinds the attempts increment, never the failure history.
+    This round-trips the H4-ciphered ``queue.last_error`` column on SS/PG (identity on plain SQLite)."""
+    (mid,) = await _seed_ingress(store, "IB_HEN", [100.0])
+    # Claim → INFLIGHT (attempts 1), then fail it: mark_failed re-pends (RetryPolicy() = retry
+    # forever, never dead-letters here) and stamps last_error. A backoff-safe synthetic string, no PHI.
+    first = await _claim_heads(store, Stage.INGRESS.value, ["IB_HEN"], now=200.0)
+    claimed = first.by_lane["IB_HEN"][0]
+    synthetic_error = "synthetic transform failure XYZ-42"
+    await store.mark_failed(claimed.id, synthetic_error, RetryPolicy(), now=300.0)
+    # Re-claim past the backoff deadline (attempts → 2, INFLIGHT); the error must already be present.
+    second = await _claim_heads(store, Stage.INGRESS.value, ["IB_HEN"], now=1_000.0)
+    reclaimed = second.by_lane["IB_HEN"][0]
+    assert reclaimed.attempts == 2
+    before = (
+        await _query(
+            store,
+            "SELECT last_error FROM queue WHERE id=?",
+            (reclaimed.id,),
+        )
+    )[0]["last_error"]
+    # Non-vacuity: mark_failed guarantees a non-NULL error before the release, and it decrypts back to
+    # exactly what we set — so the equality below is a real preservation check, not 0==0 on two NULLs.
+    assert before is not None
+    assert store._dec(before, aad=cell_aad("queue", "last_error", reclaimed.id)) == synthetic_error
+    await store.release_claimed([reclaimed.id], now=1_100.0)
+    after = (
+        await _query(
+            store,
+            "SELECT status, attempts, last_error FROM queue WHERE id=?",
+            (reclaimed.id,),
+        )
+    )[0]
+    assert after["status"] == OutboxStatus.PENDING.value  # re-pended
+    assert after["attempts"] == 1  # this claim's increment rewound (2 → 1)
+    assert after["last_error"] == before  # PRESERVED byte-unchanged — release is not a failure
 
 
 async def test_release_claimed_noops_on_non_inflight_and_unknown(store: Any) -> None:
@@ -397,9 +481,9 @@ async def test_lane_chunk_clamped_second_call_covers_rest(
     lanes = [f"IB_HC{i}" for i in range(5)]
     for lane in lanes:
         await _seed_ingress(store, lane, [100.0])
-    res = await store.claim_fifo_heads(Stage.INGRESS.value, lanes, now=200.0)
+    res = await _claim_heads(store, Stage.INGRESS.value, lanes, now=200.0)
     assert set(res.by_lane) == set(lanes[:3])
-    rest = await store.claim_fifo_heads(Stage.INGRESS.value, lanes[3:], now=200.0)
+    rest = await _claim_heads(store, Stage.INGRESS.value, lanes[3:], now=200.0)
     assert set(rest.by_lane) == set(lanes[3:])
 
 
@@ -444,7 +528,7 @@ async def test_list_fifo_lanes_pagination_and_stage_scoping(store: Any) -> None:
 async def test_list_fifo_lanes_excludes_fully_claimed_lane(store: Any) -> None:
     """A lane with no PENDING rows left (all inflight) disappears from discovery."""
     await _seed_ingress(store, "IB_LC", [100.0])
-    res = await store.claim_fifo_heads(Stage.INGRESS.value, ["IB_LC"], now=200.0)
+    res = await _claim_heads(store, Stage.INGRESS.value, ["IB_LC"], now=200.0)
     assert set(res.by_lane) == {"IB_LC"}
     assert await store.list_fifo_lanes(Stage.INGRESS.value) == []
 

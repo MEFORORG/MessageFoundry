@@ -9,7 +9,7 @@ import logging
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlsplit
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -26,26 +26,47 @@ from messagefoundry.api.security import get_auth
 from messagefoundry.auth import Identity, Permission
 from messagefoundry.auth.identity import AuthProvider
 from messagefoundry.auth.service import AuthService, MfaStatus
+from messagefoundry.auth.tokens import hash_token
 from messagefoundry.parsing import HL7PeekError, parse_tree
 
 from .. import pages
 from .._auth import (
-    session_token,
+    CLEAR_SITE_DATA_HEADER,
+    CLEAR_SITE_DATA_VALUE,
     WEBAUTHN_EXTRA_MISSING_NOTICE,
     WEBAUTHN_RP_CHANGED_NOTICE,
     WEBAUTHN_RP_MISSING_NOTICE,
+    allow_reauth_attempt,
+    assert_not_cross_site,
     assert_same_origin,
     clear_session_cookie,
     is_unlock_action,
+    login_redirect_response,
     lookup_ui_action,
     register_ui_action,
     require_ui,
     require_ui_step_up,
+    session_token,
     set_session_cookie,
     webauthn_rp,
 )
+from .._html import CSP_PROBE_SRC
+from .._service import _service
 
 _log = logging.getLogger(__name__)
+
+#: Login-page outcome codes that mean "a session just ended" and therefore carry Clear-Site-Data.
+#: The header itself (and every server-driven expiry redirect that carries it) lives in
+#: :mod:`.._auth` — see :data:`.._auth.CLEAR_SITE_DATA_VALUE`. ``pwchanged`` belongs here for the same
+#: reason as ``loggedout``: a password change revokes EVERY session for the user. It is belt — the
+#: 303 that sends the browser here already carries the header via ``clear_session_cookie`` — but a
+#: browser can reach this landing by another route (Back, a bookmark) with the cookie already gone,
+#: which is exactly the case ``_has_stale_session_cookie`` below cannot detect.
+_CLEAR_SITE_DATA_LOGIN_CODES = frozenset({"expired", "loggedout", "pwchanged"})
+
+#: How many report bodies of one CSP violation BATCH the WARNING line summarises before it is
+#: truncated to a count. The reports are attacker-influenceable, so the log line is bounded.
+_CSP_REPORT_SUMMARY_MAX = 5
 
 # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). The GET editor page is the step-up `unlock`
 # continuation (a GET form the re-auth flow can 303-GET-redirect back to); the body-carrying POST
@@ -56,30 +77,38 @@ register_ui_action(
 )
 
 
-def _csp_report_summary(doc: object) -> str:
-    """A bounded, PHI-free one-line summary of a CSP violation report body, accepting BOTH delivery
-    shapes the wired /ui headers advertise: the legacy ``report-uri`` body
-    (``{"csp-report": {"document-uri": ..., "violated-directive": ..., "blocked-uri": ...}}``)
-    and the modern Reporting-API ``report-to`` batch (a top-level ARRAY whose entries carry a ``body``
-    dict keyed ``documentURL``/``effectiveDirective``/``blockedURL``, ``application/reports+json``).
-    Returns ``"empty"`` when nothing usable is present. Never raises on hostile input — the report is
-    attacker-influenceable DATA, never instructions."""
-    report: object
+def _csp_report_bodies(doc: object) -> list[dict[str, object]] | None:
+    """Normalize either wired delivery shape to the LIST of report bodies it carries, or ``None`` when
+    the payload is not an object at all: the legacy ``report-uri`` body
+    (``{"csp-report": {"document-uri": ..., "violated-directive": ..., "blocked-uri": ...}}``, always
+    exactly one) and the modern Reporting-API ``report-to`` batch (a top-level ARRAY whose entries
+    carry a ``body`` dict keyed ``documentURL``/``effectiveDirective``/``blockedURL``,
+    ``application/reports+json``). Never raises on hostile input — the report is
+    attacker-influenceable DATA, never instructions.
+
+    Returning every entry rather than the first is LOAD-BEARING (ASVS 3.7.5). The Reporting API
+    batches per endpoint, and the enforcement canary provokes one report per page load on every
+    conforming browser, so a genuine violation raised on the same page load arrives in the SAME POST,
+    behind the canary. A first-entry-only view classified that batch by the canary and dropped the real
+    violation to DEBUG — the exact detection hole the external-canary design exists to avoid.
+    """
     if isinstance(doc, list):
-        report = {}
+        bodies: list[dict[str, object]] = []
         for entry in doc:
             if isinstance(entry, dict):
                 body = entry.get("body", entry)
                 if isinstance(body, dict):
-                    report = body
-                    break
-    elif isinstance(doc, dict):
+                    bodies.append(body)
+        return bodies
+    if isinstance(doc, dict):
         inner = doc.get("csp-report", doc)
-        report = inner if isinstance(inner, dict) else {}
-    else:
-        return "non-object"
-    if not isinstance(report, dict):
-        return "empty"
+        return [inner] if isinstance(inner, dict) else []
+    return None
+
+
+def _csp_report_summary(report: dict[str, object]) -> str:
+    """A bounded, PHI-free one-line summary of ONE CSP violation report body (either delivery shape).
+    Returns ``"empty"`` when nothing usable is present."""
     # Accept both the hyphenated report-uri keys and the camelCase report-to keys, labelling the
     # summary by the stable report-uri name in either case.
     field_specs = (
@@ -97,12 +126,125 @@ def _csp_report_summary(doc: object) -> str:
     return "; ".join(fields) or "empty"
 
 
+def _request_origin(request: Request) -> str | None:
+    """This deployment's own ORIGIN (``scheme://host[:port]``, lowercased) for a same-origin
+    comparison, or ``None`` when it cannot be established.
+
+    Follows the precedence of ``_auth._origin_matches`` — ``[api].public_origin`` is authoritative
+    when configured (the off-loopback case behind a proxy that may not preserve ``Host``), else the
+    request's own ``Host`` header — but, unlike that function's Host-only fallback, it also carries the
+    SCHEME. A violation report's blocked URL is absolute, so the scheme IS observable here, and
+    ``http://<our-host>/ui/static/csp-probe.js`` on an https deployment is NOT our canary. Behind a
+    TLS-terminating proxy that neither sets ``public_origin`` nor rewrites ``scope['scheme']`` the
+    comparison simply fails and the canary's own reports WARN instead of being filtered — noisier,
+    never quieter, which is the only safe direction for a filter on a security log.
+    """
+    public_origin: str | None = getattr(request.app.state, "public_origin", None)
+    if public_origin:
+        parts = urlsplit(public_origin)
+        if not parts.scheme or not parts.netloc:
+            return None
+        return f"{parts.scheme.lower()}://{parts.netloc.lower()}"
+    host = request.headers.get("host")
+    return f"{request.url.scheme.lower()}://{host.lower()}" if host else None
+
+
+def _is_expected_csp_probe_report(report: dict[str, object], origin: str | None) -> bool:
+    """Whether THIS report body is the one violation the 3.7.5 enforcement canary is designed to
+    provoke — a conforming browser refusing OUR OWN un-nonced ``/ui/static/csp-probe.js``.
+
+    The match is SAME-ORIGIN — scheme AND ``host[:port]`` — plus same-path, and nothing else. The path
+    alone is not sufficient: it is attacker-selectable on an attacker-hosted payload, so a host-blind
+    match would let ``https://evil.example/ui/static/csp-probe.js`` — an injected script load a real
+    CSP blocked — be filed as the expected canary and dropped to DEBUG. ``origin`` is this
+    deployment's own ``scheme://host[:port]`` (:func:`_request_origin`); a relative ``blocked-uri``
+    (some browsers report a bare path) is same-origin by construction, and an absolute URL must match
+    it case-insensitively. Unknown origin fails CLOSED — the report warns.
+
+    Being an external script rather than an inline one is what makes any filtering safe at all: a
+    blocked INLINE canary reports ``blocked-uri: "inline"`` with the same directive and document as a
+    blocked injected inline script, so any filter wide enough to drop the canary would also drop the
+    report a real XSS attempt produces. Directive naming is deliberately NOT part of the match
+    (browsers report ``script-src-elem`` or ``script-src`` depending on version), and neither is the
+    document URI (every /ui page emits the canary, so it discriminates nothing).
+    """
+    blocked = report.get("blocked-uri")
+    if blocked is None:
+        blocked = report.get("blockedURL")
+    if not isinstance(blocked, str):
+        return False
+    parts = urlsplit(blocked)
+    # Compare paths: browsers report the absolute URL, but tolerate a bare path too. Query/fragment are
+    # stripped so a cache-buster can never smuggle a non-probe URL past the match.
+    if parts.path != CSP_PROBE_SRC:
+        return False
+    if not parts.netloc:
+        return True
+    return origin is not None and f"{parts.scheme.lower()}://{parts.netloc.lower()}" == origin
+
+
+async def _has_stale_session_cookie(request: Request, auth: AuthService | None) -> bool:
+    """Whether this request presents a session cookie that no longer authenticates (ASVS 14.3.1).
+
+    A first-time visitor carries no cookie and gets an ordinary login form; a browser arriving with a
+    dead ``mf_session`` is landing AFTER a termination — idle/absolute expiry, revoke, admin disable —
+    and its cached PHI pages must be dropped even when the redirect that sent it here was not ours
+    (a bookmark, a Back navigation, or a client that never ran the watchdog). Validated with
+    ``activity=False``: probing a dead session must not be treated as user activity.
+    """
+    token = session_token(request)
+    if not token:
+        return False
+    if auth is None or not auth.enabled:
+        return True  # a cookie with no auth configured can never authenticate
+    return await auth.identity_for_token(token, activity=False) is None
+
+
 def register(app: FastAPI, deps: UiDeps) -> None:
     """Register the phase-0 /ui routes (login, dashboard, messages, dead-letters, replay,
     reauth). Runs first in ``_UI_REGISTRARS``; a page lane adds its own
     ``_register_<area>(app)`` + one tuple entry below, so parallel lanes never edit this
     shared block (ADR 0065 §multi-session-build)."""
     core = deps.core
+
+    @app.get("/ui/session-status")
+    async def ui_session_status(
+        request: Request,
+        service: AuthService = Depends(_service),
+        # activity=False (ASVS 14.3.1) is LOAD-BEARING: this probe is the client watchdog's heartbeat,
+        # so refreshing the idle clock from it would make the watchdog keep the very session alive it
+        # exists to notice the end of. No permission is required beyond a live session — every
+        # authenticated page needs it, including a must-change-confined one.
+        # allow_mfa_pending is MANDATORY, not a convenience: the confinement page at /ui/mfa carries
+        # the same watchdog, so gating this probe would 303 it to /ui/mfa on every heartbeat and the
+        # page would fight its own poll.
+        identity: Identity = Depends(
+            require_ui(allow_must_change=True, allow_mfa_pending=True, activity=False)
+        ),
+    ) -> JSONResponse:
+        """The session watchdog's heartbeat (ASVS 14.3.1).
+
+        Reaching this AT ALL is the liveness signal — ``require_ui`` 303s to the login page the moment
+        the session is idle-expired, absolute-expired or revoked, and the client treats that redirect
+        as termination. The body carries the ABSOLUTE deadline as **remaining seconds**, never a
+        wall-clock the client would have to trust against its own (possibly wrong, possibly
+        adversary-set) system time, and it is read from the session RECORD rather than computed from
+        ``[auth].session_absolute_hours`` — a federated session's deadline may be capped lower by the
+        IdP's ``id_token.exp``, so settings arithmetic would over-state it.
+
+        ``expires_secs`` is null when the record cannot be resolved; the client then relies on the
+        server verdict and its stale-contact bound alone rather than inventing a deadline.
+        """
+        remaining: int | None = None
+        token = session_token(request)
+        if token:
+            # The SAME indexed point-lookup ``identity_for_token`` just did (``require_ui`` above),
+            # not a per-user session listing: this probe runs every 30s in every open console tab, and
+            # ``list_sessions`` is an unindexed scan on all three backends.
+            record = await service.store.get_session(hash_token(token))
+            if record is not None:
+                remaining = max(0, int(record.expires_at - datetime.now(UTC).timestamp()))
+        return JSONResponse({"expires_secs": remaining})
 
     @app.get("/ui/login", response_class=HTMLResponse)
     async def ui_login_form(
@@ -111,10 +253,33 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         auth = get_auth(request)
         ad_enabled = auth is not None and auth.ad_enabled
         sso_enabled = auth is not None and auth.kerberos_available
-        return HTMLResponse(pages.login(e, ad_enabled=ad_enabled, sso_enabled=sso_enabled))
+        # getattr: an older engine (seam < 10) has no oidc_available property at all, and a bare
+        # attribute read would AttributeError rather than degrade (the exposure_protected
+        # precedent). oidc_available, not oidc_enabled -- the LINK should disappear while the IdP
+        # is known-down, even though the start leg still attempts per-request (AC-8).
+        oidc_enabled = bool(getattr(auth, "oidc_available", False))
+        resp = HTMLResponse(
+            pages.login(
+                e, ad_enabled=ad_enabled, sso_enabled=sso_enabled, oidc_enabled=oidc_enabled
+            )
+        )
+        # ASVS 14.3.1: this render IS the post-termination landing page when either the outcome code
+        # says so (the watchdog's ?e=expired, the redirect target of POST /ui/logout, or the
+        # server's own expiry redirect) OR the browser still presents a session cookie that no
+        # longer authenticates — a stale cookie IS a terminated session, whatever URL it landed on.
+        # Tell the browser to drop that session's cached representations so Back / bfcache cannot
+        # resurrect a PHI page whose session no longer exists.
+        if e in _CLEAR_SITE_DATA_LOGIN_CODES or await _has_stale_session_cookie(request, auth):
+            resp.headers[CLEAR_SITE_DATA_HEADER] = CLEAR_SITE_DATA_VALUE
+        return resp
 
     @app.post("/ui/login")
     async def ui_login(request: Request) -> Response:
+        # ASVS 3.5.1 — FIRST statement, ahead of the per-address login budget below: a cross-site
+        # credential POST is refused having spent no rate-limit token and run no password verify. The
+        # unauthenticated leg is exactly where SameSite=Strict supplies nothing (there is no session
+        # cookie yet), so this origin check is the only login-CSRF control available here.
+        assert_same_origin(request)
         auth = get_auth(request)
         if auth is None or not auth.enabled:
             raise HTTPException(503, "authentication is not configured")
@@ -140,19 +305,39 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if not outcome.ok or outcome.token is None:
             return RedirectResponse("/ui/login?e=bad", status_code=303)
         # A must-change account goes straight to the browser rotation page (L4b) — every other
-        # /ui route would bounce it there anyway (require_ui).
-        target = "/ui/account/password" if outcome.must_change_password else "/ui"
+        # /ui route would bounce it there anyway (require_ui). An MFA-pending session lands on the
+        # second-factor page for the same reason (ASVS 6.3.3). Order matches the server-side gates:
+        # must_change first, since a fresh account is BOTH and can only rotate.
+        #
+        # UX only — require_ui is what actually enforces, and it covers the other two cookie-minting
+        # legs (Kerberos SSO, the OIDC callback) without either needing this branch.
+        if outcome.must_change_password:
+            target = "/ui/account/password"
+        elif outcome.mfa_required:
+            target = "/ui/mfa"
+        else:
+            target = "/ui"
         resp = RedirectResponse(target, status_code=303)
         set_session_cookie(resp, outcome.token, request=request)
         return resp
 
     @app.post("/ui/logout")
     async def ui_logout(request: Request) -> Response:
+        # ASVS 3.5.1 — FIRST statement, before the session is revoked below. This route deliberately
+        # carries NO Depends gate (so a must-change-confined session can still sign itself out — the
+        # affordance ASVS 7.4.4 makes visible), which means the origin check is the only
+        # request-provenance control it will ever have: without it a cross-site POST the browser
+        # attaches the cookie to would forcibly terminate the operator's session.
+        assert_same_origin(request)
         auth = get_auth(request)
         token = session_token(request)
         if auth is not None and token:
             await auth.logout(token)
         resp = RedirectResponse("/ui/login?e=loggedout", status_code=303)
+        # ASVS 14.3.1: revoking server-side and deleting the cookie leaves the browser's CACHED
+        # representations of the operator's PHI pages behind, which Back / bfcache can resurrect.
+        # ``clear_session_cookie`` emits Clear-Site-Data itself — cookie deletion IS the termination,
+        # so the two cannot be written apart (see its docstring for the scope rationale).
         clear_session_cookie(resp, request)
         return resp
 
@@ -167,7 +352,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/connections", response_class=HTMLResponse)
     async def ui_connections(
         engine: Any = Depends(deps.get_engine),
-        identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
+        # activity=False (ASVS 14.3.1): the dashboard's 5s live-table refresh is timer-driven, not
+        # user activity — it must not keep an abandoned tab's session alive.
+        identity: Identity = Depends(require_ui(Permission.MONITORING_READ, activity=False)),
     ) -> HTMLResponse:
         rows = await core.list_connections(engine=engine, identity=identity)
         return HTMLResponse(pages.connections_fragment(rows))
@@ -175,6 +362,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     @app.get("/ui/connection/{name}", response_class=HTMLResponse)
     async def ui_connection_details(
         name: str,
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui(Permission.MONITORING_READ)),
     ) -> HTMLResponse:
@@ -201,6 +389,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 kind=None,
                 since=None,
                 limit=50,
+                request=request,
             )
         except HTTPException:
             events = []  # still show the connection's info + stats if events are RBAC-scoped out
@@ -316,7 +505,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # top-level GET nav can't carry the bearer token, so the /ui gate re-asserts view_raw via the
         # session cookie; the engine handler does the same PHI audit as the JSON API route.
         result: Response = await core.download_attachment(
-            message_id, attachment_id, engine=engine, identity=identity
+            message_id, attachment_id, engine=engine, identity=identity, request=request
         )
         return result
 
@@ -355,7 +544,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         action: Callable[..., Any],
     ) -> Response:
         assert_same_origin(request)
-        await action(name, engine=engine, identity=identity)
+        # ADR 0150: the console mounts IN-PROCESS on the engine's own app, so this Request is the
+        # BROWSER's — forwarding it attributes the row to the operator's host, not the engine.
+        await action(name, engine=engine, identity=identity, request=request)
         return RedirectResponse("/ui", status_code=303)
 
     @app.post("/ui/connections/{name}/start")
@@ -397,7 +588,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_REPLAY)),
     ) -> Response:
         assert_same_origin(request)
-        await core.replay_message(message_id, engine=engine, identity=identity)
+        await core.replay_message(message_id, engine=engine, identity=identity, request=request)
         return RedirectResponse(f"/ui/messages/{message_id}", status_code=303)
 
     # Edit-and-resubmit (ADR 0090 §9, BACKLOG #153). GET renders the editor (a COPY of the raw); the
@@ -430,7 +621,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         ),
     ) -> Response:
         assert_same_origin(request)
-        form = dict(await request.form())
+        # Parse the urlencoded resubmit form with stdlib — the engine has no python-multipart dep, so
+        # Form()/request.form() would fail (mirrors the /ui/login + /ui/reauth POST parsing above).
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
         raw = str(form.get("raw", ""))
         idem = str(form.get("idempotency_key", "")).strip()
         mode = str(form.get("mode", "reroute"))
@@ -465,7 +658,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return await _reject("invalid input")
         try:
             result = await core.edit_resend_message(
-                message_id, body=body, engine=engine, identity=identity
+                message_id, body=body, engine=engine, identity=identity, request=request
             )
         except HTTPException as exc:
             # str(exc.detail) carries ids only (the endpoint never interpolates the body).
@@ -504,6 +697,79 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             return None, WEBAUTHN_RP_CHANGED_NOTICE
         return options, None
 
+    @app.get("/ui/mfa", response_class=HTMLResponse)
+    async def ui_mfa_form(request: Request) -> Response:
+        """The ASVS 6.3.3 confinement page for an MFA-pending browser session.
+
+        Carries NO ``require_ui`` dependency on purpose — the gate 303s every pending session here, so
+        a gated version of this page would redirect to itself. Auth is done by hand instead, in the
+        SAME order the gate uses, so the two cannot disagree.
+
+        A separate route rather than a reuse of ``/ui/reauth``: that page 303s to /ui unless ``next``
+        names a registered write action, and its POST always demands the password — which an operator
+        proved seconds earlier at sign-in.
+        """
+        auth = get_auth(request)
+        token = session_token(request)
+        identity = await auth.identity_for_token(token) if auth is not None else None
+        if auth is None or identity is None:
+            return login_redirect_response()
+        if identity.must_change_password:
+            # must_change outranks MFA, mirroring require()/require_ui: a fresh account is both, and
+            # only rotation is reachable until it happens.
+            return RedirectResponse("/ui/account/password", status_code=303)
+        if await auth.mfa_satisfied(token):
+            return RedirectResponse("/ui", status_code=303)  # idempotent: nothing owed
+        mfa = await auth.mfa_status(identity)
+        if not (mfa.enabled or mfa.webauthn_enrolled):
+            # Required but NOTHING enrolled: there is no factor to ask for. Reuse the existing
+            # enroll-first bounce rather than rendering a form that cannot be answered — this is
+            # what keeps a fresh account from bouncing between the gate and an empty page.
+            return RedirectResponse("/ui/account?m=enroll_first", status_code=303)
+        wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
+        return HTMLResponse(
+            pages.mfa_gate(
+                totp_enrolled=mfa.enabled,
+                webauthn_options=wa_options,
+                webauthn_notice=wa_notice,
+            )
+        )
+
+    @app.post("/ui/mfa")
+    async def ui_mfa_submit(request: Request) -> Response:
+        assert_same_origin(request)
+        auth = get_auth(request)
+        token = session_token(request)
+        identity = await auth.identity_for_token(token) if auth is not None else None
+        if auth is None or not token or identity is None:
+            return login_redirect_response()
+        if identity.must_change_password:
+            return RedirectResponse("/ui/account/password", status_code=303)
+        client = request.client.host if request.client else None
+        if not allow_reauth_attempt(auth, identity, client):
+            # Same per-ACTOR ceremony budget the reauth/password flows draw on, so code-guessing
+            # here cannot outrun it either.
+            # Retry-After: 30 matches POST /ui/reauth, the sibling ceremony on the SAME per-actor
+            # budget — a different hint for the same limiter would just misreport when it clears.
+            raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        if await auth.verify_mfa(token, form.get("code", ""), client=client):
+            return RedirectResponse("/ui", status_code=303)
+        mfa = await auth.mfa_status(identity)
+        wa_options, wa_notice = await _reauth_webauthn_state(request, auth, token, mfa, False)
+        # The submitted code is NOT echoed back — it is a bearer credential, and verify_mfa has
+        # already audited the failure. Generic copy: the form cannot say whether the code was
+        # wrong or expired without narrowing a guess.
+        return HTMLResponse(
+            pages.mfa_gate(
+                totp_enrolled=mfa.enabled,
+                error="That code wasn't accepted. Try again.",
+                webauthn_options=wa_options,
+                webauthn_notice=wa_notice,
+            ),
+            status_code=400,
+        )
+
     @app.get("/ui/reauth", response_class=HTMLResponse)
     async def ui_reauth_form(
         request: Request,
@@ -519,7 +785,9 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or identity is None:
-            return RedirectResponse("/ui/login", status_code=303)
+            # The session ended under the operator (expiry / revoke) — a post-termination landing
+            # like any other, so it carries Clear-Site-Data + the explanatory code (14.3.1).
+            return login_redirect_response()
         if identity.must_change_password:
             # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
             return RedirectResponse("/ui/account/password", status_code=303)
@@ -554,7 +822,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         token = session_token(request)
         identity = await auth.identity_for_token(token) if auth is not None else None
         if auth is None or not token or identity is None:
-            return RedirectResponse("/ui/login", status_code=303)
+            return login_redirect_response()  # session ended mid-ceremony — see ui_reauth_form
         if identity.must_change_password:
             # Mirror require_ui's confinement: a must-change session can only rotate (L4b).
             return RedirectResponse("/ui/account/password", status_code=303)
@@ -593,7 +861,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 status_code=400,
             )
         client = request.client.host if request.client else None
-        if not auth.allow_login_attempt(client):
+        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             raise HTTPException(429, "too many attempts", headers={"Retry-After": "30"})
         # Satisfy whichever factor is pending — TOTP first (mirrors require_step_up), then
         # password. The code is only demanded from a user with an ENROLLED authenticator
@@ -620,7 +888,12 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                         error="Invalid code.",
                     )
                 )
-        if not await auth.reauth(identity, form.get("password", ""), token=token, client=client):
+        # 7.5.1 (ADR 0077): mint the single-use grant bound to this continuation's action. action.action
+        # is None for every non-factor continuation (replay/purge/config/create-user), so reauth mints
+        # nothing there and those flows stay byte-identical; the factor-binding lanes tag their action.
+        if not await auth.reauth(
+            identity, form.get("password", ""), token=token, client=client, purpose=action.action
+        ):
             still_unsatisfied = not await auth.mfa_satisfied(token)
             wa_options, wa_notice = await _reauth_webauthn_state(
                 request, auth, token, mfa, not still_unsatisfied
@@ -665,7 +938,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if rp is None:
             return JSONResponse({"ok": False, "error": "rp_unavailable"}, status_code=409)
         client = request.client.host if request.client else None
-        if not auth.allow_login_attempt(client):
+        if not allow_reauth_attempt(auth, identity, client):  # per-ACTOR, not the sign-in budget
             return JSONResponse(
                 {"ok": False, "error": "too many attempts"},
                 status_code=429,
@@ -707,6 +980,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             engine=engine,
             identity=identity,
             gate=gate,
+            request=request,
         )
         if isinstance(result, PendingApprovalResponse):
             return HTMLResponse(pages.dead_letter_pending(result))
@@ -750,21 +1024,54 @@ def register(app: FastAPI, deps: UiDeps) -> None:
 
     @app.post("/ui/csp-report")
     async def ui_csp_report(request: Request) -> Response:
+        # ASVS 3.5.1 — FIRST statement. The THIRD unguarded /ui POST is disposed of here, with the
+        # NARROW guard rather than the full same-origin check, because the two are not interchangeable
+        # on a report sink: `report-uri` delivery is document-initiated (Sec-Fetch-Site: same-origin),
+        # but Reporting-API (`report-to`) delivery is made OUT OF BAND by the user agent's reporting
+        # agent — no Sec-Fetch-* headers, possibly `Origin: null` — so assert_same_origin's Origin
+        # fallback would 403 every modern report and silently blind the 3.7.5 canary. The property that
+        # actually matters here is preserved: a report a FOREIGN site's CSP aimed at this endpoint
+        # (log amplification) is refused. The residual exposure of the header-less path is bounded by
+        # construction — the sink is unauthenticated, non-state-changing and observation-only: it
+        # parses defensively, never echoes or acts on the body, logs one bounded PHI-free summary and
+        # 204s, under the engine's 1 MiB request-body cap.
+        assert_not_cross_site(request)
         # Browser-delivered CSP violation report (ASVS 3.7.5). UNAUTHENTICATED and non-mutating: a
         # browser attaches no session credential to a report POST, and this only observes. The body is
         # attacker-influenceable DATA (never instructions) — parse it defensively, log a BOUNDED,
         # PHI-free summary at WARNING (the /ui surface carries no message bodies in its URLs), and 204.
         # Never echo or act on the report. Both the legacy report-uri body and the modern report-to
-        # array (the wired Reporting-Endpoints header) are summarised by ``_csp_report_summary``.
-        raw = await request.body()
-        summary = "empty"
-        if raw:
-            try:
-                doc = json.loads(raw.decode("utf-8", "replace"))
-            except ValueError:
-                summary = "malformed-json"
-            else:
-                summary = _csp_report_summary(doc)
+        # ARRAY (the wired Reporting-Endpoints header) are normalized by ``_csp_report_bodies``.
         client = request.client.host if request.client else "<unknown>"
-        _log.warning("CSP violation report from %s: %s", client, summary[:1024])
+        raw = await request.body()
+        if not raw:
+            _log.warning("CSP violation report from %s: %s", client, "empty")
+            return Response(status_code=204)
+        try:
+            doc = json.loads(raw.decode("utf-8", "replace"))
+        except ValueError:
+            _log.warning("CSP violation report from %s: %s", client, "malformed-json")
+            return Response(status_code=204)
+        bodies = _csp_report_bodies(doc)
+        if bodies is None:
+            _log.warning("CSP violation report from %s: %s", client, "non-object")
+            return Response(status_code=204)
+        # Partition the BATCH, never classify it by one entry. The canary fires once per page load on
+        # every conforming browser and the Reporting API batches per endpoint, so a real violation
+        # raised on the same page load arrives in the same POST alongside the canary's report. Only
+        # the canary's own entries are dropped to DEBUG (so it never floods the operational log); a
+        # batch containing ANY other blocked URL — including "inline", the shape a real XSS attempt
+        # produces — still WARNS, and the warning summarises the REAL entries, not the canary.
+        origin = _request_origin(request)
+        real = [b for b in bodies if not _is_expected_csp_probe_report(b, origin)]
+        canary_count = len(bodies) - len(real)
+        if canary_count:
+            _log.debug("CSP enforcement canary blocked as designed (%d report(s))", canary_count)
+        if real or not bodies:
+            # Bounded on BOTH axes — per-field (256 chars, in the summariser), per-batch (the first
+            # few entries) and overall (1024 chars) — so a hostile flood cannot inflate the log.
+            shown = " | ".join(_csp_report_summary(b) for b in real[:_CSP_REPORT_SUMMARY_MAX])
+            if len(real) > _CSP_REPORT_SUMMARY_MAX:
+                shown += f" (+{len(real) - _CSP_REPORT_SUMMARY_MAX} more)"
+            _log.warning("CSP violation report from %s: %s", client, (shown or "empty")[:1024])
         return Response(status_code=204)

@@ -367,7 +367,7 @@ async def _refused(reader: asyncio.StreamReader) -> None:
     """A refused connection is closed from the server side. That surfaces as a clean EOF, or — on
     Windows, when the client already wrote bytes the server never read — a connection reset. Either
     confirms the peer was not accepted."""
-    try:
+    try:  # noqa: SIM105
         assert await asyncio.wait_for(reader.read(), 2.0) == b""
     except (ConnectionResetError, ConnectionAbortedError):
         pass

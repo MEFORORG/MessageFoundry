@@ -14,6 +14,46 @@
     inits.push([hookSelector, fn]);
   }
 
+  // SECURITY controls register here instead, and the runner starts them FIRST (see the bottom of
+  // this file). A security control must not share a failure domain with — or be ordered behind —
+  // cosmetic page enhancers: the registry is replayed in registration order, so a control sitting
+  // ninth of fourteen depended on eight unrelated inits not throwing, on exactly the PHI pages
+  // (Messages, Dead letters) it exists to protect. Each init is also isolated in its own try/catch
+  // by the runner, so one broken feature can no longer disable the rest.
+  var securityInits = [];
+  function securityFeature(hookSelector, fn) {
+    securityInits.push([hookSelector, fn]);
+  }
+
+  // [security].allowed_client_networks: the engine's source-network gate refuses OUTSIDE the app, so a
+  // denial is a 403 that matches none of the auth branches below. Without this the pollers would keep
+  // painting the last-good table forever and the health box would hide itself as if it were an RBAC
+  // outcome — a console that LOOKS alive but is frozen, which is exactly how an operator whose
+  // workstation was renumbered mid-session experiences it. The engine marks its network denials with a
+  // dedicated header so we can tell them apart from a genuine permission 403 and navigate instead: a
+  // full page load lands on the engine's denial page, which names the setting and shows the address the
+  // engine actually observed.
+  function mfNetworkDenied(resp) {
+    return resp.status === 403 && resp.headers.get("X-MessageFoundry-Denied") === "client-network";
+  }
+
+  // ASVS 14.3.1 — "the server has ended this session", for a fetch. EVERY fetch below sets
+  // redirect:"manual", which is load-bearing and was the bug this replaces: a same-origin 303 is
+  // followed TRANSPARENTLY under the default redirect:"follow", so a status test for the redirect
+  // could never be observed in a real browser — the expiry branch was dead code and the poller
+  // instead assigned a 200 LOGIN PAGE into the container it was refreshing. With redirect:"manual"
+  // the auth redirect surfaces as an opaque response (type "opaqueredirect", status 0) that this
+  // recognises, so the page actually reloads and the server can send the operator to the login page.
+  // The explicit status tests stay for a non-browser client and for the engine answering 401.
+  function mfSessionEnded(resp) {
+    return (
+      resp.type === "opaqueredirect" ||
+      resp.status === 0 ||
+      resp.status === 303 ||
+      resp.status === 401
+    );
+  }
+
   // Auto-retry after a successful step-up re-auth: submit the pending action form (server-rendered,
   // same-origin, action already validated as a replay path). Graceful: if this doesn't run, the user
   // clicks the visible "Continue" button instead.
@@ -37,6 +77,7 @@
       try {
         var resp = await fetch(url, {
           credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
           headers: { "X-Requested-With": "fetch" },
           cache: "no-store",
         });
@@ -48,8 +89,9 @@
           // skip this swap — the next tick resumes the live view.
           if (document.body.classList.contains("mf-col-resizing")) return;
           container.innerHTML = htmlText;
-        } else if (resp.status === 303 || resp.status === 401) {
-          // Session expired — reload so the server can redirect to the login page.
+        } else if (mfSessionEnded(resp) || mfNetworkDenied(resp)) {
+          // Session expired, or the source-network gate refused us — reload so the server can redirect
+          // to the login page / serve its network-denial page instead of freezing on stale data.
           window.location.reload();
         }
       } catch (e) {
@@ -480,6 +522,17 @@
         }
         var data = await resp.json();
         if (data.ok) {
+          // ASVS 6.3.3: on the /ui/mfa sign-in gate the assertion COMPLETES the ceremony — there is
+          // no password still owed, so navigate. Without this a passkey-only user (no TOTP, so no
+          // code field and no submit button on that page) verifies successfully and is stranded on
+          // a dead page, which is the deadlock ADR 0068 decision 1(d) exists to prevent.
+          var done = button.getAttribute("data-mf-webauthn-done");
+          if (done) {
+            status.set("Passkey verified — continuing…");
+            window.location.assign(done);
+            return;
+          }
+          // On the step-up reauth page the password is still owed, so stay put and unlock it.
           status.set("Passkey verified — enter your password to continue.");
           var codeInput = document.querySelector("input[name=code]");
           if (codeInput) codeInput.disabled = true; // either factor satisfies; this one just did
@@ -883,30 +936,167 @@
     if (poll) new MutationObserver(enhanceAll).observe(poll, { childList: true, subtree: true });
   });
 
-  // --- Connections filter box: hide rows that don't match the typed query (client-side) -----------
-  // The input lives in the un-polled shell, so its value survives the ~1s live swap; app.js filters the
-  // table's rows by textContent and re-applies after each poll/ws swap (MutationObserver on [data-poll]).
-  // display:none only — the server still sends every row, and a hidden row's checkbox stays in the
-  // selection Set (the filter is view-only). Coexists with sort (which re-appends rows) + column resize.
+  // --- Connections filter box: hide rows that don't match the typed query + the Flagged-only toggle ---
+  // Both controls live in the un-polled shell, so their state survives the ~1s live swap; app.js filters
+  // the table's rows and re-applies after each poll/ws swap (MutationObserver on [data-poll]). A row is
+  // visible iff (text query matches) AND (Flagged-only off OR the row's selection checkbox is
+  // data-flagged="1", #131). display:none only — the server still sends every row and a hidden row's
+  // checkbox stays in the selection Set (the filter is view-only). Coexists with sort + column resize.
   feature("[data-mf-conns-filter]", function (input) {
     var poll = document.querySelector("[data-poll]");
     if (!poll) return; // no live table on this page
+    var flaggedOnly = document.querySelector("[data-mf-conns-flagged]");
     function apply() {
       var q = input.value.trim().toLowerCase();
+      var onlyFlagged = !!(flaggedOnly && flaggedOnly.checked);
       var rows = poll.querySelectorAll("tbody tr");
       for (var i = 0; i < rows.length; i++) {
-        var hit = !q || rows[i].textContent.toLowerCase().indexOf(q) !== -1;
-        rows[i].style.display = hit ? "" : "none";
+        var textHit = !q || rows[i].textContent.toLowerCase().indexOf(q) !== -1;
+        var cb = rows[i].querySelector("[data-mf-conns-cb]");
+        var flagHit = !onlyFlagged || (cb && cb.getAttribute("data-flagged") === "1");
+        rows[i].style.display = textHit && flagHit ? "" : "none";
       }
     }
     input.addEventListener("input", apply);
+    if (flaggedOnly) flaggedOnly.addEventListener("change", apply);
     // Re-apply after each swap (fresh rows) and after a sort re-append. Style-only changes don't feed
     // back into this observer (it watches childList), so no loop.
     new MutationObserver(apply).observe(poll, { childList: true, subtree: true });
     apply();
   });
 
+  // --- Generic fragment poller (BACKLOG #76) -------------------------------------------------------
+  // Fetch a server-rendered, server-escaped fragment named in data-fragment-url on an interval and swap
+  // it into this container's innerHTML. Used by the Flow & trends page (/ui/monitoring/live) so the
+  // status-colored inline-SVG data-flow graph + the queue-trend chart refresh without a WebSocket. A
+  // DISTINCT hook from [data-poll] (no ws, no connections-table entanglement); same server-render
+  // security model — the fragment is already escaped, never client-built markup (CSP script-src 'self').
+  // The initial content is server-rendered into the container, so the first swap is one interval later.
+  feature("[data-mf-fragment]", function (container) {
+    var url = container.getAttribute("data-fragment-url");
+    var ms = parseInt(container.getAttribute("data-fragment-ms") || "5000", 10);
+    if (!url || !(ms > 0)) return;
+    async function tick() {
+      try {
+        var resp = await fetch(url, {
+          credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+        });
+        if (resp.ok) {
+          container.innerHTML = await resp.text(); // server-rendered + server-escaped fragment
+        } else if (mfSessionEnded(resp) || mfNetworkDenied(resp)) {
+          // Session expired, or the source-network gate refused us — never freeze on stale data.
+          window.location.reload();
+        }
+      } catch (e) {
+        // Transient network/engine hiccup — leave the last good view in place and retry next tick.
+      }
+    }
+    setInterval(tick, ms);
+  });
+
   // --- Live engine-health + alerts nav glyphs ------------------------------------------------------
+  // ---------------------------------------------------------------------------------------------
+  // SESSION WATCHDOG (ASVS 14.3.1). A rendered console page can hold PHI in the DOM long after the
+  // server has ended the session — the tab keeps showing it because nothing asks. This discards it.
+  //
+  // Anchored to the SERVER, never to local DOM activity. That distinction is the whole control: the
+  // server's idle clock only advances on real requests, so a watchdog reset by mouse/keyboard would
+  // sit happily on a poll-less PHI page keeping the rendered chart alive for hours after the session
+  // it belongs to was terminated — precisely the exposure this requirement is about. Three legs, all
+  // server-derived:
+  //
+  //   1. VERDICT — GET /ui/session-status with redirect:"manual". The server 303s to the login page
+  //      the moment the session is idle-expired, absolute-expired or revoked (including "sign out
+  //      everywhere else" and an admin disable), and that surfaces here as an opaque redirect. It is
+  //      probed with activity=false server-side, so probing never keeps the session alive.
+  //   2. ABSOLUTE — the probe returns the deadline as REMAINING SECONDS, converted to a local
+  //      monotonic-ish deadline on arrival. Never a wall-clock the page would have to trust against
+  //      its own system time, and read from the session record so a federated session capped by the
+  //      IdP's id_token.exp is respected rather than over-stated from settings.
+  //   3. STALE CONTACT — if no probe has SUCCEEDED for STALE_LIMIT_MS the page can no longer confirm
+  //      the session at all (engine down, network gone, laptop offline). It terminates anyway: an
+  //      unconfirmable session is not a licence to keep PHI on screen. This bound is deliberately far
+  //      tighter than any sane server idle timeout, so it never pre-empts a healthy session.
+  //
+  // Terminating BLANKS THE DOCUMENT FIRST and only then navigates. Ordering matters: location.replace
+  // can fail or hang when the engine is unreachable — exactly leg 3's scenario — and a failed
+  // navigation would otherwise leave the PHI on screen indefinitely. Blanking is unconditional and
+  // synchronous, so the offline case is covered whether or not the navigation ever completes.
+  // Registered as a SECURITY control (securityFeature, not feature): started before every page
+  // enhancer and isolated from their failures — see the registry comment at the top of this file.
+  securityFeature("[data-mf-session-watchdog]", function () {
+    var PROBE_MS = 30000; // heartbeat; activity=false server-side, so it never slides the idle clock
+    var TICK_MS = 1000; // deadline check — cheap, and keeps the fire granularity tight
+    var STALE_LIMIT_MS = 300000; // no CONFIRMED-live server response for 5 min => discard the DOM
+    var EXPIRED_URL = "/ui/login?e=expired";
+
+    var lastServerContact = Date.now(); // the page render itself was a server interaction
+    var absoluteDeadline = null; // ms epoch, from the probe's remaining-seconds
+    var terminated = false;
+
+    function terminate() {
+      if (terminated) return;
+      terminated = true;
+      try {
+        // Blank BEFORE navigating (see above). replaceChildren() drops every rendered node; the
+        // title goes too so a tab preview cannot leak the message/patient context either.
+        if (document.body) document.body.replaceChildren();
+        document.title = "Session ended — MessageFoundry";
+      } catch (e) {
+        // Never let a DOM edge case skip the navigation below.
+      }
+      try {
+        window.location.replace(EXPIRED_URL);
+      } catch (e) {
+        window.location.href = EXPIRED_URL;
+      }
+    }
+
+    async function probe() {
+      if (terminated) return;
+      try {
+        var resp = await fetch("/ui/session-status", {
+          credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+        });
+        if (resp.type === "opaqueredirect" || resp.status === 0 || resp.status === 303) {
+          terminate(); // the server has ended this session
+          return;
+        }
+        if (resp.status === 401 || resp.status === 403) {
+          terminate();
+          return;
+        }
+        if (!resp.ok) return; // a 5xx is an engine problem, not a session verdict — let leg 3 decide
+        var data = JSON.parse(await resp.text()) || {};
+        lastServerContact = Date.now();
+        var secs = data.expires_secs;
+        absoluteDeadline = typeof secs === "number" ? Date.now() + secs * 1000 : null;
+      } catch (e) {
+        // Unreachable engine / offline: do NOT refresh lastServerContact — leg 3 is the answer.
+      }
+    }
+
+    function tick() {
+      if (terminated) return;
+      var now = Date.now();
+      if (absoluteDeadline !== null && now >= absoluteDeadline) {
+        terminate();
+        return;
+      }
+      if (now - lastServerContact >= STALE_LIMIT_MS) terminate();
+    }
+
+    probe();
+    setInterval(probe, PROBE_MS);
+    setInterval(tick, TICK_MS);
+  });
+
   // The nav renders on EVERY page, so this is the one always-on poller. It fetches the metadata-only
   // GET /ui/nav-status (~15s) and recolors two server-rendered <span> glyphs via classList + title/
   // aria-label only — never innerHTML (CSP script-src 'self'; the count is a number, set as text/aria, not
@@ -981,6 +1171,13 @@
         // "engine unreachable". Treat it as a no-op: the next real navigation takes the user to login. (Same
         // idiom as the step-up fetches above.)
         if (resp.type === "opaqueredirect" || resp.status === 0) return;
+        if (mfNetworkDenied(resp)) {
+          // NOT an RBAC outcome — the source-network gate refused us. Navigating surfaces the engine's
+          // denial page (which names the setting and the observed address) instead of silently hiding
+          // the box, which would read as "you lack monitoring:read".
+          window.location.reload();
+          return;
+        }
         if (resp.status === 403) {
           box.style.display = "none"; // not permitted to see engine status at all
           return;
@@ -1048,9 +1245,262 @@
     modeSync();
   });
 
-  // Deferred script → DOM already parsed. Run each feature whose hook is present on this page.
-  inits.forEach(function (pair) {
-    var el = document.querySelector(pair[0]);
-    if (el) pair[1](el);
+  // Runtime log-verbosity control (BACKLOG #171, ADR 0130). A server-rendered <select> whose current
+  // value is the live level; changing it PATCHes the same-origin /ui proxy of PATCH /logging/level. The
+  // override is EPHEMERAL — it resets on a process restart (and NOT on /config/reload) — so the status
+  // line says so. On failure the select reverts to the last-applied value (no silent divergence).
+  feature("[data-mf-log-level]", function (select) {
+    var status = document.querySelector("[data-mf-log-level-status]");
+    var current = select.value;
+    select.addEventListener("change", async function () {
+      var next = select.value;
+      if (status) status.textContent = "Applying…";
+      try {
+        var resp = await fetch("/ui/logging/level", {
+          method: "PATCH",
+          credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
+          headers: { "Content-Type": "application/json", "X-Requested-With": "fetch" },
+          body: JSON.stringify({ level: next }),
+          cache: "no-store",
+        });
+        if (mfSessionEnded(resp) || mfNetworkDenied(resp)) {
+          window.location.reload(); // session expired, or refused by the source-network gate
+          return;
+        }
+        if (resp.ok) {
+          var data = await resp.json();
+          current = data.level || next;
+          select.value = current;
+          if (status)
+            status.textContent =
+              "Log level set to " + current + " (ephemeral — resets on restart).";
+        } else {
+          select.value = current; // revert on refusal (e.g. missing monitoring:diagnose / step-up)
+          if (status) status.textContent = "Could not change log level (" + resp.status + ").";
+        }
+      } catch (e) {
+        select.value = current;
+        if (status) status.textContent = "Network error changing log level.";
+      }
+    });
   });
+
+  // Redacted application-log viewer (BACKLOG #171, ADR 0130). Pages the same-origin /ui proxy of GET
+  // /logs/tail, which returns ALREADY-REDACTED lines (best-effort PHI/secret scrub) counted back from the
+  // end of the newest log file. offset counts lines from the END (0 = newest page). Lines are appended as
+  // TEXT nodes, never innerHTML — the redacted log is still untrusted content and must never be parsed as
+  // markup. Degrades to a message when no log file is configured (available=false).
+  feature("[data-mf-log-viewer]", function (root) {
+    var out = root.querySelector("[data-mf-log-lines]");
+    var olderBtn = root.querySelector("[data-mf-log-older]");
+    var newerBtn = root.querySelector("[data-mf-log-newer]");
+    var refreshBtn = root.querySelector("[data-mf-log-refresh]");
+    var status = root.querySelector("[data-mf-log-status]");
+    var limit = parseInt(root.getAttribute("data-mf-log-limit") || "200", 10);
+    if (!(limit > 0)) limit = 200;
+    var offset = 0;
+    var total = 0;
+
+    async function load() {
+      if (status) status.textContent = "Loading…";
+      try {
+        var resp = await fetch("/ui/logs/tail?limit=" + limit + "&offset=" + offset, {
+          credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+        });
+        if (mfSessionEnded(resp) || mfNetworkDenied(resp)) {
+          window.location.reload(); // session expired, or refused by the source-network gate
+          return;
+        }
+        if (!resp.ok) {
+          if (status) status.textContent = "Could not load log (" + resp.status + ").";
+          return;
+        }
+        var data = await resp.json();
+        total = data.total_lines || 0;
+        if (out) {
+          out.textContent = "";
+          if (!data.available) {
+            out.textContent = "No application-log file is configured (logging to stdout).";
+          } else if (!data.lines.length) {
+            out.textContent = "(no log lines)";
+          } else {
+            data.lines.forEach(function (line) {
+              out.appendChild(document.createTextNode(line + "\n"));
+            });
+          }
+        }
+        if (newerBtn) newerBtn.disabled = offset <= 0;
+        if (olderBtn) olderBtn.disabled = offset + limit >= total;
+        if (status) {
+          var shown = Math.min(limit, Math.max(0, total - offset));
+          status.textContent = data.available
+            ? "Lines " +
+              (total - offset - shown + 1) +
+              "–" +
+              (total - offset) +
+              " of " +
+              total
+            : "";
+        }
+      } catch (e) {
+        if (status) status.textContent = "Network error loading log.";
+      }
+    }
+
+    if (olderBtn)
+      olderBtn.addEventListener("click", function () {
+        if (offset + limit < total) {
+          offset += limit;
+          load();
+        }
+      });
+    if (newerBtn)
+      newerBtn.addEventListener("click", function () {
+        offset = Math.max(0, offset - limit);
+        load();
+      });
+    if (refreshBtn)
+      refreshBtn.addEventListener("click", function () {
+        offset = 0;
+        load();
+      });
+    load();
+  });
+
+  // Bulk message-body export (BACKLOG #124, ADR 0131). Save-all downloads every match of the current
+  // search (the server-rendered data-mf-export-url carries the basic filters); save-selected downloads
+  // the checked rows (?ids=…). The download STREAMS from the same-origin /ui proxy of GET
+  // /messages/export with a live progress readout (messages + bytes) and a Stop control (AbortController).
+  // The browser's own download picker chooses the file location — a PHI-safe destination is the
+  // operator's responsibility (ADR 0131). One export at a time.
+  feature("[data-mf-msg-export]", function (root) {
+    var allBtn = root.querySelector("[data-mf-export-all]");
+    var selBtn = root.querySelector("[data-mf-export-selected]");
+    var stopBtn = root.querySelector("[data-mf-export-stop]");
+    var progress = root.querySelector("[data-mf-export-progress]");
+    var allUrl = root.getAttribute("data-mf-export-url") || "/ui/messages/export";
+    var base = root.getAttribute("data-mf-export-base") || "/ui/messages/export";
+    var controller = null;
+
+    function setBusy(busy) {
+      if (allBtn) allBtn.disabled = busy;
+      if (selBtn) selBtn.disabled = busy;
+      if (stopBtn) stopBtn.hidden = !busy;
+    }
+
+    function selectedIds() {
+      var out = [];
+      Array.prototype.forEach.call(
+        root.querySelectorAll("[data-mf-export-cb]"),
+        function (cb) {
+          if (cb.checked && cb.value) out.push(cb.value);
+        }
+      );
+      return out;
+    }
+
+    async function run(url, filename) {
+      if (controller) return; // one export at a time
+      controller = new AbortController();
+      setBusy(true);
+      if (progress) progress.textContent = "Starting…";
+      try {
+        var resp = await fetch(url, {
+          credentials: "same-origin",
+          redirect: "manual", // an auth 303 must SURFACE, not be followed into a 200 login page
+          headers: { "X-Requested-With": "fetch" },
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (mfSessionEnded(resp) || mfNetworkDenied(resp)) {
+          window.location.reload(); // session expired, or refused by the source-network gate
+          return;
+        }
+        if (!resp.ok) {
+          if (progress) progress.textContent = "Export failed (" + resp.status + ").";
+          return;
+        }
+        var reader = resp.body.getReader();
+        var chunks = [];
+        var bytes = 0;
+        var lines = 0;
+        for (;;) {
+          var step = await reader.read();
+          if (step.done) break;
+          chunks.push(step.value);
+          bytes += step.value.length;
+          // Each NDJSON record ends in a newline (0x0A) — count them for a human progress readout.
+          for (var i = 0; i < step.value.length; i++) if (step.value[i] === 10) lines++;
+          if (progress)
+            progress.textContent =
+              "Exported " + lines + " messages (" + bytes + " bytes)…";
+        }
+        var blob = new Blob(chunks, { type: "application/x-ndjson" });
+        var href = URL.createObjectURL(blob);
+        var a = document.createElement("a");
+        a.href = href;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(href);
+        if (progress) progress.textContent = "Saved " + lines + " messages.";
+      } catch (e) {
+        if (e && e.name === "AbortError") {
+          if (progress) progress.textContent = "Export stopped.";
+        } else if (progress) {
+          progress.textContent = "Network error during export.";
+        }
+      } finally {
+        controller = null;
+        setBusy(false);
+      }
+    }
+
+    if (allBtn)
+      allBtn.addEventListener("click", function () {
+        run(allUrl, "messages-export.ndjson");
+      });
+    if (selBtn)
+      selBtn.addEventListener("click", function () {
+        var ids = selectedIds();
+        if (!ids.length) {
+          if (progress) progress.textContent = "Select at least one message.";
+          return;
+        }
+        var q = ids
+          .map(function (id) {
+            return "ids=" + encodeURIComponent(id);
+          })
+          .join("&");
+        run(base + "?" + q, "messages-export.ndjson");
+      });
+    if (stopBtn)
+      stopBtn.addEventListener("click", function () {
+        if (controller) controller.abort();
+      });
+    setBusy(false);
+  });
+
+  // Deferred script → DOM already parsed. Run each feature whose hook is present on this page.
+  // ISOLATED: a throw inside one init must never abort the loop and silently disable everything
+  // after it — least of all the session watchdog (ASVS 14.3.1), whose job is discarding rendered
+  // PHI. Security controls run FIRST, so they are never behind a page enhancer in either order or
+  // failure domain.
+  function runInit(pair) {
+    var el = document.querySelector(pair[0]);
+    if (!el) return;
+    try {
+      pair[1](el);
+    } catch (e) {
+      // One broken feature must not disable the rest. Nothing is logged: the console log is a
+      // browser-side surface and these inits touch rendered PHI.
+    }
+  }
+  securityInits.forEach(runInit);
+  inits.forEach(runInit);
 })();

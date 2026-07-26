@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import parse_qsl
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
@@ -13,8 +13,10 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import (
+    ConnectionFlagRequest,
     PendingApprovalResponse,
 )
+from messagefoundry.api.security import client_ip
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -97,8 +99,42 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                 outcomes.append((name, "error"))
         return HTMLResponse(pages.bulk_control_result(action, outcomes))
 
+    @app.post("/ui/connections/{name}/flag")
+    async def ui_set_connection_flag(
+        name: str,
+        request: Request,
+        engine: Any = Depends(deps.get_engine),
+        identity: Identity = Depends(require_ui(Permission.CONFIG_DEPLOY)),
+    ) -> Response:
+        # #131 (ADR 0007 amendment): the FIRST console→connections.toml write path — the object-flag
+        # toggle. config:deploy + same-origin (like bulk-control); NO step-up (a cosmetic annotation), so
+        # it registers no write-action. The reused JSON handler persists via connections_edit
+        # (validate-before-persist, comment-preserving) + reflects it on the live registry, and REFUSES a
+        # code-first connection (no TOML home) with 409 — which we render as a friendly notice.
+        assert_same_origin(request)
+        form = dict(parse_qsl((await request.body()).decode("utf-8", "replace")))
+        direction = form.get("direction", "")
+        if direction not in ("inbound", "outbound"):
+            raise HTTPException(404, "unknown connection direction")
+        req = ConnectionFlagRequest(
+            flagged=form.get("flagged") == "true",
+            direction=cast(Literal["inbound", "outbound"], direction),
+        )
+        try:
+            await core.set_connection_flag(
+                name, req, engine=engine, identity=identity, request=request
+            )
+        except HTTPException as exc:
+            if (
+                exc.status_code == 409
+            ):  # scope fork (code-first) or a validate-before-persist failure
+                return HTMLResponse(pages.flag_rejected(name, str(exc.detail)))
+            raise
+        return RedirectResponse("/ui", status_code=303)
+
     @app.get("/ui/connections/purge-confirm", response_class=HTMLResponse)
     async def ui_purge_confirm(
+        request: Request,
         engine: Any = Depends(deps.get_engine),
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_PURGE)),
         dest: list[str] | None = Query(None),
@@ -112,7 +148,10 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         # unlock flow GET-redirects back here WITHOUT the query, so dest is empty → nothing pre-
         # armed (the operator re-selects). The confirm form POSTs to /ui/connections/purge-bulk.
         if identity.allowed_channels is not None:
-            await core.audit_channel_denied(engine, identity, None)
+            # ADR 0150: a console RBAC denial is a security event from a specific host, so it
+            # carries the browser's address exactly as the JSON API's denials do. `request` here is
+            # the browser's — the console mounts in-process on the engine's own app.
+            await core.audit_channel_denied(engine, identity, None, client_ip(request))
             raise HTTPException(
                 403, "channel-scoped users cannot purge a shared outbound connection"
             )
@@ -170,6 +209,7 @@ def register(app: FastAPI, deps: UiDeps) -> None:
                     scope=scope,
                     identity=identity,
                     gate=gate,
+                    request=request,
                 )
                 if isinstance(result, PendingApprovalResponse):
                     outcomes.append((value, f"held for approval ({result.approval_id})"))
@@ -195,7 +235,13 @@ def register(app: FastAPI, deps: UiDeps) -> None:
         if scope not in ("top", "all"):
             raise HTTPException(404, "unknown purge scope")
         result = await core.purge_connection(
-            name, Response(), engine=engine, scope=scope, identity=identity, gate=gate
+            name,
+            Response(),
+            engine=engine,
+            scope=scope,
+            identity=identity,
+            gate=gate,
+            request=request,
         )
         if isinstance(result, PendingApprovalResponse):
             return HTMLResponse(pages.purge_pending(result))

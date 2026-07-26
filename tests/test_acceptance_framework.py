@@ -8,8 +8,8 @@ deterministic aggregation/mapping/report logic is exercised in isolation.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from harness.acceptance.matrix import MATRIX, Status
 from harness.acceptance.report import (
@@ -121,11 +121,16 @@ def test_render_csv_neutralizes_formula_injection() -> None:
     data_line = csv_text.splitlines()[1]
     assert "'=cmd" in data_line  # detail neutralized
     assert "'@SUM(1)" in data_line  # evidence neutralized
-    # No cell in the data row reaches the file starting with a bare formula trigger.
-    import csv as _csv
+    # No cell in the data row reaches the file starting with a bare formula trigger. Asserted against
+    # the SHARED constant, never a local copy: this line used to hardcode "=+-@\t\r\x00" — the old
+    # four-writer set, missing LF — so an LF-leading cell reaching the CSV unescaped passed it. A
+    # re-copied literal here is exactly the drift tests/test_csv_formula_consistency.py exists to stop.
+    import csv
 
-    cells = next(_csv.reader([data_line]))
-    assert not any(cell[:1] in "=+-@\t\r\x00" for cell in cells)
+    from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS
+
+    cells = next(csv.reader([data_line]))
+    assert not any(cell[:1] in SPREADSHEET_FORMULA_TRIGGERS for cell in cells)
 
 
 def test_exit_code() -> None:

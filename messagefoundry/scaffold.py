@@ -189,6 +189,9 @@ jobs:
   # automatically, without waiting to read an advisory email. Remediate by bumping the engine pin in
   # requirements.txt to a release that fixed it; accept a triaged advisory with
   # `pip-audit --ignore-vuln <ID>` (record why, per your own change control).
+  # Declare any third-party package your Routers/Handlers import in requirements.txt too — pip-audit
+  # then covers your Handler supply chain alongside the engine (ADR 0144 supply-chain gate; see
+  # docs/security/SECURING-HANDLER-CONFIG-IN-CI.md).
   audit-pin:
     runs-on: ubuntu-latest
     steps:

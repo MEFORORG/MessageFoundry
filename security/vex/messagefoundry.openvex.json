@@ -1,0 +1,10 @@
+{
+  "@context": "https://openvex.dev/ns/v0.2.0",
+  "@id": "https://messagefoundry.org/ns/vex/messagefoundry",
+  "author": "MessageFoundry Organization",
+  "role": "Project Maintainers",
+  "timestamp": "2026-07-21T00:00:00Z",
+  "version": 1,
+  "tooling": "hand-maintained (see security/vex/README.md)",
+  "statements": []
+}

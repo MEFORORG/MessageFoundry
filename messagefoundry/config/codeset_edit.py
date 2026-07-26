@@ -26,8 +26,9 @@ import csv
 import io
 import ntpath
 import os
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
@@ -39,6 +40,7 @@ from messagefoundry.config.code_sets import (
     load_code_sets,
 )
 from messagefoundry.config.wiring import WiringError
+from messagefoundry.spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 
 #: Extensions the loader recognises (the writer only ever *writes* ``.csv``; both are read).
 _SUPPORTED_EXTS = (".csv", ".toml")
@@ -120,6 +122,7 @@ def upsert_code_set(
     rows: Any,
     *,
     validate: Validate,
+    create: bool = False,
 ) -> dict[str, Any]:
     """Insert-or-replace ``codesets/<name>.csv`` from a header row + data rows (all cells strings).
 
@@ -127,11 +130,21 @@ def upsert_code_set(
     duplicate keys; a blank-key row carrying data is rejected, a fully-blank row dropped), and the
     stem (no colliding ``.toml``) **before** writing. Writes atomically with owner-only perms, then re-loads the file via ``validate`` as the
     final authority; on any failure the prior content is restored (or a brand-new file unlinked).
-    Raises :class:`WiringError` on bad input or a file that wouldn't load."""
+    Raises :class:`WiringError` on bad input or a file that wouldn't load.
+
+    ``create`` distinguishes a *create*-flavored save from an *edit* (#240). When ``create`` is True
+    the save refuses if **any** supported file already exists for the stem (a ``.csv`` OR ``.toml``) —
+    a create must not silently overwrite an existing code set (the same collision class the connection
+    wizard/form now refuse, PR #1081). The default (``create=False``) is the edit/overwrite path:
+    the same-stem ``.csv`` is the overwrite target and only a ``.toml`` stem collision is rejected."""
     headers = _validate_columns(name, columns)
     emitted = _validate_rows(name, headers, rows)
     codesets_dir = _codesets_dir(config_dir)
     _validate_name(codesets_dir, name)
+    if create and _existing_path_or_none(codesets_dir, name) is not None:
+        # A create must not silently overwrite an existing code set — refuse loud (mirrors the wizard/
+        # form collision refusal, PR #1081). An edit (create=False) overwrites the same-stem .csv.
+        raise WiringError(_create_collision_message(name, codesets_dir))
     _reject_toml_collision(codesets_dir, name)
 
     path = codesets_dir / f"{name}.csv"
@@ -330,6 +343,15 @@ def _collision_message(name: str, codesets_dir: Path) -> str:
     )
 
 
+def _create_collision_message(name: str, codesets_dir: Path) -> str:
+    # A create-flavored save under an existing stem (#240): refuse rather than overwrite (PR #1081's
+    # collision-refusal class). Distinct wording from the .toml duplicate-stem message above.
+    return (
+        f"code set {name!r} already exists in {codesets_dir} — a create must not overwrite it "
+        "(edit it, or choose another name)"
+    )
+
+
 # --- path helpers ------------------------------------------------------------
 
 
@@ -429,7 +451,13 @@ def _shape(value_column_count: int) -> str:
 def _read_csv_grid(path: Path) -> tuple[list[str], list[list[str]]]:
     """The raw CSV as (headers, rows) — every cell a string, short rows right-padded to the header
     width. Used by ``show`` (and SUMMARY header derivation); the loader is the disposition authority,
-    this is purely for grid presentation."""
+    this is purely for grid presentation.
+
+    An **over-wide** row (more cells than the header) is **refused** (``WiringError``), NOT sheared
+    (#240): the old ``cells[:width]`` truncation let a show → save round-trip persist the shear into the
+    file, silently dropping the extra cells and defeating the write-path ``_validate_rows`` guard. An
+    over-wide row is malformed data the editor refuses at read time — the same never-accept-and-drop
+    rule the blank-key-with-values check already applies (and it mirrors the loader's own tightening)."""
     with path.open(newline="", encoding="utf-8") as fh:
         reader = csv.reader(fh)
         all_rows = list(reader)
@@ -438,12 +466,15 @@ def _read_csv_grid(path: Path) -> tuple[list[str], list[list[str]]]:
     headers = [str(h) for h in all_rows[0]]
     width = len(headers)
     rows: list[list[str]] = []
-    for raw in all_rows[1:]:
+    for i, raw in enumerate(all_rows[1:]):
         cells = [str(c) for c in raw]
+        if len(cells) > width:
+            raise WiringError(
+                f"code set {path.stem!r}: row {i} has more cells than columns "
+                f"({len(cells)} > {width})"
+            )
         if len(cells) < width:
             cells = [*cells, *([""] * (width - len(cells)))]
-        elif len(cells) > width:
-            cells = cells[:width]
         rows.append(cells)
     return headers, rows
 
@@ -482,22 +513,29 @@ def _toml_grid(cs: Any) -> tuple[list[str], list[list[str]]]:
 
 # CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
 # these as a formula, so an operator who opens codesets/<name>.csv in Excel/Sheets could execute one.
-# A leading "'" forces the cell to be read as literal text on open. Mirrors harness/load/report.py.
-_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+# A leading "'" forces the cell to be read as literal text on open. This is now the canonical engine
+# rule (messagefoundry/spreadsheet.py); this module used to carry its own copy, which omitted LF and
+# tested only value[:1], so "   =evil()" rode straight through it.
+_CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
 
 
 def _spreadsheet_safe(value: str) -> str:
     """Neutralize a leading formula trigger so a cell can't execute when the CSV is opened in a
-    spreadsheet.
+    spreadsheet — :func:`~messagefoundry.spreadsheet.spreadsheet_safe` plus this writer's caveat.
 
     NOTE (round-trip caveat): the codeset CSV is *also* re-parsed by the loader
     (:func:`~messagefoundry.config.code_sets.load_code_set`), which reads cells verbatim. So for a
     cell an operator deliberately begins with one of :data:`_CSV_FORMULA_TRIGGERS`, the loaded value
-    carries the defensive ``'`` prefix (e.g. a value ``-5`` round-trips as ``'-5``). This is accepted:
-    codeset cells are operator-authored reference data (never PHI / attacker-influenced), and a
-    healthcare code-translation key/value that legitimately starts with ``=+-@``/tab/NUL is
-    pathological. The far more common alphanumeric cell is untouched (byte-identical round-trip)."""
-    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+    carries the defensive ``'`` prefix (e.g. a value ``-5`` round-trips as ``'-5``). Under the
+    canonical rule the accepted cost now *also* covers a cell whose trigger sits behind leading
+    whitespace or another importer-droppable character (``"  -5"`` becomes ``"'  -5"``), and it
+    applies to the KEY column, so such a key is then looked up under its prefixed form. Still
+    accepted: codeset cells are operator-authored reference data (never PHI / attacker-influenced),
+    and a healthcare code-translation key/value that legitimately starts with ``=+-@``/tab/NUL — or
+    with whitespace ahead of one — is pathological. The far more common alphanumeric cell is
+    untouched (byte-identical round-trip), and no shipped sample codeset changes under the widening.
+    """
+    return spreadsheet_safe(value)
 
 
 def _build_csv_text(headers: list[str], rows: list[list[str]]) -> str:

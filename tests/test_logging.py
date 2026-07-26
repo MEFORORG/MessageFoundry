@@ -10,8 +10,9 @@ import logging.handlers
 import re
 import sys
 import time
+from collections.abc import Iterator
 from types import SimpleNamespace
-from typing import Any, Iterator
+from typing import Any
 
 import pytest
 
@@ -142,6 +143,8 @@ def test_serve_applies_log_level(monkeypatch: pytest.MonkeyPatch, tmp_path: Any)
     captured: dict[str, Any] = {}
 
     # serve imports these lazily, so patch them at the source (looked up at call time).
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic (env opt-out) to keep PHI gates quiet.
+    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: captured.update(kw))
 
@@ -275,6 +278,11 @@ def test_serve_allows_debug_in_staging(monkeypatch: pytest.MonkeyPatch, tmp_path
     # staging is a PHI environment, so the H3 keyless-start refusal would fire first; configure a key so
     # this test exercises the DEBUG posture (not the keyless gate).
     monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    # The DEBUG guard is keyed on the production TIER fact (not [security].enforcement) — but under the
+    # default enforce a staging PHI instance also refuses at the retention/notify gates (the security
+    # dial is decoupled from the tier, GIVEN 2 / ADR 0148). Run at warn to isolate the DEBUG posture (a
+    # staging diagnostic env runs at warn); the guard must still ALLOW DEBUG because staging is non-prod.
+    monkeypatch.setenv("MEFOR_SECURITY_ENFORCEMENT", "warn")
     monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
     monkeypatch.setattr(uvicorn, "run", lambda app, **kw: None)
     rc = __main__.main(
@@ -408,7 +416,9 @@ def test_serve_wires_off_box_forwarder_and_logs_enabled(
     import uvicorn
 
     monkeypatch.chdir(tmp_path)
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet.
     (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n"
         '[logging]\nforward_enabled = true\nforward_host = "127.0.0.1"\nforward_port = 5514\n'
         'forward_protocol = "udp"\nforward_format = "text"\n',
         encoding="utf-8",
@@ -440,7 +450,7 @@ def _make_tls_certs(dir_path: Any) -> SimpleNamespace:
     from cryptography.x509.oid import NameOID
 
     key = ec.generate_private_key(ec.SECP256R1())
-    now = datetime.datetime.now(datetime.timezone.utc)
+    now = datetime.datetime.now(datetime.UTC)
     cert = (
         x509.CertificateBuilder()
         .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "127.0.0.1")]))
@@ -516,7 +526,7 @@ class _TlsSyslogServer:
         return self._got_data.wait(timeout)
 
     def close(self) -> None:
-        try:
+        try:  # noqa: SIM105
             self._sock.close()
         except OSError:
             pass
@@ -570,7 +580,7 @@ def test_build_syslog_handler_selects_tls_and_wires_context(
 ) -> None:
     # The tls branch must build a _TlsSysLogHandler carrying the ssl context + SNI hostname, WITHOUT a
     # live collector — stub createSocket so no connect happens.
-    from messagefoundry.logging_setup import _TlsSysLogHandler, _build_syslog_handler
+    from messagefoundry.logging_setup import _build_syslog_handler, _TlsSysLogHandler
 
     monkeypatch.setattr(_TlsSysLogHandler, "createSocket", lambda self: None)
     certs = _make_tls_certs(tmp_path)
@@ -641,7 +651,7 @@ class _FakeUDPSocket:
     def __init__(self, reply: bytes) -> None:
         self._reply = reply
 
-    def __enter__(self) -> "_FakeUDPSocket":
+    def __enter__(self) -> _FakeUDPSocket:
         return self
 
     def __exit__(self, *exc: object) -> None:
@@ -698,7 +708,10 @@ def test_query_sntp_offset_timeout_propagates(monkeypatch: pytest.MonkeyPatch) -
 
 
 def _write_timesync_toml(tmp_path: Any, *, fail_closed: bool) -> None:
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet — these
+    # tests probe the clock-sync gate, not the security posture.
     body = (
+        "security.handles_real_patient_data = false\n"
         '[logging]\nrequire_time_sync = true\nntp_peer = "ntp.example.test"\n'
         "time_sync_max_skew_seconds = 1.0\n"
     )

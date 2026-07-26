@@ -85,7 +85,7 @@ def gated_properties(model_cls: type[BaseModel]) -> dict[str, Permission]:
     return PHI_FIELDS.get(model_cls, {})
 
 
-def redact_unauthorized(model: M, identity: Identity) -> M:
+def redact_unauthorized(model: M, identity: Identity) -> M:  # noqa: UP047
     """Return ``model`` with each PHI property the caller may **not** see set to ``None`` — a no-op
     when the caller holds every relevant permission. The single per-property read gate (ASVS 8.2.3)."""
     withheld = {

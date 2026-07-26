@@ -31,6 +31,7 @@ from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AiSettings,
+    DataClass,
     EgressSettings,
 )
 from messagefoundry.config.tls_policy import (
@@ -44,9 +45,9 @@ from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
 
-PROD_PHI = HopPosture(is_phi=True, production=True)
-STAGING_PHI = HopPosture(is_phi=True, production=False)
-SYNTHETIC = HopPosture(is_phi=False, production=False)
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
+SYNTHETIC = HopPosture(is_phi=False, enforcing=False)
 
 # Non-routable / documentation hosts only (leak-gate): RFC 5737 TEST-NET-1 + RFC 2606 .example.
 REMOTE_DB = "192.0.2.10"
@@ -167,7 +168,10 @@ async def test_api_prod_phi_secure_hop_serves_raw_view(engine: Engine) -> None:
 async def test_api_synthetic_insecure_hop_is_byte_identical(engine: Engine) -> None:
     mid = await _seed(engine)
     # A synthetic (dev) instance over an insecure hop is UNAFFECTED — no PHI to protect, byte-identical.
-    async with _client(engine, ai=AiSettings(environment="dev"), secure=False) as c:
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so the synthetic posture is declared explicitly.
+    async with _client(
+        engine, ai=AiSettings(environment="dev", data_class=DataClass.SYNTHETIC), secure=False
+    ) as c:
         assert (await c.get(f"/messages/{mid}")).status_code == 200
 
 
@@ -293,11 +297,15 @@ bind_host = "127.0.0.1"
 """
 
 
-def _write_config(tmp_path: Path, *, env: str) -> Path:
+def _write_config(tmp_path: Path, *, env: str, synthetic: bool = False) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
     (cfg / "feed.py").write_text(_CONFIG_MODULE, encoding="utf-8")
-    (tmp_path / "messagefoundry.toml").write_text(_TOML.format(env=env), encoding="utf-8")
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so a synthetic instance declares the opt-out explicitly.
+    synthetic_line = "security.handles_real_patient_data = false\n" if synthetic else ""
+    (tmp_path / "messagefoundry.toml").write_text(
+        synthetic_line + _TOML.format(env=env), encoding="utf-8"
+    )
     return cfg
 
 
@@ -319,7 +327,7 @@ def test_check_build_refuses_prod_phi_cleartext_hop(tmp_path: Path) -> None:
 def test_check_build_allows_dev_cleartext_hop(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
-    cfg = _write_config(tmp_path, env="dev")
+    cfg = _write_config(tmp_path, env="dev", synthetic=True)
     report = run_checks(cfg, run_lint=False)
     result = _build_result(report)
     # A synthetic (dev) instance: the SAME cleartext hop is allowed — byte-identical, no false-close.

@@ -332,6 +332,50 @@ async def test_shape_invariants_fail_loud(monkeypatch: pytest.MonkeyPatch) -> No
         load_shape()
 
 
+async def test_report_measured_txn_per_message_welds_to_the_model() -> None:
+    """#207 loose end 1 — the harness's MEASURED txn/msg (``report.py``) welded to this model.
+
+    ``report.py`` renders a measured txn/msg by self-differencing the live ``committed_txns`` store
+    counter (final − base) and dividing by the run message count. Welding the rendered figure to
+    ``txn_per_message(H, N)`` here means a future edit that divides by the wrong count — or drops a
+    shard's txns before the division — breaks a test instead of quietly re-fabricating the number the
+    whole capacity argument rests on. (The end-to-end weld against a REAL SQLite store is in
+    ``tests/test_live_cost_counters.py``; this is the pure self-differencing arithmetic.)
+    """
+    from harness.load.enginepoll import EnginePoller, EngineSample
+    from harness.load.report import _engine_summary
+
+    for handlers, destinations in [(1, 1), (8, 8), (20, 4)]:
+        msgs = 1000
+        model = txn_per_message(handlers, destinations)
+        poller = EnginePoller("http://x", None, origin=0.0)
+        base = EngineSample(0.0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "wal", "normal", 1.0)
+        final = EngineSample(
+            1.0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            "wal",
+            "normal",
+            2.0,
+            committed_txns=model * msgs,
+        )
+        poller._samples.extend([base, final])
+        summary = _engine_summary(poller, None, "sqlite", msgs)
+        assert summary.committed_txns == model * msgs
+        assert summary.txn_per_message_measured == pytest.approx(float(model))
+        assert summary.txn_per_message_measured == pytest.approx(
+            3 + 2 * handlers + 2 * destinations
+        )
+
+
 async def test_txn_per_event_reweights_the_estate_mix() -> None:
     """Events are not fungible, which is why capacity must be sized in transactions, not messages.
 

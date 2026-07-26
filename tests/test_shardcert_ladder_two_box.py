@@ -17,31 +17,41 @@ never a proven collapse.
 from __future__ import annotations
 
 import math
+import types
 
 import pytest
 
 from harness.load import coord
 from harness.load import shardcert as _shardcert
+from harness.load.enginepoll import PoolStats
 from harness.load.shardcert import (
+    PRODUCT_STORE_POOL_SIZE,
+    InboundBandTooNarrow,
+    RungFidelity,
     ShardCertDriveReport,
     ShardCertEngineReport,
     _derive_drive_complete_timeout,
     _derive_driver_done_timeout,
     _derive_engine_drained_timeout,
+    check_inbound_bands,
+    inbound_band_count,
+    inbound_band_warning,
+    resolve_store_pool_size,
 )
 from harness.load.shardcert_ladder import (
+    _CLAIM_RE,
+    _OBSERVER_DISAGREE_TOL,
+    _PHASE_RE,
     TARGET_EVENTS_PER_S,
     ClaimTiming,
     ConsolidatedLadderReport,
     LadderRung,
     PhaseTiming,
+    RungOutcome,
     RungVerdict,
-    _CLAIM_RE,
-    _PHASE_RE,
     _claim_lines,
     _engine_rung_payload,
     _phase_lines,
-    _OBSERVER_DISAGREE_TOL,
     aggregate_claim_timing,
     aggregate_phase_timing,
     build_consolidated_report,
@@ -65,18 +75,34 @@ def _drive(
     handlers: int | None = None,
     delivering: int | None = None,
     acked: int,
+    sent: int | None = None,
     sink_received: int | None = None,
     lane_inversions: int = 0,
     lane_repeats: int = 0,
     lanes_observed: int = 4,
     hold_seconds: float = 60.0,
     drained: bool = True,
+    routing: str = "broadcast",
+    lanes: int = 1,
+    deferred_backpressure: int = -1,
+    deferred_schedule: int = -1,
 ) -> ShardCertDriveReport:
     """A synthetic multi-process drive report. Defaults are a clean, lossless rung (S == A*delivering).
 
     BACKLOG #209: ``handlers`` (H) and ``delivering`` (D) both default to ``dests``, so every test written
     before the split is byte-identical (the pre-#209 graph WAS H = D = dests). The FAN-OUT is D — the
-    lossless default and every delivery assertion below key off it, never off ``dests``."""
+    lossless default and every delivery assertion below key off it, never off ``dests``.
+
+    ARTIFACT 4 (2026-07-14): ``sent`` defaults to ``acked`` (an engine that accepted everything the drive
+    pushed), which is what every pre-existing test meant. Set it EXPLICITLY to model a fidelity failure.
+
+    ⭐ GATE v2: a ``sent`` shortfall NAMES NO CULPRIT BY ITSELF — ``sent`` is ENGINE-PACED (a full send buffer
+    means the ENGINE stopped reading its socket), so the ``deferred_*`` split is what arbitrates. The
+    defaults are the ``-1`` NOT-RECORDED sentinels, which is the honest default for a synthetic report: a
+    shortfall then scores OFFER_SHORTFALL (cause UNATTRIBUTED, fail-closed) and blames NOBODY. To model a
+    real RIG shortfall pass ``deferred_schedule=`` dominant; to model the ENGINE refusing to read its socket
+    pass ``deferred_backpressure=`` dominant. THE DEFAULTS DELIBERATELY DO NOT BLAME THE RIG — v1 did, and
+    that is the defect this gate exists to remove."""
     h = dests if handlers is None else handlers
     d = dests if delivering is None else delivering
     s = acked * d if sink_received is None else sink_received
@@ -90,7 +116,7 @@ def _drive(
         aggregate_rate=ingress,
         hold_seconds=hold_seconds,
         offered=round(ingress * hold_seconds),
-        sent=acked,
+        sent=acked if sent is None else sent,
         acked=acked,
         sink_received=s,
         lane_inversions=lane_inversions,
@@ -103,6 +129,10 @@ def _drive(
         in_pipeline_final=0,
         drained=drained,
         drain_seconds=1.0,
+        routing=routing,
+        lanes=lanes,
+        deferred_backpressure=deferred_backpressure,
+        deferred_schedule=deferred_schedule,
     )
 
 
@@ -113,15 +143,28 @@ def _gate(
     stranded: int = 0,
     dead_total: int = 0,
     in_pipeline_final: int = 0,
+    ingress_stranded: int | None = None,
+    routed_stranded: int | None = None,
+    outbound_stranded: int | None = None,
 ) -> dict[str, object]:
-    """The ENGINE_DRAINED drain-gate payload (reliable store-truth the classifier keys off)."""
-    return {
+    """The ENGINE_DRAINED drain-gate payload (reliable store-truth the classifier keys off).
+
+    BACKLOG #229: the per-stage strand keys are added ONLY when explicitly supplied, so a gate built without
+    them is byte-identical to an older engine payload (the guard then falls back to the stage-blind total)."""
+    payload: dict[str, object] = {
         "engine_ok": engine_ok,
         "drained": drained,
         "stranded": stranded,
         "dead_total": dead_total,
         "in_pipeline_final": in_pipeline_final,
     }
+    if ingress_stranded is not None:
+        payload["ingress_stranded"] = ingress_stranded
+    if routed_stranded is not None:
+        payload["routed_stranded"] = routed_stranded
+    if outbound_stranded is not None:
+        payload["outbound_stranded"] = outbound_stranded
+    return payload
 
 
 def _report(
@@ -444,6 +487,7 @@ def _outcome(
     dests: int = 8,
     handlers: int | None = None,
     delivering: int | None = None,
+    routing: str = "broadcast",
 ):
     rung = LadderRung(
         index=0, ingress_rate=rate, hold_seconds=60.0, drain_timeout=150.0, is_soak=is_soak
@@ -455,6 +499,7 @@ def _outcome(
         dests=dests,
         handlers=handlers,
         delivering=delivering,
+        routing=routing,
     )
     out = build_rung_outcome(rung, drive, _gate(), _report())
     # force the verdict/shape for report-shape tests independent of the drive's actual numbers. Kept-up
@@ -497,6 +542,8 @@ def _rep(
     dests: int = 8,
     handlers: int | None = None,
     delivering: int | None = None,
+    routing: str = "broadcast",
+    lanes_per_shard: int = 1,
 ) -> ConsolidatedLadderReport:
     # H and D default to dests ⇒ the pre-#209 H = D = dests report, so every existing test is unchanged.
     return build_consolidated_report(
@@ -504,6 +551,8 @@ def _rep(
         dests=dests,
         handlers=dests if handlers is None else handlers,
         delivering=dests if delivering is None else delivering,
+        routing=routing,
+        lanes_per_shard=lanes_per_shard,
         driver_count=4,
         sink_count=8,
         climb=climb,
@@ -595,6 +644,7 @@ def test_target_gate_fires_exactly_at_total_events_boundary(
             dests=dests,
             handlers=handlers,
             delivering=delivering,
+            routing="broadcast",
             driver_count=4,
             sink_count=8,
             climb=[_honest_rung(ingress, drain_seconds=0.0)],
@@ -694,7 +744,9 @@ def test_collapsed_soak_reports_soak_not_sustained_not_pass() -> None:
     assert js["result"] == "SOAK_NOT_SUSTAINED"  # was "PASS" before B9
     assert js["soak_not_sustained"] is True
     assert js["exit_code"] == 0
-    assert js["schema_version"] == 4  # v4 (#209): `dests` stopped meaning the fan-out
+    assert (
+        js["schema_version"] == 8
+    )  # v8 (#229): +the per-stage strand split for the sound H>D A4b permit
     assert "SOAK NOT SUSTAINED" in rep.render()
 
 
@@ -956,7 +1008,7 @@ def test_pick_soak_rate_uses_honest_rate_not_offered() -> None:
 
     # The honest series declines monotonically as the offer rises — that is the burst-absorption signature.
     honest = [r.sustainable_ingress_rate for r in climb]
-    assert all(a is not None and b is not None and a > b for a, b in zip(honest, honest[1:]))
+    assert all(a is not None and b is not None and a > b for a, b in zip(honest, honest[1:]))  # noqa: B905
     # ... so the pin is the max of a decline, NOT a flat series: the top rung is the WORST estimator.
     assert honest[0] == pytest.approx(13.053, abs=1e-2)
     assert honest[-1] == pytest.approx(10.934, abs=1e-2)
@@ -1768,7 +1820,9 @@ def test_cross_observer_inconclusive_propagates_to_ladder_result_and_json() -> N
     js = rep.to_json_dict()
     assert js["result"] == "SETUP_DEGRADED"
     assert js["store_truth_unconfirmed"] is True
-    assert js["schema_version"] == 4  # v4 (#209) — the A4b keys themselves are unchanged/additive
+    assert (
+        js["schema_version"] == 8
+    )  # v8 (#229): +per-stage strand split for the sound H>D A4b permit
     assert js["climb"][1]["verdict"] == "inconclusive"  # the enum value carries into the JSON
 
 
@@ -2236,9 +2290,268 @@ def test_a4b_lossless_sink_with_ingress_strand_is_not_forgiven_by_free() -> None
     assert rep.first_collapse_ingress_rate is None  # no fabricated bracket
 
 
-def test_rung_json_carries_the_shape_and_schema_v4() -> None:
+# --- BACKLOG #229: the SOUND per-stage `blocked` on the under-counting branch -------------------------
+#
+# #209 credited the non-delivering-handler `free` budget STAGE-BLIND to the opaque `stranded + dead` total,
+# so on the UNDER-counting branch (S < A*D) an INGRESS strand (which blocks ALL D copies — the message never
+# routed) or an OUTBOUND strand (blocks 1) inside the `free` window was credited as blocking ZERO. That
+# MISSED a partial over-count (the sink counts MORE than the store's REAL capacity, yet less than A*D) at
+# H>D, returning a definite verdict where it must downgrade to INCONCLUSIVE. The fix threads the per-stage
+# split and charges each strand its true weight; the `free` budget is credited against ROUTED strands ONLY,
+# so a genuine H>D collapse (routed strands ~A*H) still reads as the honest COLLAPSED the observers agree on.
+
+
+def test_a4b_ingress_strand_in_free_window_now_downgrades_to_inconclusive_at_H_gt_D() -> None:
+    """*** THE #229 HEADLINE. *** An H>D rung: the engine strands rows at INGRESS that fall INSIDE the old
+    stage-blind `free` window, and the sink UNDER-counts (S < A*D, so the lossless clause a' does NOT fire)
+    but reports MORE than the store's real capacity. The pre-#229 permit credited those ingress strands to
+    `free` (blocked 0, permit = A*D) and read the rung as COLLAPSED — a definite verdict fabricated from a
+    genuine cross-observer contradiction. The sound per-stage permit charges each ingress strand D copies, so
+    the permit is the real capacity and the rung correctly downgrades to INCONCLUSIVE."""
+    a, dests, handlers, delivering = 1000, 20, 20, 4
+    expected = a * delivering  # 4000
+    free = free_budget_at_hub(a, handlers, delivering)  # 1000*(20-4) = 16000
+    ingress_strand = 500  # WELL within `free`, so the stage-blind formula forgives it entirely
+    # 500 ingress strands ⇒ those 500 messages never routed ⇒ real capacity = (1000-500)*4 = 2000 deliveries.
+    real_capacity = (a - ingress_strand) * delivering
+    assert real_capacity == 2000
+    # The sink reports 3000: BELOW A*D=4000 (a' does not fire) but ABOVE the store's real capacity of 2000 —
+    # a hard cross-observer contradiction the stage-blind formula misses.
+    sink = 3000
+    assert real_capacity < sink < expected
+    assert ingress_strand < free  # the tell-tale: the strand sits inside the forgiven `free` window
+
+    # OLD (stage-blind) permit: blocked = max(0, unclear - free) = max(0, 500 - 16000) = 0 ⇒ permit = 4000.
+    old_blocked = max(0, ingress_strand - free)
+    old_permit = expected - old_blocked
+    slack = _OBSERVER_DISAGREE_TOL * expected  # 40
+    assert old_blocked == 0 and old_permit == expected
+    assert not (
+        sink > old_permit + slack
+    )  # OLD ⇒ guard SILENT ⇒ falls through to COLLAPSED (fabricated)
+
+    # NEW (sound per-stage) permit: ingress strand blocks D each ⇒ blocked = 500*4 = 2000 ⇒ permit = 2000.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=ingress_strand,
+            engine_dead_total=0,
+            ingress_stranded=ingress_strand,
+            routed_stranded=0,
+            outbound_stranded=0,
+        )
+        is True
+    )
+    # ...and WITHOUT the per-stage split (older payload / sentinel) it stays byte-identical to OLD ⇒ False.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=ingress_strand,
+            engine_dead_total=0,
+        )
+        is False
+    )
+
+    # End-to-end through the integration path: the gate now carries the per-stage split ⇒ INCONCLUSIVE.
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+        sink_received=sink,
+    )
+    assert drive.no_loss is False  # the sink honestly under-counts (S=3000 < A*D=4000)
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        drive,
+        _gate(
+            engine_ok=False,
+            drained=False,
+            stranded=ingress_strand,
+            ingress_stranded=ingress_strand,
+            routed_stranded=0,
+            outbound_stranded=0,
+        ),
+        None,
+    )
+    assert out.verdict is RungVerdict.INCONCLUSIVE, (
+        "the sound per-stage A4b permit did not fire: an ingress strand blocking D copies was credited to "
+        "the stage-blind `free` window and a partial over-count was mislabeled COLLAPSED (BACKLOG #229)"
+    )
+    assert any("cross-observer INCONCLUSIVE" in n for n in out.notes)
+    # The rung must be EXCLUDED from the collapse bracket — the whole point of INCONCLUSIVE.
+    rep = _rep([out], dests=dests, handlers=handlers, delivering=delivering)
+    assert rep.first_collapse_ingress_rate is None
+    # The per-stage split is carried onto the record + JSON so the verdict is auditable.
+    assert out.engine_ingress_stranded == ingress_strand
+    eng_js = out.to_json_dict()["engine"]
+    assert isinstance(eng_js, dict)
+    assert eng_js["ingress_stranded"] == ingress_strand
+    assert eng_js["routed_stranded"] == 0 and eng_js["outbound_stranded"] == 0
+
+
+def test_a4b_genuine_H_gt_D_routed_collapse_still_reads_collapsed_with_per_stage_split() -> None:
+    """The soundness tension: a GENUINE H>D collapse strands ROUTED rows that scale ~A*H (the router selected
+    H handlers per stuck message and none ran transform yet). With the per-stage split present the routed
+    strands must be credited against `free` so the collapse reads as the honest COLLAPSED both observers
+    agree on — NOT re-fabricated INCONCLUSIVE. This is the exact failure the [0,1] routed bound must avoid."""
+    a, dests, handlers, delivering = 1000, 8, 20, 4
+    free = free_budget_at_hub(a, handlers, delivering)  # 16000
+    # A real collapse: 3000 messages got through completely, 700 stuck with ALL 20 routed rows stranded.
+    # (1000 accepted here for the ladder; model the strand counts directly.) Routed strands scale with H:
+    routed_strand = (
+        free - 4000
+    )  # 12000: large, WITHIN the non-delivering budget ⇒ blocks 0 net deliveries
+    sink = (
+        a * delivering - 3000
+    )  # 1000: the sink honestly under-counts — observers AGREE loss happened
+    assert 0 < routed_strand < free and 0 < sink < a * delivering
+
+    # NEW per-stage permit: routed blocked = max(0, routed_strand - free) = max(0, 12000-16000) = 0 ⇒
+    # permit = A*D = 4000; sink=1000 is NOT > 4040 ⇒ guard silent ⇒ honest COLLAPSED (NOT fabricated).
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=routed_strand,
+            engine_dead_total=0,
+            ingress_stranded=0,
+            routed_stranded=routed_strand,
+            outbound_stranded=0,
+        )
+        is False
+    )
+    # End-to-end: COLLAPSED, no cross-observer note.
+    drive = _drive(
+        ingress=24.0,
+        acked=a,
+        dests=dests,
+        handlers=handlers,
+        delivering=delivering,
+        sink_received=sink,
+    )
+    out = build_rung_outcome(
+        _rung(idx=1, rate=24.0),
+        drive,
+        _gate(
+            engine_ok=False,
+            drained=False,
+            stranded=routed_strand,
+            ingress_stranded=0,
+            routed_stranded=routed_strand,
+            outbound_stranded=0,
+        ),
+        None,
+    )
+    assert out.verdict is RungVerdict.COLLAPSED, (
+        "a genuine H>D routed-strand collapse was re-fabricated INCONCLUSIVE — the [0,1] routed bound failed "
+        "to credit the non-delivering `free` budget against the routed strands (BACKLOG #229 soundness tension)"
+    )
+    assert not any("cross-observer" in n for n in out.notes)
+
+
+def test_a4b_outbound_strand_blocks_one_each_at_H_gt_D() -> None:
+    """An OUTBOUND strand blocks exactly ONE delivery (a single message→destination row), NOT the stage-blind
+    zero the `free` window would forgive. With enough outbound strands the sink's report exceeds real capacity
+    ⇒ INCONCLUSIVE; the stage-blind formula (no per-stage split) misses it."""
+    a, handlers, delivering = 1000, 20, 4
+    expected = a * delivering  # 4000
+    slack = _OBSERVER_DISAGREE_TOL * expected  # 40
+    outbound_strand = 1500  # each blocks 1 delivery ⇒ real capacity = 4000 - 1500 = 2500
+    sink = 3000  # below A*D (a' silent) but above real capacity 2500 ⇒ contradiction
+    assert expected - outbound_strand < sink < expected
+    # SOUND: blocked = outbound_strand = 1500 ⇒ permit = 2500 ⇒ sink=3000 > 2540 ⇒ fires.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=outbound_strand,
+            engine_dead_total=0,
+            ingress_stranded=0,
+            routed_stranded=0,
+            outbound_stranded=outbound_strand,
+        )
+        is True
+    )
+    # STAGE-BLIND fallback (no per-stage split): free=16000 forgives all 1500 ⇒ permit=4000 ⇒ silent.
+    assert (
+        observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=delivering,
+            handlers=handlers,
+            engine_stranded=outbound_strand,
+            engine_dead_total=0,
+        )
+        is False
+    )
+    # (the `slack` above is the same 1% band the sound branch clears; kept explicit for the arithmetic.)
+    assert slack == 40
+
+
+def test_a4b_per_stage_permit_is_byte_identical_at_H_equals_D_even_with_split_present() -> None:
+    """At H==D the gate MUST take the stage-blind branch even when the per-stage split IS supplied — the sound
+    per-stage weights (ingress*D) would otherwise diverge from the pre-#229 `A*D - stranded - dead` and
+    regress a published run. `free == 0` at H==D, so the sound branch is deliberately GATED to H>D."""
+    a, d = 1000, 8
+    slack = _OBSERVER_DISAGREE_TOL * a * d
+    # A spread at H==D; for each, the verdict must match the OLD `S > (A*D - stranded - dead) + slack`, and
+    # must be IDENTICAL whether or not the per-stage split is supplied (the gate ignores it at H==D).
+    cases = [
+        (0, 0, 0, 0, a * d - 500),  # honest collapse, agrees
+        (300, 0, 0, 300, a * d - 300 + int(slack) + 1),  # one past the edge ⇒ contradiction
+        (200, 100, 300, 0, a * d - 700),  # split across ingress+routed, sink short by the loss
+    ]
+    for ingress_s, routed_s, outbound_s, dead, sink in cases:
+        stranded = ingress_s + routed_s + outbound_s
+        old_permit = a * d - max(0, stranded) - max(0, dead)
+        old_verdict = sink > old_permit + slack
+        with_split = observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=d,
+            handlers=d,  # H == D ⇒ free == 0 ⇒ stage-blind branch, split IGNORED
+            engine_stranded=stranded,
+            engine_dead_total=dead,
+            ingress_stranded=ingress_s,
+            routed_stranded=routed_s,
+            outbound_stranded=outbound_s,
+        )
+        without_split = observers_inconclusive(
+            engine_ok=False,
+            acked=a,
+            sink_received=sink,
+            delivering=d,
+            handlers=d,
+            engine_stranded=stranded,
+            engine_dead_total=dead,
+        )
+        assert with_split is old_verdict, (ingress_s, routed_s, outbound_s, dead, sink)
+        assert without_split is old_verdict, (ingress_s, routed_s, outbound_s, dead, sink)
+
+
+def test_rung_json_carries_the_shape_and_schema_v5() -> None:
     # The report has to SAY which shape it served, or a reader cannot tell a 4.2x-overstated headline from a
-    # correct one. schema_version 4 is the signal that `dests` stopped meaning the fan-out.
+    # correct one. schema_version 4 was the signal that `dests` stopped meaning the fan-out; v5 adds
+    # `routing`, without which the DERIVED (1, 1) pair a partitioned run reports is indistinguishable from a
+    # legal broadcast --handlers 1 --delivering 1 run (a ~50x slower graph).
     shape: dict[str, int] = {"dests": 4, "handlers": 20, "delivering": 4}
     out = _outcome(20.0, RungVerdict.SUSTAINED, **shape)
     rep = _rep([out], **shape)
@@ -2248,24 +2561,153 @@ def test_rung_json_carries_the_shape_and_schema_v4() -> None:
     assert rung_js["dests"] == 4
     assert rung_js["handlers"] == 20
     assert rung_js["delivering"] == 4
+    assert rung_js["routing"] == "broadcast"
     assert rung_js["txn_per_message"] == 51  # 3 + 2(20) + 2(4) — the ADR 0051 hub cost
     assert rung_js["outbound_expected"] == out.acked * 4  # A * D, never A * dests
 
-    assert js["schema_version"] == 4
+    assert (
+        js["schema_version"] == 8
+    )  # v8 (#229): +per-stage strand split for the sound H>D A4b permit
     topo = js["topology"]
+    assert isinstance(topo, dict)
     assert topo["dests"] == 4 and topo["handlers"] == 20 and topo["delivering"] == 4
+    assert topo["routing"] == "broadcast"
     assert topo["txn_per_message"] == 51
     assert topo["events_per_message"] == 5  # 1 + D, NOT 1 + handlers (21)
 
 
-def test_drive_report_json_carries_the_shape_and_schema_v2() -> None:
-    js = _drive(ingress=20.0, acked=1000, dests=8, handlers=20, delivering=4).to_json_dict()
-    assert (
-        js["schema_version"] == 2
-    )  # `dests` stopped meaning the fan-out ⇒ a stale reader must notice
+def test_partitioned_ladder_report_names_its_shape() -> None:
+    # ⭐ THE PROVENANCE PIN. A partitioned dests=64 run reports the DERIVED accounting pair (1, 1) — which is
+    # EXACTLY what a legal BROADCAST `--dests 64 --handlers 1 --delivering 1` run reports, from a graph that
+    # funnels every message onto ONE strict-FIFO lane (~16 msg/s) instead of round-robining 64 (~800+). The
+    # topology blocks are otherwise byte-identical; `routing` is the ONLY key that separates them.
+    part = _rep(
+        [
+            _outcome(
+                400.0,
+                RungVerdict.SUSTAINED,
+                dests=64,
+                handlers=1,
+                delivering=1,
+                routing="partitioned",
+            )
+        ],
+        dests=64,
+        handlers=1,
+        delivering=1,
+        routing="partitioned",
+    )
+    bcast = _rep(
+        [_outcome(400.0, RungVerdict.SUSTAINED, dests=64, handlers=1, delivering=1)],
+        dests=64,
+        handlers=1,
+        delivering=1,
+    )
+    p_topo = part.to_json_dict()["topology"]
+    b_topo = bcast.to_json_dict()["topology"]
+    assert isinstance(p_topo, dict) and isinstance(b_topo, dict)
+
+    # Everything a pre-v5 reader could see is identical...
+    assert {k: v for k, v in p_topo.items() if k != "routing"} == {
+        k: v for k, v in b_topo.items() if k != "routing"
+    }
+    # ...and ONLY `routing` tells them apart.
+    assert p_topo["routing"] == "partitioned" and b_topo["routing"] == "broadcast"
+    assert "routing=partitioned" in part.render()
+    climb = part.to_json_dict()["climb"]
+    assert isinstance(climb, list)
+    assert climb[0]["routing"] == "partitioned"
+
+
+def test_drive_report_json_carries_the_shape_and_schema_v3() -> None:
+    drive = _drive(
+        ingress=20.0,
+        acked=1000,
+        dests=8,
+        handlers=20,
+        delivering=4,
+        deferred_backpressure=7,
+        deferred_schedule=3,
+    )
+    js = drive.to_json_dict()
+    # v2: `dests` != fan-out; v3: +routing; v4: +fidelity gate + G (inbound bands); v5: +store_pool and the
+    # DEFERRAL CAUSE SPLIT + sent_ratio ⇒ a stale reader notices rather than silently mis-reading.
+    assert js["schema_version"] == 5
     topo = js["topology"]
+    assert isinstance(topo, dict)
     assert (topo["dests"], topo["handlers"], topo["delivering"]) == (8, 20, 4)
+    assert topo["routing"] == "broadcast"
     assert topo["txn_per_message"] == 51 and topo["events_per_message"] == 5
+
+    # ⭐ v5: every number the gate scores on is RECOVERABLE FROM THE ARTIFACT. An unauditable run is
+    # worthless — and the cause split is the ONLY thing that separates an engine bind from a rig shortfall.
+    traffic = js["traffic"]
+    assert isinstance(traffic, dict)
+    assert traffic["deferred_backpressure"] == 7 and traffic["deferred_schedule"] == 3
+    # offered = 20/s x 60s = 1,200; sent defaulted to acked = 1,000 ⇒ an 83% sent ratio. The bar the 0.98
+    # sent floor is meant to be RE-DERIVED against is now in the artifact instead of being unrecoverable.
+    assert traffic["sent_ratio"] == 0.8333
+    assert traffic["fidelity_gate_version"] == 2  # a v1 verdict is NOT comparable to a v2 one
+    # ⭐ ...and because the deferrals are BACKPRESSURE-dominant (7 > 3), that shortfall is an ENGINE finding,
+    # NOT a rig failure: the rung stays DRIVEN and keeps its rate. v1 would have called this exact row a
+    # DRIVE_SHORTFALL and voided it.
+    assert traffic["fidelity"] == "backpressure_bind"
+    assert traffic["fidelity_driven"] is True
+    assert traffic["fidelity_admissible"] is False  # driven, but it may not PIN a ceiling
+    # ARTIFACT 2: the pool size the run actually used must be reconstructible from the JSON alone.
+    pool_js = js["store_pool"]
+    assert isinstance(pool_js, dict)
+    assert pool_js["product_default"] == PRODUCT_STORE_POOL_SIZE
+
+
+def test_publishable_gate_applies_the_d4_half_derate() -> None:
+    # The RAW gate trips at HALF the ingress a 45M/day CLAIM needs (the Phase-5 D4 derate). Under broadcast
+    # this never mattered — the shape capped ingress at ~16 msg/s so the raw gate could never trip at all.
+    # Under PARTITIONED (fan-out 1, events = ingress x 2) it trips at 260 ingress/s, and a reader who quoted
+    # it would be publishing a 45M/day claim on HALF the required ceiling.
+    raw_boundary = TARGET_EVENTS_PER_S / 2  # fan-out 1 ⇒ events = ingress x 2
+    just_raw = _rep(
+        [_honest_rung(raw_boundary, drain_seconds=0.0, dests=64, handlers=1, delivering=1)],
+        dests=64,
+        handlers=1,
+        delivering=1,
+        routing="partitioned",
+    )
+    assert just_raw.clears_target_events is True  # the RAW measurement clears...
+    assert just_raw.clears_target_events_publishable is False  # ...but it is NOT publishable.
+
+    publishable = _rep(
+        [_honest_rung(raw_boundary * 2, drain_seconds=0.0, dests=64, handlers=1, delivering=1)],
+        dests=64,
+        handlers=1,
+        delivering=1,
+        routing="partitioned",
+    )
+    assert publishable.clears_target_events is True
+    assert publishable.clears_target_events_publishable is True
+
+    js = publishable.to_json_dict()
+    assert js["publishable_derate"] == 0.5
+    assert js["raw_events_per_s_needed_to_publish"] == round(TARGET_EVENTS_PER_S / 0.5, 3)
+    ceiling = js["ceiling"]
+    assert isinstance(ceiling, dict)
+    assert ceiling["publishable_events_per_s"] == round(ceiling["sustained_events_per_s"] * 0.5, 3)
+    assert ceiling["clears_target_events_publishable"] is True
+
+
+def test_accepted_ingress_rate_is_the_honest_floor_under_the_offered_rate() -> None:
+    # `sustainable_ingress_rate` is OFFERED-derived and never looks at `acked`; SUSTAINED only bounds the
+    # intake shortfall by _INTAKE_TOL (5%). So AT the ceiling — exactly where offered and accepted diverge —
+    # the pinned figure can overstate what was truly accepted. Both must be emitted.
+    rung = LadderRung(index=0, ingress_rate=100.0, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(ingress=100.0, acked=5_700, hold_seconds=60.0)  # 5% under the 6,000 offered
+    out = build_rung_outcome(rung, drive, _gate(), _report())
+
+    assert out.sustainable_ingress_rate is not None and out.accepted_ingress_rate is not None
+    # offered-derived == 100 x 60/61; accepted-derived == 5700/61 — the accepted one is the honest FLOOR.
+    assert out.accepted_ingress_rate < out.sustainable_ingress_rate
+    assert out.accepted_ingress_rate == pytest.approx(5_700 / 61.0)
+    assert out.to_json_dict()["accepted_ingress_rate"] == round(5_700 / 61.0, 3)
 
 
 def test_render_states_the_right_model() -> None:
@@ -2283,3 +2725,935 @@ def test_render_states_the_right_model() -> None:
     assert "delivered = ingress x dests" not in text  # the old, wrong prose is gone
     assert "H=20 selected, D=4 delivering" in text
     assert "txn/msg = 3 + 2H + 2D = 51" in text
+
+
+# =====================================================================================================
+# THE FOUR BENCH ARTIFACTS (2026-07-14). Ten pre-registered falsifiers hunted the ENGINE for a
+# throughput wall. Then five separate HARNESS artifacts turned up, each able to MANUFACTURE a fake
+# ceiling. #1 (the shardcert router broadcasting to every destination) is fixed in #1042. These pin the
+# other four. Each one, left in, would have commissioned an engine build against a bench bug.
+# =====================================================================================================
+
+
+# --- ARTIFACT 2: the store pool was pinned at 1/5 of the product default, and recorded nowhere --------
+
+
+def test_store_pool_defaults_to_the_product_default_not_the_hardcoded_eight() -> None:
+    """⭐ THE DEFAULT MOVED, DELIBERATELY. The bench pinned ``MEFOR_STORE_POOL_SIZE=8`` with a bare
+    ``setdefault`` at two sites. The pool is per shard PROCESS, so a 4-shard fleet ran on 32 concurrent
+    store connections against a product posture of 4 x 40 = 160. At a ~12 ms round-trip and 7 txn/message
+    that caps ingress around 380 msg/s — AND THE CAP IS FLAT IN L, which is exactly what a pooled-claim
+    wall looks like in every column we have ever plotted."""
+    assert (
+        PRODUCT_STORE_POOL_SIZE == 40
+    )  # StoreSettings.pool_size — read from the model, not copied
+    assert resolve_store_pool_size({}, None) == PRODUCT_STORE_POOL_SIZE
+    assert resolve_store_pool_size({}, None) != 8  # the value that would have faked the wall
+
+
+def test_store_pool_explicit_override_wins_and_is_sweepable() -> None:
+    # The fix is NOT a silent bump to 40 — it is that the pool became an EXPLICIT, SWEEPABLE variable.
+    assert (
+        resolve_store_pool_size({}, 8) == 8
+    )  # reproduce the old posture ON PURPOSE, on the record
+    assert resolve_store_pool_size({}, 160) == 160
+    assert resolve_store_pool_size({"MEFOR_STORE_POOL_SIZE": "12"}, 96) == 96  # flag beats ambient
+    with pytest.raises(ValueError):
+        resolve_store_pool_size({}, 0)
+
+
+def test_store_pool_ambient_env_is_still_honoured_exactly_as_setdefault_did() -> None:
+    # `setdefault` let an operator pin the pool out-of-band. That MUST keep working — only the DEFAULT
+    # moved. Precedence: explicit flag > ambient env > product default.
+    assert resolve_store_pool_size({"MEFOR_STORE_POOL_SIZE": "64"}, None) == 64
+    assert resolve_store_pool_size({}, None, environ={"MEFOR_STORE_POOL_SIZE": "24"}) == 24
+    # A garbage ambient value is LOUD, never silently the default (a bad pin must not read as a good one).
+    with pytest.raises(ValueError):
+        resolve_store_pool_size({"MEFOR_STORE_POOL_SIZE": "lots"}, None)
+    with pytest.raises(ValueError):
+        resolve_store_pool_size({"MEFOR_STORE_POOL_SIZE": "0"}, None)
+
+
+def _pool_sample(**over: object) -> object:
+    """A synthetic drain-time EngineSample carrying a pool snapshot (what the poller hands PoolStats)."""
+    base: dict[str, object] = {
+        "pool_max_size": 40,
+        "pool_size": 40,
+        "pool_idle_min": 12,
+        "pool_shards_reporting": 4,
+        "pool_acquire_wait_count": 100_000,
+        "pool_acquire_wait_mean_ms": 0.0135,  # the STEP-2 measured baseline: no queueing
+        "pool_wait_p95_max_ms": 0.02,
+        "pool_wait_p99_max_ms": 0.05,
+        "pool_wait_max_ms": 1.2,
+    }
+    return types.SimpleNamespace(**{**base, **over})
+
+
+def _engine_report_with_pool(pool: PoolStats) -> ShardCertEngineReport:
+    return ShardCertEngineReport(
+        shards=("a", "b", "c", "d"),
+        owned={s: [] for s in "abcd"},
+        killed_shard=None,
+        stranded_nonterminal=0,
+        queue_breakdown="QUEUE",
+        drained=True,
+        dead_total=0,
+        drain_seconds=1.0,
+        pool=pool,
+    )
+
+
+def test_pool_tripwire_is_silent_at_the_measured_baseline() -> None:
+    # The 0.0135 ms baseline is the run where the pool provably was NOT the constraint (560 txn/s against
+    # 32 connections = ~21% utilisation). A tripwire that fires there is a fake instrument.
+    pool = PoolStats.from_sample(_pool_sample(), requested=40)
+    assert pool.measured is True
+    assert pool.tripped is False
+    assert pool.trip_reason is None
+    assert pool.requested_matches_engine is True
+
+
+def test_pool_tripwire_fires_on_p95_the_primary_bar() -> None:
+    """The PRIMARY bar is p95, NOT the mean. ``AcquireWaitHistogram.record()`` fires on EVERY acquire, not
+    only ones that WAITED — so ``count`` is really a store-round-trip counter and ``mean_ms`` is DILUTED by
+    the flood of zero-wait acquires. A pool that is dry 5% of the time, blocking hard when it is, still
+    shows a small mean. Gating on the mean alone would be a fake instrument; p95 catches it."""
+    bound = PoolStats.from_sample(_pool_sample(pool_wait_p95_max_ms=7.5), requested=8)
+    assert bound.tripped is True
+    assert bound.trip_reason is not None
+    assert "p95" in bound.trip_reason and "THE POOL IS THE CONSTRAINT" in bound.trip_reason
+    # ...and the mean stays a SECONDARY bar that can still fire on its own.
+    mean_bound = PoolStats.from_sample(_pool_sample(pool_acquire_wait_mean_ms=2.0), requested=8)
+    assert mean_bound.tripped is True
+    assert mean_bound.trip_reason is not None and "mean" in mean_bound.trip_reason
+
+
+def test_pool_tripwire_abstains_when_the_pool_was_never_measured() -> None:
+    # An unmeasured pool is UNKNOWN, never INNOCENT. `tripped` False here means "no evidence", and the rung
+    # note says so — the gate must not read absent data as "no queueing" (the dead-gate failure mode).
+    unmeasured = PoolStats(requested=40)
+    assert unmeasured.measured is False
+    assert unmeasured.tripped is False and unmeasured.trip_reason is None
+    assert "not measured" in unmeasured.render()
+
+
+def test_pool_size_mismatch_between_harness_and_engine_is_a_finding() -> None:
+    # Recording what we ASKED for is not the same as knowing what we GOT. /status reports the engine's own
+    # configured maximum; a divergence means MEFOR_STORE_POOL_SIZE never reached the shard processes.
+    mismatch = PoolStats.from_sample(_pool_sample(pool_max_size=8), requested=40)
+    assert mismatch.requested_matches_engine is False
+    assert "REQUESTED != ENGINE" in mismatch.render()
+
+
+def test_effective_pool_size_is_recoverable_from_the_report_json() -> None:
+    """⭐ A run whose pool size is not recoverable from its own artifact is UNAUDITABLE. This walks the REAL
+    wire: the engine report -> the ENGINE_RUNG_REPORT payload -> build_rung_outcome -> the JSON."""
+    payload = _engine_rung_payload(
+        _engine_report_with_pool(PoolStats.from_sample(_pool_sample(), requested=40))
+    )
+    pool_payload = payload["store_pool"]
+    assert isinstance(pool_payload, dict)
+    assert pool_payload["requested_pool_size"] == 40  # it crosses the coord wire...
+
+    out = build_rung_outcome(_rung(), _drive(ingress=20.0, acked=1200), _gate(), payload)
+    pool_js = out.to_json_dict()["store_pool"]
+    assert isinstance(pool_js, dict)
+    assert pool_js["requested_pool_size"] == 40  # ...and lands in the rung's own JSON
+    assert pool_js["engine_max_size"] == 40  # MEASURED from /status, not asserted from our own env
+    assert pool_js["tripwire"]["tripped"] is False
+
+    rep = _rep([out])
+    store_pool = rep.to_json_dict()["store_pool"]
+    assert isinstance(store_pool, dict)
+    assert store_pool["requested_pool_size"] == 40
+    assert store_pool["product_default"] == PRODUCT_STORE_POOL_SIZE
+    assert store_pool["tripped_at_rates"] == []
+    assert "store pool: requested=40" in rep.render()
+
+
+def test_a_pool_bind_is_reported_as_a_pool_bind_not_left_to_look_like_a_claim_wall() -> None:
+    """The whole point of ARTIFACT 2. A pool bind strands at outbound, grows claim_mean, and is immune to
+    drive and to the drive box's disk — IDENTICAL to the pooled-claim wall in every column we have looked
+    at. It would have commissioned the tempdb claim-query rewrite. The tripwire is the discriminator, and
+    it has to reach the report an operator actually reads."""
+    payload = _engine_rung_payload(
+        _engine_report_with_pool(
+            PoolStats.from_sample(_pool_sample(pool_wait_p95_max_ms=9.0), requested=8)
+        )
+    )
+    out = build_rung_outcome(_rung(rate=20.0), _drive(ingress=20.0, acked=1200), _gate(), payload)
+    assert out.pool.tripped is True
+    assert any("THE POOL IS THE CONSTRAINT" in n for n in out.notes)
+
+    store_pool = _rep([out]).to_json_dict()["store_pool"]
+    assert isinstance(store_pool, dict)
+    assert store_pool["tripwire"]["tripped"] is True
+    assert store_pool["tripped_at_rates"] == [20.0]  # NAMED, so the ceiling attributes to the pool
+
+
+def test_an_unmeasured_pool_says_so_in_the_rung_notes() -> None:
+    # No ENGINE_RUNG_REPORT (or an older engine half) ⇒ no pool block. That must READ as "a pool bind cannot
+    # be ruled out from this rung", never as silence.
+    out = build_rung_outcome(_rung(), _drive(ingress=20.0, acked=1200), _gate(), None)
+    assert out.pool.measured is False
+    assert any("store pool NOT MEASURED" in n for n in out.notes)
+
+
+# --- ARTIFACT 3: the ceiling was OFFERED-derived — it reported the PLAN, not the engine ---------------
+
+
+def test_accepted_derived_ceiling_is_carried_to_the_headline_beside_the_offered_one() -> None:
+    """⭐ ARTIFACT 3. ``sustainable_ingress_rate`` is ``ingress_rate x hold / (hold + drain)`` — ``acked``
+    NEVER ENTERS IT. #1042 added ``accepted_ingress_rate`` per rung, but it stayed a PASSENGER: ``pinned_rung``
+    still selected on the OFFERED figure and every headline (events/s, publishable, the SOAK RATE) keyed off
+    it.
+
+    Here the drive pushed the full 6,000 it offered and the engine accepted 5,760 (96% — inside the 5% intake
+    tolerance, so the rung is SUSTAINED and ADMISSIBLE). The offered-derived ceiling therefore OVERSTATES the
+    accepted one, and it does so precisely AT the ceiling, which is where they diverge."""
+    rung = LadderRung(index=0, ingress_rate=100.0, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(ingress=100.0, acked=5_760, sent=6_000, hold_seconds=60.0)  # offered = 6,000
+    out = build_rung_outcome(rung, drive, _gate(), _report())
+    assert out.fidelity_admissible is True  # the gap is INSIDE the gate — it is not voided away
+    assert out.verdict is RungVerdict.SUSTAINED
+
+    rep = _rep([out])
+    span = 60.0 + 1.0  # hold + the measured drain
+    assert rep.pinned_ingress_rate == pytest.approx(
+        100.0 * 60.0 / span
+    )  # OFFERED-derived (unchanged)
+    assert rep.pinned_accepted_ingress_rate == pytest.approx(5_760 / span)  # ACCEPTED-derived
+
+    # ⭐ THE ANTI-REGRESSION: this FAILS if anyone re-derives the new number from `offered`. `offered/span`
+    # is 6000/61 — which IS the offered-derived figure. The accepted one must be the smaller, ENGINE-observed
+    # quantity, 5760/61.
+    assert rep.pinned_accepted_ingress_rate != pytest.approx(6_000 / span)
+    assert rep.pinned_accepted_ingress_rate < rep.pinned_ingress_rate
+    assert rep.accepted_vs_offered_ratio == pytest.approx(0.96, abs=1e-3)
+
+    ceiling = rep.to_json_dict()["ceiling"]
+    assert isinstance(ceiling, dict)
+    # BOTH, in the same block, in every currency the offered one is quoted in.
+    assert ceiling["pinned_ingress_rate"] == round(100.0 * 60.0 / span, 3)
+    assert str(ceiling["pinned_ingress_rate_basis"]).startswith("offered")
+    assert ceiling["pinned_accepted_ingress_rate"] == round(5_760 / span, 3)
+    assert str(ceiling["pinned_accepted_ingress_rate_basis"]).startswith("accepted")
+    assert ceiling["accepted_events_per_s"] == round(5_760 / span * 9, 3)  # x (1 + D), D = 8
+    assert ceiling["accepted_vs_offered_ratio"] == round(0.96, 4)
+    # ...and the rung still carries its own pair (the #1042 field, unchanged).
+    climb_js = rep.to_json_dict()["climb"]
+    assert isinstance(climb_js, list)
+    assert climb_js[0]["accepted_ingress_rate"] == round(5_760 / span, 3)
+
+    text = rep.render()
+    assert "accepted-derived ceiling (from acked, NOT offered)" in text
+    assert "OVERSTATES THIS RUN" in text  # 96% < 99% ⇒ the divergence is called out, not buried
+
+
+def test_accepted_events_gate_can_disagree_with_the_offered_one() -> None:
+    """The two ceilings are not decoration: they can return DIFFERENT ANSWERS to the 45M/day question. A run
+    that clears the target on what we ASKED FOR and misses it on what the engine TOOK must report both."""
+    rate = TARGET_EVENTS_PER_S / 2  # fan-out 1 ⇒ events = ingress x 2; exactly at the raw bar
+    offered = round(rate * 60.0)
+    rung = LadderRung(index=0, ingress_rate=rate, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(
+        ingress=rate,
+        acked=int(offered * 0.96),  # the engine took 96% — admissible, but under the offer
+        sent=offered,
+        hold_seconds=60.0,
+        dests=64,
+        handlers=1,
+        delivering=1,
+    )
+    out = build_rung_outcome(rung, drive, {**_gate(), "drain_seconds": 0.0}, _report())
+    rep = _rep([out], dests=64, handlers=1, delivering=1, routing="partitioned")
+
+    assert rep.clears_target_events is True  # on the OFFER...
+    assert rep.clears_target_events_accepted is False  # ...but NOT on what the engine accepted.
+    ceiling = rep.to_json_dict()["ceiling"]
+    assert isinstance(ceiling, dict)
+    assert ceiling["clears_target_events"] is True
+    assert ceiling["clears_target_events_accepted"] is False
+
+
+# --- ARTIFACT 4: classify_rung never compared `acked` to `offered` (THE LOAD-BEARING ONE) -------------
+
+
+def _fidelity_rung(
+    *,
+    offered_rate: float,
+    sent: int,
+    acked: int,
+    hold: float = 60.0,
+    deferred_backpressure: int = -1,
+    deferred_schedule: int = -1,
+    pool: PoolStats | None = None,
+    index: int = 1,
+    drained: bool = True,
+    engine_ok: bool = True,
+) -> RungOutcome:
+    """A rung built through the REAL two-box integration path (build_rung_outcome -> classify_rung), so the
+    gate is pinned where STEP 5 actually runs — not on a hand-assembled RungOutcome. The ``filling`` gate
+    shipped LIVE on the co-located path and DEAD on this one, and nobody noticed for a day.
+
+    The ``deferred_*`` split rides through the SAME path, because that plumbing IS the v2 gate: a
+    ``build_rung_outcome`` that drops it scores every shortfall as UNATTRIBUTED and silently loses the
+    BACKPRESSURE_BIND finding.
+
+    ``drained=False`` yields a TRUE COLLAPSE (engine store-truth reported and not drained) — needed because
+    the realistic pool bind lands on the rung the pool BREAKS, not the one it lets through."""
+    rung = LadderRung(
+        index=index, ingress_rate=offered_rate, hold_seconds=hold, drain_timeout=150.0
+    )
+    drive = _drive(
+        ingress=offered_rate,
+        acked=acked,
+        sent=sent,
+        hold_seconds=hold,
+        deferred_backpressure=deferred_backpressure,
+        deferred_schedule=deferred_schedule,
+        drained=drained,
+    )
+    report = _report() if pool is None else {**_report(), "store_pool": pool.to_json_dict()}
+    gate = _gate(engine_ok=engine_ok, drained=drained)
+    return build_rung_outcome(rung, drive, gate, report)
+
+
+def test_fidelity_healthy_rung_is_admissible() -> None:
+    out = _fidelity_rung(offered_rate=20.0, sent=1200, acked=1200)  # offered == 1200
+    assert out.fidelity is RungFidelity.ADMISSIBLE
+    assert out.fidelity_admissible is True
+    assert out.verdict is RungVerdict.SUSTAINED
+    js = out.to_json_dict()
+    assert js["fidelity"] == "admissible"
+    assert js["fidelity_reason"] is None
+    # An admissible rung pins the ceiling exactly as before — the gate adds no drag to a healthy climb.
+    assert _rep([out]).pinned_ingress_rate is not None
+
+
+def test_fidelity_drive_shortfall_is_void_and_is_NOT_an_engine_result() -> None:
+    """⭐ THE RIG COULD NOT PUSH IT. Partitioned needs ~520 msg/s of drive against the ~16 the rig pushes
+    today, so an UNDER-DRIVEN rung is the DEFAULT EXPECTATION, not an edge case. The engine accepted
+    everything that arrived (lossless, drained, S == A*D), so ``classify_rung`` says SUSTAINED — and the
+    ceiling built from it is a pure function of the LADDER PLAN.
+
+    ⭐ GATE v2: the DRIVE_SHORTFALL verdict now REQUIRES the deferrals to be dominated by the GENERATOR's own
+    tick-lag (``deferred_schedule``) — the sends never reached a connection, so no engine ever saw them. The
+    bare ``sent`` shortfall this test used to assert on is NOT sufficient and MUST NOT BE: ``sent`` is
+    engine-paced, so v1's "any shortfall ⇒ the rig" rule would have read a REAL ENGINE BACKPRESSURE BIND as
+    a rig failure and voided the finding. See the backpressure sibling below, which is the same shortfall
+    with the opposite cause and the opposite verdict."""
+    out = _fidelity_rung(
+        offered_rate=520.0,
+        sent=960,
+        acked=960,  # offered 31,200; the rig pushed 3%
+        deferred_schedule=30_240,  # THE GENERATOR fell behind its own tick — it never reached a socket
+        deferred_backpressure=0,  # the engine's buffers were never full: it was never the constraint
+    )
+
+    # The verdict machinery is UNCHANGED and STILL says SUSTAINED — that is the defect, demonstrated:
+    assert out.verdict is RungVerdict.SUSTAINED
+    assert out.no_loss is True
+
+    # ...and the fidelity gate is what catches it.
+    assert out.fidelity is RungFidelity.DRIVE_SHORTFALL
+    assert out.fidelity_admissible is False
+    reason = out.to_json_dict()["fidelity_reason"]
+    assert isinstance(reason, str)
+    assert "DRIVE SHORTFALL" in reason
+    assert "measures the RIG" in reason  # NOT the engine — the distinction IS the point
+    assert any("DRIVE SHORTFALL" in n for n in out.notes)
+
+    # VOID FOR THE CEILING: an under-driven climb must not pin anything.
+    rep = _rep([out])
+    assert rep.pinned_ingress_rate is None
+    assert rep.pinned_rung is None
+    assert rep.voided_climb == [out]
+    fid = rep.to_json_dict()["fidelity"]
+    assert isinstance(fid, dict)
+    assert fid["all_admissible"] is False
+    assert fid["any_drive_shortfall"] is True
+    assert fid["any_engine_intake_bind"] is False  # NOT blamed on the engine
+    assert fid["any_backpressure_bind"] is False  # v2: nor on engine backpressure
+    assert fid["void_rungs"][0]["fidelity"] == "drive_shortfall"
+    assert "FIDELITY: 1 of 1 climb rung(s) VOID" in rep.render()
+
+    # v2: the CAUSE is in the artifact, so the verdict is auditable rather than asserted. And this rung
+    # established NO RATE — it can neither pin nor bracket.
+    rung_js = out.to_json_dict()
+    assert rung_js["deferred_schedule"] == 30_240 and rung_js["deferred_backpressure"] == 0
+    assert rung_js["fidelity_driven"] is False
+    assert rep.driven_climb == []
+    assert rep.first_collapse_ingress_rate is None
+
+
+def test_fidelity_engine_intake_bind_is_void_and_IS_an_engine_finding() -> None:
+    """⭐ THE ENGINE WOULD NOT TAKE IT. The SAME lossless/drained/SUSTAINED serialization as the drive
+    shortfall above — and a COMPLETELY DIFFERENT FINDING. The drive pushed the whole plan; the engine
+    accepted 80%. That is a bind at INTAKE (ingress/routed are hard-1 per-lane pools keyed on the INBOUND
+    connection), and it is NOT the same thing as a lane/claim wall."""
+    out = _fidelity_rung(
+        offered_rate=100.0, sent=6000, acked=4800
+    )  # offered 6,000; sent all; took 80%
+
+    assert out.verdict is RungVerdict.SUSTAINED  # again: the verdict cannot see it
+    assert out.fidelity is RungFidelity.ENGINE_INTAKE_BIND
+    assert out.fidelity_admissible is False
+    reason = out.to_json_dict()["fidelity_reason"]
+    assert isinstance(reason, str)
+    assert "ENGINE INTAKE BIND" in reason
+    assert "REAL finding" in reason and "check G, not L" in reason
+
+    rep = _rep([out])
+    assert rep.pinned_ingress_rate is None  # VOID for the ceiling
+    fid = rep.to_json_dict()["fidelity"]
+    assert isinstance(fid, dict)
+    assert fid["any_engine_intake_bind"] is True
+    assert fid["any_drive_shortfall"] is False  # NOT blamed on the rig
+
+
+def test_fidelity_distinguishes_the_two_failures_that_used_to_serialise_identically() -> None:
+    """THE assertion the whole gate exists for. Same offered, same engine-side counts, same SUSTAINED
+    verdict — and the operator can now tell "my load generator is too small" from "the engine bound".
+
+    v2: the shortfall arm carries its CAUSE (``deferred_schedule`` dominant = the generator never reached a
+    socket). Without it the rung is UNATTRIBUTED, not a drive shortfall — see the fail-closed test below."""
+    shortfall = _fidelity_rung(
+        offered_rate=100.0,
+        sent=4800,
+        acked=4800,
+        deferred_schedule=1200,
+        deferred_backpressure=0,
+    )
+    bind = _fidelity_rung(offered_rate=100.0, sent=6000, acked=4800)
+
+    assert shortfall.verdict is bind.verdict is RungVerdict.SUSTAINED  # indistinguishable before...
+    assert shortfall.acked == bind.acked  # ...on identical engine-side counts, even
+    assert shortfall.fidelity is not bind.fidelity  # ...and distinguishable now
+    assert shortfall.fidelity is RungFidelity.DRIVE_SHORTFALL
+    assert bind.fidelity is RungFidelity.ENGINE_INTAKE_BIND
+
+
+def test_fidelity_is_fail_closed_when_sent_was_never_recorded() -> None:
+    # `sent` at the -1 sentinel (an older drive report / a synthetic record) is UNKNOWN — and UNKNOWN is
+    # VOID, never a silent skip. A gate that abstains into "pass" is a dead gate that reads like a live one.
+    out = _fidelity_rung(offered_rate=20.0, sent=-1, acked=1200)
+    assert out.fidelity is RungFidelity.UNKNOWN
+    assert out.fidelity_admissible is False
+    assert _rep([out]).pinned_ingress_rate is None
+    reason = out.to_json_dict()["fidelity_reason"]
+    assert isinstance(reason, str) and "never a pass" in reason
+
+
+def test_an_under_driven_climb_no_longer_pins_a_ceiling_from_the_plan() -> None:
+    """⭐ THE MONEY TEST. Four climb rungs, every one lossless and drained and SUSTAINED, every one driven at
+    ~3% of its offered rate. Before the gate this climb pinned a ceiling at the TOP rung's offered rate — a
+    number the rig never once pushed — and then SOAKED at it. Now it pins NOTHING, and says why."""
+    climb = [
+        _fidelity_rung(offered_rate=rate, sent=960, acked=960)
+        for rate in (100.0, 200.0, 400.0, 520.0)
+    ]
+    assert all(r.verdict is RungVerdict.SUSTAINED for r in climb)  # every rung "sustained"
+    rep = _rep(climb)
+    assert rep.pinned_ingress_rate is None
+    assert rep.sustained_events_per_s is None
+    assert rep.clears_target_events is False
+    assert rep.publishable_events_per_s is None
+    assert len(rep.voided_climb) == 4
+    # ...and the SOAK is not armed at a fictional rate either (it used to soak the offered figure).
+    assert pick_soak_rate(climb) is None
+
+
+def test_fidelity_gate_fires_on_the_two_box_path_specifically() -> None:
+    """⭐ THE `filling` REPEAT-FAILURE GUARD. ``ShardCertStepRecord.filling`` is LIVE on the co-located ladder
+    and explicitly DEAD on the two-box one (``ShardCertDriveReport.ceiling`` passes ``filling=False #
+    ABSTAIN``) — and the two-box path is the ONLY path STEP 5 runs. This pins the fidelity gate to the
+    two-box record type END TO END: the drive report computes it, ``build_rung_outcome`` carries it onto the
+    RungOutcome, and the consolidated report ACTS on it."""
+    drive = _drive(
+        ingress=520.0,
+        acked=960,
+        sent=960,
+        hold_seconds=60.0,
+        deferred_schedule=30_240,
+        deferred_backpressure=0,
+    )
+    assert drive.fidelity is RungFidelity.DRIVE_SHORTFALL  # (1) the DRIVE report itself
+    traffic = drive.to_json_dict()["traffic"]
+    assert isinstance(traffic, dict)
+    assert traffic["fidelity_admissible"] is False
+    # v2: the CAUSE SPLIT is in the drive report's own traffic block, or nothing downstream can attribute.
+    assert traffic["deferred_schedule"] == 30_240 and traffic["deferred_backpressure"] == 0
+
+    out = build_rung_outcome(_rung(rate=520.0), drive, _gate(), _report())
+    assert out.sent == 960  # (2) `sent` actually CROSSED into the two-box rung record
+    # ⭐ ...AND SO DID THE CAUSE SPLIT. This is the exact plumbing the v2 gate rests on: a build_rung_outcome
+    # that drops these scores EVERY shortfall as UNATTRIBUTED and silently loses the BACKPRESSURE_BIND
+    # finding — a dead gate that reads exactly like a live one, which is this file's signature defect.
+    assert out.deferred_schedule == 30_240 and out.deferred_backpressure == 0
+    assert out.fidelity is RungFidelity.DRIVE_SHORTFALL
+
+    rep = _rep([out])  # (3) ...and the CEILING acts on it
+    assert rep.pinned_ingress_rate is None
+    fid = rep.to_json_dict()["fidelity"]
+    assert isinstance(fid, dict)
+    assert fid["all_admissible"] is False
+
+
+# --- ARTIFACT 5: the INBOUND pool (G) is narrower than the outbound one (L), and was never recorded ---
+
+
+def test_inbound_band_warning_fires_exactly_when_G_is_below_L() -> None:
+    """``G = shards x lanes_per_shard`` is the width of the INGRESS and ROUTED hard-1 per-lane pools;
+    ``L = dests`` is the OUTBOUND one. The lane-scaling law applies to ALL THREE. At the SHIPPED DEFAULTS
+    (4 shards, 1 lane, 8 dests) G = 4 < L = 8 — so a destination sweep ALREADY plateaus on the inbound pool
+    and manufactures what reads, column for column, as an outbound/pooled-claim wall."""
+    assert inbound_band_count(4, 1) == 4
+    assert inbound_band_count(4, 4) == 16
+
+    warn = inbound_band_warning(4, 1, 8)  # ⭐ the shipped default IS the narrow case
+    assert warn is not None
+    assert "INBOUND BAND NARROWER" in warn
+    assert "G = shards(4) x lanes_per_shard(1) = 4" in warn and "L = dests(8)" in warn
+    assert "--lanes-per-shard (>= 2)" in warn  # ceil(8/4) — the fix, stated in the message
+
+    assert inbound_band_warning(4, 2, 8) is None  # G == L ⇒ inbound is no longer the narrow pool
+    assert inbound_band_warning(4, 8, 8) is None  # wider still
+
+
+def test_inbound_band_check_warns_by_default_and_refuses_only_under_strict() -> None:
+    """It CANNOT be a hard refusal by default: G < L is TRUE at the documented command line, so a refusal
+    would red every existing invocation and every existing test. Warn + record by default; refuse only for a
+    deliberate lane sweep, which is where silently measuring the ingress pool wastes the whole experiment."""
+    assert check_inbound_bands(4, 1, 8) is not None  # warns (to stderr) and RETURNS the note
+    assert check_inbound_bands(4, 2, 8) is None  # nothing to say
+    with pytest.raises(InboundBandTooNarrow):
+        check_inbound_bands(4, 1, 8, strict=True)
+    assert check_inbound_bands(4, 2, 8, strict=True) is None  # strict does NOT fire when G >= L
+
+
+def test_G_and_L_are_both_recorded_in_the_report_json() -> None:
+    """G was computed on BOTH boxes and recorded on NEITHER: the engine derived ``lanes`` from the built
+    graph and posted it in SHARDS_READY; the drive read it, sliced sender bands with it, and dropped it. So a
+    plateau could not be attributed to the right pool from the artifact alone."""
+    drive = _drive(ingress=20.0, acked=1200, dests=8, lanes=1)
+    assert drive.inbound_bands == 4 and drive.inbound_band_narrower is True
+    d_topo = drive.to_json_dict()["topology"]
+    assert isinstance(d_topo, dict)
+    assert d_topo["lanes_per_shard"] == 1
+    assert d_topo["inbound_bands"] == 4  # G
+    assert d_topo["dests"] == 8  # L
+    assert d_topo["inbound_bands_narrower_than_dests"] is True
+
+    out = build_rung_outcome(_rung(), drive, _gate(), _report())
+    assert out.lanes_per_shard == 1
+    assert out.to_json_dict()["lanes_per_shard"] == 1
+    assert any("inbound bands G=4 < outbound lanes L=8" in n for n in out.notes)
+
+    rep = _rep([out], lanes_per_shard=1)
+    topo = rep.to_json_dict()["topology"]
+    assert isinstance(topo, dict)
+    assert topo["inbound_bands"] == 4 and topo["dests"] == 8
+    assert topo["inbound_bands_narrower_than_dests"] is True
+    assert "INBOUND IS THE NARROW POOL" in rep.render()
+
+
+def test_a_wide_enough_inbound_band_is_reported_as_such() -> None:
+    # The complement: at --lanes-per-shard 2 the inbound side matches the outbound one, the warning is
+    # silent, and the report says so — so an operator can PROVE the sweep measured the pool it meant to.
+    drive = _drive(ingress=20.0, acked=1200, dests=8, lanes=2)
+    assert drive.inbound_bands == 8  # G == L
+    assert drive.inbound_band_narrower is False
+
+    out = build_rung_outcome(_rung(), drive, _gate(), _report())
+    assert not any("inbound bands" in n for n in out.notes)
+    rep = _rep([out], lanes_per_shard=2)
+    topo = rep.to_json_dict()["topology"]
+    assert isinstance(topo, dict)
+    assert topo["inbound_bands"] == 8
+    assert topo["inbound_bands_narrower_than_dests"] is False
+    assert "INBOUND IS THE NARROW POOL" not in rep.render()
+
+
+# ======================================================================================================
+# ⭐ FIDELITY GATE v2 — THE `sent`-SHORTFALL ARM IS CAUSE-SPLIT
+# ======================================================================================================
+# v1's rule was `sent < 0.98 x offered => DRIVE_SHORTFALL => VOID the rung`, printing "this rung says
+# NOTHING about the engine; it measures the RIG. Add sender workers / drive boxes and re-run."
+#
+# THAT IS BACKWARDS, AND WRONG IN THE MOST DANGEROUS DIRECTION. `sent` is ENGINE-PACED: it is incremented
+# only after a job is popped from a BOUNDED asyncio.Queue, and the write loop `await writer.drain()`s
+# before popping the next. When the engine stops reading its socket the TCP window fills, drain() blocks,
+# the queue fills, `submit_nowait()` refuses, and the offer lands in `deferred` WITHOUT advancing `sent`.
+# The governor's own docstring says so ("if the pool can't accept a send (ENGINE LAGGING) it's counted as
+# *deferred*"). So `sent < offered` IS THE SIGNATURE OF ENGINE BACKPRESSURE — and v1 read the single most
+# important engine signal, called it a rig failure, VOIDED the rung, and sent the operator out to buy
+# hardware. It would have discarded the one real finding the ladder exists to produce.
+#
+# v2 ATTRIBUTES the shortfall from the `deferred_*` counters instead of ASSUMING it.
+
+
+def test_backpressure_bind_is_an_ENGINE_finding_and_is_NOT_voided_as_a_rig_failure() -> None:
+    """⭐⭐ THE CRUX. The SAME `sent` shortfall v1 blamed on the rig — but the deferrals are dominated by FULL
+    SEND BUFFERS, i.e. the ENGINE stopped reading its socket. This is an ENGINE BIND. It may BE the ceiling,
+    and it must NOT be voided away as "your load generator is too small"."""
+    out = _fidelity_rung(
+        offered_rate=100.0,
+        sent=4_800,  # offered 6,000 — an 80% sent ratio, IDENTICAL to a drive shortfall's numbers
+        acked=4_800,
+        deferred_backpressure=1_200,  # ...but the buffers were FULL: THE ENGINE would not take the bytes
+        deferred_schedule=0,  # the generator kept up with its own tick perfectly
+    )
+    assert out.fidelity is RungFidelity.BACKPRESSURE_BIND
+
+    # (1) IT IS NOT THE RIG. This is the assertion v1 would have failed.
+    assert out.fidelity is not RungFidelity.DRIVE_SHORTFALL
+    reason = out.fidelity_reason
+    assert isinstance(reason, str)
+    assert "REAL engine finding, NOT a rig failure" in reason
+    assert "drive boxes" not in reason  # v1 sent the operator shopping on exactly this signature
+
+    # (2) IT KEEPS ITS RATE LABEL and may BRACKET the ceiling — an engine bind is a FINDING, not a void.
+    assert out.fidelity_driven is True
+    # (3) ...but it may NOT PIN one: the engine did not HOLD this rate, it REFUSED it.
+    assert out.fidelity_admissible is False
+
+    rep = _rep([out])
+    assert rep.driven_climb == [out]  # in the BRACKET's candidate set...
+    assert rep.admissible_climb == []  # ...and out of the PIN's
+    assert rep.pinned_ingress_rate is None
+
+    fid = rep.to_json_dict()["fidelity"]
+    assert isinstance(fid, dict)
+    assert fid["any_backpressure_bind"] is True
+    assert fid["any_drive_shortfall"] is False  # ⭐ THE ENGINE IS NOT BLAMED ON THE RIG
+    assert fid["climb_driven_rungs"] == 1 and fid["climb_not_driven_rungs"] == 0
+
+
+def test_the_same_sent_shortfall_splits_on_CAUSE_alone() -> None:
+    """The two rungs are byte-identical in `offered`, `sent` and `acked` — every number v1 looked at. ONLY
+    the deferral cause differs, and it flips the verdict from a RIG failure to an ENGINE finding. v1 could
+    not express this distinction at all, so it guessed — and it guessed the dangerous way every time."""
+    rig = _fidelity_rung(
+        offered_rate=100.0,
+        sent=4_800,
+        acked=4_800,
+        deferred_schedule=1_200,
+        deferred_backpressure=0,
+    )
+    engine = _fidelity_rung(
+        offered_rate=100.0,
+        sent=4_800,
+        acked=4_800,
+        deferred_backpressure=1_200,
+        deferred_schedule=0,
+    )
+
+    assert (rig.offered, rig.sent, rig.acked) == (engine.offered, engine.sent, engine.acked)
+    assert rig.fidelity is RungFidelity.DRIVE_SHORTFALL
+    assert engine.fidelity is RungFidelity.BACKPRESSURE_BIND
+    # And the consequence differs where it matters: only the RIG one is void for the BRACKET too.
+    assert rig.fidelity_driven is False
+    assert engine.fidelity_driven is True
+
+
+def test_an_unattributed_sent_shortfall_is_FAIL_CLOSED_and_blames_NOBODY() -> None:
+    """⭐ FAIL-CLOSED. An older drive half records no `deferred_*` split, so the shortfall's CAUSE IS UNKNOWN.
+    "The rig ran out" and "the engine applied backpressure" are OPPOSITE findings, and this rung
+    distinguishes NEITHER. The gate must say exactly that — not guess, and above all NOT default to
+    DRIVE_SHORTFALL (a silent default to "the rig" is the v1 defect wearing a fresh coat)."""
+    out = _fidelity_rung(offered_rate=100.0, sent=4_800, acked=4_800)  # no split recorded
+
+    assert out.fidelity is RungFidelity.OFFER_SHORTFALL
+    assert out.fidelity is not RungFidelity.DRIVE_SHORTFALL  # ⭐ NOT a guess against the rig
+    assert out.fidelity is not RungFidelity.BACKPRESSURE_BIND  # ⭐ nor a guess against the engine
+
+    reason = out.fidelity_reason
+    assert isinstance(reason, str)
+    assert "CAUSE NOT ATTRIBUTED" in reason
+    assert "we CANNOT say" in reason
+
+    # It VOIDS — for BOTH the pin and the bracket, because no rate was ever established on the wire.
+    assert out.fidelity_admissible is False
+    assert out.fidelity_driven is False
+    rep = _rep([out])
+    assert rep.pinned_ingress_rate is None
+    assert rep.first_collapse_ingress_rate is None
+
+    fid = rep.to_json_dict()["fidelity"]
+    assert isinstance(fid, dict)
+    assert fid["any_offer_shortfall"] is True
+    assert (
+        fid["any_drive_shortfall"] is False
+    )  # a silent skip that waves it through would be a BLOCKER
+    assert fid["any_backpressure_bind"] is False
+
+
+def test_a_dead_heat_between_the_two_causes_names_no_culprit() -> None:
+    """Equal counters (including 0 == 0: the offers vanished with neither cause recorded) attribute to
+    NEITHER side. Naming a culprit on a tie would be a coin-flip dressed up as a measurement."""
+    tie = _fidelity_rung(
+        offered_rate=100.0,
+        sent=4_800,
+        acked=4_800,
+        deferred_backpressure=600,
+        deferred_schedule=600,
+    )
+    assert tie.fidelity is RungFidelity.OFFER_SHORTFALL
+    assert tie.fidelity_driven is False
+
+
+# ======================================================================================================
+# ⭐ BLOCKER 1 — A REAL ENGINE COLLAPSE MUST STILL BRACKET THE CEILING
+# ======================================================================================================
+
+
+def _collapsed_engine_bound_rung(rate: float) -> RungOutcome:
+    """The top rung of a GENUINE saturation climb: the drive pushed the whole plan, the engine accepted only
+    70% of it (an INTAKE BIND) and the pipeline did not drain (a store-truth COLLAPSE). This is what an
+    engine actually saturating LOOKS LIKE — `_is_ceiling` fires on exactly this `acked < offered` shortfall."""
+    rung = LadderRung(index=2, ingress_rate=rate, hold_seconds=60.0, drain_timeout=150.0)
+    offered = round(rate * 60.0)
+    drive = _drive(
+        ingress=rate,
+        acked=int(offered * 0.70),  # the ENGINE would not take it ⇒ ENGINE_INTAKE_BIND
+        sent=offered,  # the drive pushed the WHOLE plan — the rig is NOT the problem
+        hold_seconds=60.0,
+        drained=False,  # ...and the pipeline did not drain ⇒ a store-truth COLLAPSE
+    )
+    # engine_ok False + not drained ⇒ classify_rung returns COLLAPSED (store-truth CONFIRMED).
+    return build_rung_outcome(
+        rung, drive, _gate(engine_ok=False, drained=False, in_pipeline_final=500), _report()
+    )
+
+
+def test_a_real_engine_collapse_still_brackets_the_ceiling() -> None:
+    """⭐⭐ BLOCKER 1. An ENGINE SATURATING AT RATE R IS EXACTLY `acked < 0.95 x offered` — that IS this
+    project's own model of a ceiling (`_is_ceiling` fires on the same shortfall). So the top rung of a REAL
+    saturation climb is normally BOTH `COLLAPSED` and fidelity-ENGINE_BOUND.
+
+    Drawing the bracket from `admissible_climb` threw that rung out and made the report announce "no ceiling
+    reached (raise the ladder)" on a run that had MEASURED A GENUINE COLLAPSE — discarding the one result a
+    saturation climb exists to produce. AN ENGINE BIND IS A FINDING, NOT A VOID."""
+    held = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200)  # SUSTAINED + admissible
+    collapsed = _collapsed_engine_bound_rung(40.0)  # the engine saturated here
+
+    assert held.fidelity is RungFidelity.ADMISSIBLE
+    assert collapsed.verdict is RungVerdict.COLLAPSED  # a REAL, store-truth-confirmed collapse
+    assert collapsed.fidelity is RungFidelity.ENGINE_INTAKE_BIND
+    assert collapsed.engine_reported is True
+
+    rep = _rep([held, collapsed])
+
+    # ⭐ THE BRACKET IS SET BY THE COLLAPSE — the engine-bound rung is DRIVEN, so its RATE is real.
+    assert collapsed.fidelity_driven is True
+    assert rep.first_collapse_ingress_rate == 40.0
+    assert rep.ceiling_bracketed is True  # NOT "raise the ladder" — we MEASURED the wall
+    assert rep.pinned_ingress_rate is not None  # ...and the FLOOR still comes from the held rung
+
+    # The PIN stays stricter than the BRACKET: an engine-bound rung may not pin a rate it REFUSED.
+    assert rep.admissible_climb == [held]
+    assert rep.driven_climb == [held, collapsed]
+    assert rep.pinned_rung is held
+
+    # It is NOT a "void collapse" — the rate label is real, so nothing is thrown away.
+    assert rep.has_void_collapse is False
+    assert rep.void_collapsed_climb == []
+
+    ceiling = rep.to_json_dict()["ceiling"]
+    assert isinstance(ceiling, dict)
+    assert ceiling["first_collapse_ingress_rate"] == 40.0
+    assert ceiling["bracketed"] is True
+    assert "ENGINE_INTAKE_BIND" in str(ceiling["bracket_basis"]).upper()
+    text = rep.render()
+    assert "first collapse at: 40 ingress/s" in text
+    assert "raise the ladder" not in text  # the pre-fix report said exactly this, on THIS run
+
+
+def test_a_collapse_at_a_rate_NOBODY_DROVE_still_does_not_bracket() -> None:
+    """The other direction, and the reason the bracket is `driven` rather than "any collapse". A rung the RIG
+    never pushed collapsed at an OFFERED rate that was never established on the wire. The collapse is real;
+    the RATE LABEL is fiction, and only a RATE can bracket a ceiling."""
+    held = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200)
+    rung = LadderRung(index=2, ingress_rate=520.0, hold_seconds=60.0, drain_timeout=150.0)
+    drive = _drive(
+        ingress=520.0,
+        acked=960,
+        sent=960,  # offered 31,200 — the rig pushed 3%
+        hold_seconds=60.0,
+        drained=False,
+        deferred_schedule=30_240,  # ...and THE GENERATOR is why (a genuine rig shortfall)
+        deferred_backpressure=0,
+    )
+    never_driven = build_rung_outcome(
+        rung, drive, _gate(engine_ok=False, drained=False, in_pipeline_final=500), _report()
+    )
+
+    assert never_driven.verdict is RungVerdict.COLLAPSED  # the collapse IS real
+    assert never_driven.fidelity is RungFidelity.DRIVE_SHORTFALL
+    assert never_driven.fidelity_driven is False  # ...but no RATE was established
+
+    rep = _rep([held, never_driven])
+    assert rep.first_collapse_ingress_rate is None  # so it cannot bracket
+    assert rep.ceiling_bracketed is False
+    assert rep.has_void_collapse is True  # ...and it is NOT hidden: it is NAMED
+    assert rep.void_collapsed_climb == [never_driven]
+    assert any("THE COLLAPSE IS REAL" in n for n in rep.void_collapse_notes)
+
+
+def test_the_two_ladder_callers_agree_that_an_engine_bind_keeps_its_rate() -> None:
+    """⭐ THE `filling` REPEAT-FAILURE GUARD, APPLIED TO THE BRACKET. The `filling` gate shipped LIVE on the
+    co-located ladder and DEAD on the two-box one, and nobody noticed for a day. The two ladder callers must
+    AGREE on the engine-bind case: an ENGINE bind KEEPS its rate (it is a finding); only a NOT-DRIVEN rung
+    (drive shortfall / unattributed / unknown) voids it. Reviewers found the two DISAGREED on exactly this."""
+    # The predicate BOTH callers split on. The co-located ladder publishes a ceiling_rate for a DRIVEN rung
+    # and voids a NOT-DRIVEN one; the two-box bracket admits exactly the same set.
+    assert RungFidelity.ADMISSIBLE.driven is True
+    assert RungFidelity.ENGINE_INTAKE_BIND.driven is True
+    assert RungFidelity.BACKPRESSURE_BIND.driven is True
+    assert RungFidelity.DRIVE_SHORTFALL.driven is False
+    assert RungFidelity.OFFER_SHORTFALL.driven is False
+    assert RungFidelity.UNKNOWN.driven is False
+    # `not_driven` is the exact complement — no verdict may fall through BOTH gates, or be counted twice.
+    for fid in RungFidelity:
+        assert fid.driven is not fid.not_driven
+
+    # ...and the two-box BRACKET uses that predicate — the same split, not a parallel re-implementation.
+    collapsed = _collapsed_engine_bound_rung(40.0)
+    held = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200)
+    rep = _rep([held, collapsed])
+    assert [r.fidelity.driven for r in rep.driven_climb] == [True, True]
+    assert rep.first_collapse_ingress_rate == 40.0
+
+
+# ======================================================================================================
+# ⭐ BLOCKER 2 — THE STORE-POOL TRIPWIRE MUST TAINT THE VERDICT, NOT MERELY ANNOTATE IT
+# ======================================================================================================
+
+
+def test_a_pool_bound_ceiling_cannot_ship_as_a_confident_bracketed_PASS() -> None:
+    """⭐⭐ BLOCKER 2. The tripwire used to be ADVISORY ONLY: `pool.tripped` appended a note and built
+    `pool_tripped_rungs`, which was emitted to JSON and READ BY NOTHING. It entered no verdict, no bracket,
+    no result token and no exit code — so a POOL-BOUND ceiling still shipped as a confident `result: PASS`,
+    exit 0. That is VERBATIM the artifact the tripwire exists to prevent: a pool bind is column-for-column
+    identical to the pooled-claim wall it would otherwise be blamed on, and it would have commissioned an
+    engine rewrite against a BENCH ARTIFACT.
+
+    The rate is REAL, so it is not voided — but it must be ATTRIBUTED TO THE RESOURCE, and it must never be
+    quotable as the ENGINE's ceiling."""
+    pool_bound = PoolStats.from_sample(_pool_sample(pool_wait_p95_max_ms=9.0), requested=8)
+    assert pool_bound.tripped is True  # the pre-registered tripwire fired
+
+    # A rung that is otherwise PERFECT: fully driven, fully accepted, lossless, drained, SUSTAINED.
+    out = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200, pool=pool_bound)
+    assert out.fidelity is RungFidelity.ADMISSIBLE
+    assert out.verdict is RungVerdict.SUSTAINED
+    assert out.pool.tripped is True
+
+    rep = _rep([out])
+    # The NUMBER survives — it is a real measurement, and suppressing it would lose information...
+    assert rep.pinned_ingress_rate is not None
+    # ...but the VERDICT is TAINTED: this is the POOL's wall, not the engine's.
+    assert rep.ceiling_pool_bound is True
+    assert rep.ceiling_admissible is False
+    assert rep.result_label == "POOL_BOUND"  # ⭐ NOT "PASS"
+    assert rep.exit_code == 2  # ⭐ NOT 0 — an exit-code-gated harness cannot read this as a pass
+
+    js = rep.to_json_dict()
+    assert js["result"] == "POOL_BOUND"
+    assert js["exit_code"] == 2
+    ceiling = js["ceiling"]
+    assert isinstance(ceiling, dict)
+    assert ceiling["pool_bound"] is True
+    assert ceiling["admissible"] is False
+    assert ceiling["pinned_ingress_rate"] is not None  # the number is still THERE, still auditable
+    store_pool = js["store_pool"]
+    assert isinstance(store_pool, dict)
+    assert store_pool["tripped_at_rates"] == [20.0]
+
+    # ...and an operator reading the TEXT cannot mistake it for an engine ceiling.
+    text = rep.render()
+    assert "POOL-BOUND CEILING — NOT AN ENGINE CEILING" in text
+    assert "RESULT: POOL-BOUND CEILING" in text
+
+
+def test_the_pool_trips_on_the_rung_it_BREAKS_not_the_one_it_lets_through() -> None:
+    """⭐⭐ THE CASE THE FIRST FIX MISSED — and it is the ONLY case that occurs in practice.
+
+    A pool bind does not announce itself on the rung it lets through. It announces itself on the rung it
+    BREAKS. So the realistic ladder is: a LOW rung sustains on a healthy pool, and the NEXT rung collapses
+    *because* the store pool saturated. The trip lands on the COLLAPSING rung — which is the one that
+    brackets the ceiling.
+
+    v1 of the taint keyed on the PINNED rung (falling back to the bracketing rung only when NOTHING pinned).
+    A pin always exists here, so the collapsing rung's trip was NEVER CONSULTED, and an executed reproduction
+    gave: tripped on rung=[40.0], first_collapse=40.0, bracketed=True, ceiling_pool_bound=FALSE,
+    result=PASS, exit 0 — the POOL's own wall, published as the ENGINE's ceiling, with a clean exit code.
+
+    That is verbatim the artifact the tripwire exists to prevent. The predicate is now FAIL-SAFE: any driven
+    rung that tripped taints the ceiling. A false taint costs one cheap re-run at a larger --store-pool-size;
+    a missed one costs an engine rewrite against a bench artifact."""
+    clean = PoolStats.from_sample(_pool_sample(), requested=40)
+    pool_bound = PoolStats.from_sample(_pool_sample(pool_wait_p95_max_ms=9.0), requested=8)
+    assert clean.tripped is False and pool_bound.tripped is True
+
+    # 20/s SUSTAINS on a healthy pool -> it PINS.  40/s COLLAPSES because the pool saturated -> it BRACKETS.
+    sustained = _fidelity_rung(index=0, offered_rate=20.0, sent=1_200, acked=1_200, pool=clean)
+    collapsed = _fidelity_rung(
+        index=1,
+        offered_rate=40.0,
+        sent=2_400,
+        acked=2_400,
+        pool=pool_bound,
+        drained=False,
+        engine_ok=False,
+    )
+    assert sustained.verdict is RungVerdict.SUSTAINED
+    assert collapsed.verdict is not RungVerdict.SUSTAINED
+
+    rep = _rep([sustained, collapsed])
+    assert (
+        rep.pinned_rung is sustained
+    )  # a pin EXISTS — which is exactly what silenced the v1 predicate
+    assert rep.pinned_rung.pool.tripped is False  # ...and the PINNED rung's pool is CLEAN
+    assert rep.first_collapse_ingress_rate == 40.0  # the bracket comes from the rung the POOL broke
+    assert rep.ceiling_bracketed is True
+
+    # ⭐ The taint must fire anyway. The ceiling is the pool's, not the engine's.
+    assert rep.ceiling_pool_bound is True
+    assert rep.ceiling_admissible is False
+    assert rep.result_label == "POOL_BOUND"  # NOT "PASS"
+    assert rep.exit_code == 2  # NOT 0
+    assert "POOL-BOUND CEILING — NOT AN ENGINE CEILING" in rep.render()
+    assert rep.to_json_dict()["store_pool"]["tripped_at_rates"] == [40.0]
+
+
+def test_a_clean_pool_leaves_the_verdict_untouched() -> None:
+    """The taint must be a real discriminator, not a blanket pessimism: a run whose pool WAS measured and did
+    NOT trip still PASSes at exit 0 with an admissible ceiling. A gate that always fires is not a gate."""
+    clean = PoolStats.from_sample(_pool_sample(), requested=40)
+    assert clean.tripped is False
+
+    out = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200, pool=clean)
+    rep = _rep([out])
+    assert rep.ceiling_pool_bound is False
+    assert rep.ceiling_admissible is True
+    assert rep.result_label == "PASS"
+    assert rep.exit_code == 0
+    assert "POOL-BOUND CEILING" not in rep.render()
+
+
+def test_a_pool_bound_ceiling_does_not_mask_a_run_where_nothing_was_measured() -> None:
+    """POOL_BOUND says "we measured a ceiling and the POOL owns it". A rendezvous abort says "we measured
+    NOTHING". The second dominates — attributing a ceiling to the pool on a run that never produced one
+    would be a fabrication of exactly the kind this gate exists to stop."""
+    pool_bound = PoolStats.from_sample(_pool_sample(pool_wait_p95_max_ms=9.0), requested=8)
+    out = _fidelity_rung(offered_rate=20.0, sent=1_200, acked=1_200, pool=pool_bound)
+    rep = _rep([out], climb_aborted=True)
+
+    assert rep.ceiling_pool_bound is True  # the pool DID trip...
+    assert (
+        rep.result_label == "SETUP_DEGRADED"
+    )  # ...but nothing was certified, and THAT is the headline
+    assert rep.exit_code == 2

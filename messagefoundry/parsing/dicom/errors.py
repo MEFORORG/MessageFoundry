@@ -21,7 +21,7 @@ secured store (CLAUDE.md §9 / ADR 0025 §1).
 
 from __future__ import annotations
 
-__all__ = ["DicomError", "DicomPeekError"]
+__all__ = ["DicomError", "DicomPeekError", "DicomBombError"]
 
 
 class DicomError(ValueError):
@@ -34,3 +34,11 @@ class DicomPeekError(DicomError):
     :class:`~messagefoundry.parsing.fhir.errors.FhirPeekError` /
     :class:`~messagefoundry.parsing.x12.errors.X12PeekError` — a Router routes the message to the
     error/dead-letter path rather than guessing. **PHI-safe:** names the failure, never the bytes."""
+
+
+class DicomBombError(DicomError):
+    """A DICOM object declares **Deflated Explicit VR Little Endian** (``1.2.840.10008.1.2.1.99``) but
+    its deflate stream inflates past the configured uncompressed cap — a **decompression bomb**, rejected
+    in **bounded memory BEFORE** any ``dcmread`` (ASVS 5.2.3). A ``DicomError`` (so it routes to the
+    error/dead-letter path exactly like any malformed object). **PHI-safe:** names the failure + the cap,
+    never the bytes or any element value."""

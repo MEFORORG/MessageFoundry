@@ -25,8 +25,9 @@ from __future__ import annotations
 
 import asyncio
 import os
+from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any
 
 import pytest
 

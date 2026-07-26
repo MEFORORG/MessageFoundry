@@ -21,6 +21,11 @@ import { buildSymbolIndex, matchSymbols, type SymbolDef, type SymbolKind } from 
 
 export type { Graph, GroupingMode, Perspective };
 
+// Every item icon across the tree shares one complementary-blue (contributed `messagefoundry.itemIcon`)
+// so the nodes read as one set — distinct from the amber (signature-orange) ACTION icons on the rows.
+// Status rows (info/error) are excluded below so a failure still reads in its own color.
+const ITEM_ICON_COLOR = new vscode.ThemeColor("messagefoundry.itemIcon");
+
 class Node extends vscode.TreeItem {
   constructor(
     public readonly vm: VmNode,
@@ -37,7 +42,7 @@ class Node extends vscode.TreeItem {
     this.id = vm.id;
     this.description = vm.description;
     if (vm.icon) {
-      this.iconPath = new vscode.ThemeIcon(vm.icon);
+      this.iconPath = new vscode.ThemeIcon(vm.icon, vm.kind === "info" ? undefined : ITEM_ICON_COLOR);
     }
     if (vm.contextValue) {
       this.contextValue = vm.contextValue;

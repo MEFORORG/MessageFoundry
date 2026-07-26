@@ -231,9 +231,14 @@ def _serve_capturing_store_path(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, argv: list[str]
 ) -> str:
     """Drive _serve far enough to capture the store path passed to create_managed_app, stubbing the
-    server so nothing binds. Uses a `dev` env (synthetic/non-prod posture) so no PHI gating fires."""
+    server so nothing binds. Uses a `dev` env (synthetic/non-prod posture) so no PHI gating fires.
+
+    GIVEN 1 (ADR 0148): dev derives PHI now, so the synthetic posture is declared explicitly via the
+    [security].handles_real_patient_data=false env opt-out — keeping these anchoring tests focused on
+    path resolution, with no PHI-gate noise."""
     import messagefoundry.api as api_mod
 
+    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
     captured: dict[str, object] = {}
 
     def _fake_app(*, store_settings: object, **_kw: object) -> object:
@@ -342,9 +347,14 @@ def _run_serve_stubbed(monkeypatch: pytest.MonkeyPatch, argv: list[str]) -> int:
 
     Note: _serve calls configure_logging(), which REPLACES the root logger's handlers (so caplog's
     handler is removed). The diagnostics therefore reach the configured stdout StreamHandler, captured
-    by ``capsys`` — these tests assert on capsys stdout, not caplog records."""
+    by ``capsys`` — these tests assert on capsys stdout, not caplog records.
+
+    GIVEN 1 (ADR 0148): dev derives PHI now, so declare the synthetic posture explicitly (the
+    [security].handles_real_patient_data=false env opt-out) so no PHI gate fires — these tests probe
+    anchoring diagnostics, not the security posture."""
     import messagefoundry.api as api_mod
 
+    monkeypatch.setenv("MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA", "false")
     monkeypatch.setattr(api_mod, "create_managed_app", lambda **_kw: object())
     import uvicorn
 

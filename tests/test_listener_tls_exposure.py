@@ -80,7 +80,9 @@ def _mock_start(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
     # The in-process-TLS start path builds an SSLContext from the cert PEM before uvicorn.run; stub it
     # so the tests need no on-disk cert (the GATE, not context-building, is under test).
-    monkeypatch.setattr("messagefoundry.api.tls.build_api_ssl_context", lambda api: object())
+    monkeypatch.setattr(
+        "messagefoundry.api.tls.build_api_ssl_context", lambda api, *, enforcing=True: object()
+    )
 
 
 def test_serve_refuses_inprocess_tls_offloopback_without_attestation(
@@ -91,7 +93,10 @@ def test_serve_refuses_inprocess_tls_offloopback_without_attestation(
     monkeypatch.chdir(tmp_path)
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\ntls_cert_file = "cert.pem"\n', encoding="utf-8"
+        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        '[api]\ntls_cert_file = "cert.pem"\n',
+        encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 2
     err = capsys.readouterr().err
@@ -108,7 +113,10 @@ def test_serve_inprocess_tls_offloopback_attested_starts(
     monkeypatch.setenv("MEFOR_TLS_REVOCATION_ATTESTED", "1")
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\ntls_cert_file = "cert.pem"\n', encoding="utf-8"
+        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        '[api]\ntls_cert_file = "cert.pem"\n',
+        encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "refusing to serve the API with in-process TLS" not in capsys.readouterr().err
@@ -123,7 +131,9 @@ def test_serve_loopback_inprocess_tls_starts(
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "127.0.0.1"\ntls_cert_file = "cert.pem"\n', encoding="utf-8"
+        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        'security.local_access_only = true\n[api]\ntls_cert_file = "cert.pem"\n',
+        encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0
     assert "in-process TLS on non-loopback" not in capsys.readouterr().err
@@ -138,7 +148,9 @@ def test_serve_proxy_terminated_offloopback_starts(
     monkeypatch.delenv("MEFOR_TLS_REVOCATION_ATTESTED", raising=False)
     _mock_start(monkeypatch)
     (tmp_path / "messagefoundry.toml").write_text(
-        '[api]\nhost = "0.0.0.0"\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
+        "security.handles_real_patient_data = false\n"  # GIVEN 1 (ADR 0148): dev derives PHI now
+        'security.local_access_only = false\nsecurity.listen_address = "0.0.0.0"\n'
+        '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.7"]\n',
         encoding="utf-8",
     )
     assert main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"]) == 0

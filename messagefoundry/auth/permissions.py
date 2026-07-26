@@ -20,7 +20,7 @@ from collections.abc import Iterable
 from enum import Enum
 
 
-class Permission(str, Enum):
+class Permission(str, Enum):  # noqa: UP042
     """A single capability a role may grant. The value is the wire/storage string."""
 
     MONITORING_READ = "monitoring:read"
@@ -34,6 +34,10 @@ class Permission(str, Enum):
     # PHI, so this IMPLIES messages:view_raw — every built-in role granting it also grants view_raw (the
     # client fetches the editable copy over the view_raw seam). Deny-by-default: no role gets it for free.
     MESSAGES_EDIT = "messages:edit"
+    # Bulk-export raw message bodies from a search result to a file (BACKLOG #124, ADR 0131). The LARGEST
+    # PHI egress surface, so it is a DISTINCT capability from messages:view_raw (bulk ≠ opening one
+    # message); the export route also requires messages:view_raw + step-up. Deny-by-default.
+    MESSAGES_EXPORT = "messages:export"
     MESSAGES_PURGE = "messages:purge"
     CONNECTIONS_CONTROL = "connections:control"
     CONNECTIONS_TEST = (
@@ -49,12 +53,23 @@ class Permission(str, Enum):
     USERS_MANAGE = "users:manage"
     AUDIT_READ = "audit:read"
     AUDIT_EXPORT = "audit:export"  # download a filtered audit report (CSV export, BACKLOG #170)
+    # PHI: the redacted application-log tail (best-effort redaction, residual single-token PHI possible).
+    # Gates GET /logs/tail (BACKLOG #171, ADR 0130) — a genuine PHI read surface, so audited + hop-guarded
+    # like a message view, not treated as free operational text.
+    LOGS_VIEW = "logs:view"
+    # Offline uploaded-logs (BACKLOG #125/#126, ADR 0134). Three deny-by-default capabilities over the
+    # connection-decoupled uploaded-file subsystem. FILES_BROWSE reads real HL7 PHI at rest, so its
+    # routes also require step-up + the PHI-read hop guard (like content search); FILES_DELETE is a
+    # destructive, audited cleanup. None is granted for free.
+    FILES_UPLOAD = "files:upload"  # import an external message file (writes PHI at rest)
+    FILES_BROWSE = "files:browse"  # list/browse/resend an uploaded file's messages (PHI read)
+    FILES_DELETE = "files:delete"  # delete an uploaded file from the server (destructive)
     APPROVALS_APPROVE = (
         "approvals:approve"  # release a pending high-value action (dual-control, 2.3.5)
     )
 
 
-class Role(str, Enum):
+class Role(str, Enum):  # noqa: UP042
     """A fixed built-in role. The role->permission policy lives in ``BUILTIN_ROLE_PERMISSIONS``."""
 
     ADMINISTRATOR = "administrator"
@@ -94,9 +109,19 @@ _OPERATOR_PERMISSIONS: frozenset[Permission] = frozenset(
         Permission.MESSAGES_REPLAY,
         Permission.MESSAGES_RESEND,
         Permission.MESSAGES_EDIT,  # implies view_raw (co-granted above) — ADR 0090 §9 / BACKLOG #153
+        Permission.MESSAGES_EXPORT,  # bulk body export (BACKLOG #124) — operator already holds view_raw
         Permission.MESSAGES_PURGE,
         Permission.CONNECTIONS_CONTROL,
         Permission.CONNECTIONS_TEST,
+        # Read the redacted application-log tail during an incident (BACKLOG #171) — the operator already
+        # holds messages:view_raw, so the redacted log is a strictly-lesser PHI surface for the same role.
+        Permission.LOGS_VIEW,
+        # Offline uploaded-logs (BACKLOG #125/#126) — inspecting a partner-supplied file is an operator
+        # troubleshooting action; the operator already holds messages:view_raw, so browsing an uploaded
+        # body is a same-tier PHI surface for the same role.
+        Permission.FILES_UPLOAD,
+        Permission.FILES_BROWSE,
+        Permission.FILES_DELETE,
     }
 )
 

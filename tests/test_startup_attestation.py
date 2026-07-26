@@ -118,6 +118,88 @@ class _RecordingSink(AlertSink):
     ) -> None: ...
 
 
+async def _assert_startup_attestation_tamper_evidence(
+    store: object, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """RBAC-16 shared per-backend contract: on a real backend (SQL Server / Postgres), engine
+    tampering must drive :func:`run_startup_attestation` to durably capture the tamper into
+    tamper-evidence — a hash-chained, off-box-teed ``startup_integrity`` audit row (``actor=None``) —
+    and then **fail closed**, never silently pass. Reused by the gated SQL Server + Postgres suites so
+    the live-server CI legs actually catch a backend regression in the NULL-actor row hashing / tee.
+
+    Proven by the NEGATIVE, not by construction: the guard is made to REFUSE (``IntegrityError``) and
+    the tamper is asserted present + chain-verified + teed, so a store that swallowed the drift row or
+    mis-hashed the NULL-actor row would fail this test.
+    """
+    import json
+    import logging
+
+    pkg = "mfengine"
+    files = {
+        f"{pkg}/__init__.py": b"VERSION = '1.0'\n",
+        f"{pkg}/core.py": b"SAFE = True\n",
+    }
+    dist, loaded = _build_wheel_install(tmp_path, pkg=pkg, files=files)
+    _patch(monkeypatch, dist, loaded, pkg)
+    # Tamper a loaded module in place AFTER the RECORD baseline was sealed (a simulated host compromise).
+    (tmp_path / f"{pkg}/core.py").write_bytes(b"SAFE = False  # neutered\n")
+    assert attest_engine().drift  # the tamper is detected
+
+    sink = _RecordingSink()
+
+    # (1) Default alert-only posture: it records the tamper row + alerts, engine still starts (no raise).
+    result = await run_startup_attestation(store, sink, fail_closed_on_drift=False)  # type: ignore[arg-type]
+    assert result.drift and not result.ok
+    landed = [a for a in await store.list_audit() if a["action"] == "startup_integrity"]  # type: ignore[attr-defined]
+    assert landed, (
+        "alert-only posture must STILL record the startup_integrity tamper row on this backend"
+    )
+
+    # (2) Opt-in fail-closed posture: capture the off-box tee, and assert the guard REFUSES to start.
+    captured: list[str] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            captured.append(record.getMessage())
+
+    handler = _Cap()
+    audit_log = logging.getLogger("messagefoundry.audit")
+    audit_log.addHandler(handler)
+    try:
+        with pytest.raises(IntegrityError):
+            await run_startup_attestation(store, sink, fail_closed_on_drift=True)  # type: ignore[arg-type]
+    finally:
+        audit_log.removeHandler(handler)
+
+    # NEGATIVE assertions — the tamper is durably captured into tamper-evidence, not silently passed:
+    rows = [a for a in await store.list_audit() if a["action"] == "startup_integrity"]  # type: ignore[attr-defined]
+    assert rows, "fail-closed must STILL record the startup_integrity row BEFORE refusing to start"
+    row = rows[0]  # newest first
+    # A machine attestation, not a user action: the NULL-actor row must persist + hash correctly here.
+    assert row["actor"] is None
+    detail = json.loads(row["detail"])
+    assert detail["drift_count"] >= 1 and detail["fail_closed"] is True
+    assert f"{pkg}/core.py" in detail["drift"]
+
+    # The NULL-actor startup_integrity row is correctly hash-chained on THIS backend (incl. None-actor
+    # row hashing) — a tamper of the row itself would break verification.
+    ok, msg = await store.verify_audit_chain()  # type: ignore[attr-defined]
+    assert ok is True, f"startup_integrity row must chain-verify on this backend: {msg}"
+
+    # An off-box tee line for action=startup_integrity was emitted (redacted, metadata-only) so the
+    # tamper evidence survives a host/DB compromise — same shared emit_audit_tee path as every backend.
+    teed = [json.loads(line) for line in captured]
+    integ_teed = [r for r in teed if r.get("action") == "startup_integrity"]
+    assert integ_teed, (
+        "the startup_integrity tamper row must tee off-box for host-compromise survival"
+    )
+    assert integ_teed[0]["event"] == "audit" and integ_teed[0]["actor"] is None  # PHI-free metadata
+
+    # The dedicated integrity_drift AlertSink channel fired (the tamper page), carrying the count.
+    assert sink.events and sink.events[-1][0] == "engine-integrity"
+    assert sink.events[-1][2] == detail["drift_count"]
+
+
 # --- AC-9: attests loaded modules against RECORD (clean wheel) ----------------
 
 

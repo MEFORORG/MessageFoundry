@@ -25,7 +25,9 @@ second-wheel release job — mirror it (with the console's **own** version, sinc
 ## 0. Decide version + compatibility
 
 - [ ] Set `messagefoundry_webconsole/__init__.py` `__version__` to the release version.
-- [ ] Confirm `SUPPORTED_ENGINE_SEAMS` lists every engine `ENGINE_UI_SEAM` this build supports.
+- [ ] Confirm `SUPPORTED_ENGINE_SEAMS` equals `{ENGINE_UI_SEAM}` — one seam, the engine this
+      build was released against (BACKLOG #279). A test enforces it; do not widen without also
+      landing the cross-seam CI matrix.
 - [ ] Choose the PEP 508 **compat range** `A..B` for the pair (the console's `messagefoundry>=X,<Y` and
       the engine's `messagefoundry-webconsole>=A,<B`). Bump `<Y`/`<B` only across a seam change.
 - [ ] Update [`CHANGELOG.md`](CHANGELOG.md) with the release entry.

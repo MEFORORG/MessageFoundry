@@ -33,11 +33,19 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from messagefoundry.config.db_lookup import DbLookupError
+from messagefoundry.config.db_lookup import activated as db_lookup_activated
+from messagefoundry.config.fhir_lookup import (
+    FhirLookupError,
+)
+from messagefoundry.config.fhir_lookup import (
+    activated as fhir_lookup_activated,
+)
 from messagefoundry.config.models import (
     AckAfter,
     AckMode,
@@ -55,11 +63,6 @@ from messagefoundry.config.models import (
     Schedule,
     Source,
     StallThreshold,
-)
-from messagefoundry.config.db_lookup import DbLookupError, activated as db_lookup_activated
-from messagefoundry.config.fhir_lookup import (
-    FhirLookupError,
-    activated as fhir_lookup_activated,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
 from messagefoundry.config.settings import EgressSettings, StoreBackend
@@ -98,27 +101,32 @@ from messagefoundry.parsing.binary import (
 )
 from messagefoundry.parsing.message import Message
 from messagefoundry.parsing.peek import DEFAULT_MAX_MESSAGE_BYTES
+from messagefoundry.parsing.sniff import attachment_mime_agrees, b64_head
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
-from messagefoundry.pipeline.sharding import owner_shard_of_destination
-from messagefoundry.redaction import safe_exc, safe_text
-from messagefoundry.pipeline.dryrun import route_only, transform_one
-from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.dryrun import TransformOutcome, route_only, transform_one
 from messagefoundry.pipeline.phase_timing import (
     # Explicit re-exports (`as`): the pre-#842 import surface — tests and the harness node-log parser
     # import these names from wiring_runner, not from phase_timing.
     _DELIVERY_PHASE_EMIT_INTERVAL as _DELIVERY_PHASE_EMIT_INTERVAL,
+)
+from messagefoundry.pipeline.phase_timing import (
     DELIVERY_PHASE_TIMING_ENV as DELIVERY_PHASE_TIMING_ENV,
+)
+from messagefoundry.pipeline.phase_timing import (
     ClaimPhaseTiming,
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
+from messagefoundry.pipeline.saturation import SaturationDetector
+from messagefoundry.pipeline.sharding import owner_shard_of_destination
 from messagefoundry.pipeline.stage_dispatcher import (
     LaneItemResult,
     LaneResultKind,
     StageDispatcher,
 )
+from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
     OutboxItem,
@@ -141,9 +149,60 @@ from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
 
-__all__ = ["RegistryRunner", "ShardLaneOwnershipError"]
+__all__ = ["NotDeployedError", "RegistryRunner", "ShardLaneOwnershipError"]
 
 log = logging.getLogger(__name__)
+
+# Process-in-place dedup-ledger prune policy (ADR 0129, BACKLOG #142): bound the store's processed_files
+# table per connection by age AND count. Applied once per poll tick, only when a new file was recorded,
+# so a stable read-only share never churns the store.
+PROCESSED_FILE_LEDGER_TTL_SECONDS = 30 * 24 * 3600  # 30 days
+PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
+
+
+class _StoreProcessedLedger:
+    """Runner-side adapter backing a leave-in-place (``after_read='leave'``, BACKLOG #142) poll source's
+    dedup ledger with the store's ``processed_files`` table, closing over the inbound's channel id.
+    Injected via the source's :attr:`~messagefoundry.transports.base.SourceConnector.processed_ledger`
+    seam so ``transports/`` never imports ``store/``; the source passes only a **HASHED** ``file_key``
+    (never a cleartext filename). :meth:`prune` bounds growth by age + count."""
+
+    def __init__(self, store: QueueStore, channel_id: str) -> None:
+        self._store = store
+        self._channel_id = channel_id
+
+    async def is_processed(self, file_key: str) -> bool:
+        return await self._store.is_file_processed(channel_id=self._channel_id, file_key=file_key)
+
+    async def mark_processed(self, file_key: str) -> None:
+        await self._store.record_processed_file(channel_id=self._channel_id, file_key=file_key)
+
+    async def prune(self) -> None:
+        await self._store.prune_processed_files(
+            channel_id=self._channel_id,
+            older_than=time.time() - PROCESSED_FILE_LEDGER_TTL_SECONDS,
+            keep_last=PROCESSED_FILE_LEDGER_KEEP_MAX,
+        )
+
+
+class NotDeployedError(RuntimeError):
+    """A runtime CONTROL (start/restart — and, at the API layer, resend) targeted a connection that is
+    present in the graph but ``deployed=False`` (#233, ADR 0111).
+
+    Raised instead of acting, because there is nothing to act ON: a not-deployed connection has no
+    connector (its ``env()`` values may not even exist yet), no listener, and — for an outbound — no
+    delivery worker at all. Unlike ``auto_start=False`` (deployed, just not up right now — an operator
+    start is the *designed* override), deploying a connection is a **config change, not a runtime
+    action**: flip ``deployed`` and reload. Starting it here would resolve secrets that were never
+    provisioned and half-wire a lane the graph says does not exist yet. The API maps this to 409."""
+
+    def __init__(self, name: str) -> None:
+        super().__init__(
+            f"connection {name!r} is present in the config but NOT deployed (deployed=false) — "
+            "deploying it is a config change, not a runtime action: set deployed=true (and supply "
+            "its env() values), then reload"
+        )
+        self.name = name
 
 
 class ShardLaneOwnershipError(RuntimeError):
@@ -181,6 +240,15 @@ _CONN_EVENT_FLUSH_GRACE = 2.0
 # router just falls behind), so it polls the lane depth at most this often — bounding the extra
 # COUNT+MIN query rate on the ingress hot path regardless of throughput.
 _BUILDUP_CHECK_INTERVAL = 1.0
+
+# BACKLOG #214: default cap on how many of ONE message's sibling routed rows transform CONCURRENTLY in
+# the transform worker. 1 = OFF (the exact sequential handoff loop, byte-identical to pre-#214). > 1
+# overlaps the pure off-loop transforms of a message's co-claimed sibling rows (bounded by this cap,
+# min'd with the run length) while every store handoff stays serial + in claim order — so the single-
+# serial-writer invariant per-destination outbound FIFO relies on is untouched. It doubles as the live-
+# lookup (db_lookup/fhir_lookup) fan-out guard. Kept a module constant / instance attribute — NOT a
+# [transform] settings section (owner-coordinated); a user-facing knob is a deliberate follow-up.
+_DEFAULT_TRANSFORM_CONCURRENCY = 1
 
 # ADR 0073: how often a SHARDED engine's read-only watchdog re-checks the buildup/stall thresholds
 # of the outbound lanes it does NOT own. With one delivery consumer per lane, a hung (not crashed)
@@ -247,6 +315,11 @@ def _strict_validate_timeout(ic: InboundConnection) -> float | None:
 # a multi-GB body whole. Measured on the raw BYTES pre-base64-inflation (binary) / the decoded str (text,
 # matching enforce_size_limits' len(norm) convention).
 _INGRESS_MAX_BYTES = DEFAULT_MAX_MESSAGE_BYTES
+
+# The generic MIME a detached document's stored content_type is downgraded to when the sender-declared
+# OBX-5.2 label contradicts the document's magic bytes (ASVS 1.3.4/5.2.2). Matches the download route's
+# _DEFAULT_ATTACHMENT_MIME so a mislabelled active-content payload is served as inert bytes either way.
+_DEFAULT_ATTACHMENT_MIME = "application/octet-stream"
 
 
 def _nul_safe_error_raw(raw: bytes, content_type: str, *, text: str | None = None) -> str:
@@ -397,6 +470,40 @@ def _to_lane_result(outcome: tuple[_ItemOutcome, float | None]) -> LaneItemResul
     return LaneItemResult(LaneResultKind.RESOLVED)
 
 
+@dataclass(frozen=True)
+class _RoutedPrep:
+    """The pure/read-only result of preparing ONE routed row for its (serial) handoff — BACKLOG #214.
+
+    Splitting the transform *computation* (pure, off-loop, no store write) from the *handoff* (the sole
+    per-lane writer) is what lets a message's sibling routed rows overlap their transforms concurrently
+    while every store handoff stays serial and in ascending claim order — so per-destination outbound
+    FIFO (``ORDER BY seq``, ADR 0059; correct only under one serial writer per lane) is preserved.
+    Exactly one field is populated: ``missing_handler`` (the row's handler is gone → dead-letter on
+    apply), ``error`` (the handler raised → internal-error policy on apply), or ``outcome`` (the
+    transform produced deliveries/state/meta to hand off). A handler raise is captured here rather than
+    raised so a concurrent ``gather`` never cancels a sibling (ADR 0057 policy is applied on the serial
+    apply, in claim order)."""
+
+    missing_handler: bool = False
+    error: Exception | None = None
+    outcome: TransformOutcome | None = None
+
+
+def _contiguous_by_message(items: Sequence[OutboxItem]) -> list[list[OutboxItem]]:
+    """Partition a FIFO-ordered routed batch into maximal runs of CONSECUTIVE rows sharing a
+    ``message_id`` (BACKLOG #214). A message's routed rows are produced contiguously in one
+    ``route_handoff`` transaction (ascending ``seq``), so each run is exactly one message's sibling rows
+    — the unit whose transforms may overlap. Order within and across runs is the batch's claim order, so
+    a serial in-order handoff over the runs preserves global claim order."""
+    runs: list[list[OutboxItem]] = []
+    for item in items:
+        if runs and runs[-1][0].message_id == item.message_id:
+            runs[-1].append(item)
+        else:
+            runs.append([item])
+    return runs
+
+
 class _FusedHandoffStore(Protocol):
     """The synchronous fused-handoff surface a fused worker hop drives (ADR 0071 B5, PR1). Only the SQL
     Server store ships it (``supports_fused_sync_handoff``); the base ``QueueStore`` protocol declares
@@ -430,6 +537,7 @@ class _FusedHandoffStore(Protocol):
         state_ops: Sequence[tuple[str, str, Any]] = (),
         pt_deliveries: Sequence[tuple[str, str]] = (),
         meta_ops: Sequence[tuple[str, str]] = (),
+        declined: Sequence[str] = (),
         correlation_depth_cap: int = 8,
         now: float | None = None,
     ) -> tuple[bool, list[tuple[tuple[str, str], Any]]]: ...
@@ -472,6 +580,17 @@ class _FusedTransformResult:
     handoff_exc: Exception | None
     outbound_wakes: tuple[str, ...]
     ingress_wakes: tuple[str, ...]
+
+
+def _resolve_send_pace(settings: Mapping[str, Any]) -> float:
+    """The resolved per-lane egress send-pacing interval in seconds (BACKLOG #82) from a connection's
+    settings: ``send_min_interval_seconds`` coerced to a float, with ``None``/absent/``0`` → ``0.0`` (no
+    pacing). Never negative — a negative value is rejected at wiring, and this clamps defensively so a
+    directly-constructed spec can't ask the delivery seam to sleep on a negative interval."""
+    raw = settings.get("send_min_interval_seconds")
+    if raw is None:
+        return 0.0
+    return max(0.0, float(raw))
 
 
 class RegistryRunner:
@@ -567,6 +686,12 @@ class RegistryRunner:
         # head-prefix in one commit (claim_next_fifo_batch) and processes each row in FIFO order. Clamp
         # the floor to 1 so a stray 0/negative can never disable the claim. From [store].fifo_claim_batch.
         self._fifo_batch = max(1, fifo_claim_batch)
+        # BACKLOG #214 (opt-in, default 1 → byte-identical): cap on how many of ONE message's co-claimed
+        # sibling routed rows transform CONCURRENTLY in the transform worker. Overlap is realized only
+        # when the batch claim co-claims siblings (``fifo_claim_batch`` > 1) AND this is > 1; the store
+        # handoff always stays serial + in claim order (single-serial-writer per lane preserved). A
+        # module attribute, not a settings section — a user-facing knob is a deliberate follow-up.
+        self._transform_concurrency = max(1, _DEFAULT_TRANSFORM_CONCURRENCY)
         # Global outbound defaults (from [delivery]); a connection's own settings override them.
         # An outbound with none inherits these (per-connection override > global default > built-in).
         self._delivery_defaults = delivery_defaults or RetryPolicy()
@@ -656,6 +781,14 @@ class RegistryRunner:
         # per_lane-mode resume Events: the delivery worker awaits its lane's Event at the loop-top pause
         # gate; start_outbound sets it. Unused in pooled mode (the dispatcher's resume_lane re-arms).
         self._outbound_resume: dict[str, asyncio.Event] = {}
+        # Which of _outbound_paused this ENGINE parked (auto_start=False #115 / deployed=False #233) as
+        # opposed to an OPERATOR pausing it. Both reuse _outbound_paused (so every consumer — status,
+        # /connections rows, buildup/stall suppression — is honest with no further change), but a reload
+        # must treat them oppositely: a lane the GRAPH parked must RESUME the moment the graph says it
+        # should run again (flip the flag + reload = deployed, with no other change), while a lane the
+        # OPERATOR paused must stay paused across a reload. Without this discriminator a re-deployed lane
+        # rebuilds its connector and respawns its worker, then sits paused forever.
+        self._gate_parked: set[str] = set()
         # Two workers per inbound connection (staged pipeline, ADR 0001 Step B): a ROUTER worker drains
         # the ingress stage (Router → routed-stage rows) and a TRANSFORM worker drains the routed stage
         # (handler transform → outbound rows). Both run independently of whether the source is actively
@@ -677,6 +810,14 @@ class RegistryRunner:
         # the unchanged one-message-per-send path). Read live per delivery so a reload can turn batching
         # on/off under a running worker.
         self._batch: dict[str, BatchConfig | None] = {}
+        # Per-connection egress send pacing (BACKLOG #82): the resolved minimum seconds between sends on
+        # each outbound lane (0.0 = no pacing, the default → byte-identical). Re-resolved per outbound at
+        # start/reconcile so a reload retunes it. _send_pace_at is the per-lane pacing CLOCK — the
+        # monotonic timestamp of that lane's last send-gate — keyed on the outbound name so independent
+        # lanes pace independently (NOT a shared bucket, which would cross-couple lanes in pooled mode).
+        # The clock is intentionally NOT reset on reload (a reload must not license an immediate burst).
+        self._send_pace: dict[str, float] = {}
+        self._send_pace_at: dict[str, float] = {}
         # Effective per-connection egress-suppression (#15): per-connection simulate= OR simulate_all.
         self._simulate: dict[str, bool] = {}
         # Per-outbound-lane health (#46), for the edge-triggered connection_lost/restored events. True
@@ -786,9 +927,7 @@ class RegistryRunner:
         # connection, spawned in start() and cancelled in _teardown_unsafe (empty = no scheduled
         # connections = byte-identical always-on lifecycle).
         self._schedule_tick = schedule_tick
-        self._schedule_clock: Callable[[], datetime] = schedule_clock or (
-            lambda: datetime.now(timezone.utc)
-        )
+        self._schedule_clock: Callable[[], datetime] = schedule_clock or (lambda: datetime.now(UTC))
         self._schedule_workers: dict[str, asyncio.Task[None]] = {}
         # ADR 0071 B5 thread-hop fusion. FROZEN intent read ONCE here; a /config/reload never re-reads it
         # (restart to change, exactly like claim_mode). ``_fusion_active`` is the EFFECTIVE decision,
@@ -1164,6 +1303,7 @@ class RegistryRunner:
         resolved: dict[str, dict[str, Any]] = {}
         for name, spec in self.registry.fhir_lookups.items():
             settings = resolve_env_settings(spec.settings, self._env_values)
+            _apply_egress_proxy_default(settings, self._egress)  # ADR 0126: site-wide forward proxy
             check_fhir_lookup_allowed(name, settings, self._egress)
             resolved[name] = settings
         # #200 (ADR 0092): stamp the derived posture around the live executor build so each connection's
@@ -1172,7 +1312,9 @@ class RegistryRunner:
         # the executor here outside build_check_registry's active_hop_posture scope, so an unstamped build
         # would either fail-closed a legit dev read or (via the send-time re-assertion) mis-key the hop.
         with active_hop_posture(self._hop_posture):
-            return FhirLookupExecutor(resolved)
+            return FhirLookupExecutor(
+                resolved, require_structured=self._egress.fhir_require_structured_params
+            )
 
     def _run_fhir_lookup(
         self,
@@ -1243,6 +1385,16 @@ class RegistryRunner:
             return "running"
         return "stopped" if self.outbound_quiesced(name) else "stopping"
 
+    def outbound_waiting_for_reply(self, name: str) -> bool:
+        """#136 (ADR 0065 amendment): whether the named outbound's LIVE connector is currently awaiting a
+        reply (past its ``waiting_display_delay``) — the per-message "Waiting for Reply" display state.
+        Duck-typed: a connector without the side-band marker (File/REST/…, or an outbound not currently
+        ACK-waiting, incl. a future no-ack mode) reports False. Read off the event loop by
+        ``list_connections``; never raises (an unknown/undeployed name → False)."""
+        connector = self._destinations.get(name)
+        probe = getattr(connector, "waiting_for_reply", None)
+        return bool(probe(time.monotonic())) if callable(probe) else False
+
     def connection_failed(self, name: str) -> str | None:
         """The failure reason if this connection failed to build/bind at start, else None. A failed
         connection is isolated, not fatal (ADR 0031): the engine starts the rest of the graph and an
@@ -1303,6 +1455,56 @@ class RegistryRunner:
         )
         return True
 
+    def _auto_start_enabled(self, name: str, kind: str) -> bool:
+        """The connection's declared ``auto_start`` (#115), by role. ``True`` for a name the registry no
+        longer declares (a reload-dropped outbound that is only draining) — there is nothing left to
+        gate, and defaulting to False would park a lane the graph never asked to disable."""
+        if kind == "inbound":
+            ic = self.registry.inbound.get(name)
+            return ic.auto_start if ic is not None else True
+        oc = self.registry.outbound.get(name)
+        return oc.auto_start if oc is not None else True
+
+    def _deployed(self, name: str, kind: str) -> bool:
+        """The connection's declared ``deployed`` (#233, ADR 0111), by role — read from the REGISTRY (the
+        graph), never from live runner state, because at-least-once (ADR 0001) requires a crash re-run to
+        re-derive an identical decision.
+
+        ``deployed=False`` WINS over ``auto_start``: every gate consults this FIRST and ignores
+        ``auto_start`` entirely when it is set, so the two flags can never disagree about whether a lane
+        comes up. ``True`` for a name the registry no longer declares (a reload-dropped outbound that is
+        only draining) — it was deployed when its rows were produced, and they must still drain."""
+        if kind == "inbound":
+            ic = self.registry.inbound.get(name)
+            return ic.deployed if ic is not None else True
+        oc = self.registry.outbound.get(name)
+        return oc.deployed if oc is not None else True
+
+    def _log_declined(self, hname: str, message_id: str, declined: Sequence[str]) -> None:
+        """Log each ``Send`` ``transform_one`` declined because its target is present but NOT DEPLOYED
+        (#233, ADR 0111). Called from all three in-pipeline transform sites (split, ADR-0057 inline,
+        ADR-0071 fused) — a no-op (one falsiness check) on a graph with nothing declined.
+
+        Count-and-log (CLAUDE.md §12): a skipped destination the operator cannot see would be an
+        accept-and-drop. Names only — the connection, the handler, the message id — never a body, so it
+        is safe at INFO (PHI stays in the store). This is the log half; the durable half (a
+        per-destination ``message_events`` row + the NOT_DEPLOYED disposition) is the store's."""
+        for dest in declined:
+            log.info(
+                "handler %r sent to connection %r, which is present but NOT DEPLOYED (deployed=false) "
+                "— delivery declined, no outbound row queued (message %s)",
+                hname,
+                dest,
+                message_id,
+            )
+
+    def _outbound_lane_live(self, name: str) -> bool:
+        """Whether ``name``'s delivery lane is actually UP right now: a built connector AND not paused.
+        The #115 reload gate's question — 'is it up?', not 'was it declared startable?' — so a reload
+        neither resurrects a start-disabled lane (never started, or started then stopped) nor undoes an
+        operator who DID start one at runtime."""
+        return name in self._destinations and name not in self._outbound_paused
+
     def outbound_simulated(self, name: str) -> bool:
         """Whether the named outbound is in **simulate** mode — egress suppressed (#15). The *effective*
         value (per-connection ``simulate=`` OR ``[shadow].simulate_all_egress``), for the ``/connections``
@@ -1343,7 +1545,7 @@ class RegistryRunner:
             return "in", build_source(source_cfg)
         oc = self.registry.outbound.get(name)
         if oc is not None:
-            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy)
+            dest_cfg = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             check_egress_allowed(dest_cfg, self._egress)
             return "out", build_destination(dest_cfg)
         raise KeyError(name)
@@ -1415,6 +1617,9 @@ class RegistryRunner:
         strands INFLIGHT forever (``reset_stale_inflight`` is startup/DR-only), defeating require-stopped."""
         self._validate_outbound(name)
         self._outbound_paused.add(name)
+        # The OPERATOR now owns this lane's down state — a reload must not resume it (#115/#233): drop any
+        # engine-park marker so _unpark_outbound_lane leaves it alone even if the graph says it may run.
+        self._gate_parked.discard(name)
         # (Re)create the quiescence Event CLEARED: the lane is not yet drained. The pooled dispatcher's
         # on_lane_paused (via _mark_outbound_quiesced) / the per_lane worker's loop-top gate SETs it once
         # in-flight hits zero.
@@ -1441,12 +1646,126 @@ class RegistryRunner:
             else:
                 self._wake_lane(Stage.OUTBOUND, name)
 
-    def _start_outbound_unsafe(self, name: str) -> None:
-        """start_outbound body without the reload lock. RESUMES delivery for a paused outbound; the
-        connector is kept WARM (a pause never tore down ``_destinations``), so no rebuild. Idempotent
-        for a name that isn't paused."""
-        self._validate_outbound(name)
+    def _park_outbound_lane(self, name: str) -> None:
+        """Record ``name``'s delivery lane as DELIBERATELY DOWN — the state both the ``auto_start=False``
+        boot gate (#115) and the ``deployed=False`` gate (#233, ADR 0111) must leave behind (each also on
+        the reload that re-evaluates it). The two differ in what they do NEXT, not here: a start-disabled
+        lane still gets a delivery worker (parked at the pause gate, ready for an operator start), a
+        not-deployed lane gets none at all.
+
+        Reuses the operator-pause state rather than inventing a parallel one, so every existing consumer
+        is honest with no further change: ``outbound_status`` reports ``"stopped"`` (it was reporting
+        ``"running"``, because the gate wrote no state at all), ``/connections`` therefore emits a
+        standalone row for a never-trafficked lane instead of hiding it, and the buildup/stall pages stay
+        suppressed (both are scoped to ``_outbound_paused`` membership) so a deliberately-down lane can
+        never page the operator.
+
+        Quiescence is signalled IMMEDIATELY, not left to the worker/dispatcher pause gate: a lane that
+        was never started has zero rows in flight, so it is genuinely 'stopped' from the first tick — not
+        a transient 'stopping' that a status read could race.
+
+        Recorded in ``_gate_parked`` so a later reload can tell an ENGINE park from an OPERATOR pause and
+        resume only the former — see :meth:`_unpark_outbound_lane`."""
+        self._outbound_paused.add(name)
+        self._gate_parked.add(name)
+        self._outbound_quiesced.setdefault(name, asyncio.Event()).set()
+        if self._claim_mode == "pooled":
+            d = self._dispatchers.get(Stage.OUTBOUND)
+            if d is not None:
+                d.pause_lane(name)
+            # d is None at boot (_start_outbound runs before the dispatchers exist) — _start_pooled_
+            # dispatchers replays _outbound_paused onto the fresh OUTBOUND dispatcher before it starts.
+        else:
+            # per_lane: the delivery worker blocks at its loop-top pause gate until start_outbound sets
+            # this (a cleared Event is the gate; setdefault creates it cleared, clear() is for a re-park).
+            self._outbound_resume.setdefault(name, asyncio.Event()).clear()
+
+    def _unpark_outbound_lane(self, name: str) -> None:
+        """Undo a :meth:`_park_outbound_lane` — but ONLY for a lane the ENGINE parked.
+
+        The exact inverse (drop the pause, clear the quiescence signal, re-arm the pooled lane / release
+        the per_lane gate). A NO-OP for a lane that is not in ``_gate_parked``: an OPERATOR pause must
+        survive a reload (a reload never undoes an operator action), and a lane that was never parked has
+        nothing to undo — so this is a pure one-set-membership check on every normal reload.
+
+        Without it, a connection RE-DEPLOYED by a reload (flip ``deployed`` back to true — AC-4's "with no
+        other change") rebuilds its connector and respawns its worker, and then sits PAUSED forever: the
+        reconcile's build/spawn branch never touched the pause state that the gate had written. Same for
+        an ``auto_start`` flipped back to true."""
+        if name not in self._gate_parked:
+            return
+        self._gate_parked.discard(name)
         self._outbound_paused.discard(name)
+        ev = self._outbound_quiesced.get(name)
+        if ev is not None:
+            ev.clear()
+        if self._claim_mode == "pooled":
+            d = self._dispatchers.get(Stage.OUTBOUND)
+            if d is not None:
+                d.resume_lane(name)
+        else:
+            self._outbound_resume.setdefault(name, asyncio.Event()).set()
+
+    def _ensure_destination_built(self, name: str) -> None:
+        """Build ``name``'s connector into ``_destinations`` if the lane has none — the missing half of
+        an operator start (#115). The ``auto_start=False`` boot gate leaves a CONNECTOR-LESS lane, so a
+        resume alone could never deliver a single byte: the advertised ``POST /connections/{name}/start``
+        looked like it worked (the route even returned ``running: true``) and silently did nothing.
+
+        A no-op in four cases: the connector is already live (so a restart keeps it WARM — never
+        rebuilds an MLLP socket / DB pool / SMART token); the registry no longer declares the outbound
+        (a reload-dropped lane that is only draining — nothing to build it FROM); the lane is
+        DR-parked (#61, ADR 0048), which is a RUN-PROFILE decision that survives a reload by design and
+        would be re-applied under the operator's feet on the next one; or the outbound is NOT DEPLOYED
+        (#233), whose whole contract is that its connector is never built (its ``env()`` values may not
+        exist). ``auto_start`` is the boot gate an operator IS meant to override at runtime; the DR
+        threshold and ``deployed`` are not. (``_start_outbound_unsafe`` already refuses a not-deployed
+        lane with :class:`NotDeployedError`; the guard here is the defense-in-depth that keeps THIS
+        method — the only place a connector is built outside start/reload — from ever resolving the
+        secrets of a connection the graph says is not deployed.)
+
+        A build failure is ISOLATED, not raised (ADR 0031, exactly like the start-time path): the lane is
+        recorded failed + alerted and the resume still proceeds, so rows are retried via the
+        connector-None path and a later fix + reload/restart self-heals — rather than 500ing the control
+        route and leaving the operator with no status to read."""
+        if name in self._destinations or name in self._filtered:
+            return
+        oc = self.registry.outbound.get(name)
+        if oc is None or not oc.deployed:
+            return
+        try:
+            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
+            check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
+            # #200 (ADR 0092): stamp the derived instance posture, exactly as _start_outbound does —
+            # an unstamped build makes the posture-keyed insecure-hop cells decide against the wrong
+            # (fail-closed/no-op default) posture.
+            with active_hop_posture(self._hop_posture):
+                connector = build_destination(dest)
+        except Exception as exc:
+            self._destinations.pop(name, None)
+            self._record_failed(name, exc, kind="outbound")
+            return
+        self._destinations[name] = connector
+        self._failed.pop(name, None)
+
+    def _start_outbound_unsafe(self, name: str) -> None:
+        """start_outbound body without the reload lock. RESUMES delivery for a paused outbound, BUILDING
+        its connector first if the lane has none (a start-disabled / DR-parked / failed lane is
+        connector-less — see :meth:`_ensure_destination_built`). A connector that IS live is kept WARM (a
+        pause never tore down ``_destinations``), so a plain resume/restart never rebuilds it. Idempotent
+        for a name that isn't paused.
+
+        REFUSES a ``deployed=False`` outbound (#233, ADR 0111) with :class:`NotDeployedError`: unlike
+        ``auto_start=False`` — a boot gate an operator is *meant* to override at runtime — deploying a
+        connection is a config change. There is no delivery worker to resume and no connector to build."""
+        self._validate_outbound(name)
+        if not self._deployed(name, "outbound"):
+            raise NotDeployedError(name)
+        self._ensure_destination_built(name)
+        self._outbound_paused.discard(name)
+        # The OPERATOR now owns this lane's UP state — the engine park (if any) is spent, and a reload
+        # must respect the start (#115): drop the marker so _unpark_outbound_lane can't re-park it.
+        self._gate_parked.discard(name)
         # Clear the quiescence signal — the lane is running again (not stopped). The buildup/stall alert
         # suppression (scoped to _outbound_paused membership) lifts here too, so a genuinely backed-up
         # resumed lane can page again.
@@ -1514,9 +1833,24 @@ class RegistryRunner:
         # doesn't error every tick on a lane another shard owns (single-shard/unsharded owns everything).
         if kind == "outbound" and not self._owns_destination(name):
             return
+        # Present but NOT DEPLOYED (#233, ADR 0111): the connection has no listener and no delivery
+        # worker, so it has no calendar to keep — a schedule on it is inert config, retained (like the
+        # rest of the connection) for the day it IS deployed. Gated ABOVE the start/park branches, not
+        # just the start one, so neither half can act: start_inbound/start_outbound would raise
+        # NotDeployedError and the scheduler would log an exception EVERY tick.
+        if not self._deployed(name, kind):
+            return
         active = schedule.is_active(self._schedule_clock())
         running = self.inbound_running(name) if kind == "inbound" else self.outbound_running(name)
         if active and not running:
+            # Per-connection auto-start (#115): ``auto_start=False`` means the ENGINE never brings this
+            # connection up on its own — only an explicit operator start does. A scheduler tick IS the
+            # engine, so an in-window tick must not resurrect a start-disabled connection; without this
+            # gate the boot gate was silently defeated by the very first in-window tick. The park branch
+            # below is deliberately NOT gated: if the connection is somehow up, the schedule still owns
+            # its calendar and closes the window cleanly.
+            if not self._auto_start_enabled(name, kind):
+                return
             log.info("schedule: connection %r entering active window — starting", name)
             if kind == "inbound":
                 await self.start_inbound(name)
@@ -1562,9 +1896,17 @@ class RegistryRunner:
 
     async def _start_inbound_unsafe(self, name: str) -> None:
         """start_inbound body without the reload lock — for callers that already hold it (start,
-        reload). asyncio.Lock isn't reentrant, so the public wrappers must not call each other."""
+        reload). asyncio.Lock isn't reentrant, so the public wrappers must not call each other.
+
+        REFUSES a ``deployed=False`` inbound (#233, ADR 0111) with :class:`NotDeployedError` — binding
+        its listener would resolve ``env()`` values the graph never promised exist, and claim a port the
+        deployed connection that superseded it may hold. start()/reload() gate BEFORE calling this (a
+        not-deployed inbound is skipped silently there, not treated as a fault), so this raise is the
+        operator/API path: deploying is a config change, not a runtime action."""
         if name in self._sources:
             return
+        if not self._deployed(name, "inbound"):
+            raise NotDeployedError(name)
         ic = self.registry.inbound[name]
         # Resolve + guard the ACK-timing setting (per-connection override > global default). Step A
         # only ships ACK-on-receipt; reject a resolved 'delivered' loud at start/reload rather than
@@ -1627,12 +1969,24 @@ class RegistryRunner:
         # sniffing poll source (RemoteFileSource) reads it to gate its HL7-header quarantine to hl7v2
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
+        # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
+        # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
+        # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
+        # — the same runtime-injection shape as on_connection_event / content_type above.
+        source.processed_ledger = _StoreProcessedLedger(self.store, ic.name)
         # Leader-gate the source's intake (Track B Step 4b). is_leader is a cheap, synchronous bound
         # method = Callable[[], bool]; passing the bound METHOD (not the coordinator) keeps transports/
         # free of any pipeline/cluster import. Only POLL sources act on it — they skip a scan when it
         # returns False so exactly one node ingests a shared external resource (a dir / DB table /
         # remote dir); LISTEN sources (MLLP/TCP) accept-and-ignore it (each binds its own endpoint). For
         # single-node (NullCoordinator) is_leader is always True, so every poll source scans as before.
+        # Opt-in at-start directory validation (#114, ADR 0031 amendment): a File/RemoteFile source with
+        # validate_directory=true fails-fast HERE on a missing/unusable directory (default no-op for every
+        # other source and for the flag-off default — byte-identical). The raise propagates to the caller
+        # (start/reload/API), which isolates the connection as ADR-0031 `failed` — the opt-in alternative
+        # to the historical run-time deferral (a dead directory logged-and-retried every poll). Placed at
+        # bind, NOT build_check: an intermittently-available dir must still let the graph BUILD.
+        await source.validate_startup()
         # Bind BEFORE registering: a failed bind (e.g. port in use) must not leave a dead source in
         # _sources, where inbound_running() would report True and a retry would no-op (review M-9).
         # The HTTP listen source (ADR 0023) gets a receipt handler returning the committed message_id for
@@ -1727,14 +2081,41 @@ class RegistryRunner:
         # #134 (ADR 0082): per-outbound batch aggregation (None = the unchanged one-per-send path).
         # No global [delivery] default — batching is strictly opt-in per outbound.
         self._batch[name] = oc.batch
+        # BACKLOG #82: resolve the per-lane egress pacing interval (None/0 = off) so the delivery seam
+        # reads a plain float; re-resolved here + in _reconcile_outbounds so a reload retunes it.
+        self._send_pace[name] = _resolve_send_pace(oc.spec.settings)
         self._simulate[name] = self._resolve_simulate(name, oc)
-        # Per-connection auto-start (#115): a start-disabled outbound is NOT built at engine start — it
-        # reports status:"stopped" and an operator can build it at runtime (POST /connections/{name}/start,
-        # which calls _start_outbound_unsafe and bypasses this gate). Its delivery worker still spawns, so
-        # a routed row queues + self-heals exactly like the DR-parked branch below. No-op (byte-identical)
-        # when auto_start is True — every normal connection. This is a boot-time gate only.
+        # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
+        # auto_start (which is ignored entirely below). No connector is built, so its env() values are
+        # NEVER resolved: this is what lets a connection whose credentials do not exist yet sit in the
+        # config without failing the build and bringing the engine up DEGRADED at every boot.
+        #
+        # And, unlike EVERY other down state (auto_start, DR park, ADR-0031 build failure), NO DELIVERY
+        # WORKER IS SPAWNED. Those states all keep the worker so a routed row queues + retries + self-
+        # heals — the right answer for a lane that is *coming back*. A not-deployed lane is not coming
+        # back without a config change, so a queued row there could only sit forever and buildup-alert on
+        # an INTENTIONAL state — the exact defect this feature removes. Nothing can queue to it anyway:
+        # transform_one declines a Send to it BEFORE any outbound row is committed (the count-and-log
+        # record is the decline event, not a stranded row). With no worker, nothing can claim, back off,
+        # buildup-alert or stall-alert. Any row that PREDATES the flag flip is retained PENDING (the lane
+        # stays in the registry, so the startup dead_letter_missing_destinations sweep leaves it alone)
+        # and drains untouched the moment the connection is deployed.
+        if not oc.deployed:
+            self._destinations.pop(name, None)  # never a live connector for a not-deployed lane
+            self._park_outbound_lane(name)
+            return
+        # Per-connection auto-start (#115): a start-disabled outbound is NOT built at engine start — its
+        # lane is recorded START-DISABLED (paused + quiesced), so it honestly reports status:"stopped"
+        # and /connections emits a row for it even before it ever carries traffic. An operator can bring
+        # it up at runtime (POST /connections/{name}/start -> _start_outbound_unsafe, which BUILDS the
+        # connector this gate declined to build and bypasses this gate). Its delivery worker still spawns
+        # (it parks at the loop-top pause gate), so a routed row is RETAINED PENDING and drains the moment
+        # the lane is started — never dropped, never claimed connector-less, and never buildup-paged (the
+        # alert suppression is scoped to _outbound_paused, which this lane now joins). No-op
+        # (byte-identical) when auto_start is True — every normal connection. Boot-time gate only.
         if not oc.auto_start:
             self._destinations.pop(name, None)  # no live connector for a start-disabled lane
+            self._park_outbound_lane(name)
             self._spawn_worker(name)
             return
         # DR run-profile (#61, ADR 0048): a below-threshold outbound is NOT built — but its delivery
@@ -1752,7 +2133,7 @@ class RegistryRunner:
             name, None
         )  # at/above threshold this run — clear any prior parked marker
         try:
-            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy)
+            dest = _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
             check_egress_allowed(dest, self._egress)  # fail-closed egress allowlist (WP-11c)
             # #200 (ADR 0092): stamp the derived instance posture for the connector build so each cell's
             # posture-keyed insecure-hop refusal decides against THIS config's posture — NOT the unstamped
@@ -1771,7 +2152,8 @@ class RegistryRunner:
             ):
                 raise RuntimeError(
                     f"outbound {name!r} sets capture_response=True but the store backend does not "
-                    "support request/response capture (ADR 0013); use the SQLite or Postgres backend"
+                    "support request/response capture (ADR 0013) — SQLite, Postgres, and SQL Server "
+                    "all do"
                 )
         except Exception as exc:
             self._destinations.pop(name, None)  # no live connector for a failed lane
@@ -1824,6 +2206,15 @@ class RegistryRunner:
                 # known (P-lookup needs both to be None). Default-OFF unless an inbound opted in.
                 self._recompute_inline_ok()
                 for ic in self.registry.inbound.values():
+                    # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS
+                    # over auto_start (ignored entirely for it). The LISTENER is not bound, so no source
+                    # is built and its env() values are never resolved; unlike an ADR-0031 bind failure
+                    # this is not a fault, so the engine is NOT degraded. Its router + transform workers
+                    # ARE still spawned below (the ADR-0048 AC-3 rule): flipping a live feed to
+                    # not-deployed while rows are in flight must not STRAND them — the listener stops
+                    # accepting NEW work while the existing ingress/routed backlog drains to completion.
+                    if not ic.deployed:
+                        continue
                     # Per-connection auto-start (#115): a start-disabled inbound listener is NOT bound at
                     # engine start — it reports status:"stopped" and an operator can start it at runtime
                     # (POST /connections/{name}/start). Its router + transform workers are still spawned
@@ -1997,9 +2388,9 @@ class RegistryRunner:
         # design (a diagnostic trail, not a reliability surface).
         if self._conn_event_drainer is not None:
             if self._conn_event_q is not None:
-                try:
+                try:  # noqa: SIM105
                     await asyncio.wait_for(self._conn_event_q.join(), _CONN_EVENT_FLUSH_GRACE)
-                except (asyncio.TimeoutError, asyncio.CancelledError):
+                except (TimeoutError, asyncio.CancelledError):
                     pass
             self._conn_event_drainer.cancel()
             await asyncio.gather(self._conn_event_drainer, return_exceptions=True)
@@ -2055,6 +2446,8 @@ class RegistryRunner:
         self._internal_error.clear()
         self._buildup.clear()
         self._batch.clear()
+        self._send_pace.clear()  # BACKLOG #82: drop pacing config + clock on a full teardown
+        self._send_pace_at.clear()
         self._simulate.clear()
         self._lane_healthy.clear()
         self._next_buildup_alert.clear()
@@ -2077,6 +2470,7 @@ class RegistryRunner:
         self._outbound_paused.clear()
         self._outbound_quiesced.clear()
         self._outbound_resume.clear()
+        self._gate_parked.clear()
         self._rcsi_off_degraded = False
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
@@ -2310,6 +2704,15 @@ class RegistryRunner:
             stages.append(Stage.RESPONSE)
         for stage in stages:
             self._dispatchers[stage] = self._make_dispatcher(stage)
+        # (2.5) Replay the already-recorded outbound pauses onto the FRESH OUTBOUND dispatcher, BEFORE it
+        # starts. _start_outbound ran before this (start() builds the outbounds first), so an
+        # auto_start=False lane is already in _outbound_paused with no dispatcher to tell — without this
+        # replay the boot gate would be defeated by step (3)'s seed-all-READY. pause_lane on an
+        # unregistered key registers it ALREADY-PAUSED, so the seed cannot arm it (#115).
+        out = self._dispatchers.get(Stage.OUTBOUND)
+        if out is not None:
+            for n in self._outbound_paused:
+                out.pause_lane(n)
         # (3) start each (seed-all-READY + immediate sweep). reset_stale_inflight already ran (engine).
         for dispatcher in self._dispatchers.values():
             await dispatcher.start()
@@ -2501,7 +2904,9 @@ class RegistryRunner:
         so the store-capability gates that must hold on every such path live here too: the
         pass-through (PT) backend allow-list (:func:`check_pt_backend_supported`) rejects a PT inbound
         on a backend that can't re-ingress (Postgres/SQL Server/any non-SQLite) BEFORE the swap, so a
-        reload/promote can never bring a PT-on-non-SQLite graph live."""
+        reload/promote can never bring a PT-on-non-SQLite graph live; the reference-set backend
+        allow-list (:func:`check_reference_backend_supported`) does the same for an ADR 0006
+        ``Reference(...)`` on a backend with no snapshot store (SQL Server)."""
         build_check_registry(
             registry,
             inbound_bind_host=self._inbound_bind_host,
@@ -2515,6 +2920,9 @@ class RegistryRunner:
         # path that build-checks the new registry also rejects a PT-on-non-SQLite graph before any
         # swap. RegistryRunner carries the resolved store, so the gate sees the backend's capability.
         check_pt_backend_supported(registry, self.store)
+        # Reference-set backend allow-list, same rationale (ADR 0006): a reload/promote that ADDS the
+        # first Reference(...) onto a backend with no snapshot store must fail 422 here, before the swap.
+        check_reference_backend_supported(registry, self.store)
 
     async def _reconcile_outbounds(self, old: Registry, new: Registry) -> None:
         """Bring the outbound connectors/workers in line with ``new`` without tearing down a live
@@ -2531,9 +2939,52 @@ class RegistryRunner:
             self._internal_error[name] = oc.internal_error or self._internal_error_default
             self._buildup[name] = oc.buildup or self._buildup_default
             self._stall[name] = oc.stall or self._stall_default
+            self._send_pace[name] = _resolve_send_pace(
+                oc.spec.settings
+            )  # BACKLOG #82 (see _start_outbound)
             self._simulate[name] = self._resolve_simulate(name, oc)
             worker = self._workers.get(name)
             failed = name in self._failed  # ADR 0031: live worker, but no connector (start failed)
+            # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS over
+            # auto_start. Unconditional (NOT keyed on the lane's live state, as the auto_start gate
+            # below is): an operator start is a legitimate override of auto_start, but there is no
+            # operator override of `deployed` — it is a config fact, so a reload that (re-)declares the
+            # connection not-deployed tears any live connector back down. Nothing is dropped: an already-
+            # queued row is retained PENDING, and a new one cannot be produced (transform_one declines
+            # the Send). No worker is spawned; a worker that predates the flip stays alive but PARKED at
+            # its pause gate — never cancel one, a cancelled mid-delivery row strands INFLIGHT forever.
+            if not oc.deployed:
+                stale = self._destinations.pop(name, None)
+                if stale is not None:
+                    await stale.aclose()
+                self._failed.pop(name, None)
+                self._park_outbound_lane(name)
+                continue
+            # Per-connection auto-start (#115): a reload must not RESURRECT a start-disabled lane. It had
+            # no gate at all here, and in the DEFAULT pooled mode `live` below is keyed on the CONNECTOR
+            # (which the boot gate popped) — so the not-live branch built one and the lane started
+            # delivering, silently undoing auto_start=False on the next reload/GUI edit. The gate is the
+            # lane's LIVE state, not the flag alone: an outbound an operator DID start at runtime is live
+            # here and reconciles normally (a reload never undoes an operator action), while one that is
+            # down (never started, started-then-stopped, or newly ADDED by this reload) stays parked with
+            # no connector — its queued rows are retained PENDING, exactly like the DR park below.
+            if not oc.auto_start and not self._outbound_lane_live(name):
+                stale = self._destinations.pop(name, None)
+                if stale is not None:
+                    await stale.aclose()
+                self._failed.pop(name, None)
+                self._park_outbound_lane(name)
+                if worker is None or worker.done():
+                    self._spawn_worker(name)
+                continue
+            # Past both gates: the GRAPH now says this lane may deliver. Lift any park the ENGINE put on
+            # it (an earlier deployed=False / auto_start=False that this reload just flipped back) —
+            # otherwise the branches below would faithfully rebuild its connector and respawn its worker
+            # and the lane would sit PAUSED forever, so "flip the flag and reload" (AC-4: with no other
+            # change) would silently not deploy it. A no-op for an OPERATOR pause (not in _gate_parked):
+            # a reload never undoes an operator action. Placed ABOVE the DR gate so a DR park applies its
+            # own semantics (queued rows RETRIED, status:"filtered") to a clean, unpaused lane.
+            self._unpark_outbound_lane(name)
             # DR run-profile (#61, ADR 0048): a reload re-evaluates against the threshold. A
             # below-threshold outbound keeps (or gets) its delivery worker but NO live connector — its
             # routed rows queue + back off + self-heal on the next full startup, exactly the parked-lane
@@ -2568,7 +3019,7 @@ class RegistryRunner:
                 # lane AFTER intake is quiesced (the "connector builds here cannot fail" invariant).
                 with active_hop_posture(self._hop_posture):
                     self._destinations[name] = build_destination(
-                        _dest_config(oc, self._env_values, self._trust_anchor_policy)
+                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
                 self._failed.pop(name, None)
                 self._spawn_worker(name)
@@ -2582,7 +3033,7 @@ class RegistryRunner:
                 # #200 (ADR 0092): stamp the posture for the in-place rebuild too (see the branch above).
                 with active_hop_posture(self._hop_posture):
                     self._destinations[name] = build_destination(
-                        _dest_config(oc, self._env_values, self._trust_anchor_policy)
+                        _dest_config(oc, self._env_values, self._trust_anchor_policy, self._egress)
                     )
                 self._failed.pop(name, None)
                 if old_conn is not None:
@@ -2655,6 +3106,24 @@ class RegistryRunner:
                 # (a reload may add/remove a lookup, flip an inbound's inline=, or change ack_after).
                 self._recompute_inline_ok()
                 for ic in new_registry.inbound.values():
+                    # Present but NOT DEPLOYED (#233, ADR 0111) — checked FIRST, so deployed=False WINS
+                    # over auto_start. Unconditional (unlike the auto_start gate below, which honors an
+                    # operator start): `deployed` is a config fact, not a runtime one, so a reload that
+                    # declares the inbound not-deployed leaves it UNBOUND even if an operator had it
+                    # listening a moment ago — step 1 above already quiesced every source. Its router +
+                    # transform workers are still re-armed below, so an in-flight backlog drains (AC-3).
+                    if not ic.deployed:
+                        continue
+                    # Per-connection auto-start (#115): a reload must not BIND a start-disabled listener
+                    # (it had no gate here at all, so every reload/GUI edit silently undid auto_start=False
+                    # and the feed came up). The test is "was it LISTENING before this reload?", not "is it
+                    # now?" — step 1 above just unbound every source, so the live state is uniformly False
+                    # here; `old_inbound_names` is the snapshot taken before the quiesce. That keeps a
+                    # listener an operator started at runtime bound across a reload (a reload never undoes
+                    # an operator action) while a never-started one stays down. Its router/transform
+                    # workers are still re-armed below, so any backlog drains (the AC-3 rule).
+                    if not ic.auto_start and ic.name not in old_inbound_names:
+                        continue
                     # DR run-profile (#61, ADR 0048): a reload re-evaluates the whole graph against the
                     # threshold (the profile is a per-run decision read at start/reload), so a
                     # below-threshold inbound stays parked (status:"filtered") and is not re-bound; its
@@ -2955,8 +3424,15 @@ class RegistryRunner:
             refs: list[str] = []
             detached = 0
             for occ, verbatim_b64, content_type in iter_obx_documents(message):
-                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), content_type)
-                message.set("OBX-5.5", make_doc_ref(ref, content_type), occurrence=occ)
+                # ASVS 1.3.4/5.2.2: OBX-5.2 is a sender-controlled MIME label. If it names a sniffable
+                # family (image/pdf/zip/xml/json) whose magic bytes the document contradicts, store the
+                # generic octet-stream so the download route can never serve a mislabelled active-content
+                # payload as its claimed inert type. Non-sniffable labels are kept as declared.
+                safe_ct = content_type
+                if not attachment_mime_agrees(content_type, b64_head(verbatim_b64)):
+                    safe_ct = _DEFAULT_ATTACHMENT_MIME
+                ref = await self.store.put_attachment(chunk_b64(verbatim_b64), safe_ct)
+                message.set("OBX-5.5", make_doc_ref(ref, safe_ct), occurrence=occ)
                 if ref not in refs:
                     refs.append(ref)
                 detached += 1
@@ -3375,6 +3851,11 @@ class RegistryRunner:
                     woken = await self._wait_for_work(wait_ev)
                     continue
                 for item in items:
+                    # BACKLOG #82: pace this lane's egress BEFORE the send seam so ONE hook covers both
+                    # the single-message and the batch body (below) — a paced batch counts as one
+                    # interval. Sits between claim and send (outside the produce→complete transaction),
+                    # so it delays without reordering; cancellable via the loop's CancelledError.
+                    await self._pace_outbound(name)
                     # #134 (ADR 0082): a batching outbound coalesces this claimed head + the lane's next
                     # due rows into ONE BHS…BTS envelope; the plain path delivers one message per send.
                     batch_cfg = self._batch.get(name)
@@ -3402,7 +3883,12 @@ class RegistryRunner:
         raw PHI body), strips the engine-internal correlation-lineage keys via
         :func:`~messagefoundry.store.metadata.user_metadata`, and keeps only ``str`` values (the shape
         :class:`~messagefoundry.config.wiring.SetMeta` writes). Pure w.r.t. the committed message row, so
-        an at-least-once re-run reads the same bag and re-derives identical headers."""
+        an at-least-once re-run reads the same bag and re-derives identical headers — **until retention
+        nulls the column**. Past the body window ``messages.metadata`` is blanked (ASVS 14.2.7), so a
+        DEAD row replayed after its message was purged reads ``None`` here and is delivered with no
+        ``dynamic_headers`` rather than the headers of its first attempt. Accepted: retaining PHI past
+        its window purely to serve a degraded replay is the defect 14.2.7 exists to close. Pinned by
+        test — see PHI.md §8."""
         raw_meta = await self.store.message_metadata_json(message_id)
         user_json = user_metadata(raw_meta)
         if not user_json:
@@ -3447,6 +3933,33 @@ class RegistryRunner:
             # exactly like the encoding-override / raw-separators pre-send failures. The row re-pends with
             # backoff (or dead-letters per policy); the buildup/stall alerts make a stuck lane loud.
             raise DeliveryError(f"document re-attach failed: {safe_exc(exc)}") from exc
+
+    async def _pace_outbound(self, name: str) -> None:
+        """Apply this outbound lane's egress send pacing (BACKLOG #82): wait until at least
+        ``send_min_interval_seconds`` has elapsed since this lane's previous send began, then stamp the
+        lane's send clock. Called once per ``send()`` — immediately before the item/batch delivery seam in
+        BOTH the per_lane :meth:`_delivery_worker` and the pooled :meth:`_dispatch_delivery`, so it covers
+        the single-message AND batch bodies in BOTH claim modes with one hook (**per-envelope** pacing: a
+        batch counts as one interval).
+
+        No pacing configured (``0.0`` — the default) is a single dict read and an immediate return, so the
+        delivery path stays byte-identical; the pacing clock is only touched once a lane actually paces.
+        The clock is per-lane (keyed on ``name``), so independent outbounds never delay one another. The
+        delivery worker is the lane's single serial sender (per-lane FIFO invariant, ADR 0067 — asserted
+        in ``MLLPDestination.send``), so there is no intra-lane race on the clock; this is a pure **wait**
+        that reorders nothing (the row is already claimed) and its ``asyncio.sleep`` is cancellable by the
+        connection's stop signal (CancelledError propagates out of the delivery loop, never swallowed)."""
+        interval = self._send_pace.get(name, 0.0)
+        if interval <= 0.0:
+            return  # no pacing on this lane → byte-identical, clock untouched
+        last = self._send_pace_at.get(name)
+        if last is not None:
+            elapsed = time.monotonic() - last
+            if elapsed < interval:
+                await asyncio.sleep(interval - elapsed)
+        # Stamp AFTER any wait so the next interval is measured from THIS send's start (send-to-send
+        # rate), matching the documented per-envelope semantics.
+        self._send_pace_at[name] = time.monotonic()
 
     async def _process_delivery_item(
         self, name: str, item: OutboxItem
@@ -3703,11 +4216,11 @@ class RegistryRunner:
             remaining = deadline - time.time()
             if remaining <= 0:
                 break
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(
                     self._stop.wait(), timeout=min(_BATCH_POLL_SECONDS, remaining)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
         ids = [it.id for it in items]
         retry_until: float | None = None
@@ -4054,7 +4567,12 @@ class RegistryRunner:
                 with run_contexts(inline_rc, phase="transform"):
                     # ADR 0087 (#197): sandbox=subprocess marshals the Handler to the per-inbound
                     # worker (inline_rc travels with it); sandbox=None is the byte-identical path.
-                    deliveries_preview, state_preview, meta_preview = await asyncio.to_thread(
+                    (
+                        deliveries_preview,
+                        state_preview,
+                        meta_preview,
+                        declined,
+                    ) = await asyncio.to_thread(
                         transform_one,
                         self.registry,
                         hname,
@@ -4067,6 +4585,12 @@ class RegistryRunner:
                 deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
                 pt_deliveries = [d for d in deliveries_preview if d.is_passthrough]
                 state_ops = list(state_preview)
+                # NB: intentionally NO _log_declined here (unlike the split + fused-sync transform
+                # workers). A non-empty `declined` fails the fusion gate below (`and not declined`), so a
+                # declined message ALWAYS falls back to the split path, whose transform worker logs — and
+                # durably records — the decline exactly once. Logging here too would emit a DUPLICATE INFO
+                # line for every declined Send on an inline inbound (#233, ADR 0111 review finding); the
+                # message_events record stays single either way, so this is log hygiene.
                 # M-deliver gate: only the pure all-deliver case is fused. A zero-delivery
                 # (filtering) handler, any state-op, any pass-through Send, or any SetMeta write
                 # (ADR 0081, #150 — the fused handoff carries no metadata-merge) FALLS BACK to the
@@ -4074,7 +4598,20 @@ class RegistryRunner:
                 # would strand non-terminal) and the state-MERGE / PT-child / metadata machinery
                 # transform_handoff carries. The split path finalizes those correctly (FILTERED
                 # via transform_handoff's _maybe_finalize; state/PT/meta via its dedicated handling).
-                if deliveries and not state_ops and not pt_deliveries and not meta_preview:
+                #
+                # `declined` (#233, ADR 0111) joins that list: a Send to a not-deployed connection has
+                # to be RECORDED (count-and-log), and `handoff` — a lean 3-statement fast-path — has
+                # nowhere to record it, so a message carrying one falls back to the split path whose
+                # transform_handoff does. The empty-`deliveries` fallback ALSO covers the declined-only
+                # case, and must be preserved regardless: store.handoff never runs the finalizer, so a
+                # zero-delivery message committed through it would strand non-terminal (G2).
+                if (
+                    deliveries
+                    and not state_ops
+                    and not pt_deliveries
+                    and not meta_preview
+                    and not declined
+                ):
                     # CF — the fused single commit: consume the ingress row, insert one
                     # outbound row per delivery, set ROUTED. G5: no DB connection/txn is held
                     # across the to_thread calls above — C2 committed + released before this
@@ -4224,10 +4761,13 @@ class RegistryRunner:
                     self._empty_claims.record_empty(woken=woken)  # B11 wall #3
                     woken = await self._wait_for_work(wait_ev)
                     continue
-                for item in items:
-                    outcome = await self._process_routed_item(name, item)
-                    if outcome[0] is _ItemOutcome.STOPPED:
-                        return
+                # Process the claimed FIFO batch. BACKLOG #214: when intra-message transform concurrency
+                # is enabled this overlaps a message's sibling rows' transforms while keeping the handoff
+                # serial + in claim order; default (concurrency 1 / single row / fused) it is the exact
+                # sequential per-item loop. Returns True iff the lane must halt (STOP policy / missing
+                # inbound), matching the old `for item in items` early return.
+                if await self._process_routed_batch(name, items):
+                    return
                 # Off the hot path (rate-limited), ONCE PER BATCH (ADR 0058): alert if this inbound's
                 # routed (transform) backlog is building behind a slow/hung handler — reported separately
                 # from the ingress lane.
@@ -4246,6 +4786,84 @@ class RegistryRunner:
                 )
                 if await self._stop_or_sleep(_WORKER_ERROR_BACKOFF_SECONDS):
                     return
+
+    async def _process_routed_batch(self, name: str, items: Sequence[OutboxItem]) -> bool:
+        """Process one claimed FIFO batch of routed rows; return ``True`` iff the lane must STOP (a STOP
+        internal-error policy or a missing inbound), matching the worker loop's old ``for item in
+        items`` early return.
+
+        BACKLOG #214 — intra-message concurrent transform. When ``_transform_concurrency > 1`` (opt-in;
+        default 1 → the exact sequential loop) and the batch holds a run of >= 2 sibling rows of ONE
+        message (co-claimed only when ``fifo_claim_batch`` > 1), those rows' **pure** transforms are
+        computed CONCURRENTLY (bounded by the cap, via ``asyncio.gather`` so each runs as its own Task
+        with an isolated contextvar context) while every store handoff is applied SERIALLY in ascending
+        claim order. The handoff is the SOLE per-lane writer and stays serial + rowid-ordered, so
+        ``seq`` == claim order for every destination — shared-destination siblings and cross-message
+        rows alike — preserving per-destination outbound FIFO (ADR 0059) and the at-least-once staged
+        handoff (each row keeps its own atomic claim→produce→complete txn). **Sibling state-visibility
+        (deterministic per-batch snapshot, ADR 0005):** because every sibling's PURE transform is computed
+        BEFORE any sibling's handoff commits, a LIVE ``state_view()`` read would be interleaving-dependent.
+        So this concurrent run freezes ONE point-in-time copy of the committed transform-state at
+        run-start (``dict(self.store.state_view())``) and threads it into every sibling's
+        :meth:`_prepare_routed`, so each deterministically observes the state as of the message-batch's
+        start — no sibling sees another sibling's in-run ``state_set``/``set_meta`` write, independent of
+        interleaving. Defined semantics: *a message's sibling handlers read message-batch-start
+        transform-state/meta; they do not chain it to each other.* This is READ-side only — final
+        committed state (the apply is serial in claim order), per-destination FIFO, and at-least-once are
+        all unchanged. The sequential / single-row / fused paths keep reading the LIVE ``state_view()`` —
+        byte-identical — so their commit-before-next-transform visibility is preserved. The fused (SQL
+        Server) path stays sequential: there transform + handoff are one off-loop write, so overlapping
+        them would parallelize the WRITE. Default / single-row / fused / missing-inbound → the exact
+        sequential ``_process_routed_item`` loop."""
+        ic = self.registry.inbound.get(name)
+        if self._transform_concurrency <= 1 or self._fusion_active or ic is None or len(items) < 2:
+            for item in items:
+                if (await self._process_routed_item(name, item))[0] is _ItemOutcome.STOPPED:
+                    return True
+            return False
+        for run in _contiguous_by_message(items):
+            if len(run) < 2:
+                # A lone row (no sibling to overlap) goes through the shared per-item path unchanged.
+                if (await self._process_routed_item(name, run[0]))[0] is _ItemOutcome.STOPPED:
+                    return True
+                continue
+            # >= 2 sibling routed rows of one message: overlap the PURE transforms (bounded), then
+            # apply the handoffs SERIALLY below. The cap doubles as the live-lookup fan-out guard.
+            cap = min(self._transform_concurrency, len(run))
+            sem = asyncio.Semaphore(cap)
+            # BACKLOG #214 state-visibility guard: freeze ONE point-in-time copy of the committed
+            # transform-state at run-start and share it across every sibling's compute. Because all
+            # siblings compute before any sibling's serial _apply_routed commits, reading the LIVE
+            # state_view() would be interleaving-dependent; reading this frozen snapshot makes every
+            # sibling deterministically observe message-batch-start state (no sibling sees another's
+            # in-run write). dict(state_view()) is a point-in-time copy: state_view() is a live
+            # MappingProxyType over the store's cache and each committed write REPLACES a key (never an
+            # in-place mutation), so the copied {(ns, key): value} references never change afterwards.
+            # READ-side only — no store write, no txn-boundary change, no reordering (the apply below
+            # stays the sole serial in-claim-order writer, so the final committed state is unchanged).
+            state_snapshot: Mapping[tuple[str, str], Any] = dict(self.store.state_view())
+
+            async def _compute(
+                it: OutboxItem,
+                _sem: asyncio.Semaphore = sem,
+                _ic: InboundConnection = ic,
+                _snap: Mapping[tuple[str, str], Any] = state_snapshot,
+            ) -> _RoutedPrep:
+                async with _sem:
+                    return await self._prepare_routed(name, _ic, it, state_snapshot=_snap)
+
+            preps = await asyncio.gather(*(_compute(it) for it in run), return_exceptions=True)
+            for it, prep in zip(run, preps, strict=True):
+                if isinstance(prep, BaseException):
+                    # An INFRA fault in prepare (a store-read error — NOT a handler raise, which is
+                    # captured as data). Mirror the sequential path: propagate to the worker's backoff.
+                    # Lower-claim siblings already handed off (committed, in order); this row + any
+                    # higher un-applied rows stay INFLIGHT and recover in claim order via
+                    # reset_stale_inflight (ADR 0058 INV-3 / ADR 0001 at-least-once).
+                    raise prep
+                if (await self._apply_routed(name, it, prep))[0] is _ItemOutcome.STOPPED:
+                    return True
+        return False
 
     async def _process_routed_item(
         self, name: str, item: OutboxItem
@@ -4300,6 +4918,55 @@ class RegistryRunner:
             for _pt in result.ingress_wakes:  # cross-lane: each DISTINCT PT-target INGRESS lane
                 self._wake_lane(Stage.INGRESS, _pt)
             return _ItemOutcome.PROCESSED, None
+        # Non-fused (default) path — split into a PURE compute (_prepare_routed) and the store WRITE
+        # (_apply_routed) so a message's sibling rows can overlap the compute under intra-message
+        # concurrency (BACKLOG #214) while the handoff stays the sole serial per-lane writer. Here they
+        # run back-to-back, byte-identical to the inlined body. The missing-handler guard above stays
+        # ahead of both (it also gates the fused branch); _prepare_routed re-checks it only so the
+        # concurrent-batch entry (which does not pre-check) is self-contained.
+        prep = await self._prepare_routed(name, ic, item)
+        return await self._apply_routed(name, item, prep)
+
+    async def _prepare_routed(
+        self,
+        name: str,
+        ic: InboundConnection,
+        item: OutboxItem,
+        *,
+        state_snapshot: Mapping[tuple[str, str], Any] | None = None,
+    ) -> _RoutedPrep:
+        """PURE, read-only compute for one routed row — the overlap-able half of the transform stage
+        (BACKLOG #214). Does NO store write: only the loopback ``response_view`` read + the off-loop
+        ``transform_one`` (SEC-013), under the same run-context + live-lookup activation as the inlined
+        body. Returns a :class:`_RoutedPrep` capturing the handler-missing guard, a handler raise (as
+        data, so a concurrent ``gather`` never cancels a sibling), or the produced
+        :class:`TransformOutcome`. The caller applies it — the SOLE writer — serially in claim order via
+        :meth:`_apply_routed`. Sibling computes are structurally ISOLATED: ``asyncio.gather`` runs each
+        call as its own Task with its own copied contextvar context, so the per-run ``run_contexts``/
+        lookup activation and the ``to_thread`` context copy never cross between siblings.
+
+        **Sibling state-visibility (BACKLOG #214) — deterministic under concurrency.** ``state_view()``
+        (ADR 0005) is a LIVE read-through cache updated only at each row's ``transform_handoff`` commit.
+        The sequential path (``state_snapshot=None``) reads it live: it commits each row before the next
+        transforms, so a later sibling observes an earlier sibling's ``state_set``/``set_meta`` write.
+        Under concurrent transform every sibling's compute runs HERE *before* any sibling's
+        :meth:`_apply_routed` commits, so a live read would be interleaving-dependent (a later sibling
+        might see the run-start value or nothing at all, depending on scheduling). To make it
+        DETERMINISTIC, :meth:`_process_routed_batch` freezes ONE point-in-time copy of the committed
+        state at run-start and threads it in as ``state_snapshot``; every sibling then reads that SAME
+        frozen mapping, so each deterministically observes the state as of the message-batch's start and
+        none sees another sibling's in-run write — independent of how the transforms interleave. The
+        FINAL committed state is identical to the sequential path (the apply is still serial in claim
+        order) and FIFO/at-least-once are unaffected; only the intra-run READ is snapshot-isolated.
+        Defined semantics: *a message's sibling handlers read message-batch-start transform-state/meta;
+        they do not chain it to each other.* When ``state_snapshot`` is None (sequential/single-row/fused
+        path) the live ``state_view()`` is used, exactly as before — byte-identical.
+
+        An unexpected store-read fault (loopback metadata read) PROPAGATES — the caller treats
+        it as INFRA and backs off, exactly like the inlined path."""
+        hname = item.handler_name
+        if hname is None or hname not in self.registry.handlers:
+            return _RoutedPrep(missing_handler=True)
         # ADR 0013 Increment 2: for a RE-INGRESSED message (only ever on a loopback inbound),
         # feed the run-context `response` provider the ORIGIN request's captured replies so its
         # Handler can read them via response_get(dest). A normal message → None (byte-identical,
@@ -4328,7 +4995,12 @@ class RegistryRunner:
             transform_rc = RunContext(
                 code_sets=self.registry.code_sets,
                 reference_view=self.store.reference_view(),
-                state_view=self.store.state_view(),
+                # BACKLOG #214: sequential/single-row/fused path (state_snapshot is None) reads the LIVE
+                # view — byte-identical. A concurrent sibling-run passes a FROZEN run-start copy so every
+                # sibling reads the same point-in-time state (deterministic; see this method's docstring).
+                state_view=(
+                    state_snapshot if state_snapshot is not None else self.store.state_view()
+                ),
                 response_view=response_view,
                 active_environment=self._active_environment,
                 ingest_time=item.created_at,
@@ -4361,7 +5033,7 @@ class RegistryRunner:
                     # worker (transform_rc travels with it); a db_lookup/fhir_lookup inside a
                     # sandboxed Handler fails closed there (they can't bridge across the process
                     # boundary in this PR). sandbox=None is the byte-identical in-process path.
-                    deliveries_preview, state_preview, meta_preview = await asyncio.to_thread(
+                    outcome = await asyncio.to_thread(
                         transform_one,
                         self.registry,
                         hname,
@@ -4371,20 +5043,59 @@ class RegistryRunner:
                         run_context=transform_rc,
                     )
         except Exception as exc:
+            # Handler/transform code error (incl. an unknown outbound name). CONTENT: captured as
+            # data, NOT raised, so a concurrent gather never cancels a sibling; the serial apply
+            # feeds it to the internal_error policy (post-ACK, no NAK). Byte-identical outcome to
+            # the old inlined except block, just deferred to _apply_routed.
+            return _RoutedPrep(error=exc)
+        return _RoutedPrep(outcome=outcome)
+
+    async def _apply_routed(
+        self, name: str, item: OutboxItem, prep: _RoutedPrep
+    ) -> tuple[_ItemOutcome, float | None]:
+        """Apply one prepared routed row — the SOLE per-lane writer (BACKLOG #214). Called serially in
+        ascending claim (rowid/seq) order so per-destination outbound FIFO is preserved even when the
+        siblings' transforms were computed concurrently. Mirrors the sequential tail of
+        :meth:`_process_routed_item` exactly: handler-missing → dead-letter (``PROCESSED``); handler
+        raise → internal-error policy (``STOP``/``CONTINUE``); else ``transform_handoff`` + lane wakes
+        (``PROCESSED``). Returns ``(outcome, None)`` — the routed path never re-pends-with-backoff."""
+        if prep.missing_handler:
+            # Handler gone (removed/renamed since routing). Can't transform this row;
+            # dead-letter it (message ERROR, replayable once restored) — the per-row analogue
+            # of the startup dead_letter_missing_handlers sweep. Dead-lettering (vs reverting)
+            # avoids a hot-loop on a permanently-missing handler and gives operator visibility.
+            hname = item.handler_name
+            log.warning(
+                "transform worker %r: handler %r for %s is missing; dead-lettering",
+                name,
+                hname,
+                item.id,
+            )
+            await self.store.dead_letter_now(item.id, f"handler {hname!r} removed from registry")
+            return _ItemOutcome.PROCESSED, None
+        if prep.error is not None:
             # Handler/transform code error (incl. an unknown outbound name). Post-ACK, so no
             # NAK — the global internal_error policy decides (factored into
             # _apply_transform_internal_error, shared with the fused transform branch;
             # byte-identical).
-            return await self._apply_transform_internal_error(name, item, exc)
+            return await self._apply_transform_internal_error(name, item, prep.error)
+        outcome = prep.outcome
+        assert outcome is not None  # exactly one _RoutedPrep field is populated
+        hname = item.handler_name
+        assert hname is not None  # a produced outcome implies the handler ran
         # Split outbound deliveries from pass-through (PT) Sends (ADR 0013, generalized): a PT
         # target re-ingresses the body through an internal inbound's own router (a fresh
         # INGRESS row on the PT channel), produced atomically in the SAME transform_handoff
         # transaction as the outbound rows + routed-row DELETE. transform_one already validated
-        # each target and tagged PT ones (is_passthrough).
-        deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
-        pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
-        state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
-        meta_ops = [(m.key, m.value) for m in meta_preview]
+        # each target and tagged PT ones (is_passthrough) — and DECLINED any Send to a
+        # not-deployed connection (#233), so none of those can appear in deliveries_preview and
+        # therefore none can become an outbound row here.
+        deliveries = [(d.to, d.payload) for d in outcome.deliveries if not d.is_passthrough]
+        pt_deliveries = [(d.to, d.payload) for d in outcome.deliveries if d.is_passthrough]
+        state_ops = [(s.namespace, s.key, s.value) for s in outcome.state_ops]
+        meta_ops = [(m.key, m.value) for m in outcome.meta_ops]
+        declined = outcome.declined
+        self._log_declined(hname, item.message_id, declined)
         await self.store.transform_handoff(
             routed_id=item.id,
             message_id=item.message_id,
@@ -4393,6 +5104,7 @@ class RegistryRunner:
             state_ops=state_ops,
             pt_deliveries=pt_deliveries,
             meta_ops=meta_ops,
+            declined=declined,  # #233: persist the decline as a not_deployed event in the same txn
             correlation_depth_cap=self._max_correlation_depth,
         )
         if deliveries:
@@ -4577,7 +5289,7 @@ class RegistryRunner:
                     lookup_stack.enter_context(db_lookup_activated(self._run_lookup))
                 if self._fhir_lookup_executor is not None:
                     lookup_stack.enter_context(fhir_lookup_activated(self._run_fhir_lookup))
-                deliveries_preview, state_preview, meta_preview = transform_one(
+                deliveries_preview, state_preview, meta_preview, declined = transform_one(
                     self.registry, hname, item.payload, content_type
                 )
         except (
@@ -4592,10 +5304,13 @@ class RegistryRunner:
                 outbound_wakes=(),
                 ingress_wakes=(),
             )
+        # transform_one DECLINED any Send to a not-deployed connection (#233), so the fused sync twin
+        # produces no outbound row for one either — the seam covers this path with no change to it.
         deliveries = [(d.to, d.payload) for d in deliveries_preview if not d.is_passthrough]
         pt_deliveries = [(d.to, d.payload) for d in deliveries_preview if d.is_passthrough]
         state_ops = [(s.namespace, s.key, s.value) for s in state_preview]
         meta_ops = [(m.key, m.value) for m in meta_preview]
+        self._log_declined(hname, item.message_id, declined)
         store = cast(_FusedHandoffStore, self.store)
         try:
             with store.sync_handoff_pool(Stage.OUTBOUND.value).acquire() as conn:
@@ -4608,6 +5323,7 @@ class RegistryRunner:
                     state_ops=state_ops,
                     pt_deliveries=pt_deliveries,
                     meta_ops=meta_ops,
+                    declined=declined,  # #233: persist the decline in the same fused-hop txn
                     correlation_depth_cap=self._max_correlation_depth,
                     now=now,
                 )
@@ -4815,6 +5531,9 @@ class RegistryRunner:
         return result
 
     async def _dispatch_delivery(self, lane: str, item: OutboxItem) -> LaneItemResult:
+        # BACKLOG #82: pace this lane's egress BEFORE the send seam (mirrors the per_lane worker) so one
+        # hook covers the single-message AND batch bodies in the POOLED claim mode too.
+        await self._pace_outbound(lane)
         # #134 (ADR 0082): batch inside the pooled claim (decision #5) — the dispatcher claims one head
         # per lane as always; a batching lane's delivery body coalesces its own tail (claim_next_fifo)
         # into one BHS…BTS envelope, so per_lane and pooled share the exact batch body with NO change to
@@ -4844,7 +5563,7 @@ class RegistryRunner:
         woken = True
         try:
             await asyncio.wait_for(event.wait(), self._idle_backstop)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             woken = False
         finally:
             event.clear()
@@ -4861,7 +5580,7 @@ class RegistryRunner:
         try:
             await asyncio.wait_for(ev.wait(), self._idle_backstop)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
     async def _mark_failed_and_arm(
@@ -4892,7 +5611,7 @@ class RegistryRunner:
         try:
             await asyncio.wait_for(self._stop.wait(), delay)
             return True
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return False
 
 
@@ -4942,16 +5661,33 @@ def _hop_attested_reason(settings: Mapping[str, Any]) -> str | None:
     return None if reason is None else str(reason)
 
 
+def _apply_egress_proxy_default(settings: dict[str, Any], egress: EgressSettings | None) -> None:
+    """Fill the site-wide ``[egress]`` forward-proxy default into a connection's resolved settings when it
+    set no per-connection proxy (ADR 0126, #112/#128). A per-connection ``proxy_url`` / ``proxy_no_proxy``
+    wins verbatim; only an ABSENT value inherits the ``egress`` default. ``None`` egress / no default →
+    byte-identical, so a graph without an ``[egress].proxy_url`` is unchanged."""
+    if egress is None:
+        return
+    if egress.proxy_url and not settings.get("proxy_url"):
+        settings["proxy_url"] = egress.proxy_url
+    if egress.proxy_no_proxy and not settings.get("proxy_no_proxy"):
+        settings["proxy_no_proxy"] = list(egress.proxy_no_proxy)
+
+
 def _dest_config(
     oc: OutboundConnection,
     env_values: Mapping[str, Any],
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    egress: EgressSettings | None = None,
 ) -> Destination:
     # Resolve env() first so any signing key/password ref is materialized here, then assemble the
     # typed signing config (ASVS 4.1.5, ADR 0018) from the resolved sign_* settings. None = signing
     # off (every existing outbound unchanged). The connector loads the key + mints the signature; this
     # is the single choke point feeding start/check/dry-run, so a bad key fails loud at all three.
     settings = resolve_env_settings(oc.spec.settings, env_values)
+    # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
+    # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
+    _apply_egress_proxy_default(settings, egress)
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -4975,6 +5711,10 @@ def _dest_config(
         # context builders resolve the same anchor both places). None → the default system/no-op policy,
         # byte-identical to before this seam.
         trust_anchor_policy=trust_anchor_policy or TrustAnchorPolicy(),
+        # #136 (ADR 0065 amendment): the cosmetic "Waiting for Reply" pre-display delay, threaded onto the
+        # Destination so the MLLP connector can size its side-band waiting window. DISPLAY ONLY — no
+        # delivery effect. Default 0.0 → byte-identical.
+        waiting_display_delay=oc.waiting_display_delay,
     )
 
 
@@ -4988,11 +5728,14 @@ def build_check_registry(
     posture: HopPosture | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> None:
-    """Construct (and discard) every connector in ``registry`` + run the fail-closed connect/egress
-    allowlists, so a bad connector spec or a non-allowlisted host fails as a :class:`WiringError`
-    BEFORE anything is applied. The standalone core of :meth:`RegistryRunner.build_check`, callable
-    offline — e.g. the ``connection`` CLI validating an edit before it persists (ADR 0007). Builds
-    nothing live (no socket bind / file I/O — binding happens later in ``start_inbound``).
+    """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
+    connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
+    :class:`WiringError` BEFORE anything is applied. The standalone core of
+    :meth:`RegistryRunner.build_check`, callable offline — e.g. the ``connection`` CLI validating an edit
+    before it persists (ADR 0007). Builds nothing live (no socket bind / file I/O — binding happens later
+    in ``start_inbound``).
+
+    A ``deployed=False`` connection (#233, ADR 0111) is SKIPPED — see :func:`_build_check_connectors`.
 
     ``posture`` (#200, ADR 0092) is the instance's derived security posture (PHI? production?), stamped
     as the active hop posture for the whole connector-construction block so each cell keys its
@@ -5036,17 +5779,42 @@ def _build_check_connectors(
     egress: EgressSettings,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> None:
-    """Construct-and-discard every connector + run the connect/egress allowlists (the body of
+    """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
     scope with a single ``try`` in the caller). Raises the raw connector error; the caller wraps a
-    non-:class:`WiringError` as one."""
+    non-:class:`WiringError` as one.
+
+    **A ``deployed=False`` connection (#233, ADR 0111) is skipped entirely** — no ``_source_config`` /
+    ``_dest_config``, therefore no :func:`resolve_env_settings`, therefore its ``env()`` values are NEVER
+    resolved and no connector is ever built for it.
+
+    This skip IS the feature. This loop is the one place that build-checks EVERY connection with no
+    lifecycle filter at all (``auto_start`` / DR-park / simulate all dodge it by never reaching a build),
+    and it is reached from ``messagefoundry check`` (the required commit/CI gate), from every live reload
+    and promote, and from every ``connection upsert``/``remove`` (the GUI write path — where one
+    unresolvable connection currently blocks edits to EVERY OTHER connection). Without the skip, a
+    connection whose credentials do not exist yet still explodes on all of those paths and the state buys
+    nothing. The fail-loud guarantee is UNCHANGED for a deployed connection: a missing ``env()`` value on
+    one still raises here, which is exactly the promote-time gate ("a graph whose env keys aren't defined
+    for the target never goes live")."""
     for ic in registry.inbound.values():
+        if not ic.deployed:
+            continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
         build_source(source_cfg)
+    # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
+    # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a
+    # capturing outbound whose loopback is owned by a sibling shard must still validate here: the runtime
+    # already spans that split (the delivering shard produces the Stage.RESPONSE row; the loopback's shard
+    # drains it — _wake_lane). Unsharded this is exactly `registry.inbound`'s loopbacks, so a typo'd or
+    # non-loopback target still fails on every shard.
+    loopbacks = registry.loopback_inbound_names()
     reingress_targets: set[str] = set()
     for oc in registry.outbound.values():
-        dest = _dest_config(oc, env_values, trust_anchor_policy)
+        if not oc.deployed:
+            continue
+        dest = _dest_config(oc, env_values, trust_anchor_policy, egress)
         check_egress_allowed(dest, egress)  # fail-closed egress allowlist (WP-11c)
         build_destination(dest)
         # ADR 0013 Increment 2: reingress_to must name an existing Loopback() inbound. This is a
@@ -5054,17 +5822,21 @@ def _build_check_connectors(
         # fails at `check`/dry-run with no store, like every other connector validation.
         target = oc.spec.settings.get("reingress_to")
         if target is not None:
-            tic = registry.inbound.get(str(target))
-            if tic is None or tic.spec.type is not ConnectorType.LOOPBACK:
+            if str(target) not in loopbacks:
                 raise WiringError(
                     f"outbound connection {oc.name!r}: reingress_to names unknown/non-loopback "
                     f"inbound {target!r} — declare it as inbound(..., Loopback(), ...) (ADR 0013)."
                 )
             reingress_targets.add(str(target))
     # A loopback inbound with no capturing outbound pointing at it is legal but inert (never fed) —
-    # surface it (it may be a staging artifact), but don't error.
+    # surface it (it may be a staging artifact), but don't error. A not-deployed loopback is inert BY
+    # DECLARATION (#233), so the warning would be noise on exactly the config that already says so.
     for iname, ic in registry.inbound.items():
-        if ic.spec.type is ConnectorType.LOOPBACK and iname not in reingress_targets:
+        if (
+            ic.deployed
+            and ic.spec.type is ConnectorType.LOOPBACK
+            and iname not in reingress_targets
+        ):
             log.warning(
                 "loopback inbound %r has no reingress_to source; it will never receive a message",
                 iname,
@@ -5080,13 +5852,16 @@ def _build_check_connectors(
     resolved_fhir_lookups: dict[str, dict[str, Any]] = {}
     for fname, fspec in registry.fhir_lookups.items():
         fsettings = resolve_env_settings(fspec.settings, env_values)
+        _apply_egress_proxy_default(fsettings, egress)  # ADR 0126: site-wide forward proxy
         check_fhir_lookup_allowed(
             fname, fsettings, egress
         )  # fail-closed egress allowlist (ADR 0043)
         resolved_fhir_lookups[fname] = fsettings
     if resolved_fhir_lookups:
         # Construct (and discard): validates each FHIR URL/TLS/SMART-auth without issuing a read.
-        FhirLookupExecutor(resolved_fhir_lookups)
+        FhirLookupExecutor(
+            resolved_fhir_lookups, require_structured=egress.fhir_require_structured_params
+        )
 
 
 def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
@@ -5094,20 +5869,20 @@ def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
     re-ingress, BEFORE any inbound listener accepts a message.
 
     **ALLOW-LIST semantics:** PT is permitted only on a backend whose ``supports_pt_reingress`` is
-    ``True`` (SQLite today). Postgres, SQL Server, and any future backend default to ``False`` (set on
-    the ``Store`` base), so a backend that hasn't implemented the ``pt_deliveries`` branch of
-    :meth:`transform_handoff` is rejected here rather than at the first Handler ``Send`` into a PT
-    connector (which would NotImplementedError *after* the inbound was already ACKed). Names the
-    offending PT connection(s) and the backend.
+    ``True`` — SQLite, Postgres, and SQL Server all set it today. The ``False`` default lives on the
+    ``QueueStore`` protocol (store/base.py), so a FUTURE backend that hasn't implemented the
+    ``pt_deliveries`` branch of :meth:`transform_handoff` is rejected here rather than at the first
+    Handler ``Send`` into a PT connector (which would NotImplementedError *after* the inbound was
+    already ACKed). Names the offending PT connection(s) and the backend.
 
     This is the **single source of truth** for the gate: it runs on EVERY config-application path —
     ``Engine.start`` calls it directly, and the reload (live-runner + runner-None bring-up) and
-    ``reload(dry_run=True)`` paths reach it via :meth:`RegistryRunner.build_check` — so a PT-on-non-
-    SQLite graph is rejected with a :class:`WiringError` (422) before any swap/start, leaving any
+    ``reload(dry_run=True)`` paths reach it via :meth:`RegistryRunner.build_check` — so a PT graph on a
+    PT-incapable backend is rejected with a :class:`WiringError` (422) before any swap/start, leaving any
     already-running graph untouched. No-op when the backend supports PT or the graph has no PT inbound,
-    so the SQLite path is byte-identical."""
+    so the path on today's three backends is byte-identical."""
     if getattr(store, "supports_pt_reingress", False):
-        return  # backend opted in (SQLite) — PT is permitted, nothing to gate
+        return  # backend opted in (SQLite/Postgres/SQL Server) — PT is permitted, nothing to gate
     pt_inbounds = sorted(
         name for name, ic in registry.inbound.items() if ic.spec.type is ConnectorType.PT
     )
@@ -5118,8 +5893,47 @@ def check_pt_backend_supported(registry: Registry, store: QueueStore) -> None:
     names = ", ".join(repr(n) for n in pt_inbounds)
     plural = "s" if len(pt_inbounds) > 1 else ""
     raise WiringError(
-        f"Pass-through (PT) connector{plural} {names} require{'' if plural else 's'} the SQLite "
-        f"store backend; backend {backend_name!r} does not support PT re-ingress yet."
+        f"Pass-through (PT) connector{plural} {names} require{'' if plural else 's'} a store backend "
+        f"with PT re-ingress support (SQLite, Postgres, and SQL Server all have it); backend "
+        f"{backend_name!r} does not support PT re-ingress."
+    )
+
+
+def check_reference_backend_supported(registry: Registry, store: QueueStore) -> None:
+    """Reject a graph that declares a reference set (ADR 0006 ``Reference(...)``) on a store backend that
+    doesn't implement the snapshot store, BEFORE any inbound listener accepts a message.
+
+    **ALLOW-LIST semantics** (the :func:`check_pt_backend_supported` shape): permitted only on a backend
+    whose ``supports_reference_sets`` is ``True``. All three shipped backends are (SQLite the reference
+    implementation, Postgres ported, SQL Server ported at parity — BACKLOG #235), so today the gate
+    guards any future backend that leaves the base-protocol default ``False``. No-op when the backend
+    supports sets, and no-op when the graph declares none, so a deployment that doesn't use reference
+    sets is untouched either way.
+
+    **Why ENGINE-REFUSAL and not an ADR-0031 lane degrade.** A reference set is registry-GLOBAL and the
+    read is a runtime-only ``reference(name)`` call inside a Handler body: there is no sound static
+    handler->refset edge to scope a degrade to (``config/reachability.py``'s is self-declared heuristic and
+    cannot see a computed name), so ANY handler on ANY inbound may read the set. Nor is it analogous to
+    the capture case — a capture-incapable lane still retries its rows and drops nothing, whereas an
+    unmaterializable set makes every reading handler raise post-ACK, forever. Refusing the graph is the
+    only sound choice; the gate keys on DECLARATION, so it fires even with ``sync_on_startup`` off (the
+    set still never materializes).
+
+    Folded into :meth:`RegistryRunner.build_check` as well as ``Engine.start``, so EVERY config-application
+    path (reload, promote, ``reload(dry_run=True)``) reaches it and a reload that ADDS a ``Reference(...)``
+    fails 422 before any swap, leaving the running graph untouched."""
+    if getattr(store, "supports_reference_sets", False):
+        return  # backend implements the snapshot store (SQLite/Postgres) — nothing to gate
+    if not registry.references:
+        return  # no reference set declared — any backend is fine
+    backend = getattr(store, "backend", None)
+    backend_name = backend.value if isinstance(backend, StoreBackend) else type(store).__name__
+    names = ", ".join(repr(n) for n in sorted(registry.references))
+    plural = "s" if len(registry.references) > 1 else ""
+    raise WiringError(
+        f"Reference set{plural} {names} require{'' if plural else 's'} a store backend that implements "
+        f"ADR 0006 reference snapshots; backend {backend_name!r} does not, so "
+        f"every reference(...) read would raise at run time, after the ACK."
     )
 
 
@@ -5307,7 +6121,7 @@ def _inbound_insecure_bind_permitted(
         return False
     if posture is None:
         return True  # un-postured (direct/embedding) call: preserve the shipped warn (see above)
-    return not (posture.production and posture.is_phi)
+    return not (posture.enforcing and posture.is_phi)
 
 
 def check_mllp_tls_exposure(

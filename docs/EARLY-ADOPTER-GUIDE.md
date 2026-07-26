@@ -78,7 +78,7 @@ use the table below alongside them when planning.
 | Code-first Connection/Router/Handler graph | ✅ Built |
 | **SQLite (WAL)** store backend | ✅ Production-ready — the default, single-node/dev |
 | **PostgreSQL** store backend (single-node) | ✅ Production-ready — full staged pipeline, at-rest encryption, retention; single-node parity with SQLite |
-| **Microsoft SQL Server** store backend (single-node) | ✅ Production-ready — full staged pipeline + response capture, at-rest encryption; needs the `sqlserver` extra + OS-level ODBC Driver 18. Retention is a DBA concern (TDE + SQL Agent). |
+| **Microsoft SQL Server** store backend (single-node) | ✅ Production-ready — full staged pipeline + response capture, at-rest encryption; needs the `sqlserver` extra + OS-level ODBC Driver 18. Engine-enforced retention/purge at full parity with SQLite; only WAL checkpoint / `VACUUM` / the DB-tier `.mfbak` snapshot are DBA-owned there. |
 | Transactional staged queue (ingress→routed→outbound), at-least-once, dead-letter, replay | ✅ Built — see [ADR 0001](adr/0001-staged-pipeline-architecture.md) |
 | Auth + RBAC + hash-chained audit log | ✅ Built — see [SECURITY.md](SECURITY.md) |
 | At-rest body encryption (AES-256-GCM, opt-in) + key rotation | ✅ Built — see [PHI.md](PHI.md) |
@@ -87,7 +87,7 @@ use the table below alongside them when planning.
 | Windows-service deployment via NSSM | ✅ Built — see [SERVICE.md](SERVICE.md) |
 | **Native transport TLS** (API + MLLP) | ✅ Built — in-process API TLS (HTTPS/WSS) + per-connection MLLP-over-TLS, ≥TLS 1.2, opt-in mTLS, and a **fail-closed off-loopback bind guard** (a non-loopback bind without TLS is refused). Raw TCP/X12 stay plaintext (loopback/proxy). See [DEPLOYMENT.md](DEPLOYMENT.md). |
 | **Native MFA** (TOTP, local accounts) | ✅ Built — RFC 6238 TOTP + single-use recovery codes; `[auth].require_mfa` enforces a second factor for local Administrators at the step-up boundary. AD/Entra users' MFA stays delegated to the IdP. See [SECURITY.md](SECURITY.md). |
-| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector. Residual: the syslog transport is plaintext — front it with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
+| **Off-box log + audit forwarding** | ✅ Built — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** when you set `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514, CA anchor via `forward_tls_*`). Residual: the transport **default** is UDP, so TLS is a per-deployment opt-in — set it, or front the collector with a local TLS-forwarding agent. See [PHI.md](PHI.md) §7. |
 | **Active-passive HA / failover** | ✅ Built (Track B) — opt-in leader/standby cluster on a **shared server-DB** store (PostgreSQL or SQL Server): only the leader runs the graph, self-fencing leadership lease, immediate on-promotion recovery. Single-node stays the byte-identical default. See [CLUSTERING.md](CLUSTERING.md) + §14. |
 
 ### Experimental or not yet built — **do not depend on these for a production pilot**
@@ -253,6 +253,22 @@ the built-in default `samples/config` exists only in a source checkout), `--serv
 > another environment's values/secrets. Built-in names `dev`/`staging`/`prod` carry a default posture;
 > a custom name (e.g. `test`, `poc`) also needs `[ai].data_class` + `[ai].production`. The active
 > environment is logged at startup.
+
+> 🔑 **`dev` now carries the PHI posture ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — provide a store key or declare synthetic.**
+> Since ADR 0148 (GIVEN 1) the built-in `dev` env derives the **PHI** data-class, so your first run exercises
+> the same at-rest-encryption path production uses (rather than first meeting it in prod). `serve --env dev`
+> therefore **refuses to start (exit 2) without a store encryption key**. Two ways forward for a local run:
+> - **Recommended — mint a throwaway dev key** (exercises the real encryption path): run `messagefoundry
+>   gen-key` and set the printed base64 value as `MEFOR_STORE_ENCRYPTION_KEY` (a dev key is fine; **never
+>   commit it**).
+> - **Genuinely no-PHI box** — declare it synthetic: set `[security].handles_real_patient_data = false` (a
+>   loud, audited opt-out) to run **key-free**, for a dev/CI box that only ever processes synthetic HL7.
+>
+> The refuse/warn severity of the PHI serve-gate ladder is the `[security].enforcement` dial (default
+> `enforce`, byte-identical to the former production behaviour). On a **loopback** dev bind you hit only the
+> keyless-PHI refusal above — the off-loopback exposure rungs (TLS, MFA-at-exposure, …) need a non-loopback
+> bind. Set `[security].enforcement = warn` to downgrade the PHI refusals to loud, audited warnings during
+> local bring-up.
 
 ### 4.4 Run it as a Windows service (the supported production run-mode)
 

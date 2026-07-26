@@ -34,15 +34,16 @@ x-ha-engine: &ha-engine
   restart: unless-stopped
 
 x-ha-engine-env: &ha-engine-env
-  MEFOR_API_HOST: "0.0.0.0"
+  MEFOR_SECURITY_LOCAL_ACCESS_ONLY: "false"
+  MEFOR_SECURITY_LISTEN_ADDRESS: "0.0.0.0"
   MEFOR_API_PORT: "8443"
   MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"
   MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
   MEFOR_INBOUND_BIND_HOST: "0.0.0.0"
-  MEFOR_AUTH_ENABLED: "true"
-  MEFOR_AUTH_REQUIRE_MFA: "true"
+  MEFOR_SECURITY_REQUIRE_SIGN_IN: "true"
+  MEFOR_SECURITY_REQUIRE_MFA: "true"
   MEFOR_STORE_REQUIRE_ENCRYPTION: "true"
-  MEFOR_EGRESS_DENY_BY_DEFAULT: "true"
+  MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
   # HA: shared external Postgres + active-passive cluster (SQLite is REFUSED under [cluster]).
   MEFOR_STORE_BACKEND: "postgres"
   MEFOR_STORE_SERVER: "postgres"
@@ -70,17 +71,18 @@ services:
 
     environment:
       # --- exposure (Topology A) ---
-      MEFOR_API_HOST: "0.0.0.0"        # off-loopback in the container so the published port is reachable
+      MEFOR_SECURITY_LOCAL_ACCESS_ONLY: "false"
+      MEFOR_SECURITY_LISTEN_ADDRESS: "0.0.0.0"        # off-loopback in the container so the published port is reachable
       MEFOR_API_PORT: "8443"
       MEFOR_API_TLS_CERT_FILE: "/etc/mefor/tls/api.crt"   # paths (not secrets) — mounted read-only below
       MEFOR_API_TLS_KEY_FILE: "/etc/mefor/tls/api.key"
       MEFOR_INBOUND_BIND_HOST: "0.0.0.0"   # MLLP listener off-loopback; each MLLP() MUST set tls=True (gate)
       # --- production guardrails (the engine refuses to start off-loopback without these) ---
-      MEFOR_AUTH_ENABLED: "true"
-      MEFOR_AUTH_REQUIRE_MFA: "true"        # required for local Administrator accounts on an exposed PHI bind
+      MEFOR_SECURITY_REQUIRE_SIGN_IN: "true"
+      MEFOR_SECURITY_REQUIRE_MFA: "true"        # required for local Administrator accounts on an exposed PHI bind
       MEFOR_STORE_REQUIRE_ENCRYPTION: "true"  # fail closed if no store key (PHI at rest must not be plaintext)
       # --- deny-by-default egress (prod posture) — list YOUR graph's outbound destinations ---
-      MEFOR_EGRESS_DENY_BY_DEFAULT: "true"
+      MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"
       # MEFOR_EGRESS_ALLOWED_MLLP: "partner-a.example.org:6661"
       # MEFOR_EGRESS_ALLOWED_FILE_DIRS: "/var/lib/mefor/out"
       # NOTE: never set MEFOR_ALLOW_INSECURE_TLS here — it is a CI-only switch and disables TLS verification.

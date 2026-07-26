@@ -88,7 +88,7 @@ deployment-conditional OWASP ASVS items ([ASVS-L3-REMEDIATION-PLAN.md](security/
 | **MFA / multi-layer admin** (6.3.3 / 8.4.2) | your **directory (AD / Entra)** — healthcare orgs are now *required* to enforce MFA there; MEFOR authenticates against it (see note below) | **native TOTP MFA is built** (ADR 0002 WP-14) — RFC 6238 for local accounts, enforced for local Administrators via `[auth].require_mfa` + the step-up gate; AD/Entra MFA stays delegated |
 | **TLS client-cert / mTLS** (12.3.5) | your **PKI**; MF's API mTLS is built (`tls_client_ca_file`, opt-in) | enable mTLS + a console client cert |
 | **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) | document the delegation, or add OCSP/CRL to the TLS contexts |
-| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector (residual: the syslog transport is plaintext — front it with a local TLS-forwarding agent) |
+| **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514) (residual: the transport **default** is UDP, so set TLS explicitly or front the collector with a local TLS-forwarding agent) |
 
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
 \<perimeter / IdP / PKI / SIEM\>" is what turns these from open gaps into *addressed-by-environment* —
@@ -163,8 +163,9 @@ HIPAA posture (BAA, KMS, PrivateLink, region pinning), see [`CLOUD-PHI-HIPAA.md`
 5. **Lock down egress** — populate the relevant `[egress].allowed_*` allow-lists so a transform can only
    send to approved destinations (see [egress allow-lists](#egress-allow-lists)).
 6. **Off-box logs + MFA** — **both are built** and pair with off-loopback exposure: enable
-   `[logging].forward_*` to ship logs + (PHI-redacted) audit to your SIEM (front the plaintext syslog
-   hop with a local TLS agent), and set `[auth].require_mfa = true` for local Administrators (AD/Entra
+   `[logging].forward_*` to ship logs + (PHI-redacted) audit to your SIEM (set
+   `forward_protocol = "tls"` for the native RFC 5425 hop — the default is UDP — or front it with a
+   local TLS agent), and set `[auth].require_mfa = true` for local Administrators (AD/Entra
    MFA stays delegated to the IdP).
 
 ---

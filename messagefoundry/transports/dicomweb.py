@@ -59,9 +59,12 @@ from messagefoundry.transports.dicom import recover_dicom_object_bytes
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
     _RETRYABLE_4XX,
-    _insecure_opener,
-    _redact_url,
     InsecureHopGuard,
+    ProxyConfig,
+    _insecure_opener,
+    _no_redirect_opener,
+    _redact_url,
+    egress_route_from_settings,
     enforce_outbound_length_limits,
     refuse_cleartext_credentials,
     refuse_cleartext_egress,
@@ -156,7 +159,17 @@ class DicomWebDestination(DestinationConnector):
         attested = config.tls_hop_attested
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
+        # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
+        self._proxy: ProxyConfig | None = egress_route_from_settings(
+            s, dest_scheme=scheme, attested=attested
+        )
+        dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
+        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
         self._headers = self._build_headers(s)
+        if proxy_dest is not None:
+            # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
+            self._headers.update(proxy_dest.auth_headers())
         # The multipart Content-Type (with the generated boundary) is set per-request in _post — it is not
         # operator-supplied, so it is excluded from the length check (which guards URL + supplied headers).
         enforce_outbound_length_limits(self.base_url, self._headers)
@@ -177,7 +190,9 @@ class DicomWebDestination(DestinationConnector):
                 connector="DICOMweb destination",
                 revocation_attested=config.tls_revocation_attested,
             )
-            self._opener: urllib.request.OpenerDirector = _NO_REDIRECT_OPENER
+            self._opener: urllib.request.OpenerDirector = (
+                _no_redirect_opener(*proxy_handlers) if proxy_handlers else _NO_REDIRECT_OPENER
+            )
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
@@ -189,7 +204,7 @@ class DicomWebDestination(DestinationConnector):
                 "DICOMweb destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.base_url),
             )
-            self._opener = _insecure_opener()
+            self._opener = _insecure_opener(*proxy_handlers)
         self._target_url = self._resolve_target_url()
 
     def _resolve_target_url(self) -> str:

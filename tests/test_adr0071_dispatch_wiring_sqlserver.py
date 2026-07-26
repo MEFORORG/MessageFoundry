@@ -38,7 +38,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
 

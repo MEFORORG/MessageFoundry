@@ -120,7 +120,7 @@ class CodeSetError(ValueError):
 #      strictly pure function with zero side effects.
 
 
-class UnmappedKind(str, Enum):
+class UnmappedKind(str, Enum):  # noqa: UP042
     """How a code-set lookup resolves a **miss** (a key not in the table), declared per code set.
 
     ``NONE`` is the backward-compatible default (no policy declared): :meth:`CodeSet.translate` raises,
@@ -515,6 +515,15 @@ def _load_csv(path: Path) -> dict[str, Any]:
             )
         single = len(value_fields) == 1
         for row in reader:
+            # An over-wide row (more cells than the header) lands in DictReader's ``restkey`` bucket
+            # under the ``None`` key — silently sinking the extra cells (accept-and-drop, CLAUDE.md §1).
+            # Reject it loud so the loader is no stricter/looser than the codeset_edit writer/grid (#240).
+            if None in row:
+                extra = row[None]
+                raise CodeSetError(
+                    f"code set {path.name!r}: a row has more cells than columns "
+                    f"({len(fields) + len(extra)} > {len(fields)})"
+                )
             key = row.get(key_field)
             if key is None:
                 continue  # short/blank row — DictReader fills missing cells with None

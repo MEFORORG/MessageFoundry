@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from messagefoundry.config.settings import StoreSettings, _FILE_SECRET_KEYS
+from messagefoundry.config.settings import _FILE_SECRET_KEYS, StoreSettings
 from messagefoundry.store.base import resolve_active_key
 from messagefoundry.store.crypto import PREFIX, CipherError, cipher_info, make_cipher
 from messagefoundry.store.keyprovider import (

@@ -153,9 +153,33 @@ def test_build_check_fails_loud_on_missing_env_value(tmp_path: Path) -> None:
     reg = load_config(d)
     # A missing value is refused when the connector is built (here, on this instance) — exactly the
     # promote-time guarantee: a graph whose env keys aren't defined for the target never goes live.
+    # This guarantee is UNCHANGED by the #233 not-deployed carve-out below: it is scoped to the flag,
+    # not a general softening — a DEPLOYED connection (the default, so: every existing one) still
+    # fails loud on an env key the target environment does not define.
     runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
     with pytest.raises(WiringError, match="peer_host"):
         runner.build_check(reg)
+
+
+def test_build_check_does_not_resolve_env_for_a_not_deployed_connection(tmp_path: Path) -> None:
+    """The sibling carve-out (#233, ADR 0111): a connection declared ``deployed=false`` is skipped by
+    the build check, so its ``env()`` refs are never resolved and its absent values never raise.
+
+    That is what makes the state usable at all — ``build_check`` is what ``messagefoundry check`` (the
+    required commit gate), every reload/promote and every ``connection upsert`` run, so a partner whose
+    credentials are not provisioned yet would otherwise block all of them (and, today, block edits to
+    every OTHER connection too). The connection stays in the graph; only its BUILD is skipped."""
+    d = _write(
+        tmp_path,
+        """
+        from messagefoundry import outbound, MLLP, env
+        outbound("OB", MLLP(host=env("peer_host"), port=2601), deployed=False)
+        """,
+    )
+    reg = load_config(d)
+    assert "OB" in reg.outbound and reg.outbound["OB"].deployed is False  # still IN the graph
+    runner = RegistryRunner(reg, store=None, env_values={})  # type: ignore[arg-type]
+    runner.build_check(reg)  # must not raise — 'peer_host' is never looked up
 
 
 def test_committed_environment_files_define_the_same_keys() -> None:

@@ -73,7 +73,7 @@ Recognized rows are deliberately **bounded** (the structural subset that round-t
 
 - **action/lookup rows** — single expression-statements calling the v1 vocabulary (or `db_lookup`/`fhir_lookup`/`code_lookup`) with literal args or bounded `Message`-read expressions (`msg["…"]`, `msg.field(…)`).
 - **control rows** — `if/elif/else` whose test is a bounded expression (Message reads, comparisons, boolean ops, string methods over them, literals), and `for` over `msg.groups(…)`/segment iterations; bodies are nested row sequences.
-- **send rows** — `return Send(…)` / list-of-`Send` returns.
+- **send rows** — `return Send(…)` / list-of-`Send` returns / `sends.append(Send(…))` accumulator sends ([ADR 0108](0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md)).
 - **everything else** — a **`code` row**: rendered *in place, in order* in the list as read-only code. This is the key UX decision: one hand-written line does **not** eject the whole handler from the lens; it appears as an opaque-but-visible step between typed rows (degradation ladder: typed row → code row → whole-file refusal only on parse failure).
 
 ## 5. Rewrite semantics + PHI (the load-bearing correctness section)

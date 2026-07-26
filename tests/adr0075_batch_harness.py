@@ -29,7 +29,6 @@ from messagefoundry.store import sqlserver as ss
 from messagefoundry.store.crypto import IdentityCipher
 from messagefoundry.store.sqlserver import SqlServerStore
 
-
 # --- canned fetch results (steer the common delivered/PROCESSED hot path) --------------------------
 
 
@@ -50,7 +49,7 @@ def fetchone_for(sql: str) -> Any:
 #   error        -> a DEAD row                        -> UPDATE messages.status = ERROR
 #   still_moving -> a PENDING row                     -> "return" (NO status UPDATE — still in flight)
 #   filtered     -> NO queue rows remain              -> "check_message" -> reads _SQL_SELECT_MESSAGE_STATUS
-#                                                        ('routed') -> UPDATE messages.status = FILTERED
+#                                                        ('routed', not_deployed=0) -> UPDATE = FILTERED
 _FINALIZE_ROWS: dict[str, list[tuple[Any, ...]]] = {
     "processed": [("outbound", "done", 1)],
     "error": [("outbound", "dead", 1)],
@@ -63,7 +62,8 @@ def fetchall_for(sql: str, scenario: str = "processed") -> Any:
     if sql == ss._SQL_FINALIZE_COUNT:
         return _FINALIZE_ROWS[scenario]
     if sql == ss._SQL_SELECT_MESSAGE_STATUS:
-        return [("routed",)]  # only reached on the check_message branch -> FILTERED
+        # (status, not_deployed_flag) — column 1 = 0 here (#233), so the check_message branch -> FILTERED.
+        return [("routed", 0)]
     return []
 
 
@@ -189,7 +189,7 @@ async def drive_async(
     return await getattr(store, method)(**kwargs)
 
 
-ROUTE_KWARGS: dict[str, Any] = dict(
+ROUTE_KWARGS: dict[str, Any] = dict(  # noqa: C408
     ingress_id="ing-1",
     message_id="m-1",
     channel_id="IB",
@@ -198,7 +198,7 @@ ROUTE_KWARGS: dict[str, Any] = dict(
     now=100.0,
 )
 
-TRANSFORM_KWARGS: dict[str, Any] = dict(
+TRANSFORM_KWARGS: dict[str, Any] = dict(  # noqa: C408
     routed_id="rtd-1",
     message_id="m-1",
     channel_id="IB",

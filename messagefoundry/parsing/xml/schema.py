@@ -35,14 +35,35 @@ class XmlSchemaResult:
     reasons: tuple[str, ...] = ()
 
 
+def _is_inline_xml(schema_source: str | bytes) -> bool:
+    """True when ``schema_source`` is the XSD **document** rather than a path/URL to one."""
+    head = schema_source.lstrip()[:1]
+    return head == (b"<" if isinstance(schema_source, (bytes, bytearray)) else "<")
+
+
 def _build_schema(xmlschema_mod: Any, schema_source: str | bytes) -> Any:
     """Construct an ``xmlschema.XMLSchema`` with remote ``schemaLocation`` fetching disabled.
 
     ``allow="local"`` + ``base_url=None`` keep xmlschema from resolving any non-local schema reference
-    over the network (no SSRF via an ``import``/``include``/``schemaLocation`` URL)."""
+    over the network (no SSRF via an ``import``/``include``/``schemaLocation`` URL).
+
+    An **inline** schema is parsed by :func:`~messagefoundry.parsing.xml.harden.parse_bytes` first, so
+    the XSD goes through the same lockdown as every other document and xmlschema is handed an
+    already-hardened tree instead of raw text (ASVS 1.5.3). Without that it parsed the source with its
+    own **non-defused** ElementTree: an XSD carrying
+    ``<!DOCTYPE xs:schema [<!ENTITY nm "patient">]>`` was parsed and its internal entity **expanded**,
+    while ``parse_bytes`` refuses a DOCTYPE outright — an unbound inconsistency between two of the
+    codec's four parsers, and the reason "xmlschema only ever sees an already-hardened tree" was not
+    true as written. A schema given as a **path** cannot be pre-parsed; xmlschema resolves it, still
+    under ``allow="local"``.
+    """
     try:
-        return xmlschema_mod.XMLSchema(schema_source, allow="local", base_url=None)
-    except Exception as exc:  # xmlschema raises its own hierarchy for a bad schema
+        source: Any = parse_bytes(schema_source) if _is_inline_xml(schema_source) else schema_source
+        return xmlschema_mod.XMLSchema(source, allow="local", base_url=None)
+    except Exception as exc:  # xmlschema (and now harden) raise their own hierarchies
+        # The exception TYPE names which gate refused it (XmlSecurityError = the XSD carried a
+        # DOCTYPE) without quoting the schema text. Keeps validate_against's documented contract:
+        # a schema that cannot be loaded is always XmlValidationError.
         raise XmlValidationError(f"could not load XSD schema: {type(exc).__name__}") from exc
 
 

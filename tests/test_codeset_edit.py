@@ -284,6 +284,95 @@ def test_upsert_collides_with_existing_toml(tmp_path: Path) -> None:
     assert not (cs_dir / "diets.csv").exists()
 
 
+# --- #240: over-wide row refused at read (show→shear→save can't defeat _validate_rows) -------
+
+
+def test_read_csv_grid_refuses_over_wide_row(tmp_path: Path) -> None:
+    # A row with more cells than the header was SILENTLY SHEARED (cells[:width]) — a show → save
+    # round-trip persisted that truncation, dropping the extra cell. It must fail loud at read (#240).
+    cs_dir = _codesets(tmp_path)
+    cs_dir.mkdir()
+    path = cs_dir / "diets.csv"
+    path.write_text("code,value\nA,Apple,EXTRA\n", encoding="utf-8")
+    with pytest.raises(WiringError, match="row 0 has more cells than columns"):
+        codeset_edit._read_csv_grid(path)
+
+
+def test_show_refuses_over_wide_row(tmp_path: Path) -> None:
+    # End-to-end: `show` on a file with an over-wide row fails loud (the loader tightening catches it
+    # too — either way it is never quietly sheared into the grid).
+    cs_dir = _codesets(tmp_path)
+    cs_dir.mkdir()
+    (cs_dir / "diets.csv").write_text("code,value\nA,Apple,EXTRA\n", encoding="utf-8")
+    with pytest.raises(WiringError, match="more cells than columns"):
+        codeset_edit.show_code_set(tmp_path, "diets")
+
+
+def test_loader_rejects_over_wide_row(tmp_path: Path) -> None:
+    # The engine loader must be no looser than the editor: an over-wide row used to sink its extra
+    # cells into DictReader's restkey (accept-and-drop). Now it fails loud like the writer/grid (#240).
+    from messagefoundry.config.code_sets import CodeSetError, load_code_set
+
+    cs_dir = _codesets(tmp_path)
+    cs_dir.mkdir()
+    path = cs_dir / "diets.csv"
+    path.write_text("code,value\nA,Apple,EXTRA\n", encoding="utf-8")
+    with pytest.raises(CodeSetError, match="more cells than columns"):
+        load_code_set(path)
+
+
+# --- #240: create-collision refusal (a create must not silently overwrite an existing stem) ---
+
+
+def test_create_refuses_existing_csv_stem(tmp_path: Path) -> None:
+    codeset_edit.upsert_code_set(
+        tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    before = (_codesets(tmp_path) / "diets.csv").read_bytes()
+    with pytest.raises(WiringError, match="already exists.*must not overwrite"):
+        codeset_edit.upsert_code_set(
+            tmp_path,
+            "diets",
+            ["code", "value"],
+            [["A", "Avocado"]],
+            validate=_validate,
+            create=True,
+        )
+    # The existing code set was not touched.
+    assert (_codesets(tmp_path) / "diets.csv").read_bytes() == before
+
+
+def test_create_refuses_existing_toml_stem(tmp_path: Path) -> None:
+    cs_dir = _codesets(tmp_path)
+    cs_dir.mkdir()
+    (cs_dir / "diets.toml").write_text('A = "Apple"\n', encoding="utf-8")
+    with pytest.raises(WiringError, match="already exists.*must not overwrite"):
+        codeset_edit.upsert_code_set(
+            tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate, create=True
+        )
+    assert not (cs_dir / "diets.csv").exists()
+
+
+def test_create_writes_a_fresh_stem(tmp_path: Path) -> None:
+    # create=True is fine when the stem is genuinely new — it only refuses a collision.
+    result = codeset_edit.upsert_code_set(
+        tmp_path, "fresh", ["code", "value"], [["A", "Apple"]], validate=_validate, create=True
+    )
+    assert result["op"] == "upsert" and result["entries"] == 1
+
+
+def test_edit_default_overwrites_existing_stem(tmp_path: Path) -> None:
+    # The default (create=False) is the edit path: overwriting the same-stem .csv is allowed.
+    codeset_edit.upsert_code_set(
+        tmp_path, "diets", ["code", "value"], [["A", "Apple"]], validate=_validate
+    )
+    codeset_edit.upsert_code_set(
+        tmp_path, "diets", ["code", "value"], [["A", "Avocado"]], validate=_validate
+    )
+    sets = load_code_sets(_codesets(tmp_path))
+    assert sets["diets"]["A"] == "Avocado"
+
+
 # --- atomic rollback ---------------------------------------------------------
 
 
@@ -509,6 +598,58 @@ def test_cli_upsert_then_list_then_show(tmp_path: Path, capsys: pytest.CaptureFi
     )
     assert rc == 0
     assert json.loads(out)["rows"] == [["A", "Apple"], ["B", "Banana"]]
+
+
+def test_cli_upsert_without_name_refuses_create_collision(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The grid editor OMITS --name when CREATING a new table; the CLI reads that as create-intent
+    # (create=--name is None) and refuses to overwrite an existing stem (#240).
+    detail = {"name": "diets", "columns": ["code", "value"], "rows": [["A", "Apple"]]}
+    _run(
+        ["codeset", "upsert", "--config", str(tmp_path), "--data", json.dumps(detail), "--json"],
+        capsys,
+    )
+    detail2 = {"name": "diets", "columns": ["code", "value"], "rows": [["A", "Avocado"]]}
+    rc, out = _run(
+        ["codeset", "upsert", "--config", str(tmp_path), "--data", json.dumps(detail2), "--json"],
+        capsys,
+    )
+    assert rc == 1
+    assert "already exists" in json.loads(out)["error"]
+    # The existing code set was not overwritten.
+    sets = load_code_sets(_codesets(tmp_path))
+    assert sets["diets"]["A"] == "Apple"
+
+
+def test_cli_upsert_with_name_edits_existing_stem(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The grid editor passes --name <editName> on an EDIT; the CLI reads that as edit-intent and
+    # overwrites the same-stem .csv (create=False).
+    detail = {"name": "diets", "columns": ["code", "value"], "rows": [["A", "Apple"]]}
+    _run(
+        ["codeset", "upsert", "--config", str(tmp_path), "--data", json.dumps(detail), "--json"],
+        capsys,
+    )
+    detail2 = {"name": "diets", "columns": ["code", "value"], "rows": [["A", "Avocado"]]}
+    rc, out = _run(
+        [
+            "codeset",
+            "upsert",
+            "--config",
+            str(tmp_path),
+            "--name",
+            "diets",
+            "--data",
+            json.dumps(detail2),
+            "--json",
+        ],
+        capsys,
+    )
+    assert rc == 0
+    sets = load_code_sets(_codesets(tmp_path))
+    assert sets["diets"]["A"] == "Avocado"
 
 
 def test_cli_upsert_reads_stdin(

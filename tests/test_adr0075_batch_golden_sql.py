@@ -11,11 +11,10 @@ teeth — a reordered or dropped grouping does NOT equal the unbatched sequence.
 
 from __future__ import annotations
 
+import adr0075_batch_harness as h
 import pytest
 
 from messagefoundry.store import sqlserver as ss
-
-import adr0075_batch_harness as h
 
 
 async def _run_pair(
@@ -88,7 +87,7 @@ async def test_transform_batched_matches_unbatched_sequence() -> None:
 async def test_transform_batched_with_state_and_multi_delivery_matches() -> None:
     # State MERGEs + 2 deliveries: the loops fold into the group ending at the finalize applock. Proves
     # the batched form preserves the shared sorted((namespace,key)) order and delivery order.
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-9",
         message_id="m-9",
         channel_id="IB",
@@ -191,7 +190,7 @@ async def test_batched_idempotent_noop_matches_unbatched() -> None:
 
 
 async def test_route_batched_multi_handler_matches() -> None:
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         ingress_id="ing-2",
         message_id="m-2",
         channel_id="IB",
@@ -210,7 +209,7 @@ async def test_route_batched_multi_handler_matches() -> None:
 
 
 async def test_route_batched_unrouted_zero_handlers_matches() -> None:
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         ingress_id="ing-3",
         message_id="m-3",
         channel_id="IB",
@@ -242,7 +241,7 @@ async def test_route_batched_unrouted_zero_handlers_matches() -> None:
 async def test_transform_batched_filtered_disposition_matches() -> None:
     # FILTERED: the transform delivered nothing and no queue rows remain -> the finalizer takes the
     # check_message branch and issues the EXTRA _SQL_SELECT_MESSAGE_STATUS read, then UPDATE=FILTERED.
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-f",
         message_id="m-f",
         channel_id="IB",
@@ -268,7 +267,7 @@ async def test_transform_batched_filtered_disposition_matches() -> None:
 async def test_transform_batched_still_moving_disposition_matches() -> None:
     # still-moving: a PENDING queue row remains -> the finalizer returns WITHOUT an UPDATE (one fewer
     # statement). Batched must emit the identical (shorter) sequence.
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-s",
         message_id="m-s",
         channel_id="IB",
@@ -290,7 +289,7 @@ async def test_transform_batched_still_moving_disposition_matches() -> None:
 
 async def test_transform_batched_error_disposition_matches() -> None:
     # ERROR: a DEAD queue row -> finalizer UPDATE=ERROR (no extra status read).
-    kwargs = dict(
+    kwargs = dict(  # noqa: C408
         routed_id="rtd-e",
         message_id="m-e",
         channel_id="IB",

@@ -14,14 +14,21 @@ A self-contained, /ui-scoped ASGI middleware the web console installs on the mou
 * **CSP reporting** — ``report-to``/``report-uri`` pointing at ``POST /ui/csp-report`` plus the modern
   ``Reporting-Endpoints`` header (3.7.5).
 
-**Loopback byte-identity (hard rule).** All of the above is NEW behavior and engages ONLY in an
-effective-https context (scheme https/wss OR the operator's ``exposure_protected`` declaration —
-:func:`._auth.effective_https`, read-only) and only while the org opt-out
-(:func:`._auth.browser_hardening_enabled`) is unset. Over cleartext loopback the middleware is a strict
-no-op: it binds no nonce and mutates no header, so the engine's existing static ``app.state.ui_csp``
-response is emitted byte-for-byte as before. This is why the engine's ``app.state.ui_csp`` seam is left
-set (option (b) in the lane brief): the middleware only OVERRIDES it off-loopback and defers to it on
-loopback — no per-request engine-side switch exists, so the console must own the conditional here.
+**Secure-context engagement (loopback + effective-https).** All of the above is NEW behavior. It
+engages in an effective-https context (scheme https/wss OR the operator's ``exposure_protected``
+declaration — :func:`._auth.effective_https`, read-only) **OR a loopback secure-context**
+(``http://127.0.0.1`` — a W3C *potentially-trustworthy* origin, signalled by ``app.state.loopback``;
+ADR 0143), and only while the org opt-out (:func:`._auth.browser_hardening_enabled`) is unset — the
+combined gate is :func:`._auth.security_headers_context`. On loopback the http-safe headers (nonce-CSP /
+COOP / CORP / Reporting) engage, but the session cookie's Secure / ``__Host-`` prefix still requires
+real https (:func:`._auth.effective_https`) so login is not broken over cleartext loopback (Chrome /
+Safari reject a Secure / ``__Host-`` cookie over http); HSTS likewise stays off on loopback (the engine
+emits it only over real https / ``exposure_protected``). Where the middleware is a strict no-op — the
+org opt-out, or a cleartext NON-loopback context with no ``exposure_protected`` — it binds no nonce and
+mutates no header, so the engine's existing static ``app.state.ui_csp`` response is emitted
+byte-for-byte. This is why the engine's ``app.state.ui_csp`` seam is left set (option (b) in the lane
+brief): the middleware only OVERRIDES it in a secure context and defers to it otherwise — no per-request
+engine-side switch exists, so the console must own the conditional here.
 
 **Proxy-TLS keying.** This middleware reads ``scope['scheme']`` at the OUTERMOST layer, which precedes
 any inner proxy-headers scheme rewrite. Exactly like the engine's ``_cookie_secure``, a proxy that
@@ -43,12 +50,113 @@ middleware before the base layer runs is copied into that task and IS visible.
 
 **Browser-support contract (defined fallback).** These are all defense-in-depth headers a conformant
 modern browser honors; an older client that ignores ``Cross-Origin-Opener-Policy`` /
-``Reporting-Endpoints`` / nonce sources simply DEGRADES to the prior same-origin posture — the
-``SameSite=Strict`` session cookie, ``frame-ancestors 'none'``, and the ``Sec-Fetch`` / ``Origin`` checks
-in :mod:`._auth` — and never hard-fails a request. There is deliberately NO
-``Cross-Origin-Embedder-Policy: require-corp``: COEP gates EVERY subresource on an explicit CORP/CORS
-opt-in and would break the same-origin ``/ui/static`` assets and the ``data:`` images the /ui CSP already
-allows, for no isolation gain on a surface that embeds no cross-origin content.
+``Cross-Origin-Resource-Policy`` / ``Reporting-Endpoints`` / nonce sources / ``SameSite`` simply
+DEGRADES to the prior same-origin posture — the ``SameSite=Strict`` session cookie,
+``frame-ancestors 'none'``, and the ``Sec-Fetch`` / ``Origin`` checks in :mod:`._auth` — and never
+hard-fails a request. There is deliberately NO ``Cross-Origin-Embedder-Policy: require-corp``: COEP
+gates EVERY subresource on an explicit CORP/CORS opt-in and would break the same-origin ``/ui/static``
+assets and the ``data:`` images the /ui CSP already allows, for no isolation gain on a surface that
+embeds no cross-origin content.
+
+**Which relied-on features are actively DETECTED, and which degrade silently (ASVS 3.7.5).** The
+contract above is only testable if it says, per feature, what the console does when the feature is
+absent. Three sets are enumerated below, each entry in exactly one bucket — detected-and-warned, or
+degrades-silently-with-a-named compensating control:
+
+1. every **browser-security response header** that reaches a ``/ui`` response — including the ones
+   emitted by the ENGINE's own security-headers middleware (``api/app.py``) rather than by this one;
+2. every **client-side browser security feature the console feature-detects** in its own scripts
+   (``static/app.js`` and the nonce'd shell scripts in :mod:`._html`);
+3. the **session cookie's security attributes** (``__Host-`` prefix / ``Secure`` / ``HttpOnly`` /
+   ``SameSite``), which no page script can observe at all.
+
+This list is the in-code source of truth the runbook's operator-facing copy mirrors, and a CI guard
+(``test_ui_csp_canary.py``) derives all three sets from the CODE — the header writes, the
+``window.<Feature>`` reads, and the ``set_cookie`` attributes — and fails if any member is missing
+here or from the runbook, so a newly-shipped header, detect or cookie attribute cannot slip in
+unbucketed. Anything OUTSIDE those three sets is outside the claim.
+
+* **Secure transport context** — DETECTED and WARNED. The nonce'd page-shell script reads
+  ``window.isSecureContext``; false raises a visible ``role="alert"`` banner
+  (:mod:`._html`). Correctly inert on the loopback posture, where ``http://127.0.0.1`` IS a secure
+  context; it exists for the proxy-TLS mismatch the engine cannot see server-side.
+* **CSP enforcement** (``Content-Security-Policy`` honoured at all) — DETECTED and WARNED. The shell
+  loads an UN-NONCED external canary (``/ui/static/csp-probe.js``); an enforcing browser refuses it
+  under ``script-src 'nonce-…' 'strict-dynamic'`` so its global stays undefined, while a browser that
+  does not enforce CSP runs it and the nonce'd detect raises a second ``role="alert"`` banner. This is
+  an ACTIVE detect that fires on the default deployment: the flag can only be set when the policy is
+  not being applied. Its expected violation reports are filtered out of the log by SAME-ORIGIN
+  blocked-URL path, per report entry — never per batch — so a real violation delivered in the same
+  Reporting-API POST still warns (:mod:`.routes.core`).
+* **CSP nonce-source support / script execution** — DETECTED and WARNED, by the INVERSE detect. A
+  browser that ENFORCES CSP but does not understand ``'nonce-…'``/``'strict-dynamic'`` has no valid
+  script source and blocks EVERY script — app.js, both detects above, and the ASVS 14.3.1 session
+  watchdog — so no script-raised banner could render (the same is true with JavaScript disabled). The
+  shell therefore SERVER-renders a ``role="alert"`` banner (id ``mf-scripts-blocked-banner``) that a
+  nonce'd mark script removes from view (via an ``<html>`` class app.css keys on) on a healthy
+  client: fail-visible, no flash, and it stands exactly when scripts do not run. **Named residual:**
+  the ASVS 14.3.1 session watchdog is one of the blocked scripts, so a timed-out tab keeps its
+  rendered PHI page until the operator navigates. Compensating: everything the blocked scripts carry
+  is client-side BELT — the server still refuses every subsequent request (idle + absolute expiry,
+  RBAC and auditing are untouched), the expiry redirect still carries ``Clear-Site-Data``, and every
+  /ui HTML response is ``Cache-Control: no-store``.
+* **``window.PublicKeyCredential`` (WebAuthn passkeys)** — DETECTED and WARNED. ``static/app.js``
+  reads it before wiring either passkey ceremony; when it is absent the button is DISABLED and the
+  status line says so in place ("This browser does not support passkeys." on enrolment, "…— use your
+  password/code." on the step-up leg), so the operator is told rather than left clicking a control
+  that silently does nothing. Compensating: a passkey is an ALTERNATIVE factor, never the only one —
+  the TOTP and password legs are untouched, so a browser without WebAuthn can still enroll MFA,
+  complete a step-up and sign in. (The RP-configuration failures — the ``[webauthn]`` extra absent, or
+  no resolvable RP id — are a SERVER-side fail-closed notice, not a browser-support case.)
+* **Session-cookie security attributes — ``__Host-`` prefix / ``Secure`` / ``HttpOnly``** — DEGRADE
+  SILENTLY, necessarily: ``HttpOnly`` is precisely what stops a page script from reading the cookie,
+  so none of the three is observable client-side (``SameSite`` has its own row below for the same
+  reason). Compensating: they are only ever SET where a browser will honour them — the ``__Host-``
+  prefix and ``Secure`` key on :func:`._auth.effective_https`, so cleartext loopback keeps the plain
+  ``mf_session`` rather than a cookie the browser would silently reject and thereby break login —
+  session termination is SERVER-side (revoke + ``Clear-Site-Data``, never cookie deletion alone), and
+  every state-changing /ui POST carries the server-side ``Sec-Fetch-Site``/``Origin`` check, so a
+  browser that ignores the attributes still cannot be driven cross-site with the cookie.
+* **``Cross-Origin-Opener-Policy``** — DEGRADES SILENTLY, by necessity. No browser API exposes COOP
+  enforcement to the page. ``window.crossOriginIsolated`` is NOT a COOP detect — it additionally
+  requires COEP, which is deliberately not set (above), so reading it would render a false "degraded"
+  banner in every browser. The compensating posture is that COOP is pure defense-in-depth here: /ui
+  opens no cross-origin windows and embeds no cross-origin content, so its absence costs process
+  isolation only, and ``frame-ancestors 'none'`` still blocks framing.
+* **``Cross-Origin-Resource-Policy``** — DEGRADES SILENTLY, same rationale: no client-observable API,
+  and /ui serves no resource intended for cross-origin embedding.
+* **``Reporting-Endpoints``** — DEGRADES SILENTLY. It only routes violation reports, so a client that
+  ignores it costs telemetry, never a control; the legacy ``report-uri`` directive is emitted
+  alongside it, so most such clients still deliver reports.
+* **``SameSite=Strict`` on the session cookie** — DEGRADES SILENTLY, with a compensating control that
+  makes the degradation non-fatal rather than merely unwarned: a page script cannot read an HttpOnly
+  cookie's SameSite attribute, so the absence is undetectable client-side, but every state-changing
+  ``/ui`` POST — including the unauthenticated ``/ui/login`` and the gate-less ``/ui/logout`` — carries
+  an explicit server-side ``Sec-Fetch-Site``/``Origin`` check (:func:`._auth.assert_same_origin`,
+  ASVS 3.5.1). A browser that ignores SameSite therefore still cannot mount CSRF against /ui.
+* **``Clear-Site-Data``** (ASVS 14.3.1; emitted by :mod:`._auth` on every login redirect and by
+  :mod:`.routes.core` on logout and the post-termination login render) — DEGRADES SILENTLY; Safari
+  has no support. Compensating: it is only the Back/bfcache belt. The session is revoked SERVER-side,
+  the cookie is explicitly deleted, every /ui HTML response carries ``Cache-Control: no-store``, and
+  the 14.3.1 watchdog blanks the rendered document synchronously before navigating away.
+* **``Cache-Control: no-store``** on /ui HTML and PHI JSON (engine middleware) — DEGRADES SILENTLY: a
+  page script cannot observe another response's cache treatment. Compensating: ``Clear-Site-Data`` on
+  session termination, the watchdog's document blanking, and the server refusing every request the
+  resurrected page would make.
+* **``X-Content-Type-Options: nosniff``** (engine middleware) — DEGRADES SILENTLY. Compensating: the
+  /ui static mount serves ONLY ``.css``/``.js`` from a fixed directory with correct MIME types (ASVS
+  13.4.7, :mod:`._static`), and no user-supplied file is ever served from the /ui origin.
+* **``X-Frame-Options: DENY``** (engine middleware) — DEGRADES SILENTLY, and is pure legacy
+  redundancy: the CSP's ``frame-ancestors 'none'`` is the modern control and every browser that
+  honours the nonce CSP honours it.
+* **``Referrer-Policy: no-referrer``** (engine middleware) — DEGRADES SILENTLY. Compensating: the same
+  policy is ALSO carried in-document by ``<meta name="referrer" content="no-referrer">`` in every page
+  shell (:func:`._html.page`), /ui URLs carry opaque ids only (never PHI), and ``/ui`` links off-site
+  nowhere.
+* **``Strict-Transport-Security``** (engine middleware, effective-https only) — DEGRADES SILENTLY.
+  Compensating: TLS is terminated by the documented reverse proxy, which is configured to redirect
+  cleartext, and the ``window.isSecureContext`` banner above makes a cleartext hop visible to the
+  operator.
 """
 
 from __future__ import annotations
@@ -58,7 +166,7 @@ import secrets
 from starlette.datastructures import MutableHeaders
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from ._auth import browser_hardening_enabled, effective_https
+from ._auth import browser_hardening_enabled, security_headers_context
 from ._html import reset_csp_nonce, set_csp_nonce
 
 #: The route (registered in :mod:`.routes.core`) the browser POSTs CSP violation reports to, and the
@@ -69,6 +177,21 @@ CSP_REPORT_GROUP = "mf-csp"
 #: Cross-origin isolation headers set on every effective-https /ui HTML response.
 COOP_VALUE = "same-origin"
 CORP_VALUE = "same-origin"
+
+#: Every browser-security response header :class:`UiSecurityHeadersMiddleware` writes. Declared here
+#: so the ASVS 3.7.5 degrade-contract guard can read the emitted set from CODE instead of a literal in
+#: the test; the guard also re-derives it from the ``send_wrapper`` source, so this tuple cannot drift
+#: away from what is actually emitted (see ``test_ui_csp_canary.py``).
+#:
+#: Deliberately a DECLARATION with no runtime consumer — the middleware writes the headers directly so
+#: the emitting code stays readable in one place. Its consumer is the contract guard, and its job is
+#: to be the thing that guard compares the source against; do not "clean it up" into the send_wrapper.
+SECURITY_HEADER_NAMES: tuple[str, ...] = (
+    "Content-Security-Policy",
+    "Cross-Origin-Opener-Policy",
+    "Cross-Origin-Resource-Policy",
+    "Reporting-Endpoints",
+)
 
 _NONCE_BYTES = 16  # secrets.token_urlsafe(16) -> 22 url-safe chars, ample CSP nonce entropy
 
@@ -102,11 +225,13 @@ class UiSecurityHeadersMiddleware:
             await self.app(scope, receive, send)
             return
         app_state = getattr(scope.get("app"), "state", None)
-        if not browser_hardening_enabled() or not effective_https(
+        if not browser_hardening_enabled() or not security_headers_context(
             app_state, scope.get("scheme", "http")
         ):
-            # Cleartext loopback / opt-out: strict no-op -> the engine's static /ui CSP response stands
-            # byte-for-byte (loopback byte-identity; the org opt-out reverts every scheme).
+            # Opt-out, or a cleartext NON-loopback context with no exposure_protected: strict no-op ->
+            # the engine's static /ui CSP response stands byte-for-byte (the org opt-out reverts every
+            # scheme; a loopback secure-context now ENGAGES the http-safe headers via
+            # security_headers_context, ADR 0143 — see the module docstring).
             await self.app(scope, receive, send)
             return
         nonce = secrets.token_urlsafe(_NONCE_BYTES)

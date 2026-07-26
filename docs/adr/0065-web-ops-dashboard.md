@@ -10,6 +10,12 @@
   MFA-at-exposure ([config/settings.py](../../messagefoundry/config/settings.py) `exposure_protected`,
   [__main__.py](../../messagefoundry/__main__.py)); the one-way dependency rule (CLAUDE.md §4).
 
+> **Amended by [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (2026-07-21):**
+> the console default flipped **ON** (`[api].serve_ui` / `[security].serve_web_console` default `true`,
+> disableable), and the §hardening bundle now also engages over the **loopback secure-context**
+> (`http://127.0.0.1`) via `security_headers_context` — the http-safe headers (nonce-CSP/COOP/CORP/Reporting)
+> engage there while the session cookie's `Secure`/`__Host-` stays https-gated (login not broken over cleartext loopback).
+
 ## Context
 
 BACKLOG #75's audience decision (2026-06-29) locked an ops view that is **viewable without a Python or
@@ -229,3 +235,82 @@ desktop-console retirement ("option c", gated per #75).
 `docs/security/ASVS-L3-ASSESSMENT.md` (the "no browser frontend" premise + the flipped cells),
 `docs/SECURITY.md` (the exposed-gate now covers `/ui`), `docs/PHI.md` (write the missing browser-client
 section), and supersedes the CORS + localStorage language in [BACKLOG #75](../BACKLOG.md).
+
+---
+
+## Amendment (2026-07-19) — Historical trend charts + status-colored data-flow graph (BACKLOG #76)
+
+- **Status:** **Accepted (2026-07-19).** Additive to the accepted M1/M2 design — no boundary, PHI, or
+  CSP change. Implements [BACKLOG #76](../BACKLOG.md) "historical-metrics charting + status-colored
+  data-flow graph" (lane `dg-s8a`, Wave 6).
+
+**What it adds.** A read-only **Monitoring → Flow & trends** page (`/ui/monitoring`) with two panels:
+
+1. **A status-colored, by-name data-flow graph.** Rendered as **inline SVG** server-side from the
+   authoritative static wiring edges — [`config/graph.py`](../../messagefoundry/config/graph.py)'s
+   `build_wiring_graph(registry)` (the same inbound → router → handler → outbound edge extractor the
+   `graph --json` CLI and the IDE CONNECTIONS view use). A new **read-only** JSON endpoint
+   `GET /graph/edges` (`monitoring:read`) returns those edges plus each connection node's **live status**
+   (running/stopped/failed/filtered/not_deployed, read from the `RegistryRunner`). The node colour is
+   **derived from live status**, never operator-assigned (that is [BACKLOG #79](../BACKLOG.md)'s scope).
+
+2. **Historical trend charts.** A new **read-only** JSON endpoint `GET /metrics/history` (`monitoring:read`)
+   returns a bounded **in-memory ring** of point-in-time samples (queue-by-status counts). The ring is
+   fed by the **existing ~1s `/ws/stats` sampler** — no new background task and no extra store I/O (the
+   sample is derived from the `outbox_by_status` dict `/ws/stats` already fetches each tick), with a
+   ≥~0.9s dedupe so multiple open sockets never double-append. The charts render as **inline SVG**.
+
+**Invariants honoured (do NOT redesign):**
+
+- **No `channel`/`route` object (CLAUDE.md §1).** The graph is the *by-name Registry edge set*
+  (`WiringEdge` tuples) rendered directly; it constructs **no** graph-bundling "channel"/"route" element.
+- **`api/` stays read-only + one-way (CLAUDE.md §4).** Both endpoints are `GET`, `monitoring:read`, and
+  import only `config.graph` (pure, stdlib-only) + the already-attached `RegistryRunner` — **no
+  `pipeline/` import** for graph derivation.
+- **CSP `script-src 'self'` (AC-5) is unchanged.** Charts + graph are **inline SVG / first-party JS
+  only** — no chart-library CDN, no new third-party asset (so the M1 "no VENDOR.md" note still holds).
+- **Metadata only — no message body.** Samples are aggregate counts; the graph carries connection
+  *names* + status. No PHI reaches these surfaces (no field values, no bodies).
+- **`store_schema` stays False.** The first slice is the **in-memory ring** only; a durable
+  history table (which would flip `store_schema` true) is explicitly out of scope.
+
+- **AC-8** — WHEN `GET /graph/edges` is called, THE SYSTEM SHALL return the `build_wiring_graph` edge set
+  with live per-node status and SHALL NOT construct any channel/route object.
+  → `tests/test_metrics_history_graph.py::test_graph_edges_from_registry`
+- **AC-9** — WHEN the `/ws/stats` sampler runs, THE SYSTEM SHALL append at most one metrics-history sample
+  per ~second and `GET /metrics/history` SHALL return them oldest-first, bounded to the ring capacity.
+  → `tests/test_metrics_history_graph.py::test_metrics_history_ring_dedupes_and_bounds`
+
+---
+
+## Amendment (2026-07-19) — Per-message 'Waiting for Reply' outbound display state + cosmetic display delay (BACKLOG #136)
+
+- **Status:** **Accepted (2026-07-19).** Implements [BACKLOG #136](../BACKLOG.md) "'Waiting for Reply'
+  per-message connection state + display delay" (lane `dg-s8a`, Wave 6). A light, additive display note.
+
+**What it adds (display only — no delivery-path change).** An outbound MLLP connection already blocks on
+the ACK read under `timeout_seconds`; what was missing is a live, per-message **"Waiting for Reply"**
+display state and a cosmetic knob for when to show it. This adds:
+
+- A **side-band** waiting marker in the MLLP outbound connector ([`transports/mllp.py`](../../messagefoundry/transports/mllp.py)):
+  the connector stamps a monotonic `waiting_since` **around the existing ACK read** and clears it when the
+  read resolves. This is purely observational — it wraps the read, changes **no** framing, retry,
+  ordering, or ACK handling, and touches the delivery path **not at all**.
+- A new persisted, per-outbound config field **`waiting_display_delay`** (seconds, default `0.0`) on
+  `OutboundConnection` / `Destination` — authored code-first **and** via `connections.toml` (it rides the
+  #131 console→TOML write seam if console-edited). It is the **cosmetic pre-display delay**, explicitly
+  **independent of** `timeout_seconds` / pacing: the connection reads "Waiting for Reply" only once
+  `now - waiting_since ≥ waiting_display_delay`.
+- The state surfaces additively on `ConnectionRow.waiting_for_reply` (read by `list_connections` from the
+  live connector via `RegistryRunner.outbound_waiting_for_reply`) and renders as a small badge on the
+  connections dashboard. No PHI — it is a boolean state on a connection, no message body.
+
+**#136 × #117 interaction (do NOT break).** "Waiting for Reply" is **inapplicable in no-ack mode**: the
+marker is stamped **only around an ACK read that actually happens**, so an outbound that skips the ACK
+read ([BACKLOG #117](../BACKLOG.md), a different wave) never sets it and the badge never shows there — the
+state is rendered **only on ACK-waiting outbounds**, by construction.
+
+- **AC-10** — WHILE an MLLP outbound is awaiting a reply AND at least `waiting_display_delay` has elapsed
+  since the send, `ConnectionRow.waiting_for_reply` SHALL be True; it SHALL be False before the delay
+  elapses, once the reply resolves, and for any connector that does not await a reply.
+  → `tests/test_waiting_for_reply.py::test_waiting_marker_respects_display_delay`

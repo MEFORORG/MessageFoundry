@@ -1,0 +1,163 @@
+# MessageFoundry — Semgrep taint rules for OPERATOR-authored Router/Handler config (ADR 0144 Inc 3).
+# Opt-in CI complement to the stdlib-AST `messagefoundry check` handler-security lint: recovers its two
+# documented false-NEGATIVES — (1) inter-statement taint `body = msg.raw; log.info(body)` and
+# (2) aliased-import evasion `from subprocess import run as r; r(...)`. Semgrep is NOT a messagefoundry
+# dependency. Ships in the wheel (hatchling packages every file under messagefoundry/); reference the
+# installed copy via importlib.resources. See docs/security/SECURING-HANDLER-CONFIG-IN-CI.md.
+# Static taint is a filter, not a boundary (~16-70% recall). Run with --error to block; drop it to advise.
+# Minor gaps mirroring the AST lint: attribute-form loggers (self.logger.info) / decorators (@mf.handler).
+rules:
+  # --- (1) inter-statement taint: message body/fields -> dangerous sink ------------------------------
+  # SOURCE = the message parameter (first positional) of every @handler/@router. Taint propagates
+  # through accessors (msg.raw, msg.field(...), msg["PID-3"], msg.encode(), ...) and assignments
+  # (body = msg.raw), so a body reaching a sink one or more statements later is caught.
+  - id: mf-handler-phi-to-log
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5", note: "CLAUDE.md §9 never log full bodies at INFO+"}
+    message: >
+      Message body/fields reach print() or an INFO+ logger call. Full payloads are PHI and go only to
+      the secured store, never the general log (CLAUDE.md §9). Log a non-PHI id (control id) instead.
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  @handler(...)
+                  def $F($MSG, ...):
+                      ...
+              - pattern: |
+                  @router(...)
+                  def $F($MSG, ...):
+                      ...
+          - focus-metavariable: $MSG
+    pattern-sinks:
+      - pattern: print(...)
+      - patterns:
+          - pattern-either:
+              - pattern: $LOG.info(...)
+              - pattern: $LOG.warning(...)
+              - pattern: $LOG.warn(...)
+              - pattern: $LOG.error(...)
+              - pattern: $LOG.exception(...)
+              - pattern: $LOG.critical(...)
+              - pattern: $LOG.fatal(...)
+              - pattern: $LOG.log(...)
+          - metavariable-regex:
+              metavariable: $LOG
+              regex: (?i)^(.*_)?(log|logger|logging)$
+    pattern-sanitizers:
+      # HL7 MSH envelope metadata is non-PHI (control id / message type); logging it is the recommended
+      # safe pattern, so it clears the taint on this rule (so the remediation above does not itself flag).
+      - pattern: $M.control_id
+      - pattern: $M.message_type
+      - pattern: $M.message_code
+      - pattern: $M.trigger_event
+  - id: mf-handler-sqli-db-lookup
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5", note: "CLAUDE.md §8 validate before it reaches SQL"}
+    message: >
+      Message-derived data flows into the db_lookup/fhir_lookup STATEMENT/QUERY argument. Keep the
+      statement constant and pass values through the parameterized `params` dict / structured FHIR
+      query — never string interpolation (SQL / FHIR injection).
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  @handler(...)
+                  def $F($MSG, ...):
+                      ...
+              - pattern: |
+                  @router(...)
+                  def $F($MSG, ...):
+                      ...
+          - focus-metavariable: $MSG
+    pattern-sinks:
+      - patterns:
+          - pattern-either:
+              - pattern: db_lookup($CONN, $STMT, ...)
+              - pattern: db_lookup($CONN, statement=$STMT, ...)
+              - pattern: fhir_lookup($CONN, $STMT, ...)
+              - pattern: fhir_lookup($CONN, query=$STMT, ...)
+          - focus-metavariable: $STMT
+  - id: mf-handler-phi-to-file
+    mode: taint
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5", note: "CLAUDE.md §9 payloads go only to the secured store"}
+    message: >
+      Message body/fields are written to a file. Do not write PHI outside the secured store from a
+      Handler; route file egress through an outbound File() connection (counted, logged, allow-listed).
+    pattern-sources:
+      - patterns:
+          - pattern-either:
+              - pattern: |
+                  @handler(...)
+                  def $F($MSG, ...):
+                      ...
+              - pattern: |
+                  @router(...)
+                  def $F($MSG, ...):
+                      ...
+          - focus-metavariable: $MSG
+    pattern-sinks:
+      # Path-specific writes only. Bare `.write()` (open(...,"w").write) is caught by Control A's
+      # ambient-authority (write-mode open), so it is intentionally NOT a sink here — a bare-`.write`
+      # taint sink over-matches benign io.StringIO/io.BytesIO payload assembly.
+      - pattern: $P.write_text(...)
+      - pattern: $P.write_bytes(...)
+  # --- (2) aliased-import evasion: plain search rules; Semgrep resolves `from X import y as z` --------
+  # These match the qualified name through an import alias (r(...) == subprocess.run(...)), the exact
+  # case the name-literal AST scan misses. They fire regardless of taint: reaching past the sanctioned
+  # Send/db_lookup boundary is itself the finding (CLAUDE.md §2/§8).
+  - id: mf-handler-ambient-subprocess
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5"}
+    message: >
+      subprocess invoked from a Router/Handler (caught even via an aliased import). Handlers must not
+      spawn processes; reach downstream systems only through an outbound Connection.
+    pattern-either:
+      - pattern: subprocess.run(...)
+      - pattern: subprocess.Popen(...)
+      - pattern: subprocess.call(...)
+      - pattern: subprocess.check_call(...)
+      - pattern: subprocess.check_output(...)
+      - pattern: subprocess.getoutput(...)
+      - pattern: subprocess.getstatusoutput(...)
+  - id: mf-handler-ambient-os-exec
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5"}
+    message: >
+      os.system/os.popen runs a string through the shell (caught even via an aliased import). Never
+      shell out from a Handler.
+    pattern-either:
+      - pattern: os.system(...)
+      - pattern: os.popen(...)
+  - id: mf-handler-ambient-eval-exec
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5"}
+    message: >
+      Dynamic eval/exec/compile/__import__ from a Router/Handler (caught even via an aliased import).
+      Never evaluate message- or config-derived data as code.
+    pattern-either:
+      - pattern: eval(...)
+      - pattern: exec(...)
+      - pattern: compile(...)
+      - pattern: __import__(...)
+  - id: mf-handler-ambient-deserialization
+    languages: [python]
+    severity: WARNING
+    metadata: {asvs: "15.2.5"}
+    message: >
+      Unsafe deserialization (pickle/marshal) from a Router/Handler (caught even via an aliased
+      import) — these execute arbitrary code. Use json / RawMessage.json() on external data.
+    pattern-either:
+      - pattern: pickle.load(...)
+      - pattern: pickle.loads(...)
+      - pattern: marshal.load(...)
+      - pattern: marshal.loads(...)

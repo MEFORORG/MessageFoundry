@@ -5,9 +5,9 @@ tree, no test suite. It answers "is *this* box set up right, and does a message 
 is the on-box complement to CI (CI proves engine *conformance*: staged pipeline, FIFO, store parity,
 parsing — against SQL Server 2025 + Postgres containers; `verify` proves the *deployment*).
 
-It runs four sections — **host**, **store**, **smoke**, **manual** — and prints a PASS/FAIL/SKIP/MANUAL
-report. Host/domain steps it can't self-check (AD login, NSSM, the visual no-console-flash check) are
-reported **MANUAL**, never faked.
+It runs five sections — **host**, **store**, **smoke**, **manual**, **federation** — and prints a
+PASS/FAIL/SKIP/MANUAL report. Host/domain steps it can't self-check (AD login, NSSM, the visual
+no-console-flash check) are reported **MANUAL**, never faked.
 
 ## Quick start
 
@@ -37,10 +37,11 @@ messagefoundry verify --report-md verify.md --report-json verify.json
 
 | Section | What it does |
 |---|---|
-| **host** | Python 3.11+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; listener ports bindable (+ firewall = MANUAL); store/working dir writable (+ service-account ACLs = MANUAL); console importable; `CREATE_NO_WINDOW` present (no-flash). |
+| **host** | Python 3.14+ & engine import; optional driver extras (asyncpg / aioodbc+pyodbc / pydicom); **ODBC Driver 18** discoverable via `pyodbc.drivers()`; listener ports bindable (+ firewall = MANUAL); store/working dir writable (+ service-account ACLs = MANUAL); console importable; `CREATE_NO_WINDOW` present (no-flash). |
 | **store** | Opens the configured store backend (`[store]`/`MEFOR_STORE_*`) and confirms it connects — **no test-data writes** beyond the idempotent schema-ensure. Run once per backend the box is pointed at. |
 | **smoke** | `self` (default) routes a synthetic HL7 through your config via dry-run — **no store, no network, no side effects**; `live` MLLP-sends one synthetic message to the running engine and confirms an **AA ACK**; `none` skips. Add **`--check-disposition`** (+ `--service-config`) to also poll the store and **FAIL unless the message reached `PROCESSED`** (a new `smoke.disposition` row). |
 | **manual** | Echoes the human-only steps (AD/Kerberos login, TOTP MFA, API bind+TLS, NSSM service, end-to-end disposition in the console) as MANUAL with instructions. |
+| **federation** | Federated SSO posture ([ADR 0142](../adr/0142-federated-sso-oidc-authorization-code-pkce-relying-party-hybrid-ad-backed.md)) — **offline**, no socket is opened. With `[auth].oidc_enabled` false it emits a single SKIP. Enabled, it reports the pinned endpoints, the MFA-claim gate and the username UPN-suffix allow-list as **MANUAL** (the settings validators already refuse an unusable combination at load, so a PASS there would be a check that cannot fail), and **PASS/FAIL**s the things that genuinely can: the client secret resolving, the pinned TLS context building, and — with `--fed-id-token <file> --fed-jwks <file>` — a captured `id_token` replayed through the real validation ladder with a **verdict per rung**. Add `--fed-nonce` to cover the flow-binding rung; without it that rung and everything after it report SKIP, never PASS. |
 
 ## self vs live smoke
 - **`--smoke self`** — safe anywhere (CI, a fresh box, before the engine is even running). Proves your

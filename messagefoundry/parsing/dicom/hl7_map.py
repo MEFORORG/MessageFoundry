@@ -20,8 +20,9 @@ I/O, no engine imports.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Sequence, Union
+from typing import Union
 
 from messagefoundry.parsing.dicom.dataset import DicomDataset, SrMeasurement
 
@@ -36,7 +37,7 @@ __all__ = [
 ]
 
 #: A field is either a single leaf value (one component) or an ordered list of component leaves.
-Field = Union[str, Sequence[Union[str, None]]]
+Field = Union[str, Sequence[str | None]]  # noqa: UP007
 
 
 @dataclass(frozen=True)

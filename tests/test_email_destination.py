@@ -14,17 +14,23 @@ import pytest
 
 import messagefoundry.transports.email as email_mod
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import EgressSettings, INSECURE_TLS_ESCAPE_ENV
+from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, EgressSettings
+from messagefoundry.config.tls_policy import (
+    HopPosture,
+    InsecureHopRefused,
+    active_hop_posture,
+)
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports.base import DeliveryError
 from messagefoundry.transports.email import EmailDestination
+from messagefoundry.transports.mllp import InsecureHopGuard
 
 
 class _FakeSMTP:
     """A drop-in for ``smtplib.SMTP`` / ``SMTP_SSL`` that records the exchange instead of dialing a
     server. ``fail_at`` makes the named step raise so the DeliveryError mapping can be exercised."""
 
-    instances: list["_FakeSMTP"] = []
+    instances: list[_FakeSMTP] = []
 
     def __init__(
         self, host: str, port: int, timeout: float = 0.0, fail_at: str | None = None
@@ -42,7 +48,7 @@ class _FakeSMTP:
         if fail_at == "connect":
             raise OSError("connection refused")
 
-    def __enter__(self) -> "_FakeSMTP":
+    def __enter__(self) -> _FakeSMTP:
         return self
 
     def __exit__(self, *exc: Any) -> None:
@@ -204,6 +210,115 @@ async def test_cleartext_send_path_when_escaped(monkeypatch: pytest.MonkeyPatch)
     assert smtp.started_tls is False  # no STARTTLS when use_tls=false
 
 
+# --- #200 (ADR 0092): the PHI BODY over cleartext SMTP, on the shared posture gradient ---------------
+#
+# The credential got a hard refusal while the (PHI) message body got only a logger.warning, and the
+# whole decision keyed on the RAW insecure_tls_allowed() while every sibling connector routes it
+# through the CLAMPED weakened_tls_escape_permitted_here(). Both are fixed: the escape can no longer
+# cross an ENFORCING production-PHI cleartext hop, and the body is decided by the same
+# InsecureHopGuard gradient raw-TCP / X12 / plaintext-DIMSE / anonymous-FTP consume.
+
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, dial at warn
+SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
+
+
+def _cleartext_dest(
+    *, host: str = "smtp.partner.org", attested: bool = False, reason: str | None = None
+) -> Destination:
+    return Destination(
+        name="OB_EMAIL",
+        type=ConnectorType.EMAIL,
+        settings={
+            "host": host,
+            "sender": "engine@hospital.org",
+            "recipients": ["clinician@partner.org"],
+            "use_tls": False,
+        },
+        tls_hop_attested=attested,
+        tls_hop_attested_reason=reason,
+    )
+
+
+def test_prod_phi_cleartext_smtp_refused_even_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # THE headline fix: before this, the escape silenced the refusal and the PHI body was sent with a
+    # warning. The clamped escape is inert under ENFORCE, so the hop is refused.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="cleartext"):
+        EmailDestination(_cleartext_dest())
+
+
+def test_prod_phi_cleartext_smtp_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(PROD_PHI), pytest.raises(ValueError, match="cleartext"):
+        EmailDestination(_cleartext_dest())
+
+
+def test_prod_phi_cleartext_smtp_allowed_when_hop_attested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The acknowledged, reasoned, audited opt-out — the ONLY way across an enforcing PHI cleartext hop.
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(PROD_PHI):
+        d = EmailDestination(_cleartext_dest(attested=True, reason="carrier-grade private circuit"))
+    assert d.use_tls is False
+
+
+def test_staging_phi_cleartext_smtp_warns_and_crosses(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Non-enforcing PHI: the gradient WARNs rather than refusing, so a lab lane still runs.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(STAGING_PHI):
+        d = EmailDestination(_cleartext_dest())
+    assert d._hop_guard is not None
+
+
+def test_synthetic_cleartext_smtp_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
+    # No PHI rides the hop → ALLOW, silently (the historical explicit-opt-in escape still applies).
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(SYNTHETIC):
+        d = EmailDestination(_cleartext_dest())
+    assert d.use_tls is False
+
+
+def test_unstamped_posture_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Built outside the construction gate (a live serve build after the pre-flight, or an embedding):
+    # the guard no-ops, so no existing lane that already carried the escape breaks.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    d = EmailDestination(_cleartext_dest())
+    assert d.use_tls is False
+
+
+def test_tls_enabled_captures_no_cleartext_guard() -> None:
+    # The STARTTLS default is not a cleartext hop — no guard, so the gradient never fires on it.
+    assert EmailDestination(_dest())._hop_guard is None
+
+
+async def test_send_time_backstop_refuses_at_the_byte_crossing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Defense in depth: a reload that flips the instance to enforcing production-PHI must not put the
+    # body on the wire just because construction happened under a laxer posture.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    _install_fake(monkeypatch)
+    with active_hop_posture(SYNTHETIC):
+        d = EmailDestination(_cleartext_dest())
+    assert d._hop_guard is not None
+    d._hop_guard = InsecureHopGuard(
+        host=d.host,
+        port=d.port,
+        cell="EMAIL outbound",
+        description="cleartext SMTP egress (use_tls=false)",
+        attested=False,
+        attested_reason=None,
+        posture=PROD_PHI,
+    )
+    with pytest.raises(InsecureHopRefused):
+        await d.send("PID|1|patient")
+    assert _FakeSMTP.instances == []  # never dialed — refused before any socket
+
+
 # --- DeliveryError mapping (the staged queue retries) -----------------------------------------------
 
 
@@ -303,7 +418,7 @@ def test_registered_in_destination_registry() -> None:
 
 def test_email_and_smtp_factories_exported() -> None:
     import messagefoundry as mf
-    from messagefoundry import Email, SMTP
+    from messagefoundry import SMTP, Email
 
     assert Email is SMTP  # the alias
     spec = mf.Email(host="smtp.partner.org", sender="s@x.org", recipients=["r@y.org"], subject="hi")

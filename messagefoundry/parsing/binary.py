@@ -30,7 +30,8 @@ from __future__ import annotations
 import base64
 import binascii
 import time
-from typing import TYPE_CHECKING, Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     # Type-only import: keep parsing.message out of this module's *runtime* imports so the dependency
@@ -310,9 +311,7 @@ def parse_doc_ref(value: str) -> tuple[str, str]:
 # no HL7 delimiter, so the message's own escaping is a no-op on it and Message.field yields it verbatim.
 
 
-def iter_obx_documents(
-    message: "Message", *, min_b64_len: int = 0
-) -> Iterator[tuple[int, str, str]]:
+def iter_obx_documents(message: Message, *, min_b64_len: int = 0) -> Iterator[tuple[int, str, str]]:
     """Yield ``(occurrence, verbatim_base64, content_type)`` for every OBX-5 ED **Base64** document in
     ``message`` whose base64 length is at least ``min_b64_len`` (#149, ADR 0105 Phase 1a).
 
@@ -403,7 +402,7 @@ def _strip_whole_body_mfb64(
 
 
 def strip_documents_in_hl7(
-    message: "Message", *, pruned_at: float | None = None, min_bytes: int = 0
+    message: Message, *, pruned_at: float | None = None, min_bytes: int = 0
 ) -> tuple[int, int]:
     """Strip every qualifying OBX-5 ED embedded document from a parsed :class:`Message` **in place**,
     returning ``(documents_stripped, bytes_reclaimed)``. The message is mutated through its own API

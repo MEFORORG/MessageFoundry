@@ -16,7 +16,7 @@ import asyncio
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
-from messagefoundry.config.wiring import WiringError, X12, build_inbound_connection
+from messagefoundry.config.wiring import X12, WiringError, build_inbound_connection
 from messagefoundry.pipeline.wiring_runner import _source_config
 from messagefoundry.transports.x12 import X12Source
 
@@ -120,12 +120,12 @@ async def _send(port: int) -> None:
     reader, writer = await asyncio.open_connection("127.0.0.1", port)
     writer.write(EDI.encode("utf-8"))
     await writer.drain()
-    try:
+    try:  # noqa: SIM105
         await asyncio.wait_for(reader.read(100), 0.5)  # drain any reply / EOF
-    except (asyncio.TimeoutError, OSError):
+    except (TimeoutError, OSError):
         pass
     writer.close()
-    try:
+    try:  # noqa: SIM105
         await writer.wait_closed()
     except OSError:
         pass

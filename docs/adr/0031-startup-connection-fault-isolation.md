@@ -154,3 +154,45 @@ yet** (so a failed-at-start outbound is never invisible just because nothing has
 4. **Auto-retry the *build* of a failed connection on a background timer.** More machinery and timing
    semantics for marginal benefit; the reload/restart paths already rebuild. Deferred — can be added
    later without changing this contract.
+
+## Amendment (2026-07-17, BACKLOG #114) — opt-in File/RemoteFile startup directory validation
+
+**Status:** Accepted (owner go, DEMAND-GATE-BACKLOG Wave 3 / S3a). Built in the same change.
+
+**Context.** As **BACKLOG #114** records, the File/RemoteFile **source** connectors do **not** validate
+their directory at construction — `FileSource._run` logs-and-retries when the poll directory is
+unreachable, and `FileDestination._write` `mkdir`s on write — so a *missing* directory never fails
+startup. That run-time deferral is correct for an **intermittently-available** remote directory (the
+feed must still come up and heal when the mount returns), but it gives no way to say "this directory
+must exist at start, refuse to start otherwise" — Corepoint's perform-vs-defer directory-validation
+toggle. (The observation that "File connectors don't validate the directory at construction" is
+**#114's**, not a claim made by the original ADR 0031 above — this amendment adds the opt-in, it does
+not correct the base decision.)
+
+**Decision.** Add a per-connection **`validate_directory`** setting (default **`false`** —
+byte-identical to today's deferral) to the File / SFTP / FTP(S) **inbound** connectors. When `true`,
+the runner runs a new `SourceConnector.validate_startup()` hook **at bind** (in
+`_start_inbound_unsafe`, right before `source.start()` — **not** at `build_check`, so an
+intermittently-available directory can still BUILD/promote) and a missing/unusable directory raises
+`SourceStartupError`, which the existing §1/§3 isolation catch records as **`failed`** (logged, alerted,
+surfaced on `/connections`). Recovery is the same operator-driven path (fix the dir → restart, or `POST
+/connections/{name}/start`).
+
+Two deliberate details:
+
+- **No-mkdir existence check (the semantic gap).** `validate_startup` must **not** reuse
+  `_probe_dir_writable` verbatim: that probe's first line is `mkdir(parents=True, exist_ok=True)`, so it
+  would silently **create** a merely-missing directory and PASS — the opposite of "missing dir fails
+  startup". The new `_probe_dir_startup` therefore **creates nothing**: a missing path (or a
+  non-directory) raises, so the connection is honestly reported `failed`.
+- **Read-only-aware (composes with #142).** A `move`/`delete` source moves processed files into its
+  subdirs, so it needs **write** (a temp-file probe). A `leave`-in-place source (BACKLOG #142) never
+  writes to the poll directory, so its validation requires only **read/list** — a genuinely read-only
+  share validates cleanly with `validate_directory=true` rather than being wrongly reported `failed`.
+
+**Consequences.** Additive and default-off (a graph that never sets `validate_directory` is
+byte-identical). No new schema, no new dependency; the failure rides the existing `_failed`/`failed`
+surfacing and the `connection_stopped` alert. Reload stays fail-fast for the rest of config; the new
+check only runs at bind, so a below-threshold / not-deployed / auto-start-off connection is unaffected.
+The equivalent outbound (FileDestination) is out of scope here — it already `mkdir`s on write and has
+the on-demand `POST /connections/{name}/test` probe.

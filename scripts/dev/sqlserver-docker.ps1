@@ -40,10 +40,16 @@
 
 .EXAMPLE
     scripts\dev\sqlserver-docker.ps1 -Image mcr.microsoft.com/mssql/server:2025-latest `
-        -ContainerName mefor-mssql-2025 -Volume mefor-mssql-2025-data -Port 1434
+        -ContainerName mefor-mssql-2025 -Volume mefor-mssql-2025-data -Port 1435
     # run SQL Server 2025 (17.x) alongside the default 2022 container (distinct name/volume/port so
-    # both coexist), then point the suite at it: scripts\dev\sqlserver.ps1 -Password '<pw>' -Port 1434
+    # both coexist), then point the suite at it: scripts\dev\sqlserver.ps1 -Password '<pw>' -Port 1435
     # NB: SQL Server 2025 requires an AVX-capable CPU.
+    #
+    # 1435, NOT 1434: a native SQL Server install commonly listens on 1434 (and the SQL Server Browser
+    # always does, on UDP). Docker publishes to `::`/0.0.0.0 while a native instance binds 127.0.0.1
+    # specifically, so 127.0.0.1,1434 silently resolves to the NATIVE instance instead of this
+    # container -- which surfaces as `Login failed for user 'sa'` with nothing in `docker logs`,
+    # sending you after the password rather than the port. The pre-flight check below refuses that.
 
 .EXAMPLE
     scripts\dev\sqlserver-docker.ps1 -Down -PurgeData
@@ -122,6 +128,45 @@ if ($Down) {
         }
     }
     exit 0
+}
+
+# --- pre-flight: is a NON-Docker process already on this port? ----------------
+# Docker publishes to `::`/0.0.0.0, but a native SQL Server binds 127.0.0.1 specifically. Windows
+# then prefers the more specific binding, so `127.0.0.1,<port>` reaches the NATIVE instance while
+# `docker run` still succeeds and `docker logs` stays clean. The visible symptom is
+# `Login failed for user 'sa'`, which sends you after the password instead of the port. Refuse up
+# front rather than hand back a container that answers on a port somebody else owns.
+function Test-PortOwnedByOther {
+    param([int]$CheckPort)
+    if (-not (Get-Command Get-NetTCPConnection -ErrorAction SilentlyContinue)) { return $null }
+    $listeners = @(Get-NetTCPConnection -LocalPort $CheckPort -State Listen -ErrorAction SilentlyContinue)
+    foreach ($l in $listeners) {
+        $proc = Get-Process -Id $l.OwningProcess -ErrorAction SilentlyContinue
+        if (-not $proc) { continue }
+        # com.docker.backend / vpnkit / wslrelay are Docker's own publishers — not a conflict.
+        if ($proc.ProcessName -notmatch '^(com\.docker\.|vpnkit|wslrelay|docker)') {
+            return "$($proc.ProcessName) (pid $($proc.Id))"
+        }
+    }
+    return $null
+}
+
+if (-not (Test-ContainerExists)) {
+    $owner = Test-PortOwnedByOther -CheckPort $Port
+    if ($owner) {
+        throw @"
+Port $Port on this host is already held by a non-Docker process: $owner.
+
+A native SQL Server binds 127.0.0.1 specifically while Docker publishes to ::/0.0.0.0, so
+127.0.0.1,$Port would reach THAT instance, not this container -- and the failure looks like
+'Login failed for user sa' with an empty 'docker logs $ContainerName', which points you at the
+password rather than the port.
+
+Pick a free port instead, e.g.:
+    scripts\dev\sqlserver-docker.ps1 -Port 1435 -ContainerName $ContainerName -Volume $Volume
+(then run the suite with: scripts\dev\sqlserver.ps1 -Password '<pw>' -Port 1435)
+"@
+    }
 }
 
 # --- bring up ---------------------------------------------------------------

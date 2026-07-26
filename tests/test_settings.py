@@ -73,6 +73,14 @@ def test_config_reload_roots_from_env_splits_on_pathsep(tmp_path: Path) -> None:
     assert s.api.config_reload_roots == ["/srv/staging", "/srv/ide"]
 
 
+def test_tls_client_cert_files_from_env_splits_on_pathsep() -> None:
+    # ASVS 6.4.5: a PEM-path list, so it must be env-settable like every other [api] list setting —
+    # it shipped as the ONE list field left out of the splitter.
+    files = os.pathsep.join(["/certs/acme/client.pem", "/certs/globex/client.pem"])
+    s = load_settings(environ={"MEFOR_API_TLS_CLIENT_CERT_FILES": files})
+    assert s.api.tls_client_cert_files == ["/certs/acme/client.pem", "/certs/globex/client.pem"]
+
+
 def test_inbound_bind_host_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.chdir(tmp_path)
     s = load_settings(environ={})
@@ -121,7 +129,10 @@ def test_unknown_sections_and_keys_ignored(tmp_path: Path) -> None:
 def test_retention_section_loads(tmp_path: Path) -> None:
     cfg = _write(
         tmp_path / "messagefoundry.toml",
-        '[retention]\nmessages_days = 30\ndead_letter_days = 90\nvacuum_at = "03:30"\n',
+        # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118); the rest of
+        # [retention] stays. Desugar populates settings.retention.messages_days from it.
+        "security.delete_message_bodies_after_days = 30\n"
+        '[retention]\ndead_letter_days = 90\nvacuum_at = "03:30"\n',
     )
     s = load_settings(config_path=cfg, environ={})
     assert s.retention.messages_days == 30
@@ -151,6 +162,16 @@ def test_egress_allowlist_loads_from_file_and_env(tmp_path: Path) -> None:
     assert s.egress.allowed_file_dirs == ["/data/out", "/data/archive"]  # from env (comma-split)
 
 
+def test_egress_fhir_require_structured_default_and_env(tmp_path: Path) -> None:
+    # 1.2.2 (ASVS): default off (byte-identical), coerced True from the env string like deny_by_default.
+    cfg = _write(tmp_path / "messagefoundry.toml", "[egress]\n")
+    assert load_settings(config_path=cfg, environ={}).egress.fhir_require_structured_params is False
+    s = load_settings(
+        config_path=cfg, environ={"MEFOR_EGRESS_FHIR_REQUIRE_STRUCTURED_PARAMS": "true"}
+    )
+    assert s.egress.fhir_require_structured_params is True
+
+
 def test_retention_secure_by_default_knob(tmp_path: Path) -> None:
     # #186a: allow_unbounded_phi defaults to the SECURE posture (False = the serve gate bounds PHI
     # retention). The [egress].deny_by_default MODEL default is left UNCHANGED (False) — the fail-closed
@@ -159,7 +180,10 @@ def test_retention_secure_by_default_knob(tmp_path: Path) -> None:
     s = ServiceSettings()
     assert s.retention.allow_unbounded_phi is False
     assert s.egress.deny_by_default is False  # unchanged model default (byte-identical constructor)
-    cfg = _write(tmp_path / "messagefoundry.toml", "[retention]\nallow_unbounded_phi = true\n")
+    # allow_unbounded_phi moved to [security].allow_keeping_phi_indefinitely (ADR 0118).
+    cfg = _write(
+        tmp_path / "messagefoundry.toml", "security.allow_keeping_phi_indefinitely = true\n"
+    )
     loaded = load_settings(config_path=cfg, environ={})
     assert loaded.retention.allow_unbounded_phi is True
 
@@ -487,6 +511,117 @@ def test_auth_kerberos_requires_ad(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", "[auth]\nkerberos_enabled = true\n")
     with pytest.raises(ValidationError):
         load_settings(config_path=cfg, environ={})
+
+
+# --- federated OIDC (ADR 0142, BACKLOG #274) -------------------------------------------------------
+
+_OIDC_AD = (
+    '[auth]\nad_enabled = true\nad_server = "ldaps://dc.example.com:636"\n'
+    'ad_domain = "example.com"\n'  # the UPN suffix oidc_allowed_username_domains falls back to
+    'ad_user_search_base = "OU=Users,DC=example,DC=com"\n'
+    'ad_bind_dn = "CN=svc,DC=example,DC=com"\n'
+)
+_OIDC_BLOCK = (
+    "oidc_enabled = true\n"
+    'oidc_issuer = "https://idp.example.com"\n'
+    'oidc_client_id = "mefor-console"\n'
+    'oidc_authorization_endpoint = "https://idp.example.com/authorize"\n'
+    'oidc_token_endpoint = "https://idp.example.com/token"\n'
+    'oidc_jwks_uri = "https://idp.example.com/jwks"\n'
+    'oidc_allowed_endpoints = ["idp.example.com"]\n'
+)
+_OIDC_ENV = {
+    "MEFOR_AUTH_AD_BIND_PASSWORD": "s3cret",
+    "MEFOR_AUTH_OIDC_CLIENT_SECRET": "client-s3cret",
+    # public_origin was relocated to [security] by ADR 0118; it desugars back into api.public_origin.
+    "MEFOR_SECURITY_WEB_CONSOLE_PUBLIC_ADDRESS": "https://ops.example.com",
+}
+
+
+def test_auth_oidc_full_config_from_file_with_env_secret(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
+    s = load_settings(config_path=cfg, environ=dict(_OIDC_ENV))
+    assert s.auth.oidc_enabled is True
+    assert s.auth.oidc_issuer == "https://idp.example.com"
+    assert s.auth.oidc_client_secret == "client-s3cret"  # secret from env, never the file
+    assert s.auth.oidc_scopes == ["openid", "profile"]  # default
+    assert s.auth.oidc_require_mfa_claim is True  # secure default
+
+
+def test_auth_oidc_list_key_from_env_comma_string(tmp_path: Path) -> None:
+    """A list key must be settable as one comma-separated env string (the split validator)."""
+    cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
+    env = dict(_OIDC_ENV) | {"MEFOR_AUTH_OIDC_SCOPES": "openid, profile, email"}
+    s = load_settings(config_path=cfg, environ=env)
+    assert s.auth.oidc_scopes == ["openid", "profile", "email"]
+
+
+def test_auth_oidc_disabled_is_default(tmp_path: Path) -> None:
+    s = load_settings(config_path=_write(tmp_path / "c.toml", "[auth]\n"), environ={})
+    assert s.auth.oidc_enabled is False
+
+
+@pytest.mark.parametrize(
+    ("block", "env", "needle"),
+    [
+        # enabled without ad_enabled
+        ("[auth]\noidc_enabled = true\n", {}, "ad_enabled"),
+        # enabled without the pinned endpoints
+        (_OIDC_AD + "oidc_enabled = true\n", {"MEFOR_AUTH_AD_BIND_PASSWORD": "s"}, "oidc_issuer"),
+        # a non-https endpoint
+        (
+            _OIDC_AD
+            + _OIDC_BLOCK.replace("https://idp.example.com/token", "http://idp.example.com/token"),
+            _OIDC_ENV,
+            "must be an https URL",
+        ),
+        # an endpoint host outside the allow-list
+        (
+            _OIDC_AD + _OIDC_BLOCK.replace('["idp.example.com"]', '["other.example.com"]'),
+            _OIDC_ENV,
+            "not in oidc_allowed_endpoints",
+        ),
+        # stripping a UPN suffix with NO suffix source to check it against: refuse rather than let a
+        # federated principal choose which on-prem account its local part resolves to.
+        (
+            _OIDC_AD.replace('ad_domain = "example.com"\n', "") + _OIDC_BLOCK,
+            _OIDC_ENV,
+            "oidc_allowed_username_domains",
+        ),
+        # an MFA gate that can never fire
+        (
+            _OIDC_AD + _OIDC_BLOCK + "oidc_mfa_amr_values = []\noidc_required_acr_values = []\n",
+            _OIDC_ENV,
+            "MFA gate that can never match",
+        ),
+    ],
+)
+def test_auth_oidc_refusals_name_the_key(
+    tmp_path: Path, block: str, env: dict[str, str], needle: str
+) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", block)
+    with pytest.raises(ValidationError, match=needle):
+        load_settings(config_path=cfg, environ=env)
+
+
+def test_auth_oidc_requires_public_origin(tmp_path: Path) -> None:
+    cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
+    env = {k: v for k, v in _OIDC_ENV.items() if k != "MEFOR_SECURITY_WEB_CONSOLE_PUBLIC_ADDRESS"}
+    with pytest.raises(ValidationError, match="public_origin"):
+        load_settings(config_path=cfg, environ=env)
+
+
+def test_auth_oidc_secret_in_file_warns_not_binds(tmp_path: Path) -> None:
+    """The client secret must not silently bind from the config file (it is a _FILE_SECRET_KEY)."""
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        _OIDC_AD + _OIDC_BLOCK + 'oidc_client_secret = "in-file"\n',
+    )
+    env = {k: v for k, v in _OIDC_ENV.items() if k != "MEFOR_AUTH_OIDC_CLIENT_SECRET"}
+    # env wins; but even present-in-file it is honoured (with a warning) rather than dropped, matching
+    # ad_bind_password behaviour — the guard is the warning + env precedence, asserted elsewhere.
+    s = load_settings(config_path=cfg, environ=env)
+    assert s.auth.oidc_client_secret == "in-file"
 
 
 # --- [cluster] settings (Track B Step 3) ------------------------------------
@@ -1021,3 +1156,16 @@ def test_auth_mfa_secure_defaults_and_totp_skew_validation() -> None:
     for bad in (-1, 3):
         with pytest.raises(ValidationError):
             AuthSettings(totp_skew_steps=bad)
+
+
+def test_copy_on_send_default_is_on() -> None:
+    """ADR 0104 / BACKLOG #230: copy-on-Send is now default-ON — the default-flip gate is satisfied (estate
+    scan: 1/152 handlers affected; Message.copy() is copy-on-write, so the common path is zero-copy). A
+    default config snapshots each Send at construction; set [pipeline].snapshot_on_send = false to opt out."""
+    assert load_settings(environ={}).pipeline.snapshot_on_send is True
+    assert (
+        load_settings(
+            environ={"MEFOR_PIPELINE_SNAPSHOT_ON_SEND": "false"}
+        ).pipeline.snapshot_on_send
+        is False
+    )

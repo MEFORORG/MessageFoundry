@@ -45,6 +45,11 @@ dependencies = [
     "hl7apy>=1.3",          # version-aware validation + profiles
     "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
+    # CONSTRAINT PIN (transitive, via pydantic/fhir-core): annotated-types 0.8.0 dropped `SLOTS`,
+    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. CI installs with a
+    # FRESH resolve (uv pip install -e ".[dev,...]"), so it ignores the lock's annotated-types==0.7.0.
+    # Drop this cap once fhir-core supports 0.8.x, or once CI installs from the hashed lock.
+    "annotated-types<0.8",
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
     "fastapi>=0.137.1",     # localhost engine API
     "starlette>=1.3.1",     # explicit floor — fastapi's own pin allows an older Starlette; >=1.3.1 fixes the Host/path + form-DoS CVEs (CVE-2026-48710 @1.0.1, CVE-2026-54282 @1.3.0, CVE-2026-54283 @1.3.1)
@@ -58,6 +63,8 @@ dependencies = [
     "prometheus-client>=0.20",  # Prometheus /metrics exposition (BACKLOG #21)
     "defusedxml>=0.7.1",    # hardened XML parse for RawMessage.xml() — XXE/DTD/entity-expansion safe (ADR 0004, BACKLOG #31)
     "psutil>=6.0",          # host CPU/mem gauges on the /metrics surface (BACKLOG #74)
+    "httpx>=0.27",          # the shared apiclient HTTP client (messagefoundry.apiclient) — used by the bundled Windows tray's tokenless /health + /ui probes (messagefoundry.tray, ADR 0113, gui-scripts messagefoundry-tray) and the harness monitor; also the ASGI test client. Base (not an extra) so the tray works on every `pip install messagefoundry`.
+    "truststore>=0.10",     # verify an https engine URL against the OS trust store (enterprise/AD-CS roots) — apiclient lazily imports it; base so the tray/monitor need no per-PC CA wrangling
 ]
 
 # Shown on the PyPI sidebar; point at the PUBLIC repo/site (the wshallwshall repo is private).
@@ -72,14 +79,19 @@ Issues = "https://github.com/MEFORORG/MessageFoundry/issues"
 # desktop admin console was retired in favour of the web console (BACKLOG #103, ADR 0032 retired); the
 # harness kept the reusable Qt view widgets (rehomed to harness/_console_widgets.py + _login.py) and is
 # now the sole consumer of PySide6. keyring was dropped with the console (OS-token cache was
-# launcher-only). httpx/truststore back the shared apiclient the harness monitor uses.
+# launcher-only). The harness monitor's HTTP client (httpx/truststore via messagefoundry.apiclient) is
+# now a BASE dependency, so it's no longer declared here.
 harness = [
     "PySide6>=6.6",         # the harness GUI (LGPL — OSS-distributable)
-    "httpx>=0.27",          # the harness monitor's HTTP client to the engine API (via messagefoundry.apiclient)
-    "truststore>=0.10",     # verify the engine's TLS cert against the OS trust store (enterprise/AD-CS roots) so a remote harness monitor needs no per-PC CA wrangling
 ]
-# EXPERIMENTAL SQL Server store backend. Also needs the Microsoft ODBC Driver 18 for SQL Server
-# installed at the OS level (not pip-installable). Lazy-imported, so SQLite-only installs skip it.
+# NOTE: there is no [tray] extra. The Windows notification-area tray service-manager (ADR 0113) ships
+# INSIDE the wheel as `messagefoundry.tray` (gui-scripts `messagefoundry-tray`, `pythonw -m
+# messagefoundry.tray`); its only third-party dep is httpx/truststore via the shared apiclient, both
+# BASE deps above — so the tray works on every `pip install messagefoundry`, no extra required.
+# SQL Server store backend — a production server-DB backend (full staged pipeline + ADR-0013
+# response capture; supports_ingest_stage / supports_response_capture both True). Also needs the
+# Microsoft ODBC Driver 18 for SQL Server installed at the OS level (not pip-installable).
+# Lazy-imported, so SQLite-only installs skip it.
 # aioodbc pulls pyodbc transitively; the lock resolves pyodbc 5.3.0 — the newest release and the
 # first to support Python 3.14 (nothing older ships py3.14 wheels). 5.3.0 has an UPSTREAM py3.14
 # parameter-binding segfault against SQL Server 2025 (mkleehammer/pyodbc#1459, still open), which the
@@ -102,7 +114,12 @@ otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
 # 7.0.0 and pydantic-v1 in 7.1.0); it drags fhir-core (BSD-3, the pydantic-v2 base model) + pydantic-core
 # (compiled). fhirpathpy is pure-Python (antlr4 runtime + python-dateutil). FHIR-XML rides fhir.resources'
 # optional lxml extra and is deferred (JSON-only MVP) — never bare-parsed (ADR 0022 §6, Options #5).
-fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0"]
+# annotated-types is CAPPED <0.8: fhir-core (dragged in by fhir.resources) imports the `SLOTS`
+# constant that annotated-types 0.8.0 REMOVED, so any fhir.resources parse dies with
+# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". It is a transitive dep, so the cap
+# lives here rather than in [project.dependencies] (pydantic, the other consumer, is fine on 0.8).
+# Drop the bound once fhir-core ships a 0.8-compatible release.
+fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
 # DICOM (DIMSE C-STORE SCP/SCU) connectors + codec for parsing/dicom/ (ADR 0025, BACKLOG #24). Lazy-imported,
 # so SQLite-only installs skip it. pynetdicom (the DIMSE upper-layer) drags pydicom (the DICOM dataset/SR codec);
 # both pure-Python — HEADERS/SR ONLY, so NO numpy (numpy is pydicom's optional pixel-data dep, never used here).
@@ -135,8 +152,11 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # pyOpenSSL>=26.3.0 (maintenance-mode upstream; hard-caps cryptography<50 — kept OUT of core so
 # repo-wide cryptography upgrades stay uncoupled), cbor2>=6.1.2 (parses untrusted browser CBOR — its
 # advisory stream is WebAuthn-relevant supply chain; never let this floor drift down), and
-# pyasn1-modules>=0.4.2. pyasn1 was ALREADY in-tree via ldap3 (pin unchanged at 0.6.3 — exactly the
-# CVE-2026-30922 decoder-DoS fix version; treat 0.6.3 as a floor, never let a re-lock regress it).
+# pyasn1-modules>=0.4.2. pyasn1 rides in via ldap3 (0.6.3 was the CVE-2026-30922 decoder-DoS fix); the
+# lock moved to pyasn1 0.6.4 for CVE-2026-59885/59886 (BER OID quadratic-decode + univ.Real float DoS,
+# both fixed in 0.6.4) — treat 0.6.4 as the floor, never let a re-lock regress it. Reachable here only
+# via WebAuthn attestation parsing (optional [webauthn] extra, auth + password re-proof gated); ldap3
+# and pyspnego do NOT route untrusted DER through pyasn1's vulnerable decoders.
 # OSV sweep 2026-07-03: all five pins CLEAR (webauthn/pyopenssl/pyasn1/pyasn1-modules/cbor2).
 webauthn = ["webauthn>=3.0.0,<4"]
 # HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault
@@ -160,13 +180,25 @@ dev = [
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
-    "ruff>=0.4",
+    # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag ~525
+    # findings in existing code. CI installs with a FRESH resolve (uv pip install -e ".[dev,...]"), so an
+    # unbounded ">=" silently adopts a new major lint baseline and reds every PR. Lift the cap in a
+    # deliberate PR that also clears the new findings.
+    "ruff>=0.4,<0.16",
     "mypy>=1.10",
-    "httpx>=0.27",          # ASGI test client for the API + harness/load polling (the harness GUI ships its own copy via [harness])
+    # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
+    # is no longer declared here.
 ]
 
 [project.scripts]
 messagefoundry = "messagefoundry.__main__:main"
+
+# The Windows notification-area tray service-manager (ADR 0113), shipped in the wheel as
+# `messagefoundry.tray`. A GUI script (→ a pythonw.exe launcher on Windows, no console window — right
+# for a background tray) rather than a console script. Windows-only at runtime; `main()` prints a
+# friendly message and exits 1 elsewhere. Equivalent to `pythonw -m messagefoundry.tray`.
+[project.gui-scripts]
+messagefoundry-tray = "messagefoundry.tray.__main__:main"
 
 # The offline common-password screening corpus (messagefoundry/auth/data/, loaded via
 # importlib.resources) ships in the wheel automatically: hatchling packages every file under the
@@ -203,6 +235,30 @@ line-length = 100
 # `except (A, B):` (-> `except A, B:`) repo-wide. We keep the parenthesized form for readability; bump
 # this to py314 if/when we choose to adopt the unparenthesized style in a dedicated formatting pass.
 target-version = "py313"
+
+[tool.ruff.lint]
+# Signal 10 (Code Quality & Anti-Slop rubric, docs/Code_Quality_Standards.md): broaden ruff beyond its
+# E/F defaults to the AI-slop-adjacent families -- flake8-bugbear (B), comprehensions (C4), simplify
+# (SIM), pyupgrade (UP), and import sorting (I). Adopted as a one-shot sweep: the safe backlog is
+# auto-fixed and the rest grandfathered with per-line `# noqa` so the required gate is green from a
+# clean baseline and NEW code must comply (the rubric's "blocking from a clean baseline" intent).
+extend-select = ["B", "C4", "SIM", "UP", "I"]
+
+[tool.ruff.lint.flake8-bugbear]
+# FastAPI's dependency-injection idiom calls Depends()/Query()/etc. in argument defaults -- the
+# framework's intended pattern, not the mutable-default bug B008 targets. Treat them as immutable so
+# B008 still catches real bugs (e.g. `x=list()`) everywhere else instead of ~460 framework false hits.
+extend-immutable-calls = [
+    "fastapi.Depends", "fastapi.Query", "fastapi.Path", "fastapi.Header",
+    "fastapi.Cookie", "fastapi.Body", "fastapi.Form", "fastapi.File", "fastapi.Security",
+]
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI route modules put dependency-injection calls (Depends() + the project's own require*() auth
+# factories from api/security.py) in argument defaults -- the framework's intended DI pattern, exactly
+# what B008 targets. Scope the B008 exemption to the route layers instead of noqa-ing every route sig.
+"messagefoundry/api/**" = ["B008"]
+"messagefoundry_webconsole/routes/**" = ["B008"]
 
 [tool.mypy]
 python_version = "3.14"

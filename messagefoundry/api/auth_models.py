@@ -43,6 +43,10 @@ class ProvidersInfo(BaseModel):
     local: bool = True
     ad: bool = False
     kerberos: bool = False
+    #: Federated (OIDC) sign-in AVAILABILITY, matching `kerberos` above: enabled AND the IdP
+    #: is not currently known-down (ADR 0142). Defaults False, so an older client that never
+    #: reads it is unaffected.
+    oidc: bool = False
 
 
 class UserSummary(BaseModel):
@@ -214,6 +218,9 @@ class AuditEntry(BaseModel):
     action: str
     channel_id: str | None = None
     detail: str | None = None
+    #: The caller's network address, or None for an engine-internal write (ADR 0150). The "from where"
+    #: that lets an incident responder trace an entry to a host; None means no client was in scope.
+    client: str | None = None
 
 
 class AuditList(BaseModel):

@@ -29,7 +29,7 @@ DEFAULT_SCAN_LIMIT = 2_000
 MAX_SCAN_LIMIT = 10_000
 
 
-class SearchTarget(str, Enum):
+class SearchTarget(str, Enum):  # noqa: UP042
     """Which decrypted column(s) a raw-substring needle is tested against."""
 
     RAW = "raw"  # the inbound body only
@@ -110,10 +110,10 @@ def row_matches(spec: SearchSpec, *, raw: str | None, summary: str | None) -> bo
     aborts the scan."""
     if spec.substring is not None:
         needle = spec.substring.casefold()
-        if spec.target in (SearchTarget.RAW, SearchTarget.BOTH) and raw is not None:
+        if spec.target in (SearchTarget.RAW, SearchTarget.BOTH) and raw is not None:  # noqa: SIM102
             if needle in raw.casefold():
                 return True
-        if spec.target in (SearchTarget.SUMMARY, SearchTarget.BOTH) and summary is not None:
+        if spec.target in (SearchTarget.SUMMARY, SearchTarget.BOTH) and summary is not None:  # noqa: SIM102
             if needle in summary.casefold():
                 return True
         return False

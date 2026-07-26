@@ -163,3 +163,29 @@ All four **compose with** the existing #200 serve-path enforcement, the #201 out
 egress refusal, and the #129 expiry-relaxation (which stays a VERIFIED hop the posture gate never keys
 on). The production-PHI clamp (`weakened_tls_escape_permitted` / `hop_insecure_escape_downgrades`) remains
 the **single authority** for the global escape on every path; no path logs PHI or a secret.
+
+## Amendment (2026-07-20) — two acknowledged production-PHI carve-outs to the No-loosen rule (§5)
+
+The No-loosen rule (§5) is refined by [ADR 0140](0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md): two production-PHI floor items may now
+be lifted, each behind a **dedicated, single-purpose `[security]` acknowledgment switch** (default `false` →
+byte-identical) — `allow_single_factor_admin_when_exposed` (the exposed-prod-PHI `require_mfa`-off refusal)
+and `allow_unencrypted_phi_in_production` (prod keyless PHI, which also requires `allow_unencrypted_phi`).
+Each downgrades the production refusal to a loud, audited warning surfaced in `GET /security/posture`. These
+are the **only** two carve-outs: the cleartext/verify-off transport-hop clamp of this ADR (the escape-clamp
+of §2, `hop_insecure_escape_downgrades`) is **unchanged** and can still never satisfy a production-PHI hop;
+cleartext off-box bind, no-auth-to-network, open egress, and unbounded PHI retention stay hard-refused; and
+ePHI-access auditing (the ADR 0118 invariant #2) stays unconditional.
+
+## Amendment (2026-07-21) — refuse/warn dial + escape-clamp re-keyed from `production` to `[security].enforcement` (ADR 0148 §5/§7)
+
+[ADR 0148](0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) (GIVEN 2) replaces the
+derived `production` tier as the **refuse/warn dial** (§5 No-loosen severity) **and** the escape-clamp key
+(§2/§7 — `hop_insecure_escape_downgrades` / `weakened_tls_escape_permitted`, i.e. the `--allow-insecure-bind`
+/ `MEFOR_ALLOW_INSECURE_TLS` escapes) with an explicit `[security].enforcement` level (`enforce` default |
+`warn`). `HopPosture.production` is renamed `enforcing`. Every re-keyed site **retains its `is_phi`
+conjunct**, so no synthetic hop is newly refused; at the default (`enforce` × PHI) every gate decision and
+every escape-clamp is **byte-identical** to the former production-PHI behaviour (adversarially verified), and
+`enforcement = warn` reproduces the historical non-production warn-and-cross (a loud, audited loosening). The
+two carve-outs of the 2026-07-20 amendment re-key to `enforcement`, and the keyless-PHI ack is renamed
+`allow_unencrypted_phi_in_production` → `allow_unencrypted_phi_under_strict_enforcement` (see the ADR 0140
+amendment). The four hard-refused floor items and the unconditional ePHI audit are unchanged.

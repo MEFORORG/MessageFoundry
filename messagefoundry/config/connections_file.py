@@ -22,9 +22,10 @@ naming the connection, exactly like a bad ``inbound()`` call.
 from __future__ import annotations
 
 import tomllib
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import Any, TypeVar
 
 from messagefoundry.config.models import (
     AckAfter,
@@ -40,6 +41,7 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.wiring import (
+    MLLP,
     ConnectionSpec,
     Database,
     DatabasePoll,
@@ -47,7 +49,6 @@ from messagefoundry.config.wiring import (
     Ftp,
     Http,
     InboundConnection,
-    MLLP,
     OutboundConnection,
     Registry,
     Rest,
@@ -106,6 +107,15 @@ _INBOUND_KEYS = frozenset(
         "priority",
         "shard",
         "schedule",
+        # Lifecycle flags (#115 auto_start, #233/ADR 0111 deployed). Both default TRUE, so an existing
+        # table that carries neither is byte-identical. auto_start was code-first-only until #233 —
+        # the docs claimed otherwise — so it joins the schema here alongside deployed.
+        "auto_start",
+        "deployed",
+        # Operator "object of interest" flag (#131, ADR 0007 amendment) — default FALSE, so an existing
+        # table without it is byte-identical. The FIRST console-settable connections.toml key (its write
+        # seam rides connections_edit); display-only, no runtime effect.
+        "flagged",
     }
 )
 _OUTBOUND_KEYS = frozenset(
@@ -124,6 +134,12 @@ _OUTBOUND_KEYS = frozenset(
         "priority",
         "metadata",
         "schedule",
+        "auto_start",  # see the inbound note above
+        "deployed",
+        "flagged",  # #131 (ADR 0007 amendment); see the inbound note above
+        # Cosmetic "Waiting for Reply" pre-display delay (#136, ADR 0065 amendment) — default 0.0, so an
+        # existing table without it is byte-identical. Display-only; no delivery effect.
+        "waiting_display_delay",
     }
 )
 
@@ -193,6 +209,11 @@ def _inbound_from_table(table: dict[str, Any], source: str) -> InboundConnection
         else None,
         shard=_optional_str(table, "shard", where),
         schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
+        auto_start=_require_bool(table, "auto_start", where, default=True),
+        deployed=_require_bool(table, "deployed", where, default=True),
+        # #131: the object-of-interest flag defaults FALSE (an absent key = unflagged).
+        flagged=_require_bool(table, "flagged", where, default=False),
         source_file=source,
         source_line=None,
     )
@@ -223,6 +244,13 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         else None,
         metadata=_optional_table(table, "metadata", where),
         schedule=_policy(Schedule, table.get("schedule"), "schedule", where),
+        # Both lifecycle flags default TRUE (an absent key means "run it", as it always has).
+        auto_start=_require_bool(table, "auto_start", where, default=True),
+        deployed=_require_bool(table, "deployed", where, default=True),
+        # #131: the object-of-interest flag defaults FALSE (an absent key = unflagged).
+        flagged=_require_bool(table, "flagged", where, default=False),
+        # #136: the cosmetic waiting-for-reply pre-display delay; absent = 0.0 (show immediately).
+        waiting_display_delay=_optional_float(table, "waiting_display_delay", where) or 0.0,
         source_file=source,
         source_line=None,
     )
@@ -301,9 +329,13 @@ def _optional_str_list(table: dict[str, Any], key: str, where: str) -> list[str]
     return value
 
 
-def _require_bool(table: dict[str, Any], key: str, where: str) -> bool:
+def _require_bool(table: dict[str, Any], key: str, where: str, *, default: bool = False) -> bool:
+    """A bool with a compile-time default: absent → ``default``, else the bool (a non-bool fails loud).
+    ``default`` exists because the lifecycle flags (``auto_start``/``deployed``, #115/#233) default to
+    TRUE while the feature flags (``strict``/``simulate``) default to FALSE — an absent key must mean
+    the model's default, not a blanket ``False``."""
     if key not in table:
-        return False
+        return default
     value = table[key]
     if not isinstance(value, bool):
         raise WiringError(f"{where}: {key!r} must be true or false")
@@ -351,7 +383,7 @@ def _optional_float(table: dict[str, Any], key: str, where: str) -> float | None
     return float(value)
 
 
-def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:
+def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:  # noqa: UP047
     try:
         return enum_cls(value)
     except ValueError as exc:
@@ -359,7 +391,7 @@ def _enum(enum_cls: type[_E], value: Any, key: str, where: str) -> _E:
         raise WiringError(f"{where}: invalid {key} {value!r} (allowed: {allowed})") from exc
 
 
-def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M | None:
+def _policy(model_cls: Callable[..., _M], raw: Any, key: str, where: str) -> _M | None:  # noqa: UP047
     if raw is None:
         return None
     if not isinstance(raw, dict):

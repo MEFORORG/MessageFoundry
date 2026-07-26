@@ -25,6 +25,7 @@ __all__ = [
     "connections_fragment",
     "dashboard",
     "decode_row_key",
+    "flag_rejected",
     "purge_confirm",
     "purge_pending",
     "purge_result",
@@ -138,6 +139,66 @@ def _selection_checkbox(r: ConnectionRow) -> Markup:
         data_status=r.status,
         data_paused=("1" if r.paused else "0"),
         data_dest=(r.destination or ""),
+        # #131: the object-of-interest flag, read by the "Flagged only" client-side filter (app.js).
+        data_flagged=("1" if r.flagged else "0"),
+    )
+
+
+def _status_cell(r: ConnectionRow) -> Markup:
+    """The Status cell: the connection status pill, plus a small "waiting for reply" badge (#136, ADR
+    0065 amendment) while an outbound is awaiting an MLLP ACK past its display delay. The badge is a
+    DISPLAY-ONLY, transient state that clears on the next ~1s poll/ws swap once the reply resolves; it
+    appears only on ACK-waiting outbounds (``waiting_for_reply`` is False otherwise)."""
+    status = el("span", r.status, class_=f"status status-{r.status}")
+    if r.waiting_for_reply:
+        return el(
+            "span",
+            status,
+            el("span", "⧖ waiting", class_="waiting", title="Waiting for reply (ACK)"),
+        )
+    return status
+
+
+def _flag_name(r: ConnectionRow) -> tuple[str, str]:
+    """The (connection name, direction) the flag write targets for a row: the inbound name for a source
+    row, the outbound name for a destination row. Direction is what ``POST /connections/{name}/flag``
+    disambiguates on."""
+    if r.role == "source":
+        return r.channel_id, "inbound"
+    return (r.destination or ""), "outbound"
+
+
+def _flag_cell(r: ConnectionRow) -> Markup:
+    """The Flag cell (#131, ADR 0007 amendment): a same-origin POST toggle form on a
+    ``connections.toml``-managed row (the write seam persists there), or a read-only indicator on a
+    code-first row (no TOML home for the flag). The glyph is filled (⚑) when flagged, outline (⚐)
+    otherwise; the button posts the DESIRED new value so a submit flips it (like the Alerts ack/resolve
+    POST forms). Every value is placed through the escaping builder."""
+    glyph = "⚑" if r.flagged else "⚐"
+    if not r.toml_managed:
+        # Code-first / draining: show the state but no toggle (it can't be persisted to connections.toml).
+        return el(
+            "span",
+            glyph if r.flagged else "",
+            class_="flag" + (" flagged" if r.flagged else ""),
+            title="Flagged (code-first — edit the .py module to change)" if r.flagged else "",
+        )
+    name, direction = _flag_name(r)
+    return el(
+        "form",
+        el("input", type="hidden", name="direction", value=direction),
+        el("input", type="hidden", name="flagged", value=("false" if r.flagged else "true")),
+        el(
+            "button",
+            glyph,
+            type="submit",
+            class_="flagbtn" + (" flagged" if r.flagged else ""),
+            title=("Unflag " if r.flagged else "Flag ") + "this connection",
+            aria_label=("Unflag " if r.flagged else "Flag ") + name,
+        ),
+        method="post",
+        action=f"/ui/connections/{quote(name)}/flag",
+        class_="ctl flagform",
     )
 
 
@@ -164,6 +225,7 @@ def connections_fragment(rows: list[ConnectionRow]) -> Markup:
     selection by ``app.js`` (the checkboxes are wiped on each poll/ws swap and re-hydrated from a JS Set)."""
     headers: list[str] = [
         el("input", type="checkbox", data_mf_conns_all=True),
+        "Flag",
         "Connection",
         "Dir",
         "Status",
@@ -177,9 +239,10 @@ def connections_fragment(rows: list[ConnectionRow]) -> Markup:
     body = [
         [
             _selection_checkbox(r),
+            _flag_cell(r),
             _name_cell(r),
             r.direction,
-            el("span", r.status, class_=f"status status-{r.status}"),
+            _status_cell(r),
             _num(r.read),
             _num(r.written),
             _num(r.queue_depth),
@@ -204,6 +267,7 @@ def _controls_toolbar() -> Markup:
     return el(
         "div",
         _filter_box(),  # filter first, then the bulk-action dropdown + Apply
+        _flagged_only_toggle(),  # #131: a client-side Flagged-only view filter
         el("select", *options, data_mf_conns_action=True),
         el("button", "Go", type="button", data_mf_conns_apply=True),
         el(
@@ -227,6 +291,20 @@ def _filter_box() -> Markup:
         class_="filterbox",
         autocomplete="off",
         aria_label="Filter connections",
+    )
+
+
+def _flagged_only_toggle() -> Markup:
+    """The Flagged Objects filter (#131): a checkbox that hides every non-flagged row (client-side,
+    ``app.js``). Lives OUTSIDE ``[data-poll]`` (like the filter box) so its state survives the live swap;
+    ``app.js`` re-applies it after each poll/ws swap. Purely presentational — the server still sends every
+    row, and a hidden row's checkbox stays in the selection Set."""
+    return el(
+        "label",
+        el("input", type="checkbox", data_mf_conns_flagged=True),
+        "Flagged only",
+        class_="flagfilter",
+        title="Show only flagged connections",
     )
 
 
@@ -372,6 +450,26 @@ def purge_result(scope: str, outcomes: list[tuple[str | None, str]]) -> Markup:
         class_="card",
     )
     return page("Queue purge", body, active="dashboard")
+
+
+def flag_rejected(name: str, detail: str) -> Markup:
+    """Shown when a flag toggle is refused (#131) — most often the SCOPE FORK: the connection is
+    code-first (no ``connections.toml`` home for the flag). Both ``name`` and ``detail`` are escaped."""
+    body = el(
+        "div",
+        el("h1", "Flag not changed"),
+        el("p", text(f"Connection: {name}"), class_="muted"),
+        el("p", text(detail), class_="muted"),
+        el(
+            "p",
+            "The object flag is settable only on a connections.toml-managed connection. A code-first "
+            "connection has no TOML home for it — edit its .py module to change the flag.",
+            class_="muted",
+        ),
+        el("p", el("a", "← Connections", href="/ui")),
+        class_="card",
+    )
+    return page("Flag not changed", body, active="dashboard")
 
 
 def purge_confirm(dests: list[str], scope: str) -> Markup:

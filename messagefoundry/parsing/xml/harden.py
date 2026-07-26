@@ -19,14 +19,23 @@ Guards (all on by design — inbound HL7/XML is attacker-influenceable, CLAUDE.m
 * ``DOCTYPE`` rejection — :func:`parse_bytes` additionally **rejects any document carrying a DOCTYPE**
   (``etree.DOCSTRING``/``DTD`` in the tree), so a payload can't smuggle entity *definitions* even
   though references wouldn't be resolved — defense in depth, mirroring defusedxml's ``forbid_dtd``.
+* **No second decode** — for ``str`` input, :func:`parse_bytes` neutralizes the XML declaration's
+  ``encoding=`` pseudo-attribute before encoding to UTF-8 (ASVS 1.5.3, see
+  :func:`_without_declared_encoding`).
 """
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from messagefoundry.parsing.xml._deps import load_lxml
 from messagefoundry.parsing.xml.errors import XmlParseError, XmlSecurityError
+
+#: The ``encoding="…"`` pseudo-attribute of an XML declaration at the very start of the text (a
+#: leading BOM character is tolerated, since a ``str`` decoded from a BOM-prefixed body keeps it).
+#: Anchored and non-nested — a declaration cannot contain ``>`` — so it is linear-backtracking.
+_DECLARED_ENCODING = re.compile(r"\A(﻿?<\?xml\b[^>]*?)\s+encoding\s*=\s*(\"[^\"]*\"|'[^']*')")
 
 
 def hardened_parser() -> Any:
@@ -46,6 +55,27 @@ def hardened_parser() -> Any:
     )
 
 
+def _without_declared_encoding(text: str) -> str:
+    """Drop an XML declaration's ``encoding=`` pseudo-attribute (ASVS 1.5.3 parser agreement).
+
+    A ``str`` reaching the codec was already decoded **exactly once**, by the connection, using the
+    connection's own declared encoding (ASVS 1.1.1) — so its characters are settled and the document's
+    own ``encoding=`` claim is stale metadata about bytes nobody will look at again. Encoding that str
+    to UTF-8 and leaving the claim in place tells libxml2 to decode those UTF-8 bytes as, say,
+    ISO-8859-1: a **second** decode, and the one the ingress invariant exists to prevent.
+
+    Left in place, that is parser confusion between two surfaces reading the *same*
+    ``RawMessage.raw``: ``rm.xml()`` (defusedxml, which ignores the declaration for ``str`` input)
+    returns ``José`` where ``XmlMessage.parse(rm.raw)`` returns ``JosÃ©`` — both **accepting**, and
+    disagreeing about a PHI value. Dropping the claim makes the two read the str's own characters, and
+    is only ever a no-op for a body whose declaration already matched.
+
+    Only the declaration is touched; nothing else in the document moves. Bytes input is untouched —
+    there the declaration is the sender's genuine, first-and-only statement about its own bytes.
+    """
+    return _DECLARED_ENCODING.sub(r"\1", text, count=1)
+
+
 def parse_bytes(data: bytes | str) -> Any:
     """Parse ``data`` into an lxml element tree with the hardened parser, refusing any DOCTYPE.
 
@@ -54,7 +84,7 @@ def parse_bytes(data: bytes | str) -> Any:
     Requires the ``[xml]`` extra."""
     etree = load_lxml()
     if isinstance(data, str):
-        payload: bytes = data.encode("utf-8")
+        payload: bytes = _without_declared_encoding(data).encode("utf-8")
     else:
         payload = bytes(data)
     parser = hardened_parser()

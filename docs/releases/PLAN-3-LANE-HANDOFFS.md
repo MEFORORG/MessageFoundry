@@ -48,10 +48,10 @@ ADR first). BACKLOG **#28 / #29** (load + throughput) are run **ad hoc** for a f
 
 ## Coordinator — coord-plan3 (drives Plan 3; builds nothing)
 
-> Create command: Open the existing worktree C:\Users\Scott\Code\MessageFoundry-coord-plan3 (branch coord-plan3) — already carries Plan 3; do NOT run new.ps1.
+> Create command: Open the existing worktree C:\Users\<you>\Code\MessageFoundry-coord-plan3 (branch coord-plan3) — already carries Plan 3; do NOT run new.ps1.
 
 ```
-ultracode. You are the COORDINATOR for the MessageFoundry Plan-3 effort — you build NO product code. Your worktree ALREADY EXISTS: open C:\Users\Scott\Code\MessageFoundry-coord-plan3 (branch coord-plan3, which carries this plan) and do ALL your work there — DO NOT run scripts\worktree\new.ps1 (it throws on an existing path), and never edit files in another worktree.
+ultracode. You are the COORDINATOR for the MessageFoundry Plan-3 effort — you build NO product code. Your worktree ALREADY EXISTS: open C:\Users\<you>\Code\MessageFoundry-coord-plan3 (branch coord-plan3, which carries this plan) and do ALL your work there — DO NOT run scripts\worktree\new.ps1 (it throws on an existing path), and never edit files in another worktree.
 
 Then read docs/releases/MULTISESSION-PLAN-3.md — especially "## The coordinator lane (drives Plan 3; builds nothing)" and §E "staff now" — plus CLAUDE.md. (Plan 2, MULTISESSION-PLAN-v0.2.md, is the superseded historical record.) You own:
 - ALL project-memory writes (single-writer; workers read memory, never write it). Record every ADR-status change + gating/dep-vet decision in memory BEFORE a worker lane acts on it.

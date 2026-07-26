@@ -26,7 +26,8 @@ from pathlib import Path
 import pytest
 
 from messagefoundry import code_set
-from messagefoundry.config.code_sets import CodeSet, activated as codesets_activated
+from messagefoundry.config.code_sets import CodeSet
+from messagefoundry.config.code_sets import activated as codesets_activated
 from messagefoundry.config.models import AckMode, ConnectorType, RetryPolicy
 from messagefoundry.config.wiring import (
     ConnectionSpec,

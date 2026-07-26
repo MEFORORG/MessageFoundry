@@ -35,21 +35,26 @@ import inspect
 import ipaddress
 import logging
 import os
+import re
 import sys
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Literal
 
 from messagefoundry.config.code_sets import (
     CODESETS_DIR_NAME,
     CodeSet,
     CodeSetError,
-    activated as _code_sets_activated,
-    code_set as _resolve_code_set,
     load_code_sets,
+)
+from messagefoundry.config.code_sets import (
+    activated as _code_sets_activated,
+)
+from messagefoundry.config.code_sets import (
+    code_set as _resolve_code_set,
 )
 from messagefoundry.config.models import (
     AckAfter,
@@ -103,6 +108,7 @@ __all__ = [
     "ReferenceSourceSpec",
     "resolve_env_settings",
     "referenced_env_keys",
+    "connector_secret_env_values",
     "display_settings",
     "redacted_settings",
     "InboundConnection",
@@ -235,7 +241,7 @@ def parse_env_setting(value: Any) -> Any:
             f"(use one of {', '.join(sorted(_NAMED_CASTS))})"
         )
     cast = _NAMED_CASTS[cast_name] if cast_name is not None else None
-    default = value["default"] if "default" in value else _UNSET
+    default = value["default"] if "default" in value else _UNSET  # noqa: SIM401
     return EnvRef(key=key.lower(), default=default, cast=cast)
 
 
@@ -576,20 +582,6 @@ def referenced_env_keys(settings: Mapping[str, Any]) -> list[str]:
     return sorted({v.key for v in settings.values() if isinstance(v, EnvRef)})
 
 
-def display_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
-    """A JSON-safe view of settings for introspection: each EnvRef becomes ``{"env": key[, default]}``."""
-    out: dict[str, Any] = {}
-    for name, value in settings.items():
-        if isinstance(value, EnvRef):
-            ref: dict[str, Any] = {"env": value.key}
-            if value.default is not _UNSET:
-                ref["default"] = value.default
-            out[name] = ref
-        else:
-            out[name] = value
-    return out
-
-
 #: Settings keys whose values are credentials — redacted in the API metadata view. Secrets are
 #: required to be ``env()`` refs (so they already render as ``{"env": ...}``); this is defence in
 #: depth against an inline value, and it suppresses an ``env()`` *default* for a secret field. Covers
@@ -614,6 +606,26 @@ _SECRET_SETTING_KEYS = frozenset(
         # HTTP Digest / NTLM password). The minted bearer / digest response are runtime-only.
         "oauth2_client_secret",
         "http_auth_password",
+        # ADR 0126 (#127) — the forward/egress web-proxy credential. The Basic Proxy-Authorization header /
+        # Digest response are runtime-only; the password + username inputs are redacted in /metadata (the
+        # username alongside `basic_user`/`ws_username`, defence-in-depth).
+        "proxy_password",
+        "proxy_user",
+        # ADR 0015 — WS-* SOAP outbound: the WS-Security UsernameToken credentials and the mTLS
+        # client-key passphrase. ``ws_password`` back-fills from ``basic_password`` in the connector,
+        # so omitting these disclosed under one name the very credential the other name masks.
+        "ws_username",
+        "ws_password",
+        "client_key_password",
+        # ADR 0085 — Direct S/MIME-over-SMTP: the signing-key passphrase. (``signing_key`` itself is a
+        # *path* to the key file, like ``tls_key_file``/``client_key_file``, so it is not listed here.)
+        "signing_key_password",
+        # ADR 0132 (#111) — File-endpoint alternate Windows/UNC-share credential. The password is the
+        # secret (env() only, enforced by the File() factory); the username is redacted defence-in-depth
+        # alongside ``basic_user``/``ws_username``. ``credential_domain`` is non-secret (an AD domain
+        # name), so it is intentionally not listed.
+        "credential_username",
+        "credential_password",
     }
 )
 
@@ -625,6 +637,68 @@ _SECRET_HEADER_NAMES = frozenset(
 )
 
 
+def _is_secret_setting(name: str) -> bool:
+    """Is ``name`` a credential-bearing settings key?
+
+    The single source of truth for **both** settings serializers — ``redacted_settings`` (the API
+    ``/metadata`` view) and ``display_settings`` (``graph --json`` → stdout, CI logs, the IDE graph
+    view). They must never disagree: a key masked on one surface and printed on the other is a
+    disclosure wearing a false sense of cover, which is exactly how ``ws_password`` was served in
+    plaintext while ``basic_password`` — the same credential — was masked.
+
+    The ``body_secret_value_*`` prefix covers the SOAP body-secret values (ADR 0015 amendment /
+    BACKLOG #236): the factory already forbids an inline literal and an ``env()`` default on them, so
+    each renders as a bare ``{"env": key}`` regardless — but the prefix is belt-and-suspenders in case
+    a value ever reaches a serializer resolved. The paired ``body_secret_tokens`` are **not** secret:
+    a placeholder is public by nature (it sits in the committed Handler source)."""
+    return name in _SECRET_SETTING_KEYS or name.startswith("body_secret_value_")
+
+
+#: Connector secret-setting keys that are IDENTIFIERS (usernames), not rotatable credentials — a
+#: username names a principal, it is not itself cycled on a cadence (you rotate its paired *password*).
+#: They live in :data:`_SECRET_SETTING_KEYS` only so ``/metadata`` redacts them defence-in-depth (a
+#: username can leak directory structure). The **single source of truth** for "which secret settings are
+#: rotatable": imported by ``tests/test_secret_rotation_inventory.py`` (the ASVS-13.1.4 registration gate)
+#: and read by :func:`connector_secret_env_values` (the ASVS-13.3.4 rotation fingerprinter), so the
+#: redaction list, the doc registration gate, and the runtime fingerprint set can never disagree about
+#: which members are credentials you rotate.
+_NON_ROTATABLE_SECRET_SETTING_KEYS: frozenset[str] = frozenset(
+    {"username", "basic_user", "proxy_user", "ws_username", "credential_username"}
+)
+
+
+def connector_secret_env_values(
+    registry: Registry, env_values: Mapping[str, Any]
+) -> dict[str, str]:
+    """The per-Connection ``env()``-sourced credential VALUES the wired graph references right now, keyed
+    by their environment-value key (a NON-SECRET identifier) — the input to the ASVS-13.3.4 rotation
+    watcher's ``extra_values`` (``pipeline/secret_rotation.reconcile_rotation_meta``), which fingerprints
+    each with the DEK-derived keyed MAC so a per-Connection connector credential is monitored for rotation
+    exactly like the fixed ``MEFOR_*`` classes.
+
+    A setting is included when its key is a **rotatable** credential — in :data:`_SECRET_SETTING_KEYS` and
+    not a non-rotatable identifier in :data:`_NON_ROTATABLE_SECRET_SETTING_KEYS` — AND it is an ``env()``
+    ref whose key resolves to a **non-empty string** in ``env_values``. Values are returned **transiently**
+    to be MAC'd — never persisted or logged; the map key is the operator-chosen env name, never the value.
+    Connections sharing an env key collapse to one entry (one secret → one rotation clock). Inline (non-
+    ``env()``) credentials are skipped: they carry no stable per-environment identity to fingerprint, and
+    the factories already forbid an inline value for a secret setting."""
+    out: dict[str, str] = {}
+    # Both connection kinds carry a ``.spec`` (ConnectionSpec); collect specs so the loop is typed to
+    # ConnectionSpec rather than the join of the two connection types.
+    specs: list[ConnectionSpec] = [c.spec for c in registry.inbound.values()]
+    specs += [c.spec for c in registry.outbound.values()]
+    for spec in specs:
+        for name, value in spec.settings.items():
+            if name in _NON_ROTATABLE_SECRET_SETTING_KEYS or name not in _SECRET_SETTING_KEYS:
+                continue
+            if isinstance(value, EnvRef):
+                resolved = env_values.get(value.key)
+                if isinstance(resolved, str) and resolved:
+                    out[value.key] = resolved
+    return out
+
+
 def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     """A JSON-safe, secret-scrubbed view of a connection's settings for the API ``/metadata`` endpoint:
     each EnvRef becomes ``{"env": key}`` (the value is never resolved — only the key is shown), a
@@ -633,7 +707,7 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     table is redacted too."""
     out: dict[str, Any] = {}
     for name, value in settings.items():
-        is_secret = name in _SECRET_SETTING_KEYS
+        is_secret = _is_secret_setting(name)
         if isinstance(value, EnvRef):
             ref: dict[str, Any] = {"env": value.key}
             if value.default is not _UNSET and not is_secret:
@@ -651,6 +725,17 @@ def redacted_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     return out
 
 
+def display_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
+    """A JSON-safe view of settings for introspection (``messagefoundry graph --json`` and the IDE
+    graph view): each EnvRef becomes ``{"env": key[, default]}``.
+
+    Credentials are scrubbed exactly as the API ``/metadata`` view scrubs them. This output reaches a
+    terminal, a CI log and the IDE, so it earns the *same* treatment, not a weaker one — it used to
+    apply none at all, printing an inline credential verbatim and an ``env()`` *default* (a fallback
+    secret) for every connection in the graph."""
+    return redacted_settings(settings)
+
+
 def MLLP(
     *,
     host: str | EnvRef | None = None,  # OUTBOUND: the downstream peer (required; may be env()).
@@ -663,6 +748,7 @@ def MLLP(
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: wait this long for the ACK
+    no_ack: bool = False,  # OUTBOUND (MLLP-only): fire-and-forward — skip the ACK read, deliver on the TCP write (at-most-once-confirmation; ADR 0124). Incompatible with capture_response/reingress_to.
     # Persistent outbound connection (ADR 0067) — outbound-only (inbound ignores them, like
     # timeout_seconds); pass None/0 on the two freshness knobs to disable that check:
     persistent: bool = False,  # outbound default (this release): connect-per-send; True = reuse ONE connection (opt-in, ADR 0067)
@@ -673,6 +759,9 @@ def MLLP(
     encoding_characters: str | None = None,  # OUTBOUND: re-encode MSH-1/MSH-2 delimiters per dest
     hl7_raw_separators: bool = False,  # OUTBOUND: emit reserved separators as RAW bytes, not \F\..\T\ escapes (BACKLOG #107)
     capture_response: bool = False,  # outbound: capture the application ACK (MSA/ERR) as a reply (ADR 0013)
+    verify_ack_control_id: bool = False,  # outbound: require the ACK's MSA-2 to echo the sent MSH-10 (BACKLOG #82)
+    send_min_interval_seconds: float
+    | None = None,  # outbound: min seconds between sends on this lane (rate pacing; BACKLOG #82)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     # --- TLS (WP-13b, ADR 0002) — per-connection MLLP-over-TLS ---
@@ -709,6 +798,14 @@ def MLLP(
     sustained high-rate lanes. ``persistent=False`` also stays the compat mode for partners that
     require connection-per-message.
 
+    ``no_ack`` (**outbound only**, BACKLOG #117 / ADR 0124) is fire-and-forward: when ``True`` the
+    connector writes + drains and confirms delivery **on the TCP write** — it reads **no** ACK and
+    validates **no** MSA-1, so there is **no NAK-driven and no ACK-timeout-driven retry**
+    (*at-most-once-confirmation*; a connect/drain failure is still charged + retried, so receivers must
+    stay idempotent). ``False`` (the default) is **byte-identical** (read + validate one ACK). It
+    composes with ``persistent=True`` (no handshake *and* no ACK wait) and is **incompatible** with
+    ``capture_response``/``reingress_to`` (there is no ACK to capture) — both rejected at ``check``.
+
     ``encoding_characters`` (**outbound only**, Corepoint ``MsgSend -override component`` parity) makes
     this destination re-encode each outgoing message with a different set of HL7 delimiters before
     framing. Give the **5 MSH delimiter characters in MSH order** — MSH-1 (field separator) followed by
@@ -734,7 +831,27 @@ def MLLP(
     **TLS (WP-13b).** ``tls=True`` wraps the connection: inbound presents ``tls_cert_file``/``tls_key_file``
     (a server identity; ``tls_ca_file`` adds opt-in mTLS — require + verify a client cert); outbound
     verifies the server cert against ``tls_ca_file`` (or the system trust store) with hostname checking,
-    and may present ``tls_cert_file`` for mTLS. ``tls_key_password`` decrypts a passphrase-encrypted
+    and may present ``tls_cert_file`` for mTLS.
+
+    ``verify_ack_control_id`` (**outbound only**, BACKLOG #82) tightens the *accept* decision: when
+    ``True``, a **positive** ACK (MSA-1 AA/CA) is accepted only if its MSA-2 (message control id)
+    equals the sent message's MSH-10 — a reply carrying a different control id is treated as a
+    correlation failure (retryable ``DeliveryError`` → the pipeline retries per the at-least-once
+    path). Both control ids are read separator-aware from the message (never hardcoded ``|^~\\&``).
+    ``False`` (the default) leaves delivery **byte-identical** — no correlation is performed. If the
+    outgoing message's own MSH-10 is absent/unreadable there is nothing to correlate, so the check is
+    skipped and the message delivers as before. It does not alter a negative ACK's handling.
+
+    ``send_min_interval_seconds`` (**outbound only**, BACKLOG #82) paces this lane's egress: the engine
+    holds each ``send`` until at least this many seconds have elapsed since the previous send on the
+    **same** outbound started, so a partner that cannot absorb bursts sees a bounded send rate. Pacing is
+    **per-envelope** — one interval per ``send()`` call — so a batching outbound (ADR 0082) counts a whole
+    ``BHS``…``BTS`` batch as ONE interval (it throttles the send RATE, not a per-message rate; a strict
+    per-message cap is a future refinement). The delay is a pure **wait**, enforced at the pipeline's
+    delivery seam: it never reorders (strict per-lane FIFO holds — the row is already claimed) and is
+    cancellable by the connection's stop signal. Independent outbounds pace independently (a per-lane
+    clock, not a shared bucket). ``None``/``0`` (the default) = **no pacing**, delivery byte-identical.
+    A negative value is rejected at wiring. ``tls_key_password`` decrypts a passphrase-encrypted
     ``tls_key_file`` (supply it via ``env()`` so the secret stays out of config — mirrors the API
     listener's ``MEFOR_API_TLS_KEY_PASSWORD``); omit it for an unencrypted key. ``tls_verify=False``
     (outbound) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning) —
@@ -755,12 +872,15 @@ def MLLP(
             "max_frame_bytes": max_frame_bytes,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
+            "no_ack": no_ack,
             "persistent": persistent,
             "idle_timeout_seconds": idle_timeout_seconds,
             "max_connection_age_seconds": max_connection_age_seconds,
             "encoding_characters": encoding_characters,
             "hl7_raw_separators": hl7_raw_separators,
             "capture_response": capture_response,
+            "verify_ack_control_id": verify_ack_control_id,
+            "send_min_interval_seconds": send_min_interval_seconds,
             "reingress_to": reingress_to,
             "tls": tls,
             "tls_cert_file": tls_cert_file,
@@ -780,7 +900,7 @@ def Tcp(
     # INBOUND: omit — the bind interface is a service setting ([inbound].bind_host), not authored.
     port: int | EnvRef,
     # Framing: a preset name ("stx_etx" | "vt_fs" | "mllp") OR explicit start/end[/trailer] byte ints.
-    framing: str | None = "stx_etx",
+    framing: Literal["stx_etx", "vt_fs", "mllp"] | None = "stx_etx",
     start: int | None = None,  # explicit start delimiter byte (use instead of `framing`)
     end: int | None = None,  # explicit end delimiter byte
     trailer: int | None = None,  # explicit optional trailer byte
@@ -791,6 +911,12 @@ def Tcp(
     max_frame_bytes: int | None = 16 * 1024 * 1024,  # cap one frame's bytes (OOM guard); both dirs
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
+    # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
+    persistent: bool = False,  # outbound: reuse ONE connection across deliveries (opt-in; default connect-per-send)
+    idle_timeout_seconds: float
+    | None = 60.0,  # outbound: don't reuse a connection idle longer than this
+    max_connection_age_seconds: float
+    | None = None,  # outbound: recycle by age (LB/firewall hygiene)
     expect_reply: bool = False,  # outbound: read one framed reply and treat it as confirmation
     capture_response: bool = False,  # outbound: capture the framed reply (requires expect_reply, ADR 0013)
     reingress_to: str
@@ -806,7 +932,12 @@ def Tcp(
     There is **no HL7 ACK** — a Handler may still return a payload, which is framed back to the
     sender. Outbound dials ``host``/``port``, frames + sends; with ``expect_reply`` it waits for one
     framed reply and treats receiving it as confirmation (the reply is **not** parsed — X12 997/TA1
-    acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**."""
+    acks are a deferred follow-up). Delivery is at-least-once → the receiver **must be idempotent**.
+
+    ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
+    deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
+    **before any byte is written** (uncharged), and any post-write failure is charged + retried.
+    ``idle_timeout_seconds``/``max_connection_age_seconds`` bound reuse (``None``/``0`` = off)."""
     return ConnectionSpec(
         ConnectorType.TCP,
         {
@@ -822,6 +953,9 @@ def Tcp(
             "max_frame_bytes": max_frame_bytes,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
+            "persistent": persistent,
+            "idle_timeout_seconds": idle_timeout_seconds,
+            "max_connection_age_seconds": max_connection_age_seconds,
             "expect_reply": expect_reply,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -843,6 +977,12 @@ def X12(
     * 1024,  # cap one interchange's bytes (OOM); both dirs
     connect_timeout: float = 10.0,  # outbound: TCP connect timeout (seconds)
     timeout_seconds: float = 30.0,  # outbound: send/await-reply timeout
+    # Persistent outbound connection (ADR 0067 §9 / BACKLOG #97) — outbound-only; None/0 on a freshness knob disables it:
+    persistent: bool = False,  # outbound: reuse ONE connection across deliveries (opt-in; default connect-per-send)
+    idle_timeout_seconds: float
+    | None = 60.0,  # outbound: don't reuse a connection idle longer than this
+    max_connection_age_seconds: float
+    | None = None,  # outbound: recycle by age (LB/firewall hygiene)
     expect_reply: bool = False,  # outbound: read one returned interchange and treat it as confirmation
     # --- ADR 0016: synchronous request/response (real-time eligibility 270/271, 278N, 277) ---
     capture_response: bool = False,  # capture the returned interchange (271/TA1) as a reply (ADR 0013)
@@ -866,7 +1006,13 @@ def X12(
     *not* retried), a business 271/277/278 returned instead is itself the confirmation; ``ta1_required``
     makes a no-reply a retry. Egress is gated by ``[egress].allowed_tcp`` (X12 shares the raw-TCP
     allowlist). Delivery is at-least-once → the receiver **must be idempotent** (a crash-re-send of a
-    non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``)."""
+    non-idempotent 270 yields a fresh 271 captured at the next ``response_seq``).
+
+    ``persistent=true`` (ADR 0067 §9 / BACKLOG #97) reuses one lazily-established connection across
+    deliveries (default ``false`` = connect-per-send, byte-identical); a stale socket is redialed once
+    **before any byte is written** (uncharged). A returned TA1/business interchange is a complete
+    transaction on a healthy transport, so the connection **stays cached** across a captured reply (and a
+    TA1*R reject); ``idle_timeout_seconds``/``max_connection_age_seconds`` bound reuse (``None``/``0`` = off)."""
     return ConnectionSpec(
         ConnectorType.X12,
         {
@@ -878,6 +1024,9 @@ def X12(
             "max_interchange_bytes": max_interchange_bytes,
             "connect_timeout": connect_timeout,
             "timeout_seconds": timeout_seconds,
+            "persistent": persistent,
+            "idle_timeout_seconds": idle_timeout_seconds,
+            "max_connection_age_seconds": max_connection_age_seconds,
             "expect_reply": expect_reply,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
@@ -957,35 +1106,107 @@ def File(
     poll_seconds: float = 1.0,
     encoding: str = "utf-8",
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
-    after_read: str = "move",  # inbound: "move" (to processed_subdir) | "delete"
+    after_read: Literal[
+        "move", "delete", "leave"
+    ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    validate_directory: bool = False,  # inbound: fail-fast at start on a missing/unusable dir (#114); default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
+    # Per-endpoint alternate Windows/network-share credential (UNC/SMB — ADR 0132, #111). Unset (the
+    # default) => the engine uses its own service-account identity, byte-identical. When set, the
+    # File connector authenticates to the share under this identity (win32-only; a non-Windows host
+    # raises a clear error at build). The password is a SECRET — env() ONLY (enforced below).
+    credential_username: str | EnvRef | None = None,
+    credential_domain: str | EnvRef | None = None,  # optional; omit for DOMAIN\\user or user@domain
+    credential_password: EnvRef | None = None,  # secret — env() only, never inline
+    compress: Literal["gzip"]
+    | None = None,  # outbound: "gzip" gzips the drop and appends `.gz` (ADR 0123)
+    decompress: Literal["gzip"]
+    | None = None,  # inbound: "gzip" gunzips each drop before the sniff/scan/split
+    max_decompressed_bytes: int | None = 64 * 1024 * 1024,  # inbound: decompression-bomb ceiling
 ) -> ConnectionSpec:
     """A File endpoint. Inbound polls ``directory`` for ``pattern``; outbound writes ``filename``
     (atomically). ``encoding`` is the file charset (outbound). ``max_file_bytes`` mirrors
-    transports.file.DEFAULT_MAX_FILE_BYTES (pass None/0 to disable)."""
-    return ConnectionSpec(
-        ConnectorType.FILE,
-        {
-            "directory": directory,
-            "filename": filename,
-            "pattern": pattern,
-            "poll_seconds": poll_seconds,
-            "encoding": encoding,
-            "min_age_seconds": min_age_seconds,
-            "after_read": after_read,
-            "sort": sort,
-            "recursive": recursive,
-            "max_file_bytes": max_file_bytes,
-            "overwrite": overwrite,
-            "processed_subdir": processed_subdir,
-            "error_subdir": error_subdir,
-        },
-    )
+    transports.file.DEFAULT_MAX_FILE_BYTES (pass None/0 to disable).
+
+    ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
+    the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
+    another system owns (#142; a HASHED per-file ledger dedups so a left file is ingested once).
+    ``validate_directory`` (inbound, #114) makes a missing/unusable directory **fail startup** (the
+    connection is reported ``failed``) instead of the default deferral to run time; a ``leave`` source
+    validates read-only (a read-only share passes).
+
+    ``credential_username`` / ``credential_domain`` / ``credential_password`` (ADR 0132, #111) give the
+    endpoint an **alternate Windows identity** for a UNC/SMB share, distinct from the engine service
+    account (both inbound poll and outbound write). ``credential_username`` may be ``user`` (+ separate
+    ``credential_domain``), ``DOMAIN\\user``, or a ``user@domain`` UPN. ``credential_password`` is a
+    secret and **must be an** :func:`env` **reference** — an inline literal is refused. Win32-only: on a
+    non-Windows host the connector refuses to build (a clear error, never a silent no-op).
+
+    **Compression** (ADR 0123, single-stream gzip only). Outbound ``compress="gzip"`` gzips the encoded
+    body and appends ``.gz`` to the rendered name. Inbound ``decompress="gzip"`` gunzips each dropped
+    file **before** the HL7 sniff, the pre-ingest AV scan, and the batch split; ``max_decompressed_bytes``
+    (default 64 MiB, None/0 disables) caps the *decompressed* size — a decompression-bomb guard the
+    compressed-only ``max_file_bytes`` cannot provide. A corrupt/oversized archive is moved to
+    ``.error`` (never accept-and-dropped). Multi-entry zip / raw deflate stay Handler-composed via
+    ``messagefoundry.parsing.compression``."""
+    settings: dict[str, Any] = {
+        "directory": directory,
+        "filename": filename,
+        "pattern": pattern,
+        "poll_seconds": poll_seconds,
+        "encoding": encoding,
+        "min_age_seconds": min_age_seconds,
+        "after_read": after_read,
+        "sort": sort,
+        "recursive": recursive,
+        "max_file_bytes": max_file_bytes,
+        "validate_directory": validate_directory,
+        "overwrite": overwrite,
+        "processed_subdir": processed_subdir,
+        "error_subdir": error_subdir,
+        "compress": compress,
+        "decompress": decompress,
+        "max_decompressed_bytes": max_decompressed_bytes,
+    }
+    if credential_username is not None or credential_password is not None:
+        # A share credential is being configured — the password is a secret and must never be inline
+        # (CLAUDE.md §5). Mirror the SOAP body_secrets rule (_hoist_body_secrets): reject a literal /
+        # a defaulted / cast env(), so a fallback secret can't slip in and the value renders as a bare
+        # {"env": key} in every settings view (belt-and-suspenders atop _SECRET_SETTING_KEYS).
+        if credential_username is None:
+            raise WiringError(
+                "File credential_password is set without credential_username — supply the share "
+                "identity (credential_username) too"
+            )
+        if credential_password is None:
+            raise WiringError(
+                "File credential_username is set without credential_password — a Windows/UNC share "
+                "credential needs a password; supply it via env() (credential_password=env('...'))"
+            )
+        if not isinstance(credential_password, EnvRef):
+            raise WiringError(
+                "File credential_password must be an env() reference — a share password is a secret "
+                "and is never inline (CLAUDE.md §5); e.g. credential_password=env('acme_share_pw')"
+            )
+        if credential_password.default is not _UNSET:
+            raise WiringError(
+                "File credential_password env() must not carry a default= — a fallback share password "
+                "would be a silent secret"
+            )
+        if credential_password.cast is not None:
+            raise WiringError(
+                "File credential_password env() must not carry a cast= (a password is text)"
+            )
+        settings["credential_username"] = credential_username
+        settings["credential_password"] = credential_password
+        if credential_domain is not None:
+            settings["credential_domain"] = credential_domain
+    return ConnectionSpec(ConnectorType.FILE, settings)
 
 
 def Timer(
@@ -994,14 +1215,24 @@ def Timer(
     interval_seconds: float | None = None,
     run_once: bool = False,
     encoding: str = "utf-8",
+    cron_expression: str | None = None,
+    timezone: str | None = None,
 ) -> ConnectionSpec:
     """A Timer **source** (inbound): emit ``body`` on a schedule (ADR 0011).
 
-    Set ``interval_seconds`` to fire every N seconds (heartbeat starts at t=0), or ``run_once=True`` to
-    fire a single time. ``body`` is emitted verbatim — declare its format with
+    Set ``interval_seconds`` to fire every N seconds (heartbeat starts at t=0), ``run_once=True`` to fire
+    a single time, or ``cron_expression`` for a calendar schedule (ADR 0011 amendment, BACKLOG #160) — the
+    three are mutually exclusive. ``body`` is emitted verbatim — declare its format with
     ``inbound(..., content_type=...)``: the default ``hl7v2`` runs the HL7 peek/validate/ACK path, while
     ``text``/``json`` route a :class:`RawMessage` (ADR 0004). In a cluster the schedule is leader-gated,
-    so exactly one node fires it (single-node fires as normal). ``cron`` scheduling is a follow-up."""
+    so exactly one node fires it (single-node fires as normal).
+
+    **Cron** is a standard 5-field expression (``minute hour day-of-month month day-of-week``) with
+    ``*``, lists, ranges, and steps; day-of-week is ``0-6`` (Sunday = 0, or 7). Unlike the interval
+    heartbeat, cron does **not** fire at ``t=0`` — the first fire is the next scheduled minute. Optional
+    ``timezone`` is an IANA name (e.g. ``"America/New_York"``) the schedule matches against (DST-aware);
+    omitted, it matches the **system-local** wall clock. E.g. ``cron_expression="0 8 * * 1-5"`` fires at
+    08:00 on weekdays."""
     return ConnectionSpec(
         ConnectorType.TIMER,
         {
@@ -1009,6 +1240,8 @@ def Timer(
             "interval_seconds": interval_seconds,
             "run_once": run_once,
             "encoding": encoding,
+            "cron_expression": cron_expression,
+            "timezone": timezone,
         },
     )
 
@@ -1064,13 +1297,29 @@ def Rest(
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
+    # --- ADR 0126: outbound forward/egress web proxy (#112/#127/#128) ---
+    proxy: str
+    | None = None,  # #112: None = inherit [egress].proxy_url / off; "default" = system default web proxy; or an http(s):// address
+    proxy_user: str | EnvRef | None = None,  # #127: forward-proxy auth username (use env())
+    proxy_password: str
+    | EnvRef
+    | None = None,  # #127: forward-proxy auth password — secret, use env()
+    proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
+    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    proxy_no_proxy: list[str]
+    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
 ) -> ConnectionSpec:
     """An HTTP(S) endpoint (**outbound only** today — there is no REST source yet, ADR 0003). The
     Handler produces the request body; this delivers it to ``url`` via ``method`` with ``content_type``
     + ``headers`` and optional bearer/basic auth. A 2xx is delivered; 5xx/408/429/connection errors
     retry; other 4xx dead-letter (a permanent rejection). Redirects are refused and the egress host is
     gated by ``[egress].allowed_http``. Put secrets in ``env()`` (``bearer_token``/``basic_*``), never
-    in ``headers``. The receiving endpoint **must be idempotent** (delivery is at-least-once)."""
+    in ``headers``. The receiving endpoint **must be idempotent** (delivery is at-least-once).
+
+    ``proxy`` routes egress through a corporate **forward proxy** (ADR 0126): ``"default"`` uses the OS
+    default web proxy, an ``http(s)://`` address is explicit, unset inherits ``[egress].proxy_url``.
+    ``proxy_user``/``proxy_password`` (secret → ``env()``) authenticate to it (``proxy_auth_type``
+    Basic/Digest); ``proxy_no_proxy`` lists intranet hosts to reach directly."""
     return ConnectionSpec(
         ConnectorType.REST,
         {
@@ -1089,6 +1338,11 @@ def Rest(
             "capture_response_headers": capture_response_headers,
             "reingress_to": reingress_to,
             "dynamic_headers": dynamic_headers,
+            "proxy_url": proxy,
+            "proxy_user": proxy_user,
+            "proxy_password": proxy_password,
+            "proxy_auth_type": proxy_auth_type,
+            "proxy_no_proxy": proxy_no_proxy,
         },
     )
 
@@ -1096,10 +1350,15 @@ def Rest(
 def FHIR(
     *,
     url: str | EnvRef,  # the FHIR service BASE url, e.g. https://host/fhir (may be env())
-    fhir_version: str = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
-    format: str = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
-    interaction: str = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
-    conditional: str | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
+    fhir_version: Literal[
+        "R4B", "R5", "STU3"
+    ] = "R4B",  # "R4B" (default) | "R5" | "STU3" — explicit, no autodetect
+    format: Literal["json"] = "json",  # "json" (MVP); "xml" is deferred (ADR 0022 Options #5)
+    interaction: Literal[
+        "create", "update", "transaction", "batch"
+    ] = "create",  # "create" (POST) | "update" (PUT) | "transaction" | "batch" (Bundle POST)
+    conditional: Literal["if-none-exist", "conditional-update", "if-match"]
+    | None = None,  # None | "if-none-exist" | "conditional-update" | "if-match"
     conditional_query: str
     | None = None,  # search params for if-none-exist / conditional-update (e.g. "identifier=sys|val")
     headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
@@ -1118,6 +1377,17 @@ def FHIR(
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     dynamic_headers: bool = False,  # #68: apply a Handler's per-message http.header.* SetMeta as headers
+    # --- ADR 0126: outbound forward/egress web proxy (#112/#127/#128) ---
+    proxy: str
+    | None = None,  # #112: None = inherit [egress].proxy_url / off; "default" = system default web proxy; or an http(s):// address
+    proxy_user: str | EnvRef | None = None,  # #127: forward-proxy auth username (use env())
+    proxy_password: str
+    | EnvRef
+    | None = None,  # #127: forward-proxy auth password — secret, use env()
+    proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
+    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    proxy_no_proxy: list[str]
+    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
 ) -> ConnectionSpec:
     """A FHIR REST endpoint (**outbound destination only** — the inbound FHIR server facade is ADR 0023).
     The Handler produces a FHIR-JSON resource (or transaction/batch ``Bundle``) body; this delivers it to
@@ -1153,6 +1423,11 @@ def FHIR(
             "capture_response_headers": capture_response_headers,
             "reingress_to": reingress_to,
             "dynamic_headers": dynamic_headers,
+            "proxy_url": proxy,
+            "proxy_user": proxy_user,
+            "proxy_password": proxy_password,
+            "proxy_auth_type": proxy_auth_type,
+            "proxy_no_proxy": proxy_no_proxy,
         },
     )
 
@@ -1348,6 +1623,17 @@ def DICOMweb(
     capture_response: bool = False,  # capture the STOW-RS dicom+json response as a reply (ADR 0013)
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
+    # --- ADR 0126: outbound forward/egress web proxy (#112/#127/#128) ---
+    proxy: str
+    | None = None,  # #112: None = inherit [egress].proxy_url / off; "default" = system default web proxy; or an http(s):// address
+    proxy_user: str | EnvRef | None = None,  # #127: forward-proxy auth username (use env())
+    proxy_password: str
+    | EnvRef
+    | None = None,  # #127: forward-proxy auth password — secret, use env()
+    proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
+    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    proxy_no_proxy: list[str]
+    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
 ) -> ConnectionSpec:
     """A **DICOMweb STOW-RS** endpoint (ADR 0025 Phase 2 — **outbound destination only**; an inbound
     STOW-RS receiver awaits the HTTP listener, ADR 0023). The Handler produces (or forwards) a DICOM
@@ -1376,8 +1662,27 @@ def DICOMweb(
             "encoding": encoding,
             "capture_response": capture_response,
             "reingress_to": reingress_to,
+            "proxy_url": proxy,
+            "proxy_user": proxy_user,
+            "proxy_password": proxy_password,
+            "proxy_auth_type": proxy_auth_type,
+            "proxy_no_proxy": proxy_no_proxy,
         },
     )
+
+
+# A stored-procedure call: the ODBC call escape ``{ [? =] CALL proc(...) }`` or a T-SQL ``EXEC``/``EXECUTE``
+# (which a scalar-return batch leads with a ``DECLARE @rv INT; EXEC @rv = proc; SELECT @rv`` preamble, so
+# the keyword is not necessarily first). Used ONLY to gate DATABASE capture_out_params (#67) — the explicit
+# opt-in must name an actual proc call so it can't mask a plain INSERT/UPDATE/DELETE (which carries neither
+# CALL nor EXEC). Advisory, not a security boundary (binding stays parameterized). Lower-cased statement in.
+_DB_PROC_CALL_RE = re.compile(r"\bexec(?:ute)?\b|\bcall\b", re.IGNORECASE | re.DOTALL)
+
+
+def _is_db_proc_call(statement_lower: str) -> bool:
+    """Whether ``statement_lower`` (an already-lower-cased SQL statement) is a stored-procedure call — an
+    ODBC ``{ ... CALL ... }`` escape or a T-SQL ``EXEC``/``EXECUTE`` (#67, ADR 0013 amendment)."""
+    return bool(_DB_PROC_CALL_RE.search(statement_lower))
 
 
 def _reject_envref_odbc_params(odbc_params: Mapping[str, Any] | None) -> None:
@@ -1403,8 +1708,12 @@ def Database(
     database: str
     | EnvRef
     | None = None,  # required for dialect='sqlserver'; optional for 'generic'
-    dialect: str = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
-    auth: str = "sql",  # sql | integrated | entra (SQL Server preset only)
+    dialect: Literal[
+        "sqlserver", "generic"
+    ] = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
+    auth: Literal[
+        "sql", "integrated", "entra"
+    ] = "sql",  # sql | integrated | entra (SQL Server preset only)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
@@ -1420,6 +1729,7 @@ def Database(
     pool_max: int = 5,
     acquire_timeout: float = 30.0,  # cap a pooled-connection borrow (s) — fail transiently, not forever
     capture_response: bool = False,  # capture the statement's RETURNING/OUTPUT result-set (ADR 0013)
+    capture_out_params: bool = False,  # #67: capture a stored-proc CALL's OUT params + scalar RETURN value
     reingress_to: str
     | None = None,  # route the captured reply into this Loopback inbound (implies capture; ADR 0013)
     capture_max_rows: int = 100,  # cap captured rows (over-cap → outcome='unparseable', empty body)
@@ -1437,7 +1747,15 @@ def Database(
     ``statement`` (translated to positional ``?`` — always parameterized, never string-built) and runs it. A
     transient DB error retries; a constraint/data error (or a payload that doesn't match) dead-letters. Put
     secrets (``password``) in ``env()``; ``odbc_params`` values are literals (put per-env/secret values in
-    the top-level fields). The write **must be idempotent** (at-least-once)."""
+    the top-level fields). The write **must be idempotent** (at-least-once).
+
+    ``capture_response=True`` captures the statement's ``RETURNING``/``OUTPUT`` result-set (ADR 0013).
+    ``capture_out_params=True`` (#67, ADR 0013 amendment) captures a **stored-procedure call's OUT params +
+    scalar RETURN value** — for a proc that reports status through OUT/return rather than a result-set. It
+    **implies** capture, requires the ``statement`` to be a stored-proc call (an ODBC ``{ … CALL … }`` escape
+    or a leading ``EXEC``/``EXECUTE``), and reads the values back **pre-commit from the same cursor** via a
+    trailing readback ``SELECT`` in the proc batch. The proc **must be idempotent and must not COMMIT/ROLLBACK
+    internally**, or a crash-re-send may capture a divergent value (ADR 0013 amendment atomicity caveat)."""
     _reject_envref_odbc_params(odbc_params)
     return ConnectionSpec(
         ConnectorType.DATABASE,
@@ -1461,6 +1779,7 @@ def Database(
             "pool_max": pool_max,
             "acquire_timeout": acquire_timeout,
             "capture_response": capture_response,
+            "capture_out_params": capture_out_params,
             "reingress_to": reingress_to,
             "capture_max_rows": capture_max_rows,
         },
@@ -1474,12 +1793,16 @@ def DatabasePoll(
     database: str
     | EnvRef
     | None = None,  # required for dialect='sqlserver'; optional for 'generic'
-    dialect: str = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
+    dialect: Literal[
+        "sqlserver", "generic"
+    ] = "sqlserver",  # 'sqlserver' preset (default) | 'generic' ODBC (#66)
     mark_statement: str
     | None = None,  # UPDATE/DELETE run per row after the handler succeeds (:name)
     body_column: str | None = None,  # None → whole row as JSON; set → that column's value verbatim
     poll_seconds: float = 5.0,
-    auth: str = "sql",  # sql | integrated | entra (SQL Server preset only)
+    auth: Literal[
+        "sql", "integrated", "entra"
+    ] = "sql",  # sql | integrated | entra (SQL Server preset only)
     username: str | EnvRef | None = None,
     password: str | EnvRef | None = None,  # secret — use env()
     port: int | EnvRef = 1433,
@@ -1544,11 +1867,77 @@ def DatabasePoll(
     )
 
 
+#: A SOAP body-secret placeholder token: 16–64 chars of a URL/XML-safe alphabet. High entropy is the
+#: author's responsibility (e.g. ``secrets.token_hex(12)``); the length floor makes an accidental
+#: collision with real HL7-derived body content vanishingly unlikely (ADR 0015 amendment, #236).
+_BODY_SECRET_TOKEN_RE = re.compile(r"^[A-Za-z0-9_.@\-]{16,64}$")
+
+
+def _hoist_body_secrets(body_secrets: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Desugar the author-facing ``body_secrets={placeholder_token: env(...)}`` map into **flat**
+    top-level settings (ADR 0015 amendment, BACKLOG #236).
+
+    The flat shape is load-bearing, not cosmetic: :func:`resolve_env_settings` resolves only
+    **top-level** ``EnvRef`` values (a nested one is copied through verbatim — the tested
+    ``_reject_envref_odbc_params`` ruling), so a nested ``{token: env()}`` would reach the connector as
+    unresolved ``EnvRef`` *objects* and be spliced onto the wire as their ``repr``. Emitting
+    ``body_secret_tokens: list[str]`` + ``body_secret_value_<i>: EnvRef`` keeps every secret a
+    top-level ``EnvRef`` that the existing resolver materializes at connector build, that
+    :func:`referenced_env_keys` sees (so the ADR 0050 missing-value gate arms), and that
+    :func:`_is_secret_setting` redacts.
+
+    **Code-first only.** Each value must be an ``env()`` ref with no ``default=`` (a fallback secret
+    would leak through ``display_settings``) and no ``cast=``. A ``connections.toml`` ``[settings.
+    body_secrets]`` table arrives here as raw ``{"env": ...}`` dicts (``parse_env_setting`` is
+    top-level only and does not descend), so the ``isinstance(..., EnvRef)`` check below rejects it
+    with a message pointing back to code-first — there is deliberately no TOML/GUI round-trip."""
+    if not body_secrets:
+        return {}
+    if not isinstance(body_secrets, Mapping):
+        raise WiringError(
+            "SOAP body_secrets must be a mapping of {placeholder_token: env(secret_key)}"
+        )
+    tokens = sorted(body_secrets)
+    for tok in tokens:
+        if not isinstance(tok, str) or not _BODY_SECRET_TOKEN_RE.fullmatch(tok):
+            raise WiringError(
+                f"SOAP body_secrets placeholder {tok!r} must match {_BODY_SECRET_TOKEN_RE.pattern} "
+                "(16–64 chars of [A-Za-z0-9_.@-]) — use a high-entropy token, e.g. secrets.token_hex(12)"
+            )
+    for shorter in tokens:
+        for longer in tokens:
+            if shorter != longer and shorter in longer:
+                raise WiringError(
+                    f"SOAP body_secrets placeholder {shorter!r} is a substring of {longer!r}; tokens "
+                    "must be disjoint (a replace of the shorter would corrupt the longer)"
+                )
+    out: dict[str, Any] = {"body_secret_tokens": tokens}
+    for i, tok in enumerate(tokens):
+        value = body_secrets[tok]
+        if not isinstance(value, EnvRef):
+            raise WiringError(
+                f"SOAP body_secrets[{tok!r}] must be an env() reference — secrets are never inline "
+                "(CLAUDE.md §5), and body_secrets is code-first only (define this outbound as a Python "
+                "Soap() call, not in connections.toml) (ADR 0015 amendment, #236)"
+            )
+        if value.default is not _UNSET:
+            raise WiringError(
+                f"SOAP body_secrets[{tok!r}] env() must not carry a default= — a fallback secret would "
+                "be emitted by `graph --json` / the API metadata view; require it be set per environment"
+            )
+        if value.cast is not None:
+            raise WiringError(
+                f"SOAP body_secrets[{tok!r}] env() must not carry a cast= (a body secret is text)"
+            )
+        out[f"body_secret_value_{i}"] = value
+    return out
+
+
 def Soap(
     *,
     url: str | EnvRef,  # the SOAP endpoint (may be env())
     soap_action: str | EnvRef | None = None,  # SOAPAction (1.1 header / 1.2 content-type param)
-    soap_version: str = "1.1",  # "1.1" | "1.2"
+    soap_version: Literal["1.1", "1.2"] = "1.1",  # "1.1" | "1.2"
     headers: dict[str, str] | None = None,  # static extra headers (no secrets — not env()-resolved)
     bearer_token: str | EnvRef | None = None,  # Authorization: Bearer … (use env() for the secret)
     basic_user: str | EnvRef | None = None,
@@ -1571,9 +1960,25 @@ def Soap(
     ws_security: bool = False,  # stamp <wsse:Security> (Timestamp + optional UsernameToken) in send()
     ws_username: str | EnvRef | None = None,  # UsernameToken username (defaults to basic_user)
     ws_password: str | EnvRef | None = None,  # UsernameToken password (defaults to basic_password)
-    ws_password_type: str = "text",  # "text" (PasswordText; recommended over mTLS) | "digest"
+    ws_password_type: Literal[
+        "text", "digest"
+    ] = "text",  # "text" (PasswordText; recommended over mTLS) | "digest"
     ws_addressing: bool = False,  # stamp <wsa:Action/To/MessageID> in send(); requires soap_version 1.2
     ws_timestamp_ttl_seconds: int = 300,  # Created→Expires window (must be >= max retry backoff)
+    # ADR 0015 amendment (#236): {placeholder_token: env(secret)} substituted into the <Body> at send
+    # time, so a config secret reaches a body-credential SOAP operation WITHOUT entering the message.
+    body_secrets: Mapping[str, EnvRef] | None = None,
+    # --- ADR 0126: outbound forward/egress web proxy (#112/#127/#128) ---
+    proxy: str
+    | None = None,  # #112: None = inherit [egress].proxy_url / off; "default" = system default web proxy; or an http(s):// address
+    proxy_user: str | EnvRef | None = None,  # #127: forward-proxy auth username (use env())
+    proxy_password: str
+    | EnvRef
+    | None = None,  # #127: forward-proxy auth password — secret, use env()
+    proxy_auth_type: Literal["basic", "digest", "ntlm", "windows"]
+    | None = None,  # #127: "basic" (default) | "digest" (http dest only); ntlm/windows deferred
+    proxy_no_proxy: list[str]
+    | None = None,  # #128: NO_PROXY-style bypass host list (intranet direct)
 ) -> ConnectionSpec:
     """A SOAP web-service endpoint (**outbound only**, ADR 0003 + 0015).
 
@@ -1588,7 +1993,16 @@ def Soap(
     A WS-Security auth/expiry fault, a **Sender/Client** fault, or an unrecognized fault dead-letters;
     a **Receiver/Server** fault retries; otherwise the HTTP status decides. Put secrets in ``env()``
     (``bearer_token``/``basic_*``/``client_key_password``/``ws_password``); the host is gated by
-    ``[egress].allowed_http`` (shared with REST — **populate it for a PHI mTLS destination**). The
+    ``[egress].allowed_http`` (shared with REST — **populate it for a PHI mTLS destination**).
+
+    ``body_secrets={placeholder: env(secret)}`` (ADR 0015 amendment, #236) is for a partner whose
+    operation carries credentials as **body elements** rather than a WS-Security header: the Handler
+    emits the opaque ``placeholder`` token inside the ``<Body>`` (staying pure — it never holds the
+    credential), and the transport substitutes the ``env()``-resolved secret in ``send()``, after the
+    payload leaves the store and before the wire encode. The secret is therefore never in the
+    ``Message``, the outbound/done/dead-letter rows, a replayed body, or ``dryrun`` output — the token
+    is. **Check the live WSDL first:** if the service accepts a WS-Security ``UsernameToken`` header,
+    use ``ws_security`` (above) and this is unnecessary. The
     operation **must be idempotent**: an at-least-once re-send mints a fresh ``<wsa:MessageID>`` (correct
     WS-\\* retry semantics), so the partner's dedup must treat a re-send as a retry, not a duplicate."""
     return ConnectionSpec(
@@ -1617,6 +2031,14 @@ def Soap(
             "ws_password_type": ws_password_type,
             "ws_addressing": ws_addressing,
             "ws_timestamp_ttl_seconds": ws_timestamp_ttl_seconds,
+            "proxy_url": proxy,
+            "proxy_user": proxy_user,
+            "proxy_password": proxy_password,
+            "proxy_auth_type": proxy_auth_type,
+            "proxy_no_proxy": proxy_no_proxy,
+            # Desugared to flat top-level body_secret_tokens + body_secret_value_<i> so env() resolves
+            # them (nested EnvRefs are NOT resolved). Absent → {} → byte-identical to before.
+            **_hoist_body_secrets(body_secrets),
         },
     )
 
@@ -1634,9 +2056,12 @@ def Sftp(
     filename: str | EnvRef = "{MSH-10}.hl7",  # outbound: upload name (may template HL7 fields)
     pattern: str = "*.hl7",  # inbound: glob of files to poll
     poll_seconds: float = 5.0,  # inbound: poll interval
-    after_read: str = "move",  # inbound: "move" (to processed_subdir) | "delete"
+    after_read: Literal[
+        "move", "delete", "leave"
+    ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -1670,6 +2095,7 @@ def Sftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,
             "error_subdir": error_subdir,
@@ -1690,9 +2116,12 @@ def Ftp(
     filename: str | EnvRef = "{MSH-10}.hl7",  # outbound: upload name (may template HL7 fields)
     pattern: str = "*.hl7",  # inbound: glob of files to poll
     poll_seconds: float = 5.0,  # inbound: poll interval
-    after_read: str = "move",  # inbound: "move" (to processed_subdir) | "delete"
+    after_read: Literal[
+        "move", "delete", "leave"
+    ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
+    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -1722,6 +2151,7 @@ def Ftp(
             "after_read": after_read,
             "min_age_seconds": min_age_seconds,
             "max_file_bytes": max_file_bytes,
+            "validate_directory": validate_directory,
             "overwrite": overwrite,
             "processed_subdir": processed_subdir,
             "error_subdir": error_subdir,
@@ -2001,6 +2431,13 @@ class InboundConnection:
     # A persisted "declare this feed start-disabled across restarts" flag (e.g. a test endpoint) — the
     # missing durable counterpart to the transient runtime start/stop. Code-first AND connections.toml.
     auto_start: bool = True
+    # Present in the config but NOT deployed (#233, ADR 0111): True (the default) = wired and run exactly
+    # as today; False = the connection stays in the graph (validate/check/graph --json all still see it)
+    # but the engine never builds its connector, never resolves its env() values, and never spawns a
+    # worker for it. Distinct from auto_start (deployed, just not up right now — startable at runtime),
+    # from a DR/scheduler park (rows are RETAINED and retried), and from simulate (the lane IS built and
+    # DOES take rows). deployed=False WINS over auto_start. Code-first AND connections.toml.
+    deployed: bool = True
     # Per-connection active-window scheduler (#147, ADR 0095): None = always-on (no scheduler task,
     # byte-identical). Set = the RegistryRunner runs a per-connection scheduler task that AUTO-STARTs
     # this inbound's listener on entering an active window and cleanly STOPs it on leaving — distinct
@@ -2060,6 +2497,12 @@ class InboundConnection:
     # shared across shards. Purely an intake-partition tag — never used for routing. See
     # messagefoundry/pipeline/sharding.py.
     shard: str | None = None
+    # Operator "object of interest" flag (#131, ADR 0007 amendment). Purely a console/CLI display marker
+    # — NO runtime path reads it — for the Flagged Objects filter. Console-settable ONLY on a
+    # connections.toml-managed connection (the write seam persists it there); a code-first connection can
+    # still declare flagged=True in Python, but the console flag-toggle refuses it (no TOML home). Default
+    # False → byte-identical. Code-first AND connections.toml.
+    flagged: bool = False
     source_file: str | None = None  # where it was declared (for IDE go-to-definition)
     source_line: int | None = None
 
@@ -2087,6 +2530,14 @@ class OutboundConnection:
     # built at boot (reports status:"stopped"), but startable at runtime (POST /connections/{name}/start).
     # Its delivery worker still spawns so any routed backlog self-heals, exactly like a DR-parked outbound.
     auto_start: bool = True
+    # Present in the config but NOT deployed (#233, ADR 0111): True (the default) = wired and run exactly
+    # as today; False = the connection stays in the graph (so validate/check/graph --json still see it and
+    # its already-queued rows are never swept) but the engine never builds its connector, never resolves
+    # its env() values, and spawns NO delivery worker — a Send to it is declined at the transform seam, so
+    # no row can ever queue to it. Distinct from auto_start (deployed, just not up right now), from a
+    # DR/scheduler park (rows RETAINED + retried), and from simulate (the lane IS built and DOES take
+    # rows). deployed=False WINS over auto_start. Code-first AND connections.toml.
+    deployed: bool = True
     # Per-connection active-window scheduler (#147, ADR 0095): None = always-on (byte-identical). Set =
     # the RegistryRunner AUTO-RESUMEs delivery on entering an active window and cleanly PAUSEs it (queued
     # rows RETAINED pending, never dropped) on leaving — reusing start_outbound/stop_outbound, the same
@@ -2107,6 +2558,14 @@ class OutboundConnection:
     metadata: Mapping[str, Any] | None = (
         None  # operability labels (Tier 4); API-surfaced, not routing
     )
+    # Operator "object of interest" flag (#131, ADR 0007 amendment) — see the InboundConnection note.
+    # Display-only (no runtime path reads it); console-settable on a connections.toml-managed outbound.
+    flagged: bool = False
+    # Cosmetic per-message "Waiting for Reply" display delay (#136, ADR 0065 amendment): seconds after a
+    # send before the connection is SHOWN awaiting a reply (the MLLP connector stamps a side-band marker
+    # around its ACK read). DISPLAY ONLY — no delivery effect, independent of `timeout_seconds`/pacing.
+    # Default 0.0. Threaded to the Destination by _dest_config. Code-first AND connections.toml.
+    waiting_display_delay: float = 0.0
     source_file: str | None = None
     source_line: int | None = None
 
@@ -2222,13 +2681,18 @@ def _resolve_port(raw: Any, env_values: Mapping[str, Any]) -> int | None:
 
 
 def resolve_listener_binding(
-    ic: "InboundConnection", *, bind_host: str, env_values: Mapping[str, Any]
+    ic: InboundConnection, *, bind_host: str, env_values: Mapping[str, Any]
 ) -> tuple[str | None, int] | None:
     """The ``(normalized_host, port)`` a listener inbound will bind, or ``None`` when it binds no
-    checkable listening port (not a listening source, or an ``env()`` port with no value yet). The host
-    is the per-connection ``bind_address`` else the service ``bind_host`` (matching ``_source_config``),
-    normalized for overlap comparison."""
-    if ic.spec.type not in _LISTEN_TYPES:
+    checkable listening port (not a listening source, an inbound that is present-but-NOT-DEPLOYED, or an
+    ``env()`` port with no value yet). The host is the per-connection ``bind_address`` else the service
+    ``bind_host`` (matching ``_source_config``), normalized for overlap comparison.
+
+    ``deployed=False`` (#233, ADR 0111) binds NO socket — ever — so it can contend for none. Excluding it
+    here is what lets the superseded half of a retired/replacement pair keep its real port in the config
+    (carrying the record IS the point of the state) without failing the port pre-flight against the
+    successor that took the port over."""
+    if ic.spec.type not in _LISTEN_TYPES or not ic.deployed:
         return None
     port = _resolve_port(ic.spec.settings.get("port"), env_values)
     if port is None:
@@ -2245,7 +2709,7 @@ def bindings_overlap(host_a: str | None, port_a: int, host_b: str | None, port_b
 
 
 def inbound_binding_conflicts(
-    registry: "Registry",
+    registry: Registry,
     *,
     bind_host: str,
     env_values: Mapping[str, Any],
@@ -2317,6 +2781,25 @@ class Registry:
     # reload refusal — all key off these.
     shard_id: str | None = None
     all_shard_ids: tuple[str, ...] | None = None
+    # The Loopback inbound NAMES of the WHOLE config, pinned beside the shard identity by the same
+    # filter (None on an unfiltered graph / single-shard config, where `inbound` IS the whole config).
+    # A shard's `inbound` map holds only its OWN inbounds, but `reingress_to` is a fact about the
+    # CONFIG, not about which shard owns the loopback — the runtime already spans the two (the
+    # capturing outbound's shard produces the Stage.RESPONSE row; the loopback's shard drains it).
+    # Names only, deliberately not the connections: every other reader of `inbound` must keep seeing
+    # only this shard's, so a map here would re-leak foreign inbounds into filtered-only paths.
+    all_loopback_inbound: frozenset[str] | None = None
+
+    def loopback_inbound_names(self) -> frozenset[str]:
+        """Every ``Loopback()`` inbound in the deployment — the pinned unfiltered set when this is one
+        engine shard's filtered view, else derived from this graph's own inbounds. The single source of
+        truth for the ADR 0013 cross-registry ``reingress_to`` rule, which must see the whole config so a
+        shard that doesn't own the loopback still validates (and still rejects a typo)."""
+        if self.all_loopback_inbound is not None:
+            return self.all_loopback_inbound
+        return frozenset(
+            name for name, ic in self.inbound.items() if ic.spec.type is ConnectorType.LOOPBACK
+        )
 
     def add_inbound(self, conn: InboundConnection) -> None:
         self._add(self.inbound, conn.name, conn, "inbound connection")
@@ -2379,11 +2862,13 @@ class Registry:
         common case (both inheriting ``[inbound].bind_host``) still does. Only listener types bind a
         port, and only an ``int`` literal is checkable (an ``EnvRef`` port resolves per environment —
         the runner's :func:`inbound_binding_conflicts` covers those, plus the reserved API port, at
-        start/reload)."""
+        start/reload). A ``deployed=False`` inbound (#233, ADR 0111) is excluded: it never binds, so it
+        cannot collide — see :func:`resolve_listener_binding`, which excludes it on the resolved path."""
         bindings = [
             _Binding(conn.name, _normalize_bind_host(conn.bind_address), port)
             for conn in self.inbound.values()
-            if conn.spec.type in _LISTEN_TYPES
+            if conn.deployed
+            and conn.spec.type in _LISTEN_TYPES
             and isinstance((port := conn.spec.settings.get("port")), int)
             and not isinstance(port, bool)
         ]
@@ -2479,6 +2964,7 @@ def build_inbound_connection(
     content_type: ContentType | str = ContentType.HL7V2,
     inline: bool = False,
     auto_start: bool = True,
+    deployed: bool = True,
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
@@ -2492,6 +2978,7 @@ def build_inbound_connection(
     max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
+    flagged: bool = False,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> InboundConnection:
@@ -2680,6 +3167,7 @@ def build_inbound_connection(
         content_type=content_type,
         inline=inline,
         auto_start=auto_start,
+        deployed=deployed,
         schedule=schedule,
         metadata=metadata,
         bind_address=bind_address,
@@ -2693,6 +3181,7 @@ def build_inbound_connection(
         max_message_bytes=max_message_bytes,
         priority=priority,
         shard=shard,
+        flagged=flagged,
         source_file=source_file,
         source_line=source_line,
     )
@@ -2711,6 +3200,7 @@ def inbound(
     content_type: ContentType | str = ContentType.HL7V2,
     inline: bool = False,
     auto_start: bool = True,
+    deployed: bool = True,
     schedule: Schedule | None = None,
     metadata: Mapping[str, Any] | None = None,
     bind_address: str | None = None,
@@ -2724,6 +3214,7 @@ def inbound(
     max_message_bytes: int | None = None,
     priority: Priority | None = None,
     shard: str | None = None,
+    flagged: bool = False,
 ) -> None:
     """Declare an inbound connection that feeds every received message to ``router``.
 
@@ -2769,7 +3260,14 @@ def inbound(
     it. Under a DR run-profile the engine binds only inbound listeners whose resolved tier rank meets
     ``[dr].priority_threshold`` — a below-threshold listener is **not bound** and reports
     ``status:"filtered"`` (distinct from ADR 0031's ``"failed"``). It governs only **when** the
-    connection runs, never routing; also a ``connections.toml`` key (ADR 0007)."""
+    connection runs, never routing; also a ``connections.toml`` key (ADR 0007).
+
+    ``deployed`` (#233, ADR 0111) declares the connection **present in the config but not deployed**:
+    ``True`` (the default) is today's behaviour; ``False`` keeps it in the graph (``validate``/``check``/
+    ``graph --json`` still see it) while the engine never builds it, never resolves its ``env()`` values
+    and never runs it — so a retired or not-yet-live feed can stay in the config repo without failing the
+    build or degrading the engine. It is stronger than ``auto_start=False`` (deployed, just not up right
+    now — startable at runtime) and **wins** over it. Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_inbound(
         build_inbound_connection(
@@ -2784,6 +3282,7 @@ def inbound(
             content_type=content_type,
             inline=inline,
             auto_start=auto_start,
+            deployed=deployed,
             schedule=schedule,
             metadata=metadata,
             bind_address=bind_address,
@@ -2797,6 +3296,7 @@ def inbound(
             max_message_bytes=max_message_bytes,
             priority=priority,
             shard=shard,
+            flagged=flagged,
             source_file=file,
             source_line=line,
         )
@@ -2815,10 +3315,13 @@ def build_outbound_connection(
     batch: BatchConfig | None = None,
     simulate: bool = False,
     auto_start: bool = True,
+    deployed: bool = True,
     schedule: Schedule | None = None,
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
+    flagged: bool = False,
+    waiting_display_delay: float = 0.0,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> OutboundConnection:
@@ -2833,6 +3336,21 @@ def build_outbound_connection(
         raise WiringError(
             f"outbound connection {name!r}: dead_letter_days must be >= 0 "
             "(0 = keep forever, omit to inherit the global [retention] window)"
+        )
+    if waiting_display_delay < 0:
+        # #136 (ADR 0065 amendment): the cosmetic "Waiting for Reply" pre-display delay is seconds; a
+        # negative value is meaningless (0.0 = show immediately). Fail loud at wiring (dry-run / check).
+        raise WiringError(
+            f"outbound connection {name!r}: waiting_display_delay must be >= 0 seconds "
+            "(0 = show 'waiting for reply' immediately)"
+        )
+    send_pace = spec.settings.get("send_min_interval_seconds")
+    if send_pace is not None and send_pace < 0:
+        # BACKLOG #82: per-connection egress send pacing (min seconds between sends on this lane). A
+        # negative interval is meaningless (None/0 = no pacing). Fail loud at wiring (dry-run / check).
+        raise WiringError(
+            f"outbound connection {name!r}: send_min_interval_seconds must be >= 0 seconds "
+            "(None or 0 = no pacing)"
         )
     if (
         spec.type in (ConnectorType.MLLP, ConnectorType.TCP, ConnectorType.X12)
@@ -2858,6 +3376,34 @@ def build_outbound_connection(
                 f"outbound connection {name!r}: reingress_to must be a non-empty inbound name (ADR 0013)"
             )
         spec.settings["capture_response"] = True
+    # #67 (ADR 0013 amendment): capturing a stored-proc's OUT params + scalar return value IMPLIES
+    # capture, so the capture-validity guards below (and the connector) treat it as a capturing outbound.
+    if spec.settings.get("capture_out_params"):
+        spec.settings["capture_response"] = True
+    # BACKLOG #117 (ADR 0124): fire-and-forward MLLP outbound. no_ack skips the ACK read entirely, so
+    # there is nothing to capture, and it is MLLP-only (the generic Tcp()/X12() fire-and-forget is
+    # expect_reply=false). Validate at check/dry-run — a config that can never do what it asks fails
+    # before any store or socket. Runs AFTER the reingress→capture desugar above, so no_ack+reingress_to
+    # is rejected via the capture_response check below too.
+    if spec.settings.get("no_ack"):
+        if spec.type is not ConnectorType.MLLP:
+            raise WiringError(
+                f"outbound connection {name!r}: no_ack is an MLLP-only fire-and-forward knob "
+                f"(got {spec.type.value.upper()}) — the generic Tcp()/X12() fire-and-forget is "
+                "expect_reply=false (BACKLOG #117)."
+            )
+        if spec.settings.get("capture_response"):
+            raise WiringError(
+                f"outbound connection {name!r}: MLLP no_ack=True skips the ACK read, so there is no "
+                "ACK to capture — capture_response/reingress_to is incompatible with no_ack "
+                "(ADR 0124 / BACKLOG #117)."
+            )
+        if spec.settings.get("verify_ack_control_id"):
+            raise WiringError(
+                f"outbound connection {name!r}: MLLP no_ack=True skips the ACK read, so there is no "
+                "MSA-2 to match against the sent MSH-10 — verify_ack_control_id is incompatible with "
+                "no_ack (BACKLOG #117 + #82)."
+            )
     # ADR 0013: response capture must be wiring-valid at `check`/dry-run time (no store needed), and
     # this is the choke point for BOTH the code-first factories and the connections.toml desugar.
     if spec.settings.get("capture_response"):
@@ -2878,7 +3424,20 @@ def build_outbound_connection(
             )
         if spec.type is ConnectorType.DATABASE:
             stmt = str(spec.settings.get("statement") or "").lower()
-            if "returning" not in stmt and "output" not in stmt:
+            if spec.settings.get("capture_out_params"):
+                # #67 (ADR 0013 amendment): a stored-proc CALL captures its OUT params / scalar RETURN
+                # value via a pre-commit readback SELECT in the SAME batch, which may carry NEITHER a
+                # RETURNING nor an OUTPUT token (a scalar `EXEC @rv = proc; SELECT @rv` batch). The
+                # EXPLICIT opt-in flag — NOT a loosening of the substring test — authorizes capture, but
+                # only for an actual stored-proc call, so the flag can't silently mask a plain
+                # INSERT/UPDATE whose result-set would re-run non-idempotently.
+                if not _is_db_proc_call(stmt):
+                    raise WiringError(
+                        f"outbound connection {name!r}: DATABASE capture_out_params=True requires the "
+                        "statement to be a stored-procedure call (an ODBC '{ ... CALL ... }' escape or a "
+                        "leading EXEC/EXECUTE), not a plain write (ADR 0013 amendment, #67)."
+                    )
+            elif "returning" not in stmt and "output" not in stmt:
                 raise WiringError(
                     f"outbound connection {name!r}: DATABASE capture_response=True requires a "
                     "RETURNING/OUTPUT clause in the statement (it is fetched from the same cursor "
@@ -2914,6 +3473,18 @@ def build_outbound_connection(
                 f"outbound connection {name!r}: SOAP ws_security/ws_addressing require "
                 "soap_version='1.2' (WS-Addressing/WS-Security are coherent only on SOAP 1.2) (ADR 0015)."
             )
+        # ADR 0015 amendment (BACKLOG #236): body-secret substitution. The Handler emits placeholder
+        # tokens; the transport swaps in the env()-resolved secret in send(), so the credential never
+        # enters the persisted message. Refuse it together with reingress_to: re-ingress promotes the
+        # (best-effort-scrubbed) partner reply into a first-class persisted message, and reingress_to
+        # force-sets capture_response — widening the one surface the scrub can only cover best-effort.
+        # (capture_response alone stays allowed: the feed needs its submit confirmation.)
+        if spec.settings.get("body_secret_tokens") and spec.settings.get("reingress_to"):
+            raise WiringError(
+                f"outbound connection {name!r}: SOAP body_secrets is incompatible with reingress_to "
+                "(re-ingress would persist a best-effort-scrubbed partner reply as a new message; "
+                "use capture_response for reconciliation instead) (ADR 0015 amendment, #236)."
+            )
     # ADR 0082 (#134): opt-in HL7 batch aggregation. Gate at the wiring choke point so `check`/dry-run
     # rejects an unsupportable config before any store is opened.
     if batch is not None:
@@ -2943,10 +3514,13 @@ def build_outbound_connection(
         batch=batch,
         simulate=simulate,
         auto_start=auto_start,
+        deployed=deployed,
         schedule=schedule,
         dead_letter_days=dead_letter_days,
         priority=priority,
         metadata=metadata,
+        flagged=flagged,
+        waiting_display_delay=waiting_display_delay,
         source_file=source_file,
         source_line=source_line,
     )
@@ -2964,10 +3538,13 @@ def outbound(
     batch: BatchConfig | None = None,
     simulate: bool = False,
     auto_start: bool = True,
+    deployed: bool = True,
     schedule: Schedule | None = None,
     dead_letter_days: int | None = None,
     priority: Priority | None = None,
     metadata: Mapping[str, Any] | None = None,
+    flagged: bool = False,
+    waiting_display_delay: float = 0.0,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
@@ -2987,7 +3564,15 @@ def outbound(
     whose resolved tier rank meets ``[dr].priority_threshold`` — a below-threshold outbound reports
     ``status:"filtered"`` and queues its routed rows for later delivery (also a ``connections.toml`` key).
     ``metadata`` attaches free-form operator labels (Tier 4) surfaced by the API, never used for
-    delivery."""
+    delivery.
+
+    ``deployed`` (#233, ADR 0111) declares the connection **present in the config but not deployed**:
+    ``True`` (the default) is today's behaviour; ``False`` keeps it in the graph (``validate``/``check``/
+    ``graph --json`` still see it, and its already-queued rows are never swept) while the engine never
+    builds it, never resolves its ``env()`` values and spawns no delivery worker — a ``Send`` to it is
+    declined and logged rather than queued. Unlike ``simulate=True`` (the lane IS built and DOES take
+    rows) and unlike a DR/scheduler park (rows are retained and retried), **nothing queues to it at
+    all**. It **wins** over ``auto_start``. Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -3001,10 +3586,13 @@ def outbound(
             batch=batch,
             simulate=simulate,
             auto_start=auto_start,
+            deployed=deployed,
             schedule=schedule,
             dead_letter_days=dead_letter_days,
             priority=priority,
             metadata=metadata,
+            flagged=flagged,
+            waiting_display_delay=waiting_display_delay,
             source_file=file,
             source_line=line,
         )

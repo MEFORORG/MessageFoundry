@@ -13,14 +13,15 @@ from __future__ import annotations
 
 import socket
 import time
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
 
 import pytest
 
 pytest.importorskip("PySide6")
 
-from messagefoundry.transports.mllp import MLLPDecoder, frame  # noqa: E402
 from harness.mllp import CLOSE, FAIL_THEN_AA, MllpReceiver, Received  # noqa: E402
+from messagefoundry.transports.mllp import MLLPDecoder, frame  # noqa: E402
 
 _MSG = "MSH|^~\\&|A|B|C|D|20260101||ADT^A01^ADT_A01|X1|P|2.5.1\rEVN|A01|20260101\r"
 

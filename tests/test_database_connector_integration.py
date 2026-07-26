@@ -36,8 +36,8 @@ import asyncio
 import json
 import os
 import uuid
-from collections.abc import Awaitable
-from typing import Any, AsyncIterator, TypeVar
+from collections.abc import AsyncIterator, Awaitable
+from typing import Any, TypeVar
 
 import pytest
 
@@ -64,7 +64,7 @@ def _conn() -> dict[str, Any]:
     ``trust_server_certificate`` is on for the container's self-signed cert; the connector's TLS guard
     permits that MITM-able combination only because the job also sets ``MEFOR_ALLOW_INSECURE_TLS`` — the
     trusted-network dev/test escape this exact scenario exists for."""
-    return dict(
+    return dict(  # noqa: C408
         server=os.environ.get("MEFOR_STORE_SERVER", "localhost"),
         port=int(os.environ.get("MEFOR_STORE_PORT", "1433")),
         database=os.environ.get("MEFOR_STORE_DATABASE", "MessageFoundry"),
@@ -74,7 +74,7 @@ def _conn() -> dict[str, Any]:
     )
 
 
-async def _bounded(coro: Awaitable[_T]) -> _T:
+async def _bounded(coro: Awaitable[_T]) -> _T:  # noqa: UP047
     """Await ``coro`` under ``_DB_TIMEOUT`` so a hung driver call fails fast (see module docstring)."""
     return await asyncio.wait_for(coro, _DB_TIMEOUT)
 

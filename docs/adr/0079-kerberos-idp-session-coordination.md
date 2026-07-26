@@ -1,6 +1,6 @@
 # 0079 — Kerberos/AD engine-session lifetime coordinated with the directory (IdP)
 
-- **Status:** Proposed  <!-- design only; DEFERRED build — no code in this lane -->
+- **Status:** Accepted (mechanism 2 built 2026-07-22)  <!-- mech 1 Kerberos path closed by acceptance; mech 1 federated path shipped in ADR 0142 -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0002](0002-auth-rbac.md) (auth/RBAC, AD/Kerberos delegation) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (browser Kerberos SSO seed_reauth) · [docs/SECURITY.md](../SECURITY.md) · ASVS 7.1.3 · BACKLOG #187
 
@@ -104,3 +104,159 @@ the coordination gap is captured against ASVS 7.1.3 with an agreed shape.
   directory-side configuration the on-prem adopter may not control; the pull re-validation loop is
   self-contained. (c) Shorten `session_absolute_hours` globally — rejected: penalizes local accounts
   and still ignores the ticket lifetime.
+
+---
+
+## Amendment (2026-07-21) — mechanism 1's preferred input is unobtainable via pyspnego; ASVS 7.1.3 closed by ACCEPTANCE, status stays Proposed
+
+**Status is unchanged: `Proposed` / DEFERRED.** This amendment records *why* the build did not happen
+when the demand trigger (a domain-joined lab) finally arrived, so the gap is not silently re-planned.
+
+**Finding — the Kerberos ticket `endtime` is not reachable.** The Decision above hedges mechanism 1 with
+*"Prefer the Kerberos ticket `endtime` **when the SSO path exposes it**"*. It does not, on the shipped
+stack:
+
+- `spnego.server()` (pyspnego 0.12.1, `spnego/auth.py:173-183`) exposes no expiry on the acceptor it
+  returns, and the public `ContextProxy` surface has no ticket-lifetime accessor.
+- The datum *does* exist one layer down on Windows — `sspilib`'s `AcceptContextResult.expiry` is SSPI's
+  `ptsExpiry` from `AcceptSecurityContext`, which for the Kerberos package derives from the service
+  ticket end time — but `spnego`'s `SSPIProxy.step()` discards it.
+
+Obtaining it therefore requires forking or monkeypatching `spnego.SSPIProxy.step`, upstreaming an
+`expiry` property to pyspnego (plus a `SecPkgContextLifespan` binding to sspilib), or bypassing pyspnego
+entirely. **Forking a security library to satisfy an already-accepted control is not a trade this project
+makes.** Without it, mechanism 1 on the Kerberos/LDAPS path degrades to the `[auth].ad_session_max_hours`
+fallback — *a second operator-set local constant presented as directory-derived data*, which is worse
+than the honest flat `session_absolute_hours` it would replace, because it invites the reader to believe
+the directory bounded the session when it did not.
+
+**Consequence for ASVS 7.1.3 — accepted, not built.** The cell is already signed-accepted
+([`ASVS-L3-RESCORE-2026-07-17.md`](../security/ASVS-L3-RESCORE-2026-07-17.md) §3; register row
+[`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md):73, signed
+theme 3, next review 2027-01-14). BACKLOG #187's residual therefore **closes by acceptance**, and this
+ADR's *"Proposed→Accepted if 7.1.3 is built"* promotion trigger is **NOT fired**.
+
+**Mechanism 1 does ship — on the federated path only.** Where the engine consumes a federated OIDC
+`id_token`, the authorizing lifetime is present and signature-verified as the `exp` claim. The federated
+relying-party build applies it as a `min()` at the single session-mint site
+(`AuthService._issue_session`, `auth/service.py`), so a federated session is never longer than the
+token that authorized it. That is mechanism 1 delivered where the datum genuinely exists, rather than
+simulated where it does not. Note the corollary: this ADR's residual language ("the shipped posture
+mints no federated session") becomes conditional the moment an operator sets `oidc_enabled = true`.
+
+**Mechanism 2 (the background directory re-validation loop) stays deferred**, unchanged: a `sessions`
+schema change across three store backends plus a supervised lifespan task, for a control already
+accepted. Revisit on a named requirement for directory-revocation propagation.
+
+---
+
+## Amendment (2026-07-22) — mechanism 2 is BUILT; the schema cost was illusory; a mass-revoke circuit breaker is added
+
+**Status moves to `Accepted` for mechanism 2.** Mechanism 1 on the Kerberos/LDAPS path remains closed
+by acceptance (previous amendment, unchanged); mechanism 1 on the federated path shipped with ADR 0142.
+
+### Why now — the residual is narrower than the original Context implied, and worse where it survives
+
+An adversarial re-read of the code narrowed the blast radius, and the narrowing is worth recording
+because it contradicts the loose reading of *"the local session stays live"*:
+
+- **`require_step_up` performs no directory bind.** It calls `has_recent_step_up(token)`
+  (`auth/service.py`), which compares the session's stored `reauth_at` against
+  `[auth].step_up_max_age_seconds` — a pure timestamp check. The live bind lives only in
+  `_reauth_ad` → `LdapAuthenticator.authenticate` → `_find_user`, which rejects
+  `userAccountControl & 0x2`, and that is reached **only** via `POST /me/reauth`.
+- **So the step-up surface is protected by inability to REFRESH, not by re-checking.** Purge, export,
+  bulk replay, config reload, message injection and the whole `/users*` admin surface are
+  `require_step_up`; a disabled AD account cannot mint a fresh `reauth_at`, so it loses them — but
+  only **once its existing window lapses**. A directory login is born with the window seeded
+  (`_complete_ad_login(seed_reauth=True)`), so there is a residual of up to
+  `step_up_max_age_seconds` (300 s default) in which an already-disabled account can still purge or
+  export.
+- **What survives to the 12-hour cap** is everything with no step-up gate at all: bulk and raw PHI
+  reads (`GET /messages`, `/messages/{id}`, attachments, `/dead-letters` — `require_phi_read`, paced
+  at `phi_read_rate_limit_per_actor = 120`/min) and connection start/stop/restart
+  (`require_paced(CONNECTIONS_CONTROL)`). A disabled clinician keeps harvesting PHI at 120 reads a
+  minute, and a disabled operator can still stop an interface.
+
+That is a smaller surface than "a disabled account keeps everything", and a materially worse one than
+"they just lose admin": it is exactly PHI egress plus availability.
+
+### The binding constraint that deferred this was wrong
+
+The original Context deferred mechanism 2 partly on *"a `sessions` schema change across three store
+backends (a co-owned migration surface)"*. **No schema change is needed.** The candidate set —
+directory-backed principals still holding a live session — is derivable from the existing
+`list_users()` + `list_sessions(user_id)` (the latter already filters revoked/expired). Provenance
+columns (`directory_expiry`, `last_revalidated_at`) were only ever required by **mechanism 1**, which
+is not being built here. `store/store.py`, `store/sqlserver.py` and `store/postgres.py` are untouched.
+
+The remaining stated cost — the supervised lifespan task — is one `asyncio.create_task` beside the
+existing `_session_reaper`, cancelled in the same `finally`.
+
+### Decision additions
+
+Mechanism 2 ships as designed (per-interval re-validation via the password-free `resolve_principal`,
+off the event loop, fail-safe, `ad_session_recheck_seconds = 0` = off, audited) **plus three
+properties the original design did not name**:
+
+1. **Two-strike before revoking** (`[auth].ad_session_recheck_strikes`, default 2). The original text
+   said "fails safe" only about *outages*. It missed that a *successful* lookup returning nothing is
+   itself ambiguous: `_find_user` returns `None` identically for disabled, deleted, moved out of the
+   search base, and never-was-in-the-search-base. Two agreeing probes cost at most one extra interval
+   of exposure and buy immunity to a single flaky search.
+
+2. **A mass-revoke circuit breaker** — the load-bearing addition. A misconfigured `ad_user_search_base`,
+   an OU reorganisation, or a service account that lost read rights returns "not found" for **every**
+   user, which is *indistinguishable* from "everyone was disabled". Un-braked, mechanism 2 converts a
+   directory misconfiguration into a total console outage — strictly worse than the gap it closes,
+   and precisely during an incident. A pass whose revocation set exceeds **both**
+   `[auth].ad_session_revoke_max` (5) **and** `[auth].ad_session_revoke_max_fraction` (0.34) of the
+   probed population **aborts**: nothing is revoked, nothing is written, a latched operator alert is
+   raised and `auth.ad_reconcile_aborted` is audited.
+
+   **Why AND, not OR.** The absolute floor alone would sign out a 5-person site on a bad search base;
+   the proportion alone would fire on a 3-of-3 genuine offboarding, where 100 % is meaningless.
+   Requiring both means the breaker fires only on a change simultaneously **large in absolute terms**
+   and **broad relative to the signed-in population** — the signature of a misconfiguration, not of
+   offboarding. A 50-of-300 batch offboarding (17 %) still applies; a 300-of-300 wipe does not.
+   **Acknowledged floor:** below 6 concurrent directory sessions the breaker cannot distinguish the
+   two cases and will revoke. Signing out five operators is recoverable, and if the directory really
+   is broken they cannot sign back in — which is the loudest possible signal.
+
+3. **All-or-nothing passes.** The pass is planned in full (`auth/reconcile.py`, a pure decision layer)
+   before any store write, so an abort leaves the store byte-identical. The strike ledger is
+   *deliberately* exempt: it is process-local bookkeeping, not store state, and keeping it across an
+   abort makes a standing misconfiguration trip on **every** pass instead of oscillating
+   (accrue → trip → reset → accrue) and flickering the alert.
+
+**Group re-diff rides the same pass, free.** `resolve_principal` already returns the group set, so a
+role **demotion** is applied without a login that may never come (closing the "a login that never
+recurs leaves a stale-privilege session running" half of the original Context). It is counted against
+the **same** breaker budget, because an emptied `ad_group_role_map` is exactly as suspicious as a mass
+disable. **Channel scope is deliberately NOT re-diffed:** `_sync_ad_channel_scope` is opt-in and
+never-clobbering (`if not channels: return user`), so replicating that rule inside the planner would
+complicate the breaker's exactness for a narrower residual. Scope still re-syncs on next login —
+a recorded, narrower residual.
+
+### Directory load
+
+One `resolve_principal` per **distinct signed-in directory user** per pass — a service-account bind
+plus one subtree search, plus one nested-group search when `ad_use_nested_groups` (the default). Zero
+binds when nobody is signed in, when AD is off, or at the default interval of 0. Bounded above by
+`[auth].ad_session_recheck_max_users` (200), so it does **not** grow with estate size: 50 concurrent
+operators at 300 s is ~0.17 binds/s; the 200-user cap at the 60 s floor is ~3.3 binds/s. A pass that
+cannot reach everyone rotates least-recently-probed-first, degrading to a longer effective interval.
+
+### Consequences (delta)
+
+- **Positive.** The CISO "AD-disable keeps live sessions" item closes for the surfaces that actually
+  survived — bulk/raw PHI reads and connection control — and role demotions no longer wait for a
+  login. No store schema change, so the three-backend migration risk the deferral cited is void.
+- **Negative / residual.** Revocation is bounded by the interval plus the strike count (default
+  2 × 300 s = up to 10 minutes), not immediate. Strike state is process-local, so a restart resets it
+  (biased toward *not* revoking). The ≤`step_up_max_age_seconds` step-up residual above is unchanged
+  by this ADR. Below the breaker's absolute floor, a whole small estate can still be signed out by a
+  misconfiguration.
+- **Not changed.** `_mfa_required_for` still returns False for every non-LOCAL provider — AD MFA stays
+  delegated to the directory (ADR 0002). Local sessions, the loopback default, and every path with
+  `ad_session_recheck_seconds = 0` are byte-identical.

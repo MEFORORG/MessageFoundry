@@ -4,8 +4,17 @@
 // bodies / patient data — regardless of the chosen model.
 import * as vscode from "vscode";
 import { assistantState, resolveAiPolicy } from "./aiPolicy";
-import { aiContextCharLimit } from "./cli";
+import { withAuth } from "./auth";
+import { aiContextCharLimit, engineUrl } from "./cli";
+import { postJson } from "./engineClient";
 import { GraphProvider } from "./graphTree";
+
+/** The engine's `POST /ai/chat` reply (ADR 0135). `data_scope` is the SERVER-enforced scope. */
+interface AiChatReply {
+  reply: string;
+  model: string;
+  data_scope: string;
+}
 
 const PRIMER = `You are an assistant embedded in the MessageFoundry VS Code extension. MessageFoundry is a
 code-first Python HL7 v2 integration engine. Users author config modules that declare named
@@ -96,9 +105,10 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
   }
 
   const handler: vscode.ChatRequestHandler = async (request, _chatContext, stream, token) => {
-    // Honor the centrally-governed AI policy before touching any model: a "off" / managed-provider /
+    // Honor the centrally-governed AI policy before touching any model: a "off" / unsupported-managed /
     // unpermitted policy disables assistance entirely (see aiPolicy.assistantState).
-    const state = assistantState(await resolveAiPolicy(context));
+    const policy = await resolveAiPolicy(context);
+    const state = assistantState(policy);
     if (!state.enabled) {
       stream.markdown(state.message ?? "AI assistance is unavailable under your MessageFoundry policy.");
       return;
@@ -134,6 +144,35 @@ export function registerChat(context: vscode.ExtensionContext, graph: GraphProvi
       parts.push("Task: " + task);
     }
     parts.push("User request: " + request.prompt);
+
+    // Engine-brokered path (ADR 0135, BACKLOG #95): under `managed_endpoint` the ENGINE brokers the call
+    // to the customer-managed / self-hosted LLM under central per-use audit — instead of the local
+    // vscode.lm model. We still attach ONLY the code_only context assembled above (graph names + editor
+    // code) — never message bodies / PHI — regardless of mode; the server re-resolves the policy and is
+    // the sole enforcement point. MVP is non-streaming: render the whole reply at once.
+    if (policy.mode === "managed_endpoint") {
+      const url = engineUrl();
+      try {
+        const res = await withAuth(context, url, (token) =>
+          postJson<AiChatReply>(
+            url,
+            "/ai/chat",
+            { prompt: parts.join("\n\n"), data_scope: "code_only" },
+            token,
+          ),
+        );
+        if (res === undefined) {
+          stream.markdown(
+            "_Sign in to the MessageFoundry engine to use engine-brokered AI assistance._",
+          );
+          return;
+        }
+        stream.markdown(res.reply);
+      } catch (e) {
+        stream.markdown(`\n\n_Engine-brokered AI request failed: ${String(e)}_`);
+      }
+      return;
+    }
 
     let model = request.model;
     if (!model) {

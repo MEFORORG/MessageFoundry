@@ -29,6 +29,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.pipeline import Engine
 from messagefoundry.store import MessageStatus, OutboxStatus
 from messagefoundry.store.base import ReingressOriginMissing, ResendKeyConflict, ResendSourceEmpty
+from messagefoundry.store.crypto import cell_aad
 from messagefoundry.store.store import REINGRESS_TARGET_PREFIX, MessageStore, Stage
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -80,7 +81,11 @@ async def _seed_error(store: MessageStore, mid: str, error: str) -> None:
     async with store._lock:
         await store._db.execute(
             "UPDATE messages SET status=?, error=? WHERE id=?",
-            (MessageStatus.ERROR.value, store._enc(error), mid),
+            (
+                MessageStatus.ERROR.value,
+                store._enc(error, aad=cell_aad("messages", "error", mid)),
+                mid,
+            ),
         )
         await store._db.commit()
 
@@ -108,6 +113,60 @@ async def test_reingress_creates_correlated_received_child(store: MessageStore) 
     # the child carries a pending INGRESS row so the router worker re-routes it normally
     rows = await _ingress_rows(store, out.new_message_id)
     assert len(rows) == 1 and rows[0]["status"] == OutboxStatus.PENDING.value
+
+
+async def test_reingress_after_retention_purge_rebases_the_lineage(store: MessageStore) -> None:
+    """ASVS 14.2.7 consequence (i), ACCEPTED and pinned: a purged origin re-BASES the chain.
+
+    `messages.metadata` carries the correlation lineage AND is PHI, so the body window nulls it. A
+    re-ingress on an origin whose metadata is gone reads `parent_meta = {}`: depth restarts at 1 and
+    the root falls back to the origin id, even though the origin was itself a deep child. The explicit
+    links — `correlation_id` and `edited_from` — still point at the origin, so provenance is NOT lost;
+    only the derived depth/root re-base.
+
+    The alternative is retaining PHI past its retention window to keep a derived counter accurate,
+    which is the defect 14.2.7 exists to close. If this test fails, the behaviour changed — decide
+    deliberately, do not "fix" it by exempting metadata from the purge.
+    """
+    origin = await _seed(store)
+    # Make the origin a DEEP child of some earlier root, the way a passthrough chain would.
+    await store._db.execute(
+        "UPDATE messages SET metadata=? WHERE id=?",
+        (
+            store._enc(
+                json.dumps(
+                    {
+                        "correlation_id": "ancestor",
+                        "correlation_root_id": "the-real-root",
+                        "correlation_depth": 4,
+                    }
+                ),
+                aad=cell_aad("messages", "metadata", origin),
+            ),
+            origin,
+        ),
+    )
+    await store._db.commit()
+
+    # Pre-purge: the child inherits the ancestry.
+    before = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="pre")
+    pre_meta = json.loads((await store.get_message(before.new_message_id))["metadata"])
+    assert pre_meta["correlation_root_id"] == "the-real-root"
+    assert pre_meta["correlation_depth"] == 5
+
+    # Retention takes the origin's metadata (its body is already terminal-eligible).
+    for r in await store.outbox_for(origin):
+        await store.mark_done(str(r["id"]))
+    assert await store.purge_message_bodies(older_than=9_999_999_999.0) >= 1
+    assert await store.message_metadata_json(origin) is None
+
+    after = await store.reingress(origin_message_id=origin, raw=EDITED, idempotency_key="post")
+    post_meta = json.loads((await store.get_message(after.new_message_id))["metadata"])
+
+    assert post_meta["correlation_root_id"] == origin  # RE-BASED, not "the-real-root"
+    assert post_meta["correlation_depth"] == 1  # restarted, not 5
+    assert post_meta["correlation_id"] == origin  # ...but the link survives
+    assert post_meta["edited_from"] == origin  # ...and so does the edit provenance
 
 
 async def test_reingress_leaves_original_byte_identical(store: MessageStore) -> None:

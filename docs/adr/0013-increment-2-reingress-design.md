@@ -30,6 +30,8 @@
   [ADR 0008](0008-cluster-observability-api.md) / Track B (active-passive leader-gating the new stage
   inherits; the per-lane ownership it originally rode was removed with the active-active drop, 2026-06-18),
   [ADR 0012](0012-x12-edi-codec.md) (an X12 loopback's `content_type`),
+  [ADR 0073](0073-ownership-scoped-recovery-single-consumer-lanes.md) (engine sharding — a capturing outbound and its
+  `reingress_to` loopback may live on **different** shards; see the cross-registry amendment below),
   [CLAUDE.md](../../CLAUDE.md) §2 (reliability + count-and-log invariants — *do not break*).
 
 ## Context
@@ -187,9 +189,20 @@ inside its existing `for oc in registry.outbound.values()` loop, a `reingress_to
   `expect_reply=True`; on DATABASE implies a `RETURNING`/`OUTPUT` clause). `reingress_to` must be a
   non-empty string → else `WiringError("outbound {name!r}: reingress_to must be a non-empty inbound name")`.
 - **cross-registry** (`build_check_registry`): for each outbound with `spec.settings.get("reingress_to")`,
-  look it up in `registry.inbound`; raise `WiringError("outbound {name!r}: reingress_to names
-  unknown/non-loopback inbound {target!r}")` if it is absent or its `spec.type is not
-  ConnectorType.LOOPBACK`.
+  look the target up in the **whole config's** `Loopback` inbound names — `Registry.loopback_inbound_names()`,
+  **not** `registry.inbound` — and raise `WiringError("outbound {name!r}: reingress_to names
+  unknown/non-loopback inbound {target!r}")` if it is not one of them.
+
+**Amendment (engine sharding).** Under ADR 0073 a shard's `Registry` carries only its **own** inbounds
+while **every** shard keeps **every** outbound, so resolving the target against `registry.inbound` made this
+check fail on every shard except the loopback's owner — a permanent 422 on reload / IDE promote — even
+though the runtime already spans the split (the capturing outbound's shard produces the `Stage.RESPONSE`
+row; the loopback's shard drains it, `RegistryRunner._wake_lane`). `reingress_to` is a fact about the
+**config**, not about which shard owns the loopback, so `filter_registry_for_shard` pins the unfiltered
+loopback **names** on the filtered `Registry` (`all_loopback_inbound`, beside `all_shard_ids`) and the check
+reads them through `loopback_inbound_names()`. Names only — never the connections — because every other
+reader of `registry.inbound` must keep seeing only this shard's. The rule keeps full strength on every
+shard: an unknown target and a non-`Loopback` target still fail everywhere, unsharded and sharded alike.
 
 Because `build_check_registry` builds **no** connectors against a live store (it constructs-and-discards),
 all of this fails at `check`/dry-run with no DB — the Increment-1 guarantee preserved.
@@ -695,6 +708,18 @@ like router/transform.
   outbound is a capturing outbound, so it hits that guard and is rejected with the existing clear error. A
   test pins that a `reingress_to` outbound on the SQL Server backend is rejected at start.
 
+> **Update (2026-07-14):** superseded by #249 (`c6010195`, 2026-06-15) — **one day after this ADR was
+> accepted**. SQL Server now sets `supports_response_capture = True`
+> ([store/sqlserver.py](../../messagefoundry/store/sqlserver.py)) and implements capture +
+> `reingress_to`/`Loopback()` re-ingress at **full parity**. The guard described above is therefore
+> **unreachable on SQL Server**, and a `reingress_to` outbound is **ACCEPTED, not rejected**. The
+> prescribed "rejected at start" test was never written and **would fail** if it were. The line refs above
+> are dead: the live guard is [pipeline/wiring_runner.py](../../messagefoundry/pipeline/wiring_runner.py)
+> (`if capture_response and not supports_response_capture`) and the flag is on `SqlServerStore`. The guard
+> is *kept* — it is the fail-closed allow-list for a **future** capture-incapable backend, not a statement
+> about SQL Server. Current truth: the [capability matrix](../CONFIGURATION.md#per-backend-capability-matrix).
+> This bullet is retained as the original decision record.
+
 **Stage-model freeze (the coordination obligation).** Adding `Stage.RESPONSE` **reopens the stage-frozen
 surface** the Increment-1 ADR explicitly kept byte-identical. This is the largest cost. The freeze window is
 a single coordinated change that:
@@ -877,6 +902,14 @@ A task isn't done until these pass (`ruff`, `mypy --strict`, `pytest`; Qt offscr
 - **Backend parity.** A Postgres `complete_with_response(reingress_to=…)` + `ingress_handoff` producing
   identical rows and exactly-once behavior; a **SQL Server "rejected at engine start"** test for a
   `reingress_to` outbound (hits the existing `supports_response_capture` guard).
+
+  > **Update (2026-07-14):** the SQL Server **"rejected at engine start"** test is **VOID** — it would
+  > fail. Per the #249 note above, SQL Server *supports* capture + re-ingress, so a `reingress_to`
+  > outbound is accepted there. **This line is the one that told a downstream team to go "add SQL Server
+  > support" for a feature that already shipped.** The parity test that *does* exist asserts the
+  > opposite: the capture/re-ingress loop is exercised against a **real SQL Server** (and a real Postgres)
+  > in `tests/test_x12_rte.py`. See the [capability matrix](../CONFIGURATION.md#per-backend-capability-matrix),
+  > pinned by `tests/test_store_capability_matrix.py`.
 - **Coexistence.** A **timer-sourced** request routed to a `reingress_to` outbound produces a
   loopback-sourced child (not a timer child). A **message-split** file whose children each capture+re-ingress
   yields N distinct children.

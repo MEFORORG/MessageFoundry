@@ -126,16 +126,18 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 ## 6. Identity, access, audit
 
-- **Authentication required + MFA.** `MEFOR_AUTH_ENABLED=true`; `MEFOR_AUTH_REQUIRE_MFA=true` for local
+- **Authentication required + MFA.** `MEFOR_SECURITY_REQUIRE_SIGN_IN=true`; `MEFOR_SECURITY_REQUIRE_MFA=true` for local
   Administrator accounts on an exposed PHI bind (the startup gate **refuses** a production-PHI off-loopback
   bind with local admins and `require_mfa=false`). AD/Entra MFA stays delegated to your IdP.
-- **Deny-by-default egress.** `MEFOR_EGRESS_DENY_BY_DEFAULT=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
+- **Deny-by-default egress.** `MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND=true` + the `MEFOR_EGRESS_ALLOWED_*` lists, so a
   transform can only send to approved destinations — a fail-closed exfiltration guard.
 - **Full audit, off-box to your SIEM.** Every PHI access (raw view, summary) is audited with the acting
-  user ([`docs/SECURITY.md`](SECURITY.md)). Ship audit + operational logs to your SIEM — but note the
-  off-box **syslog forwarder is plaintext** ([§7](#7-known-residuals)); front it with a TLS-forwarding
-  collector before enabling. Cloud-native: the container log driver to a TLS-terminating collector is the
-  cleaner path for ephemeral pods.
+  user ([`docs/SECURITY.md`](SECURITY.md)). Ship audit + operational logs to your SIEM using the
+  **native TLS-syslog forwarder** (`[logging].forward_protocol = "tls"`, RFC 5425 — ADR 0080), which
+  anchors the collector's cert to `[logging].forward_tls_ca_file` and verifies by default
+  ([§7](#7-known-residuals)). A plaintext UDP/TCP forwarder is also available but must **not** carry
+  PHI-adjacent log metadata across the wire — pin `forward_protocol = "tls"` (or, cloud-native, use the
+  container log driver to a TLS-terminating collector for ephemeral pods).
 - **Least-privilege IAM** for the pods (the DB login, the secret-manager reads, the KMS decrypt grant) —
   scope each to exactly what it needs.
 
@@ -143,10 +145,13 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
 
 ## 7. Known residuals
 
-- **Off-box syslog is plaintext (not enabled in the cloud manifest).** `SyslogProtocol` has no TLS variant
-  ([`config/settings.py`](../messagefoundry/config/settings.py)), so `[logging].forward_*` is deliberately
-  **omitted** from the HA manifest and is **not** flipped on by this guide. Pair it with a TLS
-  sidecar/collector before any enablement — do not put PHI-adjacent log metadata on the wire in cleartext.
+- **Off-box syslog is not enabled in the cloud manifest (enable it with TLS).** `[logging].forward_*` is
+  **omitted** from the HA manifest and is **not** flipped on by this guide — but the forwarder does support
+  **native TLS** (`SyslogProtocol.TLS`, RFC 5425 — ADR 0080;
+  [`config/settings.py`](../messagefoundry/config/settings.py)), so when you enable off-box shipping set
+  `[logging].forward_protocol = "tls"` with a `forward_tls_ca_file` trust anchor (verification is on by
+  default). Do **not** enable the plaintext UDP/TCP forwarder for PHI-adjacent log metadata; if you must,
+  front it with a TLS sidecar/collector first.
 - **In-engine TLS revocation is delegated** ([ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)).
   For enforced OCSP/CRL revocation, terminate with an **OCSP-must-staple** proxy (Topology B).
 - **API cert rotation needs a pod restart** (uvicorn builds the TLS context once; MLLP certs hot-reload on
@@ -169,7 +174,9 @@ PHI at rest is protected in **two layers**, and the engine layer is made **fail-
       or internal NLB only).
 - [ ] **Region-pinned**: DB, compute, KMS keys, backups, secrets all in the approved region.
 - [ ] **Auth + MFA** on; **deny-by-default egress** with populated allow-lists.
-- [ ] **Audit + logs to the SIEM** via a **TLS** collector (NOT the plaintext syslog forwarder as-is).
+- [ ] **Audit + logs to the SIEM** over **TLS** — the native TLS-syslog forwarder
+      (`[logging].forward_protocol = "tls"` + `forward_tls_ca_file`, RFC 5425) or a TLS-terminating
+      collector; **not** the plaintext UDP/TCP forwarder as-is.
 - [ ] Least-privilege IAM for the pods (DB / secrets / KMS-decrypt grants scoped tight).
 - [ ] *(NPRM-anticipated, forward-looking)* mandatory encryption, network segmentation, and an asset
       inventory documented — confirm whether the 2025 Security Rule NPRM has been finalized at deploy time.

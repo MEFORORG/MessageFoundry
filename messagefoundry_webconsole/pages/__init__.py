@@ -22,3 +22,4 @@ from .config import *  # noqa: F401,F403
 from .connections import *  # noqa: F401,F403
 from .messages import *  # noqa: F401,F403
 from .monitoring import *  # noqa: F401,F403
+from .uploaded_logs import *  # noqa: F401,F403

@@ -16,26 +16,29 @@ import io
 import json
 from dataclasses import dataclass, field
 
+from harness._spreadsheet import SPREADSHEET_FORMULA_TRIGGERS, spreadsheet_safe
 from harness.load.enginepoll import EnginePoller
 from harness.load.metrics import Counters, Histogram, LatencySummary
 from harness.load.profile import LoadProfile, Phase, Slo
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3  # 1→2: committed_txns + txn_per_message_measured; 2→3: body_copies +
+# copies_per_message (the #207 sizing proxy — a COPY COUNT, never a byte figure; ADR 0141)
 
 # Exit codes (shared with the CLI).
 EXIT_OK = 0
 EXIT_SLO_VIOLATION = 1
 
 # CSV formula-injection (CWE-1236 / ASVS 1.2.10): a spreadsheet treats a cell beginning with one of
-# these as a formula. A leading "'" forces it to be read as literal text on open.
-_CSV_FORMULA_TRIGGERS = frozenset("=+-@\t\r\x00")
+# these as a formula. A leading "'" forces it to be read as literal text on open. The rule is the
+# shared one (harness/_spreadsheet.py) — this module used to carry its own copy.
+_CSV_FORMULA_TRIGGERS = SPREADSHEET_FORMULA_TRIGGERS
 
 
 def _spreadsheet_safe(value: str) -> str:
     """Neutralize a leading formula trigger so a text cell can't execute when the CSV is opened in
     Excel/Sheets. Applied to the free-text columns of :meth:`RunReport.to_csv`; if a real PHI/message
     CSV export is ever added to ``api``/``console``, route every string cell through this helper."""
-    return "'" + value if value[:1] in _CSV_FORMULA_TRIGGERS else value
+    return spreadsheet_safe(value)
 
 
 @dataclass(frozen=True)
@@ -99,6 +102,35 @@ class EngineSummary:
     db_growth_bytes: int
     dead_letters: int
     drain_seconds: float | None
+    # #207 loose end 1 — the MEASURED durable-write cost, self-differenced from the live
+    # `committed_txns` store counter (final − base), beside the ANALYTICAL `3 + 2H + 2N` model
+    # (ADR 0051). ``committed_txns`` is the run delta; ``txn_per_message_measured`` divides it by the
+    # run message count (``Counters.acked``). The per-message figure is ``None`` — "not measured" —
+    # whenever the counter never moved (Postgres never wired it, so it reads a flat 0) or no message
+    # was acked, NEVER a fabricated 0.0/msg: every real run that acks a message commits at least its
+    # ingress row, so a 0 delta over acked traffic is an unwired counter, not a zero-transaction run.
+    committed_txns: int = 0
+    txn_per_message_measured: float | None = None
+    # #207 loose end 2 — the SIZING proxy, self-differenced from the live `body_copies` store counter
+    # (final − base) exactly as `committed_txns` above. ``copies_per_message`` divides it by the run
+    # message count (``Counters.acked``) to give the measured **body copies per message** — the live
+    # counterpart of the analytical `2 + H + N` amplification model
+    # (tests/test_bytes_per_message_amplification.py).
+    #
+    # IT IS A COPY COUNT, NOT BYTES, and it is BACKEND-DEPENDENT — both facts are rendered with the
+    # figure (ADR 0141). SQLite store-once-dedups a byte-identical fan-out (`shared_body` + `body_ref`
+    # ⇒ 1 copy) where SQL Server writes N inline copies, so the same traffic reads differently per
+    # backend and the backend name is part of the reading. No bytes/msg figure is published from it:
+    # converting copies to durable bytes needs NVARCHAR UTF-16 (×2), cipher expansion, and row/index/
+    # transaction-log overhead, none of which this counter sees — a `db_size_bytes`-delta ÷ acked
+    # figure is plausible-but-wrong, and the refusal to publish one stands.
+    #
+    # ``copies_per_message`` is ``None`` — "not measured" — whenever the counter never moved (Postgres
+    # never wired it, so it reads a flat 0) or nothing was acked, NEVER a fabricated 0.0/msg: every
+    # real run that acks a message writes at least its `messages.raw` + ingress `queue.payload` copies,
+    # so a 0 delta over acked traffic is an unwired counter, not a zero-copy run.
+    body_copies: int = 0
+    copies_per_message: float | None = None
 
 
 @dataclass(frozen=True)
@@ -153,6 +185,29 @@ class RunReport:
                 "db_growth_bytes": self.engine.db_growth_bytes,
                 "dead_letters": self.engine.dead_letters,
                 "drain_seconds": self.engine.drain_seconds,
+                # #207: the MEASURED durable-write cost beside the analytical 3+2H+2N model. `null`
+                # per-message ⇒ NOT MEASURED (Postgres never wired the counter, or no acked message),
+                # never a fabricated 0/msg — see EngineSummary.
+                "committed_txns": self.engine.committed_txns,
+                "txn_per_message_measured": (
+                    round(self.engine.txn_per_message_measured, 3)
+                    if self.engine.txn_per_message_measured is not None
+                    else None
+                ),
+                # #207 loose end 2: the SIZING proxy — body COPIES per message, the live counterpart
+                # of the analytical 2+H+N model. `null` per-message ⇒ NOT MEASURED (Postgres never
+                # wired the counter, or no acked message), never a fabricated 0/msg. The unit and the
+                # backend travel WITH the number because it is neither bytes nor backend-portable
+                # (SQLite dedups an identical fan-out to 1 copy, SQL Server writes N) — and no
+                # bytes/msg figure is published from it (ADR 0141). See EngineSummary.
+                "body_copies": self.engine.body_copies,
+                "copies_per_message": (
+                    round(self.engine.copies_per_message, 3)
+                    if self.engine.copies_per_message is not None
+                    else None
+                ),
+                "copies_per_message_backend": self.engine.db_backend,
+                "copies_per_message_unit": "body copies (NOT bytes)",
             },
             "no_loss": {
                 "ok": self.no_loss.ok,
@@ -240,6 +295,27 @@ class RunReport:
             f"journal={e.journal_mode} synchronous={e.synchronous or 'n/a'} "
             f"backend={e.db_backend or '?'}"
         )
+        # #207: the MEASURED txn/msg beside the analytical 3+2H+2N cost model. "not measured" when the
+        # live committed_txns counter never moved (Postgres) or nothing was acked — never a bogus 0.
+        measured = (
+            f"{e.txn_per_message_measured:.2f}/msg"
+            if e.txn_per_message_measured is not None
+            else "not measured"
+        )
+        lines.append(f"txn/msg (measured): {measured} (committed_txns={e.committed_txns})")
+        # #207 loose end 2: the SIZING proxy, beside the measured txn/msg. The label carries BOTH
+        # caveats into the operator's terminal — the backend (SQLite dedups an identical fan-out to one
+        # copy, SQL Server writes N, and the rig/production backend is SQL Server) and "NOT bytes"
+        # (durable bytes need UTF-16 width, cipher expansion, and row/index/tx-log overhead this
+        # counter cannot see, so no bytes/msg is published — ADR 0141). "not measured", never a bogus 0.
+        copies = (
+            f"{e.copies_per_message:.2f}/msg"
+            if e.copies_per_message is not None
+            else "not measured"
+        )
+        lines.append(
+            f"copies/msg ({e.db_backend or '?'}; NOT bytes): {copies} (body_copies={e.body_copies})"
+        )
         nl = self.no_loss
         lines.append(
             f"no-loss: {'OK' if nl.ok else 'LOSS'} — sent={nl.sent} engine_read={nl.engine_read} "
@@ -303,7 +379,7 @@ def build_report(
         tolerance=loss_tolerance,
         unconfirmed_budget=profile.pool_size * max(1, len(profile.targets)),
     )
-    engine = _engine_summary(poller, drain_seconds, db_backend)
+    engine = _engine_summary(poller, drain_seconds, db_backend, final_counters.acked)
     slos.extend(_run_slos(profile.default_slo, final_counters, no_loss, engine, drain_seconds))
 
     notes = _notes(final_counters, poller)
@@ -541,7 +617,10 @@ def _reconcile(
 
 
 def _engine_summary(
-    poller: EnginePoller, drain_seconds: float | None, db_backend: str | None
+    poller: EnginePoller,
+    drain_seconds: float | None,
+    db_backend: str | None,
+    message_count: int,
 ) -> EngineSummary:
     samples = poller.samples
     base, final = poller.baseline, poller.final
@@ -551,8 +630,36 @@ def _engine_summary(
     dead = (final.out_dead - base.out_dead) if base and final else 0
     journal = final.journal_mode if final else None
     synchronous = final.synchronous if final else None
+    # #207: self-difference the live committed_txns counter exactly as db_size/out_dead above. A 0
+    # delta over acked traffic means the backend never wired the counter (Postgres reads a flat 0) —
+    # so the per-message figure is None ("not measured"), never a fabricated 0/msg. `message_count`
+    # is Counters.acked (the run's message count); guard against division by zero when nothing acked.
+    committed_txns = (final.committed_txns - base.committed_txns) if base and final else 0
+    txn_per_message_measured = (
+        committed_txns / message_count if message_count > 0 and committed_txns > 0 else None
+    )
+    # #207 loose end 2: the same self-difference for the body-copy counter — the SIZING proxy. Same
+    # "0 delta ⇒ not measured" rule (Postgres never wired it): a run that acked messages always wrote
+    # at least 2 copies each, so a flat 0 is an unwired counter, never a zero-copy run. The figure is a
+    # COPY COUNT, and backend-dependent — `db_backend` is rendered with it and no byte figure is
+    # derived from it (ADR 0141).
+    body_copies = (final.body_copies - base.body_copies) if base and final else 0
+    copies_per_message = (
+        body_copies / message_count if message_count > 0 and body_copies > 0 else None
+    )
     return EngineSummary(
-        db_backend, journal, synchronous, peak_backlog, peak_qd, growth, dead, drain_seconds
+        db_backend,
+        journal,
+        synchronous,
+        peak_backlog,
+        peak_qd,
+        growth,
+        dead,
+        drain_seconds,
+        committed_txns,
+        txn_per_message_measured,
+        body_copies,
+        copies_per_message,
     )
 
 

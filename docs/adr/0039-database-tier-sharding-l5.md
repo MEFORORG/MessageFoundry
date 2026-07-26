@@ -1,15 +1,24 @@
 # 0039 — Database-tier sharding (L5) — per-shard store on K HA clusters + read-offload
 
-- **Status:** **Proposed** (2026-06-27) — **design approved; build deferred ("shelved").** The owner
-  has approved the *direction*; the build is deliberately **not** started and **activates only when a
-  measured DB-commit wall exists** (the Step-0 / L0 hardware test pins the bottleneck on DB commit
-  latency / WAL fsync / log flush, not on a headline number). Design landed in PR #588; no engine code
-  is built for L5 yet.
+- **Status:** **DECLINED (2026-07-01)** — the DB-tier store split stays OFF; superseded on the
+  store-split question by [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (Accepted).
+  ADR 0063 makes the no-split-store rule **absolute across backends AND tiers**, with **NO 'split on a
+  measured commit wall' exception** — the commit-wall activation trigger described below is **VOID**;
+  the aggregate store is raised **vertically** + made **per-message cheaper**, never fragmented.
+  Reversing this requires a new ADR that supersedes ADR 0063. _(Original 2026-06-27 'Proposed /
+  shelved-pending-commit-wall' status preserved below for history.)_
+  - **Original status (2026-06-27, historical):** **Proposed** — **design approved; build deferred
+    ("shelved").** The owner had approved the *direction*; the build was deliberately **not** started
+    and would **activate only when a measured DB-commit wall exists** (the Step-0 / L0 hardware test
+    pins the bottleneck on DB commit latency / WAL fsync / log flush, not on a headline number). Design
+    landed in PR #588; no engine code was built for L5.
 - **Date:** 2026-06-27
-- **Related:** [docs/design/dbshard.md](../design/dbshard.md) (full options analysis) · ADR 0037
-  (L3 process sharding — L5 generalizes its per-subprocess store) · ADR 0001 (staged pipeline — the
-  single-transaction handoffs L5 must not span across DBs) · [CLAUDE.md](../../CLAUDE.md) §2 (store /
-  reliability invariant)
+- **Related:** [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (Accepted — **declines
+  this L5 store split**; makes the no-split rule absolute across backends AND tiers, voiding the
+  commit-wall trigger below) · [docs/design/dbshard.md](../design/dbshard.md) (full options analysis) ·
+  ADR 0037 (L3 process sharding — L5 generalizes its per-subprocess store) · ADR 0001 (staged pipeline
+  — the single-transaction handoffs L5 must not span across DBs) · [CLAUDE.md](../../CLAUDE.md) §2
+  (store / reliability invariant)
 
 ---
 

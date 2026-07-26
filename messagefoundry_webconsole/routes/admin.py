@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import ValidationError

@@ -19,7 +19,6 @@ from messagefoundry.pipeline.supervisor import (
     build_shard_specs,
 )
 
-
 # --- shard-spec derivation (pure) --------------------------------------------
 
 

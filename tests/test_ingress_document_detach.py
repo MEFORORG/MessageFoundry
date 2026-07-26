@@ -215,6 +215,47 @@ async def test_no_threshold_byte_identical(store: MessageStore) -> None:
     assert await _attachments(store) == []
 
 
+# --- ASVS 1.3.4/5.2.2: OBX-5.2 MIME-vs-magic downgrade at detach ---------------
+
+
+async def test_detach_downgrades_mislabelled_mime_to_octet_stream(store: MessageStore) -> None:
+    # OBX-5.2 is a sender-controlled MIME. A document declared image/png whose bytes are NOT PNG (a %PDF
+    # here) is stored as application/octet-stream so the download route can never serve mislabelled
+    # active-content as its claimed inert type. The verbatim bytes are still recovered unchanged.
+    b64 = base64.b64encode(b"%PDF-1.7 " + b"P" * 2000).decode("ascii")  # PDF magic, not PNG
+    raw = _hl7_with_doc(b64, obx_type="image/png")
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store)
+
+    ack = await runner._handle_inbound(ic, raw.encode("utf-8"))
+    assert _ack_code(ack) == "AA"
+
+    attaches = await _attachments(store)
+    assert len(attaches) == 1
+    assert (
+        attaches[0]["content_type"] == "application/octet-stream"
+    )  # downgraded (magic contradicts)
+    # The handle in the persisted skeleton carries the downgraded type too, and the bytes round-trip.
+    _, ct = parse_doc_ref(Message.parse((await _messages(store))[0]["raw"]).field("OBX-5.5"))
+    assert ct == "application/octet-stream"
+    assert await _read_attachment(store, attaches[0]["id"]) == b64  # verbatim bytes unchanged
+
+
+async def test_detach_keeps_matching_mime(store: MessageStore) -> None:
+    # A declared MIME whose magic AGREES with the bytes is preserved (no false downgrade): real PNG bytes
+    # under an image/png label stay image/png.
+    png = b"\x89PNG\r\n\x1a\n" + b"P" * 2000
+    b64 = base64.b64encode(png).decode("ascii")
+    raw = _hl7_with_doc(b64, obx_type="image/png")
+    ic = _streaming_ic(threshold=500)
+    runner = RegistryRunner(_registry(ic), store)
+
+    await runner._handle_inbound(ic, raw.encode("utf-8"))
+    attaches = await _attachments(store)
+    assert len(attaches) == 1
+    assert attaches[0]["content_type"] == "image/png"  # magic agrees → kept
+
+
 # --- synchronous header NAK, cap, strict downgrade ----------------------------
 
 
@@ -395,9 +436,13 @@ async def test_in_flight_budget_exceeded_naks(store: MessageStore) -> None:
 
 
 async def test_unsupported_backend_naks(store: MessageStore) -> None:
-    # A streaming inbound against a backend without streaming support (SQL Server / Postgres in Phase 1a)
-    # raises the not-supported error at detach → NAK AE + ERROR, never accepted-and-dropped.
-    store.supports_streaming_attachments = False  # simulate a non-SQLite backend
+    # A streaming inbound against a backend that does not advertise streaming support raises the
+    # not-supported error at detach → NAK AE + ERROR, never accepted-and-dropped. SQLite, SQL Server, AND
+    # Postgres now all support streaming (each sets supports_streaming_attachments=True), so this forces the
+    # flag OFF as a unit seam to exercise a legacy/opt-out backend — it no longer describes SS/PG.
+    store.supports_streaming_attachments = (
+        False  # force the opt-out seam (not a real backend today)
+    )
     b64 = _big_b64(2000)
     ic = _streaming_ic(threshold=500)
     reg = _registry(ic)

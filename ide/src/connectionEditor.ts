@@ -5,20 +5,38 @@
 // source instead. After a save the graph refreshes and a Promote is offered.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
+import { type FieldGroup, buildForm } from "./connectionForm";
+import { connectionSchema } from "./connectionSchema";
 
+// The ConnObj shape lives in the pure connectionMerge.ts (the mocha-run unit tests import it and
+// must not pull vscode); re-exported here so existing consumers keep their import path.
+export type { ConnObj } from "./connectionMerge";
+
+// Fallback only. The transport list now comes from the installed engine (`connection schema --json`,
+// 11 transports); this stale copy is what the form falls back to when the engine cannot describe
+// itself -- an engine predating the verb, an untrusted workspace, a broken interpreter -- so the
+// editor keeps working rather than rendering an empty picker.
 const TRANSPORTS = ["mllp", "tcp", "file", "rest", "database", "database_poll", "soap", "sftp", "ftp"];
 
-export interface ConnObj {
-  direction: "inbound" | "outbound";
-  name: string;
-  transport: string;
-  router?: string;
-  settings?: Record<string, unknown>;
-  ack_mode?: string;
-  strict?: boolean;
-  ordering?: string;
-  retry?: Record<string, unknown>;
-  [k: string]: unknown;
+/**
+ * Ask the engine to describe itself and build the field groups for one transport/direction. Returns
+ * undefined when the schema is unavailable for ANY reason: a missing catalogue must degrade the form
+ * to its legacy free-text rows, never block editing a connection.
+ */
+export async function formSchemaFor(
+  cwd: string,
+  transport: string,
+  direction: "inbound" | "outbound",
+  settings: Record<string, unknown>,
+): Promise<FormSchema | undefined> {
+  try {
+    const schema = await connectionSchema(cwd);
+    const transports = Object.keys(schema.transports).sort();
+    return { transports, groups: buildForm(schema, transport, direction, settings) };
+  } catch {
+    return undefined; // logged by the caller's status surface; the form still opens
+  }
 }
 
 /** Sibling connections in the same connections.toml, for the customEditor's picker (#221b). When
@@ -90,26 +108,93 @@ export async function openConnectionEditor(
     }
   }, null, context.subscriptions);
 
-  current.webview.onDidReceiveMessage(async (m: { command?: string; conn?: ConnObj; name?: string }) => {
-    if (m?.command === "save" && m.conn) {
-      await save(m.conn, current, opts.onSaved);
-    } else if (m?.command === "delete" && m.name) {
-      await remove(m.name, current, opts.onSaved);
-    } else if (m?.command === "cancel") {
-      current.dispose();
-    }
-  });
+  current.webview.onDidReceiveMessage(
+    async (m: {
+      command?: string;
+      conn?: ConnObj;
+      name?: string;
+      transport?: string;
+      direction?: string;
+      settings?: Record<string, unknown>;
+    }) => {
+      if (m?.command === "save" && m.conn) {
+        await save(m.conn, current, { editName: opts.editName, cloneFrom: opts.cloneFrom }, opts.onSaved);
+      } else if (m?.command === "delete" && m.name) {
+        await remove(m.name, current, opts.onSaved);
+      } else if (m?.command === "cancel") {
+        current.dispose();
+      } else if (
+        m?.command === "fields" &&
+        typeof m.transport === "string" &&
+        (m.direction === "inbound" || m.direction === "outbound")
+      ) {
+        // Rebuild the descriptors HERE, so the grouping/typing rules live in the one tested module
+        // rather than being reimplemented in webview script.
+        const rebuilt = await formSchemaFor(ws, m.transport, m.direction, m.settings ?? {});
+        if (rebuilt) {
+          void current.webview.postMessage({ command: "fields", groups: rebuilt.groups });
+        }
+      }
+    },
+  );
 
-  current.webview.html = connectionFormHtml(current.webview, opts.routers, initial, undefined, clone);
+  // Describe the engine before drawing, so the form opens already showing this engine's real fields.
+  // Undefined degrades to the legacy free-text rows rather than blocking the editor.
+  const form = await formSchemaFor(
+    ws,
+    initial?.transport ?? "mllp",
+    initial?.direction ?? "inbound",
+    (initial?.settings as Record<string, unknown>) ?? {},
+  );
+  current.webview.html = connectionFormHtml(
+    current.webview,
+    opts.routers,
+    initial,
+    undefined,
+    clone,
+    form,
+  );
 }
 
-async function save(conn: ConnObj, current: vscode.WebviewPanel, onSaved?: () => void): Promise<void> {
+async function save(
+  conn: ConnObj,
+  current: vscode.WebviewPanel,
+  ctx: { editName?: string; cloneFrom?: string },
+  onSaved?: () => void,
+): Promise<void> {
   const ws = workspaceDir();
   if (!ws) {
     return;
   }
+  // #234: the form posts only the fields it renders, but `connection upsert` is a full replace —
+  // merge the post over a save-time FRESH `connection list` (the stated merge-source policy, shared
+  // with configEditors.ts via planSave) so non-rendered keys (schedule, shard, allowlist, …) survive
+  // an edit AND a clone. A list failure aborts the save: upserting the bare post would re-strip
+  // every non-rendered key, so failing closed is the only non-destructive option.
+  let entries: ConnObj[];
   try {
-    await runJson(["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(conn)], ws);
+    entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+  } catch (e) {
+    current.webview.postMessage({
+      command: "error",
+      message: `could not re-read connections.toml before saving (nothing was written) — ${String(e)}`,
+    });
+    return;
+  }
+  const plan = planSave(entries, conn, {
+    mergeFrom: ctx.editName ?? ctx.cloneFrom,
+    editingName: ctx.editName,
+  });
+  if (plan.collision) {
+    // Create/clone under an existing name would silently destroy that connection (full replace).
+    current.webview.postMessage({ command: "error", message: nameCollisionError(plan.collision) });
+    return;
+  }
+  try {
+    await runJson(
+      ["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(plan.conn)],
+      ws,
+    );
   } catch (e) {
     // Surface the validation/egress error inline so the user can fix the form (file was not changed).
     current.webview.postMessage({ command: "error", message: String(e) });
@@ -164,12 +249,24 @@ function embed(value: unknown): string {
   return JSON.stringify(value ?? null).replace(/</g, "\\u003c");
 }
 
+/**
+ * The transports and settings the INSTALLED engine declares, or undefined when it could not be
+ * fetched (an engine predating `connection schema`, an untrusted workspace, a broken interpreter).
+ * Undefined is a supported state, not an error: the form falls back to the legacy free-text
+ * key/value rows so the editor still works against an older engine.
+ */
+export interface FormSchema {
+  transports: string[];
+  groups: FieldGroup[];
+}
+
 export function connectionFormHtml(
   webview: vscode.Webview,
   routers: string[],
   initial?: ConnObj,
   siblings?: SiblingPicker,
   clone?: boolean,
+  form?: FormSchema,
 ): string {
   const n = nonce();
   return `<!DOCTYPE html>
@@ -281,7 +378,12 @@ export function connectionFormHtml(
     const vscode = acquireVsCodeApi();
     const INITIAL = ${embed(initial)};
     const ROUTERS = ${embed(routers)};
-    const TRANSPORTS = ${embed(TRANSPORTS)};
+    // The installed engine's transport list when it could be fetched, else the legacy constant.
+    const TRANSPORTS = ${embed(form?.transports?.length ? form.transports : TRANSPORTS)};
+    // Grouped, typed field descriptors for the CURRENT transport/direction (connectionForm.ts), or
+    // null when the engine could not describe them — see FormSchema. Recomputed extension-side on a
+    // transport/direction change: the grouping rules live in one tested module, not duplicated here.
+    let FIELD_GROUPS = ${embed(form?.groups ?? null)};
     const SIBLINGS = ${embed(siblings)};
     const CLONE = ${embed(clone)};              // #175: create mode pre-filled from INITIAL, new name required
     const EDIT = INITIAL !== null && !CLONE;    // clone is NOT edit: name editable, no delete
@@ -327,17 +429,75 @@ export function connectionFormHtml(
       $('settings').appendChild(wrap);
     }
 
-    const HINTS = {
-      'mllp:inbound': ['port'], 'mllp:outbound': ['host', 'port'],
-      'tcp:inbound': ['port'], 'tcp:outbound': ['host', 'port'],
-      'file:inbound': ['directory', 'pattern'], 'file:outbound': ['directory', 'filename'],
-    };
+    // ----- schema-driven settings -----
+    // One control per setting the ENGINE declares, grouped and typed (connectionForm.ts). Falls back
+    // to the legacy free-text key/value rows when the engine could not describe itself, so an older
+    // engine still edits connections. A field whose value the record carries but whose key the schema
+    // does not describe arrives in its own group and is rendered here like any other -- never dropped.
+    function renderField(f, into) {
+      const wrap = document.createElement('div'); wrap.className = 'field';
+      const lab = document.createElement('label');
+      lab.textContent = f.label + (f.required ? ' *' : f.conditionallyRequired ? ' †' : '');
+      lab.title = f.help || '';
+      let control;
+      const useEnv = f.isEnvRef || f.secretOnlyEnv;
+      if (f.control === 'checkbox' && !useEnv) {
+        control = document.createElement('input'); control.type = 'checkbox';
+        control.checked = f.value === true || (f.value === undefined && f.defaultValue === true);
+      } else if (f.control === 'select' && !useEnv) {
+        control = document.createElement('select');
+        for (const c of ['', ...(f.choices || [])]) {
+          const o = document.createElement('option');
+          o.value = String(c); o.textContent = c === '' ? '(default: ' + f.placeholder + ')' : String(c);
+          control.appendChild(o);
+        }
+        control.value = f.value == null ? '' : String(f.value);
+      } else {
+        control = document.createElement('input');
+        control.type = f.control === 'number' && !useEnv ? 'number' : 'text';
+        control.placeholder = useEnv ? 'environment key' : (f.placeholder || '');
+        const shown = useEnv ? (f.envKey || '') : f.value;
+        control.value = shown == null ? '' : (typeof shown === 'object' ? JSON.stringify(shown) : String(shown));
+      }
+      control.dataset.key = f.key;
+      control.dataset.kind = f.control;
+      if (useEnv) { control.dataset.env = '1'; }
+      if (f.cast) { control.dataset.cast = f.cast; }
+      const hint = document.createElement('div'); hint.className = 'sub'; hint.textContent = f.help || '';
+      wrap.append(lab, control, hint);
+      into.appendChild(wrap);
+    }
+
+    function renderGroups(groups) {
+      const host = $('settings'); host.innerHTML = '';
+      for (const g of groups) {
+        const box = document.createElement('details'); box.open = !g.collapsed;
+        const sum = document.createElement('summary');
+        sum.textContent = g.title + ' (' + g.fields.length + ')';
+        if (g.description) { sum.title = g.description; }
+        box.appendChild(sum);
+        for (const f of g.fields) { renderField(f, box); }
+        host.appendChild(box);
+      }
+    }
+
+    /** Legacy path: the engine could not describe itself, so fall back to free-text key/value rows. */
     function prefillHints() {
+      if (FIELD_GROUPS) { renderGroups(FIELD_GROUPS); return; }
       if (EDIT) return;
       $('settings').innerHTML = '';
-      const keys = HINTS[$('transport').value + ':' + $('direction').value] || [];
-      if (keys.length) { for (const k of keys) settingRow(k, '', false, ''); }
-      else settingRow('', '', false, '');
+      settingRow('', '', false, '');
+    }
+
+    /** Ask the extension to rebuild the descriptors when the transport or direction changes. */
+    function requestFields() {
+      if (!FIELD_GROUPS) { prefillHints(); return; }
+      vscode.postMessage({
+        command: 'fields',
+        transport: $('transport').value,
+        direction: $('direction').value,
+        settings: collectSettings(),
+      });
     }
 
     function refreshVisibility() {
@@ -385,8 +545,8 @@ export function connectionFormHtml(
     }
     refreshVisibility();
 
-    $('direction').addEventListener('change', () => { refreshVisibility(); prefillHints(); });
-    $('transport').addEventListener('change', prefillHints);
+    $('direction').addEventListener('change', () => { refreshVisibility(); requestFields(); });
+    $('transport').addEventListener('change', requestFields);
     $('addSetting').addEventListener('click', () => settingRow('', '', false, ''));
 
     function coerce(text) {
@@ -397,10 +557,34 @@ export function connectionFormHtml(
       return text;
     }
 
-    function build() {
-      const direction = $('direction').value;
-      const conn = { direction: direction, name: $('name').value.trim(), transport: $('transport').value };
+    /**
+     * The settings table the form currently expresses. Two shapes feed it: the schema-driven
+     * controls (one per declared setting, keyed by data-key) and, when the engine could not describe
+     * itself, the legacy free-text rows. An EMPTY control contributes no key at all — that is what
+     * keeps "absent means this engine's default" true and stops a save writing the whole default set.
+     */
+    function collectSettings() {
       const settings = {};
+      for (const el of document.querySelectorAll('#settings [data-key]')) {
+        const key = el.dataset.key;
+        if (!key) continue;
+        if (el.dataset.env === '1') {
+          const envKey = el.value.trim();
+          if (!envKey) continue;              // a secret with no key set writes nothing
+          const ref = { env: envKey };
+          if (el.dataset.cast) ref.cast = el.dataset.cast;
+          settings[key] = ref;
+          continue;
+        }
+        if (el.dataset.kind === 'checkbox') {
+          // A checkbox cannot say "untouched"; posting null lets the extension decide (see coerce).
+          settings[key] = el.checked;
+          continue;
+        }
+        const raw = el.value.trim();
+        if (raw === '') continue;             // untouched -> omit the key entirely
+        settings[key] = el.dataset.kind === 'table' ? coerce(raw) : coerce(raw);
+      }
       for (const row of document.querySelectorAll('#settings .setting')) {
         const inputs = row.querySelectorAll('input[type=text]');
         const key = inputs[0].value.trim();
@@ -416,6 +600,13 @@ export function connectionFormHtml(
           settings[key] = coerce(raw);
         }
       }
+      return settings;
+    }
+
+    function build() {
+      const direction = $('direction').value;
+      const conn = { direction: direction, name: $('name').value.trim(), transport: $('transport').value };
+      const settings = collectSettings();
       if (Object.keys(settings).length) conn.settings = settings;
       if (direction === 'inbound') {
         if ($('router').value) conn.router = $('router').value;
@@ -447,6 +638,12 @@ export function connectionFormHtml(
 
     window.addEventListener('message', (e) => {
       if (e.data && e.data.command === 'error') { errorEl.textContent = e.data.message; errorEl.style.display = ''; }
+      // Rebuilt descriptors after a transport/direction change. The grouping rules stay in the tested
+      // module; the webview only draws what it is handed.
+      if (e.data && e.data.command === 'fields' && Array.isArray(e.data.groups)) {
+        FIELD_GROUPS = e.data.groups;
+        renderGroups(FIELD_GROUPS);
+      }
     });
   </script>
 </body>

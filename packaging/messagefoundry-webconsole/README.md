@@ -27,5 +27,6 @@ default-off, the JSON API is unchanged; `serve_ui=true` without the console fail
 ## Compatibility
 
 The console pins itself against the engine's `ENGINE_UI_SEAM` (`SUPPORTED_ENGINE_SEAMS` +
-`assert_engine_seam`). An out-of-range engine/console pair is refused at startup with a clear
-`UiSeamMismatch` — the runtime backstop behind the version range.
+`assert_engine_seam`) and supports **exactly one** seam — the engine build it was released against
+(BACKLOG #279). Any other engine/console pair is refused at startup with a clear `UiSeamMismatch`
+rather than failing later inside a page render.

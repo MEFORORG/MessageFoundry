@@ -283,6 +283,109 @@ async def test_mllp_read_failure_is_delivery_error_not_capture() -> None:
         await _mllp(True)._read_ack(_EmptyReader())
 
 
+# --- transports: MLLP ACK control-id correlation (BACKLOG #82) ---------------
+
+
+def _ack_msa2(code: str, msa2: str) -> bytes:
+    """A well-formed ACK with an explicit MSA-2 (message control id) so a test can set it
+    independently of the sent MSH-10."""
+    return f"MSH|^~\\&|R|R|S|S|20240101||ACK|1|P|2.5\rMSA|{code}|{msa2}|".encode()
+
+
+def _mllp_verify(verify: bool, *, capture: bool = False) -> MLLPDestination:
+    settings = MLLP(
+        host="h", port=1, capture_response=capture, verify_ack_control_id=verify
+    ).settings
+    d = build_destination(Destination(name="OB_M", type=ConnectorType.MLLP, settings=settings))
+    assert isinstance(d, MLLPDestination)
+    return d
+
+
+def test_mllp_verify_off_is_byte_identical_on_mismatch() -> None:
+    # Default OFF (sent_control_id never threaded): a positive ACK whose MSA-2 does NOT match the sent
+    # control id is still accepted — proves back-compat. _check_ack default arg = None → no comparison.
+    d = _mllp_verify(False)
+    assert d._check_ack(_ack_msa2("AA", "999")) is None  # off ⇒ default None ⇒ no correlation
+    # Even if a caller passed a control id, an off connector's existing callers never do; the
+    # comparison itself is driven only by the threaded value, so verify=False stays a no-op.
+
+
+def test_mllp_verify_on_match_accepts() -> None:
+    assert _mllp_verify(True)._check_ack(_ack_msa2("AA", "42"), "42") is None
+
+
+def test_mllp_verify_on_mismatch_raises_retryable() -> None:
+    d = _mllp_verify(True)
+    with pytest.raises(DeliveryError) as ei:
+        d._check_ack(_ack_msa2("AA", "999"), "42")
+    # A plain DeliveryError = retryable transport failure (NOT a permanent NegativeAckError reject).
+    assert not isinstance(ei.value, NegativeAckError)
+    assert "999" in str(ei.value) and "42" in str(ei.value)
+
+
+def test_mllp_verify_on_mismatch_raises_even_when_capturing() -> None:
+    # capture_response does NOT turn a correlation mismatch into a captured outcome — it raises so it
+    # routes through the existing retry path (the brief's chosen interaction).
+    d = _mllp_verify(True, capture=True)
+    with pytest.raises(DeliveryError):
+        d._check_ack(_ack_msa2("AA", "999"), "42")
+
+
+def test_mllp_verify_reads_msa2_separator_aware() -> None:
+    # An ACK framed with a NON-default field separator ('#') still correlates: MSA-2 is read via Peek
+    # (which reads separators from MSH-1/MSH-2), not by hardcoded '|^~\&'.
+    ack = b"MSH#^~\\&#R#R#S#S#20240101##ACK#1#P#2.5\rMSA#AA#42#"
+    assert _mllp_verify(True)._check_ack(ack, "42") is None  # match under '#'
+    with pytest.raises(DeliveryError):
+        _mllp_verify(True)._check_ack(ack, "77")  # mismatch under '#'
+
+
+def test_mllp_verify_absent_msa2_is_mismatch() -> None:
+    # An ACK that omits MSA-2 while we required correlation is not a valid accept for THIS message.
+    ack = b"MSH|^~\\&|R|R|S|S|20240101||ACK|1|P|2.5\rMSA|AA||"
+    with pytest.raises(DeliveryError):
+        _mllp_verify(True)._check_ack(ack, "42")
+
+
+async def test_mllp_verify_send_threads_sent_control_id(monkeypatch: Any) -> None:
+    # send() (verify on) must parse the OUTGOING MSH-10 and thread it into _send_once. Capture the
+    # threaded value without a real socket by stubbing _send_once.
+    d = _mllp_verify(True)
+    seen: dict[str, str | None] = {}
+
+    async def _fake_once(payload: str, sent_control_id: str | None = None) -> None:
+        seen["cid"] = sent_control_id
+        return None
+
+    monkeypatch.setattr(d, "_send_once", _fake_once)
+    await d.send("MSH|^~\\&|A|A|B|B|20240101||ADT^A01|CID-777|P|2.5\rPID|1")
+    assert seen["cid"] == "CID-777"
+
+
+async def test_mllp_verify_send_skips_unparseable_own_payload(monkeypatch: Any) -> None:
+    # Degenerate case: our own payload has no readable MSH-10 → threaded control id is None → the
+    # correlation check is skipped (deliver as before), never a failure to read our own message.
+    d = _mllp_verify(True)
+    seen: dict[str, str | None] = {"cid": "sentinel"}
+
+    async def _fake_once(payload: str, sent_control_id: str | None = None) -> None:
+        seen["cid"] = sent_control_id
+        return None
+
+    monkeypatch.setattr(d, "_send_once", _fake_once)
+    await d.send("this is not an HL7 message")
+    assert seen["cid"] is None
+
+
+def test_mllp_verify_factory_round_trip() -> None:
+    # The MLLP() factory carries the flag into settings and the connector reads it.
+    assert (
+        MLLP(host="h", port=1, verify_ack_control_id=True).settings["verify_ack_control_id"] is True
+    )
+    assert _mllp_verify(True).verify_ack_control_id is True
+    assert _mllp_verify(False).verify_ack_control_id is False  # default OFF
+
+
 # --- transports: REST / SOAP / DATABASE capture (faked openers/cursors) ------
 
 
@@ -293,7 +396,7 @@ class _Resp:
     def read(self) -> bytes:
         return self._body
 
-    def __enter__(self) -> "_Resp":
+    def __enter__(self) -> _Resp:
         return self
 
     def __exit__(self, *a: object) -> bool:
@@ -455,7 +558,9 @@ def test_wiring_rejects_invalid_capture(spec: ConnectionSpec) -> None:
 async def test_runner_start_isolates_capture_on_unsupporting_backend(
     store: MessageStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # Simulate a backend that can't persist captures (the SQL Server preview). The runner must not
+    # Simulate a FUTURE backend that can't persist captures — no SHIPPED backend is capture-incapable
+    # (SQLite, Postgres, and SQL Server all set supports_response_capture=True), so this monkeypatches
+    # one. The runner must not
     # deliver via a capturing outbound it can't capture for (ADR 0013 fail-closed lane), but per
     # ADR 0031 it ISOLATES that one lane instead of crashing the engine: start() succeeds, the lane is
     # reported failed (so rows routed to it retry, never silently dropped), and the engine runs.
@@ -490,7 +595,7 @@ async def test_responses_route_rbac_and_audit(tmp_path: Any) -> None:
     pw = "a-strong-test-passphrase"
     engine = await Engine.create(tmp_path / "resp_api.db", poll_interval=0.02)
     try:
-        service = AuthService(engine.store, AuthSettings())
+        service = AuthService(engine.store, AuthSettings(require_mfa=False))
         await service.initialize()
         for user, role in [("op", Role.OPERATOR), ("vw", Role.VIEWER), ("aud", Role.AUDITOR)]:
             uid = await service.create_local_user(

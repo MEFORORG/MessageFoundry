@@ -107,7 +107,7 @@ def test_keyless_hash_is_byte_identical_frozen_fixture() -> None:
     # unkeyed SHA-256 chain, so keyless deployments + every legacy row still verify. Pinned to a frozen
     # digest AND to the exact canonical formula (breaks if either the encoding or the keyless branch
     # changes).
-    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')
+    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
     keyless = audit_row_hash("prev", key=None, **args)  # type: ignore[arg-type]
     assert keyless == "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
     canonical = json.dumps(
@@ -383,3 +383,139 @@ def test_rekey_audit_cli_refuses_missing_db(
     assert main(["rekey-audit", "--db", str(missing)]) == 2
     assert "no audit database" in capsys.readouterr().err
     assert not missing.exists()
+
+
+# --- ADR 0150: the client address on the chained audit row ------------------------------------------
+
+
+def test_absent_client_reproduces_the_legacy_digest_exactly() -> None:
+    """The compatibility gate for ADR 0150. The address is a CONDITIONAL 7th element, so a row with no
+    client must hash over the same 6-element list as before — otherwise every row written before the
+    column existed would fail verification the moment the engine was upgraded."""
+    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
+    legacy = "f189c34ba475757a3d41c56861b6215de8c1d0ed68618e52a4ae2ae0b878981e"
+    # Omitted and explicitly-None must BOTH collapse to the frozen pre-0150 digest.
+    assert audit_row_hash("prev", **args) == legacy  # type: ignore[arg-type]
+    assert audit_row_hash("prev", client=None, **args) == legacy  # type: ignore[arg-type]
+    # An UNCONDITIONAL 7th element would have produced this instead — the bug this test pins against.
+    unconditional = json.dumps(
+        ["prev", 1.5, "alice", "view", "ch", '{"n":1}', None], sort_keys=True, default=str
+    )
+    assert legacy != hashlib.sha256(unconditional.encode("utf-8")).hexdigest()
+
+
+def test_client_is_inside_the_chained_payload() -> None:
+    """The address must be CHAINED, not an unchained sibling column: attribution an attacker can
+    rewrite without breaking tamper-evidence would be worse than no attribution at all."""
+    args = dict(ts=1.5, actor="alice", action="view", channel_id="ch", detail='{"n":1}')  # noqa: C408
+    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash("prev", **args)  # type: ignore[arg-type]
+    # …and two different addresses are two different digests (the field is genuinely covered).
+    assert audit_row_hash("prev", client="10.0.0.1", **args) != audit_row_hash(  # type: ignore[arg-type]
+        "prev", client="10.0.0.2", **args
+    )
+
+
+def test_no_crafted_detail_can_forge_the_trailing_client_element() -> None:
+    """JSON is uniquely decodable, so a 6- and a 7-element list can never render to the same bytes and
+    string values are escaped — a detail ending in a quote-comma-quote run cannot impersonate a client."""
+    forged = audit_row_hash(
+        "prev", ts=1.5, actor="a", action="v", channel_id=None, detail='x", "10.0.0.1'
+    )
+    real = audit_row_hash(
+        "prev", ts=1.5, actor="a", action="v", channel_id=None, detail="x", client="10.0.0.1"
+    )
+    assert forged != real
+
+
+async def test_authenticated_action_records_the_address(store: MessageStore) -> None:
+    await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+    row = dict((await store.list_audit(limit=1))[0])
+    assert row["client"] == "10.4.2.9"
+    ok, _ = await store.verify_audit_chain()
+    assert ok
+
+
+async def test_system_write_records_null_rather_than_inheriting(store: MessageStore) -> None:
+    """A background/`system` action must record NULL — never the address of whatever request happened
+    to run before it. This is the concrete failure mode that rejected a ContextVar carrier: it leaks
+    across asyncio.create_task boundaries and would stamp a live operator's host onto these rows."""
+    await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+    await store.record_audit("retention.purge", actor="system")  # engine-internal: no client
+    rows = [dict(r) for r in await store.list_audit(limit=2)]
+    assert rows[0]["action"] == "retention.purge" and rows[0]["client"] is None
+    assert rows[1]["client"] == "10.4.2.9"
+    # Still one continuous chain across a with-client and a without-client row.
+    ok, _ = await store.verify_audit_chain()
+    assert ok
+
+
+async def test_chain_verifies_across_mixed_old_and_new_format_rows(tmp_path: Path) -> None:
+    """The load-bearing migration property: one chain spanning rows written BEFORE the client column
+    existed and rows written after it, interleaved."""
+    store = await MessageStore.open(tmp_path / "mixed.db")
+    try:
+        await store.record_audit("legacy.a", actor="u")  # 6-element payload
+        await store.record_audit("new.b", actor="u", client="10.0.0.7")  # 7-element payload
+        await store.record_audit("legacy.c", actor="system")  # 6-element again
+        await store.record_audit("new.d", actor="u", client="192.168.1.5")
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+        assert "4" in (message or "")
+    finally:
+        await store.close()
+
+
+async def test_tampering_with_a_recorded_address_breaks_the_chain(store: MessageStore) -> None:
+    """Rewriting the address out-of-band must be detected — that is the whole point of chaining it."""
+    await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+    await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+    await store._db.execute("UPDATE audit_log SET client='127.0.0.1' WHERE id=1")
+    await store._db.commit()
+    ok, message = await store.verify_audit_chain()
+    assert not ok and "id=1" in (message or "")
+
+
+async def test_migration_adds_client_to_a_preexisting_store(tmp_path: Path) -> None:
+    """Open a DB whose audit_log predates the column (the real upgrade path): the ALTER lands, the
+    legacy rows keep their original hashes, and the chain still verifies — then a NEW row carrying an
+    address chains cleanly onto them."""
+    import aiosqlite
+
+    db = tmp_path / "preexisting.db"
+    # Build the pre-ADR-0150 audit_log by hand, with correctly-computed OLD-FORMAT hashes.
+    async with aiosqlite.connect(db) as raw:
+        await raw.execute(
+            "CREATE TABLE audit_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,"
+            " actor TEXT, action TEXT NOT NULL, channel_id TEXT, detail TEXT, row_hash TEXT)"
+        )
+        prev = ""
+        for i in range(3):
+            prev = audit_row_hash(
+                prev, ts=float(i), actor="u", action="legacy", channel_id=None, detail=None
+            )
+            await raw.execute(
+                "INSERT INTO audit_log (ts, actor, action, channel_id, detail, row_hash)"
+                " VALUES (?,?,?,?,?,?)",
+                (float(i), "u", "legacy", None, None, prev),
+            )
+        await raw.commit()
+    legacy_head = prev
+
+    store = await MessageStore.open(db)
+    try:
+        cur = await store._db.execute("PRAGMA table_info(audit_log)")
+        assert "client" in {r["name"] for r in await cur.fetchall()}  # the ALTER ran
+        # The pre-existing rows were NOT rewritten, and they still verify.
+        cur = await store._db.execute("SELECT client, row_hash FROM audit_log ORDER BY id")
+        rows = await cur.fetchall()
+        assert [r["client"] for r in rows] == [None, None, None]
+        assert rows[-1]["row_hash"] == legacy_head
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+        # A new address-bearing row chains onto the legacy tail without breaking it.
+        await store.record_audit("messages.export", actor="alice", client="10.4.2.9")
+        ok, message = await store.verify_audit_chain()
+        assert ok, message
+        assert "4" in (message or "")
+    finally:
+        await store.close()

@@ -20,6 +20,10 @@ interface Summary {
 
 const NONE = vscode.TreeItemCollapsibleState.None;
 
+// The shared complementary-blue for item icons (see graphTree.ts) — applied to real code-set rows so
+// the sidebar trees match; the info/empty/error placeholder rows (no summary) keep their own color.
+const ITEM_ICON_COLOR = new vscode.ThemeColor("messagefoundry.itemIcon");
+
 // A code-set row. contextValue selects which inline/context actions apply (CSV vs TOML vs the
 // info/empty placeholder rows, which carry none).
 class CodeSetNode extends vscode.TreeItem {

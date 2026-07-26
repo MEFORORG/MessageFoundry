@@ -71,18 +71,22 @@ from messagefoundry.transports.base import (
     DeliveryResponse,
     DestinationConnector,
     NegativeAckError,
+    encode_wire_body,
     register_destination,
 )
 
 # Reuse REST's hardened HTTP plumbing — same transports/ package, same no-redirect + TLS posture.
 from messagefoundry.transports.rest import (
     _NO_REDIRECT_OPENER,
-    _NoRedirectHandler,
+    InsecureHopGuard,
+    ProxyConfig,
     _expiry_relaxed_opener,
     _insecure_opener,
+    _no_redirect_opener,
+    _NoRedirectHandler,
     _redact_url,
-    InsecureHopGuard,
     capture_response_headers,
+    egress_route_from_settings,
     enforce_outbound_length_limits,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
@@ -97,7 +101,13 @@ __all__ = ["SoapDestination"]
 
 logger = logging.getLogger(__name__)
 
-_FAULT_RE = re.compile(r"<(?:\w+:)?Fault[\s>]", re.IGNORECASE)
+# The prefix class must admit '.' and '-': `SOAP-ENV` is the prefix the SOAP 1.1 specification uses in
+# its OWN examples, and it is what Apache Axis and much of the Java/.NET estate emit. `\w` excludes the
+# hyphen, so a `\w+:` class silently fails to recognise the single most canonical fault envelope there
+# is — and _classify_soap then falls through to the HTTP status, where a fault delivered (as SOAP
+# faults routinely are) with HTTP 200 reads as SUCCESS. That is a wrong disposition on a real delivery,
+# not a cosmetic miss. Kept identical to _HEADER_EL_RE below, which already had it right.
+_FAULT_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Fault[\s/>]", re.IGNORECASE)
 _SENDER_RE = re.compile(r"client|sender", re.IGNORECASE)
 _RECEIVER_RE = re.compile(r"server|receiver", re.IGNORECASE)
 # WS-Security fault codes that are PERMANENT (a retry won't fix a rejected/expired credential).
@@ -105,8 +115,8 @@ _WSSE_FAULT_RE = re.compile(
     r"FailedAuthentication|InvalidSecurityToken|MessageExpired", re.IGNORECASE
 )
 # SOAP 1.1 <faultcode>…</faultcode>; SOAP 1.2 <Code><Value>…</Value></Code>.
-_FAULTCODE_RE = re.compile(r"<(?:\w+:)?faultcode\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
-_CODEVALUE_RE = re.compile(r"<(?:\w+:)?Value\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+_FAULTCODE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?faultcode\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
+_CODEVALUE_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Value\b[^>]*>(.*?)</", re.IGNORECASE | re.DOTALL)
 # A <…:Header> element (any/no namespace prefix) smuggled into a <Body> fragment (purity-leak lint).
 _HEADER_EL_RE = re.compile(r"<\s*(?:[\w.\-]+:)?Header[\s/>]", re.IGNORECASE)
 
@@ -173,7 +183,7 @@ def _client_cert_opener(
     certfile: str,
     keyfile: str,
     password: str | None,
-    *,
+    *extra_handlers: urllib.request.BaseHandler,
     allow_expired: bool = False,
     host: str = "",
 ) -> urllib.request.OpenerDirector:
@@ -194,7 +204,9 @@ def _client_cert_opener(
         relax_verify_expiry(
             ctx, host=host
         )  # server chain + hostname still verified; expiry relaxed
-    return urllib.request.build_opener(_NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx))
+    return urllib.request.build_opener(
+        _NoRedirectHandler, urllib.request.HTTPSHandler(context=ctx), *extra_handlers
+    )
 
 
 def _assert_well_formed_fragment(fragment: str) -> None:
@@ -235,6 +247,24 @@ def _reject_ws_leak(fragment: str) -> None:
             "SOAP <Body> fragment contains a <Header> element; in WS-* mode the Handler returns only "
             "the operation <Body> fragment and the transport builds the <Header> (ADR 0015)"
         )
+
+
+# A credential substituted into the <Body> (ADR 0015 amendment, #236) is escaped for BOTH element and
+# attribute contexts. `_xml_escape` (saxutils.escape) does only & < > — but the well-formedness gate
+# accepts a token in an attribute (`<cred pw="TOKEN"/>` parses) and runs BEFORE substitution, so a
+# secret containing " or ' could break out of the attribute and inject markup into an already-validated
+# envelope. Escape all five XML metacharacters.
+def _escape_body_secret(value: str) -> str:
+    return _xml_escape(value, {'"': "&quot;", "'": "&apos;"})
+
+
+# The C0 control characters illegal in XML 1.0 character data: everything below 0x20 except tab
+# (0x09), LF (0x0a) and CR (0x0d). Such a char in a credential is legal for saxutils.escape but
+# would make the substituted envelope not well-formed; rejecting it at connector BUILD keeps the
+# secret out of the persisted SAXParseException string a send-time failure would otherwise produce.
+_XML_ILLEGAL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
+
+_SCRUB_MIN_LEN = 8
 
 
 def _iso(t: float) -> str:
@@ -305,7 +335,18 @@ class SoapDestination(DestinationConnector):
         self._hop_guard: InsecureHopGuard | None = None
         self._validate_ws(scheme, s, attested=attested)
 
+        # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
+        self._proxy: ProxyConfig | None = egress_route_from_settings(
+            s, dest_scheme=scheme, attested=attested
+        )
+        dest_host = urllib.parse.urlsplit(self.url).hostname or ""
+        proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
+        proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
+
         self._headers = self._build_headers(s)
+        if proxy_dest is not None:
+            # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
+            self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.url, self._headers)
         refuse_cleartext_credentials(scheme, self._headers, self.url, attested=attested)
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
@@ -334,6 +375,7 @@ class SoapDestination(DestinationConnector):
                 self.client_cert_file,
                 self.client_key_file,
                 self.client_key_password,
+                *proxy_handlers,  # ADR 0126: forward proxy threaded through the mTLS opener too
                 allow_expired=bool(s.get("tls_allow_expired", False)),  # #129 (ADR 0094)
                 host=urllib.parse.urlsplit(self.url).hostname or "",
             )
@@ -342,8 +384,11 @@ class SoapDestination(DestinationConnector):
             # expired peer cert (opt-in; default off = the shared verifying opener, byte-identical).
             if bool(s.get("tls_allow_expired", False)):
                 self._opener = _expiry_relaxed_opener(
-                    urllib.parse.urlsplit(self.url).hostname or ""
+                    urllib.parse.urlsplit(self.url).hostname or "", *proxy_handlers
                 )
+            elif proxy_handlers:
+                # A forward proxy → a per-connection verifying opener carrying it (never the shared one).
+                self._opener = _no_redirect_opener(*proxy_handlers)
             else:
                 self._opener = _NO_REDIRECT_OPENER
         else:
@@ -357,7 +402,7 @@ class SoapDestination(DestinationConnector):
                 "SOAP destination %s has TLS verification DISABLED (verify_tls=false)",
                 _redact_url(self.url),
             )
-            self._opener = _insecure_opener()
+            self._opener = _insecure_opener(*proxy_handlers)
         # #65: opt-in generic HTTP auth on the SOAP transport (independent of WS-Security, which secures
         # the SOAP *message*; this secures the HTTP *hop*). A bearer provider (OAuth2 client-credentials —
         # SMART is FHIR/REST-only) injected per-request in _post, OR HTTP Digest folded into the opener.
@@ -368,7 +413,8 @@ class SoapDestination(DestinationConnector):
             digest_handler_from_settings,
         )
 
-        self._token_provider = bearer_provider_from_settings(s)
+        # ADR 0126: the token-endpoint call must ALSO traverse the proxy — thread the same ProxyConfig in.
+        self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
         if self._token_provider is not None:
             refuse_cleartext_credentials(
                 scheme, {**self._headers, "Authorization": "Bearer"}, self.url, attested=attested
@@ -383,6 +429,107 @@ class SoapDestination(DestinationConnector):
             if self._opener is _NO_REDIRECT_OPENER:
                 self._opener = urllib.request.build_opener(_NoRedirectHandler)
             self._opener.add_handler(digest)
+
+        # ADR 0015 amendment (#236): body-secret substitution. Parsed last so the credential validation
+        # runs after the hop/TLS posture is settled. Empty tuple (no body_secrets) → send() is
+        # byte-identical to before.
+        self._body_secrets: tuple[tuple[str, str], ...] = self._parse_body_secrets(
+            s, scheme, attested=attested
+        )
+
+    def _parse_body_secrets(
+        self, s: dict[str, Any], scheme: str, *, attested: bool
+    ) -> tuple[tuple[str, str], ...]:
+        """Read the flat ``body_secret_tokens`` + ``body_secret_value_<i>`` settings (already
+        env()-resolved by the loader) into ``(token, secret)`` pairs (ADR 0015 amendment, #236).
+
+        **Every error here names the TOKEN or the index, never the value.** An exception raised in a
+        connector ``__init__`` fans out — ``_record_failed`` logs it with a traceback, pushes it to the
+        AlertSink (off-box), serves it as the ``/connections/{n}/metadata`` ``error`` field, and writes
+        it into ``queue.last_error`` — and none of those redact a credential (``safe_exc`` scrubs PHI
+        shapes only). So the value must never enter an exception string."""
+        tokens = s.get("body_secret_tokens")
+        if not tokens:
+            return ()
+        pairs: list[tuple[str, str]] = []
+        for i, token in enumerate(tokens):
+            raw = s.get(f"body_secret_value_{i}")
+            # str-coerce (a value resolved from a native TOML int would break the XML escaper). A
+            # present-but-EMPTY env value resolves cleanly (resolve_env_settings tests membership, not
+            # truthiness), so an empty credential is caught HERE rather than silently shipped.
+            secret = "" if raw is None else str(raw)
+            if not secret:
+                raise ValueError(
+                    f"SOAP body secret for placeholder {token!r} resolved to an empty value — "
+                    "set its env() value for this environment"
+                )
+            if _XML_ILLEGAL_RE.search(secret):
+                raise ValueError(
+                    f"SOAP body secret for placeholder {token!r} contains a control character illegal "
+                    "in XML 1.0 character data"
+                )
+            # Reject a secret that cannot be encoded in this connection's `encoding` at BUILD, naming the
+            # token + codec — never the value or the offending character. The send-time wire encode
+            # (`_post`) would otherwise raise UnicodeEncodeError, and str(UnicodeEncodeError) names the
+            # character; catching it here (fail-fast, before any message flows) keeps that character out
+            # of the persisted last_error a send-time failure would produce. (`encoding` defaults to
+            # utf-8, which encodes any str, so this only bites a deliberately-lossy codec like 'ascii'.)
+            try:
+                secret.encode(self.encoding)
+            except UnicodeEncodeError as exc:
+                raise ValueError(
+                    f"SOAP body secret for placeholder {token!r} is not encodable as "
+                    f"{self.encoding!r} (offending code point at position {exc.start}) — set an "
+                    "encodable value or widen the connection's encoding"
+                ) from None
+            pairs.append((str(token), secret))
+        # A body-carried credential over a cleartext http hop is a plaintext-credential egress, exactly
+        # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
+        # stay allowed, byte-identical).
+        refuse_cleartext_credential_hop(
+            scheme, self.url, credential="SOAP body secret", attested=attested
+        )
+        return tuple(pairs)
+
+    def _apply_body_secrets(self, payload: str) -> str:
+        """Substitute each placeholder token with its XML-escaped secret, immediately before the wire
+        encode (ADR 0015 amendment, #236). No-op (byte-identical) when no body_secrets are configured.
+
+        Fail-closed on a token that does not appear **exactly once**: 0 occurrences (a Handler branch
+        that forgot the token) or ≥2 (an attacker-influenceable HL7 body that happens to carry it) →
+        a **permanent** dead-letter, and **nothing is POSTed**. The error names only the token and the
+        count — never the secret, never the payload."""
+        if not self._body_secrets:
+            return payload
+        for token, secret in self._body_secrets:
+            count = payload.count(token)
+            if count != 1:
+                raise NegativeAckError(
+                    f"SOAP body secret placeholder {token!r} must appear exactly once in the body, "
+                    f"found {count} — refusing to send (nothing was transmitted)",
+                    code="body-secret",
+                    permanent=True,
+                )
+            payload = payload.replace(token, _escape_body_secret(secret))
+        return payload
+
+    def _scrub_body_secrets(self, text: str) -> str:
+        """Best-effort reverse-map of any configured secret (raw and XML-escaped forms) to ``"***"`` in
+        a captured partner reply (ADR 0015 amendment, #236).
+
+        **Defence in depth, not a seal:** a base64'd / hashed / re-encoded echo defeats it. Only secrets
+        of at least :data:`_SCRUB_MIN_LEN` chars are masked — a reverse-map replace of a short,
+        low-entropy value (a facility code a CDC-IIS ACK legitimately echoes) would shred the operator's
+        reconciliation text."""
+        if not self._body_secrets or not text:
+            return text
+        for _token, secret in self._body_secrets:
+            if len(secret) < _SCRUB_MIN_LEN:
+                continue
+            for form in (secret, _escape_body_secret(secret)):
+                if form in text:
+                    text = text.replace(form, "***")
+        return text
 
     def _validate_ws(self, scheme: str, s: dict[str, Any], *, attested: bool = False) -> None:
         """Runtime validation of the WS-* / mTLS settings (also enforced at wiring time by
@@ -514,14 +661,26 @@ class SoapDestination(DestinationConnector):
         # boundary), so the per-call MessageID/Timestamp/Nonce never live in a pure transform.
         if self._ws_mode:
             payload = self._wrap_envelope(payload)
+        # ADR 0015 amendment (#236): swap placeholder tokens for the real secret HERE — after the
+        # payload left the store and (in WS-* mode) was wrapped, and before _post encodes + signs it —
+        # so the wire (and any detached JWS over those bytes) carries the secret while the store still
+        # holds only the token. No-op / byte-identical when no body_secrets are configured.
+        payload = self._apply_body_secrets(payload)
         body, status, headers = await asyncio.to_thread(self._post, payload)
         # A fault can arrive inside a 2xx body, so classify it. Transport-level faults (non-2xx,
-        # URL/timeout) already raised inside _post, for both modes.
+        # URL/timeout) already raised inside _post, for both modes. Classify the RAW reply — a partner
+        # fault names none of OUR secrets, and _WSSE_FAULT_RE must see the unscrubbed text.
         failure = _classify_soap(status, body)
         if not self.capture_response:
             if failure is not None:
                 raise failure  # byte-identical: a 2xx <Fault> still dead-letters/retries
             return None
+        # Capturing: the reply is PERSISTED (response.body + captured headers), so best-effort scrub any
+        # echoed secret before it leaves this method (a validating registry may echo a bad credential in
+        # its <Fault>). Guarded so a no-body_secrets connection is byte-identical.
+        if self._body_secrets:
+            body = self._scrub_body_secrets(body)
+            headers = {k: self._scrub_body_secrets(v) for k, v in headers.items()}
         if failure is not None:
             # Capturing: record the application <Fault> as a rejected reply rather than raising, so the
             # row is delivered-with-a-rejection (operators reconcile from the captured response).
@@ -569,7 +728,7 @@ class SoapDestination(DestinationConnector):
             )
         # payload is the FINAL wire body (in WS-* mode send() already wrapped + stamped the envelope),
         # so signing over these bytes covers exactly what the partner receives.
-        data = payload.encode(self.encoding)
+        data = encode_wire_body(payload, self.encoding, transport="SOAP")
         headers = self._headers
         if self._token_provider is not None or self._signer is not None:
             headers = dict(self._headers)

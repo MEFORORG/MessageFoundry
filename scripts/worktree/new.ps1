@@ -76,6 +76,15 @@ if ($branchExists) {
 }
 if ($LASTEXITCODE -ne 0) { throw "git worktree add failed (exit $LASTEXITCODE)" }
 
+# Record this worktree's HOME branch in its PRIVATE git dir (<repo>/.git/worktrees/<id>/), so the
+# SessionStart drift-detector in worktree-selfheal.ps1 can notice if the worktree is later SWITCHED onto
+# another branch -- the worktree-hijack (docs/WORKTREES.md). Not the working tree and not shared config:
+# it is per-worktree and untracked. Best-effort -- a failure here never blocks worktree creation.
+try {
+    $gitDir = "$(& git -C $WorktreePath rev-parse --absolute-git-dir 2>$null)".Trim()
+    if ($gitDir) { Set-Content -LiteralPath (Join-Path $gitDir 'mefor-home-branch') -Value $Name -Encoding utf8 }
+} catch { }
+
 function Show-NextSteps {
     Write-Host ""
     Write-Host "Worktree ready: $WorktreePath (branch '$Name')" -ForegroundColor Green

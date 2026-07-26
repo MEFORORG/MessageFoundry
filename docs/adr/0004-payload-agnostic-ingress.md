@@ -159,3 +159,42 @@ inbound records `ERROR` (as today) and the source decides its wire response.
 existing HL7 ingress/route/transform tests proving byte-identical behavior; then the first non-HL7 source
 as a second PR. Update CLAUDE.md §2/§8 (the "two-tier parsing"/ingress description) and
 [CONNECTIONS.md](../CONNECTIONS.md) only when code ships.*
+
+---
+
+## Amendment (2026-07-17) — accept-time magic-byte content check per declared content_type (ASVS 5.2.2, WP #245)
+
+The accept-time content sniff on the file sources is now a **per-`content_type` magic-byte check**,
+dispatched by `ContentType` in `transports/file.py` `_content_matches_declared` (replacing the prior
+hl7v2-only `_looks_like_hl7` gate): **HL7V2/None** → MSH/FHS/BHS head sniff (`_looks_like_hl7`, so the
+hl7v2 path is byte-identical); **X12** → leading `ISA` (tolerating the same BOM/whitespace/`0x0b`/`0x0c`
+leading noise the X12 codec's `find_isa_start` accepts); **DICOM** → the Part-10 128-byte preamble +
+`DICM` magic at offset 128 (every DICOM object the engine produces or can parse carries it, so a
+readable object never false-quarantines); **JSON/FHIR** → a leading `{`/`[` after BOM/whitespace (FHIR
+is "HL7 FHIR JSON", so it shares the JSON magic — see the 2026-07-17 follow-up below); **XML** →
+a leading `<`; **BINARY/TEXT** → accepted unchecked (binary is opaque bytes carried base64 per ADR 0028;
+text is arbitrary — neither has a reliable leading signature). A drop whose leading bytes
+contradict its declared `content_type` is quarantined to the source's `.error` dir with a WARNING —
+never a silent drop — before its bytes reach the pipeline; the pipeline codec/parser remains the real
+validator that records `ERROR`. The two sources **differ on `None`**: the local `FileSource` treats
+`None` as hl7v2 (its historical default, sniff-on), while `RemoteFileSource` guards `is not None` and
+skips the check on `None` (its stricter sniff-off default) — neither converges on the other. Conformant
+traffic passes its magic-byte check, so a synthetic/CI box on conformant fixtures is byte-identical; no
+new setting (an always-on accept-gate like the `_looks_like_hl7` gate it replaces). Known limit: only a
+UTF-8 BOM is stripped for JSON/XML — a UTF-16-BOM document on a json/xml inbound would quarantine (use
+`content_type=binary`/`text` for such payloads).
+
+### Follow-up (2026-07-17) — narrow FHIR to the JSON shape (ASVS 5.2.2 → full Pass, #245)
+
+The original amendment above left **FHIR** accepted unchecked ("deliberately not narrowed"), which held
+ASVS 5.2.2 at **Partial** (a declared `content_type=fhir` inbound was the last file source that took a PDF
+or other non-JSON drop without a content check). Since `ContentType.FHIR` is documented as **"HL7 FHIR
+JSON"** (`config/models.py`) it is reliably JSON-sniffable, so `_content_matches_declared` now dispatches
+FHIR through the **same** leading-`{`/`[` sniff as JSON (`case ContentType.JSON | ContentType.FHIR`). A
+non-JSON body on a fhir inbound is now quarantined to `.error` like any other content-vs-type mismatch,
+driving 5.2.2 to **Pass** in both postures (posture-independent — both `File` and `RemoteFile` dispatch
+through the shared helper). Accepting a top-level `[` for FHIR is superset-permissive by design (a single
+resource and a bundle are both `{…}`); the accept-gate can only admit more, and `parsing/fhir` stays the
+real validator. **Only `binary` (opaque bytes) and `text` (arbitrary) remain unchecked** — an explicit,
+honestly-noted policy: neither carries a reliable leading signature, so quarantining on shape would be a
+false-positive risk with no security value.

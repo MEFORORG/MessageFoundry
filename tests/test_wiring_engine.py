@@ -37,7 +37,7 @@ from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.cluster import NullCoordinator
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore, OutboxStatus, Stage
-from messagefoundry.transports import DeliveryError, NegativeAckError
+from messagefoundry.transports import DeliveryError, NegativeAckError, SourceConnector
 from messagefoundry.transports.mllp import MLLPDestination
 
 ADT = (
@@ -180,12 +180,14 @@ async def test_inbound_unknown_handler_dead_letters_at_ingress(
     ).exists()  # nothing delivered — failed closed, not accept-and-drop
 
 
-class _BoomSource:
-    """A source whose start() always fails (simulates a port-in-use bind error)."""
+class _BoomSource(SourceConnector):
+    """A source whose start() always fails (simulates a port-in-use bind error). Inherits
+    SourceConnector so it carries the full interface (e.g. the #114 validate_startup no-op the runner
+    calls at bind), like every real source."""
 
     polls_shared_resource = False
 
-    async def start(self, handler: object, *, leader_gate: object = None) -> None:
+    async def start(self, handler, *, leader_gate=None) -> None:  # type: ignore[no-untyped-def]
         raise OSError("address already in use")
 
     async def stop(self) -> None:
@@ -1133,7 +1135,7 @@ async def test_ingress_inbound_not_in_registry_reschedules_not_dead_letters(
     # Not dead-lettered (would be ERROR under the finite cap if it used the delivery policy); the
     # message is preserved and the row is pending again.
     assert (await store.get_message(mid))["status"] == MessageStatus.RECEIVED.value
-    rows = [
+    rows = [  # noqa: C416
         r
         for r in await (
             await store._db.execute("SELECT status FROM queue WHERE message_id=?", (mid,))
@@ -1437,6 +1439,123 @@ async def test_saturation_alert_not_paged_for_paused_outbound(
     for _ in range(5):
         await runner._maybe_alert_saturation("OB_PAUSED", stage=Stage.OUTBOUND.value)
     assert sink.saturations == []
+
+
+async def test_buildup_realert_throttle_fires_suppresses_then_refires(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ALERT-10: the re-alert throttle at the queue_buildup emit-site. An ONGOING buildup (pending depth
+    # stays over the threshold on every tick) must fire ONCE, then stay silent for the
+    # _BUILDUP_REALERT_SECONDS window (remind, don't spam), then re-fire on the first tick past it. A
+    # controllable clock drives the runner's time.time() across the 300s window without waiting.
+    from messagefoundry.pipeline import wiring_runner as _wr
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        buildup_default=BuildupThreshold(max_depth=1),  # 1 waiting is already over threshold
+        alert_sink=sink,
+    )
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (5, None)  # depth 5 >= max_depth 1 on every tick → always crossed
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    clock = [1000.0]
+    monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
+
+    await runner._maybe_alert_buildup("OB_X")
+    assert len(sink.buildups) == 1  # first tick fires
+
+    clock[0] += _wr._BUILDUP_REALERT_SECONDS - 1.0  # still inside the re-alert window
+    await runner._maybe_alert_buildup("OB_X")
+    assert len(sink.buildups) == 1  # throttled — no second page
+
+    clock[0] += 2.0  # now strictly past first_fire + _BUILDUP_REALERT_SECONDS
+    await runner._maybe_alert_buildup("OB_X")
+    assert len(sink.buildups) == 2  # re-fires after the window
+
+
+async def test_stall_realert_throttle_fires_suppresses_then_refires(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ALERT-10: the same re-alert throttle at the message_stall emit-site (#50). The oldest undelivered
+    # message stays over the StallThreshold every tick, so the alert fires once, is suppressed for the
+    # window, then re-fires past it — driven by a controllable clock so the oldest age is always 120s.
+    from messagefoundry.pipeline import wiring_runner as _wr
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        stall_default=StallThreshold(max_oldest_seconds=60.0),
+        alert_sink=sink,
+    )
+    clock = [1000.0]
+    monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (3, clock[0] - 120.0)  # oldest pending row always 120s old → over the 60s threshold
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+
+    await runner._maybe_alert_stall("OB_X")
+    assert len(sink.stalls) == 1  # first tick fires
+
+    clock[0] += _wr._BUILDUP_REALERT_SECONDS - 1.0  # inside the re-alert window
+    await runner._maybe_alert_stall("OB_X")
+    assert len(sink.stalls) == 1  # throttled
+
+    clock[0] += 2.0  # past the window
+    await runner._maybe_alert_stall("OB_X")
+    assert len(sink.stalls) == 2  # re-fires
+
+
+async def test_saturation_realert_throttle_fires_suppresses_then_refires(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # ALERT-10: the re-alert throttle at the saturation_rising emit-site (#93), independent of
+    # buildup/stall. The backlog keeps climbing (strictly rising depth every tick), so once the window
+    # is primed the detector signals on EVERY tick — the throttle is what keeps it to one page per
+    # window. The detector still SAMPLES every tick (throttle gates the page, not the sampling), so the
+    # window stays continuous across the suppressed tick.
+    from messagefoundry.pipeline import wiring_runner as _wr
+
+    reg = Registry()
+    sink = _RecordingAlertSink()
+    runner = RegistryRunner(
+        reg,
+        store,
+        poll_interval=0.02,
+        saturation_default=SaturationThreshold(sustain_samples=3),
+        alert_sink=sink,
+    )
+    depths = iter([0, 10, 20, 30, 40, 50])  # strictly rising → signals once primed (4th sample)
+
+    async def _stub(name: str, *, stage: str):  # type: ignore[no-untyped-def]
+        return (next(depths), None)
+
+    monkeypatch.setattr(store, "pending_depth", _stub)
+    clock = [1000.0]
+    monkeypatch.setattr(_wr.time, "time", lambda: clock[0])
+
+    # sustain_samples=3 needs 4 samples to prime; the 4th (rising end-to-end) is the first page.
+    for _ in range(4):
+        await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert len(sink.saturations) == 1
+
+    clock[0] += _wr._BUILDUP_REALERT_SECONDS - 1.0  # inside the window
+    await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert len(sink.saturations) == 1  # still rising, but throttled
+
+    clock[0] += 2.0  # past the window
+    await runner._maybe_alert_saturation("OB_X", stage=Stage.OUTBOUND.value)
+    assert len(sink.saturations) == 2  # re-fires
 
 
 async def test_transform_worker_dead_letters_missing_handler(

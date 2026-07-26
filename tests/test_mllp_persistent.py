@@ -159,9 +159,9 @@ class _AckPeer:
         for writer in self._writers:
             writer.close()
         for writer in self._writers:
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(writer.wait_closed(), 2.0)
-            except (OSError, asyncio.TimeoutError):
+            except (TimeoutError, OSError):
                 pass
         self._writers.clear()
 
@@ -171,9 +171,9 @@ class _AckPeer:
         assert self._server is not None
         self._server.close()
         await self.close_clients()
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._server.wait_closed(), 2.0)
-        except (OSError, asyncio.TimeoutError):
+        except (TimeoutError, OSError):
             pass
 
 
@@ -475,8 +475,8 @@ def _cert(tmp_path: Path) -> tuple[str, str]:
         .issuer_name(name)
         .public_key(key.public_key())
         .serial_number(x509.random_serial_number())
-        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.timezone.utc))
-        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.timezone.utc))
+        .not_valid_before(datetime.datetime(2020, 1, 1, tzinfo=datetime.UTC))
+        .not_valid_after(datetime.datetime(2040, 1, 1, tzinfo=datetime.UTC))
         .add_extension(
             x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]),
             critical=False,
@@ -574,7 +574,7 @@ async def test_reconnect_logged_with_detail_no_payload(caplog: pytest.LogCapture
     peer2 = _AckPeer(close_without_ack=True)
     await peer2.start()
     dest2 = _dest(peer2.port)
-    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.transports.mllp"):  # noqa: SIM117
         with pytest.raises(DeliveryError):
             await dest2.send(_msg("M1"))
     await dest2.aclose()

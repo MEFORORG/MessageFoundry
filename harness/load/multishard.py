@@ -741,7 +741,7 @@ def _apply_cluster_env(
     # Loopback API + no auth + the config-source/TLS escapes so `serve --host 127.0.0.1` starts clean.
     env["MEFOR_ALLOW_INSECURE_TLS"] = "1"
     env["MEFOR_ALLOW_INSECURE_CONFIG_SOURCE"] = "1"
-    env["MEFOR_AUTH_ENABLED"] = "false"
+    env["MEFOR_SECURITY_REQUIRE_SIGN_IN"] = "false"
     if cluster_enabled:
         env["MEFOR_CLUSTER_ENABLED"] = "true"
         env["MEFOR_CLUSTER_NODE_ID"] = node_id

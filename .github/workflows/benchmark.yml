@@ -27,9 +27,9 @@ jobs:
     name: baseline (sqlite)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Install project (dev)
@@ -42,7 +42,7 @@ jobs:
           { echo "## sqlite"; uname -a; python --version; python -c "import sqlite3,sys; print('sqlite', sqlite3.sqlite_version)"; git rev-parse HEAD; } | tee out/load/env-sqlite.txt
       - name: Serve (SQLite) + reference rate-steps
         env:
-          MEFOR_AUTH_ENABLED: "false"
+          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
         run: |
           set -o pipefail
@@ -88,9 +88,9 @@ jobs:
       MEFOR_STORE_ENCRYPT: "false"  # plaintext to the container; the TLS-hardening guard needs the escape
       MEFOR_ALLOW_INSECURE_TLS: "1"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Install project (dev + postgres)
@@ -103,7 +103,7 @@ jobs:
           { echo "## postgres"; uname -a; python --version; psql --version 2>/dev/null || echo "psql n/a"; git rev-parse HEAD; } | tee out/load/env-postgres.txt
       - name: Serve (Postgres) + reference rate-steps
         env:
-          MEFOR_AUTH_ENABLED: "false"
+          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
         run: |
           set -o pipefail
@@ -155,9 +155,9 @@ jobs:
       MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
       MEFOR_ALLOW_INSECURE_TLS: "1"
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Set up Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
       - name: Install Microsoft ODBC Driver 18 + sqlcmd
@@ -187,7 +187,7 @@ jobs:
           { echo "## sqlserver"; uname -a; python --version; git rev-parse HEAD; } | tee out/load/env-sqlserver.txt
       - name: Serve (SQL Server) + reference rate-steps
         env:
-          MEFOR_AUTH_ENABLED: "false"
+          MEFOR_SECURITY_REQUIRE_SIGN_IN: "false"
           MEFOR_LOAD_SINK_PORT: "2700"
         run: |
           set -o pipefail

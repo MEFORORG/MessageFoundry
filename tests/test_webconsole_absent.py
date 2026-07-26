@@ -9,8 +9,13 @@ Guards the couplings that were severed so the console could move to an optional 
 ``messagefoundry_webconsole`` only inside its guarded ``serve_ui`` branch, and ``auth_routes.py``
 returns an engine-side ``AdminHandlers`` bundle (leaf type in ``api._ui_seam``) and imports the console
 not at all; (2) the ``/ui`` CSP is the ``app.state.ui_csp`` hook; (3) the ``/ws/stats`` browser
-augmentation is the ``app.state.ui_ws_authorize`` / ``app.state.ui_connections_render`` hooks. With the
-console absent the default (JSON-only) deployment is unaffected."""
+augmentation is the ``app.state.ui_ws_authorize`` / ``app.state.ui_connections_render`` hooks.
+
+ADR 0143 made the console ON BY DEFAULT, so the console-absent premise changed: at the ``create_app``
+level a ``serve_ui=True`` caller is being EXPLICIT and still fails LOUD (``RuntimeError``); at the
+``serve`` (``__main__``) level the default-on posture SOFT-DEGRADES to a JSON-only serve + a warning
+when the wheel is absent, while an EXPLICIT ``[security].serve_web_console=true`` keeps the hard
+refuse (exit 2)."""
 
 from __future__ import annotations
 
@@ -27,10 +32,13 @@ import pytest
 
 import messagefoundry.api.app as app_module
 import messagefoundry.api.auth_routes as auth_routes_module
+from messagefoundry.__main__ import main
 from messagefoundry.api import create_app
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
+
+SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
 # The stable substring of the clear startup error raised when serve_ui is on but the console is absent.
 _CLEAR_ERROR = "serve_ui requires the web console"
@@ -163,3 +171,60 @@ def test_engine_imports_and_boots_in_fresh_interpreter_without_webui() -> None:
     )
     assert result.returncode == 0, f"stdout={result.stdout!r}\nstderr={result.stderr!r}"
     assert "OK" in result.stdout
+
+
+# --- ADR 0143 soft-degrade contract: default-on vs explicit when the wheel is absent --------------
+
+
+def _serve_with_console_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    toml: str,
+) -> tuple[int, str]:
+    """Run ``serve`` with ``importlib.util.find_spec`` reporting the console wheel ABSENT (the path the
+    ``__main__`` gate actually probes — ``find_spec`` does not import, so the __import__ shim above does
+    not cover it), the app + uvicorn mocked so no socket opens. Returns ``(exit_code, stderr)``."""
+    import importlib.util as ilu
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MEFOR_STORE_ENCRYPTION_KEY", "x" * 44)
+    # GIVEN 1 (ADR 0148): dev derives PHI now, so declare synthetic to keep the PHI gates quiet — these
+    # tests probe the ADR 0143 console soft-degrade / hard-refuse contract, not the security posture.
+    (tmp_path / "messagefoundry.toml").write_text(
+        "security.handles_real_patient_data = false\n" + toml, encoding="utf-8"
+    )
+    real_find_spec = ilu.find_spec
+
+    def fake_find_spec(name: str, *a: Any, **k: Any) -> Any:
+        if name == "messagefoundry_webconsole":
+            return None  # simulate the optional wheel being absent
+        return real_find_spec(name, *a, **k)
+
+    monkeypatch.setattr(ilu, "find_spec", fake_find_spec)
+    monkeypatch.setattr("messagefoundry.api.create_managed_app", lambda **kw: object())
+    monkeypatch.setattr("uvicorn.run", lambda *a, **k: None)
+    rc = main(["serve", "--config", str(SAMPLES_CONFIG), "--env", "dev"])
+    return rc, capsys.readouterr().err
+
+
+def test_serve_default_on_soft_degrades_to_json_only_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0143 contract (a): the console is ON BY DEFAULT, so a bare serve whose optional wheel is
+    absent SOFT-DEGRADES to a JSON-only serve with a WARNING (exit 0) — it must not refuse every serve."""
+    rc, err = _serve_with_console_absent(tmp_path, monkeypatch, capsys, "")
+    assert rc == 0
+    assert "web console is on by default" in err and "serving the JSON API only" in err
+
+
+def test_serve_explicit_console_refuses_when_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """ADR 0143 contract (b): an EXPLICIT ``[security].serve_web_console=true`` with the wheel absent
+    keeps the HARD refuse (exit 2) — the operator asked for the console by name."""
+    rc, err = _serve_with_console_absent(
+        tmp_path, monkeypatch, capsys, "security.serve_web_console = true\n"
+    )
+    assert rc == 2
+    assert "serve_web_console=true needs the web console package" in err

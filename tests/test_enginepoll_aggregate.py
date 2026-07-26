@@ -39,6 +39,7 @@ def _shard(
     uptime_s: float = 1.0,
     journal_mode: str = "wal",
     synchronous: str | None = "normal",
+    committed_txns: int = 0,
 ) -> _ShardSample:
     return _ShardSample(
         pending=pending,
@@ -54,6 +55,7 @@ def _shard(
         uptime_s=uptime_s,
         journal_mode=journal_mode,
         synchronous=synchronous,
+        committed_txns=committed_txns,
     )
 
 
@@ -110,6 +112,23 @@ def test_sample_is_per_field_sum_across_shards(monkeypatch: pytest.MonkeyPatch) 
     assert sample.backlog == 6  # (3+2) + (1+0) + 0
     assert sample.in_pipeline == 6  # 5 + 1 + 0
     assert sample.queue_depth == 6  # 5 + 1 + 0
+
+
+def test_committed_txns_sums_across_shards(monkeypatch: pytest.MonkeyPatch) -> None:
+    # #207: the live committed_txns cost counter must aggregate like read/written — each shard runs
+    # its own workers, so the cluster's durable-write cost is the sum. A per-shard read that dropped
+    # a shard's txns would understate the measured txn/msg the report divides.
+    poller = _poller_over(
+        [
+            [_shard(read=100, committed_txns=700)],
+            [_shard(read=50, committed_txns=350)],
+            [_shard(read=10, committed_txns=70)],
+        ],
+        monkeypatch,
+    )
+    sample = asyncio.run(poller.sample_once())
+    assert sample is not None
+    assert sample.committed_txns == 1120  # 700 + 350 + 70
 
 
 def test_one_unreachable_shard_skips_the_whole_sample(monkeypatch: pytest.MonkeyPatch) -> None:

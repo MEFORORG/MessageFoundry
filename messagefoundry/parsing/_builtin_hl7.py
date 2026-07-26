@@ -43,6 +43,8 @@ The semantics here mirror two *distinct* python-hl7 surfaces the existing code r
 
 from __future__ import annotations
 
+import re
+from functools import lru_cache
 from typing import TypedDict
 
 import hl7  # for byte-parity error types (ParseException) on the no-MSH-leading path
@@ -62,6 +64,10 @@ __all__ = [
     "unescape",
     "unescape_separators",
     "escape_leaf",
+    "escape_expansion_estimate",
+    "EscapeScanLimitExceeded",
+    "MAX_COUNTED_ESCAPE_OPENERS",
+    "message_escape_char",
     "raise_if_blank_segment_scan",
     "scan_segment_index",
 ]
@@ -385,7 +391,7 @@ def extract_field(
     # never split — python-hl7 returns their value **raw** (un-unescaped) for a comp=1/sub=1 read, and
     # raises ``IndexError`` for any deeper index (the path runs past the leaf). Handle before the split
     # logic so MSH-2's ``^~\&`` is not mistaken for component structure.
-    if seg_id in ("MSH", "BHS", "FHS") and fld in (1, 2):
+    if seg_id in ("MSH", "BHS", "FHS") and fld in (1, 2):  # noqa: SIM102
         if fld < len(fields):
             if comp_num == 1 and sub_num == 1:
                 return _field_text(fields[fld]) or None
@@ -490,6 +496,23 @@ def separators(msg: ParsedMessage) -> tuple[str, str, str, str, str]:
 # to bound the allocation (the upstream raw-size cap cannot — a tiny input expands past it).
 MAX_ESCAPE_REPEAT = 512
 
+#: The **counted** rich-text escapes — the ``\.xx[N]\`` family — mapped to the text ONE repeat emits.
+#: Hoisted out of :func:`unescape` (which splices it into its ``default_map``) so the pre-parse
+#: estimator's width table can be *derived* from it (:data:`_REPEAT_WIDTHS`) instead of copied: adding
+#: a counted escape here necessarily extends the estimator, so the aggregate budget (ASVS 1.3.3)
+#: cannot silently stop measuring a branch that expands. ``tests/test_builtin_hl7_hardening.py``
+#: additionally asserts, by AST, that ``unescape`` declares no dotted key of its own.
+_RICH_TEXT_MAP: dict[str, str] = {
+    ".br": "\r",
+    ".sp": "\r",
+    ".fi": "",
+    ".nf": "",
+    ".in": "    ",
+    ".ti": "    ",
+    ".sk": " ",
+    ".ce": "\r",
+}
+
 
 def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
     """Unescape an HL7 leaf value — byte-parity with ``hl7.util.unescape``.
@@ -504,6 +527,9 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
     if not field or esc not in field:
         return field
 
+    # The dotted (counted) entries come from _RICH_TEXT_MAP, never from a literal here: the
+    # pre-parse expansion estimator derives its width table from that constant, and a dotted key
+    # declared inline would expand at parse time while contributing nothing to the budget.
     default_map = {
         "H": "_",
         "N": "_",
@@ -512,14 +538,7 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
         "R": rep_sep,
         "T": sub_sep,
         "E": esc,
-        ".br": "\r",
-        ".sp": "\r",
-        ".fi": "",
-        ".nf": "",
-        ".in": "    ",
-        ".ti": "    ",
-        ".sk": " ",
-        ".ce": "\r",
+        **_RICH_TEXT_MAP,
     }
 
     out: list[str] = []
@@ -567,6 +586,174 @@ def unescape(field: str, seps: tuple[str, str, str, str, str]) -> str:
         else:
             out.append(c)
     return "".join(out)
+
+
+# --- aggregate expansion budget (ASVS 1.3.3) --------------------------------
+#
+# MAX_ESCAPE_REPEAT clamps ONE escape; *composition* was unbounded, so a size-capped body could still
+# expand ~256x while being unescaped leaf by leaf. The functions below let a caller measure that
+# growth BEFORE parsing (see ``peek.enforce_expansion_budget``), so the breach is a pre-ACK contract
+# error instead of a multi-GiB allocation on the event loop.
+
+#: The rich-text escapes that take a repeat COUNT (``\.in5\`` = indent 5) mapped to the width of ONE
+#: repeat. These are the only *expanding* branches of :func:`unescape`: every other branch contracts
+#: (``\F\``/``\H\`` are >=3 chars in and 1 out; ``\Xhh..\`` is len(hex)+3 in and len(hex)//2 out) or
+#: drops to ``""``. **Derived** from :data:`_RICH_TEXT_MAP` — the same object ``unescape`` splices into
+#: its ``default_map`` — so a counted escape cannot be added to one and forgotten in the other. (A
+#: hand-copied table could only be checked in one direction: iterating it detects a changed width but
+#: never an ADDITION on the ``unescape`` side, which is precisely the silent hole.)
+_REPEAT_WIDTHS: dict[str, int] = {prefix: len(text) for prefix, text in _RICH_TEXT_MAP.items()}
+
+#: The subset the scanner actually looks for: only prefixes whose ONE repeat is non-empty. ``.fi``
+#: and ``.nf`` map to ``""``, so ``count x 0`` is 0 for any count — they provably cannot contribute
+#: to the estimate, and matching them only buys an attacker Python-level iterations for free (a
+#: 16 MiB body of ``\.fia`` scanned at 3.3M iterations / ~1.6 s before this exclusion, and was then
+#: ACCEPTED with an estimate of 0). Derived, never hand-listed, and
+#: ``test_repeat_widths_track_unescape_output`` asserts every EXCLUDED prefix really is width 0, so a
+#: future ``_RICH_TEXT_MAP`` edit that gave one of them a body cannot leave it silently unscanned.
+_EXPANDING_PREFIXES: tuple[str, ...] = tuple(p for p, w in _REPEAT_WIDTHS.items() if w > 0)
+
+#: Ceiling on the number of counted-escape openers :func:`escape_expansion_estimate` will walk before
+#: refusing the body outright — a pre-parse resource cap in the same family as
+#: ``peek.DEFAULT_MAX_SEGMENTS``, and the reason the estimator's cost is O(1) in the payload rather
+#: than O(len(norm)).
+#:
+#: The running-total ``limit`` cannot bound this work on its own: an opener whose count is absent,
+#: non-numeric or <= 0 adds *nothing* to the total, so the cheapest hostile bodies never trip the
+#: short-circuit and buy a full multi-million-iteration walk on the pre-ACK event loop for free.
+#: This ceiling is the bound that holds for EVERY payload shape. At ~0.24 us per opener the cap costs
+#: ~25 ms of Python — the same order as the single C-speed scan the estimator already pays on a
+#: 16 MiB body (~50 ms) — versus the 1-2 s stall an uncapped walk allowed.
+#:
+#: Sized to be unreachable by real traffic rather than tight: ``\.br\``/``\.in\`` (no count) are
+#: skipped by the scanner's lookahead, so this counts only the ``\.inN\`` *counted* forms, and a
+#: message that passes ``enforce_size_limits`` carries at most 10,000 segments — so tripping it takes
+#: an average of 10 counted rich-text escapes in every segment of a maximal batch.
+MAX_COUNTED_ESCAPE_OPENERS = 100_000
+
+
+class EscapeScanLimitExceeded(ValueError):
+    """The body carries more counted-escape openers than the estimator will walk.
+
+    Raised by :func:`escape_expansion_estimate` and converted by
+    :func:`~messagefoundry.parsing.peek.enforce_expansion_budget` into the ``HL7PeekError`` contract
+    error the listener already dead-letters and NAKs — so an unscannable body is *refused and logged*,
+    never accepted un-measured and never quietly walked at attacker-chosen cost.
+    """
+
+
+_ESCAPE_DEFAULT = "\\"
+
+
+def message_escape_char(norm: str) -> str:
+    """Best-effort read of a raw message's OWN escape character (MSH-2's 4th encoding char).
+
+    Reproduces :func:`_extract_separators` **exactly** (including python-hl7's ``find`` -> ``-1``
+    slice quirk), so the budget and the **built-in** parser can never disagree about which character
+    escapes a given message — a disagreement would let a payload hide its escapes from the pre-parse
+    budget. It differs only in being defensive: this runs *before* any parse, on bytes that may not be
+    HL7 at all, so a short/malformed header falls back to HL7's default ``\\`` rather than indexing off
+    the end. Never hardcodes the escape character for a well-formed message (CLAUDE.md §8).
+
+    The **fallback** backend derives it differently: python-hl7's ``create_parse_plan`` searches
+    ``strmsg.find(sep0, 4)`` over the WHOLE stripped message, while this (like
+    :func:`_extract_separators`) searches only the first line. The two therefore pick different
+    characters on a header whose MSH line carries no second field separator — e.g. ``MSH|^~X`` yields
+    ``\\`` here and ``X`` there. No such shape is reachable: python-hl7 either refuses the message
+    (its ``_ParsePlan`` assertion, which :meth:`~messagefoundry.parsing.peek.Peek.parse` converts to
+    ``HL7PeekError``) or lands on ``\\r`` — the segment separator, which no leaf can contain, so its
+    ``unescape`` expands nothing. ``test_escape_char_read_agrees_with_python_hl7_or_is_unreachable``
+    pins that, so an upstream change that made a divergent shape parse cleanly reds the ASVS 1.3.3
+    suite instead of opening the bypass silently.
+    """
+    line = norm.lstrip().split("\r", 1)[0]
+    if len(line) < 4:
+        return _ESCAPE_DEFAULT
+    seps = line[3 : line.find(line[3], 4)]
+    return seps[3] if len(seps) > 3 else _ESCAPE_DEFAULT
+
+
+@lru_cache(maxsize=8)
+def _repeat_escape_scanner(esc: str) -> re.Pattern[str]:
+    """Compiled finder for a *counted* rich-text escape opener (``\\.in`` …) for this escape char.
+
+    Two narrowings, both of which can only ever remove openers that provably contribute zero, so
+    neither can under-estimate:
+
+    * only :data:`_EXPANDING_PREFIXES` — a zero-width repeat (``.fi``, ``.nf``) multiplies to 0;
+    * a negative lookahead skipping the count-less ``\\.in\\`` form, which ``unescape`` drops.
+
+    Both narrowings are about *cost*, not correctness: an ordinary ``\\.br\\``-heavy report therefore
+    costs one C-speed scan and no Python-level work at all. That is a statement about benign traffic
+    only — an attacker picks the shape, so the number of Python-level iterations is bounded by
+    :data:`MAX_COUNTED_ESCAPE_OPENERS` rather than by anything the pattern does.
+    """
+    prefixes = "|".join(prefix[1:] for prefix in _EXPANDING_PREFIXES)
+    e = re.escape(esc)
+    return re.compile(rf"{e}\.({prefixes})(?!{e})")
+
+
+def escape_expansion_estimate(
+    norm: str,
+    *,
+    limit: int | None = None,
+    max_openers: int | None = MAX_COUNTED_ESCAPE_OPENERS,
+) -> int:
+    """Worst-case characters HL7 escape expansion can ADD across ``norm``, WITHOUT parsing it.
+
+    Only the counted rich-text escapes expand (:data:`_REPEAT_WIDTHS`); every other branch of
+    :func:`unescape` contracts or drops. Summing ``count x width`` over every counted opener in the
+    raw text therefore bounds the total growth of *all* the message's unescaped leaves — an opener is
+    matched wherever it appears, so no leaf-level pairing can hide one (an escape run that a leaf
+    boundary would break up is counted anyway, which over-estimates a malformed body but can never
+    under-estimate a real one).
+
+    The estimate deliberately ignores :data:`MAX_ESCAPE_REPEAT`: the built-in drops an over-cap count
+    but python-hl7's ``unescape`` expands it without bound, so modelling the *unclamped* worst case is
+    what makes the budget judge a message identically on **either** backend — the built-in clamp then
+    stays a second, in-unescape line of defence for counts that pass the budget.
+
+    **Cost.** ``limit`` stops the scan once the running total breaches it — but the total alone can
+    never bound the work, because the *cheapest* hostile openers are exactly the ones that add
+    nothing to it: a count that is absent, non-numeric or ``<= 0`` contributes 0, so the
+    short-circuit is unreachable for the bodies an attacker actually sends. ``max_openers`` is
+    therefore the load-bearing bound: it caps the number of Python-level iterations independently of
+    payload shape, and a body carrying more counted openers than that is refused
+    (:class:`EscapeScanLimitExceeded`) rather than walked. Do not read the ``limit`` short-circuit as
+    a general cost bound — it holds only for bodies that breach.
+
+    Raises :class:`EscapeScanLimitExceeded` when ``max_openers`` is exceeded; ``None`` disables the
+    cap and is for tests/analysis only — never for a body off the wire.
+    """
+    esc = message_escape_char(norm)
+    total = 0
+    # Counts EVERY iteration, including the ones that `continue` — an iteration is the unit of cost,
+    # and the zero-contribution branches are precisely the cheap attack.
+    openers = 0
+    for match in _repeat_escape_scanner(esc).finditer(norm):
+        openers += 1
+        if max_openers is not None and openers > max_openers:
+            raise EscapeScanLimitExceeded(
+                f"message carries more than {max_openers} counted escape openers"
+            )
+        end = norm.find(esc, match.end())
+        if end == -1:
+            continue  # unterminated sequence: unescape collects and drops it
+        try:
+            # int() — never a `\d+` capture in the pattern. `unescape` reads the count with int(),
+            # which accepts ' 5', '+5' and '5_0'; a digits-only capture would MISS those and
+            # under-estimate, which is the one direction the budget must never fail in.
+            count = int(norm[match.end() : end])
+        except ValueError:
+            # Non-numeric or absurdly long count — unescape drops it too (DELTA-02), so it adds
+            # nothing on either backend.
+            continue
+        if count <= 0:
+            continue
+        total += count * _REPEAT_WIDTHS["." + match.group(1)]
+        if limit is not None and total > limit:
+            break
+    return total
 
 
 def escape_leaf(value: str, seps: tuple[str, str, str, str, str]) -> str:

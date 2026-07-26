@@ -55,7 +55,7 @@ concrete type must live engine-side).
 
 ### `ENGINE_UI_SEAM` — the handshake integer
 
-`api/_ui_seam.ENGINE_UI_SEAM: int` is the contract version the engine ships (currently **1**). The
+`api/_ui_seam.ENGINE_UI_SEAM: int` is the contract version the engine ships — **read the current value from that module**; it is deliberately not restated here, because a number quoted in prose goes stale silently (this line said "currently 1" until seam 11). The
 console declares `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS: frozenset[int]` and refuses a skew
 at startup via `assert_engine_seam(engine_seam)`, which raises `UiSeamMismatch` with a clear message
 rather than a raw `TypeError`. The handshake is **three-layered** and fails loud at every layer:
@@ -142,8 +142,11 @@ consumed `AuthService` method):
 2. Bump `ENGINE_UI_SEAM` in [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py)
    (e.g. `1` → `2`).
 3. Update `messagefoundry_webconsole.SUPPORTED_ENGINE_SEAMS` in
-   [`messagefoundry_webconsole/__init__.py`](../messagefoundry_webconsole/__init__.py): add the new seam
-   (`frozenset({1, 2})` to keep supporting the old engine, or `frozenset({2})` to drop it).
+   [`messagefoundry_webconsole/__init__.py`](../messagefoundry_webconsole/__init__.py) to the NEW seam
+   alone — it holds exactly one value (BACKLOG #279). A test asserts
+   `SUPPORTED_ENGINE_SEAMS == {ENGINE_UI_SEAM}`, so forgetting this step fails CI on the bump commit
+   rather than at a deployment's startup. Widening it back to a range requires landing the cross-seam
+   CI matrix in the same change.
 4. If the change touched the *curated* surface (an `api.security` symbol, an `AuthService` method, an
    `app.state` attribute, or which DTOs the console renders), update the corresponding list in
    `scripts/webconsole_seam_snapshot.py`.
@@ -182,9 +185,9 @@ python -m pytest packaging/messagefoundry-webconsole/tests -q
   fast.
 - The engine's own `pytest` no longer collects the `/ui` tests (engine `testpaths = ["tests"]`); CI runs
   the package suite as a second step on the same leg (`ci.yml`), so both suites exercise the same engine
-  build. Only `ENGINE_UI_SEAM == 1` exists today; when a seam 2 lands, expand that step into a matrix
-  that installs the MIN/MAX `SUPPORTED_ENGINE_SEAMS` engine builds and runs the package suite against
-  each.
+  build. There is no cross-seam matrix, and none is needed while `SUPPORTED_ENGINE_SEAMS` holds a
+  single value (BACKLOG #279 resolved the untested-range claim by narrowing it). Re-widening the set
+  requires adding that matrix in the same change.
 - Lint/type-check cover both trees:
   `ruff check messagefoundry messagefoundry_webconsole` and `mypy messagefoundry messagefoundry_webconsole`.
 - The **package-absent** path (engine boots + refuses `serve_ui` cleanly with the console uninstalled) is

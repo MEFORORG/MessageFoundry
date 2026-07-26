@@ -33,7 +33,7 @@ host/partner identifiers).
 - MessageFoundry version: <!-- `messagefoundry --version` -->
 - OS: <!-- e.g. Windows Server 2022 / Ubuntu 24.04 -->
 - Python version: <!-- `python --version` -->
-- Store backend: <!-- SQLite (default) / SQL Server (experimental) -->
+- Store backend: <!-- SQLite (default) / PostgreSQL / SQL Server -->
 - Component: <!-- engine / console / IDE extension -->
 - Transport(s) involved: <!-- MLLP / file / database / REST / SOAP -->
 

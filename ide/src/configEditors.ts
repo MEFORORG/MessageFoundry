@@ -13,7 +13,8 @@
 // a text view.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
-import { ConnObj, connectionFormHtml } from "./connectionEditor";
+import { connectionFormHtml, formSchemaFor } from "./connectionEditor";
+import { type ConnObj, nameCollisionError, planSave } from "./connectionMerge";
 import { Detail, codeSetFormHtml } from "./codeSetEditor";
 import {
   ConnectionListItem,
@@ -75,7 +76,12 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
       return; // F3: not the config-dir file — fell back to the text editor
     }
     panel.webview.options = { enableScripts: true };
-    let desired: string | undefined; // the connection the user selected in the picker (undefined → first/new)
+    // The picker selection: a name, `null` for an EXPLICIT "＋ New connection" (must render the blank
+    // form even when the file has entries), undefined for "no preference yet" (→ first connection).
+    let desired: string | null | undefined;
+    // The connection the currently-shown form was rendered from (null → the blank "new" form) — the
+    // save-time merge source AND the name an in-place save is allowed to replace (#234).
+    let renderedName: string | null = null;
     let savingFromWebview = false;
     let guardTimer: ReturnType<typeof setTimeout> | undefined;
     let lastRendered: string | undefined;
@@ -114,12 +120,29 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
         direction: c.direction,
         transport: c.transport,
       }));
-      const current = pickCurrentConnection(items, desired);
+      // desired === null is the user's explicit "＋ New connection" pick — render the blank form
+      // rather than falling back to the first entry (which pickCurrentConnection does for the
+      // no-preference undefined). Without this the new form was unreachable in a non-empty file.
+      const current = desired === null ? undefined : pickCurrentConnection(items, desired);
       const initial = current ? entries.find((c) => c.name === current) : undefined;
-      panel.webview.html = connectionFormHtml(panel.webview, this.routers(), initial, {
-        names: items.map((i) => i.name),
-        current: current ?? null,
-      });
+      renderedName = current ?? null;
+      // The custom editor shares the one form body, so it needs the engine-derived field catalogue
+      // too — otherwise opening connections.toml as a tab would silently fall back to the legacy
+      // free-text rows while the command-opened panel showed typed fields.
+      const form = await formSchemaFor(
+        workspaceDir() ?? "",
+        initial?.transport ?? "mllp",
+        initial?.direction ?? "inbound",
+        (initial?.settings as Record<string, unknown>) ?? {},
+      );
+      panel.webview.html = connectionFormHtml(
+        panel.webview,
+        this.routers(),
+        initial,
+        { names: items.map((i) => i.name), current: current ?? null },
+        undefined,
+        form,
+      );
       lastRendered = document.getText();
       if (listError) {
         // F7: posted right after setting the html, so it can race the webview's own message listener
@@ -137,12 +160,39 @@ export class ConnectionsCustomEditorProvider implements vscode.CustomTextEditorP
           return;
         }
         if (m?.command === "select") {
-          desired = m.name ?? undefined; // null → the "＋ New connection" blank form
+          desired = m.name ?? null; // null → the "＋ New connection" blank form
           await render();
         } else if (m?.command === "save" && m.conn) {
+          // #234: the ONE save policy, shared with the command-opened form (connectionEditor.ts
+          // save()) via planSave — merge the posted (rendered-fields-only) object over a save-time
+          // FRESH `connection list` so non-rendered keys survive the full-replace upsert, and refuse
+          // a new-form save under an existing name (it would silently destroy that connection). The
+          // form here is an in-place edit of `renderedName` (name locked) or the blank new form
+          // (renderedName null). A list failure aborts the save — upserting the bare post would
+          // re-strip every non-rendered key, so failing closed is the only non-destructive option.
+          let fresh: ConnObj[];
+          try {
+            fresh = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+          } catch (e) {
+            panel.webview.postMessage({
+              command: "error",
+              message:
+                "could not re-read connections.toml before saving (nothing was written) — " +
+                (e instanceof Error ? e.message : String(e)),
+            });
+            return;
+          }
+          const plan = planSave(fresh, m.conn, {
+            mergeFrom: renderedName ?? undefined,
+            editingName: renderedName ?? undefined,
+          });
+          if (plan.collision) {
+            panel.webview.postMessage({ command: "error", message: nameCollisionError(plan.collision) });
+            return;
+          }
           markSaving();
           try {
-            await runJson(["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(m.conn)], ws);
+            await runJson(["connection", "upsert", "--config", configDir(), "--data", JSON.stringify(plan.conn)], ws);
           } catch (e) {
             clearGuard();
             panel.webview.postMessage({ command: "error", message: e instanceof Error ? e.message : String(e) });

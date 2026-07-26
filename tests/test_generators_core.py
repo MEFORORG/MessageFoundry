@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from messagefoundry.parsing import Peek
 from messagefoundry.generators import _core, adt  # importing adt registers the ADT spec
+from messagefoundry.parsing import Peek
 
 
 def test_adt_is_registered() -> None:

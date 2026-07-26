@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SYNTHETIC Corepoint <Package> export — hand-authored for tests/test_corepoint_import.py.
+
+  Invented end to end: ACME / TEST_LAB / demo.example.org are placeholders (RFC 2606), the field paths
+  are ordinary HL7 v2 coordinates, and there is no message content of any kind. It reproduces the
+  VALIDATED export SHAPE only (ADR 0086 §2 as amended): the recursive <List> tree, the rich-text
+  markup wrapper on @Data (tags plus double-escaped entities), @Disabled, @Comment, the branch markers
+  carried as plain <Line> statements inside their construct, and one verb with no vocabulary mapping.
+-->
+<Package Name="ACME ADT" Desc="Synthetic package fixture">
+
+  <ActionList Name="ACME ADT Transform" Desc="Demographics normalisation">
+    <List>
+
+      <!-- A <Block> is a section LABEL, not an action: it must become a comment whose body stays
+           inline. Its nested <List> is the recursive-tree case. -->
+      <Block Data="&lt;span class=&amp;quot;lbl&amp;quot;&gt;Patient identity&lt;/span&gt;">
+        <List>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; &lt;span class=&amp;quot;pth&amp;quot;&gt;%ADT/PID-5.1&lt;/span&gt; &lt;span class=&amp;quot;pth&amp;quot;&gt;%ADT/NK1-2.1&lt;/span&gt;" Comment="&lt;i&gt;family name to next-of-kin&lt;/i&gt;"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; &amp;quot;ACME&amp;quot; &lt;span class=&amp;quot;pth&amp;quot;&gt;%ADT/MSH-6&lt;/span&gt;"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemClear&lt;/span&gt; &lt;span class=&amp;quot;pth&amp;quot;&gt;%ADT/PID-19&lt;/span&gt;"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemAppend&lt;/span&gt; &lt;span class=&amp;quot;pth&amp;quot;&gt;%ADT/MSH-3&lt;/span&gt; &amp;quot;_IMPORTED&amp;quot;"/>
+        </List>
+      </Block>
+
+      <!-- ForEach + LoopExit. -->
+      <Foreach Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ForEach&lt;/span&gt; %ADT/OBX $obx">
+        <List>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; %OBX/OBX-5.1 %OBX/OBX-5.2"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;LoopExit&lt;/span&gt;"/>
+        </List>
+      </Foreach>
+
+      <!-- If / ElseIf / Else: the branch markers are plain <Line> statements INSIDE the construct. -->
+      <If Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;If&lt;/span&gt; (%ADT/PID-8 = &amp;quot;M&amp;quot;)">
+        <List>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; &amp;quot;male&amp;quot; %ADT/PID-8"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ElseIf&lt;/span&gt; (%ADT/PID-8 = &amp;quot;F&amp;quot;)"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; &amp;quot;female&amp;quot; %ADT/PID-8"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;Else&lt;/span&gt;"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemClear&lt;/span&gt; %ADT/PID-8"/>
+        </List>
+      </If>
+
+      <!-- <Try> carries NO @Data (a pure container); Catch is a marker line. -->
+      <Try>
+        <List>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;MsgParse&lt;/span&gt; $body [HL7]"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;Catch&lt;/span&gt;"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;EnvLogText&lt;/span&gt; &amp;quot;demo.example.org parse failed&amp;quot;"/>
+        </List>
+      </Try>
+
+      <!-- A <Call> inlines the called list. -->
+      <Call Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ActionListCall&lt;/span&gt; &amp;quot;TEST_LAB Common&amp;quot;">
+        <Actions>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; %ADT/PID-3.1 %ADT/PID-2.1"/>
+        </Actions>
+      </Call>
+
+      <!-- @Disabled: preserved as a comment, NEVER emitted as live code — subtree included. -->
+      <Block Disabled="1" Data="&lt;span class=&amp;quot;lbl&amp;quot;&gt;Legacy address rewrite&lt;/span&gt;">
+        <List>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCopy&lt;/span&gt; %ADT/PID-11.1 %ADT/PID-11.3"/>
+          <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemClear&lt;/span&gt; %ADT/PID-11.4"/>
+        </List>
+      </Block>
+
+      <!-- An UNMAPPED verb with a recoverable target: must become a TODO marker + passthrough stub. -->
+      <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;ItemCustomScript&lt;/span&gt; %ADT/OBX-5"/>
+
+      <Line Data="&lt;span class=&amp;quot;kw&amp;quot;&gt;MsgSend&lt;/span&gt; $out [OB_ACME_ADT]"/>
+    </List>
+  </ActionList>
+
+  <!--
+    The ROLE grammar. Everything above reproduces the markup-free shape; this list reproduces the
+    rich-text markup as the validated export actually writes it — single-quoted SEMANTIC span classes
+    (keyword/literal/path/input-handle/other-handle/detail/description/variable), a `%handle` span
+    immediately followed by its `/path` span, Corepoint's DASH-separated coordinates (`PID-5-1`, not
+    `PID-5.1`), the human label carried as plain text INSIDE the path span, and the operator's prose in
+    a `description` span.
+
+    Every name and value is invented (ACME / TEST_LAB / demo.example.org, RFC 2606). Nothing here is
+    copied from any export: the statements are written from the GRAMMAR alone.
+  -->
+  <ActionList Name="ACME ADT Role Grammar" Desc="Role-tagged markup">
+    <List>
+      <!-- MAPS: a quoted literal into a single-occurrence segment on the subject tree. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;ACME&quot;&lt;/span&gt; to &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/MSH-6 (Receiving Facility)&lt;/span&gt;&lt;span class='description'&gt;stamp the receiving facility&lt;/span&gt;"/>
+      <!-- MAPS: ItemClear, and the dash->dot coordinate translation (PID-19). -->
+      <Line Data="&lt;span class='keyword'&gt;ItemClear&lt;/span&gt; &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/PID-19 (Ethnic Group)&lt;/span&gt;"/>
+      <!-- MAPS: ItemAppend is VALUE-first, target-second; PID-3-1 becomes PID-3.1. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemAppend&lt;/span&gt; &lt;span class='literal'&gt;&quot;_IMPORTED&quot;&lt;/span&gt; to &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/PID-3-1 (Patient ID)&lt;/span&gt;"/>
+      <!-- DECLINED: writes a DIFFERENT message tree — must never become msg.set. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;TEST_LAB&quot;&lt;/span&gt; to &lt;span class='other-handle'&gt;%OUT&lt;/span&gt;&lt;span class='path'&gt;/MSH-5 (Receiving App)&lt;/span&gt;"/>
+      <!-- DECLINED: OBX repeats and the path carries no occurrence — msg.set would write the first. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;F&quot;&lt;/span&gt; to &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/OBX-11 (Result Status)&lt;/span&gt;"/>
+      <!-- DECLINED: MSH-1 is the field separator; writing it corrupts the framing. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;!&quot;&lt;/span&gt; to &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/MSH-1 (Field Separator)&lt;/span&gt;"/>
+      <!-- DECLINED: a $variable destination has no Handler equivalent. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;ACME&quot;&lt;/span&gt; to &lt;span class='variable'&gt;$scratch&lt;/span&gt;"/>
+      <!-- DECLINED: a named tree node carries no HL7 coordinates. -->
+      <Line Data="&lt;span class='keyword'&gt;ItemCopy&lt;/span&gt; &lt;span class='literal'&gt;&quot;ACME&quot;&lt;/span&gt; to &lt;span class='input-handle'&gt;%ADT&lt;/span&gt;&lt;span class='path'&gt;/Patient/FamilyName (Family Name)&lt;/span&gt;"/>
+    </List>
+  </ActionList>
+
+  <!-- Subtrees this layer does not model: tolerated, never a crash. -->
+  <Connection Name="TEST_LAB results">
+    <Table>
+      <Row><Cell>host</Cell><Cell>demo.example.org</Cell></Row>
+    </Table>
+  </Connection>
+  <Codeset Name="ACME gender">
+    <Elements><Element Key="M" Value="male"/><Element Key="F" Value="female"/></Elements>
+  </Codeset>
+  <OtherObjects/>
+
+</Package>

@@ -110,7 +110,7 @@ def discover_delimiters(raw: str, isa_start: int | None = None) -> Delimiters:
     component = raw[start + _COMPONENT_SEP_OFFSET]
     terminator = raw[start + _SEGMENT_TERM_OFFSET]
     # The terminator is one character, or CR+LF when raw[+105]=CR is immediately followed by LF.
-    if terminator == "\r" and raw[start + 106 : start + 107] == "\n":
+    if terminator == "\r" and raw[start + 106 : start + 107] == "\n":  # noqa: SIM108
         segment = "\r\n"
     else:
         segment = terminator

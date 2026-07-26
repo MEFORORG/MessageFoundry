@@ -10,6 +10,8 @@ markup.
 
 from __future__ import annotations
 
+from typing import Any
+
 from messagefoundry.api.models import (
     DeadLetterList,
     MessageDetail,
@@ -123,6 +125,94 @@ def messages(
     )
 
 
+def _preset_section(
+    presets: list[Any],
+    *,
+    content: str,
+    field_path: str,
+    field_value: str,
+    target: str,
+    channel_id: str,
+    status: str,
+    message_type: str,
+    control_id: str,
+) -> Markup:
+    """Saved / layered filter presets (BACKLOG #151, ADR 0136): save the current search, recall + layer
+    saved presets, delete. The content term is loaded server-side from the encrypted preset column — the
+    layered run carries only preset ids in the query, never the PHI-shaped needle."""
+    # Save the CURRENT search state as a named preset (step-up POST; criteria ride hidden fields — the
+    # same terms already in the visible form above, sent in the body, not a URL).
+    hidden = [
+        el("input", type="hidden", name=k, value=v or None)
+        for k, v in (
+            ("content", content),
+            ("field_path", field_path),
+            ("field_value", field_value),
+            ("target", target),
+            ("channel_id", channel_id),
+            ("status", status),
+            ("message_type", message_type),
+            ("control_id", control_id),
+        )
+    ]
+    save = el(
+        "form",
+        *hidden,
+        el(
+            "label", "Save this search as", el("input", name="name", maxlength="128", required=True)
+        ),
+        el("button", "Save preset", type="submit"),
+        method="post",
+        action="/ui/messages/search/presets",
+        class_="ctl",
+    )
+    parts: list[object] = [el("h2", "Saved presets"), save]
+    if presets:
+        # Recall + layer: a GET form of checkboxes → /ui/messages/search/layered?presets=…&presets=…
+        # (ids only). Layering AND-composes ≤ 8 presets with exactly one content term (server-composed).
+        checks = [
+            el(
+                "label",
+                el("input", type="checkbox", name="presets", value=p.id),
+                " ",
+                p.name,
+                class_="preset-check",
+            )
+            for p in presets
+        ]
+        layer = el(
+            "form",
+            *checks,
+            el("button", "Run layered search", type="submit"),
+            el(
+                "span",
+                " (tick ≤ 8; exactly one must carry a content term)",
+                class_="muted",
+            ),
+            method="get",
+            action="/ui/messages/search/layered",
+            class_="filters",
+        )
+        deletes = el(
+            "div",
+            *[
+                el(
+                    "form",
+                    el("button", f"Delete “{p.name}”", type="submit"),
+                    method="post",
+                    action=f"/ui/messages/search/presets/{p.id}/delete",
+                    class_="ctl",
+                )
+                for p in presets
+            ],
+            class_="ctls",
+        )
+        parts += [layer, deletes]
+    else:
+        parts.append(el("p", "No saved presets yet.", class_="muted"))
+    return el("div", *parts, class_="presets")
+
+
 def message_search(
     results: MessageSearchResults | None,
     *,
@@ -135,6 +225,7 @@ def message_search(
     message_type: str = "",
     control_id: str = "",
     error: str = "",
+    presets: list[Any] | None = None,
 ) -> Markup:
     """The content-search page (a step-up-unlock GET, ADR 0046 #51): search by an HL7 field path
     (``PID-3``) or a raw/summary substring, over the caller's channels. ``results is None`` = the bare
@@ -205,6 +296,20 @@ def message_search(
         parts.append(el("p", text(note), class_="pager"))
         parts.append(
             rows_table(["Received", "Channel", "Type", "Status", "Control ID", "Summary"], rows)
+        )
+    if presets is not None:
+        parts.append(
+            _preset_section(
+                presets,
+                content=content,
+                field_path=field_path,
+                field_value=field_value,
+                target=target,
+                channel_id=channel_id,
+                status=status,
+                message_type=message_type,
+                control_id=control_id,
+            )
         )
     return page("Content search", *parts, active="messages")
 
@@ -549,6 +654,16 @@ def dead_letters(data: DeadLetterList) -> Markup:
     return page(
         "Dead letters",
         el("h1", "Dead letters"),
+        # BACKLOG #278: the rename was declined (see the item) — "dead letter" stays the identifier
+        # everywhere (UI, API, store), so operators and engineers keep one word for one thing. It is a
+        # messaging-middleware term rather than a healthcare-interface one, though, so the page says in
+        # plain interface vocabulary what it holds. Labelling, not renaming: no API/store churn.
+        el(
+            "p",
+            "Deliveries that failed permanently or exhausted their retries — held here for replay, "
+            "never discarded.",
+            class_="muted",
+        ),
         rows_table(headers, body),
         pager,
         *actions,

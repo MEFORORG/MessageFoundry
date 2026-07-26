@@ -22,6 +22,10 @@ don't pass one)."""
 
 from __future__ import annotations
 
+import hmac
+
+import pytest
+
 from messagefoundry.auth import totp
 
 # 160-bit base32 secret (any valid secret works; the math is secret-agnostic).
@@ -104,3 +108,72 @@ def test_single_use_step_is_stable_for_the_same_code_and_now() -> None:
         first = totp.verify_totp_step(SECRET, code, now=t, window=window)
         second = totp.verify_totp_step(SECRET, code, now=t, window=window)
         assert first == second == _step(t)
+
+
+# --- ASVS 11.2.4: the compare count is WINDOW-fixed, never match-dependent ----
+
+
+class _CompareCounter:
+    """Counts (and delegates) ``hmac.compare_digest`` calls made while installed."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self._real = hmac.compare_digest
+
+    def __call__(self, a: object, b: object) -> bool:
+        self.calls += 1
+        return bool(self._real(a, b))  # type: ignore[arg-type]
+
+
+def _compare_count(code: str, *, now: float, window: int, monkeypatch: pytest.MonkeyPatch) -> int:
+    counter = _CompareCounter()
+    monkeypatch.setattr(hmac, "compare_digest", counter)
+    try:
+        totp.verify_totp_step(SECRET, code, now=now, window=window)
+    finally:
+        monkeypatch.undo()
+    return counter.calls
+
+
+def test_compare_count_is_window_fixed_regardless_of_matching_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The L3 assessment's 11.2.4 residual named a second defect — "the TOTP verify loop short-circuits on the
+    first matching step" — is STALE: there is no ``break``. This pins the refutation mechanically.
+
+    A `now` well past the epoch is used deliberately: the loop's ``if step < 0: continue`` guard makes
+    the candidate count vary near t=0, so a fixture pinning a synthetic small `now` would measure a
+    legitimately different number and mis-pin the invariant. What must hold is that the count depends on
+    ``window`` ALONE — not on which step matched, nor on whether any did."""
+    t = 5_000 * PERIOD + 5.0
+    window = 2
+    expected = 2 * window + 1
+
+    # Vary WHICH step matches across the whole window, plus the no-match case. The count must not move.
+    counts = {
+        offset: _compare_count(
+            totp.totp(SECRET, now=t + offset * PERIOD),
+            now=t,
+            window=window,
+            monkeypatch=monkeypatch,
+        )
+        for offset in range(-window, window + 1)
+    }
+    counts["none"] = _compare_count(  # type: ignore[index]
+        "000000" if totp.totp(SECRET, now=t) != "000000" else "999999",
+        now=t,
+        window=window,
+        monkeypatch=monkeypatch,
+    )
+    assert set(counts.values()) == {expected}, counts
+    # Sanity: an early break at the first candidate would have made the -window case cost 1.
+    assert expected > 1
+
+
+def test_compare_count_scales_only_with_the_window(monkeypatch: pytest.MonkeyPatch) -> None:
+    t = 5_000 * PERIOD + 5.0
+    current = totp.totp(SECRET, now=t)
+    for window in (0, 1, 2, 3):
+        assert (
+            _compare_count(current, now=t, window=window, monkeypatch=monkeypatch) == 2 * window + 1
+        )

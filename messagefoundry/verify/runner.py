@@ -4,8 +4,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from messagefoundry.config.settings import ServiceSettings, StoreBackend
 from messagefoundry.verify.checks import run_host_checks
@@ -16,8 +16,10 @@ from messagefoundry.verify.smoke import (
     synthetic_message,
 )
 
-#: The four runnable sections; default is all of them.
-ALL_SECTIONS: tuple[str, ...] = ("host", "store", "smoke", "manual")
+#: The five runnable sections; default is all of them. "federation" (ADR 0142) is offline and
+#: emits a single SKIP row when [auth].oidc_enabled is false, so it costs a non-federated
+#: deployment one line and never changes its exit code.
+ALL_SECTIONS: tuple[str, ...] = ("host", "store", "smoke", "manual", "federation")
 
 _DEFAULT_DICOM_PORT = 11112
 _DEFAULT_API_PORT = 8765
@@ -44,15 +46,46 @@ _MANUAL_ROWS: tuple[tuple[str, str, str], ...] = (
 )
 
 
-def _load_settings(service_config: str | None) -> ServiceSettings | None:
+def _settings_error_detail(exc: Exception) -> str:
+    """Render a settings-load failure WITHOUT echoing any configured value.
+
+    A verify report is written to disk (``--report-md``/``--report-json``) and pasted into tickets, so
+    a pydantic ``ValidationError`` must contribute only its field path + message — never ``input``,
+    which for ``[auth].ad_bind_password`` or a store DSN would put a credential in the artifact.
+    """
+    from pydantic import ValidationError
+
+    if isinstance(exc, ValidationError):
+        rows = [
+            f"{'.'.join(str(part) for part in err['loc']) or '<root>'}: {err['msg']}"
+            for err in exc.errors()[:5]
+        ]
+        extra = "" if len(exc.errors()) <= 5 else f" (+{len(exc.errors()) - 5} more)"
+        return "; ".join(rows) + extra
+    # Our own model validators raise plain ValueError with hand-authored text naming the key.
+    return str(exc)
+
+
+def _load_settings(service_config: str | None) -> tuple[ServiceSettings | None, str | None]:
+    """Load the service settings, returning ``(settings, error)``.
+
+    An **absent** config is NOT an error: ``load_settings`` returns defaults, so ``settings`` is
+    non-None on a box with no ``messagefoundry.toml``. A ``None`` here therefore always means the
+    config could not be *loaded* — an explicit ``--service-config`` path that does not exist, or a
+    config that exists and fails to validate. Both are real deployment problems.
+
+    This used to collapse both into a bare ``None``, so every dependent row read "no service settings
+    — pass --service-config", sending an operator to look for a missing file that was usually present
+    and simply broken. The reason is now surfaced (see the ``config.load`` row).
+    """
     from pydantic import ValidationError
 
     from messagefoundry.config.settings import load_settings
 
     try:
-        return load_settings(config_path=service_config)
-    except (FileNotFoundError, ValueError, ValidationError):
-        return None
+        return load_settings(config_path=service_config), None
+    except (FileNotFoundError, ValueError, ValidationError) as exc:
+        return None, _settings_error_detail(exc)
 
 
 def _writable_dir(settings: ServiceSettings | None) -> Path:
@@ -105,7 +138,10 @@ def _run_live_smoke(
     if settings is None:
         results.append(
             CheckResult(
-                rid, title, Status.SKIP, "no service settings — pass --service-config to poll"
+                rid,
+                title,
+                Status.SKIP,
+                "service settings did not load — see the config.load row",
             )
         )
     elif not control_id:
@@ -139,6 +175,9 @@ def run_verify(
     inbound: str | None = None,
     check_disposition: bool = False,
     disposition_timeout: float = 15.0,
+    fed_id_token: str | None = None,
+    fed_jwks: str | None = None,
+    fed_nonce: str | None = None,
 ) -> list[CheckResult]:
     """Run the selected verify sections and return one :class:`CheckResult` per check.
 
@@ -146,8 +185,19 @@ def run_verify(
     the config, safe anywhere), ``live`` (MLLP to a running engine), or ``none``.
     """
     selected = set(sections) if sections else set(ALL_SECTIONS)
-    settings = _load_settings(service_config)
+    settings, settings_error = _load_settings(service_config)
     results: list[CheckResult] = []
+    if settings_error is not None:
+        # Emitted ONLY on a real load failure, so a box with no config (which resolves to
+        # defaults) sees no new row and no exit-code change.
+        results.append(
+            CheckResult(
+                "config.load",
+                "Service settings load",
+                Status.FAIL,
+                f"the service config could not be loaded: {settings_error}",
+            )
+        )
 
     if "host" in selected:
         api_port = settings.api.port if settings is not None else _DEFAULT_API_PORT
@@ -161,7 +211,9 @@ def run_verify(
                     "store.connect",
                     "Store connectivity",
                     Status.SKIP,
-                    "no service settings found — pass --service-config or run where messagefoundry.toml is",
+                    "service settings did not load — see the config.load row (a box with NO "
+                    "config resolves to defaults, so this means the config is missing-at-path "
+                    "or invalid, not simply absent)",
                 )
             )
         else:
@@ -169,7 +221,14 @@ def run_verify(
 
     if "smoke" in selected:
         if smoke_mode == "self":
-            results.append(smoke_self(config_dir, inbound=inbound))
+            # Mirror the live engine's copy-on-Send posture (ADR 0104) so the self-smoke previews what
+            # a default engine actually delivers: a default engine runs [pipeline].snapshot_on_send ON
+            # (PipelineSettings default True), while dry_run's library default is OFF. Keep that library
+            # default when no service settings resolve (#241 F3, #230 CLI parity).
+            snapshot_on_send = settings.pipeline.snapshot_on_send if settings is not None else False
+            results.append(
+                smoke_self(config_dir, inbound=inbound, snapshot_on_send=snapshot_on_send)
+            )
         elif smoke_mode == "live":
             try:
                 msg = synthetic_message()
@@ -192,6 +251,15 @@ def run_verify(
                     disposition_timeout=disposition_timeout,
                 )
         # smoke_mode == "none": nothing to run
+
+    if "federation" in selected:
+        # manual.ad stays as-is: it covers the AD/Kerberos sign-in, not federation, and every
+        # federation row lives in the fed.* namespace, so no id can collide with it.
+        from messagefoundry.verify.federation import run_federation_checks
+
+        results += run_federation_checks(
+            settings, id_token_file=fed_id_token, jwks_file=fed_jwks, nonce=fed_nonce
+        )
 
     if "manual" in selected:
         results += _manual_rows()

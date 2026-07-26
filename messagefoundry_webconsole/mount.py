@@ -20,13 +20,12 @@ moved tests + a golden route-table test instead.
 from __future__ import annotations
 
 from fastapi import FastAPI
-from fastapi.staticfiles import StaticFiles
 
 from messagefoundry.api._ui_seam import UiDeps
 
-from . import STATIC_DIR, assert_engine_seam
-from . import _auth, pages
+from . import STATIC_DIR, _auth, assert_engine_seam, pages
 from ._security import UiSecurityHeadersMiddleware
+from ._static import AllowlistedStaticFiles
 from .routes import (
     account,
     admin,
@@ -36,9 +35,11 @@ from .routes import (
     core,
     monitoring,
     monitoring_writes,
+    oidc,
     search,
     sso,
     status,
+    uploaded_logs,
 )
 
 # Fixed registration order, pinned by the golden route-table test. This reproduces the pre-extraction
@@ -51,19 +52,28 @@ _REGISTRARS = (
     audit,
     search,
     core,
+    uploaded_logs,
     monitoring,
     status,
     monitoring_writes,
     connection_writes,
     config,
     sso,
+    # Self-gating: registers nothing unless [auth].oidc_enabled, so the golden route table
+    # is unchanged for the default-off build (ADR 0142 AC-1). Tail placement is safe --
+    # both paths are literal, with no {param} sibling anywhere in the table to shadow.
+    oidc,
 )
 
 
 def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     """Mount the entire /ui web console onto ``app``, wiring the moved routes to the injected
-    ``deps`` bundle. Idempotent registrations (append-by-pattern) make a re-mount across create_app()
-    calls a no-op."""
+    ``deps`` bundle.
+
+    Route registration is append-by-pattern and the security middleware is explicitly guarded, so a
+    re-mount of the SAME app does not stack a second, nonce-conflicting copy of it. The static mount
+    is NOT guarded — ``create_app`` builds a fresh ``FastAPI`` per call, so it is never re-mounted in
+    practice; a re-mount would simply shadow with an identical entry."""
     assert_engine_seam(deps.engine_seam)
     # Always-on seams the JSON engine reads when serve_ui is on (Option B Phase 0): the /ui CSP
     # (co-versioned with app.js/app.css), the browser-cookie WS authorizer (CSWSH-guarded), and the
@@ -73,7 +83,12 @@ def mount_ui(app: FastAPI, deps: UiDeps) -> None:
     app.state.ui_ws_authorize = _auth.authorize_ui_ws
     app.state.ui_connections_render = pages.connections_fragment
 
-    app.mount("/ui/static", StaticFiles(directory=str(STATIC_DIR)), name="ui-static")
+    # ASVS 13.4.7: the console's asset tier serves ONLY allow-listed extensions. A bare StaticFiles
+    # serves any regular file under the directory, and this directory IS the working tree under the
+    # editable dev/CI install — so a stray .map/backup/.env is otherwise an unauthenticated 200. Any
+    # future static mount must use AllowlistedStaticFiles too; the allowlist governs the mount, not
+    # the process. See :mod:`._static`.
+    app.mount("/ui/static", AllowlistedStaticFiles(directory=str(STATIC_DIR)), name="ui-static")
 
     for module in _REGISTRARS:
         module.register(app, deps)

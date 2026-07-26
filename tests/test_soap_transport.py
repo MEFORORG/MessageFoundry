@@ -46,6 +46,28 @@ def test_fault_code_extraction() -> None:
     assert _fault_code("<soap:Body>ok</soap:Body>") == ""
 
 
+@pytest.mark.parametrize(
+    "prefix",
+    ["soap", "soapenv", "SOAP-ENV", "S", "env", "soap.v11", ""],
+    ids=["soap", "soapenv", "SOAP-ENV", "S", "env", "dotted", "unprefixed"],
+)
+def test_a_fault_is_recognised_under_any_legal_namespace_prefix(prefix: str) -> None:
+    """A namespace prefix is an XML NCName: it may contain '-' and '.', not just ``\\w``.
+
+    ``SOAP-ENV`` is the prefix the SOAP 1.1 specification uses in its own examples and what Apache Axis
+    and much of the Java/.NET estate emit — so a ``\\w+:`` prefix class missed the single most canonical
+    fault envelope there is. The consequence is not a cosmetic miss: with no fault recognised,
+    ``_classify_soap`` falls through to the HTTP status, and SOAP endpoints routinely return a fault
+    with **HTTP 200** — so a rejected message was recorded as delivered.
+    """
+    q = f"{prefix}:" if prefix else ""
+    body = f"<{q}Fault><faultcode>{q}Client</faultcode></{q}Fault>"
+    assert isinstance(_classify_soap(200, body), NegativeAckError), (
+        f"a SOAP fault carrying the '{prefix or '(none)'}' namespace prefix was not recognised, so "
+        f"an HTTP 200 fault response would be recorded as a successful delivery"
+    )
+
+
 def test_classify_no_fault_uses_http_status() -> None:
     assert _classify_soap(200, "<ok/>") is None
     assert type(_classify_soap(500, "<oops/>")) is DeliveryError  # transient
@@ -228,7 +250,7 @@ def test_soap_cleartext_http_nonloopback_allowed_with_escape(
 ) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, production=False)):
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
         dest = build_destination(
             Destination(
                 name="OB",

@@ -39,12 +39,18 @@ from the shared `walkMove`). So the byte-stable `lens rewrite` path, the F7 stal
 the one-edit-at-a-time projection are all unchanged. There is **no new engine surface** and no new
 provider execution path.
 
-**3. Item set.** *Insert before ▸* / *Insert after ▸* (each a submenu of the native, import-free
-insertable actions — Set Field / Copy Field / Delete Segment), *Delete*, *Move up*, *Move down*.
+**3. Item set.** *Insert before ▸* / *Insert after ▸* (each a submenu of the insertable actions — the full
+grouped Add palette once [ADR 0106](0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md)
+lands; Set Field / Copy Field / Delete Segment at this ADR's time), *Add destination* (on a Send row — the
+fan-out sibling of the ＋ dest button, [ADR 0108](0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md)),
+*Delete*, *Move up*, *Move down*.
 Copy / Cut / Paste stay **keyboard-served** and are deliberately **out** of this menu (owner decision this
 session). Enablement is a pure, unit-tested matrix (`contextMenuEnablement`) mirrored in the webview:
-Insert before is always available; **Insert after is suppressed on a `send` row** (a step after the
-return would be dead code — the same rule the toolbar Add already derives); Delete is offered only on an
+Insert before is always available; **Insert after is suppressed on a terminal return** — a returned send OR
+the accumulator's `return sends` scaffold footer (a step after the return is dead code), but **allowed on a
+mid-body `sends.append(...)` send** row (keyed on `isReturnRow`, refined by
+[ADR 0108](0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md); this ADR shipped the coarser
+"suppressed on a `send` row"); Delete is offered only on an
 editable `action`/`lookup`/`send` row (a `code`/`control` row is read-only — the §4 degradation ladder);
 ↑/↓ follow the walk (greyed at a suite edge / on a non-movable / sole-child row).
 

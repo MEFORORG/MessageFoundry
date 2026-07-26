@@ -14,10 +14,12 @@ import pytest
 from messagefoundry.config.wiring import (
     API_LISTENER_LABEL,
     MLLP,
+    File,
     PortConflictError,
     Registry,
     WiringError,
     build_inbound_connection,
+    build_outbound_connection,
     inbound_binding_conflicts,
     load_config,
     validate_config,
@@ -375,6 +377,54 @@ def test_validate_config_reports_module_error_with_file(tmp_path: Path) -> None:
     diags = validate_config(tmp_path)
     assert len(diags) == 1
     assert diags[0].file is not None and diags[0].file.endswith("bad.py")
+
+
+# --- the deployed flag (#233, ADR 0111) --------------------------------------
+
+
+def test_factories_thread_deployed_and_default_it_true() -> None:
+    """The four build_*/inbound/outbound factories are the single choke point shared by code-first
+    authoring AND the connections.toml loader, so threading the kwarg here covers both surfaces."""
+    ib_spec = MLLP(port=2600)
+    ob_spec = File(directory="./out")
+    assert build_inbound_connection("IB", ib_spec, router="r").deployed is True  # default
+    assert build_inbound_connection("IB", ib_spec, router="r", deployed=False).deployed is False
+    assert build_outbound_connection("OB", ob_spec).deployed is True  # default
+    assert build_outbound_connection("OB", ob_spec, deployed=False).deployed is False
+
+
+def test_code_first_declares_a_not_deployed_connection(tmp_path: Path) -> None:
+    """A not-deployed connection stays IN the graph — the whole point (#233): the config repo keeps it,
+    ``validate``/``check``/``graph --json`` keep seeing it, and its already-queued rows are never swept.
+    ``deployed=False`` is also independent of ``auto_start`` (it wins over it; enforcement is a later
+    layer — this pins only that both flags are representable together)."""
+    _write(
+        tmp_path,
+        """
+        from messagefoundry import inbound, outbound, router, handler, Send, MLLP, File
+        inbound("IB", MLLP(port=2600), router="r")
+        inbound("IB_OFF", MLLP(port=2601), router="r", deployed=False, auto_start=False)
+        outbound("OB", File(directory="./out"))
+        outbound("OB_OFF", File(directory="./out"), deployed=False)
+
+        @router("r")
+        def route(msg):
+            return ["h"]
+
+        @handler("h")
+        def handle(msg):
+            return Send("OB", msg)
+        """,
+    )
+    reg = load_config(tmp_path)
+    assert validate_config(tmp_path) == []  # a not-deployed connection is not a config error
+    assert "IB_OFF" in reg.inbound and "OB_OFF" in reg.outbound  # still in the graph
+    assert reg.inbound["IB_OFF"].deployed is False
+    assert reg.inbound["IB_OFF"].auto_start is False
+    assert reg.outbound["OB_OFF"].deployed is False
+    assert reg.outbound["OB_OFF"].auto_start is True  # untouched by deployed
+    assert reg.inbound["IB"].deployed is True  # the default is unchanged
+    assert reg.outbound["OB"].deployed is True
 
 
 def test_validate_config_collects_multiple_problems(tmp_path: Path) -> None:

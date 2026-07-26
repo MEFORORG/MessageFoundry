@@ -634,8 +634,8 @@ def _validate_new_name(config_dir: Path, target_kind: str, new: str) -> None:
         raise WiringError(f"the new name {new!r} must not contain a quote or backslash")
     if target_kind in _FILE_BACKED_KINDS:
         # Reuse the exact traversal/drive/containment rules the codeset writer enforces on a file stem.
-        from messagefoundry.config.codeset_edit import _validate_name
         from messagefoundry.config.code_sets import CODESETS_DIR_NAME
+        from messagefoundry.config.codeset_edit import _validate_name
 
         _validate_name(config_dir / CODESETS_DIR_NAME, new)
 

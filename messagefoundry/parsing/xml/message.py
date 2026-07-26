@@ -17,7 +17,8 @@ Pure: no I/O to disk/network, no engine imports.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from collections.abc import Mapping
+from typing import Any
 
 from messagefoundry.parsing.xml._deps import load_lxml
 from messagefoundry.parsing.xml.errors import XmlError, XmlPathError

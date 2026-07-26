@@ -21,6 +21,17 @@ from messagefoundry.parsing.binary import (
     embed_obx_document,
     extract_obx_document,
 )
+from messagefoundry.parsing.compression import (
+    CompressionError,
+    deflate_compress,
+    deflate_decompress,
+    gzip_compress,
+    gzip_decompress,
+    zip_compress,
+    zip_decompress,
+)
+from messagefoundry.parsing.dicom import DicomDataset, DicomPeek, DicomPeekError
+from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError, FhirResource
 from messagefoundry.parsing.groups import SegmentGroup
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.parsing.peek import HL7PeekError, Peek, normalize, parse_path
@@ -28,16 +39,6 @@ from messagefoundry.parsing.split import encode_batch, split_batch, split_by_obr
 from messagefoundry.parsing.summary import summarize
 from messagefoundry.parsing.tree import TreeNode, parse_tree
 from messagefoundry.parsing.validate import ValidationResult, validate
-from messagefoundry.timezone import (
-    age_from_dob,
-    convert_hl7_timestamp,
-    hl7_now,
-    length_of_stay,
-    parse_hl7_timestamp,
-    to_zone,
-)
-from messagefoundry.parsing.dicom import DicomDataset, DicomPeek, DicomPeekError
-from messagefoundry.parsing.fhir import FhirPeek, FhirPeekError, FhirResource
 from messagefoundry.parsing.x12 import (
     X12FrameReader,
     X12Group,
@@ -56,6 +57,14 @@ from messagefoundry.parsing.xml import (
     XmlPathError,
     XmlSecurityError,
     XmlValidationError,
+)
+from messagefoundry.timezone import (
+    age_from_dob,
+    convert_hl7_timestamp,
+    hl7_now,
+    length_of_stay,
+    parse_hl7_timestamp,
+    to_zone,
 )
 
 __all__ = [
@@ -109,6 +118,16 @@ __all__ = [
     "BinaryCarriageError",
     "embed_obx_document",
     "extract_obx_document",
+    # Compression codec (ADR 0123) — pure gzip/zlib-deflate/zip, bytes in → bytes out. Deterministic
+    # compress (re-run pure) + incremental decompression-bomb ceiling. Full surface under
+    # messagefoundry.parsing.compression.
+    "CompressionError",
+    "gzip_compress",
+    "gzip_decompress",
+    "deflate_compress",
+    "deflate_decompress",
+    "zip_compress",
+    "zip_decompress",
     # HL7 v2 timestamp helpers (messagefoundry.timezone) — tolerant TS parse, DST-aware zone
     # conversion, and the derived-value helpers (age / length-of-stay / now). Pure; console-importable.
     "convert_hl7_timestamp",

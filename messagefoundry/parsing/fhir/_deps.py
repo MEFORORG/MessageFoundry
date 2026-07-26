@@ -17,7 +17,8 @@ from ``messagefoundry.config``/``pipeline``/``store``/``transports`` — the cod
 
 from __future__ import annotations
 
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 _SUPPORTED_VERSIONS = ("R4B", "R5", "STU3")
 

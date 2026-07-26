@@ -1,0 +1,162 @@
+name: quality-advisory
+
+# Advisory-only quality-measurement gates from the Code Quality and Anti-Slop Standards rubric
+# (docs/Code_Quality_Standards.md, signals 6-11). EVERY job here is advisory: it runs with `--exit-zero`
+# (or continue-on-error) so it can NEVER fail a build or block a merge -- it surfaces findings for triage
+# only. This is the rubric's "advisory-first, ratchet to blocking once the baseline is trusted" rule:
+# raw complexity, coverage %, and clone counts are weak / gameable signals (rubric section 4.1) and must
+# never be a hard gate. This workflow is NOT in branch protection; adding a job here cannot freeze the repo.
+#
+# Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7):
+#   * signal 11 - complexity triage (ruff C901)        -> BUILT (complexity job)
+#   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job)
+#   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only)
+#   * signal  7 - mutation testing (highest leverage)   -> BUILT (mutation job; mirror-nightly + workflow_dispatch)
+# signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  schedule:
+    # Nightly mutation run. The mutation job's `if:` gates it to the MIRROR (free minutes); on the
+    # private repo mutation runs only via workflow_dispatch. The cheap jobs (complexity/clone) also
+    # fire on this cron but cost seconds, and coverage is PR-only so it no-ops here.
+    - cron: "23 4 * * *"
+
+# Deny-by-default at the workflow level; each job grants only what it needs.
+permissions: {}
+
+jobs:
+  complexity:
+    # Signal 11 - cyclomatic-complexity triage. Surfaces functions over the mccabe threshold (>10) so large
+    # units are visible in review. Raw complexity is a WEAK defect predictor (rubric section 2), so this is
+    # ADVISORY ONLY: --exit-zero reports but never fails, and this job is not a required status check.
+    name: complexity triage (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install ruff (pinned)
+        run: pipx install ruff==0.15.19
+      - name: Ruff C901 complexity triage (advisory - never gates)
+        run: |
+          echo "== functions over mccabe complexity 10 (advisory triage; NEVER a merge gate) =="
+          ruff check --select C901 --output-format=concise --exit-zero messagefoundry
+          echo ""
+          echo "== summary =="
+          ruff check --select C901 --statistics --exit-zero messagefoundry
+
+  clone:
+    # Signal 9 - duplication / clone detection. Flags copy-pasted blocks (the "copy-instead-of-abstract"
+    # AI-slop signature, rubric section 3). ADVISORY: reports duplicates, never fails. The justified
+    # ~21k-LOC store-backend parity (store/sqlserver.py + store/postgres.py = deliberate T-SQL vs Postgres
+    # dialect duplication, whitelisted in the rubric) is ignored so it does not drown the real signal.
+    name: clone detection (advisory)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: jscpd clone report (advisory - never gates)
+        run: |
+          echo "== copy-pasted blocks in messagefoundry/ (advisory; justified store-backend parity ignored) =="
+          npx --yes jscpd@4.0.5 messagefoundry \
+            --min-tokens 60 \
+            --ignore "**/store/sqlserver.py,**/store/postgres.py" \
+            --reporters console \
+            || true
+
+  coverage:
+    # Signal 8 - diff-coverage visibility. Runs the suite under coverage, then reports coverage of the
+    # lines CHANGED by this PR (diff-cover) -- never a whole-repo % gate, which the rubric (section 4.1)
+    # calls a gameable signal. ADVISORY: --fail-under=0 + `|| true` so it never fails a build, and this
+    # job is not a required status check. PR-only (needs a base ref to diff against). It re-runs the
+    # ubuntu suite (~a few min) per PR; gate it tighter or move it to the mirror if that cost bites.
+    name: diff-coverage (advisory)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Qt headless system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - name: Install project + coverage tools
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock pytest-cov diff-cover
+      - name: Tests under coverage (advisory - never fails)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
+      - name: Diff-coverage vs the PR base (advisory - never fails)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "== coverage of the lines this PR changed (advisory; not a whole-repo % gate) =="
+          git fetch --no-tags --depth=1 origin "$BASE_REF" || true
+          diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 || true
+
+  mutation:
+    # Signal 7 - mutation testing (advisory; the HIGHEST-leverage gate -- it adversarially checks the
+    # tests actually assert something, catching the "tests that never fail" AI-slop mode, rubric section 3).
+    # EXPENSIVE: mutmut runs the scoped tests once per mutant, so this is NOT per-PR. It runs on the
+    # mirror's nightly cron (free minutes) and on manual workflow_dispatch (so it can run on the private
+    # repo on demand -- e.g. to verify this job). Scope is bounded to one well-tested pure module to keep
+    # the run tractable; widen it later. Non-required; `|| true` so a surviving mutant never fails a build.
+    name: mutation (advisory)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.repository == 'MEFORORG/MessageFoundry')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - name: Qt headless system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1 libxkbcommon0 libdbus-1-3
+      - name: Install project + mutmut
+        run: |
+          uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
+          uv pip install --system --constraint constraints.lock "mutmut<3"
+      - name: Mutation-test a bounded scope (advisory - never fails)
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          echo "== mutation testing messagefoundry/parsing/binary.py (advisory; bounded scope) =="
+          # Ephemeral mutmut config (the repo ships none): mutate one pure module, scored by its own
+          # focused test file so each mutant re-runs seconds of tests, not the whole suite.
+          printf '[mutmut]\npaths_to_mutate=messagefoundry/parsing/binary.py\nrunner=python -m pytest -x -q tests/test_binary_carriage.py\n' > setup.cfg
+          mutmut run || true
+          echo "== results =="
+          mutmut results || true

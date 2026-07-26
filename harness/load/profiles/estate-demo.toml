@@ -1,0 +1,40 @@
+# Estate demo shape (#216) — the heterogeneous 1,500-connection estate driven at the 45M/day target.
+#
+# 1,500 connections split ~72% simple pass-through (1 in -> 1 out) / ~28% fan-out hubs (1 in -> F out),
+# each connection calibrated to ~0.347 EVENTS/sec so the aggregate converges on 1500 * 0.347 = ~520.5
+# total events/sec (in + out) = the 45M-messages/day capability-demo target (see the mf-45m-target
+# memory: 45M/day = ALL msgs in+out = 520.83 ev/s over 1,500 connections).
+#
+# CALIBRATION CONSTANTS — OWNER SIGN-OFF REQUIRED before the demo is run. simple_fraction (0.72) and
+# hub_fanout (3) describe the SHAPE of the estate and must come from the operator's own estate recon of
+# their inbound feeds, NOT a guess. These placeholders are internally consistent (parsing proves the rate
+# identity) but the real-world numbers are the operator's to confirm and this file to record.
+#
+# The full 1,500-connection run is operator-side on the bench rig. Point MEFOR_STORE_* at the target
+# store (and set store_backend below to postgres|sqlserver) for a real run; the default sqlite is for a
+# self-contained smaller check. Every value here is synthetic and generic — no real site.
+
+[estate]
+name = "estate-demo"
+description = "1,500-conn heterogeneous estate (~72% simple / ~28% hub, fan-out 3) at ~520.5 ev/s"
+count = 1500
+simple_fraction = 0.72       # OWNER-CONFIRM: fraction of connections that are simple pass-through
+hub_fanout = 3               # OWNER-CONFIRM: outbound destinations each hub fans to (from the recon)
+per_conn_event_rate = 0.347  # events/sec/connection -> 1500 * 0.347 = 520.5 total ev/s (the target)
+total_event_rate = 520.5     # stated for the record; must equal per_conn_event_rate * count (checked)
+hold_seconds = 120.0
+connect_batch = 50
+connect_batch_pause_s = 0.05
+poll_interval_s = 1.0
+drain_timeout_s = 300.0
+# base_port 3000 leaves the default --sink-port (2700) BELOW the inbound block: 1,500 connections occupy
+# [3000, 4499], so the correlation sink at 2700 does not collide (the shape guard would fail-loud on an
+# overlap). If you pass --sink-port, keep it outside [3000, 4499].
+base_port = 3000
+transform = "cheap"
+store_backend = "sqlite"     # operator overrides to postgres|sqlserver (with MEFOR_STORE_*) for a real run
+corpus_count_per_trigger = 20
+correlator_capacity = 4000000
+
+[estate.slo]
+zero_loss = true

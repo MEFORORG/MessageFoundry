@@ -15,34 +15,77 @@ no reply channel, so the handler's return value is ignored.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
 import tempfile
 import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from contextlib import suppress
 from pathlib import Path
+from typing import Any, TypeVar
 
-from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
+from messagefoundry.config.models import (
+    ConnectorType,
+    ContentType,
+    Destination,
+    Source,
+    WindowsCredential,
+)
+from messagefoundry.parsing.compression import CompressionError, gzip_compress, gzip_decompress
 from messagefoundry.parsing.peek import HL7PeekError, Peek
+from messagefoundry.parsing.sniff import _content_matches_declared, _looks_like_hl7
 from messagefoundry.parsing.split import split_batch
+from messagefoundry.transports import wincred
 from messagefoundry.transports.base import (
     DeliveryError,
     DestinationConnector,
     InboundHandler,
     SourceConnector,
+    SourceStartupError,
+    encode_wire_body,
     register_destination,
     register_source,
 )
 
-__all__ = ["FileDestination", "FileSource", "render_filename", "DEFAULT_MAX_FILE_BYTES"]
+__all__ = [
+    "FileDestination",
+    "FileSource",
+    "render_filename",
+    "DEFAULT_MAX_FILE_BYTES",
+    "LEAVE_SEEN_CACHE_MAX",
+    # Re-exported from parsing.sniff (ASVS 5.2.2) so remotefile.py + existing tests import them here.
+    "_content_matches_declared",
+    "_looks_like_hl7",
+    "DEFAULT_MAX_DECOMPRESSED_BYTES",
+]
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
 
 # Cap a single inbound file read so a multi-GB drop can't OOM the engine (DoS guard). A
 # falsy value (None/0) in settings disables the cap; see docs/CONNECTIONS.md.
 DEFAULT_MAX_FILE_BYTES = 16 * 1024 * 1024  # 16 MiB — matches the MLLP frame cap
+
+# Cap the leave-in-place (#142) in-memory dedup fast-path so it can't outgrow the durable
+# processed_files ledger's count cap (PROCESSED_FILE_LEDGER_KEEP_MAX in pipeline/wiring_runner.py). It
+# is only a cache in front of the AUTHORITATIVE, bounded durable read: an evicted key falls through to
+# ledger.is_processed(), so eviction never causes a false re-ingest. Shared by RemoteFileSource.
+LEAVE_SEEN_CACHE_MAX = 100_000
+
+# When `decompress=` is set, this bounds the *decompressed* output (ADR 0123): `max_file_bytes` only
+# caps the COMPRESSED input (`st_size`), so a small gzip can expand to gigabytes (a decompression bomb).
+# Because the batch split, the sniff, and every downstream stage run on the decompressed bytes, bounding
+# the decompressed output also bounds post-split expansion. A falsy value (None/0) disables the cap.
+DEFAULT_MAX_DECOMPRESSED_BYTES = 64 * 1024 * 1024  # 64 MiB
+
+# Compression algorithms the FILE connector supports on its compress=/decompress= option. The connector
+# is restricted to single-stream gzip (ADR 0123); multi-entry zip / raw deflate stay Handler-composed
+# via messagefoundry.parsing.compression.
+_SUPPORTED_COMPRESSION = frozenset({"gzip"})
 
 _PLACEHOLDER = re.compile(r"\{([A-Z][A-Z0-9]{2}-\d+(?:\.\d+){0,2})\}")
 # Strip characters that are unsafe in filenames on Windows and POSIX alike (path separators
@@ -90,6 +133,23 @@ def _sanitize(value: str) -> str:
     return _UNSAFE.sub("_", value).lstrip(".")
 
 
+def _validate_compression(value: object, knob: str) -> str | None:
+    """Validate a FILE ``compress``/``decompress`` setting: ``None`` (off) or ``"gzip"`` only.
+
+    The connector is restricted to single-stream gzip (ADR 0123) — a ``zip``/``deflate`` value is
+    rejected at construction with a clear error rather than silently ignored, so a config typo or an
+    unsupported request is caught at wiring / ``messagefoundry check``. Multi-entry zip and raw deflate
+    are Handler-composed via :mod:`messagefoundry.parsing.compression`."""
+    if value is None:
+        return None
+    if isinstance(value, str) and value in _SUPPORTED_COMPRESSION:
+        return value
+    supported = ", ".join(sorted(_SUPPORTED_COMPRESSION))
+    raise ValueError(
+        f"file connector {knob}={value!r} is not supported (allowed: {supported}, or omit for none)"
+    )
+
+
 def _probe_dir_writable(directory: Path) -> None:
     """Reachability probe shared by the FILE connectors: ensure ``directory`` exists and accepts a
     write — a destination writes messages there and a source moves processed files into its subdirs,
@@ -99,6 +159,44 @@ def _probe_dir_writable(directory: Path) -> None:
     fd, tmp = tempfile.mkstemp(dir=directory, suffix=".probe")
     os.close(fd)
     os.unlink(tmp)
+
+
+def _probe_dir_startup(directory: Path, *, require_write: bool) -> None:
+    """The **no-mkdir** sibling of :func:`_probe_dir_writable` for the opt-in at-start check (#114).
+
+    Unlike ``_probe_dir_writable`` — whose first line ``mkdir(parents=True, exist_ok=True)`` **creates**
+    a missing directory before probing, so reusing it verbatim would silently fabricate a merely-missing
+    dir and PASS — this **never creates** anything: a missing path (or a non-directory) raises
+    ``FileNotFoundError``, so ``validate_directory=true`` reports the connection ``failed`` at start.
+
+    ``require_write`` adds a temp-file write probe (a ``move``/``delete`` source moves processed files
+    into its subdirs, so it needs write); a ``leave``-in-place source (#142) never writes to the poll
+    dir, so it only needs to **list** (read) — letting a genuinely read-only share validate cleanly.
+    Raises ``OSError`` on any failure (the caller wraps it into :class:`SourceStartupError`)."""
+    if not directory.is_dir():
+        raise FileNotFoundError(f"{directory} does not exist or is not a directory")
+    if require_write:
+        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".probe")
+        os.close(fd)
+        os.unlink(tmp)
+    else:
+        os.listdir(directory)  # readability probe — no write on a read-only share
+
+
+def _build_credential_context(settings: Mapping[str, Any]) -> wincred.CredentialContext | None:
+    """Build the alternate-Windows-credential context (ADR 0132, #111) from a File connector's
+    ``credential_*`` settings, or ``None`` when none is configured (byte-identical — the connector then
+    uses the engine's service-account identity via the shared :func:`asyncio.to_thread` pool).
+
+    Constructed **at connector build**, so a credential configured on a **non-Windows host raises a clear
+    :class:`~messagefoundry.transports.wincred.CredentialUnsupportedError` here** (a ``ValueError``,
+    surfaced as a build/wiring failure) — never a silent no-op."""
+    cred: WindowsCredential | None = WindowsCredential.from_settings(settings)
+    if cred is None:
+        return None
+    return wincred.CredentialContext(
+        username=cred.username, password=cred.password, domain=cred.domain
+    )
 
 
 class FileDestination(DestinationConnector):
@@ -111,30 +209,57 @@ class FileDestination(DestinationConnector):
         # When two messages resolve to the same name, append a counter rather than clobber.
         self._overwrite: bool = bool(s.get("overwrite", False))
         self.encoding: str = s.get("encoding", "utf-8")
+        # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
+        # service-account identity, byte-identical. On a non-Windows host a configured credential
+        # raises CredentialUnsupportedError here (a build error), never a silent no-op.
+        self._cred_ctx = _build_credential_context(s)
+        # Optional outbound compression (ADR 0123): "gzip" gzips the encoded body and appends `.gz` to
+        # the rendered name; None (default) is byte-identical to before. Single-stream gzip only.
+        self.compress: str | None = _validate_compression(s.get("compress"), "compress")
+
+    async def _run_fs(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run a blocking filesystem callable off the event loop — under the alternate credential (on a
+        dedicated impersonated thread) when one is configured, else via the shared
+        :func:`asyncio.to_thread` pool (byte-identical to before #111)."""
+        if self._cred_ctx is not None:
+            return await self._cred_ctx.run(fn, *args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
     ) -> None:  # metadata (#68): unused — no per-message header knob here
         try:
-            await asyncio.to_thread(self._write, payload)
+            await self._run_fs(self._write, payload)
         except OSError as exc:
             raise DeliveryError(f"file write failed: {exc}") from exc
 
     async def test_connection(self) -> None:
         try:
-            await asyncio.to_thread(_probe_dir_writable, self.directory)
+            await self._run_fs(_probe_dir_writable, self.directory)
         except OSError as exc:
             raise DeliveryError(f"file directory {self.directory} not writable: {exc}") from exc
+
+    async def aclose(self) -> None:
+        # Release the alternate-credential context (worker thread + any token) on stop/reload, so no
+        # identity leaks across a reconfigure. No-op when no credential is configured.
+        if self._cred_ctx is not None:
+            await self._cred_ctx.close()
 
     def _write(self, payload: str) -> None:
         self.directory.mkdir(parents=True, exist_ok=True)
         name = render_filename(self.filename_template, payload, fallback="message.hl7")
+        if self.compress == "gzip" and not name.endswith(".gz"):
+            # Signal the on-disk format so a downstream reader (or a gunzip source) knows to unpack.
+            name = f"{name}.gz"
         target = self.directory / name
         # Defence in depth atop the filename sanitization (FILE-1): never write outside the
         # configured directory even if a name somehow carried a path component.
         if self.directory.resolve() not in target.resolve().parents:
             raise DeliveryError(f"refusing to write outside the destination directory: {name!r}")
-        data = payload.encode(self.encoding)
+        data = encode_wire_body(payload, self.encoding, transport="file")
+        if self.compress == "gzip":
+            # Deterministic (mtime=0) so a re-delivery of the same body writes identical bytes.
+            data = gzip_compress(data)
         # Write to a uniquely-named temp (mkstemp — no shared counter, no name race), then publish
         # atomically. For no-overwrite, claim the final name by exclusive create so two concurrent
         # deliveries can't clobber each other (FILE-5: replaces the TOCTOU exists()-then-rename).
@@ -170,7 +295,20 @@ class FileSource(SourceConnector):
         self.pattern: str = s.get("pattern", "*")
         self.poll_seconds: float = float(s.get("poll_seconds", 1.0))
         self.min_age_seconds: float = float(s.get("min_age_seconds", 0.0))
-        self.after_read: str = s.get("after_read", "move")  # "move" | "delete"
+        self.after_read: str = s.get("after_read", "move")  # "move" | "delete" | "leave" (#142)
+        if self.after_read not in ("move", "delete", "leave"):
+            raise ValueError(
+                f"file source after_read must be 'move', 'delete', or 'leave', got "
+                f"{self.after_read!r}"
+            )
+        # #142 leave-in-place: HASHED file_keys (never a cleartext name) this connection has ingested —
+        # a BOUNDED LRU fast-path (cap LEAVE_SEEN_CACHE_MAX) in front of the authoritative durable
+        # ledger, so it can't outgrow the ledger's own count cap. A miss falls through to the durable
+        # is_processed() read, so an eviction never causes a false re-ingest.
+        self._processed_seen: OrderedDict[str, None] = OrderedDict()
+        # Opt-in at-start directory validation (#114, ADR 0031 amendment). Default off = the historical
+        # run-time deferral (a missing dir is logged-and-retried each poll, never fails start).
+        self.validate_directory: bool = bool(s.get("validate_directory", False))
         self.sort: str = s.get("sort", "name")  # "name" | "mtime"
         self.recursive: bool = bool(s.get("recursive", False))
         # Encoding used to re-encode split batch messages back to bytes for the handler. A single
@@ -178,6 +316,13 @@ class FileSource(SourceConnector):
         self.encoding: str = s.get("encoding", "utf-8")
         mfb = s.get("max_file_bytes", DEFAULT_MAX_FILE_BYTES)
         self.max_file_bytes: int | None = int(mfb) if mfb else None
+        # Optional inbound decompression (ADR 0123): "gzip" gunzips each file's bytes BEFORE the sniff /
+        # AV scan / batch split (they must see the real HL7). None (default) is byte-identical to before.
+        self.decompress: str | None = _validate_compression(s.get("decompress"), "decompress")
+        # Bounds the DECOMPRESSED output (a bomb guard `max_file_bytes` — a compressed-`st_size` cap —
+        # cannot provide). A falsy value disables it. Only consulted when `decompress` is set.
+        mdb = s.get("max_decompressed_bytes", DEFAULT_MAX_DECOMPRESSED_BYTES)
+        self.max_decompressed_bytes: int | None = int(mdb) if mdb else None
         self.processed_dir = self.directory / s.get("processed_subdir", ".processed")
         self.error_dir = self.directory / s.get("error_subdir", ".error")
         self._handler: InboundHandler | None = None
@@ -188,6 +333,35 @@ class FileSource(SourceConnector):
         self._skipping = False  # whether the last tick was gated out (for a single transition log)
         self._stop = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        # Alternate Windows/UNC credential (ADR 0132, #111). None (the default) => the ambient
+        # service-account identity, byte-identical. On a non-Windows host a configured credential
+        # raises CredentialUnsupportedError here (a build error), never a silent no-op.
+        self._cred_ctx = _build_credential_context(s)
+
+    async def _run_fs(self, fn: Callable[..., _T], *args: Any, **kwargs: Any) -> _T:
+        """Run a blocking filesystem callable off the event loop — under the alternate credential (on a
+        dedicated impersonated thread) when one is configured, else via the shared
+        :func:`asyncio.to_thread` pool (byte-identical to before #111). Every share touch (list, stat,
+        read, move/delete, the startup probe) goes through here, so the whole poll cycle runs under the
+        endpoint's identity."""
+        if self._cred_ctx is not None:
+            return await self._cred_ctx.run(fn, *args, **kwargs)
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    def _prepare_subdirs(self) -> None:
+        """Create the ``.processed``/``.error`` subdirs (runs on the credentialed thread when a
+        credential is set). In ``leave`` mode both are best-effort (a read-only share can't create them
+        and must not fail start); otherwise both are required."""
+        if self.after_read == "leave":
+            # Leave-in-place (#142) never moves/deletes a source file, so it needs no .processed dir — and
+            # a genuinely read-only share can't create either subdir anyway. Best-effort: a quarantine
+            # move still has a target where the dir IS writable, but a read-only share doesn't fail start.
+            for d in (self.processed_dir, self.error_dir):
+                with suppress(OSError):
+                    d.mkdir(parents=True, exist_ok=True)
+        else:
+            self.processed_dir.mkdir(parents=True, exist_ok=True)
+            self.error_dir.mkdir(parents=True, exist_ok=True)
 
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None
@@ -197,15 +371,39 @@ class FileSource(SourceConnector):
         self._handler = handler
         self._leader_gate = leader_gate
         self._stop.clear()
-        self.processed_dir.mkdir(parents=True, exist_ok=True)
-        self.error_dir.mkdir(parents=True, exist_ok=True)
+        # Create the subdirs under the endpoint's identity when a credential is configured (a UNC share
+        # the service account can't touch); otherwise inline, byte-identical to before #111.
+        if self._cred_ctx is None:
+            self._prepare_subdirs()
+        else:
+            await self._cred_ctx.run(self._prepare_subdirs)
         self._task = asyncio.create_task(self._run())
 
     async def test_connection(self) -> None:
         try:
-            await asyncio.to_thread(_probe_dir_writable, self.directory)
+            await self._run_fs(_probe_dir_writable, self.directory)
         except OSError as exc:
             raise DeliveryError(f"file directory {self.directory} not writable: {exc}") from exc
+
+    async def validate_startup(self) -> None:
+        """Opt-in at-start directory validation (#114). No-op unless ``validate_directory`` is set; then
+        the poll directory must already exist (no mkdir) — and be writable unless in ``leave`` mode,
+        where only read/list is required (a read-only share). A failure raises
+        :class:`SourceStartupError` so the runner isolates the connection as ADR-0031 ``failed``.
+
+        The probe runs under the alternate credential when one is configured (#111), so it validates the
+        share under the same identity the poll will use — and a bad credential surfaces here (a
+        :class:`~messagefoundry.transports.wincred.CredentialLogonError` is an ``OSError``) as a clean
+        startup failure rather than a per-poll retry."""
+        if not self.validate_directory:
+            return
+        require_write = self.after_read != "leave"
+        try:
+            await self._run_fs(_probe_dir_startup, self.directory, require_write=require_write)
+        except OSError as exc:
+            raise SourceStartupError(
+                f"file source directory {self.directory} failed startup validation: {exc}"
+            ) from exc
 
     async def _run(self) -> None:
         while not self._stop.is_set():
@@ -222,9 +420,9 @@ class FileSource(SourceConnector):
                 logger.exception(
                     "file source scan failed for %s; retrying next poll", self.directory
                 )
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(self._stop.wait(), self.poll_seconds)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass  # poll interval elapsed; scan again
 
     def _may_poll(self) -> bool:
@@ -255,11 +453,29 @@ class FileSource(SourceConnector):
             # the belt-and-suspenders.
             await asyncio.gather(self._task, return_exceptions=True)
             self._task = None
+        # Release the alternate-credential context (worker thread + any token) AFTER the poll task has
+        # quiesced, so no identity leaks across a stop/reload. No-op when no credential is configured.
+        if self._cred_ctx is not None:
+            await self._cred_ctx.close()
 
     async def _scan_once(self) -> None:
         assert self._handler is not None
-        for path in await asyncio.to_thread(self._candidates):
-            if await asyncio.to_thread(self._oversize, path):
+        newly_recorded = (
+            0  # #142: files marked processed THIS tick — gates a single end-of-tick prune
+        )
+        for path in await self._run_fs(self._candidates):
+            # #142 leave-in-place dedup: skip a file this connection already ingested. In-memory set
+            # first (no I/O), then the durable ledger (survives restart / a fresh process). Keyed on a
+            # HASHED file id (name+mtime+size) — never a cleartext filename, never logged at INFO+.
+            file_key: str | None = None
+            if self.after_read == "leave":
+                try:
+                    file_key = await self._run_fs(self._file_key, path)
+                except OSError:
+                    continue  # vanished/locked mid-scan — retry next poll (never a drop)
+                if await self._leave_already_ingested(file_key):
+                    continue
+            if await self._run_fs(self._oversize, path):
                 # Transport-level reject *before* any message is read — parallels MLLP dropping an
                 # over-cap frame. It never became a "received message", so (like MLLP) there's no
                 # store disposition to record; preserve the file in .error for the operator and log it.
@@ -268,35 +484,56 @@ class FileSource(SourceConnector):
                     path.name,
                     self.max_file_bytes,
                 )
-                await asyncio.to_thread(self._move, path, self.error_dir)
+                await self._run_fs(self._move, path, self.error_dir)
                 continue
             try:
-                raw = await asyncio.to_thread(path.read_bytes)
+                raw = await self._run_fs(path.read_bytes)
             except OSError as exc:
                 # Transient (file locked / vanished mid-scan): leave it in place to retry next scan
                 # rather than quarantining a healthy file. Logged, never silently swallowed.
                 logger.warning("could not read %s (will retry next scan): %s", path.name, exc)
                 continue
-            if self.content_type in (ContentType.HL7V2, None) and not _looks_like_hl7(raw):
-                # Content doesn't match the declared hl7v2 type (binary / non-HL7 text) — quarantine
-                # before its bytes reach the pipeline (ASVS 5.2.2). Like the oversize reject above, it
-                # never became a "received message", so there's no store disposition; preserve it in
-                # .error and log it (never a silent drop).
-                #
-                # Gated on the inbound's declared content_type (mirrors RemoteFileSource): the header
-                # sniff runs ONLY for an hl7v2 inbound. A legitimate non-hl7v2 drop (binary/x12/dicom/…)
-                # has no MSH/FHS/BHS header by design, so it must NOT be rejected for lacking one — its
-                # raw bytes flow on to the content_type-aware pipeline (handed off verbatim by _emit,
-                # carried NUL-safely via RawMessage.from_bytes / mfb64, ADR 0028). The runner injects
-                # content_type; it is None only for a direct caller/test that never had it set — treated
-                # as "unknown", which KEEPS the sniff ON (the pre-gate default), so only an explicitly
-                # non-hl7v2 inbound skips it and the None path stays byte-identical to before.
+            if self.decompress == "gzip":
+                # Decompress BEFORE the sniff, the AV/ICAP scan, and the batch split (ADR 0123): each
+                # must see the REAL bytes, not the gzip container. The ceiling bounds the decompressed
+                # output (and therefore post-split expansion) — the compressed-`st_size` `_oversize`
+                # cap above cannot. A corrupt / oversized archive is quarantined like an oversize /
+                # non-HL7 reject: it never became a received message, so there is no store disposition;
+                # move the ORIGINAL compressed file to .error and log the CODEC message only (never the
+                # decompressed body — it is PHI).
+                try:
+                    raw = await asyncio.to_thread(
+                        gzip_decompress, raw, max_output_bytes=self.max_decompressed_bytes
+                    )
+                except CompressionError as exc:
+                    logger.warning(
+                        "file %s failed to gunzip (%s); routing to error dir", path.name, exc
+                    )
+                    await self._run_fs(self._move, path, self.error_dir)
+                    continue
+            if not _content_matches_declared(self.content_type, raw):
+                # Content doesn't match the declared content_type (a PDF on a json inbound, a non-ISA
+                # body on an x12 inbound, a headerless HL7 drop, …) — quarantine before its bytes reach
+                # the pipeline (ASVS 5.2.2). Like the oversize reject above it never became a "received
+                # message", so there's no store disposition; preserve it in .error and log it (never a
+                # silent drop). Gated by content_type inside the helper: binary/text carry no reliable
+                # signature and pass unchecked (fhir uses the json {/[ sniff); None keeps the historical hl7v2 sniff
+                # (None→hl7v2), byte-identical to before; a conformant x12/json/xml/dicom drop matches
+                # its magic bytes and flows on to the content_type-aware pipeline (carried NUL-safely via
+                # RawMessage.from_bytes / mfb64, ADR 0028). Only a genuine content-vs-type mismatch is
+                # newly quarantined (the 5.2.2 hardening over the prior hl7v2-only sniff).
                 logger.warning(
-                    "file %s is not HL7 (no MSH/FHS/BHS header); routing to error dir", path.name
+                    "file %s does not match its declared content type %r (no matching magic bytes); "
+                    "routing to error dir",
+                    path.name,
+                    (self.content_type or ContentType.HL7V2).value,
                 )
-                await asyncio.to_thread(self._move, path, self.error_dir)
+                await self._run_fs(self._move, path, self.error_dir)
                 continue
             try:
+                # The scan hook operates on already-read bytes (it may itself dial an AV/ICAP service),
+                # so it runs on the SHARED pool, NOT under the share credential — impersonating the
+                # endpoint's SMB identity for an unrelated scanner call would be wrong (#111).
                 await asyncio.to_thread(scan_inbound_file, raw, path.name)
             except ScanRejected as exc:
                 # A configured pre-ingest scanner (AV/ICAP/plugin) rejected the content before it
@@ -307,7 +544,7 @@ class FileSource(SourceConnector):
                     path.name,
                     exc,
                 )
-                await asyncio.to_thread(self._move, path, self.error_dir)
+                await self._run_fs(self._move, path, self.error_dir)
                 continue
             except Exception as exc:  # noqa: BLE001 - operator scan hook: any failure fails closed
                 # The scan hook MALFUNCTIONED (AV/ICAP unreachable, a plugin bug) — NOT a content
@@ -339,7 +576,67 @@ class FileSource(SourceConnector):
                 # only some of its messages emitted (no accept-and-drop of the tail).
                 logger.warning("handler failed for %s (will retry next scan): %s", path.name, exc)
                 continue
-            await asyncio.to_thread(self._after_processing, path)
+            await self._run_fs(self._after_processing, path)
+            if self.after_read == "leave" and file_key is not None:
+                # Record AFTER emit success (the FILE — not each split message — is the dedup unit), so a
+                # partial-emit crash re-reads and re-emits the whole file (at-least-once), never dropping.
+                await self._leave_record(file_key)
+                newly_recorded += 1
+        if newly_recorded and self.processed_ledger is not None:
+            # Bound the ledger's growth (age + count); only when this tick recorded something, so a stable
+            # read-only share (nothing new) never churns the store.
+            await self.processed_ledger.prune()
+
+    def _file_key(self, path: Path) -> str:
+        """A stable, HASHED identity for a source file, for the leave-in-place dedup ledger (#142).
+
+        The identity folds the file's path **relative to the watch root** (not just the basename) +
+        mtime + size, so that under ``recursive=True`` two DISTINCT files that share a basename in
+        different subdirectories — and, on a timestamp-preserving copy over a coarse-mtime share, also
+        share mtime+size — hash to DIFFERENT keys and are BOTH ingested (never one silently deduped away,
+        which would be an accept-and-drop of a received file, count-and-log invariant). SHA-256 so the
+        relative path — which, like a filename, can embed an MRN — is never stored or logged in the clear
+        (the ledger holds this derived id only; never log the relative path). Folding mtime+size in means
+        an UPDATED file (new mtime/size → new key) is re-ingested, while an unchanged file is skipped. May
+        raise ``OSError`` if the file vanished mid-scan (the caller treats that as transient)."""
+        st = path.stat()
+        rel = path.relative_to(self.directory).as_posix()
+        ident = f"{rel}\x00{st.st_mtime_ns}\x00{st.st_size}"
+        return hashlib.sha256(ident.encode("utf-8", "surrogatepass")).hexdigest()
+
+    def _seen_touch(self, file_key: str) -> bool:
+        """True if ``file_key`` is in the bounded in-memory fast-path (and refresh its LRU recency)."""
+        if file_key in self._processed_seen:
+            self._processed_seen.move_to_end(file_key)
+            return True
+        return False
+
+    def _seen_add(self, file_key: str) -> None:
+        """Add ``file_key`` to the bounded LRU, evicting the oldest on overflow. Eviction is safe: a
+        later miss falls through to the authoritative durable ``ledger.is_processed()`` read."""
+        self._processed_seen[file_key] = None
+        self._processed_seen.move_to_end(file_key)
+        while len(self._processed_seen) > LEAVE_SEEN_CACHE_MAX:
+            self._processed_seen.popitem(last=False)
+
+    async def _leave_already_ingested(self, file_key: str) -> bool:
+        """True if this leave-in-place file was already ingested — the bounded in-process cache first (no
+        I/O), then, on a miss, the AUTHORITATIVE durable ledger (covers a restart / a fresh process /
+        a cache eviction). A durable hit is re-cached, so eviction never causes a false re-ingest."""
+        if self._seen_touch(file_key):
+            return True
+        ledger = self.processed_ledger
+        if ledger is not None and await ledger.is_processed(file_key):
+            self._seen_add(file_key)
+            return True
+        return False
+
+    async def _leave_record(self, file_key: str) -> None:
+        """Mark a leave-in-place file ingested: the durable ledger (a HASHED key, no cleartext filename)
+        plus the bounded in-process cache. Idempotent on the store side."""
+        self._seen_add(file_key)
+        if self.processed_ledger is not None:
+            await self.processed_ledger.mark_processed(file_key)
 
     async def _emit(self, raw: bytes) -> None:
         """Hand every HL7 message in ``raw`` to the pipeline handler, in file order (FIFO).
@@ -462,6 +759,10 @@ class FileSource(SourceConnector):
             except OSError as exc:
                 # A processed file we can't delete will be re-read (duplicate); surface it (FILE-4).
                 logger.warning("could not delete processed file %s: %s", path.name, exc)
+        elif self.after_read == "leave":
+            # #142 process-in-place: never move or delete the source file — the durable dedup ledger
+            # (recorded by _scan_once AFTER this returns) is what stops it being re-ingested next poll.
+            return
         else:
             self._move(path, self.processed_dir)
 
@@ -475,24 +776,10 @@ class FileSource(SourceConnector):
 
 
 # --- helpers -----------------------------------------------------------------
-
-
-# Segment ids a valid HL7 v2 payload (single message or batch file) may start with.
-_HL7_LEADING_SEGMENTS = (b"MSH", b"FHS", b"BHS")
-
-
-def _looks_like_hl7(raw: bytes) -> bool:
-    """Cheap content sniff: does ``raw`` start with an HL7 v2 header segment (ASVS 5.2.2)?
-
-    Mirrors what the tolerant parser accepts at the very start — an optional UTF-8 BOM, an MLLP
-    start byte, and leading whitespace — then requires the first segment id to be MSH (message), FHS
-    (file) or BHS (batch). This rejects a binary or non-HL7 file that merely carries the ``.hl7``
-    extension before its bytes enter the pipeline, without rejecting a structurally-odd-but-textual
-    HL7 message (which still flows through and is recorded as ``ERROR`` by the parser)."""
-    head = raw.lstrip(b"\x0b\r\n \t")
-    if head.startswith(b"\xef\xbb\xbf"):  # UTF-8 BOM
-        head = head[3:].lstrip(b"\x0b\r\n \t")
-    return head[:3] in _HL7_LEADING_SEGMENTS
+# The pure magic-byte sniffers (_looks_like_hl7 / _lstrip_bom_ws / _content_matches_declared) were hoisted
+# to parsing/sniff.py (ASVS 5.2.2) so the leaf uploads.py can reuse them without importing a transport;
+# they are re-imported at the top of this module and re-exported (see __all__) so remotefile.py and the
+# existing tests that import them from here are unchanged.
 
 
 class ScanRejected(Exception):

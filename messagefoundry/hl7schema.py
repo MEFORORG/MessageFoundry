@@ -12,7 +12,7 @@ table, -1)`` or a nested ``('sequence', (...))`` for composite datatypes.
 
 from __future__ import annotations
 
-from functools import lru_cache
+from functools import cache
 from typing import Any
 
 from hl7apy import v2_5_1 as _ref
@@ -57,7 +57,7 @@ def _segment_fields(seg_def: Any) -> list[dict[str, Any]]:
     return fields
 
 
-@lru_cache(maxsize=None)
+@cache
 def hl7_schema(version: str = SUPPORTED_VERSION) -> dict[str, Any]:
     """Segment → fields → components metadata for ``version`` (only 2.5.1 today).
 

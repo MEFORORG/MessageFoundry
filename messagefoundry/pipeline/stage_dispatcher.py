@@ -14,12 +14,14 @@ time-multiplexed (ADR 0066 §4.5 / §7). This is the FIFO guard leaving the SQL 
 application code, so the machine is deliberately small, exhaustively unit-tested, and guarded by a
 ``busy_violations`` tripwire.
 
-**Unwired in this PR (ADR 0066 PR3).** Nothing in production constructs a ``StageDispatcher`` yet — it
-is imported only by its tests. ``RegistryRunner`` wiring, the ``claim_mode`` flag, and adapting the
-four ``_process_*_item`` bodies to return :class:`LaneItemResult` are PR4. The dispatcher depends only
-on injected callables/values (a store, a ``process_item`` body-callable, a ``lane_provider``, plain
-knobs) — never on ``RegistryRunner`` — which keeps this module free of an import cycle and makes the
-PR4 wiring a typed constructor contract rather than a coupling.
+**WIRED and DEFAULT (corrected 2026-07-13).** This module's original header said "unwired in this PR
+(ADR 0066 PR3) ... imported only by its tests" — that is long stale and materially understates the
+blast radius of a change here: ``[pipeline].claim_mode`` now defaults to ``pooled``
+(``wiring_runner:513``) and ``RegistryRunner`` constructs ONE dispatcher PER STAGE (ingress / routed /
+outbound / response). The dispatcher still depends only on injected callables/values (a store, a
+``process_item`` body-callable, a ``lane_provider``, plain knobs) — never on ``RegistryRunner`` — which
+keeps this module free of an import cycle and makes the wiring a typed constructor contract rather than
+a coupling.
 
 **Concurrency discipline.** All dispatcher state is mutated **only on the event loop, never under a
 lock** (mirroring the runner's ``_lane_events`` / ``EmptyClaimCounters``): every transition is
@@ -42,7 +44,12 @@ from enum import Enum, auto
 from typing import Protocol
 
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
-from messagefoundry.pipeline.phase_timing import ClaimPhaseTiming, delivery_phase_timing_enabled
+from messagefoundry.pipeline.phase_timing import (
+    ClaimPhaseTiming,
+    LaneEpisodeTiming,
+    delivery_phase_timing_enabled,
+    lane_episode_timing_enabled,
+)
 from messagefoundry.store import ClaimedHeads, OutboxItem, QueueStore, Stage
 
 log = logging.getLogger(__name__)
@@ -134,6 +141,14 @@ class _LaneState:
     # claim (CLAIMING) routes the now-quiesced lane to PAUSED and fires on_lane_paused — letting the head
     # finish first (COOPERATIVE, never a task.cancel). Meaningful only in CLAIMING/PROCESSING.
     pause_pending: bool = False
+    # S_lane (STEP 4 ARM 1, bench-gated): perf_counter_ns stamped when this lane's slot is RESERVED (the
+    # READY→CLAIMING transition, where _slots_free decrements) and read back at the slot's RELEASE. 0 ==
+    # "no open episode" — the SELF-GUARD: _release_slot() silently CLAMPS an over-release rather than
+    # raising, so a leaked/duplicated stamp would produce no runtime signal at all. Booking only a
+    # non-zero stamp, and zeroing it at EVERY release site, degrades any such bug to a DROPPED sample
+    # rather than a double-book or a poisoned mean. A field on this already-per-lane dataclass (never a
+    # new lane→start_ns dict): zero allocation per episode, zero growth with message volume.
+    episode_start_ns: int = 0
 
 
 @dataclass
@@ -264,11 +279,23 @@ class StageDispatcher:
 
         self._states: dict[str, _LaneState] = {}
         self._claimers: list[_Claimer] = [_Claimer() for _ in range(claimers_per_stage)]
-        # Bench-gated claim-phase timing (default OFF, read ONCE here — never per claim). A claimer's
-        # loop is serial, so this stage's lanes are re-fed at most K times per claim round-trip; timing
-        # the round-trip makes that bound measurable instead of inferred (see phase_timing.py).
+        # Bench-gated phase timing (default OFF, read ONCE here — never per claim / per episode). The ONE
+        # Two SEPARATE bench levers, deliberately.
+        # * claim (MEFOR_DELIVERY_PHASE_TIMING): a claimer's loop is serial, so this stage's lanes are
+        #   re-fed at most K times per claim round-trip; timing the round-trip makes that bound
+        #   measurable instead of inferred.
+        # * lane episode (MEFOR_PIPELINE_LANE_EPISODE_TIMING — S_lane, ARM 1): a lane is a single-server
+        #   queue, so its max service rate is 1/S_lane, measured directly reserve→release (see
+        #   phase_timing.LaneEpisodeTiming).
+        #
+        # S_lane does NOT ride the claim lever: the rig sets MEFOR_DELIVERY_PHASE_TIMING=1 on EVERY arm,
+        # so sharing it would pin S_lane ON everywhere and make the one control that matters impossible —
+        # an instrument-OFF rung at the same offered rate, proving this hot-path stamp did not move the
+        # ceiling it exists to explain.
         self._claim_phase_timing = delivery_phase_timing_enabled()
         self._claim_phase_stats = ClaimPhaseTiming(logger=log)
+        self._lane_episode_timing = lane_episode_timing_enabled()
+        self._lane_episode_stats = LaneEpisodeTiming(logger=log)
         self._sweep_task: asyncio.Task[None] | None = None
         self._sweep_now = asyncio.Event()
         # Per-lane coalesced timer handles + their armed deadlines (earliest-wins refresh).
@@ -463,6 +490,10 @@ class StageDispatcher:
         then clear state POST-gather (never mid-run). Idempotent (mirrors ``_teardown_unsafe``). A
         cancelled serializer leaves its claimed rows INFLIGHT — ``reset_stale_inflight`` re-pends them
         on restart; we deliberately do NOT release_claimed on cancellation (crash-safety, ADR 0066)."""
+        # Flush the last partial episode window BEFORE the teardown clears _states (the emit reads the
+        # servable-lane count from it). Without this the tail of every run — the drain, where S_lane is
+        # most interesting — is silently discarded. No-op when the bench lever is off.
+        self._emit_lane_episode(force=True)
         self._stop.set()
         self._sweep_now.set()
         for claimer in self._claimers:
@@ -495,9 +526,11 @@ class StageDispatcher:
 
     def _on_task_done(self, name: str, task: asyncio.Task[None]) -> None:
         """Claimer/sweep supervision — these should only finish on shutdown (their loops swallow +
-        back off). If one dies unexpectedly while running, log; respawning the whole loop is a PR4
-        concern (the dispatcher is unwired here), so PR3 surfaces it loudly rather than silently
-        stalling a stage. Expected cancellation/stop is a no-op."""
+        back off). If one dies unexpectedly while running, log LOUDLY rather than silently stalling a
+        stage. (Respawning the loop in place is still not implemented — a dead claimer wedges its
+        partition until the engine restarts; that is a known gap, NOT "the dispatcher is unwired", which
+        this docstring used to claim and which the module header corrects.) Expected cancellation/stop is
+        a no-op."""
         if self._stop.is_set() or not self._running or task.cancelled():
             return
         exc = task.exception()
@@ -525,6 +558,10 @@ class StageDispatcher:
                 continue
             lanes = self._assemble_chunk(claimer)
             if not lanes:
+                # A quiet stage still ticks here (an empty claim on the next pass, or a sweep wake). Flush
+                # the episode window from the claimer as well as from the booking site, so the FINAL
+                # partial window of a draining rung is not silently discarded (see LaneEpisodeTiming).
+                self._emit_lane_episode()
                 continue
             await self._claim_and_dispatch(claimer, lanes)
 
@@ -534,6 +571,12 @@ class StageDispatcher:
         released for any lane the claim does not turn into PROCESSING (§4.3 exact-reservation)."""
         budget = min(self._slots_free, self._claim_lane_chunk)
         lanes: list[str] = []
+        # S_lane (ARM 1): ONE clock read for the whole chunk, hoisted out of the loop. The whole
+        # assembly is await-free — every lane below is reserved in the SAME instant — so per-lane reads
+        # would be up to `claim_lane_chunk` (default 200) syscalls per claim round-trip on the hot
+        # claimer path for stamps that are semantically identical. Hoisting makes the "reserved together"
+        # invariant literal AND costs one read instead of N. Zero when the lever is off.
+        now_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
         while claimer.ready and len(lanes) < budget:
             lane = claimer.ready.popleft()
             claimer.ready_set.discard(lane)
@@ -542,6 +585,12 @@ class StageDispatcher:
                 continue  # stale: the lane already left READY (e.g. teardown, or a double entry)
             st.phase = _LanePhase.CLAIMING  # T8
             st.dirty = False
+            # The lane EPISODE opens exactly HERE — reserving the slot is the moment the lane stops being
+            # idle and starts being served. The `phase is not READY` guard above IS the anti-double-stamp
+            # guard (a lane cannot re-enter CLAIMING while an episode is open, and a stale deque duplicate
+            # is skipped by it). Await-free from this read to the mutation, so no sibling claimer can
+            # interleave.
+            st.episode_start_ns = now_ns
             self._slots_free -= 1  # reserve
             lanes.append(lane)
         return lanes
@@ -561,9 +610,15 @@ class StageDispatcher:
             )
         except Exception:  # noqa: BLE001 — a store error must not kill the claimer loop
             # Return the whole chunk to READY, release the reserved slots, back off this partition.
+            err_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
             for lane in lanes:
                 self._release_slot()
-                self._to_ready(lane, woken=self._states[lane].ready_woken)
+                st = self._states[lane]
+                # S_lane DROP (error path): the claim rendered no service — the same exclusion the claim
+                # timer already makes for a raised claim — but the lane WAS occupied for that interval,
+                # so it is booked as `dropped` (occupancy), never as `episode` (service).
+                self._drop_lane_episode(st, err_ns)
+                self._to_ready(lane, woken=st.ready_woken)
             log.warning(
                 "StageDispatcher %s claim failed for %d lane(s); backing off %.1fs",
                 self._stage.value,
@@ -588,6 +643,9 @@ class StageDispatcher:
             self._claim_phase_stats.maybe_emit(
                 stage=self._stage.value, claimers=len(self._claimers)
             )
+        # ONE clock read for every non-service release this dispatch pass books (they all end at the same
+        # instant — the claim has returned and this loop is await-free). Zero when the lever is off.
+        rel_ns = time.perf_counter_ns() if self._claim_phase_timing else 0
         for lane in lanes:
             st = self._states[lane]
             items = result.by_lane.get(lane)
@@ -603,6 +661,7 @@ class StageDispatcher:
                 # the lane is already quiesced (no row claimed, the reserved slot never consumed), so
                 # route it STRAIGHT to PAUSED — a pause must never drop to a claimable IDLE / re-ready.
                 self._release_slot()
+                self._drop_lane_episode(st, rel_ns)  # S_lane DROP: no service was rendered
                 st.phase = _LanePhase.PAUSED
                 st.pause_pending = False
                 st.dirty = False
@@ -611,14 +670,30 @@ class StageDispatcher:
                 lane in result.rearm
             ):  # T10: head consumed in-store (H2/poison) -> immediate re-claim
                 self._release_slot()
+                # S_lane DROP (rearm): claim-only, the lane never entered PROCESSING. These are frequent
+                # and sub-millisecond — booking them as SERVICE would drag S_lane down toward the bare
+                # claim time and manufacture the "lanes do not bind" verdict on the load-bearing question.
+                # They ARE lane occupancy, though (the lane sat reserved across the whole shared claim
+                # round-trip), so they go to `dropped` — discarding them outright is what would make the
+                # negative branch of the ARM 1 test unfalsifiable.
+                self._drop_lane_episode(st, rel_ns)
                 self._to_ready(lane, woken=st.ready_woken)
             else:  # EMPTY
                 self._release_slot()
+                self._drop_lane_episode(
+                    st, rel_ns
+                )  # S_lane DROP: same as rearm — occupancy, not service
                 self._record_empty(woken=st.ready_woken)
                 if st.dirty:  # T11: a wake raced the claim -> re-claim now, no sweep wait
                     self._to_ready(lane, woken=True)
                 else:  # T12
                     st.phase = _LanePhase.IDLE
+        # Flush the episode window on EVERY claim round-trip, exactly as the claim line already does. A
+        # stage that has gone quiet still CLAIMS (empty claims keep firing while the sweep re-readies
+        # lanes), so this is what guarantees a draining rung's FINAL window — the tail, where S_lane is
+        # most interesting — reaches the log. Booking alone would never flush it, because the last
+        # episodes of a rung are followed by no further book.
+        self._emit_lane_episode()
 
     # --- lane serializer (T9, T13-T17) --------------------------------------
 
@@ -683,17 +758,31 @@ class StageDispatcher:
                     exc_info=True,
                 )
         # --- synchronous terminal transition (NO await below) -------------------------------------
+        # S_lane (ARM 1): read the episode clock ONCE, here, before the outcome branch — re-reading it
+        # inside each branch would silently fold the branch's own work into the episode and costs extra
+        # syscalls. The BOOK-vs-DROP split is an explicit statement per branch below: a try/finally around
+        # this task would book the CANCELLED (teardown), PAUSED, RETRY and STOP episodes as SERVICES, none
+        # of which is one.
+        _episode_end_ns = time.perf_counter_ns() if self._lane_episode_timing else 0
         self._lane_tasks.pop(lane, None)
         self._release_slot()
         st = self._states.get(lane)
-        if st is None:  # torn down under us
+        if st is None:  # torn down under us — the stamp died with the state; nothing to book
             return
+        # Consume the stamp UNCONDITIONALLY: whichever branch runs below, this episode is over, and a
+        # stamp that survived it could be mis-booked onto the lane's NEXT episode.
+        _episode_start_ns = st.episode_start_ns
+        st.episode_start_ns = 0
         if st.pause_pending:
             # An operator pause landed mid-PROCESSING: the <=1 claimed OUTBOUND row just finished
             # (delivered, or re-pended PENDING by a FIFO RETRY / a T17 re-pend), so the lane is quiesced
             # with ZERO INFLIGHT. Route it to PAUSED and fire — SKIPPING _lane_done/_apply_retry (no
             # re-ready, no park). The slot is already released above (conservation + busy_violations
             # intact). resume_lane later re-arms from the head (a backed-off head is re-swept promptly).
+            #
+            # S_lane DROP: an operator pause is not the product's service time — booking it would let an
+            # operator action move the ceiling arithmetic. Occupancy, though, so it goes to `dropped`.
+            self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.pause_pending = False
             st.phase = _LanePhase.PAUSED
             st.dirty = False
@@ -702,6 +791,12 @@ class StageDispatcher:
         if (
             outcome.kind is None
         ):  # every item RESOLVED — a clean drain resets the infra-fault streak
+            # THE ONLY BOOKABLE SERVICE: the lane was reserved, claimed a prefix, drained EVERY item and
+            # quiesced. `rows=len(items)` is the λ numerator — it must read 1 on the hard-1 OUTBOUND /
+            # RESPONSE stages and may exceed 1 on the batching INGRESS / ROUTED prefixes.
+            self._book_lane_episode(
+                _episode_start_ns, _episode_end_ns, rows=len(items), service=True
+            )
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
             # A full batch (claim hit per_lane_limit) ⇒ more due rows likely remain — feeds T13b's greedy
@@ -710,8 +805,12 @@ class StageDispatcher:
                 lane, st, claimed_full=len(items) >= self._per_lane_limit
             )  # T13/T13b/T14
         elif outcome.kind is LaneResultKind.RETRY:  # T15
+            # S_lane DROP: a RETRY head was re-pended, not delivered — no completed service. Occupancy.
+            self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             self._apply_retry(lane, st, outcome)
         else:  # T16 STOP (content-policy STOP — the InternalErrorPolicy path, untouched by ADR 0070)
+            # S_lane DROP: a STOPped lane rendered no completed service either. Occupancy.
+            self._book_lane_episode(_episode_start_ns, _episode_end_ns, rows=0, service=False)
             st.infra_error_streak = 0
             st.lane_stuck_alerted = False
             st.phase = _LanePhase.STOPPED
@@ -923,13 +1022,85 @@ class StageDispatcher:
             if claimer.ready:
                 claimer.event.set()
 
+    def _servable_lanes(self) -> int:
+        """The lanes that can actually SERVE — the multiplier in ``aggregate_ceiling ~= min(lanes, slots)
+        / S_lane``. ``len(self._states)`` would over-count it: a PAUSED (operator-halted) or STOPPED
+        (content-halted) lane serves nothing until an operator/reload re-arms it, so counting it inflates
+        the printed ceiling. PARKED is deliberately INCLUDED — it is a transient backoff of an otherwise
+        servable lane (its timer re-readies it), and excluding it would make the multiplier flap with
+        retry noise. O(lanes), and called only on the throttled 5 s emit — never per episode."""
+        halted = (_LanePhase.PAUSED, _LanePhase.STOPPED)
+        return sum(1 for st in self._states.values() if st.phase not in halted)
+
+    def _emit_lane_episode(self, *, force: bool = False) -> None:
+        """Flush the throttled lane-episode window (a no-op between windows). Called from the booking
+        sites AND the claimer loop AND once at ``stop()``: booking alone never flushes the FINAL partial
+        window of a stage that has gone quiet, which is exactly the drain tail of every bench rung."""
+        if not self._lane_episode_timing:
+            return
+        try:
+            self._lane_episode_stats.maybe_emit(
+                stage=self._stage.value,
+                lanes=self._servable_lanes(),
+                slots=self._max_processing_lanes,
+                force=force,
+            )
+        except Exception:  # noqa: BLE001 — a METRICS failure must degrade to silence, never to a wedge
+            # This is reached from the serializer's synchronous terminal transition, which runs OUTSIDE a
+            # try: a raise there lands after _release_slot() but before _lane_done/_apply_retry, pinning
+            # the lane in PROCESSING forever with its slot already returned (the conservation law broken,
+            # the lane silently dead, surfaced only as a swallowed line in _on_lane_task_done).
+            log.debug("lane episode emit failed", exc_info=True)
+
+    def _book_lane_episode(self, start_ns: int, end_ns: int, *, rows: int, service: bool) -> None:
+        """Book ONE lane episode — reserve→release (STEP 4 ARM 1, ``S_lane``).
+
+        ``service=True`` is a COMPLETED SERVICE (the clean-drain branch: a prefix was claimed and every
+        item RESOLVED) and lands in ``S_lane``; ``service=False`` is a non-service release (empty / rearm
+        / claim error / pause / RETRY / STOP) and lands in ``dropped`` — real lane OCCUPANCY, but not
+        service. Both are needed: booking the drops as service would deflate ``S_lane`` toward the bare
+        claim time and manufacture the "lanes do not bind" verdict; DISCARDING them would hide that an
+        empty-claim lane still cannot serve a delivery while it sits reserved, which is what makes the
+        negative branch of the ARM 1 test falsifiable at all (see ``LaneEpisodeTiming``).
+
+        SELF-GUARDING: a zero ``start_ns`` (no open episode — the lever was off when the slot was
+        reserved, or a stamp was already consumed) is silently DROPPED, never booked as a 0-length
+        sample. ``_release_slot`` CLAMPS an over-release instead of raising and the conservation law is
+        asserted only in tests, so a leaked or duplicated stamp would otherwise produce no runtime signal
+        at all; degrading it to a lost sample keeps a dispatcher bug from quietly poisoning the very mean
+        this exists to measure. Wrapped: a metrics failure must never wedge a lane (see
+        :meth:`_emit_lane_episode`)."""
+        if not self._lane_episode_timing or start_ns == 0:
+            return
+        try:
+            if service:
+                self._lane_episode_stats.record_episode(end_ns - start_ns, rows=rows)
+            else:
+                self._lane_episode_stats.record_dropped(end_ns - start_ns)
+        except Exception:  # noqa: BLE001 — a metrics failure must degrade to silence, never to a wedge
+            log.debug("lane episode record failed", exc_info=True)
+            return
+        # Only a SERVICE book triggers the throttled flush. A drop merely accumulates: the claim round-trip
+        # flushes anyway (see _claim_and_dispatch), so an idle-but-churning stage still reports — and a
+        # drop-driven emit here would just add a redundant call on the hottest release paths.
+        if service:
+            self._emit_lane_episode()
+
+    def _drop_lane_episode(self, st: _LaneState, end_ns: int) -> None:
+        """Consume ``st``'s open episode stamp and book it as OCCUPANCY (not service). The stamp is
+        zeroed UNCONDITIONALLY — a stamp that survived a release could be mis-booked onto the lane's NEXT
+        episode, which is the one failure mode `_book_lane_episode`'s zero-guard cannot catch."""
+        start_ns = st.episode_start_ns
+        st.episode_start_ns = 0
+        self._book_lane_episode(start_ns, end_ns, rows=0, service=False)
+
     def _record_empty(self, *, woken: bool) -> None:
         self._empty.record_empty(woken=woken)
 
     async def _sleep_or_stop(self, seconds: float) -> None:
-        try:
+        try:  # noqa: SIM105
             await asyncio.wait_for(self._stop.wait(), timeout=seconds)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
 
     # --- timers (coalesced, earliest-wins) ----------------------------------
@@ -973,9 +1144,9 @@ class StageDispatcher:
         """Run one sweep every ``sweep_interval`` OR immediately when ``sweep_now`` is set (recovery).
         An independent task, so sustained wake traffic can never starve the backstop (ADR 0066 §4.4)."""
         while not self._stop.is_set():
-            try:
+            try:  # noqa: SIM105
                 await asyncio.wait_for(self._sweep_now.wait(), timeout=self._sweep_interval)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 pass
             self._sweep_now.clear()
             if self._stop.is_set():

@@ -42,6 +42,16 @@ log = logging.getLogger(__name__)
 DELIVERY_PHASE_TIMING_ENV = "MEFOR_DELIVERY_PHASE_TIMING"
 _TRUTHY = frozenset({"1", "true", "yes", "on"})
 
+#: The LANE EPISODE lever is DELIBERATELY SEPARATE from ``MEFOR_DELIVERY_PHASE_TIMING``.
+#:
+#: The bench rig sets ``MEFOR_DELIVERY_PHASE_TIMING=1`` on EVERY arm — it is a hard prerequisite of the
+#: harness's claim/delivery parsing. Riding that flag would therefore pin ``S_lane`` ON for every arm and
+#: make the one control that matters IMPOSSIBLE: an instrument-OFF rung at the same offered rate, proving
+#: the instrument did not perturb the very ceiling it exists to explain. ``S_lane`` is measured on the
+#: dispatcher's hot path, so "it is only a clock read" is an assertion, not evidence — and ADR 0101 does
+#: not accept assertions. A separate flag buys a same-session inertness control for one env var.
+LANE_EPISODE_TIMING_ENV = "MEFOR_PIPELINE_LANE_EPISODE_TIMING"
+
 #: How often (monotonic seconds) each process emits a rolling phase summary, then resets the window.
 #: Bounded — a per-process INFO line every ~5 s, never a line per delivery or per claim.
 _DELIVERY_PHASE_EMIT_INTERVAL = 5.0
@@ -53,6 +63,17 @@ def delivery_phase_timing_enabled() -> bool:
     Default OFF — read ONCE per runner/dispatcher at construction, never per delivery or per claim.
     """
     return os.environ.get(DELIVERY_PHASE_TIMING_ENV, "").strip().lower() in _TRUTHY
+
+
+def lane_episode_timing_enabled() -> bool:
+    """Whether the LANE EPISODE lever is on (``MEFOR_PIPELINE_LANE_EPISODE_TIMING`` truthy).
+
+    Deliberately NOT ``MEFOR_DELIVERY_PHASE_TIMING`` — see :data:`LANE_EPISODE_TIMING_ENV`. The rig sets
+    that one on every arm, which would make an instrument-OFF control rung impossible.
+
+    Default OFF — read ONCE per dispatcher at construction, never per episode.
+    """
+    return os.environ.get(LANE_EPISODE_TIMING_ENV, "").strip().lower() in _TRUTHY
 
 
 @dataclass
@@ -220,3 +241,189 @@ class ClaimPhaseTiming:
             claimers,
         )
         self._reset()
+
+
+class LaneEpisodeTiming:
+    """Bench-gated accumulator for the LANE EPISODE — ``S_lane``, the pooled dispatcher's per-lane
+    **service time**, plus the lane's non-service OCCUPANCY (STEP 4 ARM 1).
+
+    **What it measures.** One episode = the interval from a lane's processing slot being **RESERVED**
+    (the lane enters ``_LanePhase.CLAIMING`` and ``_slots_free`` decrements) to that slot being
+    **RELEASED**. It therefore spans the whole serialized per-lane cycle — claim round-trip + prefix
+    drain (``send_ack`` + ``mark_done`` + everything between) — which is exactly the quantity that
+    neither :class:`DeliveryPhaseTiming` (inside the body only) nor :class:`ClaimPhaseTiming` (the claim
+    only) can see, and which the accounted phases do not sum to. TWO windows are kept:
+
+    * ``episode`` — **BOOKED**: the slot was reserved, a prefix was claimed, every item RESOLVED and the
+      lane quiesced. A COMPLETED SERVICE. This is ``S_lane``.
+    * ``dropped`` — **NOT a service**: the same reserve→release interval for a release via an empty /
+      rearm-only claim, a claim error, an operator pause, or a RETRY/STOP outcome. These render no
+      delivery, so folding them into ``S_lane`` would poison the mean (empty/rearm releases are frequent
+      and sub-millisecond — they would drag ``S_lane`` toward the bare claim time and MANUFACTURE the
+      "lanes do not bind" verdict on the load-bearing question). But they still **OCCUPY the lane**: an
+      empty-claim lane sits RESERVED across the whole shared ``claim_fifo_heads`` round-trip and cannot
+      serve a delivery meanwhile. Discarding them entirely would make the negative branch of the ARM 1
+      test UNFALSIFIABLE, so they are counted separately rather than thrown away.
+
+    **How to read it (do NOT misread this as Little's law).** A lane is a single-server queue: it holds
+    at most one outstanding claim-or-processing episode at a time (ADR 0066 §4.5). So its maximum
+    service rate is the RECIPROCAL OF ITS SERVICE TIME — a definition, measured directly, with no
+    ``N = lambda x W`` identity anywhere::
+
+        lambda_max_per_lane ~= rows / S_lane_total            # one lane's ceiling, MESSAGES/s
+        aggregate_ceiling   ~= min(lanes, slots) / S_lane     # fan-out-to-all: every lane serves every msg
+        utilization         ~= (episode_sum + dropped_sum) / (window x lanes)
+
+    ``min(lanes, slots)`` — **not** ``lanes``. Concurrent episodes are capped by the dispatcher's slot
+    pool (``max_processing_lanes``, default **256**), so at the programme's 1,500-connection target a
+    reader applying ``lanes / S_lane`` would over-state the ceiling ~5.9x. Both terms are printed
+    (``lanes=`` and ``slots=``) so the line stays self-contained and cannot be misapplied.
+
+    ``lambda_max_per_lane`` is derived from **rows**, not from ``1 / mean``. On OUTBOUND/RESPONSE
+    ``per_lane_limit`` is hard-clamped to 1, so one episode == one delivery and the two coincide; on
+    INGRESS/ROUTED an episode drains a PREFIX of up to ``fifo_claim_batch`` rows, and ``1 / mean`` would
+    under-state that stage's message rate by the batch factor while looking identical in shape. The line
+    also prints ``rows/episode``, which is SELF-CHECKING: it must read ``1.00`` on ``stage=outbound``, so
+    a broken hard-1 assumption surfaces instead of silently skewing ``S_lane``.
+
+    **``utilization`` is what makes the negative branch falsifiable.** ``lambda_max = rows / S_lane``
+    is the ceiling of a lane that is back-to-back busy with COMPLETED SERVICES. A lane that burns real
+    slot time on empty claims has an actual ceiling BELOW that, and ``S_lane`` alone cannot see the
+    difference. So before quoting ``lambda_max``, read ``utilization`` (and cross-check ``empty=`` /
+    ``rearm=`` on the CLAIM line of the same 5 s window): a utilization near **1.0** means the lanes
+    BIND regardless of what ``S_lane`` reads, and a non-trivial ``dropped``/``empty`` count means the
+    reciprocal is an upper bound on an upper bound.
+
+    **stage=outbound is the line to read.** The engine runs ONE dispatcher (and so emits ONE of these
+    lines) PER STAGE — ingress / routed / outbound / response. ARM 1's arithmetic is about the OUTBOUND
+    stage only. Blending the four is a live, already-committed error on the claim line (the harness
+    n-weighted all four into one ``claim_mean`` — see ``shardcert_ladder._CLAIM_RE``); do not repeat it
+    here. ``shardcert_ladder.aggregate_episode_timing`` splits ``by_stage`` for exactly that reason.
+
+    **The ARM 1 test, stated so the result cannot be motivated.** TWO priors are live, and they point
+    OPPOSITE ways — which is the whole reason to measure rather than assert:
+
+    * **(a) accounted-service arithmetic.** The phases we can already see sum to ``S_acc ~= 24.4 ms``
+      (claim 13.37 + send_ack 0.53 + mark_done 10.52), or ~28.8 ms once the claim SLOT WAIT is added
+      (STEP 4 §1). Either way the lane-bound ceiling is ``lambda_max = 1 / S_acc ~= 34.7-41.0 msg/s``
+      (28.8 ms => **34.7/s**, the figure STEP 4 §1 registers; 24.4 ms => 41.0/s) — ~2.2-2.6x **ABOVE**
+      the ~16/s per-lane rate actually observed. On this prior the lanes would **NOT** explain the wall.
+    * **(b) the direct cycle prior.** The 2026-07-09 rig ladder put the per-lane delivery cycle at
+      **62-190 ms** (module docstring, lines 9-10), i.e. ``lambda_max ~= 5.3-16.1 msg/s`` — which
+      **BRACKETS** the ~16/s ceiling. On this prior the lanes **MIGHT** explain it. Caveat: that figure
+      is from an OLDER build and was **INFERRED** from the residual, not measured as an episode.
+
+    So do NOT read a particular ``S_lane`` as "the expected one": (a) and (b) cannot both be right, and
+    ``S_lane`` exists to DECIDE between them, not to confirm either. Whatever it reads, pair it with
+    ``utilization``: a value near 1.0 means the lanes BIND regardless of the mean (the slot time went to
+    empty claims — ``dropped`` says so), and a value well below 1.0 with a small mean means the lanes do
+    not bind and the cap is elsewhere. **Every outcome is informative.**
+
+    **``1 / S_lane`` is an UPPER BOUND on the per-lane rate, not the rate.** The episode is measured from
+    slot RESERVATION (``_LanePhase.CLAIMING``) to release, so it excludes the lane's idle **DWELL** —
+    the time before CLAIMING: waiting in the ready deque, and waiting UNDISCOVERED for a producer wake or
+    the 0.25 s sweep to notice work. Real per-lane throughput is ``1 / (S_lane + dwell)``, which is lower.
+    A measured ``S_lane`` can therefore REFUTE "the lanes bind" (if even the bound sits above the
+    ceiling) but cannot by itself PROVE it; that is what ``utilization`` is for.
+
+    Same discipline as its siblings: recorded synchronously on the event loop, never a lock; bounded
+    aggregates (count / sum_ns / max_ns) only.
+
+    **PHI (and the policy, stated so the next reader does not "fix" the wrong thing).** A lane key IS a
+    ``destination_name`` — a partner identifier — so no lane name and no per-lane structure EVER reaches
+    this class or its log line: counts only. That rule is about THIS metrics surface. It is *not* a
+    module-wide absolute: the dispatcher's own WARN/ERROR paths and its ``AlertSink`` deliberately name
+    the lane (an operator cannot action "some connection crashed"), and that is accepted. Metrics
+    aggregate; alerts identify."""
+
+    def __init__(self, *, logger: logging.Logger | None = None) -> None:
+        self.episode = _PhaseWindow()  # BOOKED — completed services (S_lane)
+        self.dropped = (
+            _PhaseWindow()
+        )  # NOT a service, but still lane OCCUPANCY (empty/rearm/pause/...)
+        self.rows = 0  # Σ items drained across the booked episodes (rows/episode; the λ numerator)
+        self._log = logger if logger is not None else log
+        # 0.0 (not now) so the FIRST sample emits promptly — same as the sibling accumulators, and the
+        # rig's per-rung teardown would otherwise lose a short stage's only window.
+        self._last_emit = 0.0
+        # Window ORIGIN (monotonic): the instant the PREVIOUS window closed, so ``window=`` is a true
+        # since-last-emit wall-clock span and ``utilization`` has a denominator. **A process's FIRST window
+        # is a partial RAMP window** — it opens at construction and closes at the first sample, so its
+        # span is near-zero and its utilization is not meaningful. That is precisely why
+        # ``shardcert_ladder.aggregate_episode_timing`` DROPS each STAGE's first window (per stage, per
+        # log — one dispatcher, and so one ramp window, per stage), exactly as the claim/delivery
+        # aggregators already do.
+        self._window_start = time.monotonic()
+
+    def record_episode(self, ns: int, *, rows: int = 1) -> None:
+        """Book ONE completed service. ``rows`` is the number of items the episode drained (always 1 on
+        the hard-1 OUTBOUND/RESPONSE stages; up to ``fifo_claim_batch`` on INGRESS/ROUTED)."""
+        self.episode.add(ns)
+        self.rows += rows
+
+    def record_dropped(self, ns: int) -> None:
+        """Book ONE non-service release — the lane WAS reserved for ``ns`` and rendered no delivery. Kept
+        out of ``S_lane`` (it is not a service) but counted, because it is real lane occupancy."""
+        self.dropped.add(ns)
+
+    def _reset(self, now: float) -> None:
+        self.episode.reset()
+        self.dropped.reset()
+        self.rows = 0
+        self._window_start = now
+        self._last_emit = now
+
+    def maybe_emit(self, *, stage: str, lanes: int, slots: int, force: bool = False) -> None:
+        """Emit the throttled episode summary + reset the window.
+
+        Called from BOTH the booking site AND the claimer loop (and once with ``force`` at dispatcher
+        stop): booking alone would never flush the FINAL partial window of a stage that goes quiet —
+        which is exactly what every bench rung does once the offer stops and the backlog drains, i.e. the
+        tail where ``S_lane`` is most interesting. The claimer keeps ticking (empty claims) while idle, so
+        routing the emit through it too guarantees the window lands.
+
+        ``lanes`` is the dispatcher's SERVABLE lane COUNT and ``slots`` its ``max_processing_lanes``
+        (never a name) — the ceiling bound is ``min(lanes, slots) / S_lane``, printed so the arithmetic is
+        readable straight off the node log without knowing the config."""
+        now = time.monotonic()
+        if not force and now - self._last_emit < _DELIVERY_PHASE_EMIT_INTERVAL:
+            return
+        if self.episode.count == 0 and self.dropped.count == 0:
+            # Nothing to say: return WITHOUT touching the window or the throttle clock. An all-zero line
+            # every 5 s on an idle stage would be noise; but advancing ``_last_emit`` here would be worse —
+            # this runs on every claim round-trip, so an empty tick would silently THROTTLE the next real
+            # sample for a full window, and a short-lived stage's only window would never be emitted at all.
+            # The window simply stays open until it has something in it.
+            return
+        elapsed = now - self._window_start
+        mean_ms = self.episode.mean_ms()
+        rows_per = self.rows / self.episode.count if self.episode.count else 0.0
+        # λ from ROWS/second, not 1/mean — correct on the batching prefix stages too (see the docstring).
+        # Guarded: this runs inside the lane serializer's terminal transition, and a raise there would
+        # wedge the lane in PROCESSING (the transition sits outside a try).
+        busy_s = self.episode.sum_ns / 1e9
+        lambda_max = self.rows / busy_s if busy_s > 0.0 else 0.0
+        # Lane occupancy over the window: BOTH the booked services and the non-service reservations, over
+        # (window x lanes) lane-seconds. ~1.0 ⇒ the lanes bind REGARDLESS of what S_lane reads.
+        occupied_s = (self.episode.sum_ns + self.dropped.sum_ns) / 1e9
+        denom = elapsed * lanes
+        utilization = occupied_s / denom if denom > 0.0 else 0.0
+        # Metrics only — counts + ms + rates; never a lane name (destination_name) or payload.
+        self._log.info(
+            "lane episode timing (stage=%s): episode n=%d mean=%.2fms max=%.2fms | "
+            "rows/episode=%.2f lambda_max_per_lane=%.2f/s | dropped n=%d sum=%.2fms | "
+            "lanes=%d slots=%d window=%.2fs utilization=%.3f",
+            stage,
+            self.episode.count,
+            mean_ms,
+            self.episode.max_ms(),
+            rows_per,
+            lambda_max,
+            self.dropped.count,
+            self.dropped.sum_ns / 1e6,
+            lanes,
+            slots,
+            elapsed,
+            utilization,
+        )
+        self._reset(now)

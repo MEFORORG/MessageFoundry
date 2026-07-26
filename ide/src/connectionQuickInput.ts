@@ -6,10 +6,12 @@
 // node-side); this file is just the Extension-Host plumbing.
 import * as vscode from "vscode";
 import { configDir, runJson, workspaceDir } from "./cli";
+import { type ConnObj, nameCollisionError } from "./connectionMerge";
 import {
   WIZARD_TRANSPORTS,
   buildConnObj,
   connectionUpsertArgs,
+  planWizardSave,
   settingKeysFor,
   shouldSaveConnection,
   validateName,
@@ -220,6 +222,25 @@ async function saveConnection(
   ws: string,
   onSaved?: () => void,
 ): Promise<void> {
+  // #240 (c): fetch a save-time FRESH `connection list` and run the create-semantics collision gate
+  // BEFORE the upsert. `connection upsert` is a full REPLACE (ADR 0007), so finishing the keyboard
+  // wizard on an EXISTING name would silently overwrite that connection — the same overwrite hole the
+  // webview form closed via planSave (#234/#1081). Reuse the ONE policy so the wizard refuses
+  // identically. A list failure aborts the save (upserting blind could clobber an existing table).
+  let entries: ConnObj[];
+  try {
+    entries = await runJson<ConnObj[]>(["connection", "list", "--config", configDir()], ws);
+  } catch (e) {
+    void vscode.window.showErrorMessage(
+      `MessageFoundry: could not re-read connections.toml before saving ${conn.name} (nothing was written) — ${e instanceof Error ? e.message : String(e)}`,
+    );
+    return;
+  }
+  const plan = planWizardSave(entries, conn);
+  if (plan.collision) {
+    void vscode.window.showErrorMessage(`MessageFoundry: ${nameCollisionError(plan.collision)}`);
+    return;
+  }
   try {
     await runJson(connectionUpsertArgs(configDir(), conn), ws);
   } catch (e) {

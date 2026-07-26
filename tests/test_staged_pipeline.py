@@ -14,9 +14,9 @@ from __future__ import annotations
 import base64
 import sqlite3
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -899,7 +899,7 @@ def test_ack_after_defaults_to_ingest() -> None:
 
 def test_ack_after_delivered_rejected_at_wiring() -> None:
     reg = Registry()
-    with _active(reg):
+    with _active(reg):  # noqa: SIM117
         with pytest.raises(WiringError, match="ack_after='delivered' is not yet implemented"):
             inbound(
                 "IB",
@@ -969,7 +969,9 @@ async def test_replay_dead_ignores_ingress_rows(store: MessageStore) -> None:
 
 async def test_engine_refuses_backend_without_ingest_stage(tmp_path: Path) -> None:
     # Fail loud at start (not per-message): a store backend that doesn't implement the staged ingress
-    # path (SQL Server, gated on BACKLOG #1) must be rejected, not trap the first message.
+    # path must be rejected, not trap the first message. No SHIPPED backend is staging-incapable —
+    # SQLite, Postgres, and SQL Server all set supports_ingest_stage=True — so this simulates a FUTURE
+    # one (BACKLOG #1, which gated SQL Server staging, is long closed).
     from messagefoundry.pipeline.engine import Engine
 
     s = await MessageStore.open(tmp_path / "x.db")

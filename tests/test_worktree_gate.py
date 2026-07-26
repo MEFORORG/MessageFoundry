@@ -184,6 +184,92 @@ def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -
     assert run_gate(payload, repos_file) is None
 
 
+# --------------------------------------------------------------------------- rule 3: git tree-swaps
+
+
+def bash(cmd: str, cwd: Path | str, tool: str = "Bash") -> dict[str, Any]:
+    return {
+        "session_id": "s-1",
+        "cwd": str(cwd),
+        "hook_event_name": "PreToolUse",
+        "tool_name": tool,
+        "tool_input": {"command": cmd},
+    }
+
+
+def test_git_checkout_in_the_primary_is_denied(primary: Path, repos_file: Path) -> None:
+    """The core rule-3 case: `cd <primary> && git checkout` swaps the shared tree out from under siblings."""
+    reason = assert_denied(
+        run_gate(bash(f'cd "{primary}" && git checkout somebranch', primary), repos_file)
+    )
+    assert "SHARED PRIMARY" in reason
+
+
+def test_git_dash_c_reset_into_the_primary_is_denied(primary: Path, repos_file: Path) -> None:
+    """An explicit -C into the primary from a worktree cwd must still block (the -C handler catches it)."""
+    worktree = primary.parent / "Repo-alerts"
+    assert_denied(run_gate(bash(f'git -C "{primary}" reset --hard', worktree), repos_file))
+
+
+def test_git_dash_c_into_a_primary_subdir_is_denied(primary: Path, repos_file: Path) -> None:
+    """A path INTO the primary (a subdirectory) is still the primary's tree."""
+    worktree = primary.parent / "Repo-alerts"
+    assert_denied(run_gate(bash(f'git -C "{primary}/sub" checkout x', worktree), repos_file))
+
+
+def test_git_merge_into_sibling_worktree_whose_name_extends_the_primary_is_allowed(
+    primary: Path, repos_file: Path
+) -> None:
+    """The false positive this fix removes: a sibling worktree path CONTAINS the primary's as a prefix
+    substring ('Repo-ss-capture' starts with 'Repo'). Its -C already resolved to a non-governed target,
+    so the raw-substring fallback must NOT re-flag it. `git merge` into that sibling is ordinary work."""
+    sibling = primary.parent / "Repo-ss-capture"
+    assert run_gate(bash(f'git -C "{sibling}" merge origin/main', primary), repos_file) is None
+
+
+def test_git_rebase_into_sibling_worktree_extending_the_primary_is_allowed(
+    primary: Path, repos_file: Path
+) -> None:
+    sibling = primary.parent / "Repo2"
+    assert run_gate(bash(f'git -C "{sibling}" rebase main', primary), repos_file) is None
+
+
+def test_git_checkout_naming_primary_with_trailing_separator_is_denied(
+    primary: Path, repos_file: Path
+) -> None:
+    """A trailing path separator IS a real boundary and must still match (no false negative)."""
+    worktree = primary.parent / "Repo-alerts"
+    assert_denied(run_gate(bash(f'cd "{primary}/" ; git checkout x', worktree), repos_file))
+
+
+def test_git_checkout_naming_primary_with_trailing_dot_is_denied(
+    primary: Path, repos_file: Path
+) -> None:
+    """Windows STRIPS a trailing dot from a path component, so `cd <primary>.` resolves to the primary and
+    a checkout there swaps the shared tree. This is the regression guard for the trailing-dot false
+    negative that the first boundary fix introduced (a bare `(?![a-z0-9._-])` with `.` in the reject class
+    ALLOWED it); the second lookahead must block it again."""
+    worktree = primary.parent / "Repo-alerts"
+    assert_denied(
+        run_gate(bash(f'cd "{primary}." && git checkout somebranch', worktree), repos_file)
+    )
+
+
+def test_git_merge_into_sibling_worktree_named_with_dot_suffix_is_allowed(
+    primary: Path, repos_file: Path
+) -> None:
+    """A genuinely different directory whose name extends the primary with a dotted suffix ('Repo.old') is
+    NOT the primary -- the second lookahead must not re-flag it (the false positive that put `.` in the
+    reject class in the first place). Its -C already resolved to a non-governed target."""
+    sibling = primary.parent / "Repo.old"
+    assert run_gate(bash(f'git -C "{sibling}" merge origin/main', primary), repos_file) is None
+
+
+def test_git_read_verb_in_the_primary_is_allowed(primary: Path, repos_file: Path) -> None:
+    """merge-base/merge-tree are read-only plumbing -- the verb match must not fire on them."""
+    assert run_gate(bash("git merge-base HEAD origin/main", primary), repos_file) is None
+
+
 # --------------------------------------------------------------------------- fail-open contract
 
 

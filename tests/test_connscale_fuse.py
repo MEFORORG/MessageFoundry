@@ -25,7 +25,6 @@ from harness.load.connscale.profile import (
 from harness.load.connscale.report import ConnScaleRecord, NoLoss
 from harness.load.connscale.runner import _node_env, run_connscale
 
-
 # --------------------------------------------------------------------------- #
 # B1 — profile parsing of the fuse_modes A/B axis
 # --------------------------------------------------------------------------- #
@@ -118,7 +117,7 @@ def test_fuse_ab_builtin_resolves() -> None:
 
 
 def _env(**kw: object) -> dict[str, str]:
-    base = dict(
+    base = dict(  # noqa: C408
         count=256,
         base_port=2600,
         transform="cheap",

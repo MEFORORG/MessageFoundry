@@ -86,15 +86,16 @@ spec:
             # and X12 all refuse a non-loopback bind without TLS at startup. For raw-TCP/X12 there is no TLS
             # escape — keep them loopback-bound or front them with a TLS-terminating TCP proxy.
           env:
-            - { name: MEFOR_API_HOST, value: "0.0.0.0" }
+            - { name: MEFOR_SECURITY_LOCAL_ACCESS_ONLY, value: "false" }
+            - { name: MEFOR_SECURITY_LISTEN_ADDRESS, value: "0.0.0.0" }
             - { name: MEFOR_API_PORT, value: "8443" }
             - { name: MEFOR_API_TLS_CERT_FILE, value: "/etc/mefor/tls/api.crt" }
             - { name: MEFOR_API_TLS_KEY_FILE, value: "/etc/mefor/tls/api.key" }
             - { name: MEFOR_INBOUND_BIND_HOST, value: "0.0.0.0" }   # MLLP() must set tls=True (exposure gate)
-            - { name: MEFOR_AUTH_ENABLED, value: "true" }
-            - { name: MEFOR_AUTH_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
+            - { name: MEFOR_SECURITY_REQUIRE_SIGN_IN, value: "true" }
+            - { name: MEFOR_SECURITY_REQUIRE_MFA, value: "true" }       # local-admin MFA on an exposed PHI bind
             - { name: MEFOR_STORE_REQUIRE_ENCRYPTION, value: "true" }
-            - { name: MEFOR_EGRESS_DENY_BY_DEFAULT, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
+            - { name: MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND, value: "true" } # plus MEFOR_EGRESS_ALLOWED_* for your graph
             # Secrets injected from the Secret as env (never plain manifest values):
             - name: MEFOR_STORE_ENCRYPTION_KEY
               valueFrom: { secretKeyRef: { name: mefor-secrets, key: store-encryption-key } }
