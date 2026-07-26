@@ -44,6 +44,19 @@ import pytest
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
 
+if not _DOC.exists():
+    # ``docs/security/**`` is deny-listed from the OSS mirror (and vaulted after the cutover), so the
+    # runbook this module asserts against is simply absent there. Without this guard the module raises
+    # FileNotFoundError at IMPORT time, which is a hard collection ERROR that reds the whole required
+    # test leg — exactly what happened on the mirror's first run of this file (added 2026-07-20).
+    # Skipping is honest here, unlike a leak guard that silently stops guarding: there is no document
+    # present to drift, so the assertion has nothing to say. See tests/test_anon_parity.py for the same
+    # pattern over the deny-listed scanner.
+    pytest.skip(
+        "docs/security/OFF-LOOPBACK-DEPLOYMENT.md is private-only (OSS-mirror deny-list / vault)",
+        allow_module_level=True,
+    )
+
 _SECTION_HEADING = "## Tamper-evident audit chain (ASVS 16.4.2)"
 # The store METHOD name (store/store.py), which is NOT a CLI subcommand — must never appear as a command.
 _STORE_METHOD_NAME = "rekey_audit_chain"

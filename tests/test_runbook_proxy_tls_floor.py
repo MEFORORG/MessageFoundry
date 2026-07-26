@@ -55,11 +55,20 @@ from pathlib import Path
 
 import pytest
 
-from tests.test_off_loopback_runbook import _TOML_FENCE_RE, _dedent
-
 _ROOT = Path(__file__).resolve().parent.parent
 _DOCS = _ROOT / "docs"
 _DOC = _DOCS / "security" / "OFF-LOOPBACK-DEPLOYMENT.md"
+
+if not _DOC.exists():
+    # Same deny-list/vault guard as tests/test_off_loopback_runbook.py, and it must sit BEFORE the import
+    # of that module: it skips at module level too, so importing it first would make this file's skip an
+    # incidental side effect of someone else's guard rather than its own stated reason.
+    pytest.skip(
+        "docs/security/OFF-LOOPBACK-DEPLOYMENT.md is private-only (OSS-mirror deny-list / vault)",
+        allow_module_level=True,
+    )
+
+from tests.test_off_loopback_runbook import _TOML_FENCE_RE, _dedent  # noqa: E402
 
 #: Directory names the repo-wide Markdown walk never descends into: build output, dependency trees
 #: and caches. A vendored or generated copy of a page under one of these is not something we ship.
