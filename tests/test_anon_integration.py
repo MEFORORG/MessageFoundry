@@ -197,7 +197,7 @@ def test_corpus_from_file_rejects_empty_and_malformed(tmp_path) -> None:
 # mirror too.
 #
 # The IP is ASSEMBLED at runtime (never a source literal): the anon leak-check and the CI publish guard
-# share scripts/publish/scan_forbidden.py, so a literal routable IP in this file trips the repo
+# share scripts/security/scan_forbidden.py, so a literal routable IP in this file trips the repo
 # forbidden-content scan even though it is synthetic (public DNS, not a customer host).
 _LEAK_IP = ".".join(["8"] * 4)
 _LEAKY_RAW = (

@@ -448,8 +448,8 @@ points to ~6.4 vCPU; if not, ~23 shards and no box helps — Phases C/F decide w
   (publish at ≤50% of the measured ceiling), with the **PROVES / does NOT prove** discipline from E2 carried
   forward — explicitly disclaiming the flat-vs-month-start-2.89×-peak, the adopter-SAN-vs-our-NVMe disk,
   multi-hour stability, and real-PHI byte sizes. Ratios only; no customer/site/partner/host/IP. Run
-  `python scripts/publish/scan_forbidden.py --published` first.
-  *Falsifier:* `scan_forbidden.py --published` flags content ⇒ a denylisted term leaked. — **🔍 FABLE REVIEW**
+  `python scripts/security/scan_forbidden.py --path .` first.
+  *Falsifier:* `scan_forbidden.py --path .` flags content ⇒ a denylisted term leaked. — **🔍 FABLE REVIEW**
   (a doc; the scan gate + review catch leaks cheaply).
 
 **Exit criteria.** A published, un-fabricated capability number at ≤50% of the measured ceiling, with its

@@ -1062,7 +1062,7 @@ Properties of the anonymizer:
   `AnonError`) — it never emits an un-scrubbed body.
 
 Surfaces: the **`messagefoundry tee anonymize-captures`** subcommand and the test-harness
-`CaptureSink`/corpus hooks. [`scripts/publish/scan_forbidden.py`](../scripts/publish/scan_forbidden.py)
+`CaptureSink`/corpus hooks. [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py)
 is now the **single leak-token source-of-truth** (a fail-closed leak gate). HL7 v2 is supported first;
 X12/FHIR seams come later.
 

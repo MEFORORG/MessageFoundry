@@ -2,7 +2,7 @@
 # Copyright (C) 2026 MessageFoundry Organization and contributors
 """Guards on `docs/FEATURE-MAP.md`, the **public** capability catalog.
 
-FEATURE-MAP.md is not in `scripts/publish/publish-denylist.txt`, so it reaches the public
+FEATURE-MAP.md is not git-ignored as a private-only path, so it reaches the public
 mirror. In July 2026 it carried a hardcoded ASVS score (`214 / 0 / 0 / 131`) copied from
 `docs/security/ASVS-L3-ASSESSMENT.md` — a document that had since been banner-marked
 "⛔ SUPERSEDED … the scoring in this document is not reliable". Three defects at once: a

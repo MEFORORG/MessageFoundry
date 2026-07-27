@@ -82,7 +82,7 @@ fixture `tests/fixtures/corepoint/acme_adt_package.xml` is the pattern to follow
 Verify before every commit:
 
 ```powershell
-python scripts\publish\scan_forbidden.py --published   # must exit 0
+python scripts\security\scan_forbidden.py --path .   # must exit 0
 ```
 
 ---
@@ -168,7 +168,7 @@ python -m ruff format <touched>;  python -m ruff check <touched>
 python -m mypy messagefoundry
 python -m pytest tests/test_corepoint_import.py -q
 python scripts\docs\backlog_status_check.py
-python scripts\publish\scan_forbidden.py --published
+python scripts\security\scan_forbidden.py --path .
 ```
 
 ⚠️ `scan_forbidden` also blocks the **spaced** two-word form of *action-list* — the repo convention is the

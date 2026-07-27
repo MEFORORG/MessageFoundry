@@ -14,6 +14,6 @@
 # Security, licensing, and the public-mirror publish/scan tooling.
 /docs/SECURITY.md                         @wshallwshall
 /docs/Secure_Development_Standards.md     @wshallwshall
-/scripts/publish/                         @wshallwshall
+/scripts/security/                        @wshallwshall
 /CLA.md                                   @wshallwshall
 /LICENSE                                  @wshallwshall

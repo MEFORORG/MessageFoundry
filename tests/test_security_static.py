@@ -100,7 +100,7 @@ import pytest
 # exclusion is a fact about the tree rather than a filter.
 #
 # ``scripts/`` is walked by neither the ReDoS nor the single-JSON/URL-parser clause: it is
-# build/release tooling not reachable from untrusted input, and ``scripts/publish/check_release_sync.py``
+# build/release tooling not reachable from untrusted input, and the retired release-sync checker
 # carries a release-version parser (``(\d+(?:\.\d+)*)(.*)$``) that matches the nested-quantifier shape
 # while backtracking linearly. The scanner has no suppression mechanism, so walking it there would red
 # the build on a measured false positive instead of finding a real defect.

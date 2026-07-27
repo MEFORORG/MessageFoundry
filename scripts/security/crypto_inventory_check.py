@@ -24,7 +24,7 @@ widened the original six-stdlib-module list so *delegated* crypto stops being in
 The walk-set (:data:`WALK_ROOTS`) is byte-identical to ``tests/test_security_static.py``'s
 ``_CRYPTO_ROOTS`` (BACKLOG #283 owns that pin; this gate consumes it).
 
-Stdlib only (no install), like ``scripts/publish/scan_forbidden.py`` — runnable as a CI step and a
+Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
     python scripts/security/crypto_inventory_check.py            # scan the five real roots
