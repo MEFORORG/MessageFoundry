@@ -7,20 +7,53 @@ name: quality-advisory
 # raw complexity, coverage %, and clone counts are weak / gameable signals (rubric section 4.1) and must
 # never be a hard gate. This workflow is NOT in branch protection; adding a job here cannot freeze the repo.
 #
-# Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7):
-#   * signal 11 - complexity triage (ruff C901)        -> BUILT (complexity job)
-#   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job)
-#   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only)
-#   * signal  7 - mutation testing (highest leverage)   -> BUILT (mutation job; mirror-nightly + workflow_dispatch)
+# Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7), each with how
+# it reaches a reviewer:
+#   * signal 11 - complexity triage (ruff C901)        -> BUILT (complexity job); PR-caused DELTA as
+#                                                         annotations + step summary, full list in the log
+#   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job); step summary only, see below
+#   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only); INLINE `::notice`
+#                                                         annotations on the Files changed tab + summary
+#   * signal  7 - mutation testing (highest leverage)   -> BUILT and WORKING on mutmut 3 (2.5.1 crashed on
+#                                                         Python 3.14 before producing a mutant, and `|| true`
+#                                                         made that look green for months). Measured: 461
+#                                                         mutants in 3s -- 87 killed, 19 survived. Runs on
+#                                                         PRs too; survivor table in the step summary.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
+#
+# WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
+# assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF
+# upload back:
+#   1. All 122 C901 findings on this tree are SINGLE-LINE regions anchored on the function-name token of
+#      the `def`. GitHub renders an alert inline only when its lines are in the diff, so a PR adding
+#      branching INSIDE a function surfaces nothing, while a signature reflow fires on pre-existing debt.
+#   2. jscpd emits ONE location per clone pair, chosen by scan order, so ~8 files can never be the anchor
+#      and roughly half of newly-introduced clones would anchor on the untouched twin.
+#   3. Uploading on pull_request only leaves NO default-branch baseline, so every PR forever would report
+#      all ~161 findings as new -- not a one-off first-PR blip.
+# Workflow commands need no token and no permission grant, and behave identically on fork PRs. Every job
+# below therefore holds `contents: read` and nothing else -- least privilege, worth pinning on its own
+# merits given that two of these jobs execute third-party code fetched at run time.
+#
+# What actually keeps this advisory is TWO things, and permissions are neither of them: (a) these job
+# contexts are not in the required-checks set on `main`, and (b) every analysis step is
+# `continue-on-error: true` plus `--exit-zero` / `--fail-under=0` / `|| true`, so the job reports success
+# regardless of findings. Branch-protection membership is the only thing that determines gating.
+# tests/test_quality_advisory_invariants.py pins (b), the absent write scopes, and the absence of SARIF.
+#
+# HONEST LIMIT of the annotation mechanism: a workflow-command annotation renders INLINE on the Files
+# changed tab only when its line is in the diff. That always holds for diff-coverage (every line it
+# flags is a line the PR changed) but usually does NOT hold for the complexity delta, whose findings
+# anchor on a `def` line the PR often did not touch -- those land in the Checks tab and the step summary
+# instead. The summary table is the primary surface for complexity, not a nice-to-have.
 
 on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly mutation run. The mutation job's `if:` gates it to the MIRROR (free minutes); on the
-    # private repo mutation runs only via workflow_dispatch. The cheap jobs (complexity/clone) also
-    # fire on this cron but cost seconds, and coverage is PR-only so it no-ops here.
+    # Nightly sweep. Every job here is cheap (mutation is ~3s of actual mutating; complexity and clone
+    # are seconds), so the cron is a safety net that catches drift on `main` rather than a cost dodge.
+    # Coverage is PR-only -- it needs a base ref to diff against -- so it no-ops here.
     - cron: "23 4 * * *"
 
 # Deny-by-default at the workflow level; each job grants only what it needs.
@@ -40,15 +73,64 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Install ruff (pinned)
-        run: pipx install ruff==0.15.19
+          # The delta step needs the base branch's history for `git merge-base`.
+          fetch-depth: 0
+      - name: Install ruff (version derived from the lock)
+        # DERIVED, not duplicated. This job used to hardcode 0.15.19 while all four locks pinned 0.15.22,
+        # and that drift is load-bearing: c901_delta.py parses ruff's human-readable C901 message because
+        # ruff exposes the complexity number nowhere else, so a skew can change the wording under the
+        # parser. The obvious fix -- hardcode the right version and assert it matches the lock in a test --
+        # would leave a REQUIRED check (the pytest suite) hostage to a routine Dependabot ruff bump:
+        # the lock moves, the workflow string does not, and a blocking context goes red for a purely
+        # advisory concern. Reading the lock at run time removes the drift AND the coupling.
+        run: |
+          RUFF_PIN="$(sed -n 's/^ruff==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$RUFF_PIN" ]; then
+            echo "::notice title=Ruff pin not found::falling back to the unpinned ruff from PyPI"
+            pipx install ruff
+          else
+            echo "ruff pin from constraints.lock: $RUFF_PIN"
+            pipx install "ruff==$RUFF_PIN"
+          fi
       - name: Ruff C901 complexity triage (advisory - never gates)
+        continue-on-error: true
         run: |
           echo "== functions over mccabe complexity 10 (advisory triage; NEVER a merge gate) =="
           ruff check --select C901 --output-format=concise --exit-zero messagefoundry
           echo ""
           echo "== summary =="
           ruff check --select C901 --statistics --exit-zero messagefoundry
+      - name: Complexity delta vs the merge base (advisory - never gates)
+        # PR-only: there is no base ref to diff against on the cron or on workflow_dispatch, where the
+        # whole-repo console triage above remains the full picture.
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "== complexity this PR CHANGED (advisory; pre-existing findings deliberately omitted) =="
+          git fetch --no-tags origin "$BASE_REF" || true
+          # Steps run under `bash -e`, so an unresolvable merge base would abort this step with no
+          # explanation at all. Say why instead: an advisory signal that goes quiet should at least
+          # leave a reason in the log, since nobody watches a green advisory job for absence.
+          if ! MERGE_BASE="$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null)"; then
+            echo "::notice title=Complexity delta skipped::could not resolve a merge base against origin/$BASE_REF"
+            exit 0
+          fi
+          echo "merge base: $MERGE_BASE"
+          ruff check --select C901 --output-format=json --exit-zero messagefoundry > c901-head.json
+          # A second checkout of the merge base, so the "before" numbers come from real ruff output
+          # rather than a reconstruction. Its absolute paths differ from HEAD's by the extra directory;
+          # c901_delta.py collapses both to repo-relative keys (regression-tested -- if it did not,
+          # every function would report as new).
+          git worktree add --detach base-tree "$MERGE_BASE"
+          ( cd base-tree && ruff check --select C901 --output-format=json --exit-zero messagefoundry ) \
+            > c901-base.json
+          python3 scripts/quality/c901_delta.py \
+            --base c901-base.json \
+            --head c901-head.json \
+            --repo-root . \
+            --summary-file "$GITHUB_STEP_SUMMARY"
 
   clone:
     # Signal 9 - duplication / clone detection. Flags copy-pasted blocks (the "copy-instead-of-abstract"
@@ -65,13 +147,32 @@ jobs:
         with:
           persist-credentials: false
       - name: jscpd clone report (advisory - never gates)
+        continue-on-error: true
         run: |
           echo "== copy-pasted blocks in messagefoundry/ (advisory; justified store-backend parity ignored) =="
+          # Summary only, DELIBERATELY. jscpd ships a SARIF reporter and it works, but each result
+          # carries exactly ONE location -- whichever file jscpd scanned first -- so the case this
+          # signal exists for (a PR copy-pasting an existing block into a new place) anchors on the
+          # untouched twin about half the time. That is a coin flip, not a diff-scoped signal.
+          # Keep the 4.x pin: npm `latest` is a 5.x Rust rewrite with a different CLI.
           npx --yes jscpd@4.0.5 messagefoundry \
             --min-tokens 60 \
             --ignore "**/store/sqlserver.py,**/store/postgres.py" \
-            --reporters console \
+            --reporters console,markdown \
+            --output ./jscpd-report \
             || true
+          if [ -f jscpd-report/jscpd-report.md ]; then
+            {
+              echo "## Duplicate blocks (jscpd)"
+              echo ""
+              # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+              # ENTIRELY, so truncate rather than silently lose the whole summary.
+              head -c 900000 jscpd-report/jscpd-report.md
+              echo ""
+              echo "<sub>Advisory only. Clone locations are in the job log — see the note in the"
+              echo "workflow for why these are not annotated on the diff.</sub>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   coverage:
     # Signal 8 - diff-coverage visibility. Runs the suite under coverage, then reports coverage of the
@@ -104,28 +205,70 @@ jobs:
       - name: Install project + coverage tools
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          uv pip install --system --constraint constraints.lock pytest-cov diff-cover
+          # NEITHER package is in constraints.lock, so the --constraint above is a no-op for them and both
+          # previously floated to whatever PyPI served that day. diff-cover is now pinned exactly: the
+          # inline-annotation surface depends on `--format github-annotations:<level>` and on adjacent-line
+          # coalescing in GitHubAnnotationsReportGenerator. Deliberately NOT in pyproject.toml -- these are
+          # CI-only tools, and adding them would trip the DEP-1 lock-sync gate and force four re-exports.
+          uv pip install --system --constraint constraints.lock pytest-cov "diff-cover==10.4.1"
       - name: Tests under coverage (advisory - never fails)
+        continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
+        continue-on-error: true
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
           echo "== coverage of the lines this PR changed (advisory; not a whole-repo % gate) =="
-          git fetch --no-tags --depth=1 origin "$BASE_REF" || true
-          diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 || true
+          # NO --depth HERE. Running a shallow fetch against the COMPLETE clone that `fetch-depth: 0`
+          # just produced writes .git/shallow and grafts away everything behind origin/<base>'s tip.
+          # diff-cover diffs with the three-dot range `origin/<base>...HEAD`, which needs a merge base --
+          # so once the base branch advances past the PR's merge ref (another PR merging, or a re-run of
+          # a stale check) the diff dies with "no merge base". Reproduced. It then fails in the worst
+          # possible way: the markdown reporter runs BEFORE the annotations reporter and truncates
+          # diff-cover.md on open, so `|| true` swallows the error, zero annotations are emitted, and the
+          # summary shows a bare heading that reads as "nothing uncovered".
+          git fetch --no-tags origin "$BASE_REF" || true
+          if [ ! -s coverage.xml ]; then
+            echo "::notice title=Diff coverage skipped::coverage.xml was not produced (the test step did not complete)"
+            exit 0
+          fi
+          # `github-annotations:notice` writes `::notice file=...,line=N,endLine=M` workflow commands to
+          # STDOUT, which the runner turns into INLINE annotations on the Files changed tab -- no token,
+          # no permission grant, identical behaviour on fork PRs. Adjacent uncovered lines are coalesced
+          # into ranges, so a long uncovered block costs one annotation rather than one per line. Every
+          # line flagged is a line this PR changed, so there is no pre-existing-debt noise by construction.
+          # The console report still prints, so the job log is unchanged.
+          diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 \
+            --format "github-annotations:notice,markdown:diff-cover.md" || true
+          # `-s` not `-f`: diff-cover creates and truncates this file BEFORE it can fail, so a crashed
+          # run leaves a 0-byte report. Testing for existence alone would append an empty section that
+          # looks like a clean result -- the exact silent-success shape this workflow keeps producing.
+          if [ -s diff-cover.md ]; then
+            {
+              echo "## Diff coverage"
+              echo ""
+              # The markdown report embeds a source snippet per uncovered line, so it can get large.
+              # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+              # ENTIRELY -- truncate rather than silently lose the whole summary.
+              head -c 900000 diff-cover.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice title=Diff coverage unavailable::diff-cover produced no report (see the job log)"
+          fi
 
   mutation:
     # Signal 7 - mutation testing (advisory; the HIGHEST-leverage gate -- it adversarially checks the
     # tests actually assert something, catching the "tests that never fail" AI-slop mode, rubric section 3).
-    # EXPENSIVE: mutmut runs the scoped tests once per mutant, so this is NOT per-PR. It runs on the
-    # mirror's nightly cron (free minutes) and on manual workflow_dispatch (so it can run on the private
-    # repo on demand -- e.g. to verify this job). Scope is bounded to one well-tested pure module to keep
-    # the run tractable; widen it later. Non-required; `|| true` so a surviving mutant never fails a build.
+    #
+    # NOT expensive, contrary to the note that used to sit here. MEASURED on Python 3.14 (linux, the
+    # bounded scope below): 461 mutants in 3 SECONDS -- 87 killed, 19 survived, 355 not covered by the
+    # scoped test file. mutmut 3 only runs the tests that actually cover each mutant, so the old
+    # "runs the suite once per mutant" cost model does not apply. That is why this now runs on PRs too:
+    # a real signal for seconds of runtime is worth having in review, which is where survivors get fixed.
     name: mutation (advisory)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.repository == 'MEFORORG/MessageFoundry')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -148,15 +291,85 @@ jobs:
       - name: Install project + mutmut
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          uv pip install --system --constraint constraints.lock "mutmut<3"
+          # mutmut 3, pinned. `mutmut<3` resolved to 2.5.1, which CRASHES on Python 3.14 in its pony-ORM
+          # cache (`cannot pickle 'itertools.count'`) before generating a single mutant -- verified from
+          # run 30248096425. pytest-timeout is REQUIRED: mutmut 3 always passes `--timeout`/
+          # `--timeout-method` to pytest, and without the plugin every test invocation dies with an
+          # unrecognised-argument error that surfaces only as BadTestExecutionCommandsException.
+          # Neither package is in constraints.lock, so the --constraint above does not pin them.
+          uv pip install --system "mutmut==3.6.0" pytest-timeout
       - name: Mutation-test a bounded scope (advisory - never fails)
+        continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           echo "== mutation testing messagefoundry/parsing/binary.py (advisory; bounded scope) =="
-          # Ephemeral mutmut config (the repo ships none): mutate one pure module, scored by its own
-          # focused test file so each mutant re-runs seconds of tests, not the whole suite.
-          printf '[mutmut]\npaths_to_mutate=messagefoundry/parsing/binary.py\nrunner=python -m pytest -x -q tests/test_binary_carriage.py\n' > setup.cfg
-          mutmut run || true
-          echo "== results =="
-          mutmut results || true
+          # Ephemeral mutmut config (the repo ships none). THREE things here are load-bearing, each
+          # found by a run that silently produced nothing:
+          #   * source_paths is the PACKAGE, not the one file. mutmut 3 copies source_paths into
+          #     `mutants/` and runs pytest THERE; with a single file copied, tests/conftest.py died on
+          #     `ModuleNotFoundError: messagefoundry.config` and every mutant came back "not checked".
+          #   * only_mutate keeps the bounded scope -- the whole package is copied, one module mutated.
+          #   * pytest_add_cli_args_test_selection replaces mutmut 2's `runner=`; the old `runner` and
+          #     `paths_to_mutate` keys are gone/deprecated in 3.x.
+          printf '[mutmut]\nsource_paths=messagefoundry\nonly_mutate=messagefoundry/parsing/binary.py\npytest_add_cli_args_test_selection=tests/test_binary_carriage.py\n' > setup.cfg
+          if mutmut run > mutmut-run.txt 2>&1; then
+            MUTMUT_OK=1
+          else
+            MUTMUT_OK=0
+          fi
+          tail -c 20000 mutmut-run.txt
+          if [ "$MUTMUT_OK" = "1" ]; then
+            mutmut results > mutmut-results.txt 2>&1 || true
+            KILLED="$(grep -c ': killed' mutmut-results.txt || true)"
+            SURVIVED="$(grep -c ': survived' mutmut-results.txt || true)"
+            NOTESTS="$(grep -c ': no tests' mutmut-results.txt || true)"
+            echo "== killed=$KILLED survived=$SURVIVED no-tests=$NOTESTS =="
+            grep ': survived' mutmut-results.txt || true
+            {
+              echo "## Mutation testing — \`messagefoundry/parsing/binary.py\`"
+              echo ""
+              echo "| Killed | Survived | Not covered |"
+              echo "| --- | --- | --- |"
+              echo "| $KILLED | **$SURVIVED** | $NOTESTS |"
+              echo ""
+              if [ "$SURVIVED" != "0" ]; then
+                echo "Survivors — injected bugs the tests did **not** catch:"
+                echo ""
+                echo '```'
+                grep ': survived' mutmut-results.txt | head -c 100000
+                echo '```'
+              fi
+              echo ""
+              echo "<sub>Advisory only. A survivor is a hint to strengthen an assertion, not a defect —"
+              echo "and mutation score is a poor single number (rubric §2), so this never gates.</sub>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=Mutation run failed::mutmut exited non-zero — see the job log"
+            {
+              echo "## Mutation testing — FAILED TO RUN"
+              echo ""
+              echo "\`mutmut run\` exited non-zero, so this signal produced nothing. Tail of the run:"
+              echo ""
+              echo '```'
+              tail -c 4000 mutmut-run.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Upload the mutmut results (advisory)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mutmut-results
+          path: |
+            mutmut-results.txt
+            mutmut-run.txt
+            .mutmut-cache
+          # .mutmut-cache is a DOTFILE and upload-artifact skips hidden files by DEFAULT. Without this
+          # the step logs "No files were found", uploads nothing, and still reports success -- a silent
+          # no-op that looks green.
+          include-hidden-files: true
+          # Deliberately `warn`, not `ignore`: if mutmut ever renames its cache, that must be visible in
+          # the log rather than silently swallowed.
+          if-no-files-found: warn

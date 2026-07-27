@@ -15,6 +15,7 @@ which checks are *required* — this page describes the intended layout.
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens). **Blocking.** |
+| `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 
 Several heavier legs (server-DB store tests, load/throughput, service-smoke, DICOM/FHIR breadth) run
 **nightly on a schedule** and/or only when a PR touches their paths, so an ordinary PR does not pay for
@@ -37,6 +38,32 @@ The stable contexts required on `main` are:
 CodeQL and Scorecard run on PRs but are **advisory** (not in the required set) — their SARIF upload needs
 `security-events: write`, which fork-PR tokens do not have, so requiring them would block PRs from forks.
 Nightly / path-gated legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
+
+The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
+they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
+things keep them advisory: they are absent from branch protection, and every analysis step is
+`continue-on-error: true` plus `--exit-zero` / `--fail-under=0` / `|| true`, so the job reports success
+whatever it finds. (The workflow also holds **no write permission on any job** — that is least privilege,
+worth having because two of these jobs run third-party code fetched at run time, but it is *not* what
+determines merge gating; required-checks membership is.)
+`tests/test_quality_advisory_invariants.py` fails if a write scope, a SARIF upload, or a removed
+`--exit-zero` ever lands there.
+
+### How the advisory quality signals reach a reviewer
+
+These use GitHub **workflow-command annotations** (`::notice` / `::warning` on stdout) rather than code
+scanning. That needs no token and no permission grant, and behaves identically on fork PRs. The
+reasoning — including why SARIF was measured and rejected — is recorded in the workflow's header comment.
+
+An annotation renders **inline on Files changed only when its line is in the diff**. That is always true
+for diff-coverage and usually *not* true for complexity, so the two land in different places:
+
+| Signal | Where it shows up |
+|---|---|
+| Diff-coverage | **Inline on the Files changed tab**, one `::notice` per contiguous uncovered range of lines the PR changed, plus a step summary. Every line it flags is a line the PR touched, so this is the one signal that is reliably inline. |
+| Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex. Findings anchor on the `def` line, which a body-only edit does not touch, so **most complexity annotations appear in the Checks tab and the step summary rather than inline**. The summary table is this signal's primary surface. Pre-existing findings are never reported; the full list stays in the job log. |
+| Duplication (`jscpd`) | Step summary only. jscpd emits one location per clone pair chosen by scan order, so annotating it would anchor on the untouched twin about half the time. |
+| Mutation (`mutmut`) | A **killed / survived / not-covered** table in the step summary, with the surviving mutants listed — those are injected bugs the tests did not catch. Runs on PRs too: measured at **461 mutants in 3 seconds** (87 killed, 19 survived) over the bounded scope, because mutmut 3 only runs the tests that cover each mutant. Repaired 2026-07-27 — `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 before generating a single mutant and, thanks to `\|\| true`, had been reporting success in 37s while measuring nothing. |
 
 ### The `CI gate` roll-up
 
