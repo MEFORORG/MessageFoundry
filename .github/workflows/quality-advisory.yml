@@ -14,11 +14,11 @@ name: quality-advisory
 #   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job); step summary only, see below
 #   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only); INLINE `::notice`
 #                                                         annotations on the Files changed tab + summary
-#   * signal  7 - mutation testing (highest leverage)   -> BUILT but NOT CURRENTLY WORKING: mutmut 2.5.1
-#                                                         crashes on Python 3.14 before generating any
-#                                                         mutant, so this signal reports NOTHING today.
-#                                                         The job now says so loudly instead of going
-#                                                         green in 37s. It never runs on PRs either way.
+#   * signal  7 - mutation testing (highest leverage)   -> BUILT and WORKING on mutmut 3 (2.5.1 crashed on
+#                                                         Python 3.14 before producing a mutant, and `|| true`
+#                                                         made that look green for months). Measured: 461
+#                                                         mutants in 3s -- 87 killed, 19 survived. Runs on
+#                                                         PRs too; survivor table in the step summary.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
@@ -51,9 +51,9 @@ on:
   pull_request:
   workflow_dispatch:
   schedule:
-    # Nightly mutation run. The mutation job's `if:` gates it to the MIRROR (free minutes); on the
-    # private repo mutation runs only via workflow_dispatch. The cheap jobs (complexity/clone) also
-    # fire on this cron but cost seconds, and coverage is PR-only so it no-ops here.
+    # Nightly sweep. Every job here is cheap (mutation is ~3s of actual mutating; complexity and clone
+    # are seconds), so the cron is a safety net that catches drift on `main` rather than a cost dodge.
+    # Coverage is PR-only -- it needs a base ref to diff against -- so it no-ops here.
     - cron: "23 4 * * *"
 
 # Deny-by-default at the workflow level; each job grants only what it needs.
@@ -262,12 +262,13 @@ jobs:
   mutation:
     # Signal 7 - mutation testing (advisory; the HIGHEST-leverage gate -- it adversarially checks the
     # tests actually assert something, catching the "tests that never fail" AI-slop mode, rubric section 3).
-    # EXPENSIVE: mutmut runs the scoped tests once per mutant, so this is NOT per-PR. It runs on the
-    # mirror's nightly cron (free minutes) and on manual workflow_dispatch (so it can run on the private
-    # repo on demand -- e.g. to verify this job). Scope is bounded to one well-tested pure module to keep
-    # the run tractable; widen it later. Non-required; `|| true` so a surviving mutant never fails a build.
+    #
+    # NOT expensive, contrary to the note that used to sit here. MEASURED on Python 3.14 (linux, the
+    # bounded scope below): 461 mutants in 3 SECONDS -- 87 killed, 19 survived, 355 not covered by the
+    # scoped test file. mutmut 3 only runs the tests that actually cover each mutant, so the old
+    # "runs the suite once per mutant" cost model does not apply. That is why this now runs on PRs too:
+    # a real signal for seconds of runtime is worth having in review, which is where survivors get fixed.
     name: mutation (advisory)
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.repository == 'MEFORORG/MessageFoundry')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -290,64 +291,81 @@ jobs:
       - name: Install project + mutmut
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          uv pip install --system --constraint constraints.lock "mutmut<3"
+          # mutmut 3, pinned. `mutmut<3` resolved to 2.5.1, which CRASHES on Python 3.14 in its pony-ORM
+          # cache (`cannot pickle 'itertools.count'`) before generating a single mutant -- verified from
+          # run 30248096425. pytest-timeout is REQUIRED: mutmut 3 always passes `--timeout`/
+          # `--timeout-method` to pytest, and without the plugin every test invocation dies with an
+          # unrecognised-argument error that surfaces only as BadTestExecutionCommandsException.
+          # Neither package is in constraints.lock, so the --constraint above does not pin them.
+          uv pip install --system "mutmut==3.6.0" pytest-timeout
       - name: Mutation-test a bounded scope (advisory - never fails)
         continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
           echo "== mutation testing messagefoundry/parsing/binary.py (advisory; bounded scope) =="
-          # Ephemeral mutmut config (the repo ships none): mutate one pure module, scored by its own
-          # focused test file so each mutant re-runs seconds of tests, not the whole suite.
-          printf '[mutmut]\npaths_to_mutate=messagefoundry/parsing/binary.py\nrunner=python -m pytest -x -q tests/test_binary_carriage.py\n' > setup.cfg
-          # KNOWN BROKEN ON PYTHON 3.14 (verified from run 30248096425, 2026-07-27): mutmut 2.5.1 crashes
-          # in its pony-ORM cache -- `TypeError: cannot pickle 'itertools.count' object` at
-          # cache.py:369 update_line_numbers -- AFTER printing its banner and running the baseline, and
-          # BEFORE generating a single mutant. `|| true` then made the job green in 37s, so this signal
-          # has been reporting success while producing nothing. Do not present it as results; make the
-          # crash visible and let the exit status be seen. mutmut 3.x has a different CLI and mutating
-          # this to work is a separate piece of work, not part of surfacing existing signals.
+          # Ephemeral mutmut config (the repo ships none). THREE things here are load-bearing, each
+          # found by a run that silently produced nothing:
+          #   * source_paths is the PACKAGE, not the one file. mutmut 3 copies source_paths into
+          #     `mutants/` and runs pytest THERE; with a single file copied, tests/conftest.py died on
+          #     `ModuleNotFoundError: messagefoundry.config` and every mutant came back "not checked".
+          #   * only_mutate keeps the bounded scope -- the whole package is copied, one module mutated.
+          #   * pytest_add_cli_args_test_selection replaces mutmut 2's `runner=`; the old `runner` and
+          #     `paths_to_mutate` keys are gone/deprecated in 3.x.
+          printf '[mutmut]\nsource_paths=messagefoundry\nonly_mutate=messagefoundry/parsing/binary.py\npytest_add_cli_args_test_selection=tests/test_binary_carriage.py\n' > setup.cfg
           if mutmut run > mutmut-run.txt 2>&1; then
             MUTMUT_OK=1
           else
             MUTMUT_OK=0
           fi
-          cat mutmut-run.txt
+          tail -c 20000 mutmut-run.txt
           if [ "$MUTMUT_OK" = "1" ]; then
-            echo "== results =="
             mutmut results > mutmut-results.txt 2>&1 || true
-            cat mutmut-results.txt
+            KILLED="$(grep -c ': killed' mutmut-results.txt || true)"
+            SURVIVED="$(grep -c ': survived' mutmut-results.txt || true)"
+            NOTESTS="$(grep -c ': no tests' mutmut-results.txt || true)"
+            echo "== killed=$KILLED survived=$SURVIVED no-tests=$NOTESTS =="
+            grep ': survived' mutmut-results.txt || true
             {
-              echo "## Mutation testing (bounded scope: messagefoundry/parsing/binary.py)"
+              echo "## Mutation testing — \`messagefoundry/parsing/binary.py\`"
               echo ""
-              echo '```'
-              head -c 900000 mutmut-results.txt
-              echo '```'
+              echo "| Killed | Survived | Not covered |"
+              echo "| --- | --- | --- |"
+              echo "| $KILLED | **$SURVIVED** | $NOTESTS |"
               echo ""
-              echo "<sub>Advisory only. This job never runs on pull requests, so it has no PR surface by"
-              echo "design — surviving mutants are reviewed from this run page.</sub>"
+              if [ "$SURVIVED" != "0" ]; then
+                echo "Survivors — injected bugs the tests did **not** catch:"
+                echo ""
+                echo '```'
+                grep ': survived' mutmut-results.txt | head -c 100000
+                echo '```'
+              fi
+              echo ""
+              echo "<sub>Advisory only. A survivor is a hint to strengthen an assertion, not a defect —"
+              echo "and mutation score is a poor single number (rubric §2), so this never gates.</sub>"
             } >> "$GITHUB_STEP_SUMMARY"
           else
-            echo "::warning title=Mutation run failed::mutmut produced no mutants (known: mutmut 2.5.1 is broken on Python 3.14)"
+            echo "::warning title=Mutation run failed::mutmut exited non-zero — see the job log"
             {
-              echo "## Mutation testing — NOT RUNNING"
+              echo "## Mutation testing — FAILED TO RUN"
               echo ""
-              echo "\`mutmut run\` exited non-zero and generated **no mutants**. mutmut 2.5.1 crashes on"
-              echo "Python 3.14 (\`cannot pickle 'itertools.count'\`) before mutation begins, so this"
-              echo "signal currently reports nothing. Tail of the run:"
+              echo "\`mutmut run\` exited non-zero, so this signal produced nothing. Tail of the run:"
               echo ""
               echo '```'
               tail -c 4000 mutmut-run.txt
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
-      - name: Upload the mutmut cache (advisory)
+      - name: Upload the mutmut results (advisory)
         if: always()
         continue-on-error: true
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
-          name: mutmut-cache
-          path: .mutmut-cache
+          name: mutmut-results
+          path: |
+            mutmut-results.txt
+            mutmut-run.txt
+            .mutmut-cache
           # .mutmut-cache is a DOTFILE and upload-artifact skips hidden files by DEFAULT. Without this
           # the step logs "No files were found", uploads nothing, and still reports success -- a silent
           # no-op that looks green.

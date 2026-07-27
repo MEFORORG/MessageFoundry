@@ -68,6 +68,9 @@ coverage.xml
 diff-cover.md
 jscpd-report/
 .mutmut-cache
+mutants/
+mutmut-run.txt
+mutmut-results.txt
 c901-head.json
 c901-base.json
 base-tree/

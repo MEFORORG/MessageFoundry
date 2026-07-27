@@ -246,11 +246,42 @@ def test_report_guards_test_for_content_not_mere_existence(code: str) -> None:
     assert "[ -f diff-cover.md ]" not in code
 
 
-def test_step_summary_writes_are_size_guarded(raw: str) -> None:
-    """An oversized $GITHUB_STEP_SUMMARY write is dropped ENTIRELY, losing the whole surface."""
-    appends = raw.count('>> "$GITHUB_STEP_SUMMARY"')
+def test_step_summary_writes_are_size_guarded(code: str) -> None:
+    """An oversized $GITHUB_STEP_SUMMARY write is dropped ENTIRELY, losing the whole surface.
+
+    Asserts on the COUNT of truncation idioms rather than one magic constant: the blocks legitimately
+    use different limits (a survivor list needs less room than a coverage report), and pinning the
+    exact byte count made this fail on a change that was still correctly guarded.
+    """
+    appends = code.count('>> "$GITHUB_STEP_SUMMARY"')
     assert appends >= 3, f"expected the summary blocks to be present, found {appends}"
-    assert raw.count("head -c 900000") >= 3, "each summary block must be truncated"
+    truncations = code.count("head -c ") + code.count("tail -c ")
+    assert truncations >= appends, (
+        f"{appends} summary blocks but only {truncations} truncation guards -- an oversized write "
+        "is dropped entirely, silently losing the whole surface"
+    )
+
+
+def test_mutmut_is_pinned_to_3x_with_pytest_timeout(code: str) -> None:
+    """mutmut 2.5.1 crashes on Python 3.14 before generating a mutant, and `|| true` made that look
+    green for months. pytest-timeout is not optional: mutmut 3 always passes `--timeout` to pytest,
+    and without the plugin every invocation dies inside BadTestExecutionCommandsException."""
+    assert re.search(r'"mutmut==3\.\d+\.\d+"', code), "mutmut must be pinned to an exact 3.x"
+    assert "mutmut<3" not in code, "mutmut 2.x does not run on Python 3.14"
+    assert "pytest-timeout" in code, "mutmut 3 requires pytest-timeout"
+
+
+def test_mutmut_copies_the_package_not_just_the_mutated_file(code: str) -> None:
+    """mutmut 3 copies `source_paths` into mutants/ and runs pytest there. With a single FILE as the
+    source path, conftest.py cannot import the rest of the package and every mutant comes back
+    'not checked' -- a green job measuring nothing. Copy the package, mutate one module."""
+    # The config is emitted by `printf`, so the separators are literal backslash-n in the YAML.
+    assert r"source_paths=messagefoundry\n" in code, (
+        "source_paths must be the package, not one file"
+    )
+    assert "only_mutate=" in code, "the bounded scope must come from only_mutate"
+    assert "paths_to_mutate" not in code, "deprecated in mutmut 3"
+    assert "runner=" not in code, "mutmut 3 uses pytest_add_cli_args_test_selection"
 
 
 def test_mutmut_artifact_includes_hidden_files(workflow: dict) -> None:
