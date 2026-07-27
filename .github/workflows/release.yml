@@ -71,20 +71,20 @@ jobs:
         with:
           python-version: "3.14"
 
-      - name: Rewrite README repo slug for the public PyPI long_description
-        run: |
-          # PyPI renders README.md (pyproject `readme = "README.md"`) as the project description and
-          # fetches it anonymously. The source README points at the PRIVATE source repo
-          # (MEFORORG/MessageFoundry) so the team's GitHub view shows the private repo's own CI
-          # badges — but anonymous fetches of a private repo's Actions badge SVG 404 (broken badge
-          # images), and every body link 404s on click. The public mirror (MEFORORG/MessageFoundry)
-          # runs the same workflows and is anonymously reachable, so rewrite the slug here (the same
-          # rewrite the retired scripts/publish/publish.ps1 used to apply) before `python -m build` embeds
-          # the README. Ephemeral runner edit only — never committed.
-          sed -i 's#MEFORORG/MessageFoundry#MEFORORG/MessageFoundry#g' README.md
-          if grep -q 'MEFORORG/MessageFoundry' README.md; then
-            echo '::error::README slug rewrite left private-repo links'; exit 1
-          fi
+      # REMOVED at the MEFORORG cutover: "Rewrite README repo slug for the public PyPI
+      # long_description". It rewrote the private source slug to the public mirror's before `build`
+      # embedded README.md, because PyPI fetches the long_description anonymously and a private repo's
+      # badge SVGs and body links 404 for anonymous readers.
+      #
+      # There is one repo now, and README.md already names it — so there is nothing to rewrite. Worse,
+      # the step could no longer even fail safely: publish.ps1's slug rewrite had been applied to this
+      # workflow itself, collapsing BOTH sides of the substitution to the same string. The sed became a
+      # no-op that replaced the public slug with itself, and the guard immediately after it failed if
+      # that slug appeared in the README — which it always does, 19 times. So the step failed on EVERY
+      # tag push. That is exactly what happened: the v0.3.0 tag (2026-07-13) died here, and the repo has
+      # zero published releases as a result. Same root cause as the release job's inverted `if:` guard —
+      # mirror-era logic that the slug rewrite mangled and the cutover left behind.
+      # (tests/test_release_pipeline.py rejects both the step and any self-substituting sed returning.)
 
       - name: Build sdist + wheel
         run: |
@@ -118,9 +118,32 @@ jobs:
           built=$(/tmp/relsmoke/bin/python -c "import messagefoundry; print(messagefoundry.__version__)")
           echo "built version: $built"
           # On a tag push, the built version MUST equal the tag (single-source check).
+          #
+          # Compared as PEP 440 VERSIONS, not as strings. A pre-release tag has to be spelled with a
+          # hyphen to match the `v[0-9]+.[0-9]+.[0-9]+-*` trigger above (`v0.3.0rc1` fires nothing), so
+          # a string compare forced __version__ to carry the non-canonical "0.3.0-rc1" purely to satisfy
+          # the gate — while hatchling/PyPI normalise it to 0.3.0rc1 everywhere else, meaning the tag,
+          # the module attribute and the wheel filename could not all be canonical at once. Version()
+          # normalises both sides, so canonical "0.3.0rc1" in __init__.py matches tag v0.3.0-rc1 and the
+          # check still fails loudly on a genuine mismatch.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            [ "$built" = "$want" ] || { echo "::error::built version $built != tag $want"; exit 1; }
+            /tmp/relsmoke/bin/pip install --quiet packaging
+            /tmp/relsmoke/bin/python - "$built" "$want" <<'PYVER'
+          import sys
+          from packaging.version import InvalidVersion, Version
+
+          built, want = sys.argv[1], sys.argv[2]
+          try:
+              b, w = Version(built), Version(want)
+          except InvalidVersion as exc:
+              raise SystemExit(f"::error::unparseable version ({exc}) — built={built!r} tag={want!r}")
+          if b != w:
+              raise SystemExit(
+                  f"::error::built version {built} != tag {want} (normalised {b} != {w})"
+              )
+          print(f"version matches tag: {b}")
+          PYVER
             # A released wheel MUST ship the PEP 561 marker so an external consumer's mypy sees the
             # typed surface. Enforced ONLY on a tag, so the workflow_dispatch dry-run is never blocked
             # before py.typed (WS-3) merges. This is the CI enforcement of the cross-workstream rule
@@ -306,9 +329,30 @@ jobs:
         run: |
           built=$(python -c "import glob,re; print(re.search(r'messagefoundry_harness-([^-]+)-', glob.glob('harness-dist/*.whl')[0]).group(1))")
           echo "harness wheel version: $built"
+          # PEP 440 comparison, for a STRONGER reason than the engine's copy of this check: `built` is
+          # read out of the WHEEL FILENAME, which hatchling has already normalised. On tag v0.3.0-rc1
+          # the file is messagefoundry_harness-0.3.0rc1-...whl, so built=0.3.0rc1 while want=0.3.0-rc1
+          # and a string compare could NEVER match — this job failed on every pre-release tag by
+          # construction, whatever __version__ said. With PUBLISH_HARNESS=true it also runs after the
+          # engine has already uploaded, so the failure would land half-published.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            [ "$built" = "$want" ] || { echo "::error::harness wheel version $built != tag $want"; exit 1; }
+            python -m pip install --quiet packaging
+            python - "$built" "$want" <<'PYVER'
+          import sys
+          from packaging.version import InvalidVersion, Version
+
+          built, want = sys.argv[1], sys.argv[2]
+          try:
+              b, w = Version(built), Version(want)
+          except InvalidVersion as exc:
+              raise SystemExit(f"::error::unparseable version ({exc}) — built={built!r} tag={want!r}")
+          if b != w:
+              raise SystemExit(
+                  f"::error::harness wheel version {built} != tag {want} (normalised {b} != {w})"
+              )
+          print(f"harness version matches tag: {b}")
+          PYVER
           fi
 
       - name: Attach the harness wheel to the GitHub release
