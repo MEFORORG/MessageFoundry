@@ -65,9 +65,13 @@ def test_scaffold_writes_the_skeleton(tmp_path: Path) -> None:
     # repo variable for indexes that strip attestations; the check job gates on it (never on verify failure)
     assert "verify-engine:" in ci
     assert (
-        "gh attestation verify dist-verify/messagefoundry-*.whl --repo wshallwshall/MessageFoundry"
+        "gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry"
         in ci
     )
+    # The scaffolded gate must name the repo that BUILDS the release — attestations are minted by the
+    # public repo's release workflow, so a private-vault slug here verifies against something no
+    # adopter can read. Pin the negative too: the retired slug must never creep back in.
+    assert "wshallwshall" not in ci
     assert "vars.MEFOR_VERIFY_ENGINE != 'off'" in ci
     assert "needs: verify-engine" in ci
     assert "needs.verify-engine.result != 'failure'" in ci

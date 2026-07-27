@@ -162,7 +162,7 @@ jobs:
       - name: Verify SLSA build provenance before install
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh attestation verify dist-verify/messagefoundry-*.whl --repo wshallwshall/MessageFoundry
+        run: gh attestation verify dist-verify/messagefoundry-*.whl --repo MEFORORG/MessageFoundry
 
   check:
     needs: verify-engine
