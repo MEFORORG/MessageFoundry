@@ -257,13 +257,19 @@ behaviour on fork PRs. The workflow still holds **no write scope on any job**.
   unshippable as a diff signal: all 122 findings on this tree anchor on a single `def` line, so body edits
   produce nothing and signature edits fire on pre-existing debt. The delta reports only what the PR caused.
 - **Clones** — step summary only. jscpd emits one location per clone pair chosen by scan order.
-- **Mutation** — step summary + a `.mutmut-cache` artifact (needs `include-hidden-files: true`; it is a
-  dotfile and `upload-artifact` skips hidden files by default, which would otherwise upload nothing and
-  still report success). This job never runs on `pull_request`, so it has **no PR surface** by design.
+- **Mutation** — **the signal is dead and was reporting success anyway.** Measured from the scheduled run
+  `30248096425` (2026-07-27): the job takes **37 seconds** and goes green because `mutmut run || true`
+  swallows a crash. mutmut 2.5.1 prints its banner, runs the baseline, then dies in its pony-ORM cache with
+  `TypeError: cannot pickle 'itertools.count' object` (`cache.py:369 update_line_numbers`) — **before
+  generating a single mutant**. The job now captures the exit status, emits a `::warning`, and says so in
+  the summary rather than presenting a results block for a tool that produced none. The `.mutmut-cache`
+  artifact still uploads (`include-hidden-files: true` — it is a dotfile and `upload-artifact` skips hidden
+  files by default), but expect it to be a stale/empty cache until the tool works.
 
-**Open, pending a measurement:** whether the mutation job should run on PRs. Its scope is already one module
-scored by one focused test file, so it may be a two-line `if:` + `paths:` change — but its wall-clock is
-unmeasured. Trigger it once via `workflow_dispatch`, read the duration off the run page, then decide.
+**The real blocker (supersedes the old "measure the wall-clock" step):** the PR-vs-nightly question cannot
+be answered while the tool produces nothing — 37s is the cost of crashing, not of mutating. Fix mutmut
+first (mutmut 3.x has a different CLI; cosmic-ray is the other candidate), *then* measure a real run, then
+decide about PRs. Do not read the current duration as evidence that a PR run would be cheap.
 
 ---
 

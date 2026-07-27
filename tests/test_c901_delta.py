@@ -312,6 +312,99 @@ def test_main_appends_rather_than_truncating_the_summary(tmp_path: Path) -> None
     assert "## existing content" in summary.read_text(encoding="utf-8")
 
 
+def test_a_file_move_does_not_report_pre_existing_complexity_as_new(tmp_path: Path) -> None:
+    """Renaming a file changes every key in it. Without rename tolerance the whole file's worth of
+    pre-existing debt annotates as PR-caused -- the flood this script exists to prevent, arriving by
+    a different door."""
+    old = [
+        _finding(f"/repo/messagefoundry/old/m{i}.py", f"fn{i}", 12 + i, i + 1) for i in range(13)
+    ]
+    moved = [
+        _finding(f"/repo/messagefoundry/new/m{i}.py", f"fn{i}", 12 + i, i + 1) for i in range(13)
+    ]
+    base = _parse(tmp_path, "base.json", old)
+    head = _parse(tmp_path, "head.json", moved)
+
+    new, increased, decreased = delta.classify(base, head)
+
+    assert new == [], f"a pure move must annotate nothing, got {[c.key for c in new]}"
+    assert increased == [] and decreased == []
+
+
+def test_a_move_that_also_increases_complexity_is_still_reported(tmp_path: Path) -> None:
+    """Rename tolerance must not swallow a real regression that happens to accompany a move."""
+    base = _parse(tmp_path, "base.json", [_finding("/repo/messagefoundry/a.py", "fn", 12, 1)])
+    head = _parse(tmp_path, "head.json", [_finding("/repo/messagefoundry/b.py", "fn", 40, 1)])
+
+    new, increased, decreased = delta.classify(base, head)
+
+    assert len(new) == 1, "a moved function whose complexity changed is not an unchanged move"
+    assert new[0].after == 40
+
+
+def test_a_threshold_change_reports_not_comparable_instead_of_flooding(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A PR tightening max-complexity would otherwise report every function between the old and new
+    thresholds as new."""
+    base = [
+        _finding(f"/repo/messagefoundry/f{i}.py", f"fn{i}", 12, 1, threshold=10) for i in range(30)
+    ]
+    head = [
+        _finding(f"/repo/messagefoundry/f{i}.py", f"fn{i}", 12, 1, threshold=5) for i in range(30)
+    ]
+    summary = tmp_path / "summary.md"
+
+    rc = delta.main(
+        [
+            "--base",
+            _write(tmp_path, "base.json", base),
+            "--head",
+            _write(tmp_path, "head.json", head),
+            "--repo-root",
+            "/repo",
+            "--summary-file",
+            str(summary),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "::warning" not in out
+    assert "not comparable" in out
+    assert "not comparable" in summary.read_text(encoding="utf-8")
+
+
+def test_a_negative_annotation_cap_is_rejected(tmp_path: Path) -> None:
+    """A negative cap would slice from the END of the list, reporting the wrong findings."""
+    with pytest.raises(SystemExit):
+        delta.main(
+            [
+                "--base",
+                _write(tmp_path, "base.json", []),
+                "--head",
+                _write(tmp_path, "head.json", []),
+                "--max-annotations",
+                "-5",
+            ]
+        )
+
+
+def test_a_path_outside_the_scan_root_still_keys_consistently(tmp_path: Path) -> None:
+    """A widened scope reporting a file outside the package must not key the base tree copy
+    differently from HEAD's -- that would flood every such finding as new."""
+    root = "/home/runner/work/r/r"
+    head = _parse(tmp_path, "head.json", [_finding(f"{root}/tee/x.py", "f", 30, 10)], root)
+    base = _parse(
+        tmp_path, "base.json", [_finding(f"{root}/base-tree/tee/x.py", "f", 30, 10)], root
+    )
+
+    assert set(head) == {delta.Key("tee/x.py", "f")}
+    # The base tree copy cannot be root-stripped to the same string, so rename tolerance is what
+    # keeps it from flooding; either way it must not be reported as new.
+    assert delta.classify(base, head)[0] == []
+
+
 def test_workflow_command_metacharacters_are_escaped() -> None:
     change = delta.Change(
         key=delta.Key(path="messagefoundry/a,b.py", function="weird%name"),

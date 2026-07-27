@@ -14,8 +14,11 @@ name: quality-advisory
 #   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job); step summary only, see below
 #   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only); INLINE `::notice`
 #                                                         annotations on the Files changed tab + summary
-#   * signal  7 - mutation testing (highest leverage)   -> BUILT (mutation job; mirror-nightly + workflow_dispatch);
-#                                                         step summary + artifact, no PR surface (never runs on PRs)
+#   * signal  7 - mutation testing (highest leverage)   -> BUILT but NOT CURRENTLY WORKING: mutmut 2.5.1
+#                                                         crashes on Python 3.14 before generating any
+#                                                         mutant, so this signal reports NOTHING today.
+#                                                         The job now says so loudly instead of going
+#                                                         green in 37s. It never runs on PRs either way.
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
 #
 # WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
@@ -29,9 +32,20 @@ name: quality-advisory
 #   3. Uploading on pull_request only leaves NO default-branch baseline, so every PR forever would report
 #      all ~161 findings as new -- not a one-off first-PR blip.
 # Workflow commands need no token and no permission grant, and behave identically on fork PRs. Every job
-# below therefore holds `contents: read` and nothing else; the workflow grants NO write scope anywhere,
-# which is what actually guarantees it cannot gate a merge. tests/test_quality_advisory_invariants.py
-# pins that, and pins the absence of any SARIF upload.
+# below therefore holds `contents: read` and nothing else -- least privilege, worth pinning on its own
+# merits given that two of these jobs execute third-party code fetched at run time.
+#
+# What actually keeps this advisory is TWO things, and permissions are neither of them: (a) these job
+# contexts are not in the required-checks set on `main`, and (b) every analysis step is
+# `continue-on-error: true` plus `--exit-zero` / `--fail-under=0` / `|| true`, so the job reports success
+# regardless of findings. Branch-protection membership is the only thing that determines gating.
+# tests/test_quality_advisory_invariants.py pins (b), the absent write scopes, and the absence of SARIF.
+#
+# HONEST LIMIT of the annotation mechanism: a workflow-command annotation renders INLINE on the Files
+# changed tab only when its line is in the diff. That always holds for diff-coverage (every line it
+# flags is a line the PR changed) but usually does NOT hold for the complexity delta, whose findings
+# anchor on a `def` line the PR often did not touch -- those land in the Checks tab and the step summary
+# instead. The summary table is the primary surface for complexity, not a nice-to-have.
 
 on:
   pull_request:
@@ -61,13 +75,23 @@ jobs:
           persist-credentials: false
           # The delta step needs the base branch's history for `git merge-base`.
           fetch-depth: 0
-      - name: Install ruff (pinned)
-        # Held to the SAME version as constraints.lock / requirements.lock / uv.lock (previously 0.15.19
-        # against their 0.15.22 -- unguarded drift). This is now load-bearing: c901_delta.py parses ruff's
-        # human-readable C901 message because ruff exposes the complexity number nowhere else, so a skew
-        # can change the wording under the parser. Nothing automates this -- DEP-1 byte-diffs the exported
-        # locks and cannot see a version inside a `run:` body.
-        run: pipx install ruff==0.15.22
+      - name: Install ruff (version derived from the lock)
+        # DERIVED, not duplicated. This job used to hardcode 0.15.19 while all four locks pinned 0.15.22,
+        # and that drift is load-bearing: c901_delta.py parses ruff's human-readable C901 message because
+        # ruff exposes the complexity number nowhere else, so a skew can change the wording under the
+        # parser. The obvious fix -- hardcode the right version and assert it matches the lock in a test --
+        # would leave a REQUIRED check (the pytest suite) hostage to a routine Dependabot ruff bump:
+        # the lock moves, the workflow string does not, and a blocking context goes red for a purely
+        # advisory concern. Reading the lock at run time removes the drift AND the coupling.
+        run: |
+          RUFF_PIN="$(sed -n 's/^ruff==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$RUFF_PIN" ]; then
+            echo "::notice title=Ruff pin not found::falling back to the unpinned ruff from PyPI"
+            pipx install ruff
+          else
+            echo "ruff pin from constraints.lock: $RUFF_PIN"
+            pipx install "ruff==$RUFF_PIN"
+          fi
       - name: Ruff C901 complexity triage (advisory - never gates)
         continue-on-error: true
         run: |
@@ -198,7 +222,19 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           echo "== coverage of the lines this PR changed (advisory; not a whole-repo % gate) =="
-          git fetch --no-tags --depth=1 origin "$BASE_REF" || true
+          # NO --depth HERE. Running a shallow fetch against the COMPLETE clone that `fetch-depth: 0`
+          # just produced writes .git/shallow and grafts away everything behind origin/<base>'s tip.
+          # diff-cover diffs with the three-dot range `origin/<base>...HEAD`, which needs a merge base --
+          # so once the base branch advances past the PR's merge ref (another PR merging, or a re-run of
+          # a stale check) the diff dies with "no merge base". Reproduced. It then fails in the worst
+          # possible way: the markdown reporter runs BEFORE the annotations reporter and truncates
+          # diff-cover.md on open, so `|| true` swallows the error, zero annotations are emitted, and the
+          # summary shows a bare heading that reads as "nothing uncovered".
+          git fetch --no-tags origin "$BASE_REF" || true
+          if [ ! -s coverage.xml ]; then
+            echo "::notice title=Diff coverage skipped::coverage.xml was not produced (the test step did not complete)"
+            exit 0
+          fi
           # `github-annotations:notice` writes `::notice file=...,line=N,endLine=M` workflow commands to
           # STDOUT, which the runner turns into INLINE annotations on the Files changed tab -- no token,
           # no permission grant, identical behaviour on fork PRs. Adjacent uncovered lines are coalesced
@@ -207,7 +243,10 @@ jobs:
           # The console report still prints, so the job log is unchanged.
           diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 \
             --format "github-annotations:notice,markdown:diff-cover.md" || true
-          if [ -f diff-cover.md ]; then
+          # `-s` not `-f`: diff-cover creates and truncates this file BEFORE it can fail, so a crashed
+          # run leaves a 0-byte report. Testing for existence alone would append an empty section that
+          # looks like a clean result -- the exact silent-success shape this workflow keeps producing.
+          if [ -s diff-cover.md ]; then
             {
               echo "## Diff coverage"
               echo ""
@@ -216,6 +255,8 @@ jobs:
               # ENTIRELY -- truncate rather than silently lose the whole summary.
               head -c 900000 diff-cover.md
             } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::notice title=Diff coverage unavailable::diff-cover produced no report (see the job log)"
           fi
 
   mutation:
@@ -259,20 +300,47 @@ jobs:
           # Ephemeral mutmut config (the repo ships none): mutate one pure module, scored by its own
           # focused test file so each mutant re-runs seconds of tests, not the whole suite.
           printf '[mutmut]\npaths_to_mutate=messagefoundry/parsing/binary.py\nrunner=python -m pytest -x -q tests/test_binary_carriage.py\n' > setup.cfg
-          mutmut run || true
-          echo "== results =="
-          mutmut results 2>&1 | tee mutmut-results.txt || true
-          {
-            echo "## Mutation testing (bounded scope: messagefoundry/parsing/binary.py)"
-            echo ""
-            echo '```'
-            head -c 900000 mutmut-results.txt
-            echo '```'
-            echo ""
-            echo "<sub>Advisory only. This job never runs on pull requests (cron on the public repo +"
-            echo "workflow_dispatch), so it has no PR surface by design — surviving mutants are reviewed"
-            echo "from this run page.</sub>"
-          } >> "$GITHUB_STEP_SUMMARY"
+          # KNOWN BROKEN ON PYTHON 3.14 (verified from run 30248096425, 2026-07-27): mutmut 2.5.1 crashes
+          # in its pony-ORM cache -- `TypeError: cannot pickle 'itertools.count' object` at
+          # cache.py:369 update_line_numbers -- AFTER printing its banner and running the baseline, and
+          # BEFORE generating a single mutant. `|| true` then made the job green in 37s, so this signal
+          # has been reporting success while producing nothing. Do not present it as results; make the
+          # crash visible and let the exit status be seen. mutmut 3.x has a different CLI and mutating
+          # this to work is a separate piece of work, not part of surfacing existing signals.
+          if mutmut run > mutmut-run.txt 2>&1; then
+            MUTMUT_OK=1
+          else
+            MUTMUT_OK=0
+          fi
+          cat mutmut-run.txt
+          if [ "$MUTMUT_OK" = "1" ]; then
+            echo "== results =="
+            mutmut results > mutmut-results.txt 2>&1 || true
+            cat mutmut-results.txt
+            {
+              echo "## Mutation testing (bounded scope: messagefoundry/parsing/binary.py)"
+              echo ""
+              echo '```'
+              head -c 900000 mutmut-results.txt
+              echo '```'
+              echo ""
+              echo "<sub>Advisory only. This job never runs on pull requests, so it has no PR surface by"
+              echo "design — surviving mutants are reviewed from this run page.</sub>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=Mutation run failed::mutmut produced no mutants (known: mutmut 2.5.1 is broken on Python 3.14)"
+            {
+              echo "## Mutation testing — NOT RUNNING"
+              echo ""
+              echo "\`mutmut run\` exited non-zero and generated **no mutants**. mutmut 2.5.1 crashes on"
+              echo "Python 3.14 (\`cannot pickle 'itertools.count'\`) before mutation begins, so this"
+              echo "signal currently reports nothing. Tail of the run:"
+              echo ""
+              echo '```'
+              tail -c 4000 mutmut-run.txt
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       - name: Upload the mutmut cache (advisory)
         if: always()
         continue-on-error: true

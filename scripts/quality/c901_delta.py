@@ -81,6 +81,7 @@ def _normalise_path(filename: str, repo_root: str, scan_root: str) -> str:
     anchor = f"{scan_root}/"
 
     # Windows paths are case-insensitive; comparing casefolded avoids a C:/ vs c:/ miss.
+    stripped: str | None = None
     if root and normalised.casefold().startswith(f"{root.casefold()}/"):
         stripped = normalised[len(root) + 1 :]
         if stripped.startswith(anchor):
@@ -91,6 +92,12 @@ def _normalise_path(filename: str, repo_root: str, scan_root: str) -> str:
     index = normalised.rfind(f"/{anchor}")
     if index != -1:
         return normalised[index + 1 :]
+
+    # No scan-root anchor -- e.g. a widened scope that reports a file outside the package. Prefer the
+    # successful root strip over the raw absolute path: returning the latter would give the base tree
+    # and HEAD different keys for the same file, and every such finding would flood as new.
+    if stripped is not None:
+        return stripped.lstrip("./")
 
     # Already relative, or a shape we cannot anchor. Return it normalised rather than guessing.
     return normalised.lstrip("./")
@@ -141,6 +148,34 @@ class Change(NamedTuple):
     line: int
 
 
+def _moved_unchanged(base: dict[Key, Finding], head: dict[Key, Finding]) -> set[Key]:
+    """Head keys that look like a rename/move of an identical base finding.
+
+    A file move or a function rename makes every complex function in it read as NEW while its old key
+    silently disappears -- pre-existing debt annotated as PR-caused, a whole file's worth at a time.
+    Proper detection needs git rename data; this is the cheap floor that needs none: if a vanished base
+    finding has exactly the same (function, complexity, threshold) as an appearing head one, treat it as
+    moved rather than introduced. Conservative in the right direction -- an ACTUAL new function that
+    coincidentally matches a deleted one's name and exact complexity is merely under-reported, whereas
+    the flood it prevents is the failure that makes the whole signal untrustworthy.
+    """
+    vanished: dict[tuple[str, int, int], int] = {}
+    for key, finding in base.items():
+        if key not in head:
+            signature = (key.function, finding.complexity, finding.threshold)
+            vanished[signature] = vanished.get(signature, 0) + 1
+
+    moved: set[Key] = set()
+    for key, finding in sorted(head.items()):
+        if key in base:
+            continue
+        signature = (key.function, finding.complexity, finding.threshold)
+        if vanished.get(signature, 0) > 0:
+            vanished[signature] -= 1
+            moved.add(key)
+    return moved
+
+
 def classify(
     base: dict[Key, Finding], head: dict[Key, Finding]
 ) -> tuple[list[Change], list[Change], list[Change]]:
@@ -148,10 +183,13 @@ def classify(
     new: list[Change] = []
     increased: list[Change] = []
     decreased: list[Change] = []
+    moved = _moved_unchanged(base, head)
 
     for key, finding in sorted(head.items()):
         previous = base.get(key)
         if previous is None:
+            if key in moved:
+                continue
             new.append(Change(key, None, finding.complexity, finding.threshold, finding.line))
         elif finding.complexity > previous.complexity:
             increased.append(
@@ -228,13 +266,30 @@ def _markdown(new: list[Change], increased: list[Change], decreased: list[Change
     return "\n".join(lines)
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError(f"must be >= 0, got {parsed}")
+    return parsed
+
+
+def _threshold_of(findings: dict[Key, Finding]) -> int | None:
+    """The mccabe threshold these findings were measured against, if they agree on one."""
+    thresholds = {f.threshold for f in findings.values()}
+    return thresholds.pop() if len(thresholds) == 1 else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--base", required=True, help="ruff C901 JSON from the merge base")
     parser.add_argument("--head", required=True, help="ruff C901 JSON from HEAD")
     parser.add_argument("--repo-root", default=".", help="checkout root, for relative paths")
     parser.add_argument("--scan-root", default="messagefoundry", help="scanned package name")
-    parser.add_argument("--max-annotations", type=int, default=_DEFAULT_MAX_ANNOTATIONS)
+    # Non-negative: a negative cap would slice from the END of the list (reporting the wrong findings)
+    # and print a nonsense "further change(s)" count.
+    parser.add_argument(
+        "--max-annotations", type=_non_negative_int, default=_DEFAULT_MAX_ANNOTATIONS
+    )
     parser.add_argument(
         "--summary-file", default=None, help="append markdown here (GITHUB_STEP_SUMMARY)"
     )
@@ -243,6 +298,30 @@ def main(argv: list[str] | None = None) -> int:
     repo_root = os.path.abspath(args.repo_root)
     base = _parse_findings(args.base, repo_root, args.scan_root)
     head = _parse_findings(args.head, repo_root, args.scan_root)
+
+    # A PR that TIGHTENS ruff's max-complexity makes every function between the old and new thresholds
+    # appear as new -- pre-existing debt, annotated en masse, on the one PR whose author already knows.
+    # The two runs are not comparable, so say that instead of reporting a fake delta.
+    base_threshold, head_threshold = _threshold_of(base), _threshold_of(head)
+    if (
+        base_threshold is not None
+        and head_threshold is not None
+        and base_threshold != head_threshold
+    ):
+        print(
+            f"::notice title=Complexity delta not comparable::the mccabe threshold moved "
+            f"{base_threshold} -> {head_threshold}; a delta against the old threshold would be noise"
+        )
+        summary = (
+            "## Cyclomatic complexity (C901) — not comparable\n\n"
+            f"This PR changes the mccabe threshold ({base_threshold} → {head_threshold}), so a "
+            "before/after delta would report pre-existing functions as new. Skipped deliberately.\n"
+        )
+        if args.summary_file:
+            with open(args.summary_file, "a", encoding="utf-8") as handle:
+                handle.write(summary)
+        return 0
+
     new, increased, decreased = classify(base, head)
 
     annotated = new + increased

@@ -39,10 +39,13 @@ CodeQL and Scorecard run on PRs but are **advisory** (not in the required set) �
 `security-events: write`, which fork-PR tokens do not have, so requiring them would block PRs from forks.
 Nightly / path-gated legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
-The `quality-advisory.yml` jobs create **no code-scanning category and no new check context**, and they
-**must never be added to the required list**. The guarantee is stronger than "branch protection is
-untouched": that workflow holds **no write permission on any job** (`contents: read` and nothing else),
-so it cannot gate a merge even if branch protection or a ruleset changes.
+The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
+they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
+things keep them advisory: they are absent from branch protection, and every analysis step is
+`continue-on-error: true` plus `--exit-zero` / `--fail-under=0` / `|| true`, so the job reports success
+whatever it finds. (The workflow also holds **no write permission on any job** — that is least privilege,
+worth having because two of these jobs run third-party code fetched at run time, but it is *not* what
+determines merge gating; required-checks membership is.)
 `tests/test_quality_advisory_invariants.py` fails if a write scope, a SARIF upload, or a removed
 `--exit-zero` ever lands there.
 
@@ -52,12 +55,15 @@ These use GitHub **workflow-command annotations** (`::notice` / `::warning` on s
 scanning. That needs no token and no permission grant, and behaves identically on fork PRs. The
 reasoning — including why SARIF was measured and rejected — is recorded in the workflow's header comment.
 
+An annotation renders **inline on Files changed only when its line is in the diff**. That is always true
+for diff-coverage and usually *not* true for complexity, so the two land in different places:
+
 | Signal | Where it shows up |
 |---|---|
-| Diff-coverage | **Inline on the Files changed tab**, one `::notice` per contiguous uncovered range of lines the PR changed, plus a step summary. |
-| Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex — as annotations plus a summary table. Pre-existing findings are deliberately never reported; the full list stays in the job log. |
+| Diff-coverage | **Inline on the Files changed tab**, one `::notice` per contiguous uncovered range of lines the PR changed, plus a step summary. Every line it flags is a line the PR touched, so this is the one signal that is reliably inline. |
+| Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex. Findings anchor on the `def` line, which a body-only edit does not touch, so **most complexity annotations appear in the Checks tab and the step summary rather than inline**. The summary table is this signal's primary surface. Pre-existing findings are never reported; the full list stays in the job log. |
 | Duplication (`jscpd`) | Step summary only. jscpd emits one location per clone pair chosen by scan order, so annotating it would anchor on the untouched twin about half the time. |
-| Mutation (`mutmut`) | Step summary and an artifact. This job never runs on pull requests, so it has **no PR surface** by design. |
+| Mutation (`mutmut`) | **Currently produces nothing.** mutmut 2.5.1 crashes on Python 3.14 (`cannot pickle 'itertools.count'`) before generating a single mutant; the job used to go green in 37s regardless. It now emits a `::warning` and says so in the summary instead of reporting success. It also never runs on pull requests, so it has no PR surface either way. Fixing it (mutmut 3.x has a different CLI, or a different tool) is separate, unstarted work. |
 
 ### The `CI gate` roll-up
 

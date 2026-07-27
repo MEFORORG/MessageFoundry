@@ -5,10 +5,15 @@ scope, drop an `--exit-zero`, or add a SARIF upload, and nothing else in the rep
 This repo already parses workflow YAML in tests for exactly that reason (see
 test_dependabot_automerge_guardrails.py, test_release_pipeline.py, test_lint_scope_parity.py).
 
-The single strongest assertion here is that the workflow holds NO write permission on any job.
-That -- not "it is absent from branch protection" -- is what makes it structurally incapable of
-gating a merge, and it is only assertable because these jobs surface findings via workflow-command
-annotations rather than by uploading SARIF to code scanning.
+What actually keeps these jobs advisory is that their contexts are not in the required-checks set on
+`main`, and that every analysis step is non-failing (`continue-on-error` + `--exit-zero` /
+`--fail-under=0` / `|| true`). Only the second half is assertable from inside the repo, so that is
+what test_every_analysis_step_cannot_fail_its_job pins.
+
+The no-write-scope assertion is a separate, narrower claim: least privilege. It does NOT by itself
+prevent merge gating -- permissions and branch protection are unrelated mechanisms -- but it is
+worth pinning because two of these jobs execute third-party code fetched at run time, and it is
+only holdable because the jobs surface findings via workflow commands rather than SARIF upload.
 """
 
 import re
@@ -21,8 +26,8 @@ _WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "qua
 
 # Steps that actually run a quality tool. Setup steps (checkout, setup-python, apt-get, the tool
 # installs) are deliberately NOT required to be continue-on-error: masking an infrastructure failure
-# would produce confusing downstream errors, and the merge-blocking guarantee comes from the absent
-# write scopes plus the workflow's absence from branch protection, not from those steps.
+# would produce confusing downstream errors, and a red ADVISORY job blocks nothing anyway -- these
+# contexts are not in the required-checks set.
 _ANALYSIS_MARKERS = (
     "ruff check",
     "npx --yes jscpd",
@@ -92,10 +97,10 @@ def test_workflow_grants_no_permissions_by_default(workflow: dict) -> None:
 
 
 def test_no_job_holds_any_write_scope(workflow: dict) -> None:
-    """The load-bearing assertion. A write scope anywhere here is a merge-gating capability in
-    disguise, and both the clone and complexity jobs execute third-party code fetched at run time
-    (`npx --yes jscpd`, `pipx install ruff`) with no integrity pin -- handing those a write-scoped
-    repository token would be a least-privilege regression."""
+    """Least privilege. Both the clone and complexity jobs execute third-party code fetched at run
+    time (`npx --yes jscpd`, `pipx install ruff`) with no integrity pin, so handing them a
+    write-scoped repository token would be a real regression. This does NOT by itself stop the jobs
+    gating a merge -- see the module docstring -- it just keeps their blast radius at zero."""
     for name, job in workflow["jobs"].items():
         permissions = job.get("permissions")
         assert permissions is not None, f"job {name!r} must declare explicit permissions"
@@ -158,18 +163,26 @@ def test_diff_cover_is_pinned_exactly(raw: str) -> None:
     assert re.search(r'"diff-cover==\d+\.\d+\.\d+"', raw), "diff-cover must be pinned with =="
 
 
-def test_ruff_pin_matches_the_lock(raw: str) -> None:
+def test_the_ruff_version_is_derived_from_the_lock_not_hardcoded(workflow: dict, code: str) -> None:
     """The delta script parses ruff's human-readable C901 message, so a version skew can change the
-    wording under the parser. DEP-1 byte-diffs the exported locks and cannot see this one."""
-    match = re.search(r"pipx install ruff==(\S+)", raw)
-    assert match, "the complexity job must pin ruff"
-    workflow_pin = match.group(1)
+    wording under the parser -- but the fix must NOT be a hardcoded pin asserted against the lock.
 
-    lock = (_WORKFLOW.parents[2] / "constraints.lock").read_text(encoding="utf-8")
-    locked = re.search(r"^ruff==(\S+?)(?:\s|$)", lock, re.MULTILINE)
-    assert locked, "ruff not found in constraints.lock"
-    assert workflow_pin == locked.group(1), (
-        f"workflow pins ruff=={workflow_pin} but constraints.lock has {locked.group(1)}"
+    This test file runs in the ordinary pytest suite, which IS a required check. Asserting equality
+    between a workflow string and constraints.lock would mean a routine Dependabot ruff bump reds a
+    BLOCKING context over a purely advisory concern. Deriving the version at run time removes the
+    drift and the coupling at once, so assert the derivation instead of the value.
+    """
+    step = next(
+        s
+        for job, s in _steps(workflow)
+        if job == "complexity" and "pipx install" in (s.get("run") or "")
+    )
+    body = step["run"]
+    assert "constraints.lock" in body, (
+        "the complexity job must read ruff's version from constraints.lock at run time"
+    )
+    assert not re.search(r"pipx install ruff==\d", code), (
+        "do not hardcode the ruff version here -- it couples a required check to this workflow"
     )
 
 
@@ -215,6 +228,22 @@ def test_checkouts_do_not_persist_credentials(workflow: dict) -> None:
             assert step.get("with", {}).get("persist-credentials") is False, (
                 f"{job} checkout must set persist-credentials: false"
             )
+
+
+def test_the_coverage_job_does_not_reshallow_its_own_full_clone(code: str) -> None:
+    """`fetch-depth: 0` then `git fetch --depth=1` writes .git/shallow and grafts away the history
+    behind the base tip, so diff-cover's three-dot range loses its merge base the moment the base
+    branch advances. It then fails in the worst way: the markdown reporter truncates diff-cover.md
+    on open before raising, `|| true` swallows the error, and the summary shows a clean-looking
+    empty section while zero annotations are emitted."""
+    assert "--depth" not in code, "a shallow fetch here defeats diff-cover's merge base"
+
+
+def test_report_guards_test_for_content_not_mere_existence(code: str) -> None:
+    """diff-cover creates and truncates its report before it can fail, so `-f` passes on a 0-byte
+    file and would append an empty section that reads as 'nothing uncovered'."""
+    assert "[ -s diff-cover.md ]" in code
+    assert "[ -f diff-cover.md ]" not in code
 
 
 def test_step_summary_writes_are_size_guarded(raw: str) -> None:
