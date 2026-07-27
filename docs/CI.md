@@ -15,6 +15,7 @@ which checks are *required* — this page describes the intended layout.
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens). **Blocking.** |
+| `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 
 Several heavier legs (server-DB store tests, load/throughput, service-smoke, DICOM/FHIR breadth) run
 **nightly on a schedule** and/or only when a PR touches their paths, so an ordinary PR does not pay for
@@ -37,6 +38,26 @@ The stable contexts required on `main` are:
 CodeQL and Scorecard run on PRs but are **advisory** (not in the required set) — their SARIF upload needs
 `security-events: write`, which fork-PR tokens do not have, so requiring them would block PRs from forks.
 Nightly / path-gated legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
+
+The `quality-advisory.yml` jobs create **no code-scanning category and no new check context**, and they
+**must never be added to the required list**. The guarantee is stronger than "branch protection is
+untouched": that workflow holds **no write permission on any job** (`contents: read` and nothing else),
+so it cannot gate a merge even if branch protection or a ruleset changes.
+`tests/test_quality_advisory_invariants.py` fails if a write scope, a SARIF upload, or a removed
+`--exit-zero` ever lands there.
+
+### How the advisory quality signals reach a reviewer
+
+These use GitHub **workflow-command annotations** (`::notice` / `::warning` on stdout) rather than code
+scanning. That needs no token and no permission grant, and behaves identically on fork PRs. The
+reasoning — including why SARIF was measured and rejected — is recorded in the workflow's header comment.
+
+| Signal | Where it shows up |
+|---|---|
+| Diff-coverage | **Inline on the Files changed tab**, one `::notice` per contiguous uncovered range of lines the PR changed, plus a step summary. |
+| Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex — as annotations plus a summary table. Pre-existing findings are deliberately never reported; the full list stays in the job log. |
+| Duplication (`jscpd`) | Step summary only. jscpd emits one location per clone pair chosen by scan order, so annotating it would anchor on the untouched twin about half the time. |
+| Mutation (`mutmut`) | Step summary and an artifact. This job never runs on pull requests, so it has **no PR surface** by design. |
 
 ### The `CI gate` roll-up
 

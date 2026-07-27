@@ -234,9 +234,36 @@ Add the cron to the workflow's `on:` block, then the job:
 
 ## 5. After they're green — flip the rubric
 
+> **UNACTIONABLE as written (2026-07-27).** `docs/Code_Quality_Standards.md` has never existed in this
+> repo's git history, despite being cited by `quality-advisory.yml`'s header and `pyproject.toml`. There is
+> no rubric file to flip. Leave the existing dangling citations alone and do not add new ones; if the rubric
+> is ever written, redo this step then.
+
 Update [Code_Quality_Standards.md](../Code_Quality_Standards.md) exactly as #10/#8 were flipped in v0.3:
 signals 6 + 7 go from *deferred* → ✅ **Built (advisory)** in **§5** (status column), **Appendix A.2** (rows
 6/7), **A.3**, and the **A.1** verdict. Bump the rubric **Version** + add a history row.
+
+## 6. Update — how these signals now surface (2026-07-27)
+
+All four advisory signals were wired to reach a reviewer without buying GitHub's paid Code Quality SKU
+(GA 2026-07-20, $10 per active committer/month, a standalone product **not** bundled with GHAS). They use
+**workflow-command annotations**, not code scanning — no token, no permission grant, and identical
+behaviour on fork PRs. The workflow still holds **no write scope on any job**.
+
+- **Diff-coverage** — `diff-cover --format "github-annotations:notice,markdown:diff-cover.md"` puts
+  `::notice` annotations **inline on the Files changed tab**. Adjacent uncovered lines are coalesced into
+  ranges, so a long uncovered block costs one annotation, not one per line.
+- **Complexity** — a merge-base-vs-HEAD **delta** (`scripts/quality/c901_delta.py`). Raw `C901` is
+  unshippable as a diff signal: all 122 findings on this tree anchor on a single `def` line, so body edits
+  produce nothing and signature edits fire on pre-existing debt. The delta reports only what the PR caused.
+- **Clones** — step summary only. jscpd emits one location per clone pair chosen by scan order.
+- **Mutation** — step summary + a `.mutmut-cache` artifact (needs `include-hidden-files: true`; it is a
+  dotfile and `upload-artifact` skips hidden files by default, which would otherwise upload nothing and
+  still report success). This job never runs on `pull_request`, so it has **no PR surface** by design.
+
+**Open, pending a measurement:** whether the mutation job should run on PRs. Its scope is already one module
+scored by one focused test file, so it may be a two-line `if:` + `paths:` change — but its wall-clock is
+unmeasured. Trigger it once via `workflow_dispatch`, read the duration off the run page, then decide.
 
 ---
 
