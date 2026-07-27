@@ -12,6 +12,7 @@ the ``MEFOR_TEST_FORCE_AAD_BIND`` conftest fixture; these are the targeted, alwa
 
 from __future__ import annotations
 
+import base64
 from pathlib import Path
 
 import pytest
@@ -27,6 +28,28 @@ BODY = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|OUT1|P|2.5.1\rPID|1||200||ROE^RICH\
 async def _open_bound(path: Path, key: str, retired: list[str] | None = None) -> MessageStore:
     """Open a store whose cipher writes the cell-bound ``mfenc:v2`` marker (``aad_bind`` ON)."""
     return await MessageStore.open(path, cipher=make_cipher(key, retired or [], write_v2=True))
+
+
+def _plaintext_absent(cell: str, plaintext: str) -> bool:
+    """Is ``plaintext`` absent from the DECODED at-rest bytes of an ``mfenc`` cell?
+
+    Decoding first is the whole point. Substring-matching the BASE64 TEXT is wrong in both directions,
+    and this assertion previously did it with a 3-character needle ("DOE"):
+
+      * TOO SHORT -> FLAKY. The payload is base64 of a random nonce + AES-GCM ciphertext, so any short
+        needle appears by chance. Measured for a 3-char needle at this payload size: ~0.12% of runs,
+        i.e. roughly 1 in 850 -- which red-X'd a PR whose diff touched nothing near the store.
+      * TOO LONG -> VACUOUS. The obvious "fix" of a longer, more distinctive needle such as
+        "DOE^JANE" can NEVER match, because '^' is not in the base64 alphabet. The assertion would
+        pass unconditionally and prove nothing -- a worse outcome than the flake, because it looks
+        stronger.
+
+    Against the decoded bytes the needle is the FULL plaintext, so a false positive needs a collision
+    across the whole message rather than three characters: deterministic in practice, and it still
+    fails loudly if a cell ever carries its plaintext.
+    """
+    payload = cell.split(":", 4)[4]  # mfenc:v2:<alg>:<key_id>:<base64(nonce|ciphertext|tag)>
+    return plaintext.encode() not in base64.b64decode(payload)
 
 
 @pytest.fixture
@@ -56,7 +79,23 @@ async def test_messages_cells_roundtrip_under_aad_bind(aad_store: MessageStore) 
     async with aad_store._read() as db:
         cur = await db.execute("SELECT raw FROM messages WHERE id=?", (mid,))
         on_disk = (await cur.fetchone())["raw"]
-    assert on_disk.startswith("mfenc:v2:") and "DOE" not in on_disk
+    assert on_disk.startswith("mfenc:v2:")
+    assert _plaintext_absent(on_disk, RAW)
+
+
+def test_the_plaintext_probe_can_actually_fail() -> None:
+    """Guards the guard.
+
+    The assertion ``_plaintext_absent`` replaced was flaky, and the obvious alternative (a longer
+    needle against the base64 text) would have been VACUOUS -- it could never match. A probe that
+    cannot fail is indistinguishable from a passing one, so pin that this probe still reports a cell
+    that really does carry its plaintext. Without this, the round-trip test above would pass no matter
+    what the store wrote at rest.
+    """
+    leaked = "mfenc:v2:aes-gcm:k1:" + base64.b64encode(RAW.encode()).decode()
+    assert _plaintext_absent(leaked, RAW) is False, "the probe cannot see plaintext at rest"
+    opaque = "mfenc:v2:aes-gcm:k1:" + base64.b64encode(b"\x00" * 96).decode()
+    assert _plaintext_absent(opaque, RAW) is True
 
 
 async def test_queue_payload_roundtrip_and_claim(aad_store: MessageStore) -> None:
