@@ -5,9 +5,17 @@
 The reconcile invariant under test (both the load runner's and the connscale runner's copies): a
 ``timeouts``-counted message (in-flight at a connection close with no ACK seen) is UNCONFIRMED — the
 frame may never have left the closed socket — so ``read >= sent - timeouts`` is the honest intake
-bound, BUT the excusal is bounded by ``unconfirmed_budget`` (~one stranded in-flight per connection):
-past it the timeout count is a systemic no-ACK fault and NOTHING is excused. With ``timeouts == 0``
-(every healthy run) the check is exactly as strict as ``read >= sent``.
+bound, BUT the excusal is BOUNDED: past the bound the timeout count is a systemic no-ACK fault and
+NOTHING is excused. With ``timeouts == 0`` (every healthy run) the check is exactly as strict as
+``read >= sent``.
+
+The bound is ``max(unconfirmed_budget, sent // 2)``. It was ``unconfirmed_budget`` alone — "~one
+stranded in-flight frame per connection" — until that model was found to be wrong for this sender:
+``_inflight`` is an unbounded deque and open-loop sends are paced by the offered rate, not by an ACK
+slot, so genuine teardown stranding scales with rate x ACK-latency rather than the connection count.
+It false-failed a zero-loss run (14 stranded of 90 against a budget of 4) and red the required
+windows-2025 leg. Capping at half the run keeps ``read >= sent // 2`` always required, so a dead ACK
+path still fails loudly while ordinary teardown weather does not.
 
 These tests pin every edge the tolerance could silently widen through (the harness has caught real
 store bugs with this check — mf-load-test-harness — and that detection must survive the de-flake):
@@ -93,17 +101,28 @@ def test_connscale_reconcile_timeout_flood_fails_even_without_shortfall() -> Non
     # A systemic no-ACK fault: timeouts past the budget fail EVEN when every frame demonstrably
     # arrived (read == sent) — an engine that ingests but never ACKs is broken, and excusing an
     # unbounded count would let `timeouts == sent` degrade the intake bound to `read >= 0`.
-    c = Counters(sent=36, acked=30, timeouts=6, sink_received=36)
+    #
+    # NB the flood must now be a REAL one. The budget is max(connections, half the run), so the old
+    # 6-of-36 scenario is ordinary teardown stranding under the current bound, not a fault — it would
+    # pass here for the wrong reason. 30 of 36 unconfirmed is unambiguously a dead ACK path.
+    c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
     result = connscale_reconcile(c, _BASE, _sample(read=36, written=36), unconfirmed_budget=_BUDGET)
     assert not result.ok
     assert "stranding budget" in result.detail
     # And with the flood masking a real shortfall, nothing is excused: the loss is reported too.
-    c2 = Counters(sent=36, acked=30, timeouts=6, sink_received=30)
-    result2 = connscale_reconcile(
-        c2, _BASE, _sample(read=30, written=30), unconfirmed_budget=_BUDGET
-    )
+    c2 = Counters(sent=36, acked=6, timeouts=30, sink_received=6)
+    result2 = connscale_reconcile(c2, _BASE, _sample(read=6, written=6), unconfirmed_budget=_BUDGET)
     assert not result2.ok
-    assert "lost 6 on intake" in result2.detail
+    assert "lost 30 on intake" in result2.detail
+
+
+def test_connscale_reconcile_teardown_stranding_is_not_a_flood() -> None:
+    # The other side of the same boundary: ordinary teardown stranding (6 of 36, ~17% — the shape the
+    # old ~one-per-connection cap false-failed) reconciles clean when the engine read everything that
+    # was not stranded. This is the case the previous test used to assert FAILED.
+    c = Counters(sent=36, acked=30, timeouts=6, sink_received=30)
+    result = connscale_reconcile(c, _BASE, _sample(read=30, written=30), unconfirmed_budget=_BUDGET)
+    assert result.ok, result.detail
 
 
 def test_connscale_reconcile_tolerance_is_intake_only() -> None:
@@ -169,6 +188,46 @@ def test_load_reconcile_timeout_flood_fails_even_without_shortfall() -> None:
     )
     assert not result.ok
     assert "stranding budget" in result.detail
+
+
+def test_load_reconcile_ci_teardown_stranding_is_not_a_flood() -> None:
+    # Regression for the red windows-2025 leg (2026-07-27): a demonstrably zero-loss run whose
+    # teardown left 14 of 90 sends unconfirmed (~16%) against the old connection-count budget of 4.
+    # The engine read every send that was not stranded (84 == 90 - 6 never-left-the-socket) and
+    # delivered all of them twice (fan-out 2), so this MUST reconcile clean.
+    c = Counters(sent=90, acked=76, timeouts=14, sink_received=168)
+    result = load_reconcile(
+        c, _poller(_sample(read=84, written=168)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+
+
+def test_load_reconcile_excusal_is_capped_at_half_the_run() -> None:
+    # Mutation pin on the NEW bound. Half the run is the most the reconcile will ever forgive, so
+    # `read >= sent // 2` is always required and the intake bound can never go vacuous. Exactly at
+    # the cap passes; one over flips to a systemic fault with nothing excused.
+    at_cap = Counters(sent=90, acked=45, timeouts=45, sink_received=90)
+    assert load_reconcile(
+        at_cap, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
+    ).ok
+    over = Counters(sent=90, acked=44, timeouts=46, sink_received=88)
+    result = load_reconcile(
+        over, _poller(_sample(read=44, written=88)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok
+    assert "stranding budget" in result.detail
+
+
+def test_load_reconcile_loss_beyond_a_large_excusal_still_fails() -> None:
+    # The widened bound must not blunt real detection: with 14 legitimately excused, the 15th absent
+    # message is still confirmed-then-lost and still fails. This is the assertion that would break if
+    # the cap were ever raised to "excuse everything".
+    c = Counters(sent=90, acked=76, timeouts=14, sink_received=150)
+    result = load_reconcile(
+        c, _poller(_sample(read=75, written=150)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert not result.ok
+    assert "lost 1 on intake" in result.detail
 
 
 def test_load_reconcile_tolerance_is_intake_only() -> None:
