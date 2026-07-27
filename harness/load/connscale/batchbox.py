@@ -292,10 +292,8 @@ def aggregate_cell_record(
     engine_read = _engine_gauge("engine_read")
     engine_written = _engine_gauge("engine_written")
     backlog = _engine_gauge("backlog")
-    achieved_read = max((float(_thr(r, "achieved_aggregate_rate") or 0.0) for r in proc_reports))
-    achieved_written = max(
-        (float(_thr(r, "delivered_aggregate_rate") or 0.0) for r in proc_reports)
-    )
+    achieved_read = max(float(_thr(r, "achieved_aggregate_rate") or 0.0) for r in proc_reports)
+    achieved_written = max(float(_thr(r, "delivered_aggregate_rate") or 0.0) for r in proc_reports)
     in_pipeline_peak = max((int(_thr(r, "in_pipeline_peak") or 0) for r in proc_reports), default=0)
 
     # A timed-out drain in ANY process (drain_seconds None) poisons the cell's worst-case drain — the

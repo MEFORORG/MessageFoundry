@@ -17,9 +17,9 @@ import os
 import subprocess
 import sys
 import tempfile
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Sequence
 from xml.etree import ElementTree
 
 from harness.acceptance.matrix import MATRIX, Coverage, MatrixRow, Status

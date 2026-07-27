@@ -48,7 +48,7 @@ _DOC_SUFFIXES = (".md",)
 
 
 def _git(*args: str) -> str:
-    return subprocess.run(
+    return subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
     ).stdout
 

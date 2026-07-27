@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 from pathlib import Path
 
 from messagefoundry.parsing import normalize
@@ -36,10 +37,8 @@ async def _send(host: str, port: int, payload: str, timeout: float) -> bytes:
                 return message
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(OSError):
             await writer.wait_closed()
-        except OSError:
-            pass
 
 
 def main(argv: list[str] | None = None) -> int:

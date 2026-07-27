@@ -291,7 +291,7 @@ class RunReport:
         lines.append(
             f"engine: peak_backlog={e.peak_backlog} peak_queue_depth={e.peak_queue_depth} "
             f"dead={e.dead_letters} db_growth={e.db_growth_bytes}B "
-            f"drain={'%.1fs' % e.drain_seconds if e.drain_seconds is not None else 'TIMEOUT'} "
+            f"drain={f'{e.drain_seconds:.1f}s' if e.drain_seconds is not None else 'TIMEOUT'} "
             f"journal={e.journal_mode} synchronous={e.synchronous or 'n/a'} "
             f"backend={e.db_backend or '?'}"
         )

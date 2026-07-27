@@ -15,8 +15,8 @@ never re-parses or mutates them — only the ACK path looks inside a message.
 from __future__ import annotations
 
 import re
+from collections.abc import Iterator
 from datetime import datetime
-from typing import Iterator
 
 __all__ = [
     "SB",

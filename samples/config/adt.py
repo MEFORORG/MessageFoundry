@@ -23,7 +23,7 @@ downstream mnemonic), captured once at module top level. Both reload with the gr
 inside the handler works just as well — the engine/dry-run keeps the set active while a handler runs.)
 """
 
-from messagefoundry import File, MLLP, Send, code_set, handler, inbound, outbound, router
+from messagefoundry import MLLP, File, Send, code_set, handler, inbound, outbound, router
 
 inbound("IB_Test_ADT", MLLP(port=2575), router="adt_router")
 outbound("FILE-OUT_Test_ADT", File(directory="./out/adt", filename="{MSH-10}.hl7"))

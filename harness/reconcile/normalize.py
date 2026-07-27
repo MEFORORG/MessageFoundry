@@ -42,7 +42,7 @@ class Separators:
     subcomponent: str
 
     @classmethod
-    def from_message(cls, message: str) -> "Separators":
+    def from_message(cls, message: str) -> Separators:
         """Read the separators from the ``MSH`` header (``MSH-1`` = field sep, ``MSH-2`` = enc chars)."""
         norm = _normalize_line_endings(message)
         if not norm.startswith("MSH") or len(norm) < 5:
@@ -78,7 +78,7 @@ class NormalizeRules:
     sort_segments: frozenset[str] = frozenset()
     ignore_segments: frozenset[str] = frozenset()
 
-    def with_blanks(self, *fields: tuple[str, int]) -> "NormalizeRules":
+    def with_blanks(self, *fields: tuple[str, int]) -> NormalizeRules:
         """Return a copy with extra blanked fields added (keeps the defaults)."""
         return NormalizeRules(
             blank_fields=self.blank_fields | frozenset(fields),

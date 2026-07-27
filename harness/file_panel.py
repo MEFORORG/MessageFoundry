@@ -30,10 +30,12 @@ from PySide6.QtWidgets import (
 )
 
 from harness._console_widgets import ConfigurableTable
-from messagefoundry.generators import _core
-from messagefoundry.generators import all_types  # noqa: F401  (registers the built-in message types)
 from harness.file_transport import DropResult, FileDropWorker, FolderWatcher
 from harness.mllp import Received, SendItem
+from messagefoundry.generators import (
+    _core,
+    all_types,  # noqa: F401  (registers the built-in message types)
+)
 
 _RANDOM = "(random across all)"
 _DROP_COLUMNS = ["#", "Type", "Trigger", "Control ID", "File", "Error"]

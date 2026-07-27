@@ -277,7 +277,20 @@ jobs:
           # `tee/` is in-tree vendored SOUP (a standalone relay) — scanned to the SAME bar as the
           # engine. Its one urllib GET (tee/mefor_api.py) is per-line `# nosec B310`: the URL scheme is
           # fixed by operator config (default localhost), never message-derived.
-          bandit -r messagefoundry tee --skip B101,B110,B311,B404,B608
+          #
+          # SCOPE = the whole repo minus the excludes below, which mirrors the pre-commit bandit hook
+          # (.pre-commit-config.yaml) EXACTLY. It was `-r messagefoundry tee` while the hook scanned
+          # everything except tests/harness/samples — so scripts/ (security tooling, subprocess-heavy)
+          # was gated locally and by nothing in CI. Touching a file there failed the commit on findings
+          # no CI run could report. Widening cost nothing: the repo is already clean at this bar.
+          #   tests/harness/samples — intentional non-production idioms (asserts, synthetic-data RNG)
+          #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper: 20 B105/B106
+          #                           "hardcoded password" hits that are all literal test credentials
+          #   ide/                  — TypeScript; no Python to scan
+          #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          # tests/test_lint_scope_parity.py fails if this and the hook drift apart again.
+          bandit -r . --skip B101,B110,B311,B404,B608 \
+            --exclude ./tests,./harness,./samples,./ide,./docs/benchmarks/results,./packaging/messagefoundry-webconsole/tests,./.venv,./node_modules
 
   gitleaks:
     name: gitleaks (secret scan)

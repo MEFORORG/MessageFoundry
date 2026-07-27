@@ -12,8 +12,8 @@ from __future__ import annotations
 import csv
 import io
 from collections import Counter
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from harness._spreadsheet import (
     SPREADSHEET_FORMULA_TRIGGERS,

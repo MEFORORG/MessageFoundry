@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -39,7 +40,7 @@ import re
 import ssl
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from tee import __version__, mefor_api
@@ -113,7 +114,7 @@ def _parse_age(spec: str) -> float:
         seconds = int(match.group(1)) * {"d": 86400, "h": 3600, "m": 60}[match.group(2)]
         return time.time() - seconds
     try:
-        day = datetime.strptime(spec, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day = datetime.strptime(spec, "%Y-%m-%d").replace(tzinfo=UTC)
     except ValueError:
         raise argparse.ArgumentTypeError(
             f"expected an age like '7d'/'12h'/'30m' or a UTC date 'YYYY-MM-DD', got {spec!r}"
@@ -336,10 +337,8 @@ async def _run(args: argparse.Namespace) -> int:
         capture_corepoint_copy=args.capture_corepoint_copy,
     )
     relay = TeeRelay(config)
-    try:
+    with contextlib.suppress(asyncio.CancelledError):
         await relay.serve_forever()
-    except asyncio.CancelledError:
-        pass
     return 0
 
 
@@ -353,7 +352,7 @@ async def _naks(args: argparse.Namespace) -> int:
         print("no NAKs or transport errors logged")
         return 0
     for row in rows:
-        when = datetime.fromtimestamp(row.at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        when = datetime.fromtimestamp(row.at, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
         code = row.ack_code or row.outcome
         print(
             f"{when}  {row.direction:<17}  {row.leg:<9}  {code:<6}  "

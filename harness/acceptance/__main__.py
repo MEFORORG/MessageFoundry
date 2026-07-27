@@ -35,7 +35,7 @@ from harness.acceptance.runner import run_matrix
 
 def main(argv: list[str] | None = None) -> int:
     for _stream in (sys.stdout, sys.stderr):
-        try:
+        try:  # noqa: SIM105 - suppress() would add an import to satisfy a pure style preference
             _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError, OSError):
             pass

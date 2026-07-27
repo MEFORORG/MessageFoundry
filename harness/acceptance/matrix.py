@@ -23,10 +23,10 @@ every ``PROBE`` key is registered and every ``PYTEST`` node-id file exists on di
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 
 
-class Status(str, Enum):
+class Status(StrEnum):
     """Outcome of a single matrix row. ``str`` mix-in so it serialises as its value."""
 
     PASS = "PASS"
@@ -36,7 +36,7 @@ class Status(str, Enum):
     ERROR = "ERROR"  # the check itself broke (bad node id, probe raised)
 
 
-class Coverage(str, Enum):
+class Coverage(StrEnum):
     """How a row is exercised."""
 
     PROBE = "probe"

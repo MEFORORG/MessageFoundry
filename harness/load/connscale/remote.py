@@ -34,15 +34,16 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import itertools
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from harness.load.connscale.driver import ConnScaleDriver
 from harness.load.connscale.report import NoLoss
 from harness.load.connscale.runner import ConnScaleError, _reconcile
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EngineSample, EnginePoller, sample_until_reconciled
+from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
 from harness.load.failover import _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -205,7 +206,10 @@ def check_remote_bands(
 
 def _reject_overlaps(blocks: list[tuple[int, int]], label: str) -> None:
     ordered = sorted(blocks)
-    for (alo, ahi), (blo, bhi) in zip(ordered, ordered[1:]):
+    # pairwise, not zip(x, x[1:]): the operands differ in length BY DESIGN here, so this is the one
+    # B905 site where `strict=True` would be wrong — it would raise on every non-empty input. pairwise
+    # states "adjacent pairs" directly and drops the throwaway slice copy.
+    for (alo, ahi), (blo, bhi) in itertools.pairwise(ordered):
         if blo <= ahi:
             raise ConnScaleError(
                 f"{label} bands [{alo},{ahi}] and [{blo},{bhi}] overlap — sink/inbound bands per process "
@@ -372,7 +376,7 @@ async def run_connscale_remote(
 
 
 def _now_iso() -> str:
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 async def _sample_loop(
@@ -383,7 +387,5 @@ async def _sample_loop(
         sample = await poller.sample_once()
         if sample is not None:
             out.append(sample)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except (asyncio.TimeoutError, TimeoutError):
-            pass

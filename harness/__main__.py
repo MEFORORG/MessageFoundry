@@ -86,6 +86,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from datetime import UTC
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -94,7 +95,7 @@ def main(argv: list[str] | None = None) -> int:
     # CI use. Force UTF-8 on the CLI streams — best-effort, since a pytest/redirect wrapper may
     # not support reconfigure.
     for _stream in (sys.stdout, sys.stderr):
-        try:
+        try:  # noqa: SIM105 - suppress() would add an import to satisfy a pure style preference
             _stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[attr-defined]
         except (AttributeError, ValueError, OSError):
             pass
@@ -268,8 +269,8 @@ def _list_scenarios() -> int:
 
 
 def _run_scenario(name: str, engine_url: str, token: str | None, timeout: float) -> int:
-    from messagefoundry.apiclient import ApiError, EngineClient
     from harness.scenarios import SCENARIOS, run_scenario
+    from messagefoundry.apiclient import ApiError, EngineClient
 
     scenario = SCENARIOS.get(name)
     if scenario is None:
@@ -302,11 +303,10 @@ def _run_load(args: argparse.Namespace) -> int:
     import time
     from pathlib import Path
 
-    from messagefoundry.apiclient import ApiError
-
     from harness.load.profile import LoadProfileError, get_profile
     from harness.load.report import compare_to_baseline
     from harness.load.runner import PreflightError, run_load
+    from messagefoundry.apiclient import ApiError
 
     try:
         profile = get_profile(args.load)
@@ -1249,10 +1249,9 @@ def _run_shardcert_driver(argv: list[str]) -> int:
     import json
     from pathlib import Path
 
-    from messagefoundry.apiclient import ApiError
-
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_driver
+    from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -1523,10 +1522,9 @@ def _run_shardcert_drive(argv: list[str]) -> int:
     parser.add_argument("--report-json", help="write the JSON report to this path")
     args = parser.parse_args(argv)
 
-    from messagefoundry.apiclient import ApiError
-
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import run_shardcert_drive
+    from messagefoundry.apiclient import ApiError
 
     coord = _coord_from_args(args)
     assert isinstance(coord, FileDropCoord)
@@ -1776,7 +1774,7 @@ def _run_shardcert_engine_ladder(argv: list[str]) -> int:
 
 def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     import asyncio
-    from datetime import datetime, timezone
+    from datetime import datetime
 
     parser = argparse.ArgumentParser(
         prog="harness shardcert-drive-ladder",
@@ -1868,11 +1866,10 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
     parser.add_argument("--report-json", help="write the consolidated JSON report to this path")
     args = parser.parse_args(argv)
 
-    from messagefoundry.apiclient import ApiError
-
     from harness.load.coord import CoordTimeout, FileDropCoord
     from harness.load.shardcert import parse_rate_ladder
     from harness.load.shardcert_ladder import run_drive_ladder
+    from messagefoundry.apiclient import ApiError
 
     try:
         rates = parse_rate_ladder(args.rate_ladder)
@@ -1936,7 +1933,7 @@ def _run_shardcert_drive_ladder(argv: list[str]) -> int:
             # P2: the raw --rate-ladder string (the invocation's primary independent variable, and the value
             # that must match the engine box verbatim) so the consolidated JSON is self-describing.
             "rate_ladder": args.rate_ladder,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "generated_at": datetime.now(UTC).isoformat(),
             "commit_sha": _git_commit_sha(),
         }
         # D5 P1: parent-mkdir + never raise on a bad path (a completed run's exit_code must still return).

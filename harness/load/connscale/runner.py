@@ -54,7 +54,7 @@ from harness.load.connscale.report import (
 )
 from harness.load.corpus import Corpus, build_corpus
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EngineSample, EnginePoller, sample_until_reconciled
+from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
 from harness.load.failover import EngineNode, FailoverError, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -680,10 +680,8 @@ async def _sample_loop(
                 proc = await loop.run_in_executor(None, fd_sampler.sample_proc)
                 _PROC_BY_SAMPLE[id(sample)] = proc
             out.append(sample)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except asyncio.TimeoutError:
-            pass
 
 
 # OS-side process readings (handle count + CPU-seconds + working set) are keyed to the EngineSample

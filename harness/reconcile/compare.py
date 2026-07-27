@@ -21,8 +21,6 @@ import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from messagefoundry.parsing.peek import normalize as _normalize_line_endings
-
 from harness.reconcile.normalize import (
     Difference,
     NormalizeRules,
@@ -30,6 +28,7 @@ from harness.reconcile.normalize import (
     Separators,
     diff,
 )
+from messagefoundry.parsing.peek import normalize as _normalize_line_endings
 
 #: Default per-connection match key — the message control id (``MSH-10``).
 DEFAULT_KEY: tuple[str, int] = ("MSH", 10)

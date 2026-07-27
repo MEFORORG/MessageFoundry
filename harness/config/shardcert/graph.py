@@ -29,17 +29,16 @@ Every value here is synthetic and generic — no real partner, site, host, or vo
 
 from __future__ import annotations
 
-from messagefoundry import MLLP, Send, handler, inbound, outbound, router
-from messagefoundry.config.models import RetryPolicy
-from messagefoundry.config.wiring import HandlerFn, RouterFn
-from messagefoundry.parsing.message import Message, RawMessage
-
 from harness.config.shardcert._shape import (
     ShardCertShape,
     apply_transform,
     load_shape,
     shared_dest_name,
 )
+from messagefoundry import MLLP, Send, handler, inbound, outbound, router
+from messagefoundry.config.models import RetryPolicy
+from messagefoundry.config.wiring import HandlerFn, RouterFn
+from messagefoundry.parsing.message import Message, RawMessage
 
 _SHAPE = load_shape()
 

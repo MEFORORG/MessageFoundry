@@ -24,15 +24,14 @@ import socket
 import time
 from collections.abc import Sequence
 
-from messagefoundry.config.models import AckMode
-from messagefoundry.parsing import Peek
-from messagefoundry.parsing.peek import HL7PeekError
-from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
-
 from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
 from harness.load.ids import ControlIds
 from harness.load.metrics import LiveMetrics
+from messagefoundry.config.models import AckMode
+from messagefoundry.parsing import Peek
+from messagefoundry.parsing.peek import HL7PeekError
+from messagefoundry.transports.mllp import MLLPDecoder, build_ack, frame
 
 _READ_BYTES = 65536  # larger than the engine's inbound read: the sink only absorbs, never routes
 

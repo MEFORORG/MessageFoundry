@@ -33,6 +33,7 @@ handshake needs. It is intentionally NOT a general message bus — two named mes
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import time
@@ -213,7 +214,5 @@ class CoordTimeout(TimeoutError):
 
 def with_missing_ok_unlink(path: Path) -> None:
     """``Path.unlink(missing_ok=True)`` but tolerant of a concurrent unlink (best-effort cleanup)."""
-    try:
+    with contextlib.suppress(OSError):
         path.unlink(missing_ok=True)
-    except OSError:
-        pass

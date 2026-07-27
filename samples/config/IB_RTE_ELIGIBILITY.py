@@ -20,11 +20,11 @@ Peers are environment-specific → ``env()`` (resolved from ``environments/<env>
 """
 
 from messagefoundry import (
+    X12,
     AckMode,
     ContentType,
     Loopback,
     Send,
-    X12,
     env,
     handler,
     inbound,

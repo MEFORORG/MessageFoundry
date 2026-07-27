@@ -27,11 +27,10 @@ import json
 import sys
 from pathlib import Path
 
-from messagefoundry.config.models import AckMode
-
 from harness.reconcile.compare import DEFAULT_KEY, ReconcileResult, load_messages, reconcile
 from harness.reconcile.normalize import NormalizeRules
 from harness.reconcile.report import render_json, render_text
+from messagefoundry.config.models import AckMode
 
 
 def _parse_field(spec: str) -> tuple[str, int]:

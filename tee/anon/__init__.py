@@ -23,7 +23,7 @@ from pathlib import Path
 from .hl7 import anonymize_message
 from .keying import Keyer
 from .leak import leak_check
-from .rules import AnonError, DEFAULT_RULES, FieldRule, RuleError, SurrogateKind, load_rules
+from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
 
 __all__ = [
     "DEFAULT_RULES",

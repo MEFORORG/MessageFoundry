@@ -20,9 +20,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.apiclient import ApiError, EngineClient
-
 from harness._console_widgets import ERROR_COLOR
+from messagefoundry.apiclient import ApiError, EngineClient
 
 
 class LoginDialog(QDialog):

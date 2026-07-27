@@ -64,11 +64,18 @@ repos:
     hooks:
       - id: gitleaks
 
-  # Python SAST — same test set + skips as the CI bandit job (security.yml). Engine code only;
-  # tests/harness/samples carry intentional non-production idioms (asserts, synthetic-data RNG).
+  # Python SAST — the SAME skips AND the same excluded paths as the CI bandit job (security.yml).
+  # It said "same ... as CI" before and was not: CI scanned `-r messagefoundry tee` while this hook
+  # scanned everything but tests/harness/samples, so scripts/ was gated here and by nothing in CI —
+  # a commit could fail on findings no CI run would ever report. Both sides now name one list, and
+  # tests/test_lint_scope_parity.py fails if they drift.
+  #   tests/harness/samples   — intentional non-production idioms (asserts, synthetic-data RNG)
+  #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper (literal test creds)
+  #   ide/                    — TypeScript; no Python to scan
+  #   docs/benchmarks/results — archived measurement artifacts, not maintained source
   - repo: https://github.com/PyCQA/bandit
     rev: 1.9.4
     hooks:
       - id: bandit
         args: ["--skip", "B101,B110,B311,B404,B608"]
-        exclude: ^(tests/|harness/|samples/)
+        exclude: ^(tests/|harness/|samples/|ide/|docs/benchmarks/results/|packaging/messagefoundry-webconsole/tests/)

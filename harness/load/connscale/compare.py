@@ -144,9 +144,7 @@ class ComparisonRow:
             return False
         if self.collapse_verdict == COLLAPSE_FAIL:
             return False
-        if self.throughput_comparable and not self.throughput_ok:
-            return False
-        return True
+        return not (self.throughput_comparable and not self.throughput_ok)
 
 
 @dataclass(frozen=True)
@@ -315,7 +313,7 @@ def build_comparison(
     """Build the per_lane-vs-pooled A/B from a run's records. Returns ``None`` for a single-arm profile
     (nothing to compare). ``missing_detail`` maps a ``(sweep_mode, count)`` whose pooled arm failed to
     start to the loud reason (from the runner), surfaced on the missing row."""
-    modes = [m for m in claim_modes]
+    modes = list(claim_modes)
     if len(modes) < 2:
         return None
     baseline_mode = BASELINE_MODE if BASELINE_MODE in modes else modes[0]

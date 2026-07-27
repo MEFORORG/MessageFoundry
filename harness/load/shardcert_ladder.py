@@ -66,6 +66,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from harness.config.shardcert._shape import BROADCAST
 from harness.load.coord import (
     DRIVE_START,
     ENGINE_DRAINED,
@@ -77,7 +78,6 @@ from harness.load.coord import (
     CoordTimeout,
     FileDropCoord,
 )
-from harness.config.shardcert._shape import BROADCAST
 from harness.load.enginepoll import EMPTY_POOL_STATS, PoolStats
 from harness.load.shardcert import (
     FIDELITY_ACKED_FLOOR,
@@ -90,9 +90,9 @@ from harness.load.shardcert import (
     ShardCertEngineReport,
     fidelity_note,
     inbound_band_count,
-    rung_fidelity,
     run_shardcert_drive,
     run_shardcert_engine,
+    rung_fidelity,
 )
 
 #: 45M messages/day as the sustained TOTAL message-event rate (inbound + outbound) the ladder pins
@@ -354,7 +354,7 @@ class ClaimTiming:
     #: `stage=`. The blend is retained (its Σn·mean busy-time is exact, and prior reports quote it) but it
     #: is NOT the outbound claim and must never be read as one. Read `by_stage["outbound"]` for that.
     #: Empty on a pre-stage log.
-    by_stage: dict[str, "ClaimTiming"] = field(default_factory=dict)
+    by_stage: dict[str, ClaimTiming] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:
@@ -558,7 +558,7 @@ class EpisodeTiming:
     )
     utilization: float  # n-weighted mean (episode + dropped occupancy) / (window × lanes)
     #: PER-STAGE split — the ONLY correct read for ARM 1. Empty on a log with no episode lines.
-    by_stage: dict[str, "EpisodeTiming"] = field(default_factory=dict)
+    by_stage: dict[str, EpisodeTiming] = field(default_factory=dict)
 
     @property
     def is_empty(self) -> bool:

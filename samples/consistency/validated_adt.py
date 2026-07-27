@@ -23,7 +23,7 @@ Run::
     python -m messagefoundry serve --config samples/consistency --db ./mf.db --env dev
 """
 
-from messagefoundry import File, MLLP, Send, handler, inbound, outbound, router
+from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router
 from messagefoundry.parsing.consistency import (
     ConsistencyError,
     check,
