@@ -16,9 +16,13 @@ quarantined at cutover, and nothing replaced it.
 
 WHAT THIS IS NOT. A guardrail, not a security boundary: ``git push --no-verify`` skips it, and it is
 local-only, so a different machine is unprotected. It removes the ACCIDENT, not the capability. The
-durable server-side fix is ``enforce_admins=true``, which is deliberately NOT in place yet because a
-known flaky test (BACKLOG #17) has blocked two consecutive PRs, and removing the override while a
-flake can strand a merge trades an accidental-push risk for a cannot-ship risk.
+durable server-side fix is ``enforce_admins=true``, which was deliberately NOT enabled while an
+intermittent harness-monitor failure was blocking consecutive PRs -- removing the admin override while
+a flake can strand a merge trades an accidental-push risk for a cannot-ship risk. That failure turned
+out to be a livelock in ``MessagesPanel._apply`` rather than a flake, and is fixed
+(``tests/test_console_messages_refresh.py``), so the argument against ``enforce_admins`` is weaker now
+than when this was written. (An earlier revision of this note cited "BACKLOG #17" for it; that is the
+py3.11 pytest/aiosqlite deadlock, OBSOLETE and unrelated.)
 
 Stdlib only, like the other gates -- most worktrees have no project .venv.
 

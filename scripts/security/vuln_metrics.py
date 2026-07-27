@@ -27,6 +27,7 @@ import argparse
 import base64
 import csv
 import json
+import os
 import re
 import statistics
 import subprocess
@@ -264,7 +265,14 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    p.add_argument("--repo", default="wshallwshall/MessageFoundry")
+    # Measure the repo the workflow actually runs in. vuln-metrics.yml invokes this with no --repo, so a
+    # hardcoded default silently decides what gets measured: it named the private vault, whose Dependabot
+    # PRs a public GITHUB_TOKEN cannot read — every KPI would have been computed over an empty window.
+    # $GITHUB_REPOSITORY makes it self-correcting; the literal is only for a local run outside Actions.
+    p.add_argument(
+        "--repo",
+        default=os.environ.get("GITHUB_REPOSITORY") or "MEFORORG/MessageFoundry",
+    )
     p.add_argument("--limit", type=int, default=200, help="Dependabot PRs to scan (the window)")
     p.add_argument("--timeout", type=float, default=20.0)
     p.add_argument("--csv", default="docs/security/metrics/vuln-metrics.csv")

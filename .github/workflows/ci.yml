@@ -47,11 +47,11 @@ jobs:
     # edge can't wedge the required context.)
     needs: changes
     # Every leg runs on GitHub-HOSTED runners now — the self-hosted NucBox Windows runners are RETIRED.
-    # The PRIVATE repo (wshallwshall) runs the UBUNTU leg only (its remaining Actions cost); the mirror
-    # (MEFORORG) runs the full ubuntu + windows-2022 + windows-2025 matrix, all FREE (hosted minutes are
-    # free on the public mirror). Hosted-everywhere is also safer: a self-hosted runner must never be
-    # reachable by a public repo (fork PR = RCE on the owner's LAN). `matrix.hosted` is the runner label
-    # set; the per-repo matrix (which drops the Windows legs on the private repo) is built in `changes`.
+    # This repo (MEFORORG) runs the full ubuntu + windows-2022 + windows-2025 matrix, all FREE (hosted
+    # minutes are free on a public repo); a FORK building its own pushes gets the UBUNTU leg only, to
+    # keep a contributor's personal CI cheap. Hosted-everywhere is also safer: a self-hosted runner must
+    # never be reachable by a public repo (fork PR = RCE on the owner's LAN). `matrix.hosted` is the
+    # runner label set; the per-repo matrix is built in `changes`.
     runs-on: ${{ matrix.hosted }}
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
     # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
@@ -61,11 +61,11 @@ jobs:
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
-      # Per-repo matrix from the `changes` job: ubuntu-only on the private repo (Windows runners retired),
-      # full ubuntu+windows matrix on the mirror. Each leg carries os / python-version / hosted (the
-      # runner labels, an array) + the timeout knobs. NB: the Windows legs no longer EXIST on the private
-      # repo, so drop `test (windows-2022/2025, py3.14)` from wshallwshall's REQUIRED checks — a
-      # required-but-absent context blocks the PR forever.
+      # Per-repo matrix from the `changes` job: the full ubuntu+windows matrix here, ubuntu-only on a
+      # fork's own pushes. Each leg carries os / python-version / hosted (the runner labels, an array) +
+      # the timeout knobs. NB: a fork *PR* against this repo still runs in THIS repo's context, so it
+      # gets the full matrix — the required `test (windows-2022/2025, py3.14)` contexts are always
+      # present on a PR here, and a required-but-absent context (which blocks a PR forever) can't occur.
       matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}
     defaults:
       run:

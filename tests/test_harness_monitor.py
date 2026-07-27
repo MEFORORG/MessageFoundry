@@ -162,13 +162,17 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
 # Override the global 60s per-test watchdog: the two waits share a 60s budget, and fixture/engine
 # startup sits outside it, so a slow-but-passing CI run could otherwise brush the 60s cap.
 #
-# NO reruns=2 here any more, deliberately. It was added to let BACKLOG #17 "self-heal" within a run,
-# on the theory that this was a residual timing flake on loaded Windows runners. It was not: the
-# message list was livelocking (MessagesPanel._apply discarded every snapshot as superseded while this
-# test polled refresh() at 50ms — see tests/test_console_messages_refresh.py), which is why neither
-# 10s→30s nor the reruns ever fixed it. That is now fixed at the source. Keeping the retry would only
-# hide the next real defect the same way it hid this one, and would make the fix unmeasurable — a
-# masked failure looks exactly like a working one.
+# NO reruns=2 here any more, deliberately. It was added to let this "self-heal" within a run, on the
+# theory that it was a residual timing flake on loaded Windows runners. It was not: the message list
+# was livelocking (MessagesPanel._apply discarded every snapshot as superseded while this test polled
+# refresh() at 50ms — see tests/test_console_messages_refresh.py), which is why neither 10s→30s nor the
+# reruns ever fixed it. That is now fixed at the source. Keeping the retry would only hide the next real
+# defect the same way it hid this one, and would make the fix unmeasurable — a masked failure looks
+# exactly like a working one.
+#
+# The comment this replaced blamed "BACKLOG #17". That is the py3.11 pytest/aiosqlite cancellation
+# deadlock, OBSOLETE since the 3.14-only migration and unrelated to anything here — a wrong citation
+# that survived long enough to be copied into new files. This defect has no backlog entry.
 @pytest.mark.timeout(120)
 def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
     url, inbox = server
@@ -201,7 +205,7 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
 def test_monitor_observes_a_message_that_arrives_after_connect(
     qapp: Any, server: tuple[str, Path]
 ) -> None:
-    """The deterministic form of what CI kept hitting, and the reason BACKLOG #17 looked like a flake.
+    """The deterministic form of what CI kept hitting, and the reason this looked like a flake at all.
 
     The sibling test writes the message BEFORE the panel connects, so the single initial ``refresh()``
     in ``_build_inner`` normally renders it and the polling path below is never exercised at all. That
