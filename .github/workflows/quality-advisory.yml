@@ -7,12 +7,31 @@ name: quality-advisory
 # raw complexity, coverage %, and clone counts are weak / gameable signals (rubric section 4.1) and must
 # never be a hard gate. This workflow is NOT in branch protection; adding a job here cannot freeze the repo.
 #
-# Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7):
-#   * signal 11 - complexity triage (ruff C901)        -> BUILT (complexity job)
-#   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job)
-#   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only)
-#   * signal  7 - mutation testing (highest leverage)   -> BUILT (mutation job; mirror-nightly + workflow_dispatch)
+# Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7), each with how
+# it reaches a reviewer:
+#   * signal 11 - complexity triage (ruff C901)        -> BUILT (complexity job); PR-caused DELTA as
+#                                                         annotations + step summary, full list in the log
+#   * signal  9 - clone / duplication (jscpd)           -> BUILT (clone job); step summary only, see below
+#   * signal  8 - diff-coverage visibility              -> BUILT (coverage job; PR-only); INLINE `::notice`
+#                                                         annotations on the Files changed tab + summary
+#   * signal  7 - mutation testing (highest leverage)   -> BUILT (mutation job; mirror-nightly + workflow_dispatch);
+#                                                         step summary + artifact, no PR surface (never runs on PRs)
 # signal 10 (lint breadth) is a coordinated one-shot sweep, not an advisory job; DORA is a context caveat, not a gate.
+#
+# WHY THIS USES WORKFLOW-COMMAND ANNOTATIONS AND *NOT* CODE SCANNING / SARIF. This was measured, not
+# assumed, and the measurements are recorded here so a future session does not "helpfully" add a SARIF
+# upload back:
+#   1. All 122 C901 findings on this tree are SINGLE-LINE regions anchored on the function-name token of
+#      the `def`. GitHub renders an alert inline only when its lines are in the diff, so a PR adding
+#      branching INSIDE a function surfaces nothing, while a signature reflow fires on pre-existing debt.
+#   2. jscpd emits ONE location per clone pair, chosen by scan order, so ~8 files can never be the anchor
+#      and roughly half of newly-introduced clones would anchor on the untouched twin.
+#   3. Uploading on pull_request only leaves NO default-branch baseline, so every PR forever would report
+#      all ~161 findings as new -- not a one-off first-PR blip.
+# Workflow commands need no token and no permission grant, and behave identically on fork PRs. Every job
+# below therefore holds `contents: read` and nothing else; the workflow grants NO write scope anywhere,
+# which is what actually guarantees it cannot gate a merge. tests/test_quality_advisory_invariants.py
+# pins that, and pins the absence of any SARIF upload.
 
 on:
   pull_request:
@@ -40,15 +59,48 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # The delta step needs the base branch's history for `git merge-base`.
+          fetch-depth: 0
       - name: Install ruff (pinned)
-        run: pipx install ruff==0.15.19
+        # Held to the SAME version as constraints.lock / requirements.lock / uv.lock (previously 0.15.19
+        # against their 0.15.22 -- unguarded drift). This is now load-bearing: c901_delta.py parses ruff's
+        # human-readable C901 message because ruff exposes the complexity number nowhere else, so a skew
+        # can change the wording under the parser. Nothing automates this -- DEP-1 byte-diffs the exported
+        # locks and cannot see a version inside a `run:` body.
+        run: pipx install ruff==0.15.22
       - name: Ruff C901 complexity triage (advisory - never gates)
+        continue-on-error: true
         run: |
           echo "== functions over mccabe complexity 10 (advisory triage; NEVER a merge gate) =="
           ruff check --select C901 --output-format=concise --exit-zero messagefoundry
           echo ""
           echo "== summary =="
           ruff check --select C901 --statistics --exit-zero messagefoundry
+      - name: Complexity delta vs the merge base (advisory - never gates)
+        # PR-only: there is no base ref to diff against on the cron or on workflow_dispatch, where the
+        # whole-repo console triage above remains the full picture.
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          echo "== complexity this PR CHANGED (advisory; pre-existing findings deliberately omitted) =="
+          git fetch --no-tags origin "$BASE_REF" || true
+          MERGE_BASE="$(git merge-base HEAD "origin/$BASE_REF")"
+          echo "merge base: $MERGE_BASE"
+          ruff check --select C901 --output-format=json --exit-zero messagefoundry > c901-head.json
+          # A second checkout of the merge base, so the "before" numbers come from real ruff output
+          # rather than a reconstruction. Its absolute paths differ from HEAD's by the extra directory;
+          # c901_delta.py collapses both to repo-relative keys (regression-tested -- if it did not,
+          # every function would report as new).
+          git worktree add --detach base-tree "$MERGE_BASE"
+          ( cd base-tree && ruff check --select C901 --output-format=json --exit-zero messagefoundry ) \
+            > c901-base.json
+          python3 scripts/quality/c901_delta.py \
+            --base c901-base.json \
+            --head c901-head.json \
+            --repo-root . \
+            --summary-file "$GITHUB_STEP_SUMMARY"
 
   clone:
     # Signal 9 - duplication / clone detection. Flags copy-pasted blocks (the "copy-instead-of-abstract"
@@ -65,13 +117,32 @@ jobs:
         with:
           persist-credentials: false
       - name: jscpd clone report (advisory - never gates)
+        continue-on-error: true
         run: |
           echo "== copy-pasted blocks in messagefoundry/ (advisory; justified store-backend parity ignored) =="
+          # Summary only, DELIBERATELY. jscpd ships a SARIF reporter and it works, but each result
+          # carries exactly ONE location -- whichever file jscpd scanned first -- so the case this
+          # signal exists for (a PR copy-pasting an existing block into a new place) anchors on the
+          # untouched twin about half the time. That is a coin flip, not a diff-scoped signal.
+          # Keep the 4.x pin: npm `latest` is a 5.x Rust rewrite with a different CLI.
           npx --yes jscpd@4.0.5 messagefoundry \
             --min-tokens 60 \
             --ignore "**/store/sqlserver.py,**/store/postgres.py" \
-            --reporters console \
+            --reporters console,markdown \
+            --output ./jscpd-report \
             || true
+          if [ -f jscpd-report/jscpd-report.md ]; then
+            {
+              echo "## Duplicate blocks (jscpd)"
+              echo ""
+              # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+              # ENTIRELY, so truncate rather than silently lose the whole summary.
+              head -c 900000 jscpd-report/jscpd-report.md
+              echo ""
+              echo "<sub>Advisory only. Clone locations are in the job log — see the note in the"
+              echo "workflow for why these are not annotated on the diff.</sub>"
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   coverage:
     # Signal 8 - diff-coverage visibility. Runs the suite under coverage, then reports coverage of the
@@ -104,18 +175,42 @@ jobs:
       - name: Install project + coverage tools
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          uv pip install --system --constraint constraints.lock pytest-cov diff-cover
+          # NEITHER package is in constraints.lock, so the --constraint above is a no-op for them and both
+          # previously floated to whatever PyPI served that day. diff-cover is now pinned exactly: the
+          # inline-annotation surface depends on `--format github-annotations:<level>` and on adjacent-line
+          # coalescing in GitHubAnnotationsReportGenerator. Deliberately NOT in pyproject.toml -- these are
+          # CI-only tools, and adding them would trip the DEP-1 lock-sync gate and force four re-exports.
+          uv pip install --system --constraint constraints.lock pytest-cov "diff-cover==10.4.1"
       - name: Tests under coverage (advisory - never fails)
+        continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: pytest -q --cov=messagefoundry --cov-report=xml --cov-report=term-missing:skip-covered || true
       - name: Diff-coverage vs the PR base (advisory - never fails)
+        continue-on-error: true
         env:
           BASE_REF: ${{ github.base_ref }}
         run: |
           echo "== coverage of the lines this PR changed (advisory; not a whole-repo % gate) =="
           git fetch --no-tags --depth=1 origin "$BASE_REF" || true
-          diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 || true
+          # `github-annotations:notice` writes `::notice file=...,line=N,endLine=M` workflow commands to
+          # STDOUT, which the runner turns into INLINE annotations on the Files changed tab -- no token,
+          # no permission grant, identical behaviour on fork PRs. Adjacent uncovered lines are coalesced
+          # into ranges, so a long uncovered block costs one annotation rather than one per line. Every
+          # line flagged is a line this PR changed, so there is no pre-existing-debt noise by construction.
+          # The console report still prints, so the job log is unchanged.
+          diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 \
+            --format "github-annotations:notice,markdown:diff-cover.md" || true
+          if [ -f diff-cover.md ]; then
+            {
+              echo "## Diff coverage"
+              echo ""
+              # The markdown report embeds a source snippet per uncovered line, so it can get large.
+              # $GITHUB_STEP_SUMMARY is capped at 1 MiB per step and an oversized write is DROPPED
+              # ENTIRELY -- truncate rather than silently lose the whole summary.
+              head -c 900000 diff-cover.md
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
 
   mutation:
     # Signal 7 - mutation testing (advisory; the HIGHEST-leverage gate -- it adversarially checks the
@@ -150,6 +245,7 @@ jobs:
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
           uv pip install --system --constraint constraints.lock "mutmut<3"
       - name: Mutation-test a bounded scope (advisory - never fails)
+        continue-on-error: true
         env:
           QT_QPA_PLATFORM: offscreen
         run: |
@@ -159,4 +255,29 @@ jobs:
           printf '[mutmut]\npaths_to_mutate=messagefoundry/parsing/binary.py\nrunner=python -m pytest -x -q tests/test_binary_carriage.py\n' > setup.cfg
           mutmut run || true
           echo "== results =="
-          mutmut results || true
+          mutmut results 2>&1 | tee mutmut-results.txt || true
+          {
+            echo "## Mutation testing (bounded scope: messagefoundry/parsing/binary.py)"
+            echo ""
+            echo '```'
+            head -c 900000 mutmut-results.txt
+            echo '```'
+            echo ""
+            echo "<sub>Advisory only. This job never runs on pull requests (cron on the public repo +"
+            echo "workflow_dispatch), so it has no PR surface by design — surviving mutants are reviewed"
+            echo "from this run page.</sub>"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload the mutmut cache (advisory)
+        if: always()
+        continue-on-error: true
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: mutmut-cache
+          path: .mutmut-cache
+          # .mutmut-cache is a DOTFILE and upload-artifact skips hidden files by DEFAULT. Without this
+          # the step logs "No files were found", uploads nothing, and still reports success -- a silent
+          # no-op that looks green.
+          include-hidden-files: true
+          # Deliberately `warn`, not `ignore`: if mutmut ever renames its cache, that must be visible in
+          # the log rather than silently swallowed.
+          if-no-files-found: warn
