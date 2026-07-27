@@ -84,6 +84,14 @@ All notable changes to MessageFoundry are documented here. The format follows
   ON). Residuals in [SERVICE.md](docs/SERVICE.md).
 
 ### Fixed
+- **The harness message list could livelock and stop updating entirely.** `MessagesPanel._apply` cleared
+  its in-flight guard, re-fired any refresh latched during the read, then returned *before* rendering —
+  discarding the snapshot as superseded. Whenever refreshes arrive faster than a read completes there is
+  always a latch waiting when the read lands, so every snapshot was discarded and the table never
+  updated: permanently stuck, not merely slow (measured: 391 reads served, 0 rendered). It now renders
+  first and drains afterwards, costing at most one read of staleness while still converging on the
+  latest filter. This surfaced as an intermittent CI failure that no timeout or retry could fix, because
+  neither addresses a livelock.
 - **Two config blocks in the off-loopback runbook aborted at load** — `[diagnostics].audit_all_authz` and
   `[ai].data_class` had been relocated by ADR 0118, so an operator copy-pasting either block got an
   immediate start failure. Corrected to `[security].audit_all_authorization_decisions` and
