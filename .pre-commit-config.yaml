@@ -1,6 +1,7 @@
 # Pre-commit hooks — surface lint/format/secret/SAST issues locally before they reach a commit,
 # mirroring the CI gate (ruff, bandit, gitleaks). One-time setup per clone:
 #   pip install pre-commit  &&  pre-commit install
+#   pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1     # claim gate (commit-msg)
 # Run across the whole tree on demand:  pre-commit run --all-files
 # Keep hook versions roughly in step with CI (.github/workflows/security.yml) and pyproject.
 repos:
@@ -8,6 +9,25 @@ repos:
   # CI/dev ruff on a version (language: system uses the installed ruff from the active venv).
   - repo: local
     hooks:
+      # The LEDGER GATE runs here rather than as a standalone .git/hooks/pre-commit, and that is a
+      # deliberate reversal — see scripts/coord/install-git-hooks.ps1 for the full reasoning.
+      #
+      # Short version: two tools cannot both own .git/hooks/pre-commit. install-git-hooks.ps1 refuses
+      # to overwrite a foreign hook, and `pre-commit install` responds by moving the existing hook to
+      # pre-commit.legacy and calling it from its own shim — which WORKS ON POSIX AND FAILS ON
+      # WINDOWS, because pre-commit invokes the legacy hook from a Python subprocess that cannot
+      # resolve `#!/bin/sh` (ExecutableNotFoundError). Measured 2026-07-27: every commit in the repo
+      # was blocked. Owning one file with one tool makes the contention impossible instead of managed.
+      #
+      # always_run + pass_filenames: false — the gate inspects the staged TREE (which ADR/BACKLOG
+      # numbers the commit introduces), not a list of changed files, so it must run even when no file
+      # it "owns" changed.
+      - id: ledger-gate
+        name: ledger gate (ADR/BACKLOG number reuse)
+        entry: python scripts/hooks/ledger_check.py
+        language: system
+        pass_filenames: false
+        always_run: true
       - id: ruff-format
         name: ruff format
         entry: ruff format
