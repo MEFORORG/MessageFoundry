@@ -55,6 +55,46 @@ maintainer.)
    $env:QT_QPA_PLATFORM = "offscreen"; pytest -q
    ```
    You can also run the project's own commit/CI gate: `python -m messagefoundry check`.
+5. **Install the commit hooks — including the leak gate — before your first commit:**
+   ```powershell
+   pip install pre-commit
+   pre-commit install
+   pwsh -NoProfile -File scripts\dev\setup-leak-gate.ps1 -Synthetic
+   ```
+   See *Leak gate* below for what that last line does and why it is not optional.
+
+### Leak gate (required, and it fails closed)
+
+One pre-commit hook — **forbidden-content** — scans for customer/PHI tokens. Its token list is
+private and git-ignored, so it does **not** arrive with a clone or a `git worktree add`. Without a
+token source the hook refuses to run and **every commit is blocked**:
+
+```
+scan_forbidden: no token source is configured ... refusing to run structural-only (fail closed).
+```
+
+That is deliberate. A gate that quietly loaded zero detectors would pass every commit green while
+seeing nothing — the failure mode this project has hit more than once. Do not remove
+`--require-tokens`, and do not reach for `--no-verify`.
+
+- **Outside contributors** cannot have the real list; it will never be distributable. Run
+  `setup-leak-gate.ps1 -Synthetic` to install the committed synthetic template. Your commits will
+  pass, and **CI runs the real detector set on your PR** — that is the authoritative check.
+- **Maintainers** install the real list: `setup-leak-gate.ps1 -From <path>`.
+
+The script always finishes by running the scanner and printing its per-section detector counts,
+because a green gate is evidence only if you confirmed it can see. The scanner labels its mode on
+every run, so a synthetic set can never be mistaken for a real one:
+
+```
+loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1
+loaded names=5, estate=3,  ...  [SYNTHETIC EXAMPLE TOKENS — blind to real customer tokens; CI is authoritative]
+loaded names=0, estate=0,  ...  [STRUCTURAL-ONLY: no token source configured]
+```
+
+Only the first is a real local scan. Note that the synthetic template is **below CI's per-section
+floor** (`names=7, estate=13, site_prefixes=1`) by design — passing locally with it does not mean you
+would pass CI's gate, only that nothing structural was found.
 
 ## Finding something to work on
 

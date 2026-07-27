@@ -196,3 +196,60 @@ def test_scanner_no_longer_skips_its_own_token_bearing_tests(sf) -> None:
     assert sf._is_skipped("tests/test_scan_forbidden.py") is False
     assert sf._is_skipped("tests/test_anon_core.py") is False
     assert sf._is_skipped("messagefoundry/__init__.py") is False
+
+
+# --- synthetic-vs-real token set ---------------------------------------------------------------------
+#
+# Copying scan-tokens.local.txt.example is the supported way an outside contributor satisfies the
+# pre-commit hook (the real list is private and undistributable). The danger is that the example
+# POPULATES every section, so it clears the count floor while matching nothing real — a maintainer who
+# copied it instead of installing the real list would get a green, blind gate, and the floor could not
+# tell. Distinguishing the two is therefore the only thing standing between "exit 0" and false clean.
+
+_EXAMPLE = _REPO_ROOT / "scripts" / "security" / "scan-tokens.local.txt.example"
+
+
+def _scanner_with_tokens(monkeypatch: pytest.MonkeyPatch, text: str | None):
+    """A FRESH scanner module whose tokens came from ``text`` (inline content, or None for no source)."""
+    if text is None:
+        monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", "")
+    else:
+        monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", text)
+    return _load_scanner()
+
+
+def test_the_shipped_example_is_recognised_as_synthetic(monkeypatch: pytest.MonkeyPatch) -> None:
+    mod = _scanner_with_tokens(monkeypatch, _EXAMPLE.read_text(encoding="utf-8"))
+    assert mod.TOKENS_PRESENT is True
+    assert mod.is_synthetic_token_set() is True
+    # The trap this guards: every floor section is non-empty, so counts alone look like a real install.
+    counts = mod.loaded_token_counts()
+    assert all(counts[s] > 0 for s in ("names", "estate", "site_prefixes"))
+
+
+def test_a_reformatted_copy_of_the_example_still_reads_synthetic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compared on PARSED content, not bytes — otherwise adding one comment line would silently
+    reclassify a synthetic set as real, which is the direction that fails open."""
+    noisy = "# a local note\n\n" + _EXAMPLE.read_text(encoding="utf-8") + "\n\n# trailing note\n"
+    mod = _scanner_with_tokens(monkeypatch, noisy)
+    assert mod.is_synthetic_token_set() is True
+
+
+def test_a_real_shaped_token_set_is_NOT_flagged_synthetic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The control. Without this, a function that returned True unconditionally would look correct."""
+    mod = _scanner_with_tokens(
+        monkeypatch,
+        "[names]\n\\bNOTREAL\\b | customer | i\n\n[estate]\nnotrealvendor\n\n[site_prefix]\n77\n",
+    )
+    assert mod.TOKENS_PRESENT is True
+    assert mod.is_synthetic_token_set() is False
+
+
+def test_no_token_source_is_absent_rather_than_synthetic(monkeypatch: pytest.MonkeyPatch) -> None:
+    """'Nothing loaded' and 'the example loaded' are different failures with different fixes, and the
+    run banner names them differently — so the predicate must not conflate them."""
+    mod = _scanner_with_tokens(monkeypatch, None)
+    assert mod.TOKENS_PRESENT is False
+    assert mod.is_synthetic_token_set() is False
