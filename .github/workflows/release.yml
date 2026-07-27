@@ -238,7 +238,18 @@ jobs:
         with:
           subject-path: "dist/*.tar.gz, dist/*.whl, messagefoundry-sbom.cdx.json, messagefoundry-vex.openvex.json"
 
-      - name: Create GitHub release
+      # CREATE-OR-UPDATE, not create. This was a bare `gh release create`, which fails with "a release
+      # with the same tag name already exists" on any re-run — and because it sits BEFORE the PyPI
+      # publish below, that turned one publish failure into a permanent retry deadlock: every re-run
+      # died here and SKIPPED the publish, so a re-run could not even test the fix it was meant to
+      # verify. Observed on v0.3.1 — attempt 1 created the release then failed at PyPI (403, publisher
+      # mismatch); attempts 2-3 died here; only deleting the public release by hand let attempt 4 through.
+      #
+      # The step ORDER is deliberate and stays: the reversible action (a GitHub release, deletable)
+      # precedes the irreversible one (a PyPI upload burns that version forever). Publishing first would
+      # leave a failure here with an un-retryable PyPI version and no release. The defect was never the
+      # ordering — it was that the reversible half could not be repeated.
+      - name: Create or update the GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -248,13 +259,24 @@ jobs:
           # Release notes = this version's CHANGELOG section (fall back to a one-liner).
           awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}' CHANGELOG.md > notes.md
           [ -s notes.md ] || echo "MessageFoundry $tag" > notes.md
-          pre=""
-          case "$ver" in *-*) pre="--prerelease";; esac
-          gh release create "$tag" \
-            dist/*.tar.gz dist/*.whl dist/*.sigstore* \
-            messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore* \
-            messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* \
-            --title "$tag" --notes-file notes.md $pre
+          # `edit` needs an explicit true/false: a bare `--prerelease` only ever SETS the flag, so a
+          # re-run could never demote a release that had been mis-marked as a pre-release.
+          case "$ver" in
+            *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
+            *)   pre_create="";             pre_edit="--prerelease=false" ;;
+          esac
+          assets=( dist/*.tar.gz dist/*.whl dist/*.sigstore*
+                   messagefoundry-sbom.cdx.json messagefoundry-sbom.cdx.json.sigstore*
+                   messagefoundry-vex.openvex.json messagefoundry-vex.openvex.json.sigstore* )
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — updating in place (this is a re-run)."
+            gh release edit "$tag" --title "$tag" --notes-file notes.md "$pre_edit"
+            # --clobber: re-uploading an existing asset name errors otherwise, and a re-run regenerates
+            # every artifact (fresh signatures), so replacing is the correct semantic.
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "$tag" --notes-file notes.md $pre_create
+          fi
 
       - name: Upload artifacts (dry-run / always)
         if: always()

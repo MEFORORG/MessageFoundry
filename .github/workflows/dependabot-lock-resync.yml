@@ -58,8 +58,14 @@ jobs:
     #     seconds earlier. Observed on #801:
     #         00:04:30  triggering_actor=dependabot[bot]        -> success, pushed the resync commit
     #         00:04:48  triggering_actor=mefor-lock-resync[bot] -> failure, "client-id ... is required"
-    #     Skipping the self-triggered re-run is correct: the work is already done. The secrets are
-    #     configured correctly under Settings > Secrets and variables > Dependabot; nothing to add.
+    #     Skipping the self-triggered re-run is correct: the work is already done.
+    #
+    #     (This line used to end "the secrets are configured correctly ... nothing to add". True of the
+    #     PRIVATE repo, and it did NOT survive the cutover: MEFORORG carried only MEFOR_FORBIDDEN_TOKENS,
+    #     so the App credentials were absent and this job would have skipped on every Dependabot uv PR
+    #     while the comment asserted it was configured. LOCK_RESYNC_APP_ID + LOCK_RESYNC_APP_PRIVATE_KEY
+    #     were added to MEFORORG > Secrets > Dependabot on 2026-07-27. State a configuration fact WITH
+    #     the repository it applies to, or a migration turns it into a confident lie.)
     if: >-
       ${{ github.event.pull_request.user.login == 'dependabot[bot]'
       && github.triggering_actor == 'dependabot[bot]' }}

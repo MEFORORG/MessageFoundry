@@ -199,6 +199,11 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     )
 
     # Publish (irreversible) must come AFTER build, leak-gate, sign and the GitHub release.
+    #
+    # This order is load-bearing, not cosmetic: the GitHub release is REVERSIBLE (deletable) and the
+    # PyPI upload is not (a version number is burned forever). Doing the reversible half first is what
+    # made the v0.3.1 publisher failure recoverable at all — a failed publish left a release we could
+    # delete and retry, rather than an un-retryable PyPI version with no release.
     def idx(tok: str) -> int:
         i = release_job.find(tok)
         assert i != -1, f"expected marker missing from release job: {tok!r}"
@@ -208,7 +213,7 @@ def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
         idx("Build sdist + wheel"),
         idx("Leak gate — sdist MUST be package-only"),
         idx("python -m sigstore sign"),
-        idx("Create GitHub release"),
+        idx("Create or update the GitHub release"),
         idx("Publish to PyPI"),
     ]
     assert order == sorted(order), (
@@ -268,6 +273,30 @@ def test_release_jobs_are_gated_ON_the_source_repo() -> None:
     )
     # The private vault must never be a release target either.
     assert "wshallwshall" not in rel, "release.yml must not reference the retired private vault"
+
+
+def test_the_github_release_step_is_idempotent() -> None:
+    """A re-run must be able to repeat the release step, or a publish failure wedges the tag forever.
+
+    The step sits BEFORE the irreversible PyPI upload (deliberately — see the ordering test above), so
+    when it was a bare `gh release create` the first publish failure was terminal: the release now
+    existed, so every re-run died on "a release with the same tag name already exists" and SKIPPED the
+    publish. The retry could not even reach the thing it was retrying. v0.3.1 needed a human to delete
+    a public release before attempt 4 could get through.
+    """
+    rel = _release()
+    assert "gh release view" in rel, (
+        "the release step no longer probes for an existing release — a re-run will fail on 'already "
+        "exists' and skip the PyPI publish below it"
+    )
+    assert "gh release edit" in rel and "--clobber" in rel, (
+        "create-or-update is incomplete: an existing release must be edited and its assets replaced "
+        "(--clobber), since a re-run regenerates every artifact with fresh signatures"
+    )
+    # `gh release edit --prerelease` (bare) only ever SETS the flag; demoting needs an explicit value.
+    assert "--prerelease=true" in rel and "--prerelease=false" in rel, (
+        "edit uses a bare --prerelease, so a re-run could never demote a mis-marked pre-release"
+    )
 
 
 def test_no_self_referential_slug_rewrite_survives() -> None:
