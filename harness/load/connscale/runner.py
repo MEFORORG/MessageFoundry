@@ -815,14 +815,17 @@ def _reconcile(
     # unconfirmed sends as unconfirmed while ANY FURTHER shortfall is a real, confirmed-then-lost
     # message and still fails. With timeouts == 0 (every healthy run) it is exactly read >= sent.
     #
-    # BUT the excusal is BOUNDED by `unconfirmed_budget` (the caller's connection count — at most ~one
-    # stranded in-flight frame per connection is a plausible teardown artifact). Past the budget the
-    # timeout count is a SYSTEMIC no-ACK fault (mass resets, or the engine accepting frames and never
-    # ACKing — possibly accepted-and-dropped, the exact class the count-and-log invariant forbids), so
-    # NOTHING is excused and the reconcile fails loudly. Without the cap, `timeouts == sent` would
-    # degrade the intake bound to `read >= 0` and a total ACK-path regression would pass zero_loss.
+    # BUT the excusal must never go VACUOUS: with `timeouts == sent` an unbounded excusal degrades the
+    # intake bound to `read >= 0` and a total ACK-path regression would pass zero_loss. That cap used
+    # to be `unconfirmed_budget` alone, modelled as "~one stranded in-flight frame per connection" —
+    # a model this sender breaks (`_inflight` is an UNBOUNDED deque; open-loop sends are paced by the
+    # offered rate, not an ACK slot), so genuine teardown stranding scales with rate x ACK-latency,
+    # not the connection count. Bound it as a FRACTION instead — at most half the run, floored by the
+    # connection count — which keeps `read >= sent // 2` ALWAYS required. See harness/load/report.py's
+    # copy for the full rationale; the three copies are kept in step deliberately.
     unconfirmed = c.timeouts
-    over_budget = unconfirmed > unconfirmed_budget
+    budget = max(unconfirmed_budget, sent // 2)
+    over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
     deliver_short = written - sink_received
@@ -842,7 +845,7 @@ def _reconcile(
     if over_budget:
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({unconfirmed_budget} ≈ one in-flight per connection) — systemic no-ACK fault "
+            f"({budget} = max(connections, half the run)) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
         )
     elif unconfirmed > 0 and read < sent:

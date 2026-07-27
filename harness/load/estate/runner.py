@@ -428,10 +428,13 @@ def _reconcile(
     read = final.read - base.read
     written = final.written - base.written
     backlog = final.backlog
-    # An unconfirmed send (in-flight at a connection close, no ACK seen) is bounded-excused (at most ~one
-    # per connection); past the budget it is a systemic no-ACK fault. Mirrors the connscale reconcile.
+    # An unconfirmed send (in-flight at a connection close, no ACK seen) is bounded-excused; past the
+    # budget it is a systemic no-ACK fault. The bound is a FRACTION of the run (at most half), floored
+    # by the connection count — NOT "~one per connection", a model this sender breaks because
+    # `_inflight` is an unbounded deque. Mirrors the connscale/report reconciles; see report.py.
     unconfirmed = c.timeouts
-    over_budget = unconfirmed > unconfirmed_budget
+    budget = max(unconfirmed_budget, sent // 2)
+    over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
     deliver_short = written - sink_received
@@ -451,7 +454,7 @@ def _reconcile(
     if over_budget:
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({unconfirmed_budget} ≈ one in-flight per connection) — systemic no-ACK fault"
+            f"({budget} = max(connections, half the run)) — systemic no-ACK fault"
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)
