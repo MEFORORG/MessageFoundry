@@ -234,10 +234,12 @@ Add the cron to the workflow's `on:` block, then the job:
 
 ## 5. After they're green — flip the rubric
 
-> **UNACTIONABLE as written (2026-07-27).** `docs/Code_Quality_Standards.md` has never existed in this
-> repo's git history, despite being cited by `quality-advisory.yml`'s header and `pyproject.toml`. There is
-> no rubric file to flip. Leave the existing dangling citations alone and do not add new ones; if the rubric
-> is ever written, redo this step then.
+> **NOW ACTIONABLE — and done (2026-07-27).** `docs/Code_Quality_Standards.md` had never existed in this
+> repo's git history despite being cited by `quality-advisory.yml`'s header and `pyproject.toml:246`. It was
+> restored from the maintained copy at **v0.10**, which also carries the corrections this cycle produced:
+> signal 7 had been scored ✅ Built since v0.8 while its tool crashed before generating a mutant, signal 11's
+> "85 functions over C901>10" is now 122 across 43 files, and signal 8 now emits inline PR annotations. The
+> citations resolve again.
 
 Update [Code_Quality_Standards.md](../Code_Quality_Standards.md) exactly as #10/#8 were flipped in v0.3:
 signals 6 + 7 go from *deferred* → ✅ **Built (advisory)** in **§5** (status column), **Appendix A.2** (rows
@@ -257,19 +259,25 @@ behaviour on fork PRs. The workflow still holds **no write scope on any job**.
   unshippable as a diff signal: all 122 findings on this tree anchor on a single `def` line, so body edits
   produce nothing and signature edits fire on pre-existing debt. The delta reports only what the PR caused.
 - **Clones** — step summary only. jscpd emits one location per clone pair chosen by scan order.
-- **Mutation** — **the signal is dead and was reporting success anyway.** Measured from the scheduled run
-  `30248096425` (2026-07-27): the job takes **37 seconds** and goes green because `mutmut run || true`
-  swallows a crash. mutmut 2.5.1 prints its banner, runs the baseline, then dies in its pony-ORM cache with
-  `TypeError: cannot pickle 'itertools.count' object` (`cache.py:369 update_line_numbers`) — **before
-  generating a single mutant**. The job now captures the exit status, emits a `::warning`, and says so in
-  the summary rather than presenting a results block for a tool that produced none. The `.mutmut-cache`
-  artifact still uploads (`include-hidden-files: true` — it is a dotfile and `upload-artifact` skips hidden
-  files by default), but expect it to be a stale/empty cache until the tool works.
+- **Mutation** — **was dead, now repaired and running.** The signal had been reporting success while
+  measuring nothing: from scheduled run `30248096425` (2026-07-27) the job went green in 37 seconds because
+  `mutmut run || true` swallowed a crash — mutmut 2.5.1 dies in its pony-ORM cache with `TypeError: cannot
+  pickle 'itertools.count' object` (`cache.py:369`) **before generating a single mutant**. Repaired on
+  **`mutmut==3.6.0`**, verified on Linux/Python 3.14: **461 mutants, 87 killed, 19 survived, 355 not covered
+  by the scoped test — in 3 seconds.** The step summary now carries that table plus the survivor list, and
+  a non-zero `mutmut run` emits a `::warning` instead of passing silently.
 
-**The real blocker (supersedes the old "measure the wall-clock" step):** the PR-vs-nightly question cannot
-be answered while the tool produces nothing — 37s is the cost of crashing, not of mutating. Fix mutmut
-first (mutmut 3.x has a different CLI; cosmic-ray is the other candidate), *then* measure a real run, then
-decide about PRs. Do not read the current duration as evidence that a PR run would be cheap.
+  Three things are load-bearing in the mutmut 3 config, each found by a run that produced nothing:
+  `source_paths` must be the **package** (mutmut 3 copies it into `mutants/` and runs pytest there; with a
+  single file copied, `conftest.py` cannot import `messagefoundry.config` and every mutant returns "not
+  checked"); `only_mutate` supplies the bounded scope instead; and **`pytest-timeout` must be installed**
+  because mutmut 3 always passes `--timeout` to pytest.
+
+**Mutation-on-PR: DECIDED — yes, it now runs on pull requests.** The old "measure the wall-clock first" step
+is answered: the mutating itself costs ~3 seconds, so the previous "expensive, never per-PR" cost model was
+a property of mutmut 2's run-the-suite-per-mutant design, not of this scope. The job's real cost on a PR is
+its install step, in line with the other jobs here. Survivors are most useful in review, which is where
+someone is already looking at the test that failed to kill them.
 
 ---
 
