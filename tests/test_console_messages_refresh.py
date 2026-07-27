@@ -1,6 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (C) 2026 MessageFoundry Organization and contributors
-"""MessagesPanel refresh convergence — the BACKLOG #17 livelock.
+"""MessagesPanel refresh convergence — the discard-every-snapshot livelock.
+
+NOT BACKLOG #17, despite what earlier comments here and in test_harness_monitor.py said. #17 is the
+py3.11 pytest/aiosqlite cancellation deadlock (OBSOLETE since the 3.14-only migration); following that
+citation lands on a closed item about an unrelated bug. The misattribution was inherited from a comment
+on the flaky test and then repeated across new files while fixing something else entirely. This
+livelock has no backlog entry — it was found, fixed and covered in one pass.
 
 ``refresh()`` reads the message list off the main thread and guards against pile-up with ``_loading``;
 a refresh requested mid-flight is latched in ``_pending`` and re-fired when the read lands. ``_apply``
@@ -75,7 +81,7 @@ def test_a_latched_refresh_no_longer_discards_the_snapshot(qapp: Any) -> None:
         panel._apply(_MessagesSnapshot([_msg("m1")], "1 shown of 1", False, None))
 
         assert panel._table.rowCount() == 1, (
-            "snapshot discarded as 'superseded' — this is the BACKLOG #17 livelock"
+            "snapshot discarded as 'superseded' — this is the refresh livelock"
         )
         # Dropping the render must not come back as dropping the re-fire either.
         assert panel._pending is None, "the latched refresh was never drained"
