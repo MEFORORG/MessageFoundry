@@ -6,6 +6,8 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.1] — 2026-07-27 — Early Access
+
 ### Security
 - **BREAKING — multi-factor authentication is now an ACCESS gate, not only a step-up gate**
   (ASVS 6.3.3). An MFA-pending session is refused on **every** authorized route with `403` +
@@ -954,7 +956,14 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.10...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...HEAD
+[0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
+[0.3.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...v0.3.0
+[0.2.15]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.14...v0.2.15
+[0.2.14]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.13...v0.2.14
+[0.2.13]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.12...v0.2.13
+[0.2.12]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.11...v0.2.12
+[0.2.11]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.10...v0.2.11
 [0.2.10]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.9...v0.2.10
 [0.2.9]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.8...v0.2.9
 [0.2.8]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.7...v0.2.8
