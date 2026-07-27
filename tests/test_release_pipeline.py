@@ -133,7 +133,10 @@ def test_release_load_bearing_canaries_present() -> None:
         "leak gate exits nonzero": "exit 1",
         # version single-sourced from the package == the tag
         "version==tag single-source": 'want="${GITHUB_REF_NAME#v}"',
-        "version==tag comparison": '[ "$built" = "$want" ]',
+        # The comparison itself. Was the raw string test `[ "$built" = "$want" ]`; that could not
+        # accept a canonical pre-release (0.3.0rc1 vs tag v0.3.0-rc1), so it is now a PEP 440
+        # Version() compare. The canary tracks the CHECK existing, not how it is spelled.
+        "version==tag comparison": "from packaging.version import InvalidVersion, Version",
         # py.typed (WS-3) enforced on a tag push
         "py.typed enforced on tag": "unzip -l dist/*.whl | grep -q 'messagefoundry/py.typed'",
         "py.typed only on a tag": 'GITHUB_REF_TYPE:-}" = "tag"',
@@ -265,3 +268,41 @@ def test_release_jobs_are_gated_ON_the_source_repo() -> None:
     )
     # The private vault must never be a release target either.
     assert "wshallwshall" not in rel, "release.yml must not reference the retired private vault"
+
+
+def test_no_self_referential_slug_rewrite_survives() -> None:
+    """The README slug rewrite is GONE, and no `sed s#X#X#` may come back.
+
+    publish.ps1 rewrote the private slug to the public one across *.yml — including this workflow —
+    so at the cutover both sides of the substitution collapsed to the same string, leaving a no-op
+    sed followed by a guard that failed if that string was present. The README names it 19 times, so
+    the step failed on EVERY tag push: the v0.3.0 tag died there and the repo has no releases.
+    """
+    rel = _release()
+    assert "- name: Rewrite README repo slug" not in rel, (
+        "the mirror-era README slug rewrite is back — there is one repo now, so it rewrites nothing, "
+        "and its 'left private-repo links' guard then fails on every tag"
+    )
+    assert not re.search(r"sed[^\n]*s([#/|])([^\n#/|]+)\1\2\1", rel), (
+        "a self-referential sed (s#X#X#) is present — it cannot transform anything, and paired with "
+        "a grep guard it fails unconditionally"
+    )
+
+
+def test_both_wheel_smokes_compare_versions_not_strings() -> None:
+    """Tag-vs-built comparison must normalise (PEP 440), in BOTH the engine and harness jobs.
+
+    The trigger only fires on `vX.Y.Z` / `vX.Y.Z-*`, so a pre-release tag must carry a hyphen, while
+    hatchling and PyPI normalise `0.3.0-rc1` to `0.3.0rc1`. A raw string compare therefore cannot be
+    satisfied by a canonical version — and in the HARNESS job it can never be satisfied at all, since
+    its `built` is parsed out of the already-normalised wheel FILENAME.
+    """
+    rel = _release()
+    assert '[ "$built" = "$want" ]' not in rel, (
+        "a raw string compare of tag vs built version is back; it rejects canonical pre-release "
+        "versions (0.3.0rc1 != 0.3.0-rc1) and blocks every rc tag"
+    )
+    assert rel.count("from packaging.version import") == 2, (
+        "both the engine and harness wheel smokes must compare PEP 440 versions — fixing only one "
+        "moves the failure rather than removing it"
+    )

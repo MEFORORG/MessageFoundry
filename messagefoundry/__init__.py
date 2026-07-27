@@ -107,7 +107,7 @@ from messagefoundry.timezone import (
     to_zone,
 )
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "Message",
