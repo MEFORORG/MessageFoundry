@@ -52,6 +52,20 @@ def git(*args: str) -> str:
     return proc.stdout or ""
 
 
+def _obj_exists(spec: str) -> bool:
+    """Does the `<ref>:<path>` object exist? Probed EXPLICITLY rather than inferred from an error.
+
+    :func:`git` raises on any non-zero exit deliberately — a swallowed failure would read as "empty
+    ledger", i.e. "no numbers taken", the false-clean this gate exists to prevent. "The path is simply
+    not on that ref" is the one case that is NOT a failure, so it gets its own probe instead of a
+    broad ``except``.
+    """
+    probe = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+        ["git", "cat-file", "-e", spec], capture_output=True
+    )
+    return probe.returncode == 0
+
+
 class Ledger:
     def __init__(self, *, ci: bool, base: str = "origin/main") -> None:
         self.ci = ci
@@ -107,10 +121,19 @@ class Ledger:
         verified — otherwise a bad/unfetched base would quietly answer "absent" and disable the check.
         """
         git("rev-parse", "--verify", f"{self.base}^{{commit}}")
-        probe = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
-            ["git", "cat-file", "-e", f"{self.base}:{path}"], capture_output=True
-        )
-        return probe.returncode == 0
+        return _obj_exists(f"{self.base}:{path}")
+
+    def head_has(self, path: str) -> bool:
+        """Does the commit under test contain ``path``? Mirrors :meth:`head_text`'s ref.
+
+        The symmetric case to :meth:`base_has`, and it bites the moment a ledger file is FIRST
+        published. In CI the change set is `diff base HEAD`, so once ``origin/main`` gains a file that
+        a branch predates, that branch's diff lists it — as a DELETION relative to base — even though
+        the branch never touched it. The rule then reads HEAD for a copy that was never there and
+        `git show HEAD:path` exits 128. That is not a ledger violation; it is a stale branch, and it
+        broke every open branch the hour docs/BACKLOG.md landed.
+        """
+        return _obj_exists(f"HEAD:{path}" if self.ci else f":{path}")
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -205,6 +228,12 @@ class Ledger:
             # cutover published it). Numbers that do not exist on base cannot be collided with, so
             # there is nothing to police; without this, importing the ledger wholesale would report
             # every one of its ~229 items as "not allocated to this worktree".
+            return
+        if not self.head_has("docs/BACKLOG.md"):
+            # Present on base, absent here: a branch that PREDATES the file's publication. CI diffs
+            # against origin/main, so the file shows up as "changed" (a deletion relative to base)
+            # although the branch never touched it — and reading HEAD for a copy that was never there
+            # exits 128. A stale branch is not a ledger violation.
             return
         head = set(BACKLOG_HEADING.findall(self.head_text("docs/BACKLOG.md")))
         base = set(BACKLOG_HEADING.findall(self.base_text("docs/BACKLOG.md")))

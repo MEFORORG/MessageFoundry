@@ -412,6 +412,42 @@ def test_ADDING_a_backlog_that_the_base_lacks_is_not_a_wall_of_unallocated_numbe
     assert "not allocated" not in out
 
 
+def test_a_branch_that_PREDATES_the_backlog_is_not_a_ledger_violation(tmp_path: Path) -> None:
+    """The mirror image of the case above, and it broke every open branch the hour BACKLOG.md landed.
+
+    CI's change set is `diff base HEAD`. The moment origin/main gained docs/BACKLOG.md, every branch
+    cut before that merge began listing the file as changed — as a DELETION relative to base — while
+    its own HEAD had no copy. The rule then read HEAD for a file that was never there and died on
+    `git show HEAD:docs/BACKLOG.md` (exit 128). A stale branch is not a number collision.
+    """
+    r = tmp_path / "repo"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    git(r, "config", "user.email", "t@t")
+    git(r, "config", "user.name", "t")
+    git(r, "config", "commit.gpgsign", "false")
+    write(r, "README.md", "no backlog yet\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "root")
+    root = git(r, "rev-parse", "HEAD").strip()
+
+    # main moves on and PUBLISHES the backlog...
+    write(r, "docs/BACKLOG.md", "# Backlog\n\n## 1. First\n\nb\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "publish backlog")
+    git(r, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    # ...while this branch was cut BEFORE it and never touched the file.
+    git(r, "checkout", "-q", "-b", "stale", root)
+    write(r, "src.py", "x = 1\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "unrelated work")
+
+    code, out = run_check(r, "--ci")
+    assert code == 0, out
+    assert "BACKLOG" not in out
+
+
 def test_an_unreachable_base_ref_never_reports_success(tmp_path: Path) -> None:
     """System-level property: an unresolvable base must never read as "nothing to check".
 
