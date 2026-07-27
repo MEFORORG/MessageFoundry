@@ -44,11 +44,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from harness._async import AsyncRunner
 from messagefoundry.api.models import MessageDetail, MessageSummary
 from messagefoundry.apiclient import ApiError, EngineClient
 from messagefoundry.parsing import HL7PeekError, parse_tree
-
-from harness._async import AsyncRunner
 
 #: Shared "error red" for inline error text — the message-detail error, the auth dialogs'
 #: error labels, and the heart's stopped state — so the palette can't drift across modules.
@@ -506,12 +505,9 @@ class MessagesPanel(QWidget):
     def _apply(self, snap: _MessagesSnapshot, *, autosize: bool = False) -> None:
         """Runs on the main thread (result slot) — safe to touch widgets."""
         self._loading = False
-        # A refresh was requested mid-flight (e.g. the filter changed) — re-fire it and skip rendering
-        # this now-superseded snapshot, so the list always reflects the latest filter.
-        if self._drain_pending():
-            return
         if snap.error is not None:
             self.error.emit(snap.error)
+            self._drain_pending()
             return
         messages = snap.messages
         assert messages is not None
@@ -541,6 +537,14 @@ class MessagesPanel(QWidget):
             # The selected message rolled off the list (deleted / filtered / aged past the 200-row
             # limit); tell the detail pane to clear so it stops showing a now-absent message (M2).
             self.selection_cleared.emit()
+        # LAST, and only after rendering: re-fire a refresh that was latched while this one was in
+        # flight. This used to run FIRST and `return` early, discarding the snapshot as "superseded"
+        # — which livelocked the panel (BACKLOG #17). Under sustained refresh pressure there is ALWAYS
+        # a latched request when a fetch lands, so every snapshot was discarded and the table never
+        # updated: not slow, permanently stuck. Rendering first costs at most one fetch of staleness
+        # (the drained refresh re-reads the current filters and renders again immediately), and the
+        # list still converges on the latest filter — but it can no longer starve itself.
+        self._drain_pending()
 
     def _on_select(self) -> None:
         message_id = self._selected_id()
