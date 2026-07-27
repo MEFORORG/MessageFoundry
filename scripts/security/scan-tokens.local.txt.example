@@ -16,6 +16,17 @@
 #   the name / estate / site-code detectors are empty (appropriate for a fork without the secret).
 #   Set MEFOR_REQUIRE_TOKENS=1 to fail closed (exit 2) instead when the source is absent.
 #
+#   USING THIS FILE AS-IS IS A SUPPORTED CONTRIBUTOR SETUP, AND IS NOT THE SAME GATE AS CI.
+#   `scripts/dev/setup-leak-gate.ps1 -Synthetic` copies it to scan-tokens.local.txt so the pre-commit
+#   hook -- which passes --require-tokens and otherwise blocks EVERY commit -- can run. Two
+#   consequences, both intentional:
+#     * The scanner LABELS this set on every run: "[SYNTHETIC EXAMPLE TOKENS - blind to real customer
+#       tokens; CI is authoritative]". The placeholders below populate every section, so the count
+#       FLOOR alone cannot tell this apart from a real install -- the label is what does.
+#     * These counts (names=5, estate=3, site_prefix=1) are BELOW CI's per-section floor
+#       (MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1 in .github/workflows/security.yml), so
+#       passing locally with this file does not predict CI's leak gate.
+#
 # FORMAT (sectioned; `#` comments and blank lines ignored)
 #   [names]        one entry per line:  REGEX | REASON | CASE
 #                    REASON optional (default "customer/vendor token").

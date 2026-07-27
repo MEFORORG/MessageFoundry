@@ -85,6 +85,24 @@ try {
     if ($gitDir) { Set-Content -LiteralPath (Join-Path $gitDir 'mefor-home-branch') -Value $Name -Encoding utf8 }
 } catch { }
 
+# The forbidden-content gate's token list is git-ignored, so `git worktree add` cannot deliver it and a
+# fresh worktree starts unable to commit AT ALL -- the pre-commit hook passes --require-tokens and fails
+# closed. Carry the source checkout's copy across if it has one; otherwise say so here, because the
+# symptom is a hard commit block whose message does not mention worktrees. Best-effort: never block
+# worktree creation. MEFOR_FORBIDDEN_TOKENS, if set, already covers every checkout on the machine.
+try {
+    $tokenRel = 'scripts/security/scan-tokens.local.txt'
+    $srcToken = Join-Path $RepoRoot $tokenRel
+    if (Test-Path -LiteralPath $srcToken) {
+        Copy-Item -LiteralPath $srcToken -Destination (Join-Path $WorktreePath $tokenRel) -Force
+        Write-Host "Leak-gate token list copied into the worktree." -ForegroundColor DarkGray
+    }
+    elseif (-not $env:MEFOR_FORBIDDEN_TOKENS) {
+        Write-Host "NOTE: no leak-gate token source found - commits here will fail closed." -ForegroundColor Yellow
+        Write-Host "      Fix once: pwsh -NoProfile -File scripts\dev\setup-leak-gate.ps1 -From <path>" -ForegroundColor Yellow
+    }
+} catch { }
+
 function Show-NextSteps {
     Write-Host ""
     Write-Host "Worktree ready: $WorktreePath (branch '$Name')" -ForegroundColor Green

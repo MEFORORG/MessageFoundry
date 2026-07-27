@@ -455,6 +455,38 @@ def reload_tokens() -> None:
         _SITE_CODE_PATTERN_LITERAL = _NEVER
 
 
+#: The committed synthetic template, used only to RECOGNISE itself (never as a token source).
+EXAMPLE_TOKEN_FILE = Path(__file__).parent / "scan-tokens.local.txt.example"
+
+
+def is_synthetic_token_set() -> bool:
+    """Is the loaded token set just the shipped synthetic example?
+
+    Copying ``scan-tokens.local.txt.example`` is the documented way an OUTSIDE CONTRIBUTOR satisfies
+    the pre-commit hook: the real list is private and will never be distributable. That is a fine
+    contributor posture -- but it yields a gate that exits 0 while being BLIND to every real customer
+    token, which is indistinguishable from a genuinely clean run unless it is announced. A maintainer
+    who reaches for the example instead of installing the real list would get exactly the false-clean
+    this module exists to prevent, and the count floor cannot catch it: the synthetic set POPULATES
+    every section, so it satisfies "detectors that can fire" while firing on nothing real.
+
+    Compared against the PARSED content, not the file bytes, so reformatting or re-commenting the copy
+    still reads as synthetic.
+    """
+    if not TOKENS_PRESENT:
+        return False
+    try:
+        example = EXAMPLE_TOKEN_FILE.read_text(encoding="utf-8")
+        ex_names, ex_estate, _body, ex_prefixes = _parse_tokens(example)
+    except (OSError, ValueError):
+        return False
+    return (
+        tuple(p.pattern for p, _ in ex_names) == tuple(p.pattern for p, _ in FORBIDDEN)
+        and tuple(ex_estate) == ESTATE_TOKENS
+        and tuple(ex_prefixes) == _SITE_PREFIXES
+    )
+
+
 def loaded_token_counts() -> dict[str, int]:
     """Detector counts for the current token tables.
 
@@ -810,10 +842,17 @@ def main(argv: list[str]) -> int:
     # alone cannot distinguish "scanned with the real tables and found nothing" from "loaded nothing
     # and had nothing to find" -- both are silent successes.
     counts = loaded_token_counts()
+    # Three distinguishable states, because "exit 0" collapses them: real tables (silent), the shipped
+    # synthetic example (populates every section and so passes the floor, but matches nothing real),
+    # and no source at all. Only the first is evidence.
+    if not TOKENS_PRESENT:
+        mode = "  [STRUCTURAL-ONLY: no token source configured]"
+    elif is_synthetic_token_set():
+        mode = "  [SYNTHETIC EXAMPLE TOKENS — blind to real customer tokens; CI is authoritative]"
+    else:
+        mode = ""
     print(
-        "scan_forbidden: loaded "
-        + ", ".join(f"{k}={v}" for k, v in counts.items())
-        + ("" if TOKENS_PRESENT else "  [STRUCTURAL-ONLY: no token source configured]"),
+        "scan_forbidden: loaded " + ", ".join(f"{k}={v}" for k, v in counts.items()) + mode,
         file=sys.stderr,
     )
 
