@@ -69,6 +69,8 @@ $marker = "MessageFoundry ledger gate"
 # commit message, so a claim check bolted onto it would look installed and silently never fire.
 $commitMsg = Join-Path $hooksDir "commit-msg"
 $claimMarker = "MessageFoundry claim gate"
+$prePush = Join-Path $hooksDir "pre-push"
+$pushMarker = "MessageFoundry push guard"
 
 if ($Status) {
     $stale = (Test-Path $preCommit) -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match [regex]::Escape($marker))
@@ -83,6 +85,8 @@ if ($Status) {
         Write-Host "             ^ a leftover standalone hook will make `pre-commit install` chain to" -ForegroundColor Yellow
         Write-Host "               pre-commit.legacy, which FAILS on Windows and blocks every commit." -ForegroundColor Yellow
     }
+    $pushInstalled = (Test-Path $prePush) -and ((Get-Content $prePush -Raw -EA SilentlyContinue) -match [regex]::Escape($pushMarker))
+    Write-Host "pre-push   : $(if ($pushInstalled) { 'INSTALLED (push guard)' } elseif (Test-Path $prePush) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
     Write-Host "worktrees  : $(@(& git -C $RepoRoot worktree list).Count) share these hooks"
     return
 }
@@ -99,12 +103,20 @@ if ($Uninstall) {
         Write-Host "Claim commit-msg hook REMOVED." -ForegroundColor Yellow
         $removed = $true
     }
+    if ((Test-Path $prePush) -and ((Get-Content $prePush -Raw) -match [regex]::Escape($pushMarker))) {
+        Remove-Item -LiteralPath $prePush -Force
+        Write-Host "Push guard pre-push hook REMOVED." -ForegroundColor Yellow
+        $removed = $true
+    }
     if (-not $removed) { Write-Host "Nothing to remove (no MessageFoundry hooks installed)." }
     return
 }
 
 if ((Test-Path $commitMsg) -and ((Get-Content $commitMsg -Raw) -notmatch [regex]::Escape($claimMarker))) {
     throw "A commit-msg hook that is not ours already exists at $commitMsg. Refusing to overwrite it -- merge them by hand."
+}
+if ((Test-Path $prePush) -and ((Get-Content $prePush -Raw) -notmatch [regex]::Escape($pushMarker))) {
+    throw "A pre-push hook that is not ours already exists at $prePush. Refusing to overwrite it -- merge them by hand."
 }
 
 New-Item -ItemType Directory -Force -Path $hooksDir | Out-Null
@@ -148,13 +160,40 @@ exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
 
 [System.IO.File]::WriteAllText($commitMsg, $claimHook, (New-Object System.Text.UTF8Encoding $false))
 
+# --- push guard ------------------------------------------------------------------------------------
+# Since the MEFORORG cutover this repo IS the published artifact -- a push to main is publication, with
+# no publish step left to catch anything. Server-side protection requires a PR and 12 checks, but
+# enforce_admins is false, so the owner bypasses all of it and VS Code's Sync button does not
+# distinguish main from a feature branch. This restores the class of protection the old mirror clone's
+# Gate-Provenance pre-push hook provided before it was quarantined at cutover.
+Copy-Item (Join-Path $RepoRoot "scripts\hooks\push_guard.py") (Join-Path $hooksDir "push_guard.py") -Force
+
+$pushHook = @'
+#!/bin/sh
+# MessageFoundry push guard -- INSTALLED COPY. Source: scripts/hooks/push_guard.py
+# Refuses a DIRECT push (or delete) of a protected branch. git feeds the refs on stdin.
+# Re-install after changing the source:  pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1
+HOOK_DIR=$(dirname "$0")
+PY=python
+command -v python >/dev/null 2>&1 || PY=python3
+if ! command -v "$PY" >/dev/null 2>&1; then
+  echo "MessageFoundry: python not found -- THE PUSH GUARD IS OFF for this push." >&2
+  exit 0
+fi
+exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
+'@ -replace "`r`n", "`n"
+
+[System.IO.File]::WriteAllText($prePush, $pushHook, (New-Object System.Text.UTF8Encoding $false))
+
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
-if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg }
+if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush }
 
 Write-Host ""
-Write-Host "MessageFoundry claim gate INSTALLED." -ForegroundColor Green
+Write-Host "MessageFoundry hooks INSTALLED." -ForegroundColor Green
 Write-Host "  commit-msg: $commitMsg"
 Write-Host "              $(Join-Path $hooksDir 'claim_check.py')   (claim gate, BACKLOG #309)"
+Write-Host "  pre-push  : $prePush"
+Write-Host "              $(Join-Path $hooksDir 'push_guard.py')    (refuses a direct push to main)"
 Write-Host "  governs   : all $(@(& git -C $RepoRoot worktree list).Count) worktree(s) of this repo, immediately"
 Write-Host ""
 
