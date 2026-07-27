@@ -40,7 +40,7 @@ def git(*args: str) -> str:
     # so the decode raised inside subprocess's reader thread, `proc.stdout` came back **None**, and the
     # caller died on `findall(None)` — blocking every commit that touched either ledger file. The gate's
     # own failure mode was the one it exists to prevent: silent, and worst on the files it guards.
-    proc = subprocess.run(
+    proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
     # A git failure (bad ref, missing path) must not read as "the file is empty" — an empty ledger parses
@@ -96,6 +96,21 @@ class Ledger:
 
     def base_text(self, path: str) -> str:
         return git("show", f"{self.base}:{path}")
+
+    def base_has(self, path: str) -> bool:
+        """Does the base ref contain ``path`` at all?
+
+        A ledger file being ADDED legitimately has no base version, and `git show base:path` exits 128
+        for that — indistinguishable, to :func:`git`, from a real failure, which it must keep raising on
+        (an error swallowed as "empty ledger" reads as "no numbers taken", the false-clean this gate
+        exists to prevent). So absence is probed EXPLICITLY here, and only after the base ref itself is
+        verified — otherwise a bad/unfetched base would quietly answer "absent" and disable the check.
+        """
+        git("rev-parse", "--verify", f"{self.base}^{{commit}}")
+        probe = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
+            ["git", "cat-file", "-e", f"{self.base}:{path}"], capture_output=True
+        )
+        return probe.returncode == 0
 
     def base_adr_numbers(self) -> dict[str, str]:
         out: dict[str, str] = {}
@@ -184,6 +199,12 @@ class Ledger:
 
     def check_backlog(self) -> None:
         if "docs/BACKLOG.md" not in self.changed_files():
+            return
+        if not self.base_has("docs/BACKLOG.md"):
+            # The base has no backlog at all — the file is being ADDED (it was gitignored until the
+            # cutover published it). Numbers that do not exist on base cannot be collided with, so
+            # there is nothing to police; without this, importing the ledger wholesale would report
+            # every one of its ~229 items as "not allocated to this worktree".
             return
         head = set(BACKLOG_HEADING.findall(self.head_text("docs/BACKLOG.md")))
         base = set(BACKLOG_HEADING.findall(self.base_text("docs/BACKLOG.md")))
