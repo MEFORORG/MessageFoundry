@@ -370,3 +370,62 @@ def test_ci_mode_skips_the_ownership_rule_but_still_catches_a_reused_number(repo
     code, out = run_check(repo, "--ci")
     assert code == 1
     assert "ADR 0001 already exists" in out
+
+
+# --------------------------------------------------------------------------------------------------
+# WIRING. Everything above tests the gate's LOGIC against a throwaway repo. None of it notices if the
+# gate is never invoked -- and on 2026-07-27 that is exactly what happened: the ledger gate had to move
+# out of .git/hooks/pre-commit because `pre-commit install` and install-git-hooks.ps1 both want that
+# file, and their chaining fails on Windows. Logic tests stayed green throughout. These assert the gate
+# is actually WIRED UP, which is the property that was silently lost.
+# --------------------------------------------------------------------------------------------------
+
+_CONFIG = Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml"
+_INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
+
+
+def _ledger_hook() -> dict[str, object]:
+    """The ledger-gate entry from .pre-commit-config.yaml, or fail loudly.
+
+    Plain import, deliberately NOT pytest.importorskip: pyyaml is pinned in requirements.lock and
+    constraints.lock, so it is always present where CI runs. importorskip would turn a missing
+    dependency into a silent SKIP — and a wiring test that skips is exactly the failure this test
+    exists to catch.
+    """
+    import yaml
+
+    cfg = yaml.safe_load(_CONFIG.read_text(encoding="utf-8"))
+    for repo in cfg["repos"]:
+        for hook in repo.get("hooks", []):
+            if hook.get("id") == "ledger-gate":
+                return hook
+    raise AssertionError(
+        "no 'ledger-gate' hook in .pre-commit-config.yaml — the ledger gate is NOT wired up, and every "
+        "logic test above still passes"
+    )
+
+
+def test_the_ledger_gate_is_wired_into_pre_commit() -> None:
+    hook = _ledger_hook()
+    assert "ledger_check.py" in str(hook["entry"]), hook["entry"]
+    # It inspects the staged TREE (which ADR/BACKLOG numbers the commit introduces), not a file list,
+    # so it must run even when no file it "owns" changed. Without always_run a commit that touches only
+    # unrelated files would skip the gate entirely.
+    assert hook.get("always_run") is True, "ledger-gate must be always_run"
+    assert hook.get("pass_filenames") is False, "ledger-gate must not be given a file list"
+
+
+def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
+    """The contention must stay impossible, not merely resolved once.
+
+    If install-git-hooks.ps1 starts writing .git/hooks/pre-commit again, the next `pre-commit install`
+    chains to pre-commit.legacy and — on Windows — blocks every commit in the repo.
+    """
+    src = _INSTALLER.read_text(encoding="utf-8")
+    assert "WriteAllText($preCommit" not in src, (
+        "install-git-hooks.ps1 writes a pre-commit hook again — that re-creates the two-owner conflict"
+    )
+    # ...and it must still MIGRATE an old standalone install away, or upgrading users stay broken.
+    assert "Remove-Item -LiteralPath $preCommit" in src, (
+        "the installer must remove a previously-installed standalone ledger hook"
+    )
