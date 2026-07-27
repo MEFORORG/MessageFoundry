@@ -284,6 +284,21 @@ def test_mutmut_copies_the_package_not_just_the_mutated_file(code: str) -> None:
     assert "runner=" not in code, "mutmut 3 uses pytest_add_cli_args_test_selection"
 
 
+def test_the_killed_count_is_derived_not_grepped(code: str) -> None:
+    """`mutmut results` lists ONLY the mutants worth looking at (survived / no tests / timeout /
+    suspicious). Killed mutants are never listed, so counting `': killed'` returns 0 on a perfectly
+    healthy run -- which is exactly what shipped in #18: CI reported `killed=0 survived=19` for a run
+    mutmut itself scored at 87 killed. Derive it from total-minus-listed instead.
+
+    Verified against the real artifact from run 30308667584: 461 total - 374 listed = 87, matching
+    mutmut's own counter.
+    """
+    assert "grep -c ': killed'" not in code, (
+        "mutmut never lists killed mutants -- this grep always yields 0"
+    )
+    assert "TOTAL - LISTED" in code, "the killed count must be derived from the run total"
+
+
 def test_mutmut_artifact_includes_hidden_files(workflow: dict) -> None:
     """.mutmut-cache is a dotfile and upload-artifact skips hidden files by default -- without this
     the step logs 'No files were found', uploads nothing, and still reports success."""
