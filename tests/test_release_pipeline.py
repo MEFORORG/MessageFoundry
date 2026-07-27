@@ -240,16 +240,28 @@ def test_release_publish_uses_trusted_publishing_no_token() -> None:
 # --- (6) the mirror must never release (rewrite-proof inverted guard) --------------------------------
 
 
-def test_release_mirror_guard_is_rewrite_proof() -> None:
+def test_release_jobs_are_gated_ON_the_source_repo() -> None:
+    """Both release jobs must run on MEFORORG/MessageFoundry, and nowhere else.
+
+    THIS ASSERTION USED TO BE THE EXACT OPPOSITE, and that is the point. Before the cutover this repo
+    was the published MIRROR, the mirror had to never release, and publish.ps1 rewrote the private slug
+    to the public one across *.yml — so the guard was written `!= public-slug` to be rewrite-proof, and
+    this test pinned that form.
+
+    Both premises died at the cutover: publish.ps1 is retired, and MEFORORG is now the SOURCE. The old
+    assertion therefore kept the release pipeline gated OFF the only repo that can publish — PyPI
+    Trusted Publishing is bound to MEFORORG/MessageFoundry + release.yml — so no tag could ever ship,
+    and the test made that look intentional. A test can outlive the premise it encodes; this one did.
+    """
     rel = _release()
-    # publish.ps1 rewrites the PRIVATE slug -> the PUBLIC slug across *.yml when it materializes the mirror.
-    # An `== private-slug` test would be rewritten into `== public-slug` and become TRUE on the mirror, so
-    # the guard is written as `!= public-slug` (which the rewrite cannot touch). Both release jobs use it.
-    assert rel.count("if: github.repository != 'MEFORORG/MessageFoundry'") >= 2, (
-        "the rewrite-proof mirror guard (`!= 'MEFORORG/MessageFoundry'`) must gate BOTH the release and "
-        "release-harness jobs — a naive `== 'wshallwshall/MessageFoundry'` normalization is rewrite-VULNERABLE"
+    assert rel.count("if: github.repository == 'MEFORORG/MessageFoundry'") >= 2, (
+        "both the `release` and `release-harness` jobs must be gated ON the source repo "
+        "(`== 'MEFORORG/MessageFoundry'`), or a pushed tag silently skips and nothing publishes"
     )
-    # The vulnerable normalization must NOT be present as a job guard.
-    assert "if: github.repository == 'wshallwshall/MessageFoundry'" not in rel, (
-        "the mirror guard was normalized to a rewrite-VULNERABLE `== private-slug` form"
+    # The pre-cutover inversion must never come back: it skips on the only repo that can release.
+    assert "if: github.repository != 'MEFORORG/MessageFoundry'" not in rel, (
+        "the pre-cutover mirror guard (`!= 'MEFORORG/MessageFoundry'`) is back — that disables releases "
+        "entirely, because MEFORORG is the source repo now, not the mirror"
     )
+    # The private vault must never be a release target either.
+    assert "wshallwshall" not in rel, "release.yml must not reference the retired private vault"

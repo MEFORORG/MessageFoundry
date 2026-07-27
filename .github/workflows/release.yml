@@ -39,20 +39,23 @@ permissions: {}
 
 jobs:
   release:
-    # Source-repo only. The public mirror carries a copy of this file, and the owner tags the mirror on
-    # its own snapshot sha — which fired this workflow there and red-X'd every tag. The mirror must never
-    # release: PyPI Trusted Publishing is bound to the SOURCE repo + `release.yml`, so a mirror upload is
-    # rejected on an OIDC claim mismatch, and a mirror `gh release create` would publish a release nobody
-    # asked for.
+    # Source-repo only — and since the MEFORORG cutover, MEFORORG/MessageFoundry IS the source repo.
     #
-    # The guard is INVERTED (`!=` the public slug) on purpose — DO NOT "normalize" it to
-    # `== 'MEFORORG/MessageFoundry'`. Historically scripts/publish/publish.ps1 (retired at the MEFORORG
-    # cutover) rewrote the private slug to the
-    # public one across *.yml when it materializes the mirror, so an `==` private-slug test is rewritten
-    # into `== 'MEFORORG/MessageFoundry'` and becomes TRUE exactly where it must be false. This form names
-    # only the public slug, so the rewrite cannot touch it: true on the source repo, false on the mirror.
-    # (Same rewrite-proof shape as ci.yml's `windows service smoke`, which pins itself ON the mirror.)
-    if: github.repository != 'MEFORORG/MessageFoundry'
+    # THIS GUARD WAS INVERTED UNTIL THE CUTOVER, AND THE INVERSION IS NOW WRONG. The old rationale: this
+    # repo was the published MIRROR, the mirror must never release, and scripts/publish/publish.ps1
+    # rewrote the private slug to the public one across *.yml — so an `==` private-slug test would be
+    # rewritten into `== 'MEFORORG/MessageFoundry'` and become true exactly where it had to be false.
+    # Naming only the public slug made the test rewrite-proof.
+    #
+    # Both premises are gone: publish.ps1 was retired at the cutover (nothing rewrites anything), and
+    # this repo is the source, not the mirror. Left inverted, the job skips on the ONLY repo that can
+    # release — PyPI Trusted Publishing is bound to MEFORORG/MessageFoundry + `release.yml` (see the
+    # header), so the guard and the OIDC binding pointed in opposite directions and no tag could ever
+    # publish. Every other slug guard in .github/workflows (ci, codeql, quality-advisory, scorecard)
+    # was already flipped to `==` at the cutover; release.yml was missed.
+    #
+    # `==` is also the safe form now: a fork, or the retired private vault, still cannot release.
+    if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
     permissions:
       contents: write       # create the release + upload its assets
@@ -270,10 +273,11 @@ jobs:
     # this job still BUILDS + version-checks the wheel and attaches it to the GitHub release, but does not
     # publish — so a missing harness PyPI project can never red a release.
     #
-    # Source-repo only, same rewrite-proof guard as `release` above (see the rationale there). `needs:
-    # release` already cascades the skip, so this is belt-and-braces: it keeps the harness release from
-    # firing on the mirror even if that dependency is ever dropped.
-    if: github.repository != 'MEFORORG/MessageFoundry'
+    # Source-repo only, same guard as `release` above (see the rationale there — it was inverted for the
+    # retired mirror topology and is flipped as of the cutover). `needs: release` already cascades the
+    # skip, so this is belt-and-braces: it keeps the harness release from firing anywhere that is not the
+    # source repo even if that dependency is ever dropped.
+    if: github.repository == 'MEFORORG/MessageFoundry'
     needs: release
     runs-on: ubuntu-latest
     permissions:
