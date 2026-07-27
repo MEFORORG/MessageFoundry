@@ -1828,7 +1828,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | File remote scheme, planned |
 | **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ~ | `REST-OUT` shipped; `REST-IN` planned |
 | **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped; `SOAP-IN` planned |
-| **Database** reader/writer (JDBC/ODBC) | ✅ | ✅ | ✅ | ✅ | `DB-OUT` + `DB-IN` shipped (SQL Server, exp.) |
+| **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server, exp.); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ❌ | `SMTP-OUT` planned |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |
