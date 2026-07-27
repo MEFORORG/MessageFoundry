@@ -88,18 +88,29 @@ def qapp() -> Any:
     return QApplication.instance() or QApplication([])
 
 
-def _spin(qapp: Any, predicate: Any, timeout: float = 30.0) -> None:
-    # 30s (was 10s): the predicate just needs the off-thread poller + file-poll + engine
-    # processing + API round-trips + a Qt event-loop turn to complete. That's a few seconds
-    # locally, but a loaded Windows CI runner intermittently overran 10s — a timing flake
-    # (BACKLOG #17), not a real failure. The generous deadline only ever extends a SLOW pass;
-    # a genuine hang still fails fast (predicate never true) well within the per-test watchdog.
-    deadline = time.time() + timeout
+def _spin(qapp: Any, predicate: Any, what: str, deadline: float, context: Any = None) -> None:
+    """Pump the Qt event loop until ``predicate()`` holds, or the SHARED ``deadline`` passes.
+
+    Takes an absolute deadline rather than a per-call timeout because this test makes two sequential
+    waits, and two independent budgets fail where one shared budget would not: a first wait that eats
+    25s of its own 30s allowance still hands the second a full fresh 30s, so the pair can blow the
+    watchdog with most of it unspent — while a single budget simply absorbs the slow stage.
+
+    ``what`` names the condition and ``context`` (called only on failure) reports live panel state,
+    including the status label — which carries ``poll failed: …`` when the background poller is
+    erroring. Both waits used to raise the same bare "condition not met within timeout", so four CI
+    failures never revealed which stage stalled, and the diagnosis had to start from nothing.
+    """
+    start = time.time()
     while not predicate():
+        if time.time() > deadline:
+            detail = f" | {context()}" if context is not None else ""
+            raise AssertionError(
+                f"{what}: still false after {time.time() - start:.1f}s "
+                f"(shared budget exhausted){detail}"
+            )
         qapp.processEvents()
         time.sleep(0.05)
-        if time.time() > deadline:
-            raise AssertionError("condition not met within timeout")
 
 
 def test_poller_cancel_abandons_remaining_calls(qapp: Any) -> None:
@@ -148,14 +159,16 @@ def test_monitor_panel_builds_disconnected(qapp: Any) -> None:
     panel.shutdown()  # safe to call when never connected
 
 
-# Override the global 60s per-test watchdog: this test makes two sequential _spin waits (30s each
-# worst case) plus fixture/engine startup, so a slow-but-passing CI run could otherwise brush the
-# 60s cap. 120s keeps an ample backstop without the watchdog itself becoming the flake.
-# In-run auto-retry for the residual timing flake (BACKLOG #17): even with the 30s _spin + 120s
-# watchdog, a heavily-loaded Windows runner still intermittently overran the _spin deadline. reruns=2
-# lets a single flake occurrence self-heal within the SAME CI run (up to 3 attempts) instead of reding
-# the matrix and blocking the auto-merge pipeline; a genuine break still fails all attempts.
-@pytest.mark.flaky(reruns=2)
+# Override the global 60s per-test watchdog: the two waits share a 60s budget, and fixture/engine
+# startup sits outside it, so a slow-but-passing CI run could otherwise brush the 60s cap.
+#
+# NO reruns=2 here any more, deliberately. It was added to let BACKLOG #17 "self-heal" within a run,
+# on the theory that this was a residual timing flake on loaded Windows runners. It was not: the
+# message list was livelocking (MessagesPanel._apply discarded every snapshot as superseded while this
+# test polled refresh() at 50ms — see tests/test_console_messages_refresh.py), which is why neither
+# 10s→30s nor the reruns ever fixed it. That is now fixed at the source. Keeping the retry would only
+# hide the next real defect the same way it hid this one, and would make the fix unmeasurable — a
+# masked failure looks exactly like a working one.
 @pytest.mark.timeout(120)
 def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
     url, inbox = server
@@ -164,15 +177,60 @@ def test_monitor_observes_engine(qapp: Any, server: tuple[str, Path]) -> None:
     panel = MonitorPanel()
     panel._url.setText(url)
     panel._connect_btn.click()  # connects (auth disabled) and starts the off-thread poller
+    deadline = time.time() + 60  # ONE budget spanning both waits, not 30s each
     try:
         assert panel._client is not None
+
+        def ctx() -> str:
+            """Failure-path only. The status label carries 'poll failed: …' when the background
+            poller is erroring, which is otherwise invisible to this test."""
+            return f"live_rows={_live_rows(panel)} status={panel._status.text()!r}"
+
         # The poller runs on its own thread; processEvents() delivers its queued snapshot.
-        _spin(qapp, lambda: _live_rows(panel) > 0)
+        _spin(
+            qapp, lambda: _live_rows(panel) > 0, "live connections table populated", deadline, ctx
+        )
         # The reused message list shows the delivered message with a disposition.
-        _spin(qapp, lambda: _has_message(panel, qapp))
+        _spin(qapp, lambda: _has_message(panel, qapp), "delivered message in list", deadline, ctx)
     finally:
         panel.shutdown()
     assert panel._client is None
+
+
+@pytest.mark.timeout(120)
+def test_monitor_observes_a_message_that_arrives_after_connect(
+    qapp: Any, server: tuple[str, Path]
+) -> None:
+    """The deterministic form of what CI kept hitting, and the reason BACKLOG #17 looked like a flake.
+
+    The sibling test writes the message BEFORE the panel connects, so the single initial ``refresh()``
+    in ``_build_inner`` normally renders it and the polling path below is never exercised at all. That
+    race is the whole difference between local and CI: a fast machine wins it every time, a loaded
+    runner lost it about a third of the time and then hit a livelock no timeout could escape.
+
+    Connecting first makes the initial snapshot empty by construction, so the message can ONLY appear
+    via the 50ms ``refresh()`` polling — exercising the path that used to discard every snapshot.
+    """
+    url, inbox = server
+    panel = MonitorPanel()
+    panel._url.setText(url)
+    panel._connect_btn.click()
+    (inbox / "a.hl7").write_bytes(
+        ADT.encode("utf-8")
+    )  # only AFTER the initial refresh has gone out
+
+    deadline = time.time() + 60
+    try:
+        assert panel._client is not None
+        _spin(
+            qapp,
+            lambda: _has_message(panel, qapp),
+            "message arriving after connect appears in list",
+            deadline,
+            lambda: f"status={panel._status.text()!r}",
+        )
+    finally:
+        panel.shutdown()
 
 
 def _live_rows(panel: MonitorPanel) -> int:
