@@ -20,8 +20,10 @@ import time
 from dataclasses import dataclass
 
 from messagefoundry.apiclient import ApiError, EngineClient
-from messagefoundry.generators import _core
-from messagefoundry.generators import all_types  # noqa: F401  (registers the built-in message types)
+from messagefoundry.generators import (
+    _core,
+    all_types,  # noqa: F401  (registers the built-in message types)
+)
 from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 _TERMINAL = {"processed", "unrouted", "filtered", "error"}

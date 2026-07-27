@@ -42,7 +42,9 @@ def main() -> int:
     # Scan a copy in a temp dir (outside the tests tree, not a git repo) so it is actually analyzed.
     with tempfile.TemporaryDirectory() as tmp:
         shutil.copy(_FIXTURE, Path(tmp) / _FIXTURE.name)
-        proc = subprocess.run(  # noqa: S603 — fixed args, no shell
+        # nosec B603 B607 - fixed argv, no shell. The `noqa` covers ruff's copy of these rules; bandit
+        # does not read noqa, so both annotations are needed now that CI scans scripts/ too.
+        proc = subprocess.run(  # noqa: S603 — fixed args, no shell  # nosec B603 B607
             ["semgrep", "--config", str(_RULES), "--json", "--metrics", "off", tmp],  # noqa: S607
             capture_output=True,
             text=True,

@@ -13,9 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
-from typing import Sequence
-
-from messagefoundry.apiclient import ApiError
+from collections.abc import Sequence
 
 from harness.load.corpus import build_corpus
 from harness.load.correlator import Correlator
@@ -27,6 +25,7 @@ from harness.load.profile import LoadProfile
 from harness.load.report import PhaseRecord, RunReport, build_report
 from harness.load.sender import ConnectionPool, Dispatcher
 from harness.load.sink import CorrelationSink
+from messagefoundry.apiclient import ApiError
 
 _STOP_GRACE = 5.0
 _SETTLE = 0.25  # let final ACKs/arrivals settle before the final engine sample

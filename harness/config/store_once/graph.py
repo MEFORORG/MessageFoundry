@@ -23,11 +23,10 @@ then inject a few ADT messages on the inbound port and inspect the store (``shar
 
 from __future__ import annotations
 
+from harness.config.load._shape import load_shape
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.parsing.message import Message, RawMessage
-
-from harness.config.load._shape import load_shape
 
 _SHAPE = load_shape()
 

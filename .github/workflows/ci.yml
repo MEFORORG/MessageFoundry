@@ -163,9 +163,16 @@ jobs:
       # BOTH platforms on the cheap Linux leg (below). Running them on the 2x-billed Windows legs was
       # duplicate cost, so gate them to Linux. The Windows legs keep pytest — the one check whose
       # result genuinely differs by OS (real sockets, ProactorEventLoop, Windows service paths).
+      # `.` — the WHOLE repo, matching the format check below and the pre-commit ruff hook, which has no
+      # `exclude` and so lints every changed Python file. This was an explicit allow-list of six paths,
+      # and the mismatch was not academic: harness/ (73 findings), tee/ (12), samples/ and docker/ were
+      # linted by the hook and by nothing in CI, so touching any file there blocked the commit on errors
+      # CI could not see and no CI run could ever have reported. Scope now lives in ONE place —
+      # pyproject's [tool.ruff] extend-exclude — instead of being re-stated, differently, per tool.
+      # tests/test_lint_scope_parity.py fails if the two drift apart again.
       - name: Lint (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
-        run: ruff check messagefoundry messagefoundry_webconsole tests packaging/messagefoundry-webconsole scripts/webconsole_seam_snapshot.py scripts/docs/backlog_status_check.py scripts/tray/make_icons.py
+        run: ruff check .
 
       - name: Format check (ruff)
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'

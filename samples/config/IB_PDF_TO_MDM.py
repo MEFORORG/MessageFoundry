@@ -17,6 +17,8 @@ so the whole document streams inline.
 Drop a synthetic (never real PHI) PDF into the DEV inbox to exercise it. Endpoints are loopback/synthetic.
 """
 
+from _pdf_mdm_transforms import build_mdm_from_pdf
+
 from messagefoundry import (
     MLLP,
     ContentType,
@@ -28,8 +30,6 @@ from messagefoundry import (
     outbound,
     router,
 )
-
-from _pdf_mdm_transforms import build_mdm_from_pdf
 
 # File inbound: poll a DEV drop directory for *.pdf and deliver each as raw bytes (content_type=BINARY →
 # base64-carried, routed as a RawMessage). The bind directory is a DEV path; a real deployment points it

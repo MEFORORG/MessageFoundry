@@ -20,12 +20,13 @@ import random
 from dataclasses import dataclass
 from pathlib import Path
 
-from messagefoundry.generators import _core
-from messagefoundry.generators import all_types as _all_types  # noqa: F401  (registers message types)
-from messagefoundry.parsing.message import Message
-
 from harness.load.ids import ControlIds
 from harness.load.profile import LoadProfile, LoadProfileError, TypeMix
+from messagefoundry.generators import _core
+from messagefoundry.generators import (
+    all_types as _all_types,  # noqa: F401  (registers message types)
+)
+from messagefoundry.parsing.message import Message
 
 
 @dataclass(frozen=True)

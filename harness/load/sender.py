@@ -22,13 +22,12 @@ import time
 from collections import deque
 from collections.abc import Callable
 
-from messagefoundry.transports.mllp import MLLPDecoder, frame
-
 from harness.load.corpus import Outgoing
 from harness.load.correlator import Correlator
 from harness.load.failover_track import FailoverTracker
 from harness.load.metrics import LiveMetrics
 from harness.load.profile import Target
+from messagefoundry.transports.mllp import MLLPDecoder, frame
 
 OnDone = Callable[[], None]
 _Job = tuple[Outgoing, OnDone | None]
@@ -312,7 +311,10 @@ class Dispatcher:
             return self._rng.choice(eligible)[1]
         x = self._rng.random() * total
         running = 0.0
-        for (_target, pool), weight in zip(eligible, weights):
+        # strict=True: weights is a comprehension over `eligible` just above, so the two are the same
+        # length by construction. If that ever drifts, zip's default would truncate the weighted draw
+        # and silently bias target selection rather than fail.
+        for (_target, pool), weight in zip(eligible, weights, strict=True):
             running += weight
             if x <= running:
                 return pool

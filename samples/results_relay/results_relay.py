@@ -26,7 +26,7 @@ Run it locally::
         --messages samples/results_relay/messages --show-phi
 """
 
-from messagefoundry import File, MLLP, Send, code_set, env, handler, inbound, outbound, router
+from messagefoundry import MLLP, File, Send, code_set, env, handler, inbound, outbound, router
 from messagefoundry.parsing.message import Message
 
 OB_EHR = "OB_EHR_ORU"

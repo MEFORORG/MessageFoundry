@@ -19,12 +19,11 @@ correlation clean. See ``docs/LOAD-TESTING.md``.
 
 from __future__ import annotations
 
+from harness.config.load._shape import Shape, apply_transform, load_shape
 from messagefoundry import MLLP, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.config.wiring import HandlerFn
 from messagefoundry.parsing.message import Message, RawMessage
-
-from harness.config.load._shape import Shape, apply_transform, load_shape
 
 _SHAPE = load_shape()
 

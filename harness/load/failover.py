@@ -167,7 +167,7 @@ class EngineNode:
                 proc.terminate()
             try:
                 await asyncio.wait_for(proc.wait(), timeout=10.0)
-            except (TimeoutError, asyncio.TimeoutError):
+            except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     proc.kill()
                 with contextlib.suppress(Exception):
@@ -791,7 +791,10 @@ async def _await_single_leader(
     start = time.perf_counter()
     while time.perf_counter() - start < timeout:
         roles = [await n.role(client) for n in nodes]
-        leaders = [n for n, r in zip(nodes, roles) if r == "primary"]
+        # strict=True: roles is built one-per-node on the line above, so a mismatch is impossible today
+        # and would be a bug if it became possible — zip's default silently DROPS the tail, which here
+        # means skipping nodes in the very scan that decides who the leader is.
+        leaders = [n for n, r in zip(nodes, roles, strict=True) if r == "primary"]
         if len(leaders) == 1:
             return leaders[0]
         if len(leaders) > 1:

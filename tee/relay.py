@@ -28,9 +28,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import AsyncIterator
 from contextlib import suppress
 from dataclasses import dataclass
-from typing import AsyncIterator
 
 from tee import mllp
 from tee.store import RelayStore
@@ -113,14 +113,14 @@ async def _forward_once(
         reader, writer = await asyncio.wait_for(
             asyncio.open_connection(host, port), connect_timeout
         )
-    except (OSError, asyncio.TimeoutError) as exc:
+    except (TimeoutError, OSError) as exc:
         raise ForwardError(f"connect to {host}:{port} failed: {exc}") from exc
 
     try:
         writer.write(mllp.frame(payload))
         await asyncio.wait_for(writer.drain(), send_timeout)
         ack = await asyncio.wait_for(_read_one_frame(reader, max_frame_bytes), send_timeout)
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         raise ForwardError(f"timed out talking to {host}:{port}") from exc
     except (OSError, mllp.FrameError) as exc:
         raise ForwardError(f"I/O error talking to {host}:{port}: {exc}") from exc
@@ -196,7 +196,7 @@ class TeeRelay:
             writer.write(mllp.frame(mllp.build_ack(message)))
             await asyncio.wait_for(writer.drain(), self.config.send_timeout)
             return True
-        except (asyncio.TimeoutError, OSError) as exc:
+        except (TimeoutError, OSError) as exc:
             logger.warning("failed to ACK a peer (connection slow or closed): %r", exc)
             return False
 
@@ -509,7 +509,7 @@ class TeeRelay:
                     chunk = await asyncio.wait_for(reader.read(_READ_CHUNK), cfg.receive_timeout)
                 else:
                     chunk = await reader.read(_READ_CHUNK)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 raise _ConnectionClosed from None
             except OSError:
                 raise _ConnectionClosed from None

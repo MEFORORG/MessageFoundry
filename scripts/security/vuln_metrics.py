@@ -33,7 +33,7 @@ import subprocess
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -46,7 +46,7 @@ _USER_AGENT = "messagefoundry-vuln-metrics"
 def _gh(args: list[str]) -> Any:
     """Run a `gh` command that emits JSON; return the parsed value ([] on failure)."""
     try:
-        out = subprocess.run(
+        out = subprocess.run(  # nosec B603 B607 - fixed argv (`gh`), no shell, args are literals
             ["gh", *args],
             capture_output=True,
             text=True,
@@ -67,7 +67,9 @@ def _gh(args: list[str]) -> Any:
 def _http_json(url: str, timeout: float) -> Any:
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310 - fixed https feeds
+        # nosec B310 - same reason as the noqa: the URL is a fixed https advisory feed, never
+        # message-derived or caller-supplied, so no file:/custom scheme is reachable here.
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310  # nosec B310
             return json.loads(resp.read())
     except (urllib.error.URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         print(f"warning: GET {url} failed: {exc}", file=sys.stderr)
@@ -280,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--reachability", default=None, help="triaged reachable/total, e.g. 3/5")
     args = p.parse_args(argv)
 
-    now = _parse_dt(args.now) or datetime.now(timezone.utc)
+    now = _parse_dt(args.now) or datetime.now(UTC)
     adopter_repos = [r.strip() for r in args.adopter_repos.split(",") if r.strip()]
     row = compute(args.repo, args.limit, args.timeout, now, adopter_repos, args.reachability)
 

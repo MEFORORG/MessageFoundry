@@ -236,6 +236,12 @@ line-length = 100
 # this to py314 if/when we choose to adopt the unparenthesized style in a dedicated formatting pass.
 target-version = "py313"
 
+# Archived benchmark ARTIFACTS, not maintained source. docs/benchmarks/results/<date>-<topic>/ holds
+# the exact scripts a published measurement was produced with; reformatting them edits the record, and
+# a number you cannot reproduce from the script filed beside it is worthless. New benchmark code lives
+# outside results/ and is linted normally. `extend-exclude` (not `exclude`) so ruff's defaults survive.
+extend-exclude = ["docs/benchmarks/results"]
+
 [tool.ruff.lint]
 # Signal 10 (Code Quality & Anti-Slop rubric, docs/Code_Quality_Standards.md): broaden ruff beyond its
 # E/F defaults to the AI-slop-adjacent families -- flake8-bugbear (B), comprehensions (C4), simplify

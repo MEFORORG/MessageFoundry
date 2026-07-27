@@ -148,7 +148,7 @@ def _kerberos_capable() -> bool:
                 proxy = getattr(importlib.import_module(mod), cls)
                 if "kerberos" in proxy.available_protocols():
                     return True
-            except Exception:
+            except Exception:  # nosec B112 - probing candidate SSPI providers; absent is the norm
                 continue
         return False
     except Exception:
@@ -169,7 +169,7 @@ def _detect_provider() -> str:
             proxy = getattr(importlib.import_module(mod), cls)
             if "kerberos" in proxy.available_protocols():
                 return label
-        except Exception:
+        except Exception:  # nosec B112 - probing candidate SSPI providers; absent is the norm
             continue
     return "pure-Python NTLM fallback (NOT Kerberos-capable)"
 

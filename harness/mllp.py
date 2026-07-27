@@ -10,6 +10,7 @@ so the harness frames and acknowledges exactly like the engine.
 
 from __future__ import annotations
 
+import contextlib
 import socket
 import threading
 import time
@@ -111,10 +112,8 @@ class SendWorker(QObject):
         self._stop = True
         with self._lock:
             if self._sock is not None:
-                try:
+                with contextlib.suppress(OSError):
                     self._sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
 
     def run(self) -> None:
         delay = 1.0 / self._rate if self._rate > 0 else 0.0
@@ -249,7 +248,7 @@ class MllpReceiver(QObject):
     def _delayed_aa(self, sock: QTcpSocket, text: str) -> None:
         if sock not in self._decoders:  # the engine may have timed out and closed by now
             return
-        try:
+        try:  # noqa: SIM105 - suppress() would drop the reason recorded on the except below
             self._write_ack(sock, text, "AA", AckMode.ORIGINAL)
         except RuntimeError:  # underlying socket already deleted
             pass

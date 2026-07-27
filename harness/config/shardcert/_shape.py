@@ -103,9 +103,8 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
-from messagefoundry.parsing.message import Message, RawMessage
-
 from harness.load.ids import SHARDCERT_IDS
+from messagefoundry.parsing.message import Message, RawMessage
 
 CHEAP = "cheap"
 EDIT = "edit"

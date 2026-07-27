@@ -23,17 +23,17 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Sequence, TypeVar
-
-from messagefoundry.apiclient import ApiError, EngineClient
+from typing import Any, TypeVar
 
 from harness.load.metrics import Counters
+from messagefoundry.apiclient import ApiError, EngineClient
 
 _T = TypeVar("_T")
 
 
-def _first_not_none(values: Iterable[_T | None]) -> _T | None:
+def _first_not_none[T](values: Iterable[_T | None]) -> _T | None:
     """The first non-``None`` value, or ``None`` if all are ``None`` (per-process gauges: the connscale
     harness drives a single engine, so this is exactly that engine's reading)."""
     for value in values:
@@ -568,7 +568,7 @@ class EnginePoller:
         start = loop.time()
         prev = self.final or await self.sample_once()
         while loop.time() - start < timeout:
-            try:
+            try:  # noqa: SIM105 - suppress() would drop the pragma below, which coverage reads
                 await asyncio.wait_for(asyncio.sleep(interval), timeout=interval + 1.0)
             except TimeoutError:  # pragma: no cover - defensive
                 pass

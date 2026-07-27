@@ -39,12 +39,6 @@ from typing import Any
 
 import httpx
 
-from messagefoundry.config.wiring import load_config
-from messagefoundry.pipeline.sharding import (
-    owned_destination_set,
-    shard_ids,
-)
-
 from harness.config.shardcert._shape import (
     BROADCAST,
     PARTITIONED_FANOUT,
@@ -74,6 +68,11 @@ from harness.load.metrics import Counters, Histogram, LiveMetrics
 from harness.load.profile import TypeMix, load_profile_text
 from harness.load.sender import PersistentConnection
 from harness.load.sink import CorrelationSink
+from messagefoundry.config.wiring import load_config
+from messagefoundry.pipeline.sharding import (
+    owned_destination_set,
+    shard_ids,
+)
 
 _CONFIG_DIR = "harness/config/shardcert"
 
@@ -1316,10 +1315,8 @@ async def _sample_in_pipeline_peak(
                 depth = sample.in_pipeline // n_shards
                 if depth > out[0]:
                     out[0] = depth
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=interval)
-            except (asyncio.TimeoutError, TimeoutError):
-                pass
     finally:
         await poller.close()
 
@@ -1351,10 +1348,8 @@ async def _sample_in_pipeline_trace(
             sample = await poller.sample_once()
             if sample is not None:
                 out.append([round(time.perf_counter() - t0, 3), sample.in_pipeline / n_shards])
-            try:
+            with contextlib.suppress(TimeoutError):
                 await asyncio.wait_for(stop.wait(), timeout=interval)
-            except (asyncio.TimeoutError, TimeoutError):
-                pass
     finally:
         await poller.close()
 
@@ -3907,7 +3902,7 @@ async def _reap_child(label: str, proc: Any, *, grace: float) -> str:
     out = b""
     try:
         out, _ = await asyncio.wait_for(proc.communicate(), timeout=grace)
-    except (asyncio.TimeoutError, TimeoutError):
+    except TimeoutError:
         with contextlib.suppress(Exception):
             proc.kill()
         with contextlib.suppress(Exception):

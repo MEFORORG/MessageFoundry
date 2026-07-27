@@ -19,7 +19,7 @@ import os
 import time
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import aiosqlite
@@ -95,7 +95,7 @@ def _clean_detail(detail: str | None) -> str | None:
 
 def _iso(at: float) -> str:
     """An epoch-seconds timestamp as a UTC ISO-8601 string (for human/AI-readable export)."""
-    return datetime.fromtimestamp(at, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(at, tz=UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def _is_nak(row: aiosqlite.Row) -> bool:
@@ -166,7 +166,7 @@ def _secure_file(path: str) -> None:
     """Best-effort owner-only permissions on the DB file **and its WAL/SHM siblings** (which WAL mode
     creates and which can hold message data when body capture is on)."""
     for sibling in (path, path + "-wal", path + "-shm"):
-        try:
+        try:  # noqa: SIM105 - suppress() would drop the rationale recorded in the handler below
             os.chmod(sibling, 0o600)
         except OSError:
             # Non-fatal: on some filesystems / Windows ACLs chmod is a partial no-op. Deployments that

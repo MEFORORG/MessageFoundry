@@ -40,7 +40,7 @@ import os
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from harness.load.connscale.driver import ConnScaleDriver
@@ -53,7 +53,7 @@ from harness.load.connscale.runner import (
     _reconcile,
 )
 from harness.load.correlator import Correlator
-from harness.load.enginepoll import EngineSample, EnginePoller, sample_until_reconciled
+from harness.load.enginepoll import EnginePoller, EngineSample, sample_until_reconciled
 from harness.load.failover import EngineNode, _await_port
 from harness.load.ids import ControlIds
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -784,7 +784,7 @@ def _check_port_layout(
 
 def _now_iso() -> str:
     """Timezone-aware ISO-8601 (UTC, seconds resolution) — the operator's wait-stat window bracket."""
-    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+    return datetime.now(UTC).replace(microsecond=0).isoformat()
 
 
 async def _sample_loop(
@@ -797,10 +797,8 @@ async def _sample_loop(
         sample = await poller.sample_once()
         if sample is not None:
             out.append(sample)
-        try:
+        with contextlib.suppress(TimeoutError):
             await asyncio.wait_for(stop.wait(), timeout=interval)
-        except (asyncio.TimeoutError, TimeoutError):
-            pass
 
 
 def _peak_float(values: list[float | None]) -> float | None:

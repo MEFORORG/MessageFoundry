@@ -10,6 +10,7 @@ gate on delivery before it polls the message disposition.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import sys
 
 from messagefoundry.transports.mllp import MLLPDecoder, frame
@@ -37,10 +38,8 @@ async def _send(host: str, port: int, payload: str, timeout: float) -> bytes:
                 return message
     finally:
         writer.close()
-        try:
+        with contextlib.suppress(OSError):
             await writer.wait_closed()
-        except OSError:
-            pass
 
 
 def main() -> int:

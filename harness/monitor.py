@@ -17,8 +17,9 @@ view widgets, rehomed here from the retired desktop console (BACKLOG #103).
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable
 
 from PySide6.QtCore import QMetaObject, QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
@@ -35,8 +36,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from messagefoundry.api.models import ConnectionRow, DeadLetterRow
-from messagefoundry.apiclient import ApiError, EngineClient
 from harness._console_widgets import (
     ConfigurableTable,
     MessageDetailPanel,
@@ -44,6 +43,8 @@ from harness._console_widgets import (
     fmt_ts,
 )
 from harness._login import LoginDialog
+from messagefoundry.api.models import ConnectionRow, DeadLetterRow
+from messagefoundry.apiclient import ApiError, EngineClient
 
 _DEFAULT_URL = "http://127.0.0.1:8765"
 _POLL_INTERVAL_MS = 1500
@@ -270,10 +271,8 @@ class MonitorPanel(QWidget):
     def _disconnect(self) -> None:
         self._stop_poller()
         if self._client is not None:
-            try:
+            with contextlib.suppress(ApiError):
                 self._client.logout()
-            except ApiError:
-                pass
             self._client.close()
             self._client = None
         inner = self._body.widget(1)

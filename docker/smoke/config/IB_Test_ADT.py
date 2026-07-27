@@ -11,7 +11,7 @@ read-only root filesystem. Every ADT is archived (no event filter) so the smoke'
 reaches a terminal PROCESSED disposition; a non-ADT message would be logged UNROUTED.
 """
 
-from messagefoundry import File, MLLP, Send, handler, inbound, outbound, router
+from messagefoundry import MLLP, File, Send, handler, inbound, outbound, router
 
 inbound("IB_Test_ADT", MLLP(port=2575), router="adt_router")
 outbound("FILE-OUT_Test_ADT", File(directory="/var/lib/mefor/out/adt", filename="{MSH-10}.hl7"))

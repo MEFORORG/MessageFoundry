@@ -18,11 +18,10 @@ Synthetic + generic; reuses the load graph's ``_shape`` for the entry port and s
 
 from __future__ import annotations
 
+from harness.config.load._shape import load_shape
 from messagefoundry import MLLP, PassThrough, Send, handler, inbound, outbound, router
 from messagefoundry.config.models import RetryPolicy
 from messagefoundry.parsing.message import Message, RawMessage
-
-from harness.config.load._shape import load_shape
 
 _SHAPE = load_shape()
 

@@ -21,8 +21,8 @@ from pathlib import Path
 
 from PySide6.QtCore import QFileSystemWatcher, QObject, QTimer, Signal
 
-from messagefoundry.parsing import HL7PeekError, Peek, normalize
 from harness.mllp import Received, SendItem
+from messagefoundry.parsing import HL7PeekError, Peek, normalize
 
 _RESCAN_MS = 1000  # safety-net poll; QFileSystemWatcher can miss bursts on some platforms
 

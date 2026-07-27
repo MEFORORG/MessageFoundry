@@ -9,9 +9,9 @@ declared as data in ``connections.toml``. All the manipulation detail lives in t
 small, reviewable, and unit-testable — not inlined here.
 """
 
-from messagefoundry import Send, handler
-
 from _demo_oru_transforms import apply_demo_oru_transforms
+
+from messagefoundry import Send, handler
 
 # The outbound is declared as data in connections.toml; the Handler references it by name.
 OB_DEMO_ORU = "OB_DEMO_ORU"
