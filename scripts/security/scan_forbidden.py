@@ -1,0 +1,883 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Forbidden-content scanner: keep customer/PHI-adjacent strings out of the public repo.
+
+Two callers share this one module so their detection can never drift:
+  * ``.pre-commit-config.yaml`` runs it over staged files before every commit.
+  * ``.github/workflows/security.yml`` runs it over the whole tracked tree in CI.
+
+Why a custom scanner in addition to gitleaks: gitleaks finds *secrets* (keys/tokens). This finds
+*customer-identifying* strings -- a partner/vendor name, a real site-estate's site-code prefix, a
+routable host IP -- which are not credentials but must never reach the open-source repo.
+
+Token authority is EXTERNALIZED. The committed source carries only STRUCTURAL detectors (a routable-
+IPv4 detector and the generic site-code *shape*); the real customer/vendor name patterns, estate
+substrings, and the site-code numeric prefix are loaded at runtime from, in order of precedence:
+
+  1. ``MEFOR_FORBIDDEN_TOKENS`` -- either a path to a token file OR the token content inline
+     (newline-separated, same format). Used in CI via the Actions secret of the same name.
+  2. ``scripts/security/scan-tokens.local.txt`` -- a git-ignored local file (pre-commit). A synthetic
+     template ships as ``scan-tokens.local.txt.example``.
+
+With no source present the scanner degrades to STRUCTURAL-ONLY (routable-IPv4 only); the name /
+estate / site-code detectors are simply empty -- appropriate for a fork with no access to the secret.
+Set ``MEFOR_REQUIRE_TOKENS=1`` to fail closed (exit 2) instead when the source is absent, so a
+misconfigured owner/CI run refuses rather than silently under-scanning.
+
+PRESENCE IS NOT SUFFICIENCY. A source that loads only PART of its tokens is the dangerous case: it
+satisfies "tokens present", prints no structural-only warning, and passes a gate that calls itself
+fail-closed. So requiring tokens also requires every floor section (``names`` / ``estate`` /
+``site_prefixes``) to be non-empty, and ``MEFOR_MIN_DETECTORS=N`` (or ``--require-tokens=N``) asserts
+a minimum TOTAL, which is what catches loss *within* a section. It is a floor, not an equality:
+adding tokens is free, losing them fails. The expected total comes from OUTSIDE the token source --
+a count carried inside the file would be destroyed by the same mangling it is meant to detect.
+
+``--require-tokens[=N]`` exists because pre-commit can pass args to a hook but cannot set env for
+one, so it is the only way to make the commit-time gate fail closed on a checkout with no token file.
+
+Token-file format (sectioned; ``#`` comments and blank lines ignored):
+  [names]        REGEX | REASON | CASE  -- REASON optional (default "customer/vendor token");
+                 CASE optional: "i" case-insensitive (default) or "s" case-sensitive. The field
+                 delimiter is a space-pipe-space (`` | ``); a regex alternation ``a|b`` is unaffected.
+  [estate]       one substring token per line (matched case-insensitively, anywhere in a body).
+  [site_prefix]  one numeric prefix per line; the detector matches PREFIX + four digits.
+
+Usage:
+  scan_forbidden.py [FILE ...]      # scan the given files (how pre-commit invokes it)
+  scan_forbidden.py --path DIR      # scan every text file under DIR
+  scan_forbidden.py --show-context  # also print the matched line/value (NEVER used in CI -- a hit
+                                    #   means the content already sits in a tracked file, so echoing
+                                    #   it would copy the leak into public CI logs; default is
+                                    #   reasons-only: location + category, never the matched text)
+  scan_forbidden.py                 # scan all git-tracked files in the current repo
+
+Exit: 0 clean, 1 forbidden content found (fail closed), 2 usage error / required-tokens-missing.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+# --------------------------------------------------------------------------------------------------
+# Structural detectors (NO customer data -- safe to commit). These run regardless of the token source.
+# --------------------------------------------------------------------------------------------------
+
+# Routable-IPv4 detector. The look-arounds keep dotted OIDs (1.3.6.1..., 2.16.840...) and version
+# strings embedded in longer dotted sequences from matching; only a free-standing IPv4 does.
+_OCTET = r"(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)"
+_IPV4 = re.compile(rf"(?<![\d.])(?:{_OCTET}\.){{3}}{_OCTET}(?![\d.])")
+# Non-routable / documentation / loopback prefixes never identify a real host: RFC1918 private,
+# loopback, link-local, broadcast, RFC5737 TEST-NET-1/2/3 (documentation), multicast/reserved.
+_ALLOWED_IP = re.compile(
+    r"^(?:"
+    r"0\.|127\.|10\.|192\.168\.|169\.254\.|255\.|"
+    r"172\.(?:1[6-9]|2\d|3[01])\.|"  # 172.16.0.0/12
+    r"192\.0\.2\.|198\.51\.100\.|203\.0\.113\.|"  # TEST-NET-1/2/3 (RFC 5737)
+    r"22[4-9]\.|23\d\."  # 224.0.0.0+ multicast/reserved
+    r")"
+)
+
+# Internal-environment disclosure. Neither of these is a customer token, so NO token list can catch
+# them -- they are recognised by SHAPE, and they are therefore live even in structural-only / fork
+# runs where the token tables are empty. Both reached a publish dry run undetected once.
+#
+# A worktree/branch slug is whatever the task happened to be CALLED, so it can name a prospect segment,
+# a customer engagement, or a competitor study. That is unbounded: the leak is the project name itself,
+# and there is no list to add it to. Matching the shape is the only control that scales.
+_WORKTREE_SLUG = re.compile(r"(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}")
+# An absolute user-home path carries the OS account name, and inside a worktree path the slug as well.
+# Exempt: bracket/env placeholders (<you>, $HOME, %USERPROFILE%, {home}), the well-known shared and CI
+# accounts, and the DOCUMENTATION placeholder names this repo already uses in examples (me, svc, you,
+# user, username, example). Everything else looks like a real account and fires. That list is the whole
+# judgement call here: "is this a real person's login" is not decidable by shape, so the pattern trusts
+# a small, explicit set of conventional stand-ins and treats anything else as a disclosure.
+_HOME_PATH = re.compile(
+    r"(?:[A-Za-z]:[\\/]Users|/home|/Users)[\\/]"
+    r"(?!<|\$|%|\{"
+    r"|(?:Public|Default|All|ContainerAdministrator|runner|vsts"
+    r"|me|svc|you|user|username|example)[\\/\s\"'`]"
+    r")"
+    r"[A-Za-z][A-Za-z0-9._-]*"
+)
+
+# A pattern that can never match -- the "detector off" sentinel used for the site-code regexes when no
+# numeric prefix is loaded (structural-only / fork context). ``(?!)`` is an always-failing assertion,
+# so ``.search``/``.finditer``/``.fullmatch`` never fire and ``.pattern`` stays a valid string.
+_NEVER: re.Pattern[str] = re.compile(r"(?!)")
+
+# Skip routable-IP detection (only) where dotted numbers are package versions, not hosts.
+_IP_SKIP_SUFFIXES = {".lock"}
+_IP_SKIP_NAMES = {"requirements.lock", "uv.lock", "package-lock.json"}
+
+# Lock/SVG/password-list files are dense with incidental standalone digit runs -> skip the site-code
+# file scan (only) on them to avoid a false-positive storm.
+_SITE_SKIP_SUFFIXES = {".lock", ".svg"}
+_SITE_SKIP_NAMES = {
+    "requirements.lock",
+    "uv.lock",
+    "package-lock.json",
+    "common_passwords.txt",
+}
+
+SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".ruff_cache",
+    ".pytest_cache",
+    "build",
+    "dist",
+}
+
+# The ONLY skipped path: the git-ignored real-token file itself. It is never committed (so it is
+# absent from a tracked scan), but a whole-worktree ``--path .`` scan on the owner's machine would
+# otherwise walk it and self-trip on every real token it exists to hold. Nothing that reaches the
+# public repo is skipped -- no blanket public directory, and NOT ``.gitignore`` (which is scanned).
+SKIP_PATHS = ("scripts/security/scan-tokens.local.txt",)
+
+
+def _is_skipped(posix: str) -> bool:
+    # ``posix`` is ALWAYS relative to the scan root (main() derives it that way in --path mode too), so
+    # this is an EXACT path match, never a suffix match. A suffix test would skip a same-named file at a
+    # different path, which must still be scanned.
+    return posix in SKIP_PATHS
+
+
+# --------------------------------------------------------------------------------------------------
+# Token authority (EXTERNALIZED -- never committed). These module globals are (re)computed by
+# ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry/anon/leak.py and
+# tee/anon/leak.py) as the single source of truth, so their names/shapes are a stable public contract.
+# --------------------------------------------------------------------------------------------------
+
+#: Location of the git-ignored local token file (pre-commit source). Overridable in tests.
+LOCAL_TOKEN_FILE = Path(__file__).parent / "scan-tokens.local.txt"
+
+FORBIDDEN: list[tuple[re.Pattern[str], str]] = []
+ESTATE_TOKENS: tuple[str, ...] = ()
+SITE_CODE_RE: re.Pattern[str] = _NEVER
+#: Boundary-aware site-code FILE detector: fires on a code delimited by non-alphanumerics
+#: (``PT_990123_ADT`` -> matches) but NOT on the prefix embedded in a longer alphanumeric run
+#: (a SHA, a DOB, a dotted version), so the broad-substring false-positive storm does not happen on
+#: source files. ``.`` is a boundary exclusion too (a real site code is never dot-adjacent).
+_SITE_CODE_FILE: re.Pattern[str] = _NEVER
+#: The site-code detectors above match a prefix followed by four LITERAL digits. But the SECRET IS THE
+#: PREFIX, not any particular code, so a doc or comment that writes the PATTERN itself -- the prefix
+#: followed by a regex quantifier expression, or by an x-run -- discloses exactly the same thing while
+#: matching neither. Not hypothetical: ADR 0030's de-identification pass certified a file clean by
+#: grepping one form and walked past three occurrences of the other, one on the ADJACENT line. A
+#: form-blind sweep reads as evidence of absence while being incapable of finding what it looks for.
+_SITE_CODE_PATTERN_LITERAL: re.Pattern[str] = _NEVER
+#: Estate tokens are substring-matched, so a few are file-scanned and the rest are body-only. Listed in
+#: the token source under ``[estate_body_only]``: tokens that are ordinary words or a vendor product
+#: name used as an example identifier, which mass-false-positive over tracked source. Everything in
+#: ``[estate]`` and NOT here is compiled into ``_ESTATE_FILE_RES`` and applied by ``scan_file``.
+_ESTATE_BODY_ONLY: frozenset[str] = frozenset()
+#: (token, boundary-aware pattern) for every file-scanned estate token. The boundary requires non-LETTER
+#: flanks: it must fire on ``OB_<TOKEN>_ORU`` (underscore is a word char, so the ``\b`` name patterns
+#: cannot see it -- the exact hole that let a customer org name sit in a tracked test and be reported
+#: clean by every gate) while NOT firing on a token that is merely a run of letters inside an unrelated
+#: identifier, e.g. the WebAuthn exception name ``InvalidCBORData``.
+_ESTATE_FILE_RES: tuple[tuple[str, re.Pattern[str]], ...] = ()
+#: True when a token source was found AND it actually yielded detectors. Both halves matter: see
+#: ``reload_tokens``.
+TOKENS_PRESENT: bool = False
+#: The parsed site prefixes themselves, kept so ``loaded_token_counts`` can report how many loaded.
+#: Deriving that number from ``SITE_CODE_RE is not _NEVER`` made it a 0-or-1 presence BIT, so N loaded
+#: prefixes and 1 printed identically -- and the counts line is the ONE diagnostic that distinguishes a
+#: real scan from a vacuous one, so a floor built on it would have inherited the same blindness.
+_SITE_PREFIXES: tuple[str, ...] = ()
+
+
+def _resolve_token_text() -> str | None:
+    """The active token content, or ``None`` if no source is configured.
+
+    ``MEFOR_FORBIDDEN_TOKENS`` wins: an existing file path is read; any other non-empty value is taken
+    as inline content; an explicitly-empty value means "no source". Otherwise the git-ignored local
+    file is read if present.
+    """
+    env = os.environ.get("MEFOR_FORBIDDEN_TOKENS")
+    if env is not None:
+        env = env.strip()
+        if not env:
+            return None
+        try:
+            p = Path(env)
+            if p.is_file():
+                return p.read_text(encoding="utf-8")
+        except OSError:
+            pass
+        return env  # inline newline-separated token content
+    try:
+        if LOCAL_TOKEN_FILE.is_file():
+            return LOCAL_TOKEN_FILE.read_text(encoding="utf-8")
+    except OSError:
+        pass
+    return None
+
+
+#: Zero-width, bidi-control, BOM and C0/C1 control codepoints. These are the corruption class the
+#: COUNT FLOOR cannot see. A zero-width space is not ``str.isspace()`` and survives ``str.strip()``
+#: (unlike NBSP, which strips to empty), so one injected INSIDE a token by a paste through a rendering
+#: surface leaves an entry that parses, counts toward the floor, and silently never matches: measured
+#: identical counts with detection flipped off. Rejecting them at parse time is what makes the floor
+#: count detectors that can FIRE rather than entries that merely PARSE.
+def _is_invisible(ch: str) -> bool:
+    """True for a codepoint that carries no glyph: control, zero-width, BOM or bidi mark.
+
+    ``str.isprintable()`` is False for exactly the categories that matter here -- Cc controls and
+    Cf formats, which covers U+200B ZERO WIDTH SPACE, U+FEFF and the bidi overrides -- and True for
+    ordinary letters, digits and the plain space. Expressed via isprintable() rather than a
+    character-class literal on purpose: a literal needs escape sequences that are themselves easy to
+    mangle, in a check whose entire job is catching mangling.
+    """
+    return not ch.isprintable()
+
+
+#: An empty negative lookahead matches nothing anywhere -- the module's own ``_NEVER`` sentinel.
+_NEVER_MATCH_RE = re.compile(r"\(\?\!\)")
+
+
+def _reject_entry(kind: str, value: str) -> bool:
+    """True (and warns) when an entry carries an invisible codepoint, so it must be dropped.
+
+    This is the corruption class the COUNT FLOOR cannot see. A zero-width space is not
+    ``str.isspace()`` and survives ``str.strip()`` (unlike NBSP, which strips to empty), so one
+    injected INSIDE a token by a paste through a rendering surface leaves an entry that parses,
+    counts toward the floor, and silently never matches -- measured: identical counts, detection
+    flipped off. Rejecting these makes the floor count detectors that can FIRE, not entries that
+    merely PARSE.
+
+    The warning deliberately does NOT echo the value: this runs in a world-readable Actions log on
+    a public repo and the value is a customer/vendor token. Codepoint and offset are enough to fix.
+    """
+    for offset, ch in enumerate(value):
+        if _is_invisible(ch):
+            print(
+                f"scan_forbidden: ignoring a {kind} containing an invisible/control codepoint "
+                f"U+{ord(ch):04X} at offset {offset} - it would count toward the detector floor "
+                "but never match. Re-set the token source from the file rather than pasting it.",
+                file=sys.stderr,
+            )
+            return True
+    return False
+
+
+#: UTF-8 BOM. Built with chr() rather than written literally: an escape or a raw
+#: codepoint here is exactly the kind of thing that gets mangled in transit, in the one
+#: place whose job is to survive mangling.
+_BOM = chr(0xFEFF)
+
+
+def _parse_tokens(
+    text: str,
+) -> tuple[list[tuple[re.Pattern[str], str]], tuple[str, ...], tuple[str, ...], list[str]]:
+    """Parse sectioned token content.
+
+    Returns (name patterns, estate substrings, body-only estate substrings, site prefixes).
+    ``[estate_body_only]`` is a SUBSET marker, not a separate token set -- a token listed there should
+    also appear in ``[estate]``; it simply stays out of the file scan.
+    """
+    section: str | None = None
+    names: list[tuple[re.Pattern[str], str]] = []
+    estate: list[str] = []
+    body_only: list[str] = []
+    prefixes: list[str] = []
+    known = {"names", "estate", "estate_body_only", "site_prefix"}
+    for lineno, raw in enumerate(text.splitlines(), 1):
+        # Strip a BOM before anything else: a UTF-8 BOM immediately ahead of the first section header
+        # defeats the ``startswith("[")`` test below, silently voiding that entire section.
+        line = raw.lstrip(_BOM).strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            if section not in known:
+                # Silently discarding an unrecognised section is how a typo'd header dropped up to 13
+                # tokens with no diagnostic at all. Name it.
+                print(
+                    f"scan_forbidden: line {lineno}: unknown section header — its entries will be "
+                    f"IGNORED (expected one of: {', '.join(sorted(known))})",
+                    file=sys.stderr,
+                )
+            continue
+        if section is None:
+            print(
+                f"scan_forbidden: line {lineno}: content before the first section header — IGNORED",
+                file=sys.stderr,
+            )
+            continue
+        if section == "names":
+            parts = [p.strip() for p in line.split(" | ")]
+            if len(parts) > 3:
+                # The field delimiter is a space-pipe-space, so a regex with a SPACED alternation
+                # (``a | b``) splits into extra fields and parts[0] silently truncates to its first
+                # branch -- still compiling, so the re.error handler never fires and the count is
+                # unchanged. Ambiguous input is refused rather than half-honoured.
+                print(
+                    f"scan_forbidden: line {lineno}: [names] entry has {len(parts)} fields, expected "
+                    "at most 3 (PATTERN | REASON | CASE) — a spaced regex alternation would be "
+                    "truncated, so this entry is IGNORED (content withheld)",
+                    file=sys.stderr,
+                )
+                continue
+            pattern = parts[0]
+            reason = parts[1] if len(parts) > 1 and parts[1] else "customer/vendor token"
+            case = parts[2].lower() if len(parts) > 2 and parts[2] else "i"
+            if case not in {"i", "s"}:
+                # Warn, but KEEP the entry. Dropping it would lose a detector, and under-detection is
+                # the dangerous direction; the ``else re.I`` below already falls back to
+                # case-INSENSITIVE, which is strictly broader than case-sensitive and so can only
+                # over-match, never under-match. Fail toward more detection.
+                print(
+                    f"scan_forbidden: line {lineno}: [names] CASE field is not 'i' or 's' — defaulting "
+                    "to case-INSENSITIVE (content withheld)",
+                    file=sys.stderr,
+                )
+            # Only an explicit "s" is case-sensitive; anything else (including a malformed flag) is
+            # case-insensitive. There is deliberately no separate assignment implementing that
+            # fallback -- one would be dead code, indistinguishable from this line under mutation.
+            flags = 0 if case == "s" else re.I
+            if _reject_entry("name pattern", pattern):
+                continue
+            if _NEVER_MATCH_RE.search(pattern):
+                # ``(?!)`` is this module's own "detector off" sentinel. Accepted from a token source
+                # it would compile cleanly, count toward the floor, and never fire.
+                print(
+                    "scan_forbidden: ignoring a name pattern that can never match "
+                    "(contains the empty-negative-lookahead sentinel)",
+                    file=sys.stderr,
+                )
+                continue
+            try:
+                compiled = re.compile(pattern, flags)
+                if compiled.search(reason):
+                    # A REASON is printed verbatim on every hit, into a world-readable Actions log on
+                    # the public repo. A reason that names its own token therefore publishes the token
+                    # on the first match -- the same defect as echoing it in a parse warning, just on
+                    # the success path. Neutralise the LABEL, keep the DETECTOR: dropping the entry
+                    # would trade a disclosure for under-detection, which is the worse failure.
+                    print(
+                        f"scan_forbidden: line {lineno}: [names] REASON matches its own pattern and "
+                        "would echo the token on every hit — using the generic reason instead",
+                        file=sys.stderr,
+                    )
+                    reason = "customer/vendor token"
+                names.append((compiled, reason))
+            except re.error:
+                # NEVER echo the pattern. This warning lands in a world-readable Actions log on the
+                # PUBLIC repo and the pattern IS the customer/vendor token, so a malformed line --
+                # exactly the case where the source was mishandled -- would leak the thing the gate
+                # exists to protect. Position only.
+                print(
+                    f"scan_forbidden: ignoring an uncompilable [names] regex at entry "
+                    f"{len(names) + 1} (content withheld)",
+                    file=sys.stderr,
+                )
+        elif section == "estate":
+            if not _reject_entry("estate token", line):
+                estate.append(line.lower())
+        elif section == "estate_body_only":
+            if not _reject_entry("estate_body_only token", line):
+                body_only.append(line.lower())
+        elif section == "site_prefix":
+            # ASCII digits only: str.isdigit() is True for non-ASCII digits (e.g. Arabic-Indic), which
+            # would compile into the site-code alternation and never match an ASCII site code.
+            if line.isdigit() and line.isascii():
+                prefixes.append(line)
+            else:
+                # Position only -- see the [names] branch above. A site prefix is customer data.
+                print(
+                    f"scan_forbidden: ignoring a non-ASCII-numeric [site_prefix] entry at position "
+                    f"{len(prefixes) + 1} (content withheld)",
+                    file=sys.stderr,
+                )
+    # DEDUPE before the caller counts. The floor is a count, so a double-pasted section would
+    # otherwise inflate it: 13 estate tokens pasted twice reads as 26 and masks the loss of 13 real
+    # ones. Duplicates also add no detection. Order is preserved so behaviour is deterministic.
+    estate = list(dict.fromkeys(estate))
+    body_only = list(dict.fromkeys(body_only))
+    prefixes = list(dict.fromkeys(prefixes))
+    seen_names: dict[tuple[str, int], None] = {}
+    deduped_names: list[tuple[re.Pattern[str], str]] = []
+    for compiled, why in names:
+        key = (compiled.pattern, compiled.flags)
+        if key not in seen_names:
+            seen_names[key] = None
+            deduped_names.append((compiled, why))
+    return deduped_names, tuple(estate), tuple(body_only), prefixes
+
+
+def reload_tokens() -> None:
+    """Recompute the externalized token globals from the current environment / local file.
+
+    Called once at import and again at the top of :func:`main` (so a fresh CLI process always reflects
+    its environment). Tests call it after adjusting the source. Never raises: an absent source simply
+    yields empty tables (structural-only).
+    """
+    global FORBIDDEN, ESTATE_TOKENS, SITE_CODE_RE, _SITE_CODE_FILE, TOKENS_PRESENT
+    global _SITE_CODE_PATTERN_LITERAL, _ESTATE_BODY_ONLY, _ESTATE_FILE_RES, _SITE_PREFIXES
+    text = _resolve_token_text()
+    names, estate, body_only, prefixes = _parse_tokens(text or "")
+    # A source being PRESENT is not the same as a source being USABLE. Deriving TOKENS_PRESENT from
+    # ``text is not None`` alone meant a mangled secret -- headers lost, comments only, a UTF-8 BOM ahead
+    # of the first section header -- produced ZERO detectors while still reporting "tokens present", so
+    # MEFOR_REQUIRE_TOKENS=1 passed and the gate ran structural-only with a green tick. The cutover
+    # runbook has the owner paste a whole sectioned file into a GitHub secret box, which is exactly the
+    # mangling case. Require that parsing actually yielded something.
+    TOKENS_PRESENT = text is not None and bool(names or estate or prefixes)
+    FORBIDDEN = names
+    ESTATE_TOKENS = estate
+    _ESTATE_BODY_ONLY = frozenset(body_only)
+    _ESTATE_FILE_RES = tuple(
+        (token, re.compile(rf"(?<![A-Za-z]){re.escape(token)}(?![A-Za-z])", re.IGNORECASE))
+        for token in estate
+        if token not in _ESTATE_BODY_ONLY
+    )
+    _SITE_PREFIXES = tuple(prefixes)
+    if prefixes:
+        alt = "|".join(re.escape(p) for p in prefixes)
+        SITE_CODE_RE = re.compile(rf"(?:{alt})\d{{4}}")
+        _SITE_CODE_FILE = re.compile(rf"(?<![A-Za-z0-9.])(?:{alt})\d{{4}}(?![A-Za-z0-9.])")
+        _SITE_CODE_PATTERN_LITERAL = re.compile(
+            rf"(?<![A-Za-z0-9])(?:{alt})(?:\\+d\s*\{{\s*4\s*\}}|[xX]{{4}})(?![A-Za-z0-9])"
+        )
+    else:
+        SITE_CODE_RE = _NEVER
+        _SITE_CODE_FILE = _NEVER
+        _SITE_CODE_PATTERN_LITERAL = _NEVER
+
+
+def loaded_token_counts() -> dict[str, int]:
+    """Detector counts for the current token tables.
+
+    ``main`` prints these on every run. "The gate exited 0" is NOT evidence it scanned anything -- these
+    counts are what distinguishes a real scan from a vacuous one, and they are what
+    ``MEFOR_MIN_DETECTORS`` / ``--require-tokens N`` assert against.
+
+    ``estate`` and ``estate_file_scanned`` legitimately differ: tokens listed under
+    ``[estate_body_only]`` are ordinary words or vendor product names that mass-false-positive over
+    tracked source, so they are applied to message BODIES but held out of the file scan. A gap between
+    the two is expected, not a defect -- only the FLOOR counts (``names`` / ``estate`` /
+    ``site_prefixes``) feed the gate.
+    """
+    return {
+        "names": len(FORBIDDEN),
+        "estate": len(ESTATE_TOKENS),
+        "estate_file_scanned": len(_ESTATE_FILE_RES),
+        "site_prefixes": len(_SITE_PREFIXES),
+    }
+
+
+#: The sections a fully-loaded token source must ALL populate. ``TOKENS_PRESENT`` is deliberately an OR
+#: (any section proves a source exists at all); the gate below is the AND.
+_FLOOR_SECTIONS: tuple[str, ...] = ("names", "estate", "site_prefixes")
+
+
+def parse_min_spec(value: str) -> int | dict[str, int]:
+    """Parse a floor spec: either a bare total (``21``) or per-section (``names=7,estate=13``).
+
+    Per-section is STRICTLY STRONGER and is what CI should use. A bare total is a SUM, so growth in a
+    cheap section masks collapse in an expensive one -- names 7->1 alongside estate 13->19 still
+    totals 21 and passes, with 6 of 7 customer-name detectors silently off.
+    """
+    value = value.strip()
+    if value.isdigit() and value.isascii():
+        return int(value)
+    spec: dict[str, int] = {}
+    for part in value.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "=" not in part:
+            raise ValueError(f"floor spec {part!r} is neither an integer nor section=N")
+        name, _, num = part.partition("=")
+        name, num = name.strip(), num.strip()
+        if name not in _FLOOR_SECTIONS:
+            raise ValueError(
+                f"unknown floor section {name!r} (expected one of {', '.join(_FLOOR_SECTIONS)})"
+            )
+        if not (num.isdigit() and num.isascii()):
+            raise ValueError(f"floor for {name!r} must be an integer, got {num!r}")
+        spec[name] = int(num)
+    if not spec:
+        raise ValueError("empty floor spec")
+    return spec
+
+
+def token_floor_failure(min_detectors: int | dict[str, int] | None = None) -> str | None:
+    """Why the loaded tables are not trustworthy, or ``None`` if they are.
+
+    Presence is not sufficiency. ``TOKENS_PRESENT`` is satisfied by ANY ONE section surviving, so a
+    partially-mangled source -- a clipboard paste that lost a section, a typo'd header, a BOM ahead of
+    the first header -- loaded as few as 1 of 21 detectors and still passed a "fail-closed" gate with a
+    green tick. Losing only the FINAL line, the likeliest paste error, silently disabled every
+    site-code detector while printing "fail-closed". This closes that in two independent ways:
+
+    * every floor section must be non-empty (catches whole-section loss), and
+    * the total must meet ``min_detectors`` when given (catches loss WITHIN a section, e.g. 7 names
+      down to 3, which the section check alone cannot see).
+
+    The expected total is deliberately supplied from OUTSIDE the token source (CI env / CLI arg). An
+    ``[expect]`` count carried inside the file would be destroyed by the very mangling it is meant to
+    detect -- self-referential, and vacuous in exactly the way this function exists to prevent.
+    """
+    if not TOKENS_PRESENT:
+        return (
+            "no token source is configured (set MEFOR_FORBIDDEN_TOKENS or place "
+            "scripts/security/scan-tokens.local.txt) — refusing to run structural-only"
+        )
+    counts = loaded_token_counts()
+    empty = [s for s in _FLOOR_SECTIONS if not counts[s]]
+    if empty:
+        return (
+            f"the token source loaded but section(s) {', '.join(empty)} are EMPTY — a partial or "
+            f"mangled source (loaded {', '.join(f'{s}={counts[s]}' for s in _FLOOR_SECTIONS)}). "
+            "Re-set the source from the file rather than pasting it"
+        )
+    if isinstance(min_detectors, dict):
+        short = [f"{s} {counts[s]}<{need}" for s, need in min_detectors.items() if counts[s] < need]
+        if short:
+            return (
+                f"section detector counts below their floor ({', '.join(short)}) — the token source "
+                "is incomplete. Per-section floors catch the case a total cannot: growth in one "
+                "section masking collapse in another"
+            )
+    elif min_detectors is not None:
+        total = sum(counts[s] for s in _FLOOR_SECTIONS)
+        if total < min_detectors:
+            return (
+                f"only {total} detectors loaded, below the required floor of {min_detectors} "
+                f"({', '.join(f'{s}={counts[s]}' for s in _FLOOR_SECTIONS)}) — the token source is "
+                "incomplete. This is a FLOOR: adding tokens is free, losing them is not"
+            )
+    return None
+
+
+#: Benign strings an allowlist entry must NOT match. An entry that matches any of these is broad
+#: enough to veto ordinary source lines, and therefore broad enough to switch the gate off wholesale.
+#: The empty string is included so a pattern that can match nothing-in-particular is caught too.
+_ALLOWLIST_CANARIES: tuple[str, ...] = (
+    "",
+    "the quick brown fox jumps over the lazy dog",
+    "def handler(message: Message) -> list[Send]:",
+    "# a perfectly ordinary comment",
+    "0123456789",
+)
+
+
+#: Identifier separators neutralised before the second name-pattern pass. Only ``_`` today: it is
+#: the one separator that is also a WORD character, so it is the only one that defeats . Kept as
+#: a pattern (not str.replace) so a future separator is a one-character edit.
+_IDENT_SEP = re.compile(r"_")
+
+
+def _takes_ident_pass(pat: re.Pattern[str]) -> bool:
+    r"""Whether a name pattern is eligible for the identifier (underscore-neutralised) pass.
+
+    Only SINGLE-TOKEN patterns are. The gap being closed is a lone token buried in an identifier --
+    ``OB_TOKEN_ORU`` -- which a \b-anchored pattern cannot see because ``_`` is a word character.
+
+    A MULTI-WORD pattern must be excluded, and this is not hypothetical: neutralising ``_`` for a
+    two-word phrase makes it match ordinary snake_case. Measured on the real tree, a phrase pattern
+    matched 9 occurrences of a perfectly generic Python identifier across two files -- every one a
+    false positive, and enough to block the cutover PR on its own required gate. Whitespace in the
+    pattern (literal or ``\s``) is the signal.
+    """
+    src = pat.pattern
+    return " " not in src and r"\s" not in src
+
+
+def _load_allowlist() -> list[re.Pattern[str]]:
+    """Optional line-regex allowlist for vetted false positives (one regex per line, '#' comments).
+
+    NEVER allowlist real customer data -- only genuinely-innocent lines a structural pattern
+    over-matches.
+    """
+    f = Path(__file__).parent / "scan-allowlist.txt"
+    if not f.exists():
+        return []
+    out: list[re.Pattern[str]] = []
+    for lineno, raw in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        try:
+            pat = re.compile(line)
+        except re.error:
+            print(
+                f"scan_forbidden: scan-allowlist.txt line {lineno}: uncompilable regex — IGNORED",
+                file=sys.stderr,
+            )
+            continue
+        # An allowlist entry is a per-line VETO applied BEFORE any detector runs, so one over-broad
+        # entry disables the ENTIRE gate -- every detector, every file -- while the "loaded ..."
+        # diagnostic still reports full counts, making the log indistinguishable from a healthy run.
+        # This file is committed and public, so the entry that does it need not be malicious: a
+        # hastily-written `.` or `.*` for one false positive is enough. Reject anything that matches
+        # ordinary prose or the empty string.
+        if any(pat.search(probe) is not None for probe in _ALLOWLIST_CANARIES):
+            print(
+                f"scan_forbidden: scan-allowlist.txt line {lineno}: pattern matches ordinary text — "
+                "it would veto every line and disable the whole gate. IGNORED. Anchor it or make it "
+                "specific to the false positive you are excusing.",
+                file=sys.stderr,
+            )
+            continue
+        out.append(pat)
+    return out
+
+
+ALLOWLIST = _load_allowlist()
+reload_tokens()
+
+
+# --------------------------------------------------------------------------------------------------
+# Scanning
+# --------------------------------------------------------------------------------------------------
+
+
+def _git_tracked() -> list[str]:
+    # Fixed literal argv ["git", "ls-files"]: no shell, no user input.
+    return subprocess.run(  # nosec B603 B607
+        ["git", "ls-files"], capture_output=True, text=True, check=True
+    ).stdout.splitlines()
+
+
+def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
+    # Returns (openable path, scan-root-RELATIVE posix). The relative posix is what all skip decisions
+    # and hit reports key on, so the logic is identical whether we scan tracked files (already
+    # repo-relative) or a --path snapshot in an arbitrary directory.
+    if argv and argv[0] == "--path":
+        if len(argv) < 2:
+            print("scan_forbidden: --path requires a directory", file=sys.stderr)
+            sys.exit(2)
+        root = Path(argv[1])
+        return [(p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file()]
+    if argv:
+        return [(Path(a), Path(a).as_posix()) for a in argv]
+    return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
+
+
+def _read_text(path: Path) -> str | None:
+    try:
+        data = path.read_bytes()
+    except OSError:
+        return None
+    if b"\x00" in data[:4096]:  # binary file -- nothing to scan
+        return None
+    return data.decode("utf-8", errors="replace")
+
+
+def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = False) -> list[str]:
+    """Forbidden-content hits in a file, as ``path:line: reason`` strings.
+
+    Reasons-only by default (location + category, never the matched value or line) so a hit report is
+    safe to print in public CI logs. ``show_context`` additionally appends the matched value and the
+    trimmed line -- for local triage only, never CI.
+    """
+    posix = rel_posix if rel_posix is not None else path.as_posix()
+    if _is_skipped(posix):
+        return []
+    text = _read_text(path)
+    if text is None:
+        return []
+    ip_scan = path.suffix not in _IP_SKIP_SUFFIXES and path.name not in _IP_SKIP_NAMES
+    site_scan = path.suffix not in _SITE_SKIP_SUFFIXES and path.name not in _SITE_SKIP_NAMES
+    hits: list[str] = []
+    for lineno, line in enumerate(text.splitlines(), 1):
+        if any(a.search(line) for a in ALLOWLIST):
+            continue
+        ctx = f": {line.strip()[:120]}" if show_context else ""
+        before = len(hits)
+        # ``_`` is a WORD character, so a \b-anchored name pattern cannot see its token inside an
+        # identifier: ``\bTOKEN\b`` does not match ``OB_TOKEN_ORU``. That blindness has hidden real
+        # leaks in this repo more than once, and the estate set only covers it for tokens that happen
+        # to appear in BOTH lists. Scanning a shadow copy with identifier separators neutralised closes
+        # it for EVERY name pattern rather than for the instances someone remembered to duplicate.
+        # Substitution preserves length, so offsets and ``show_context`` stay meaningful.
+        unwrapped = _IDENT_SEP.sub(" ", line)
+        for pat, reason in FORBIDDEN:
+            if pat.search(line) or (_takes_ident_pass(pat) and pat.search(unwrapped)):
+                hits.append(f"{posix}:{lineno}: {reason}{ctx}")
+        if site_scan:
+            for m in _SITE_CODE_FILE.finditer(line):
+                value = f" ({m.group(0)})" if show_context else ""
+                hits.append(f"{posix}:{lineno}: site code{value}{ctx}")
+            if _SITE_CODE_PATTERN_LITERAL.search(line):
+                hits.append(f"{posix}:{lineno}: site-code pattern written out{ctx}")
+        if ip_scan:
+            for m in _IPV4.finditer(line):
+                ip = m.group(0)
+                if not _ALLOWED_IP.match(ip):
+                    value = f" ({ip})" if show_context else ""
+                    hits.append(f"{posix}:{lineno}: routable IP address{value}{ctx}")
+        # Internal-environment disclosure. Reason-only, never the value: the slug or account name IS
+        # the disclosure, so echoing it into a public CI log would publish what the hit is reporting.
+        if _WORKTREE_SLUG.search(line):
+            hits.append(f"{posix}:{lineno}: worktree/branch slug (internal project name)")
+        if _HOME_PATH.search(line):
+            hits.append(f"{posix}:{lineno}: absolute user-home path (OS account name)")
+        # Estate substrings run LAST and only on a line nothing else flagged: the sets overlap (the
+        # customer name is typically in [names] AND [estate]), and double-reporting one line adds noise
+        # rather than information. What this adds is the case no other detector can reach -- a token
+        # butted against word characters, e.g. ``OB_<TOKEN>_ORU``.
+        if len(hits) == before:
+            for _token, estate_pat in _ESTATE_FILE_RES:
+                if estate_pat.search(line):
+                    hits.append(f"{posix}:{lineno}: estate token{ctx}")
+                    break
+    return hits
+
+
+def scan_text(text: str, *, include_estate: bool = False) -> list[str]:
+    """Forbidden-token **reasons** in an in-memory string -- the importable single source of truth for
+    body scanning (the anonymizer leak-check, ADR 0030 §5).
+
+    Always runs the FORBIDDEN name patterns + a routable-IP check. With ``include_estate`` (a message
+    body, where a token can sit *inside* a field the word-boundary form would miss) it also applies the
+    ESTATE_TOKENS substring set. The ``site_prefix`` code is deliberately NOT checked here: a broad
+    substring search false-positives on every value that merely contains such a run (timestamps,
+    fabricated dates), so the anonymizer checks it **field-anchored** instead
+    (``surrogates.message_has_site_code``). Returns REASONS ONLY -- never the matched text -- so a
+    caller may raise/log the result without leaking PHI.
+    """
+    reasons: list[str] = []
+    for pat, reason in FORBIDDEN:
+        if pat.search(text):
+            reasons.append(reason)
+    for m in _IPV4.finditer(text):
+        if not _ALLOWED_IP.match(m.group(0)):
+            reasons.append("routable IP address")
+            break
+    if include_estate:
+        lowered = text.lower()
+        reasons.extend(f"estate token ({token})" for token in ESTATE_TOKENS if token in lowered)
+    return reasons
+
+
+def _parse_require_flag(argv: list[str]) -> tuple[bool, int | dict[str, int] | None, list[str]]:
+    """Pull ``--require-tokens[=N]`` out of argv, returning (require, floor, remaining args).
+
+    pre-commit can pass ARGS to a hook but has no per-hook ``env:`` key, so this flag is the only way
+    to make the COMMIT-time gate fail closed. Without it a fresh clone or a new worktree -- neither of
+    which carries the git-ignored token file -- runs every commit with zero name/estate/site detectors
+    and reports "Passed". CI keeps using the environment variables.
+    """
+    require = False
+    minimum: int | dict[str, int] | None = None
+    rest: list[str] = []
+    for arg in argv:
+        if arg == "--require-tokens":
+            require = True
+        elif arg.startswith("--require-tokens="):
+            value = arg.split("=", 1)[1]
+            require, minimum = True, parse_min_spec(value)
+        elif arg.startswith("--") and arg != "--path":
+            # Refuse unknown flags rather than treating them as filenames. Falling through put an
+            # unrecognised token at rest[0], which defeated the ``rest[0] == "--path"`` test: the run
+            # silently became a file-list scan of a nonexistent file, examined ZERO files, and exited
+            # 0. A typo'd flag must fail loudly, not quietly scan nothing.
+            raise ValueError(f"unknown option {arg!r}")
+        else:
+            rest.append(arg)
+    return require, minimum, rest
+
+
+#: Values accepted as "on" for MEFOR_REQUIRE_TOKENS. An exact ``== "1"`` compare meant a well-meant
+#: ``true``/``yes`` silently disabled the gate while looking configured.
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def main(argv: list[str]) -> int:
+    reload_tokens()
+    show_context = "--show-context" in argv
+    rest = [a for a in argv if a != "--show-context"]
+    try:
+        flag_require, minimum, rest = _parse_require_flag(rest)
+    except ValueError as exc:
+        print(f"scan_forbidden: {exc}", file=sys.stderr)
+        return 2
+
+    # Announce what loaded BEFORE any refusal, so a failure shows the counts that CAUSED it. Exit 0
+    # alone cannot distinguish "scanned with the real tables and found nothing" from "loaded nothing
+    # and had nothing to find" -- both are silent successes.
+    counts = loaded_token_counts()
+    print(
+        "scan_forbidden: loaded "
+        + ", ".join(f"{k}={v}" for k, v in counts.items())
+        + ("" if TOKENS_PRESENT else "  [STRUCTURAL-ONLY: no token source configured]"),
+        file=sys.stderr,
+    )
+
+    env_require = os.environ.get("MEFOR_REQUIRE_TOKENS", "").strip()
+    if env_require and env_require.lower() not in _TRUTHY:
+        print(
+            f"scan_forbidden: MEFOR_REQUIRE_TOKENS={env_require!r} is not a recognised value "
+            f"({'/'.join(sorted(_TRUTHY))}) — refusing rather than silently running unguarded.",
+            file=sys.stderr,
+        )
+        return 2
+    require = flag_require or env_require.lower() in _TRUTHY
+    if minimum is None:
+        env_min = os.environ.get("MEFOR_MIN_DETECTORS", "").strip()
+        if env_min:
+            try:
+                minimum = parse_min_spec(env_min)
+            except ValueError as exc:
+                print(f"scan_forbidden: MEFOR_MIN_DETECTORS: {exc}", file=sys.stderr)
+                return 2
+            # Asking for a floor implies requiring tokens; otherwise a floor set without the require
+            # flag would be silently inert -- another gate that cannot fail.
+            require = True
+
+    if require:
+        why = token_floor_failure(minimum)
+        if why is not None:
+            print(f"scan_forbidden: {why} (fail closed).", file=sys.stderr)
+            return 2
+
+    path_mode = bool(rest) and rest[0] == "--path"
+    hits: list[str] = []
+    scanned = 0
+    for abs_path, rel in _candidate_files(rest):
+        # SKIP_DIRS is evaluated on the RELATIVE parts, so a scan-root path component that happens to be
+        # named build/venv/dist/… can no longer short-circuit the scan of every file.
+        if not abs_path.is_file() or set(Path(rel).parts) & SKIP_DIRS or _is_skipped(rel):
+            continue
+        scanned += 1
+        hits.extend(scan_file(abs_path, rel, show_context=show_context))
+
+    # A --path scan that examined ZERO files is not a pass: it means the whole tree was skipped (a
+    # SKIP_DIRS component in the path, or an empty/wrong tree). Refuse rather than report a vacuous clean.
+    if path_mode and scanned == 0:
+        print(
+            "scan_forbidden: --path examined ZERO files (all skipped, or empty tree) — refusing "
+            "(fail closed). Check the scan path for a SKIP_DIRS component (build/venv/dist/…).",
+            file=sys.stderr,
+        )
+        return 2
+
+    if hits:
+        print("FORBIDDEN CONTENT -- commit blocked (fail closed):", file=sys.stderr)
+        for h in hits:
+            print(f"  {h}", file=sys.stderr)
+        print(
+            f"\n{len(hits)} hit(s). A real customer/host string must be removed, not allowlisted. "
+            "For a genuine false positive, narrow the pattern or add a vetted line to "
+            "scripts/security/scan-allowlist.txt.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

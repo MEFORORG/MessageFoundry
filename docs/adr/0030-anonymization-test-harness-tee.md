@@ -14,7 +14,7 @@
   the harness capture sink ([`harness/reconcile/capture.py`](../../harness/reconcile/capture.py)) and
   file-replay loader ([`harness/reconcile/compare.py`](../../harness/reconcile/compare.py),
   [`harness/load/corpus.py`](../../harness/load/corpus.py)); and the publish leak-gate
-  [`scripts/publish/scan_forbidden.py`](../../scripts/publish/scan_forbidden.py) (`FORBIDDEN`).
+  [`scripts/security/scan_forbidden.py`](../../scripts/security/scan_forbidden.py) (`FORBIDDEN`).
 - **Decision in one line:** ship a **pure-stdlib, dependency-free `anon` package** that turns real,
   messy HL7 v2 into structurally-faithful **PHI-free** datasets via a **two-layer rule model — a
   declarative field-*selection* map (data) over a code registry of pure surrogate *functions* (logic)** —
@@ -237,7 +237,7 @@ Every anonymized dataset is run through the **reconciled forbidden-token set** *
 blocks the whole output). The mechanism, spelled out so the SoT claim is honest:
 
 1. **One authoritative token list.** The `FORBIDDEN` set in
-   [`scan_forbidden.py`](../../scripts/publish/scan_forbidden.py) becomes an **importable module-level
+   [`scan_forbidden.py`](../../scripts/security/scan_forbidden.py) becomes an **importable module-level
    constant/function** (today it is a CLI script with two callers — `publish.ps1` and the pre-commit hook;
    making it importable is net-new work, not mere "exposure").
 2. **Fold in the drifted copy.** `tests/test_load_config.py`'s `_FORBIDDEN_SUBSTRINGS` (adds the

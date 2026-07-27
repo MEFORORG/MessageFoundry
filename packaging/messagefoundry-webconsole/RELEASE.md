@@ -62,8 +62,8 @@ second-wheel release job — mirror it (with the console's **own** version, sinc
 
 - [ ] Ensure the **SBOM** job covers the second wheel.
 - [ ] Add the wheel to the **publish/mirror** wiring as needed
-      ([`scripts/publish/`](../../scripts/publish/)); extend
-      `scripts/publish/check_release_sync.py` if the mirror should track the console version too.
+      (retired at the MEFORORG cutover -- development is now direct on the public repo, so there
+      is no mirror to keep in sync and no release-sync checker).
 
 ## 5. CI build + release job
 
@@ -88,7 +88,8 @@ second-wheel release job — mirror it (with the console's **own** version, sinc
 
 ## 7. Post-publish verification
 
-- [ ] Run `python scripts/publish/check_release_sync.py` (tag == PyPI == mirror).
+- [ ] Confirm the tag matches the PyPI version. (The tag == PyPI == mirror checker was retired
+      with the publish machinery at the MEFORORG cutover; there is no mirror to compare against.)
 - [ ] `pip install "messagefoundry[webconsole]"` resolves the pair inside the compat range.
 - [ ] `serve_ui=true` boots end-to-end on the CLI/service path with the console installed, and the
       engine still **boots + refuses `serve_ui` cleanly** with the console **absent** (return 2 /

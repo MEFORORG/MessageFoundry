@@ -108,3 +108,23 @@ Thumbs.db
 # this file before the tooling that references it exists, so ignoring the path up front
 # removes any window in which a real token list sits un-ignored in a working tree.
 scripts/security/scan-tokens.local.txt
+
+# --- Private-only paths (formerly enforced by scripts/publish/publish-denylist.txt) ---------------
+# The cutover RETIRES the publish deny-list. On the private repo these were TRACKED and stripped from
+# the mirror at publish time; with the deny-list gone and development happening directly on the public
+# repo, a gitignore rule is now the ONLY thing keeping them out of a commit -- and the cutover runbook
+# runs `git add -A`. Same failure shape as the leak-scanner token file, different files.
+#
+# DELIBERATELY NOT LISTED: tests/test_scan_forbidden.py, tests/test_anon_core.py and
+# .github/dependabot.yml. Those were deny-listed too, but this change set publishes synthetic/public
+# versions of them -- ignoring them here would silently drop content that is meant to ship.
+/CLAUDE.md
+/.claude/
+/TRANSCRIPTS.md
+/docs/security/
+/docs/reviews/
+/docs/marketing/
+/docs/BACKLOG.md
+/docs/WORKTREES.md
+/docs/CI-TOPOLOGY.md
+/docs/Secure_Development_Standards.md

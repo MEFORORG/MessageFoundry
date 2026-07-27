@@ -46,7 +46,8 @@ jobs:
     # asked for.
     #
     # The guard is INVERTED (`!=` the public slug) on purpose — DO NOT "normalize" it to
-    # `== 'MEFORORG/MessageFoundry'`. scripts/publish/publish.ps1 rewrites the private slug to the
+    # `== 'MEFORORG/MessageFoundry'`. Historically scripts/publish/publish.ps1 (retired at the MEFORORG
+    # cutover) rewrote the private slug to the
     # public one across *.yml when it materializes the mirror, so an `==` private-slug test is rewritten
     # into `== 'MEFORORG/MessageFoundry'` and becomes TRUE exactly where it must be false. This form names
     # only the public slug, so the rewrite cannot touch it: true on the source repo, false on the mirror.
@@ -75,7 +76,7 @@ jobs:
           # badges — but anonymous fetches of a private repo's Actions badge SVG 404 (broken badge
           # images), and every body link 404s on click. The public mirror (MEFORORG/MessageFoundry)
           # runs the same workflows and is anonymously reachable, so rewrite the slug here (the same
-          # rewrite scripts/publish/publish.ps1 applies to the mirror) before `python -m build` embeds
+          # rewrite the retired scripts/publish/publish.ps1 used to apply) before `python -m build` embeds
           # the README. Ephemeral runner edit only — never committed.
           sed -i 's#MEFORORG/MessageFoundry#MEFORORG/MessageFoundry#g' README.md
           if grep -q 'MEFORORG/MessageFoundry' README.md; then

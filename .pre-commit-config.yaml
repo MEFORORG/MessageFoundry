@@ -18,6 +18,23 @@ repos:
         entry: ruff check --fix
         language: system
         types: [python]
+      # Leak guard (always on): keep customer/PHI-adjacent strings -- partner names, site data,
+      # routable host IPs, internal worktree slugs and absolute home paths -- out of the TRACKED tree
+      # so they can never reach this public repo. Mirrors the CI forbidden-content gate.
+      #
+      # `--require-tokens` makes this FAIL CLOSED. The real token list lives in a git-ignored
+      # scripts/security/scan-tokens.local.txt that does NOT travel with a clone or a new worktree;
+      # without the flag the hook would load zero customer detectors there and pass every commit
+      # green. pre-commit can pass ARGS to a hook but has no per-hook `env:`, so the flag is the only
+      # mechanism. Run `pre-commit run --all-files` once after creating the token file to confirm.
+      - id: forbidden-content
+        name: forbidden-content (customer/PHI leak guard)
+        entry: python scripts/security/scan_forbidden.py
+        args: [--require-tokens]
+        language: system
+        pass_filenames: true
+        types: [text]
+        exclude: ^scripts/security/scan-tokens\.local\.txt$
 
   # Secret scanning — blocks a commit that would introduce a credential/token/key.
   # (rev is verified by `pre-commit autoupdate` on first install; a wrong tag fails loudly there,

@@ -180,7 +180,7 @@ allocated and written **when that item is actually built**, with the real design
    - **secret-rotation inventory** (any new `MEFOR_*` name ending `_PASSWORD`/`_TOKEN`/`_SECRET`/`_KEY`) →
      `CRITICAL_SECRETS` **and** the rotation-schedule table.
    - **route doc-drift** (any new API route) → `docs/SECURITY.md` route map + the count constants.
-   - **forbidden-content** — runs locally: `python scripts/publish/scan_forbidden.py --published`. ⚠️ It flags any
+   - **forbidden-content** — runs locally: `python scripts/security/scan_forbidden.py --path .`. ⚠️ It flags any
      dotted-decimal string as a routable IP, so a bare **X.509 OID literal** (e.g. the subjectAltName OID) trips
      it — use the symbolic constant (`x509.SubjectAlternativeName.oid`) instead. It also blocks the **customer
      name** anywhere outside the allowlisted `docs/security/*` — say "the ASVS drive-to-green cluster", never the

@@ -1,0 +1,55 @@
+# scan-tokens.local.txt.example — SYNTHETIC template for the forbidden-content token list.
+#
+# WHAT THIS IS
+#   The customer/vendor token list that powers the forbidden-content gate is PRIVATE and is NEVER
+#   committed. This *.example file is the committed, synthetic template. To use it:
+#     1. Copy it to `scan-tokens.local.txt` in this same directory (that name is git-ignored).
+#     2. Replace the SYNTHETIC placeholders below with the REAL token set, which the owner migrates
+#        from the private vault (the former inline FORBIDDEN / ESTATE_TOKENS / site-code prefix that
+#        lived in the retired scripts/publish/scan_forbidden.py).
+#     3. `pre-commit install` — the gate now loads real tokens locally.
+#
+#   In CI the same content is supplied via the `MEFOR_FORBIDDEN_TOKENS` Actions secret, whose value is
+#   EITHER a path to a file in this format OR the file's contents inline (newline-separated).
+#
+#   With NO source present the scanner runs STRUCTURAL-ONLY: only the routable-IPv4 detector fires;
+#   the name / estate / site-code detectors are empty (appropriate for a fork without the secret).
+#   Set MEFOR_REQUIRE_TOKENS=1 to fail closed (exit 2) instead when the source is absent.
+#
+# FORMAT (sectioned; `#` comments and blank lines ignored)
+#   [names]        one entry per line:  REGEX | REASON | CASE
+#                    REASON optional (default "customer/vendor token").
+#                    CASE  optional:  "i" case-insensitive (default) or "s" case-sensitive.
+#                    The field delimiter is a space-pipe-space ( | ); a regex alternation a|b is fine.
+#   [estate]       one substring token per line (matched case-insensitively). Applied to anonymizer
+#                    BODIES, and — unlike the [names] patterns, which are word-boundary anchored and so
+#                    cannot see a token butted against "_" — also to tracked FILES, which is what
+#                    catches a customer token buried in an identifier like OB_<TOKEN>_ORU.
+#   [estate_body_only]
+#                  a SUBSET of [estate] (list the token in both): tokens that are ordinary words, or a
+#                    vendor product name used as an example identifier, which would mass-false-positive
+#                    over tracked source. These stay BODY-ONLY and are excluded from the file scan.
+#   [site_prefix]  one numeric prefix per line. Two detectors are built: PREFIX followed by four digits,
+#                    and the PATTERN written out (the prefix followed by a regex quantifier expression
+#                    or an x-run) — the prefix itself is the secret, so spelling the pattern leaks it.
+#
+# Everything below is SYNTHETIC (ACME / EXAMPLE, and a NON-REAL 99xxxx site prefix). It exercises the
+# mechanism and MUST be replaced for real use. Do NOT commit the filled-in scan-tokens.local.txt.
+
+[names]
+\bacme\b | customer name (ACME) | i
+\bexampleco\b | partner name (EXAMPLE) | i
+example\s+estate | reference to the example estate | i
+\bwidget\s+manifests?\b | migration artifact (EXAMPLE widget manifest) | i
+\bACMECORP\b | customer adopter repo (ACMECORP) | s
+
+[estate]
+acme
+exampleco
+examplevendor
+
+[estate_body_only]
+examplevendor
+
+[site_prefix]
+99

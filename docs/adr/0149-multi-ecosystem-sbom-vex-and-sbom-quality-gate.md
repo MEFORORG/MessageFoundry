@@ -37,7 +37,7 @@ This must not weaken any existing invariant. In particular it must not touch the
 invariant](../../CLAUDE.md)** (staged queue / at-least-once) or the **count-and-log invariant** — these
 are build/release-pipeline and documentation changes only, with one new **stdlib-only, side-effect-free**
 helper script. It must also respect the publishing rule that **security-posture docs stay private**
-([`scripts/publish/publish-denylist.txt`](../../scripts/publish/publish-denylist.txt) covers
+(the retired publish deny-list covered
 `docs/security`); the SBOM/VEX and the operator guide are **transparency artifacts meant to be public**,
 so they live outside the deny-listed paths.
 

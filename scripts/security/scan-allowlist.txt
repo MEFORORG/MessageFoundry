@@ -1,0 +1,19 @@
+# Vetted false-positive allowlist for scan_forbidden.py (one line-regex per line; '#' comments).
+#
+# NEVER allowlist real customer data -- only genuinely-innocent lines a pattern over-matches.
+# Each entry MUST be narrow enough that a real customer/host string in the same file still trips.
+# See the scanner header in scripts/security/scan_forbidden.py.
+
+# sys.dm_os_wait_stats soak rows in the benchmark artifacts (docs/benchmarks/results/.../storedmv_soak.txt)
+# print "<WAIT_TYPE>  <wait_time_ms> ms  <waiting_tasks_count> tasks". A task count that lands in the
+# site-code range (e.g. WRITELOG ... 993496 tasks) collides with the site-code guard (99\d{4}) despite
+# being a pure engine perf counter with no customer-data path. This row shape is unambiguous DMV output,
+# so a real site code embedded in a path/HL7 field/prose (PT_990700_ADT, ^993496^) does NOT match it.
+^\s*[A-Z0-9_]+\s+\d+ ms\s+\d+ tasks\s*$
+
+# OIDC Core spec-section citations in the federated-SSO claim ladder (ADR 0142) read as dotted
+# quads: 'OIDC core 3.1.3.7/2' is section 3.1.3.7, rule 2 -- not a host. The citation is worth
+# keeping verbatim in security-critical verification code, so the line is allowlisted rather than
+# reworded. Anchored to the literal 'OIDC core <section>/<rule>' shape, so a real routable IP
+# elsewhere in claims.py (or anywhere else) still trips the scan.
+OIDC core \d+(?:\.\d+)+/\d+

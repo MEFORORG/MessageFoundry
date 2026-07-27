@@ -40,12 +40,13 @@ _REFUSED = ["", "PID|1||9^^^H^MR||DOE^JOHN", "MSH|^~|A|B", "not hl7 at all"]
 
 
 def _load_scan_forbidden() -> object:
-    path = _ROOT / "scripts" / "publish" / "scan_forbidden.py"
+    # scripts/security/, not the retired scripts/publish/. The scanner is COMMITTED now, so this skip
+    # should effectively never fire in a source checkout — it remains only for an installed wheel with
+    # no scripts/ tree above it. Leaving the old path here silently skipped the parity assertions
+    # below, which are the only thing keeping tee/anon/leak.py's tables identical to the guard's.
+    path = _ROOT / "scripts" / "security" / "scan_forbidden.py"
     if not path.exists():
-        # Private-only (scripts/publish/ is deny-listed in the OSS mirror); skip where it's absent.
-        pytest.skip(
-            "scan_forbidden.py is private-only (OSS-mirror deny-list)", allow_module_level=True
-        )
+        pytest.skip("scan_forbidden.py not found above this tree", allow_module_level=True)
     spec = importlib.util.spec_from_file_location("scan_forbidden", path)
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
@@ -81,17 +82,32 @@ def test_leak_token_table_matches_publish_guard() -> None:
 
 
 def test_leak_tables_load_empty_without_the_publish_guard(tmp_path: Path) -> None:
-    # On the OSS mirror scripts/publish/ is deny-listed, so the guard is ABSENT. The token tables must
-    # then load EMPTY (never a stale/fragmented copy), so no customer/vendor token ships in the tee.
-    # Exercise the loader against a tree that has no scripts/publish above it.
+    # Where no guard is reachable (an installed wheel with no scripts/ above it) the token tables
+    # must load EMPTY -- never a stale or fragmented copy -- so no customer/vendor token ships in
+    # the tee. Exercise the loader against a tree that has no scripts/security above it.
     assert tee_leak._load_publish_guard(tmp_path / "no-guard-here" / "leak.py") is None  # type: ignore[attr-defined]
 
 
 def test_leak_tables_are_sourced_from_the_guard_when_present() -> None:
-    # In the private source tree the guard IS present -> the tables are populated *from it* (not hard-
-    # coded here). Skipped on the mirror, where the guard is absent and the tables are legitimately empty.
-    if tee_leak._load_publish_guard() is None:  # type: ignore[attr-defined]
-        pytest.skip("publish guard is private-only (absent on the OSS mirror)")
+    """The tee's tables are populated FROM the guard, never hard-coded in the published file.
+
+    The gate here used to be "is the guard present", because the guard lived under the deny-listed
+    scripts/publish/ AND carried its tokens as literals -- so present implied populated. Neither half
+    holds now: the guard is committed at scripts/security/, and its tokens are EXTERNALIZED to a
+    secret / git-ignored file. Guard-present therefore no longer implies tables-populated, and this
+    test failed in CI on exactly that (present guard, no token source, empty tables) while passing
+    locally only because the developer's checkout has the token file.
+
+    Gate on the TOKEN SOURCE instead -- the condition that actually determines whether there is
+    anything to source. The assertion still bites: blanking the bridge in tee/anon/leak.py reds it.
+    """
+    guard = tee_leak._load_publish_guard()  # type: ignore[attr-defined]
+    if guard is None:
+        pytest.skip("guard absent (e.g. an installed wheel with no scripts/ above it)")
+    if not getattr(guard, "TOKENS_PRESENT", False):
+        pytest.skip(
+            "no token source configured (fork CI / fresh clone) — tables legitimately empty"
+        )
     assert tee_leak.FORBIDDEN and tee_leak.ESTATE_TOKENS  # type: ignore[attr-defined]
 
 
