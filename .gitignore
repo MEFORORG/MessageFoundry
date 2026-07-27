@@ -118,13 +118,23 @@ scripts/security/scan-tokens.local.txt
 # DELIBERATELY NOT LISTED: tests/test_scan_forbidden.py, tests/test_anon_core.py and
 # .github/dependabot.yml. Those were deny-listed too, but this change set publishes synthetic/public
 # versions of them -- ignoring them here would silently drop content that is meant to ship.
-/CLAUDE.md
+# PUBLISHED by this change (removed from the list above): CLAUDE.md, docs/BACKLOG.md and
+# docs/WORKTREES.md. All three were scanned and carry no customer/estate tokens (BACKLOG.md needed a
+# two-line redaction). CLAUDE.md in particular MUST be tracked: it is gitignored-by-default's worst
+# case here, because `git worktree add` cannot deliver an untracked file, so every worktree silently
+# came up with ZERO project conventions loaded.
 /.claude/
 /TRANSCRIPTS.md
 /docs/security/
 /docs/reviews/
 /docs/marketing/
-/docs/BACKLOG.md
-/docs/WORKTREES.md
+# Deliberately still private, each for a different reason:
+#   docs/security/      — 32 files of posture/risk-register detail; an attacker roadmap.
+#   docs/reviews/       — review findings, same reason.
+#   docs/CI-TOPOLOGY.md — STALE: it documents the retired private-repo/public-mirror split and
+#                         scripts/publish/, which the cutover deleted. Publishing it would actively
+#                         mislead. Rewrite for the post-cutover topology or delete it.
+#   docs/Secure_Development_Standards.md — scans clean, but it was deliberately pulled from the public
+#                         PyPI sdist (#1020); reversing that is an owner call, not a side effect.
 /docs/CI-TOPOLOGY.md
 /docs/Secure_Development_Standards.md

@@ -384,6 +384,59 @@ _CONFIG = Path(__file__).resolve().parents[1] / ".pre-commit-config.yaml"
 _INSTALLER = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "install-git-hooks.ps1"
 
 
+def test_ADDING_a_backlog_that_the_base_lacks_is_not_a_wall_of_unallocated_numbers(
+    tmp_path: Path,
+) -> None:
+    """docs/BACKLOG.md was gitignored until the cutover published it, so the base has no version of it.
+
+    `git show base:docs/BACKLOG.md` exits 128 for that, which crashed the gate; and treating the missing
+    base as an empty ledger is no better — every heading in the imported file then reads as a brand-new
+    number and the gate reports ~229 items as 'not allocated to this worktree'. Numbers that do not
+    exist on base cannot be collided with, so the correct answer is to police nothing.
+    """
+    r = tmp_path / "repo"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    git(r, "config", "user.email", "t@t")
+    git(r, "config", "user.name", "t")
+    git(r, "config", "commit.gpgsign", "false")
+    write(r, "README.md", "base with NO backlog\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "base")
+    git(r, "update-ref", "refs/remotes/origin/main", "HEAD")
+
+    write(r, "docs/BACKLOG.md", "# Backlog\n\n## 7. Seven\n\nb\n\n## 42. Forty-two\n\nb\n")
+    git(r, "add", "-A")
+    code, out = run_check(r)
+    assert code == 0, out
+    assert "not allocated" not in out
+
+
+def test_an_unreachable_base_ref_never_reports_success(tmp_path: Path) -> None:
+    """System-level property: an unresolvable base must never read as "nothing to check".
+
+    SCOPE, honestly: this does NOT isolate ``base_has``'s own rev-parse guard. Removing that guard
+    leaves this test green, because ``changed_files()``/``base_adr_numbers()`` already raise on the
+    missing ref before the backlog rule is reached. The guard stays as defence-in-depth — if the
+    backlog rule is ever reordered ahead of those calls, absence-probing would otherwise answer
+    "absent" for an unfetched base and silently disable itself — but that path is not reachable
+    today, so no test can currently pin it. Claiming otherwise would be the false assurance this
+    gate exists to prevent.
+    """
+    r = tmp_path / "repo"
+    r.mkdir()
+    git(r, "init", "-q", "-b", "main")
+    git(r, "config", "user.email", "t@t")
+    git(r, "config", "user.name", "t")
+    git(r, "config", "commit.gpgsign", "false")
+    write(r, "docs/BACKLOG.md", "# Backlog\n\n## 3. Three\n\nb\n")
+    git(r, "add", "-A")
+    git(r, "commit", "-qm", "base")
+    # NOTE: refs/remotes/origin/main is deliberately never created.
+    code, out = run_check(r)
+    assert code != 0, "a missing base ref must not read as 'nothing to check'"
+
+
 def _ledger_hook() -> dict[str, object]:
     """The ledger-gate entry from .pre-commit-config.yaml, or fail loudly.
 
