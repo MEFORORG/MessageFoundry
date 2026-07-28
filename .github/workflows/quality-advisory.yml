@@ -1,11 +1,16 @@
 name: quality-advisory
 
 # Advisory-only quality-measurement gates from the Code Quality and Anti-Slop Standards rubric
-# (docs/Code_Quality_Standards.md, signals 6-11). EVERY job here is advisory: it runs with `--exit-zero`
-# (or continue-on-error) so it can NEVER fail a build or block a merge -- it surfaces findings for triage
-# only. This is the rubric's "advisory-first, ratchet to blocking once the baseline is trusted" rule:
-# raw complexity, coverage %, and clone counts are weak / gameable signals (rubric section 4.1) and must
+# (docs/Code_Quality_Standards.md, signals 6-11). Every MEASUREMENT job here runs with `--exit-zero`
+# (or continue-on-error) so it can never fail on what it finds -- it surfaces findings for triage only.
+# This is the rubric's "advisory-first, ratchet to blocking once the baseline is trusted" rule: raw
+# complexity, coverage %, and clone counts are weak / gameable signals (rubric section 4.1) and must
 # never be a hard gate. This workflow is NOT in branch protection; adding a job here cannot freeze the repo.
+#
+# ONE DELIBERATE EXCEPTION: the `liveness` job at the bottom CAN go red, and is built to. It never rules
+# on findings -- it rules on whether each gate proved it MEASURED anything at all. A red mark there still
+# blocks nothing (this workflow holds no required contexts); it is simply the loudest honest way to say
+# a gate has stopped working. See that job's own comment for the three incidents that motivated it.
 #
 # Signals from the rubric (renumbered by tier -- docs/Code_Quality_Standards.md v0.7), each with how
 # it reaches a reviewer:
@@ -68,6 +73,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -131,6 +138,22 @@ jobs:
             --head c901-head.json \
             --repo-root . \
             --summary-file "$GITHUB_STEP_SUMMARY"
+      - name: Record gate liveness
+        id: receipt
+        if: always()
+        continue-on-error: true
+        run: |
+          # Units count what was EXAMINED, never what was found: a repo with zero functions over the
+          # threshold is good news, and a liveness check that fires on good news gets muted.
+          # `--show-files` lists exactly the files ruff would check, so it is non-zero iff ruff ran.
+          FILES="$(ruff check --select C901 --show-files messagefoundry 2>/dev/null | wc -l)"
+          FINDINGS="$(ruff check --select C901 --output-format=json --exit-zero messagefoundry \
+            | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+          python3 scripts/quality/liveness.py record \
+            --signal complexity --status measured \
+            --units "$FILES" --unit-name "files scanned" \
+            --evidence "ruff C901 scanned $FILES files; $FINDINGS over the threshold" \
+            --extra "{\"findings\":$FINDINGS}"
 
   clone:
     # Signal 9 - duplication / clone detection. Flags copy-pasted blocks (the "copy-instead-of-abstract"
@@ -141,6 +164,8 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -173,19 +198,37 @@ jobs:
               echo "workflow for why these are not annotated on the diff.</sub>"
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Record gate liveness
+        id: receipt
+        if: always()
+        continue-on-error: true
+        run: |
+          # Files ANALYSED, not clones found -- zero clones is a healthy repo, not a dead gate.
+          REPORT=jscpd-report/jscpd-report.md
+          FILES="$(grep -oE 'duplicated lines in [0-9]+' "$REPORT" 2>/dev/null | grep -oE '[0-9]+$' || true)"
+          CLONES="$(grep -oE 'Found [0-9]+ exact clones' "$REPORT" 2>/dev/null | grep -oE '[0-9]+' || true)"
+          python3 scripts/quality/liveness.py record \
+            --signal clone --status measured \
+            --units "${FILES:-0}" --unit-name "files analysed" \
+            --evidence "jscpd analysed ${FILES:-0} files; found ${CLONES:-0} clones" \
+            --extra "{\"clones\":${CLONES:-0}}"
 
   coverage:
     # Signal 8 - diff-coverage visibility. Runs the suite under coverage, then reports coverage of the
     # lines CHANGED by this PR (diff-cover) -- never a whole-repo % gate, which the rubric (section 4.1)
     # calls a gameable signal. ADVISORY: --fail-under=0 + `|| true` so it never fails a build, and this
     # job is not a required status check. PR-only (needs a base ref to diff against). It re-runs the
-    # ubuntu suite (~a few min) per PR; gate it tighter or move it to the mirror if that cost bites.
+    # ubuntu suite (~a few min) per PR; add a paths filter if that cost bites. (This used to say
+    # "move it to the mirror" -- there is no mirror since the cutover; development happens directly
+    # on the public repo.)
     name: diff-coverage (advisory)
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
       contents: read
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -242,7 +285,7 @@ jobs:
           # line flagged is a line this PR changed, so there is no pre-existing-debt noise by construction.
           # The console report still prints, so the job log is unchanged.
           diff-cover coverage.xml --compare-branch="origin/$BASE_REF" --fail-under=0 \
-            --format "github-annotations:notice,markdown:diff-cover.md" || true
+            --format "github-annotations:notice,markdown:diff-cover.md" 2>&1 | tee diff-cover-console.txt || true
           # `-s` not `-f`: diff-cover creates and truncates this file BEFORE it can fail, so a crashed
           # run leaves a 0-byte report. Testing for existence alone would append an empty section that
           # looks like a clean result -- the exact silent-success shape this workflow keeps producing.
@@ -257,6 +300,48 @@ jobs:
             } >> "$GITHUB_STEP_SUMMARY"
           else
             echo "::notice title=Diff coverage unavailable::diff-cover produced no report (see the job log)"
+          fi
+      - name: Record gate liveness
+        id: receipt
+        if: always()
+        # BASE_REF is needed here too -- without it the evidence string read "against origin/".
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        continue-on-error: true
+        run: |
+          # THE DISTINCTION THIS WHOLE CHECK RESTS ON, and the place it is easiest to get wrong.
+          #
+          # "No lines with coverage information in this diff" is a real, correct outcome -- it is what
+          # PRs #18 and #19 produced, because neither touched measured source. But diff-cover prints
+          # that SAME line when coverage.xml itself measured nothing (its console template branches on
+          # whether any source has measured lines, and never consults the diff size). So the message
+          # alone cannot tell "nothing to measure" from "the measurement is dead" -- exactly the
+          # ambiguity this control exists to resolve, one layer up. Reproduced with a valid-but-empty
+          # coverage.xml against a diff that really did change six lines.
+          #
+          # So: prove coverage.xml measured something before accepting the not-applicable branch, and
+          # treat a MISSING coverage.xml as a dead gate (failed), never as inapplicable -- the same way
+          # the mutation job treats a missing mutmut-counts.env.
+          if [ ! -s coverage.xml ]; then
+            python3 scripts/quality/liveness.py record --signal coverage --status failed \
+              --reason "coverage.xml was not produced; the measurement never happened"
+            exit 0
+          fi
+          MEASURED_FILES="$(grep -c '<class ' coverage.xml || true)"
+          if [ "${MEASURED_FILES:-0}" -eq 0 ] 2>/dev/null; then
+            python3 scripts/quality/liveness.py record --signal coverage --status failed \
+              --reason "coverage.xml contains no measured files; diff-cover had nothing to compare against"
+            exit 0
+          fi
+          if grep -q "No lines with coverage information" diff-cover-console.txt 2>/dev/null; then
+            python3 scripts/quality/liveness.py record --signal coverage --status not-applicable \
+              --reason "no lines with coverage information in this diff; coverage.xml measured ${MEASURED_FILES} files, so the tooling is live and this PR simply changed no measured source"
+          else
+            LINES="$(grep -oE 'Total:[[:space:]]+[0-9]+' diff-cover-console.txt 2>/dev/null \
+              | grep -oE '[0-9]+' | head -1 || true)"
+            python3 scripts/quality/liveness.py record --signal coverage --status measured \
+              --units "${LINES:-0}" --unit-name "changed lines analysed" \
+              --evidence "diff-cover reported on ${LINES:-0} changed lines against origin/${BASE_REF}; coverage.xml measured ${MEASURED_FILES} files"
           fi
 
   mutation:
@@ -273,6 +358,8 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
+    outputs:
+      receipt: ${{ steps.receipt.outputs.receipt }}
     steps:
       - name: Check out the source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -331,6 +418,21 @@ jobs:
             LISTED="$(grep -cE '^[[:space:]]+\S+: ' mutmut-results.txt || true)"
             SURVIVED="$(grep -c ': survived' mutmut-results.txt || true)"
             NOTESTS="$(grep -c ': no tests' mutmut-results.txt || true)"
+            # Counted INDEPENDENTLY, never as `LISTED - SURVIVED - NOTESTS`. Deriving it as a
+            # remainder would make the liveness reconciliation tautological -- the parts would add up
+            # by construction and the check could never fire.
+            #
+            # The alternation must cover EVERY non-killed status mutmut can print, or the sum breaks
+            # on a healthy run and the liveness job reddens for no reason. A check whose only
+            # reachable failure is a false positive gets muted within a month, which would leave us
+            # worse off than having no check.
+            OTHER="$(grep -cE ': (timeout|suspicious|skipped|segfault|not checked|caught by type check|check was interrupted by user)$' mutmut-results.txt || true)"
+            # mutmut's OWN killed counter, off its final progress line. KILLED above is derived a
+            # completely different way (total minus listed); the liveness check reconciles the two.
+            # Two independent derivations agreeing is what actually protects the number -- the sum
+            # check alone cannot, because TOTAL cancels out of it algebraically.
+            KILLED_REPORTED="$(tr '\r' '\n' < mutmut-run.txt | grep -oE '🎉 [0-9]+' | tail -1 \
+              | grep -oE '[0-9]+' || true)"
             if [ -n "$TOTAL" ] && [ "$TOTAL" -ge "$LISTED" ] 2>/dev/null; then
               KILLED=$((TOTAL - LISTED))
             else
@@ -357,6 +459,16 @@ jobs:
               echo "<sub>Advisory only. A survivor is a hint to strengthen an assertion, not a defect —"
               echo "and mutation score is a poor single number (rubric §2), so this never gates.</sub>"
             } >> "$GITHUB_STEP_SUMMARY"
+            # Stash the breakdown for the liveness receipt in the next step.
+            {
+              echo "MUT_TOTAL=$TOTAL"
+              echo "MUT_KILLED=$KILLED"
+              echo "MUT_SURVIVED=$SURVIVED"
+              echo "MUT_NOTESTS=$NOTESTS"
+              echo "MUT_OTHER=$OTHER"
+              echo "MUT_LISTED=$LISTED"
+              echo "MUT_KILLED_REPORTED=${KILLED_REPORTED:-}"
+            } > mutmut-counts.env
           else
             echo "::warning title=Mutation run failed::mutmut exited non-zero — see the job log"
             {
@@ -369,6 +481,47 @@ jobs:
               echo '```'
             } >> "$GITHUB_STEP_SUMMARY"
           fi
+      - name: Record gate liveness
+        id: receipt
+        if: always()
+        continue-on-error: true
+        run: |
+          if [ ! -s mutmut-counts.env ]; then
+            # mutmut crashed. This is the 2.5.1 case verbatim -- and it must NOT be silent.
+            python3 scripts/quality/liveness.py record --signal mutation --status failed \
+              --reason "mutmut produced no counts; the run did not complete (see the job log)"
+            exit 0
+          fi
+          . ./mutmut-counts.env
+          # `?` means the mutant total was unreadable, so KILLED is underivable. Interpolating it into
+          # the --extra JSON would emit `"killed":?` -- malformed, and it would surface as "receipt is
+          # not valid JSON" rather than the real diagnosis.
+          case "$MUT_KILLED" in
+            ''|*[!0-9]*)
+              python3 scripts/quality/liveness.py record --signal mutation --status failed \
+                --reason "could not read mutmut's mutant total from the progress line; the killed count is underivable"
+              exit 0
+              ;;
+          esac
+          # An EMPTY results file yields LISTED=0, hence killed=TOTAL, survived=0 -- a flawless score
+          # that reconciles perfectly. A 100% kill rate with nothing listed is not a triumph, it is a
+          # tool that produced no output. Refuse to report it as success.
+          if [ "${MUT_LISTED:-0}" -eq 0 ] && [ "${MUT_TOTAL:-0}" -gt 0 ] 2>/dev/null; then
+            python3 scripts/quality/liveness.py record --signal mutation --status failed \
+              --reason "mutmut listed no mutants at all while reporting $MUT_TOTAL processed; a perfect score here means the results file was empty, not that every mutant died"
+            exit 0
+          fi
+          EXTRA="{\"killed\":$MUT_KILLED,\"survived\":$MUT_SURVIVED,\"no_tests\":$MUT_NOTESTS,\"other\":$MUT_OTHER"
+          case "$MUT_KILLED_REPORTED" in
+            ''|*[!0-9]*) ;;
+            *) EXTRA="$EXTRA,\"killed_reported\":$MUT_KILLED_REPORTED" ;;
+          esac
+          EXTRA="$EXTRA}"
+          python3 scripts/quality/liveness.py record \
+            --signal mutation --status measured \
+            --units "$MUT_TOTAL" --unit-name "mutants processed" \
+            --evidence "mutmut processed $MUT_TOTAL mutants; $MUT_LISTED listed as non-killed" \
+            --extra "$EXTRA"
       - name: Upload the mutmut results (advisory)
         if: always()
         continue-on-error: true
@@ -386,3 +539,39 @@ jobs:
           # Deliberately `warn`, not `ignore`: if mutmut ever renames its cache, that must be visible in
           # the log rather than silently swallowed.
           if-no-files-found: warn
+
+  liveness:
+    # THE META-GATE. Every other job here is built so it can never fail; this one is built so it CAN.
+    #
+    # Three separate signals in this workflow spent months reporting success while measuring nothing:
+    # diff-coverage (a shallow fetch destroyed its merge base, and the empty report looked clean),
+    # mutation (mutmut 2.5.1 crashed before producing a mutant, and `|| true` made that green in 37s),
+    # and the killed count (a grep for a line mutmut never prints, so a healthy run said "Killed 0").
+    # The rubric's anti-metric rule guards against trusting a NUMBER too much. Nothing guarded against
+    # trusting a GREEN CHECK THAT NEVER RAN. This job is that control.
+    #
+    # It reads each job's liveness receipt and demands proof of EXECUTION -- a count of things
+    # examined -- or an explicit, reasoned declaration that there was nothing to measure. It does not
+    # demand findings: a clean repo legitimately has zero clones, and a gate that fires on good news
+    # gets muted, which would leave us worse off than before.
+    #
+    # DELIBERATELY has no `continue-on-error` and no `|| true`. A dead gate should be loud, and a red
+    # mark here blocks nothing -- this job is not, and must never become, a required status check.
+    name: gate liveness (advisory)
+    if: always()
+    needs: [complexity, clone, coverage, mutation]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Verify every gate proved it measured something
+        # `needs` carries each job's result AND its receipt output. Routed through `env:` rather than
+        # interpolated into the shell body -- the receipts are job-authored strings, and expanding
+        # them into a command line is the template-injection shape zizmor exists to catch.
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+        run: python3 scripts/quality/liveness.py verify --needs-json "$NEEDS_JSON"
