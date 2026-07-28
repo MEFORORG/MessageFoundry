@@ -6,6 +6,37 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+## [0.3.2] — 2026-07-28 — Early Access
+
+A patch release for one adopter-facing defect shipped in 0.3.1, plus two gates that were passing
+without being able to fail.
+
+### Fixed
+- **The scaffolded supply-chain gate named a repository adopters cannot read.** `messagefoundry init`
+  writes a fail-closed CI gate that runs `gh attestation verify --repo …` on the pinned engine wheel
+  before installing it. It named the retired private development vault rather than the public
+  repository that actually mints the attestations, so **every project scaffolded by 0.3.1 shipped a
+  provenance gate that fails on its owner's first CI run.** If you scaffolded against 0.3.1, either
+  re-run `messagefoundry init`, or edit that one `--repo` argument in
+  `.github/workflows/check.yml` to `MEFORORG/MessageFoundry`; setting the repository variable
+  `MEFOR_VERIFY_ENGINE=off` skips the job entirely as a stopgap. The scaffold test had pinned the
+  wrong value, so the defect was being actively enforced; it now also pins the negative.
+- **The weekly vulnerability-metrics job measured an empty window instead of failing.**
+  `vuln-metrics.yml` invokes `scripts/security/vuln_metrics.py` with no `--repo`, so the argparse
+  default silently decided what was measured — and it named the same retired vault, whose Dependabot
+  PRs a public token cannot read. All seven KPIs were computed over zero pull requests rather than
+  erroring. The default is now `$GITHUB_REPOSITORY`, so the job measures the repository it runs in.
+- **A partially-failed release could not be retried.** The GitHub release step failed when the tag or
+  release already existed, so a publish that died midway (as 0.3.0's did) left no clean path forward.
+  It is now idempotent.
+- **The load harness's no-loss reconcile false-failed a demonstrably zero-loss run.** It excuses a
+  send left unconfirmed at connection teardown, capped so a dead ACK path cannot pass as zero-loss —
+  but the cap modelled legitimate stranding as "~one in-flight frame per connection". The sender
+  keeps an unbounded in-flight window and paces open-loop sends by offered rate, so real stranding
+  scales with rate × ACK-latency instead. A run that stranded 14 of 90 sends while the engine read
+  and delivered every one of the rest was reported as message loss. The cap is now
+  `max(connections, half the run)`, which keeps `read >= sent // 2` always required.
+
 ## [0.3.1] — 2026-07-27 — Early Access
 
 ### Security
@@ -964,7 +995,8 @@ tests, but the external code review + penetration test (the bar for a security-c
 - Releases are built, SBOM'd (CycloneDX), and signed with [Sigstore](https://www.sigstore.dev/) — see the
   `release` workflow.
 
-[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...HEAD
+[Unreleased]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.2...HEAD
+[0.3.2]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.1...v0.3.2
 [0.3.1]: https://github.com/MEFORORG/MessageFoundry/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.15...v0.3.0
 [0.2.15]: https://github.com/MEFORORG/MessageFoundry/compare/v0.2.14...v0.2.15
