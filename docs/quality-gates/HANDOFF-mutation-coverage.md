@@ -267,6 +267,12 @@ behaviour on fork PRs. The workflow still holds **no write scope on any job**.
   by the scoped test — in 3 seconds.** The step summary now carries that table plus the survivor list, and
   a non-zero `mutmut run` emits a `::warning` instead of passing silently.
 
+  **Confirmed in production** on run `30308667584` (PR #18): 461 mutants, 19 survived, 355 not covered,
+  87 killed — matching the Docker measurement exactly. That run also exposed a reporting bug: `mutmut
+  results` lists ONLY the mutants worth looking at, so `grep -c ': killed'` is always 0 and the summary
+  table reported "Killed 0" on a healthy run. The count is now derived as total-minus-listed
+  (461 − 374 = 87), validated against that run's own artifact.
+
   Three things are load-bearing in the mutmut 3 config, each found by a run that produced nothing:
   `source_paths` must be the **package** (mutmut 3 copies it into `mutants/` and runs pytest there; with a
   single file copied, `conftest.py` cannot import `messagefoundry.config` and every mutant returns "not

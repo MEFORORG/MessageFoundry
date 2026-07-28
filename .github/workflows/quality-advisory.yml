@@ -321,10 +321,23 @@ jobs:
           tail -c 20000 mutmut-run.txt
           if [ "$MUTMUT_OK" = "1" ]; then
             mutmut results > mutmut-results.txt 2>&1 || true
-            KILLED="$(grep -c ': killed' mutmut-results.txt || true)"
+            # `mutmut results` lists ONLY the mutants worth looking at -- survived / no tests /
+            # timeout / suspicious. Killed mutants are NEVER listed, so `grep -c ': killed'` is
+            # always 0 and a naive table reports "Killed 0" on a perfectly healthy run. Derive it:
+            # the run's final progress line carries the total (`461/461`), and every non-killed
+            # mutant is exactly one line in the results file. Verified against run 30308667584:
+            # 461 total - 374 listed = 87 killed, matching mutmut's own counter.
+            TOTAL="$(tr '\r' '\n' < mutmut-run.txt | grep -oE '[0-9]+/[0-9]+' | tail -1 | cut -d/ -f2)"
+            LISTED="$(grep -cE '^[[:space:]]+\S+: ' mutmut-results.txt || true)"
             SURVIVED="$(grep -c ': survived' mutmut-results.txt || true)"
             NOTESTS="$(grep -c ': no tests' mutmut-results.txt || true)"
-            echo "== killed=$KILLED survived=$SURVIVED no-tests=$NOTESTS =="
+            if [ -n "$TOTAL" ] && [ "$TOTAL" -ge "$LISTED" ] 2>/dev/null; then
+              KILLED=$((TOTAL - LISTED))
+            else
+              # Never invent a number: if the total could not be read, say so rather than print 0.
+              KILLED="?"
+            fi
+            echo "== total=$TOTAL killed=$KILLED survived=$SURVIVED no-tests=$NOTESTS =="
             grep ': survived' mutmut-results.txt || true
             {
               echo "## Mutation testing — \`messagefoundry/parsing/binary.py\`"
