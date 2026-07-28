@@ -6371,7 +6371,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 207. txn/msg and bytes/msg counters in the harness
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **5/10** · Difficulty **4/10** · _fill-in_. Adds two never-measured incumbent-parity counters (txn/msg, bytes/msg); real for adopter sizing, but the analytical cost model is a clean workaround. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Closed by [ADR 0141](adr/0141-publish-copies-per-message-as-the-207-sizing-proxy-the-bytes-per-message-figure-stays-refused.md), **Accepted 2026-07-20**, whose own text names this item — *"BACKLOG **#207** (this closes it)"* (`:10`). **txn/msg is measured, not modelled:** the engine-side counter is `Store.committed_txns` (`messagefoundry/store/base.py:220-233` — write-path commits only; read-snapshot-release commits are excluded so it stays the currency ADR 0051 sizes on), self-differenced over the run into `EngineSummary.committed_txns` + `txn_per_message_measured` (`harness/load/report.py:112-113`, `:676-682`). A zero delta reports `None` — *"not measured"* — rather than a fabricated `0/msg`. **The second counter resolved differently, by design:** `bytes/msg` **stays refused**; `body_copies` / copies-per-message ships as the sizing proxy instead (`harness/load/report.py:114`, `:132`; `SCHEMA_VERSION = 3` at `:24`). That is the ADR's decision, not an unbuilt residual. _(was 🔢 P2 · Value 5/10 · Difficulty 4/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** medium.
 
@@ -6399,7 +6399,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 209. Teach the ladder routed_fanout ≠ delivered (H ≠ N)
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Harness shape fix: shardcert hardwires H=N=dests (verified); teaching it H≠N at the ADT hub shape corrects the cost-model ceiling the 2H thesis rests on. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **SHIPPED (code) — verified against `origin/main` (2026-07-28).** The `H = N = dests` hardwiring is gone: `dests` now keeps **one** meaning (topology), while `handlers` (H) and `delivering` (D) are separate inputs — `harness/load/shardcert_ladder.py:875-878`, `:1063-1064`, `:1154-1155`, with `schema_version` 4 adding the two fields (`:55`). Delivery arithmetic is keyed on `delivering`, **never** `dests` (`outbound_rate`, `:807-810`; the module contract states it at `:39-41`), and `txn_per_message` reports `3 + 2H + 2D` (`:1318-1320`, `:1806-1808`, `:2503`). Defaults reproduce the old shape exactly, pinned by `tests/test_shardcert_config.py:154+` including `test_default_shape_is_byte_identical` (`:172`). ⚠️ **Residual is bench time, not code:** the `H = 20` hub-shape rig run is a soak-slot ask against rig capacity the project does not own — it does not reopen this item. _(was 🔢 P2 · Value 6/10 · Difficulty 5/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -6521,7 +6521,9 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 216. 1,500-connection traffic-driving harness mode (the demo shape)
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Builds the only instrument for the 45M/day demo shape (~1,500 conns, estate mix); gates #211 and the Phase-D demo — no existing harness covers it. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** ⚠️ **The banner's premise — *"no existing harness covers it"* — is FALSE**: the whole estate mode exists as `harness/load/estate/` (`profile.py` 360 ln, `driver.py` 200 ln, `runner.py` 568 ln, `report.py` 214 ln) plus the graph under `harness/config/estate/`, driven by `python -m harness --estate` (`harness/__main__.py:167`, with `--estate-api-port` and `--list-estate-profiles` beside it). The demo profile `harness/load/profiles/estate-demo.toml` declares `count = 1500` (`:20`) at a calibrated per-connection event rate converging on the target total (`:24`).
+>
+> ⚠️ **Two calibration constants still require OWNER SIGN-OFF before the demo is run** — they describe the *shape* of the estate and must come from the operator's own recon, not from this harness: `simple_fraction = 0.72` (`estate-demo.toml:21`) and `hub_fanout = 3` (`:22`), both marked `OWNER-CONFIRM` in the file (`:8-9`) and named as the calibration pair in `harness/load/estate/profile.py:9`. Note the **shape discrepancy** against this item's own text: the profile encodes a 72/28 simple-to-hub split at fan-out 3, whereas the item asked for "17% hub, H=20, N=4". The instrument is built; which shape it drives is the owner's call. _(was 🔢 P2 · Value 7/10 · Difficulty 6/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -6591,7 +6593,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 220. CPU delta is differenced across a subtree that can change between ticks
 
-> 🔢 **Re-scored 2026-07-10 → P3.** Value **4/10** · Difficulty **3/10** · _fill-in_. Confirmed bug in _drain_proc: CPU delta differences subtree sums over changing PID sets; real but low-probability edge-case hardening, nobody blocked. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** The fix is the one the item asked for: the probe now records **which** PIDs it summed, so a changing subtree can be detected rather than silently differenced. `ProcSample.cpu_pids` carries the exact PID set per tick (`harness/load/connscale/probe.py:50-70`, whose docstring names this item and states the invariant — `None` **iff** `cpu_seconds` is `None`). `_drain_proc` then derives CPU as a **piecewise sum over consecutive intervals whose summed-over PID set is unchanged**, degrading the rest to a gap instead of a bogus delta (`harness/load/connscale/runner.py:928-1014`), with the twin `_cpu_from` on the estate side (`harness/load/estate/runner.py:513`). Falsifiers in `tests/test_connscale_cpu_probe.py`. _(was 🔢 P3 · Value 4/10 · Difficulty 3/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P3. **Verdict:** build. **Severity:** low.
 
