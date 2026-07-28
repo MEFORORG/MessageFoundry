@@ -3451,9 +3451,7 @@ parity analysis.
 
 ## 82. Sender transport-polish bundle — pacing · MSA-2↔MSH-10 matching · TCP keep-alive
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **2/10** · _quick win_. Confirmed gap: _check_ack matches MSA-1/MSA-3 only, so a wrong ACK is accepted; the serial connect-per-message default masks most exposure. _(was P1 · V3/5 · D2/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Both remaining halves of the bundle are built. **MSA-2↔MSH-10 correlation:** the per-outbound `verify_ack_control_id` knob (`messagefoundry/transports/mllp.py:663`) makes the ACK check reject a positive ACK whose MSA-2 does not echo the sent MSH-10 — raising a *retryable* `DeliveryError` and, on a persistent lane, discarding the cached socket as desynced (`:793`, `:1196`, `:1215-1226`; control ids only in the exception text, never a payload). **Pacing:** the per-outbound `send_min_interval_seconds` lane pacer (`messagefoundry/config/wiring.py:763`, documented `:845-853`, threaded `:883`, validated `:3347-3352`). ⚠️ **The former banner's *"Confirmed gap: `_check_ack` matches MSA-1/MSA-3 only, so a wrong ACK is accepted"* is factually FALSE against `origin/main` and is retracted here** — it is exactly the kind of stale claim that gets rebuilt. Keep-alive was promoted out to [#97](#97-keep-alive--persistent-outbound-connections--per-connector-setting-p3-on-trigger), also shipped. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 2/10.)_
 
 **Cluster:** Minor gaps. **Priority:** P3. **Verdict:** demand-gate.
 
@@ -4110,9 +4108,7 @@ filed against this item.
 
 ## 97. Keep-alive / persistent outbound connections — per-connector setting (P3, on-trigger)
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **3/10** · Difficulty **3/10** · _fill-in_. Niche outbound keep-alive knob most partners never need; MLLP persistent already ships (ADR 0067), residual ports the pattern to TCP/X12 outbounds. _(was DEMAND-GATE · V2/5 · D2/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”). Promotes the keep-alive sub-scope of [#82](#82-sender-transport-polish-bundle--pacing--msa-2msh-10-matching--tcp-keep-alive) into its own tracked item at the owner's request.
+> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The residual — porting MLLP's persistent-connection pattern to the `Tcp()`/`X12()` outbounds — is built behind a per-outbound `persistent=false` opt-in with the same knobs and semantics as MLLP minus TLS (raw TCP has none): `self.persistent` + `idle_timeout_seconds` + `max_connection_age_seconds` at `messagefoundry/transports/tcp.py:124` and `messagefoundry/transports/x12.py:94`. [ADR 0067](adr/0067-persistent-outbound-mllp.md) now carries the `Tcp()`/`X12()` parity box checked at `:128` and a full **§9 amendment** (`:130`) fixing the reconnect model to exactly-one-redial-before-first-byte (**not** this item's original "reconnect-with-backoff" wording — a failed redial is a normal charged `DeliveryError` the delivery worker retries). **This supersedes any framing that the work is stranded on the `dg-s5` lane: it is on `main`.** _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
 
 **Type:** feature — a per-outbound-connection option to **hold the TCP link open across deliveries** (keep-alive / persistent) instead of the current connect-per-message behavior.
 
@@ -4271,7 +4267,7 @@ is combined with `[cluster]` membership.
 
 ## 102. Server-DB DR seed verification has no teeth (P2)
 
-> 🚧 **PARTIAL (built 2026-07-10, lane `plan8-102`, commit `b912aee`; PR #890).** The empty/fresh-bootstrap data-loss hole is closed fail-closed: server-DB DR activation now requires the restored `mefor` DB to carry backup provenance (`Store.has_prior_backup_history()`, ≥ 1 `dr_backup` row) plus an explicit per-activation DBA attestation, refusing closed even when falsely attested. Deliberately weaker than the SQLite full-snapshot default — vintage/partial-restore of a DBA-managed native DB remain attestation-guarded residuals, tracked as #223.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28)** (built 2026-07-10, lane `plan8-102`, commit `b912aee`, PR #890). The empty/fresh-bootstrap data-loss hole is closed fail-closed on **all three backends**: `Store.has_prior_backup_history()` is on the protocol at `messagefoundry/store/base.py:1401` and implemented at `store/store.py:7463`, `store/postgres.py:5679` and `store/sqlserver.py:8366`. Server-DB DR activation now requires **both** an explicit per-activation DBA attestation **and** a live restore-provenance probe (≥ 1 `dr_backup` audit row — written on every leader-gated backup success, absent on a fresh DR-box bootstrap since a passive standby is never leader), aborting **even when falsely attested** and aborting on an unreachable DB (`messagefoundry/pipeline/dr.py:413-478`, probed off the event loop; `tests/test_dr_server_seed_gate.py`). The vintage/completeness residual it hands off is **#223 — also closed**, so nothing here is outstanding. _(was 🚧 PARTIAL · Value 8/10 · Difficulty 4/10.)_
 
 **Type:** bug / hardening.
 
@@ -4665,9 +4661,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 >
 > **Build constraints:** Ship as an opt-in per-connection toggle on the MLLP outbound; the default MUST remain ACK-waiting (read one ACK, validate MSA-1 in _check_ack) so existing feeds are unchanged. Mirror the existing expect_reply=false semantics: mark the outbox row PROCESSED/delivered on successful TCP write, and document explicitly that delivery is confirmed on write, not on a positive MSA-1 ACK — there is no NAK-driven or timeout-driven retry in this mode. Preserve per-lane send ORDER (pipelining must not reorder within a lane)…
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **3/10** · Difficulty **3/10** · _fill-in_. Niche non-acking-peer knob; a clean byte-identical Tcp(vt_fs) workaround already ships; opt-in toggle is a contained connector change. _(was DEMAND-GATE · V2/5 · D3/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The opt-in per-outbound MLLP toggle is built: `self.no_ack` at `messagefoundry/transports/mllp.py:620` — default `False` = today's ACK-waiting behaviour, byte-identical; when on, `send()` frames, writes, drains and finalizes on the TCP write, reading no ACK (*at-most-once-confirmation*: no NAK-/timeout-driven retry). [ADR 0124](adr/0124-outbound-mllp-fire-and-forward-no-wait-for-ack-delivery-on-write.md) **is on `main`**, with its index row at `docs/adr/README.md:151`. The build constraints above were met, and the interaction with #82 is **guarded, not merely documented**: `messagefoundry/config/wiring.py:3388-3405` raises a `WiringError` at `check`/dry-run time for `no_ack` on a non-MLLP outbound, for `no_ack` + `capture_response`/`reingress_to`, and for `no_ack` + `verify_ack_control_id` (no ACK is read, so there is no MSA-2 to correlate) — pinned by `tests/test_no_ack_wiring.py:47-60`. _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5181,9 +5175,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 142. 'Leave source file' - process-in-place file/FTP source disposition
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **6/10** · _big bet_. Read-only-share poll gap with only an awkward external copy-job workaround; leave-in-place needs a dedup ledger across the store's 3 backends. _(was DEMAND-GATE · V3/5 · D3/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0129](adr/0129-process-in-place-file-disposition-and-cross-backend-processed-file-dedup-ledger.md). `after_read='leave'` is a validated third disposition on the file source (`messagefoundry/transports/file.py:298-302`, honoured at `:355`), and it correctly relaxes the write-permission precondition a leave-in-place read-only share cannot satisfy (`:400`). The re-poll dedup it needs is the cross-backend ledger the banner said was missing: the `ProcessedFileLedger` protocol at `messagefoundry/transports/base.py:65` over a `processed_files` table (`:250`) implemented on **all three** store backends. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 6/10.)_
 
 **Cluster:** Connections & Transports. **Priority:** P2. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -6059,7 +6051,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 187. Authentication defaults: require MFA, tighten TOTP skew, phishing-resistant factor
 
-> 🚧 **Status — core shipped 2026-07-10 (ADR 0079); Kerberos residual.** `require_mfa` default-on (opt-out `[auth].require_mfa=false`) + a strict TOTP `[auth].totp_skew_steps` knob (default 0 = current 30s step only; opt-out 1/2 restores the RFC-6238 ±1 network-delay window) shipped — ASVS 6.3.3 / 6.5.5. WebAuthn passkeys (ASVS 6.5.7 / 6.7.2) ship via the `[webauthn]` extra **by design, NOT a core dep** ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §3: its pyOpenSSL transitive hard-caps `cryptography<50`, so keeping it an extra leaves the core PHI-crypto upgrade-agile) — `pip install messagefoundry[webauthn]`. Sole deferred residual: Kerberos 7.1.3 IdP session-lifetime coordination (ADR 0079, Proposed). Filed by the independent ASVS 5.0 L3 re-score (PR #854).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** All three parts are built. **Defaults:** `require_mfa: bool = True` (`messagefoundry/config/settings.py:1662`) and the strict `totp_skew_steps: int = 0` (`:1682`, values > 2 rejected) — ASVS 6.3.3 / 6.5.5. **Phishing-resistant factor:** WebAuthn passkeys ship via the `[webauthn]` extra **by design, NOT a core dep** ([ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §3: its pyOpenSSL transitive hard-caps `cryptography<50`, so keeping it an extra leaves the core PHI crypto upgrade-agile). **The "sole deferred residual" is closed:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) is no longer Proposed — its status line reads **Accepted, mechanism 2 built 2026-07-22** — shipping the directory reconciler (`messagefoundry/auth/reconcile.py`; `_directory_reconciler` at `messagefoundry/api/app.py:5066`, which re-resolves principals holding live sessions and revokes those AD has disabled or deleted) behind five `[auth]` settings at `messagefoundry/config/settings.py:1777-1803`. ⚠️ **Scope note, not a residual of this item:** `ad_session_recheck_seconds` still ships at `0` (`:1777`), so no reconciler task is created until an operator sets it (`docs/SECURITY.md:1321` recommends `300` for an off-loopback PHI deployment serving AD accounts). Flipping that default is owner-approved but is a **separate code+test change on a separate lane**, deliberately not folded into this docs-only reconcile. _(was 🚧 core shipped / Kerberos residual · Value 8/10 · Difficulty 5/10.)_
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -6485,7 +6477,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 213. accepts= seam (pure router-stage predicate) plus an advisory lint
 
-> 🔢 **Re-scored 2026-07-11 → P1.** Value **8/10** · Difficulty **7/10** · _big bet_. Router-stage accepts= predicate lets handler filters cost 0 txn instead of 2 (ADT hub 51→19). **ADR 0084 is RATIFIED (2026-07-11) — the semantics are settled and this build lane is UNBLOCKED.** _(was 5/7 P2; raised because the capacity frontier makes it a co-requisite, not a follow-on — see below)_
+> ✅ **SHIPPED — re-verified against `origin/main` (2026-07-28).** The [ADR 0084](adr/0084-accepts-router-seam.md) `accepts=` router-stage seam is built end to end: the `HandlerAccepts` predicate type plus the fail-closed `_check_accepts_predicate` (`messagefoundry/config/wiring.py:2291`, which REJECTS a predicate naming the transform-only `state_get`/`response_get` — those fail *open* in the router phase and would silently invert a migrated suppression filter); `Registry.handler_accepts` (`:2760`, registered `:2817`, validated `:2845-2848`, re-checked on load `:4179-4186`); the component-wise `message_type_of(...)` helper (`:2355`); dry-run parity via `_accepted` (`messagefoundry/pipeline/dryrun.py:206`); sandbox parity (`messagefoundry/pipeline/_sandbox_worker.py:115`); the advisory lint `_check_accepts_candidate` (`messagefoundry/checks.py:388`); and `tests/test_accepts_seam.py` (749 lines). _(was 🔢 P1 · Value 8/10 · Difficulty 7/10 — the highest double-build risk in this reconcile: the banner described ~1,500 already-merged lines as unstarted work.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build (**ADR 0084 ratified — go**). **Severity:** medium.
 
@@ -6702,7 +6694,7 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 ## 223. Server-DB DR restore vintage/completeness attestation (the #102 residual)
 
-> 🚧 **DESIGN + RISK-ACCEPTANCE RECORDED (2026-07-12, [ADR 0102](adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md)); full engine-seed (option a) DEFERRED to owner.** The three options are analyzed; **(c) chosen** — the vintage/completeness residual is formally ACCEPTED (ASVS-style: recorded in [ASVS-L3-RISK-ACCEPTANCE-REGISTER](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) + made explicit for operators in ADR 0048's cold-restore runbook). **(b) built, opt-in:** a `[dr].restore_token` (default `""` = OFF, byte-identical to #102; SQLite no-op; local/UNC only) that the #102 gate cross-checks against the restored DB's latest `dr_backup` archive — a VINTAGE FLOOR (a stale/wrong native restore is refused closed), NOT completeness proof. **(a) DEFERRED — owner decision:** the full engine-driven server-DB store seed (re-opens the #52 DBA-delegation boundary) is scheduled separately, not built here. This banner is design + risk-acceptance (+ the small opt-in token), not the large engine-seed build.
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0102](adr/0102-server-db-dr-restore-vintage-completeness-attestation-residual.md) is **Accepted (2026-07-12)** and the mechanism it authorized is built. **(c)** the vintage/completeness residual is formally risk-accepted; **(b)** the opt-in cross-check ships: `[dr].restore_token` (`messagefoundry/config/settings.py:3314` — default `""` = OFF, leaving the #102 gate byte-unchanged and a SQLite no-op; a cloud URL is rejected by the `_no_cloud_restore_token` validator at `:3347`) is cross-checked by `_verify_restore_token` (`messagefoundry/pipeline/dr.py:480`, invoked from the gate at `:478`) against the restored DB's **own** latest `dr_backup` anchor — a **vintage floor** a bare boolean attestation cannot give (a stale or wrong native restore is refused closed). It is deliberately **not** completeness proof. **(a) — the full engine-driven server-DB store seed — was DECLINED by the owner 2026-07-20**, not deferred: it re-opens the #52 DBA-delegation boundary. With (a) declined and (b)+(c) built, this item has no residual and closes. _(was 🚧 DESIGN + RISK-ACCEPTANCE RECORDED.)_
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** owner decision (design first). **Severity:** medium.
 
