@@ -71,11 +71,18 @@ _RETROSPECTIVE = re.compile(
 _PROSE_CEILING = 55
 
 
+#: This module, excluded from its own scan. Its taxonomy above necessarily SPELLS every phrase it
+#: searches for, so it counted itself: CI reported 61 against a ceiling of 55, which is exactly main's
+#: 53 plus 8 self-hits (the file count also rose 1367 -> 1368). A detector cannot scan its own
+#: specification without measuring the specification. Scoped to this one path, not a blanket ignore.
+_SELF = "tests/test_cutover_slug_rot.py"
+
+
 def _tracked() -> list[str]:
     out = subprocess.run(  # nosec B603 B607 - fixed argv, no shell
         ["git", "ls-files"], capture_output=True, text=True, cwd=_ROOT
     ).stdout
-    return [f for f in out.split() if not f.startswith(_HISTORICAL)]
+    return [f for f in out.split() if not f.startswith(_HISTORICAL) and f != _SELF]
 
 
 def _read(rel: str) -> str:
