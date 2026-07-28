@@ -119,10 +119,14 @@ diff-cover coverage.xml --compare-branch=origin/main --fail-under=0
           git fetch --no-tags --depth=1 origin main || true
           diff-cover coverage.xml --compare-branch=origin/main --fail-under=0 || true
 ```
-**Cost lever:** if a full-suite run per PR is too much on the private repo, either add a path filter (only run
-when `messagefoundry/**` or `tests/**` change) or gate the whole job to the mirror with the repo-slug
-`if: github.repository == 'MEFORORG/MessageFoundry'` (free minutes) — but then it won't report on private
-PRs. Start advisory-on-PR; move to mirror if cost bites.
+**Cost lever:** if a full-suite run per PR is too much, add a path filter (only run when
+`messagefoundry/**` or `tests/**` change).
+
+> **STALE — pre-cutover (corrected 2026-07-27).** This paragraph used to offer "gate the whole job to
+> the mirror with the repo-slug `if: github.repository == 'MEFORORG/MessageFoundry'` (free minutes)".
+> **There is no mirror**; the cutover moved development directly onto the public repo, and that
+> repo-slug gate was *removed* from the mutation job. Do not re-add it — it would make the job a no-op
+> on every PR while looking deliberate.
 
 ---
 
@@ -137,8 +141,8 @@ that *adversarially* proves your tests assert something (rubric A.4: matters mos
 2. **Where it runs** (mutation is too slow for every private PR):
    - **(A) PR, diff-scoped** — mutate only files changed vs `origin/main` (small diffs → few mutants →
      tolerable). Closest to the rubric's "mutation on changed code"; higher per-PR cost. **Recommended.**
-   - **(B) mirror-nightly, rotating** — a nightly cron on the mirror (free minutes) mutates a rotating
-     slice. Cheap, but not per-PR.
+   - **(B) nightly, rotating** — a nightly cron mutates a rotating slice. Cheap, but not per-PR.
+     *(Was "mirror-nightly (free minutes)" — there is no mirror post-cutover.)*
 
 ### 3b. Local verify (against the installed mutmut version)
 ```powershell
@@ -194,14 +198,14 @@ mutmut results
           mutmut results || true
 ```
 
-### 3c′. CI job — option (B) mirror-nightly (add a `schedule:` trigger + repo-slug gate)
+### 3c′. CI job — option (B) nightly (add a `schedule:` trigger)
 Add the cron to the workflow's `on:` block, then the job:
 ```yaml
 # on:
 #   pull_request:
 #   workflow_dispatch:
 #   schedule:
-#     - cron: "23 4 * * *"     # nightly; the job's repo-slug if keeps it mirror-only (free minutes)
+#     - cron: "23 4 * * *"     # nightly sweep against main
 
   mutation-nightly:
     name: mutation (nightly, advisory)
