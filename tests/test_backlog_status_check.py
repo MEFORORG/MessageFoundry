@@ -139,13 +139,16 @@ _BACKLOG = _ROOT / "docs" / "BACKLOG.md"
 
 @pytest.mark.skipif(
     not _BACKLOG.exists(),
-    reason="docs/BACKLOG.md is private-only (OSS-mirror deny-list); absent on the mirror snapshot",
+    reason="docs/BACKLOG.md absent — only expected in an installed wheel with no docs/ tree",
 )
 def test_the_real_backlog_satisfies_the_invariant() -> None:
     """The operative guard: `docs/BACKLOG.md` itself must pass on every PR.
 
-    On the public mirror the file is deny-listed (never published), so this test skips there —
-    the guard is enforced by the private repo's CI, where the file always exists.
+    THE SKIP ABOVE SHOULD NEVER FIRE IN A SOURCE CHECKOUT. It used to read "private-only (OSS-mirror
+    deny-list); absent on the mirror snapshot" — true while the backlog was git-ignored and this repo
+    was a published mirror, and quietly false afterwards: the file was un-ignored and committed, but
+    the reason still described a topology that had ended, so a reader who saw a skip would have
+    concluded it was expected rather than a missing file. Same shape as the guard it protects.
     """
     errors, _ = bsc.scan(_BACKLOG.read_text(encoding="utf-8"))
     assert errors == [], "docs/BACKLOG.md violates the status invariant:\n" + "\n".join(errors)
