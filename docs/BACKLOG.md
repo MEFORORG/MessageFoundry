@@ -4669,11 +4669,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 117. Sender no-wait-for-ACK (fire-and-forward) option
 
-> 🛠 **Decline overturned (2026-07-09).** A prioritization pass recommended DECLINE; the stated reason was **invalid**. Purity binds `@router` / `@handler` — **not connectors** (CLAUDE.md §8: “side effects (DB, network) belong in connections/transports”). This is an unfired **demand-gate**, not an architectural impossibility.
->
-> **Build constraints:** Ship as an opt-in per-connection toggle on the MLLP outbound; the default MUST remain ACK-waiting (read one ACK, validate MSA-1 in _check_ack) so existing feeds are unchanged. Mirror the existing expect_reply=false semantics: mark the outbox row PROCESSED/delivered on successful TCP write, and document explicitly that delivery is confirmed on write, not on a positive MSA-1 ACK — there is no NAK-driven or timeout-driven retry in this mode. Preserve per-lane send ORDER (pipelining must not reorder within a lane)…
-
 > ✅ **SHIPPED — merged 2026-07-24 (PR #1220); verified against `origin/main` (2026-07-28).** The opt-in per-outbound MLLP toggle is built: `self.no_ack` at `messagefoundry/transports/mllp.py:620` — default `False` = today's ACK-waiting behaviour, byte-identical; when on, `send()` frames, writes, drains and finalizes on the TCP write, reading no ACK (*at-most-once-confirmation*: no NAK-/timeout-driven retry). [ADR 0124](adr/0124-outbound-mllp-fire-and-forward-no-wait-for-ack-delivery-on-write.md) **is on `main`**, with its index row at `docs/adr/README.md:151`. The build constraints above were met, and the interaction with #82 is **guarded, not merely documented**: `messagefoundry/config/wiring.py:3388-3405` raises a `WiringError` at `check`/dry-run time for `no_ack` on a non-MLLP outbound, for `no_ack` + `capture_response`/`reingress_to`, and for `no_ack` + `verify_ack_control_id` (no ACK is read, so there is no MSA-2 to correlate) — pinned by `tests/test_no_ack_wiring.py:47-60`. _(was 🔢 DEMAND-GATE · Value 3/10 · Difficulty 3/10.)_
+
+> 🛠 **Decline overturned (2026-07-09) — historical.** A prioritization pass recommended DECLINE; the stated reason was **invalid**. Purity binds `@router` / `@handler` — **not connectors** (CLAUDE.md §8: “side effects (DB, network) belong in connections/transports”). This was an unfired **demand-gate**, not an architectural impossibility — and it has since been built (see the banner above).
+>
+> **Build constraints (all met by the shipped build):** Ship as an opt-in per-connection toggle on the MLLP outbound; the default MUST remain ACK-waiting (read one ACK, validate MSA-1 in _check_ack) so existing feeds are unchanged. Mirror the existing expect_reply=false semantics: mark the outbox row PROCESSED/delivered on successful TCP write, and document explicitly that delivery is confirmed on write, not on a positive MSA-1 ACK — there is no NAK-driven or timeout-driven retry in this mode. Preserve per-lane send ORDER (pipelining must not reorder within a lane)…
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
