@@ -715,8 +715,11 @@ def _build_record(
 ) -> ConnScaleRecord:
     c = metrics_counters.snapshot()
     base, final = poller.baseline, poller.final
-    # Budget = this step's connection count: at most ~one stranded in-flight per connection is a
-    # plausible teardown artifact; more is a systemic no-ACK fault the reconcile must fail.
+    # Budget = this step's connection count. NOT "~one stranded in-flight per connection" — that
+    # model was retired (this sender's `_inflight` is unbounded, so stranding scales with
+    # rate x ACK-latency): `_reconcile` treats the count only as a small-run FLOOR under its
+    # half-the-run fraction, and its separate intake floor keeps `read >= sent // 2` required here
+    # even when `count` exceeds half the step's sends (the short-hold smoke cells).
     no_loss = _reconcile(c, base, final, unconfirmed_budget=count)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
 
@@ -821,20 +824,38 @@ def _reconcile(
     # a model this sender breaks (`_inflight` is an UNBOUNDED deque; open-loop sends are paced by the
     # offered rate, not an ACK slot), so genuine teardown stranding scales with rate x ACK-latency,
     # not the connection count. Bound it as a FRACTION instead — at most half the run, floored by the
-    # connection count — which keeps `read >= sent // 2` ALWAYS required. See harness/load/report.py's
-    # copy for the full rationale; the three copies are kept in step deliberately.
+    # connection count for tiny runs.
+    #
+    # That cap ALONE does NOT keep `read >= sent // 2` required, though the comment here used to claim
+    # it did: `max()` treats the connection count as a FLOOR, and THIS call site passes the step's
+    # `count` verbatim (_build_record above). A short, low-rate step sends barely more than one
+    # message per connection — connscale-smoke's N=100 cell is ~105 sends against budget
+    # max(100, 52) = 100 — so the count wins the max() and the bound collapses to `read >= 5`. So the
+    # guarantee is enforced SEPARATELY below as an intake floor the excusal cannot lower. See
+    # harness/load/report.py's copy for the full rationale; the three copies are kept in step
+    # deliberately.
     unconfirmed = c.timeouts
     budget = max(unconfirmed_budget, sent // 2)
     over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
+    # The anti-vacuity guarantee, independent of the excusal: at least half the sends must be
+    # observed at intake whatever the budget forgives (nothing clamps `excused` to `sent`, so without
+    # this a `timeouts > sent` run would pass at `read >= 0`). Zero at sent == 0, rounds DOWN on an
+    # odd `sent`, so it is never stricter than the documented bound.
+    floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    ok = read_short <= 0 and deliver_short <= 0 and drained and not over_budget
+    ok = read_short <= 0 and floor_short <= 0 and deliver_short <= 0 and drained and not over_budget
     parts: list[str] = []
     if read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+        )
+    if floor_short > 0:
+        parts.append(
+            f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
+            f"the unconfirmed-send excusal cannot lower this floor"
         )
     if deliver_short > 0:
         parts.append(

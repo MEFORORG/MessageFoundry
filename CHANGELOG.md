@@ -6,6 +6,24 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **The load harness's no-loss reconcile did not enforce the `read >= sent // 2` intake guarantee
+  0.3.2 documented.** The unconfirmed-send excusal is capped at `max(connections, half the run)`, but
+  that `max()` takes the connection count as a *floor*, and every call site passes a connection count
+  — so on a short, low-rate step (connscale-smoke's N=100 cell: ~105 sends, 100 connections) the count
+  won the max() and the intake bound degraded to `read >= 5`, the very vacuity the cap exists to
+  prevent. Nothing clamped the excusal to `sent` either, so `timeouts > sent` degraded it to
+  `read >= 0`. The half-the-run cap still decides the systemic no-ACK verdict (0.3.2's de-flake is
+  unchanged), and an **unconditional intake floor** the excusal cannot lower now enforces
+  `read >= sent // 2` in all three reconcile copies, at every call site. The estate copy also gained
+  the honest-reporting branch its two siblings had: it previously printed `read>=sent, …` on a
+  bounded-excused run whose read was demonstrably below `sent`, and its over-budget detail string now
+  matches theirs — a test pins the three in step, since nothing enforced the claim that they were.
+  *Known gap, unfixed:* the systemic no-ACK verdict is still gated on the same capped budget, so a
+  dead ACK path that nonetheless delivered everything still passes when `connections >= sent`; an
+  intake floor cannot catch a fault whose signature is a high read with no ACKs. Bounding that arm
+  needs its own change.
+
 ## [0.3.2] — 2026-07-28 — Early Access
 
 A patch release for one adopter-facing defect shipped in 0.3.1, plus two gates that were passing
