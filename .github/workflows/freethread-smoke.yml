@@ -7,15 +7,26 @@
 # hence weekly (+ manual dispatch), not on every push/PR.
 #
 # IT MUST NEVER BLOCK A MERGE:
+#   * It runs ONLY on a weekly cron and manual dispatch -- never on `pull_request` or `push` -- so it
+#     produces no PR check at all. That is what actually makes it non-blocking, and it is structural.
 #   * It is a SEPARATE workflow, deliberately not part of ci.yml's `ci-gate` (the required "CI gate"
 #     context). It is not in any `needs:` list a PR waits on.
-#   * The job AND its fragile steps are `continue-on-error: true`, so a red canary is an informational
-#     red check, never a failed required one.
 #   * DO NOT add the "freethread smoke (3.14t)" context to branch-protection required checks. The
 #     required set is the `test` matrix + bandit + pip-audit + cla — keep it that way.
 #
-# If actions/setup-python ever cannot provision 3.14t on the runner, the continue-on-error job simply
-# goes red as information; nothing downstream is gated on it.
+# WHY THIS JOB IS NO LONGER `continue-on-error` (2026-07-28). It used to be, on top of every step
+# already being continue-on-error AND every step after setup being gated on
+# `if: steps.setup.outcome == 'success'`. The combination made the canary INCAPABLE OF REPORTING A
+# PROBLEM: if 3.14t could not be provisioned every later step skipped and the job went green; if the
+# smoke tests failed, continue-on-error swallowed it and the job went green. A canary that never flew
+# was indistinguishable from one that flew clean -- and the header used to claim "a red canary is an
+# informational red check" when no red canary was reachable. Five runs, five successes, and nothing in
+# that record could have told you which.
+#
+# The belt-and-braces bought nothing (the triggers already guarantee no PR is gated) and cost the
+# entire signal. The steps stay continue-on-error so they all run and each outcome is collectable; a
+# terminal verdict step then rules on those outcomes and IS allowed to fail. Green now means the
+# canary flew; red means it either did not fly or found something.
 
 name: freethread smoke
 
@@ -37,9 +48,9 @@ permissions:
 jobs:
   freethread:
     name: freethread smoke (3.14t)
-    # The whole job is non-blocking: a failure here is reported but never fails the workflow's
-    # required-context resolution, so it cannot block a PR even if it is ever (mis)added to protection.
-    continue-on-error: true
+    # NO job-level continue-on-error -- see the header. This job is allowed to go red, because that is
+    # the only way a dead tripwire is distinguishable from a healthy one, and the triggers already
+    # guarantee it cannot block anything.
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -64,6 +75,7 @@ jobs:
       # chain. --prerelease handling: pip resolves the cp314t wheels; the cffi 2.0 chain may need a
       # prerelease allowance depending on the index state at run time.
       - name: Install the core engine (dev extra; no compiled-heavy extras)
+        id: install
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
@@ -74,6 +86,7 @@ jobs:
       # CPython silently RE-ENABLE the GIL, which would make a "green" canary meaningless. Fail (softly)
       # if the GIL is back on.
       - name: Assert the GIL is actually disabled
+        id: gil
         if: steps.setup.outcome == 'success'
         continue-on-error: true
         run: |
@@ -90,6 +103,73 @@ jobs:
       # cheap install-and-import + smoke signal, NOT the perf experiment (that lives in the load harness,
       # run manually — see docs/LOAD-TESTING.md / docs/design/freethread.md §4).
       - name: Smoke a pure test subset under 3.14t
+        id: smoke
         if: steps.setup.outcome == 'success'
         continue-on-error: true
-        run: pytest -q tests/test_parsing.py tests/test_wiring.py
+        run: |
+          # `| tee` would mask pytest's exit code behind tee's, so redirect and re-read instead --
+          # the same pipe-hides-the-status trap this repo has been bitten by more than once.
+          pytest -q tests/test_parsing.py tests/test_wiring.py > smoke.txt 2>&1
+          STATUS=$?
+          cat smoke.txt
+          # Record how many tests actually ran, so the verdict can say what flew rather than just
+          # that nothing errored. A green pytest that collected nothing is the vacuous-pass shape.
+          PASSED="$(grep -oE '[0-9]+ passed' smoke.txt | tail -1 | grep -oE '[0-9]+' || true)"
+          echo "passed=${PASSED:-0}" >> "$GITHUB_OUTPUT"
+          exit $STATUS
+
+      # THE VERDICT. Every step above is continue-on-error so they all run and every outcome is
+      # collectable; this one is NOT, and it is what turns those outcomes into a signal. Without it the
+      # job is structurally incapable of reporting a problem -- see the header.
+      - name: Verdict — did the canary actually fly?
+        if: always()
+        # Outcomes routed through env rather than interpolated into the shell body (zizmor: template
+        # injection). `skipped` is a real value here: every step after setup is gated on it.
+        env:
+          SETUP: ${{ steps.setup.outcome }}
+          INSTALL: ${{ steps.install.outcome }}
+          GIL: ${{ steps.gil.outcome }}
+          SMOKE: ${{ steps.smoke.outcome }}
+          PASSED: ${{ steps.smoke.outputs.passed }}
+        run: |
+          echo "setup=$SETUP install=$INSTALL gil=$GIL smoke=$SMOKE passed=${PASSED:-0}"
+          VERDICT=""
+          if [ "$SETUP" != "success" ]; then
+            # The tripwire is DOWN, which is not the same as clean. A canary that cannot be
+            # provisioned for months is the exact thing this workflow exists to notice early.
+            echo "::error title=Free-threaded canary did not fly::could not provision Python 3.14t (setup outcome=$SETUP). This is a dead tripwire, not a clean run -- fix the provisioning or retire the workflow."
+            VERDICT="did-not-fly"
+          else
+            for pair in "install:$INSTALL" "GIL assertion:$GIL" "smoke tests:$SMOKE"; do
+              NAME="${pair%%:*}"
+              OUT="${pair##*:}"
+              if [ "$OUT" != "success" ]; then
+                echo "::error title=Free-threaded canary regression::$NAME outcome=$OUT under the 3.14t interpreter"
+                VERDICT="regressed"
+              fi
+            done
+            if [ -z "$VERDICT" ] && [ "${PASSED:-0}" -eq 0 ] 2>/dev/null; then
+              # pytest exited 0 having collected nothing -- a vacuous pass.
+              echo "::error title=Free-threaded canary measured nothing::the smoke step succeeded but reported 0 passing tests"
+              VERDICT="vacuous"
+            fi
+          fi
+          {
+            echo "## Free-threaded (3.14t) canary"
+            echo ""
+            echo "| Step | Outcome |"
+            echo "| --- | --- |"
+            echo "| provision 3.14t | $SETUP |"
+            echo "| install core engine | $INSTALL |"
+            echo "| GIL actually disabled | $GIL |"
+            echo "| smoke tests | $SMOKE (${PASSED:-0} passed) |"
+            echo ""
+            if [ -z "$VERDICT" ]; then
+              echo "The canary **flew clean** — ${PASSED:-0} tests passed on the free-threaded build."
+            else
+              echo "**Verdict: \`$VERDICT\`.** Green here would have been indistinguishable from a"
+              echo "healthy run, which is why this job is allowed to fail. It blocks nothing: this"
+              echo "workflow never runs on a pull request."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          [ -z "$VERDICT" ]
