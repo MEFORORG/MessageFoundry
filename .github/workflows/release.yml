@@ -228,9 +228,10 @@ jobs:
       #   gh attestation verify dist/<artifact> --repo MEFORORG/MessageFoundry
       # GATED to PUBLIC repos: the GitHub attestation API (actions/attest-build-provenance) is "not
       # available for user-owned private repositories" and FAILS there, aborting the job BEFORE the PyPI
-      # publish below. While this repo is private the step is SKIPPED (skip != fail, so the release
-      # proceeds); provenance is still covered by the Sigstore bundle (above) and the PyPI-side PEP 740
-      # attestations (publish step below). Auto-resumes if a release ever runs from the public mirror.
+      # publish below. THIS repo is public since the cutover, so the step now RUNS and every release
+      # carries SLSA provenance. The gate remains for a private fork, where it SKIPS rather than fails
+      # (skip != fail, so the release proceeds) and provenance is still covered by the Sigstore bundle
+      # above plus the PyPI-side PEP 740 attestations from the publish step.
       # `github.event.repository.private` is populated on the tag-push event.
       - name: Attest build provenance (SLSA) for sdist + wheel
         if: ${{ !github.event.repository.private }}

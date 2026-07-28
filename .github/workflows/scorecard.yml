@@ -5,12 +5,14 @@ name: Scorecard
 # repo already does (SHA-pinned Actions, least-privilege tokens) and catches regressions, and yields a
 # public OpenSSF badge.
 #
-# WHY GUARDED TO THE MIRROR: like CodeQL, Scorecard uploads SARIF to GitHub code scanning (paid GHAS on
-# a private repo) and `publish_results: true` requires a PUBLIC repo. So this is gated to the public
-# mirror MEFORORG/MessageFoundry — a skipped no-op on the private source repo, free on the mirror after
-# publish.ps1 mirrors this file. NOTE: the Branch-Protection check then reflects the MIRROR's settings,
-# not the private repo's; the workflow-hardening checks (Pinned-Dependencies / Dangerous-Workflow /
-# Token-Permissions) assess the shared source and are the signal that transfers.
+# WHY GUARDED TO THE REPO SLUG: like CodeQL, Scorecard uploads SARIF to GitHub code scanning (paid GHAS
+# on a private repo) and `publish_results: true` requires a PUBLIC repo. THIS repo is public, so both
+# are free here; the slug gate keeps it a skipped no-op anywhere else — a fork, or the retired private
+# archive. Every check now assesses this repo directly, including Branch-Protection.
+#
+# (Pre-cutover MEFORORG was the published mirror, so the Branch-Protection score reflected the MIRROR's
+# settings rather than the private source's, and this file only ran once publish.ps1 copied it across.
+# Both caveats are obsolete: there is one repo, and the publish machinery was deleted.)
 #
 # PINNING CAVEAT: actions/checkout + actions/upload-artifact reuse this repo's existing SHA pins; the
 # ossf/scorecard-action and github/codeql-action/upload-sarif steps are on version tags pending a
@@ -28,7 +30,7 @@ permissions: read-all
 jobs:
   analysis:
     name: Scorecard analysis
-    # ONLY on the public mirror (free code scanning + public badge); skipped no-op on the private repo.
+    # ONLY on this repo — public, so code scanning and the badge are free; skipped no-op on a fork.
     if: github.repository == 'MEFORORG/MessageFoundry'
     runs-on: ubuntu-latest
     permissions:
