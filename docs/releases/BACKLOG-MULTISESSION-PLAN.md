@@ -994,3 +994,65 @@ DO NOT PUSH. No Co-Authored-By trailer. Never --no-verify. Stage explicit paths 
 8. **`enforce_admins: false` + `strict: false` means the merge order in §6 is entirely self-imposed.** Nothing serializes it, and the only guard against a direct push to `main` is a per-clone `pre-push` hook that fails open with no python on PATH.
 
 9. **This plan produces roughly one day of parallel work and one to two days of serial work, then stops.** Everything beyond it is gated on the seven decisions in §5. If none of them is answered, the next wave has nothing schedulable in it.
+
+---
+
+# Wave 0 — EXECUTED 2026-07-28
+
+Owner pre-flight is complete. This section is the decision record; where it contradicts §5 above,
+**this section wins** (§5 states the questions, this states the answers).
+
+## Repo hygiene — DONE
+
+* **16 merged branches deleted** from `MEFORORG/MessageFoundry`. Every one was confirmed `MERGED`
+  through the PR API before deletion, not inferred from commit counts. Remote went **19 → 3 refs**.
+* **Retained deliberately:** `main`; `cla-signatures` (excluded by §4); and **`claude/diffcov-probe`**,
+  which was *not* in §4's list — it carries **open PR #28**, titled *"TEMPORARY diff-coverage probe —
+  do not merge"*. Any future cleanup must keep excluding it while that PR is open.
+* **`delete_branch_on_merge = true`** is now set on the repo, so merged head branches are removed
+  automatically and the 16 cannot re-accumulate.
+* **Local refs were left alone.** Twelve locals are stale, but `blplan` carries this plan's only copy
+  (unpushed) and several others are checked out in live worktrees. Local cleanup is
+  `scripts\worktree\prune-merged.ps1`, not a ref delete — it is *not* done and is not urgent.
+
+## §5.4 posture — BOTH FLIPS APPROVED (build required)
+
+| Setting | From | To | Note |
+|---|---|---|---|
+| `[store].aad_bind` (`config/settings.py:373`) | `False` | **on** | Crypto + ~307 backend sites already merged; v1 stays byte-identical and dual-read, so the flip is reversible. Takes ASVS 11.3.3 from Pass(B) to Pass. |
+| `[auth].ad_session_recheck_seconds` (`config/settings.py:1777`) | `0` (reconciler never runs) | **set** | `docs/SECURITY.md:1321` recommends 300 off-loopback. |
+
+⚠️ **These are approvals, not completed work.** They are code+test+doc changes and therefore a
+**separate lane** — provisionally `posture` — which must **not** be folded into lane 1A. 1A owns
+`docs/BACKLOG.md` exclusively and is docs-only by design; a settings diff inside it would break that
+guarantee and trip the code-vs-docs CI classification. The `posture` lane is **not yet scheduled**.
+Open sub-question the lane must answer, not assume: the exact value for `ad_session_recheck_seconds`
+(SECURITY.md recommends 300; the related ADR 0079 narrowing gives a disabled account up to
+`step_up_max_age_seconds` = 300 s of retained privilege, so the two interact).
+
+## §5.1 / §5.4 ledger calls — owner delegated to the coordinator
+
+* **#185 — CLOSE as superseded.** *Authorised.* It is an index-only umbrella owning no findings and
+  shipping nothing runnable; all 20 children are resolved and ADR 0115 re-partitioned the programme
+  into #242–#246. **Required wording:** superseded by the re-partition — explicitly **not** "ASVS is
+  done", because the programme continued past this baseline and `docs/security/` is gitignored
+  post-cutover. This **overrides** §7.1's "LEAVE ALONE ENTIRELY" and its stop-and-ask on #185.
+* **#214 — DO NOT expose `transform_concurrency`.** *Declined.* The lever is triply dark (needs
+  `claim_mode="per_lane"` **and** `[store].fifo_claim_batch > 1` **and** not the SQL Server fused
+  path), its benefit is unmeasured, and it was withheld as owner-coordinated pending a measured need.
+  Public surface for no demonstrated benefit is the wrong trade. §5.1's amend-only treatment stands:
+  #214 stays `🚧` with its residuals named. **Wave 3's `xform` lane is cancelled, not deferred.**
+
+## Wave 1 scope — 1A ONLY
+
+Lane **1A `ledger`** is authorised to start. Lanes **1B `bench`** and **1C `wtree`** are **not**
+started. 1C's absence leaves the session-relocation data-loss mode live — a session must still be
+*started* in its worktree, never relocated into one.
+
+## Already done by the coordinator — do NOT repeat
+
+The five **AI memory corrections** listed at the end of §7.1 are **complete** (entry count unchanged
+at 54; `mf-backlog-baseline-against-origin` was rewritten around the alloc trap rather than a new
+entry being added). Lane 1A must **skip** that step. Each was verified against `origin/main` first:
+the no-loss budget formula in all three copies, `cell_aad` counts per backend, the 32 open alerts,
+and the #97/#117 symbols.
