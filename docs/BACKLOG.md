@@ -3566,7 +3566,7 @@ is gated on the auto-start follow-up, else the nightly silently no-ops.
 
 ## 87. Competitive intelligence — study the closest code-first scripted commercial engine (non-code, recon)
 
-> 🔢 **Re-scored 2026-07-10 → P3.** Value **1/10** · Difficulty **1/10** · _fill-in_. Competitive recon that ships nothing and blocks nobody; a no-code research task the owner picks up during a positioning pass. _(was P3 · V2/5 · D1/5)_
+> ⛔ **DECLINED — owner ruling 2026-07-24** (*"close 87"*). A non-code recon task that ships nothing runnable and blocks nobody (its own score was Value 1 / Difficulty 1). Competitive positioning is owner work picked up when the owner wants it, not a tracked engineering item — carrying it on the ledger only implies unfunded scope. _(was 🔢 P3 · Value 1/10 · Difficulty 1/10.)_
 
 **Type:** competitive intelligence / strategy. **No code.** A research/learning task, not a feature.
 
@@ -3699,7 +3699,9 @@ gap) — it does **not** move the store fsync ceiling. Complementary to ADR 0037
 
 ## 91. GIL-on-vs-FT A/B harness on a real hot feed — free-threading final commit gate (P2)
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **6/10** · Difficulty **5/10** · _quick win_. Sole final commit gate deciding free-threading and whether #90 reopens; ADR 0053 records only a paper NO-GO awaiting this real-feed A/B. **Reopened** — the prior ⛔ decline misquoted ADR 0053, which records only a *paper* NO-GO and names this the unchecked final-commit gate. _(was unset · unscored)_
+> ⛔ **DECLINED 2026-07-20 — on four unavailable rig inputs, and on a premise measurement has since removed.** The 2026-07-10 re-score reopened this because the earlier decline misquoted ADR 0053; that correction was right at the time, but the A/B is no longer decisive.
+>
+> **Why it cannot pay off at the current wall.** Free-threading buys parallel CPU across cores, and the engine is **not** CPU-bound: per-shard engine CPU measures **~0.06–0.36 cores** (`docs/benchmarks/PLAN-ENGINE-ATTRIBUTION.md:81`). There is no engine-CPU saturation for FT to relieve. [ADR 0053](adr/0053-free-threaded-multicore-engine.md) itself gates on exactly that condition — **NO-GO unless a real feed's transform CPU is far higher** (`:33`: *">~23 % for +25 %, ~57 % for 2×"*) — and the related fusion lever already returned **NO-GO** at +6.5/+9.3/+10.0 % against a ≥10 % bar ([ADR 0071](adr/0071-cut-executor-round-trips-b5.md)`:3`). The wall is store-side and transaction-shaped ([ADR 0098](adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md), [ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)), which a GIL-vs-FT A/B does not address. **Re-open only if a real feed shows transform CPU near ADR 0053's stated threshold** — that is the trigger, not a general interest in free-threading. _(was 🔢 P2 · Value 6/10 · Difficulty 5/10.)_
 
 **Type:** measurement / gate. The GO/NO-GO confirmation for ADR 0053's scoped throughput claim **before**
 building #90.
@@ -5471,9 +5473,9 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 157. Direct Project / HIE secure-messaging connector
 
-> 🔢 **Re-scored 2026-07-10 → P3.** Value **3/10** · Difficulty **7/10** · _money pit_. Direct/HIE breadth with zero live feed and declining relevance; a multi-component S/MIME + HISP + XDR subsystem needing new deps and an ADR. _(was DEMAND-GATE · V3/5 · D5/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ⛔ **DECLINED — owner ruling 2026-07-24** (*"if it is Direct, then close it"*). Zero live feed, declining relevance, and the remainder is a multi-component HISP + XDR subsystem needing new dependencies and its own ADR — not breadth worth carrying.
+>
+> ⚠️ **This decline is NOT a removal instruction. Do NOT delete `messagefoundry/transports/direct.py`; the outbound S/MIME half ships and stays.** That module is a working Direct-Project **S/MIME-over-SMTP destination** ([ADR 0085](adr/0085-direct-hisp-smime-connector.md), PR1, outbound only — it signs/encrypts the clinical payload as an S/MIME message independent of transport TLS and submits it over STARTTLS SMTP off the event loop; `messagefoundry/transports/direct.py:3-15`). What is declined is the *rest* of the connector — the inbound half, HISP integration and XDR. Reading this ⛔ as "rip out Direct" would delete shipped, working code. _(was 🔢 P3 · Value 3/10 · Difficulty 7/10.)_
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** **owner go/no-go**. **Severity (vs Corepoint):** minor.
 
@@ -6417,7 +6419,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 210. Remove the tempdb table variables from the pooled claim query
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **7/10** · _big bet_. Verified: pooled default's claim_fifo_heads declares 4 tempdb table vars; rewriting them attacks the measured shipped-default outbound wall. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ⛔ **DECLINED — withdrawn, owner-ratified 2026-07-17.** `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md` §Phase 1 (`:652`) says it plainly at `:675` — **"Do not build it."** — and the tempdb rewrite is struck through as **WITHDRAWN** at `:1760`. ⚠️ **Critically, the four table variables are PRESERVED ON PURPOSE — do not "clean them up".** [ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) redesigned this exact claim path and **deliberately kept** the `@heads` / `@locked` / `@keep` / `@claimed` declarations in the shared probe-then-claim body (`messagefoundry/store/sqlserver.py:702-717`, `_fifo_heads_steps`, implementing ADR 0066 §3.2 with the #285 inversion fix). They are load-bearing for strict per-lane FIFO, not incidental scaffolding. Removing them is a **rejected** design, not an unfinished one. _(was 🔢 P2 · Value 7/10 · Difficulty 7/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -6543,7 +6545,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 217. Group-commit / durable-write — sequenced AFTER the claim path
 
-> 🔢 **Re-scored 2026-07-10 → P3.** Value **4/10** · Difficulty **7/10** · _money pit_. Partly built (SQLite committer); ADR 0069 measures server group-commit at ~0 payoff, so real value is only a modest carriage-byte trim. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ⛔ **DECLINED — dead by measurement, three times over.** [ADR 0069](adr/0069-durable-write-throughput-lever.md) found the server-side commit tier only ~9% utilised, so there is nothing for group-commit to amortize. [ADR 0099](adr/0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md) (**Accepted 2026-07-12**) then formally **withdrew** the group-commit build it had been gating. [ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (**Accepted 2026-07-13**) closes Phase 4 entirely — its status line reads *"closes options; authorizes no build. **Do not build F2 or F3.**"* (`:3`) — and terminates the adjacent inline fast-path, stamping [ADR 0057](adr/0057-inline-step-a-fast-path.md) **⛔ DO NOT PROMOTE** (`0107:7`, `0057:3`). Transaction reduction is a **measured dead end**: the residual carriage-byte trim does not justify the seam. Do not re-open on a modelled or analytical argument — only new *measurement* contradicting ADR 0107 would. _(was 🔢 P3 · Value 4/10 · Difficulty 7/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -6831,7 +6833,7 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 ## 231. Steps view: decorative collapsible block grouping (Corepoint Block analog)
 
-> 🔢 **Filed 2026-07-12.** Deferred design question spun out of the ADR 0106 Steps-view authoring-palette work; to be value/difficulty-scored at the next backlog pass.
+> ⛔ **DECLINED 2026-07-20 — against the #26 guardrail.** ⚠️ **This banner previously read *"🔢 Filed"*, which made it a live double-build trap: the ruling had been made, but the published file still invited the work.** A decorative, collapsible, labeled grouping whose only purpose is to organize the Steps view is **visual/template-driven authoring** — the thing [#26](#26-visual--template-driven-channel-authoring--decision-decline-by-design-no-build) declines by design and CLAUDE.md §12 restates. The #26 amendment's carve-out is deliberately narrower than this: it permits a **structured Steps view over real Python Handlers via a typed action vocabulary** ([#222](#222-structured-action-list-lens-over-real-python-handlers--typed-action-vocabulary--custom-editor-adr-0076), shipped), where every row projects code that already exists. A Block row would project **nothing executable** — it is chrome authored in the canvas, which is exactly the line #26 draws. The open question below is therefore **answered: out of scope.** Organize long handlers with the existing control-flow rows and ordinary comments. _(was 🔢 Filed 2026-07-12.)_
 
 **Cluster:** IDE & Authoring. **Priority:** P3 (nice-to-have). **Verdict:** defer / revisit after the palette ships. **Severity:** none (cosmetic/organizational only).
 
