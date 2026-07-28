@@ -192,7 +192,21 @@ _RECORDED_SPREADSHEET_WRITERS = {
 #: spreadsheet writer for this gate's purposes even though it constructs no ``csv`` writer.
 _SPREADSHEET_LIBS = frozenset({"openpyxl", "xlsxwriter", "xlwt", "odf", "odfpy", "pyexcel"})
 
-_SKIP_DIRS = {".venv", ".git", "node_modules", "__pycache__", ".mypy_cache", ".pytest_cache"}
+#: `.claude` matters and is not cosmetic: the documented parallel-session workflow (docs/WORKTREES.md)
+#: places sibling worktrees at `.claude/worktrees/<name>/`, i.e. NESTED INSIDE this checkout. This gate
+#: walks `_REPO.rglob("*.py")`, so with a sibling session active it scanned a SECOND FULL COPY of the
+#: repo — 5,712 extra .py files, at a DIFFERENT COMMIT — and failed on writers registered over there.
+#: CI never sees this (no nested worktrees), so it reds only the local run, which is where people
+#: iterate; the natural response is to learn to ignore this test, and then it guards nothing.
+_SKIP_DIRS = {
+    ".venv",
+    ".git",
+    ".claude",
+    "node_modules",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+}
 
 
 def _spreadsheet_writer_sites_in(source: str) -> bool:
@@ -454,3 +468,37 @@ def test_xlsx_write_back_survives_a_control_character_detail(tmp_path: Path) -> 
     cell = openpyxl.load_workbook(xlsx).active.cell(row=2, column=3)
     assert cell.data_type == "s"
     assert "\x00" not in str(cell.value)
+
+
+def test_repo_root_scans_exclude_nested_worktrees() -> None:
+    """Any gate that walks from the REPO ROOT must skip `.claude/`, or it scans a second checkout.
+
+    docs/WORKTREES.md puts sibling worktrees at `.claude/worktrees/<name>/` — inside this tree. A
+    repo-root `rglob` therefore sees another session's entire working copy, at a different commit.
+    Both directions are wrong: it can fail on a file this checkout does not contain (which is how this
+    was found — 5,712 stray .py files), and a gate that searches for a REQUIRED registration could find
+    it over there and pass while this checkout lacks it. The second is the dangerous one, and it is
+    invisible in CI because CI has no nested worktrees.
+
+    Scoped deliberately to repo-root walkers. Narrow roots (`messagefoundry/`, `samples/messages/`)
+    cannot reach `.claude/` and are left alone rather than blanket-patched. A first pass at sizing this
+    counted 13 files "using rglob"; only ONE walks from the repo root, which is the question that
+    matters.
+
+    SCOPE OF THE TWO ASSERTIONS, stated because they differ. The `_SKIP_DIRS` membership check is the
+    always-on guard and is what mutation-testing confirms. The `leaked` check below only has teeth in a
+    tree that actually HAS a nested worktree — in a sibling worktree (or in CI) there is nothing under
+    `.claude/` to find, so it passes trivially. That is acceptable for a belt-and-braces assertion, but
+    it is not evidence on its own, and it should not be read as one.
+    """
+    assert ".claude" in _SKIP_DIRS, (
+        "a repo-root scan that does not skip .claude/ will walk a sibling worktree's full checkout"
+    )
+    # And prove the exclusion actually bites: no scanned path may sit under .claude/.
+    scanned = [p for p in _REPO.rglob("*.py") if not _SKIP_DIRS & set(p.parts)]
+    leaked = [str(p.relative_to(_REPO)) for p in scanned if ".claude" in p.parts]
+    assert not leaked, f"nested-worktree files reached the scan: {leaked[:5]}"
+    # Non-vacuity: the scan must actually be finding this repo's own files.
+    assert len(scanned) > 500, (
+        f"only {len(scanned)} files scanned — the walk collapsed, so a pass proves nothing"
+    )
