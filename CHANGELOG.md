@@ -6,7 +6,7 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
-## [0.3.2] — 2026-07-27 — Early Access
+## [0.3.2] — 2026-07-28 — Early Access
 
 A patch release for one adopter-facing defect shipped in 0.3.1, plus two gates that were passing
 without being able to fail.
