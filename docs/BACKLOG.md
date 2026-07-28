@@ -6385,7 +6385,9 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 208. Fix the per-PID engine CPU collector (attribution is blind without it)
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Restores the per-PID CPU collector that fabricated a constant 0.00; no engine CPU verdict is admissible until it reads true, gating the decisive shard probes. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **CLOSED — shipped 2026-07-20. The in-repo work is done; the residual is OFF-REPO and no in-repo change can close it.** The blocking premise — *"no engine CPU verdict is admissible until it reads true"* — is discharged: an admissible **aggregate** engine-CPU verdict already exists and exonerates the engine, bounding it at **≤ 0.36 cores per shard** (`docs/benchmarks/PLAN-ENGINE-ATTRIBUTION.md:81`, `:280`, which recommends closing this item as superseded and cites the `py_all_cpu%` bound). Per-PID attribution would refine a number already known to be small, so it was **killed as a soak slot**; two things survived and were folded in — the engine exoneration itself, and `store_service_ms = claim_mean_ms − acquire_wait_mean_ms`, the first split of a store round-trip into engine-side pool queueing vs real store service (carried with its own caveat: `acquire_wait` is one global histogram across ~68 call sites, so that subtraction is an estimate, not an identity).
+>
+> ⚠️ **Deliberately published without a sizing figure.** Any residual here is **off-repo measurement**; this ledger states no implementation estimate for it, because a prior sizing claim was refuted and repeating one would re-invite the build. **Related but separate:** [#220](#220-cpu-delta-is-differenced-across-a-subtree-that-can-change-between-ticks) — the harness-side same-PID-set CPU differencing — is a distinct item and is shipped. _(was 🔢 P2 · Value 7/10 · Difficulty 6/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** build. **Severity:** high.
 
@@ -6431,7 +6433,9 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 211. Claim-mode lane-count sweep (16 → 1,500 lanes) — NOT a default flip
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Lane-count sweep that finds the pooled/per_lane crossover, preventing a data-loss default flip at the real 1,500-conn scale and gating #210. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **CLOSED — owner-ratified 2026-07-17, as CHARACTERIZATION-ONLY.** The claim-mode A/B was run and its findings are published: `per_lane` sustains ≥ 28 ingress/s at 16 lanes over a 540 s soak, and its per-delivered-row claim cost is **~4.5× cheaper** than pooled (5.6 ms vs 25.03 ms) — `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:256`, `:259` — **but at 1,500 lanes `per_lane` degenerates into a claim storm** (~18k empty `UPDLOCK` claims/s saturating the store at *zero messages*, 92% CPU, `LCK_M_U` convoy 40–70 ms) and **drops messages at high fan-out** (`:664`). §8 stays unflipped and `per_lane` stays off (`:302`, `:654`).
+>
+> ⚠️ **Two things this closure is explicitly NOT.** It is **not a licence to flip the `claim_mode` default** — the measured 1,500-lane behaviour is the reason the default stands, and the document warns in terms against exactly that flip (`:654`). And it is **not a rig ask**: no further sweep is funded or scheduled. Characterization was the deliverable; it is delivered. _(was 🔢 P2 · Value 7/10 · Difficulty 6/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** measure. **Severity:** high.
 
@@ -6447,7 +6451,7 @@ Note the honest framing: an accepted risk is still an unmet requirement. These f
 
 ## 212. fifo_claim_batch: decide the shipped default (verification DONE — it is NOT a no-op)
 
-> 🔢 **Re-scored 2026-07-11 → P2.** Value **6/10** · Difficulty **2/10** · _quick win_. The verification half is **done**; what remains is the default decision. _(was 5/2 _fill-in_ on an incorrect premise — see below; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **CLOSED — owner-ratified 2026-07-17. DECIDED: `fifo_claim_batch` SHIPS OFF.** This item asked for exactly one thing — the default decision — and it has been made. **The shipped code already matches the decision:** `fifo_claim_batch: int = Field(default=1, ge=1, …)` at `messagefoundry/config/settings.py:295`, where `1` is documented as OFF and byte-identical to the single `TOP(1)`/`LIMIT 1` claim (the batch method is never invoked); `> 1` stays available as opt-in throughput tuning. **No code change is required to close this.** The rationale is measured, not assumed: the lever prices out at an **upper bound of ~+4.7%** (`docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:749`, `:1930`) against the pre-registered **+8% PROCEED bar** ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)`:62`), and the published row already marks it *"ships OFF"* (`THROUGHPUT-STATUS §Phase 3(2)`, `:549`). **Revisit only on a latency or store-load rationale — not a throughput one**, which is settled. _(was 🔢 P2 · Value 6/10 · Difficulty 2/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P2. **Verdict:** build (decide the default). **Severity:** medium.
 
@@ -6505,7 +6509,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 215. Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **6/10** · _big bet_. The decisive unmeasured experiment: does per-shard throughput stay flat as N grows on one unified store; it gates every lever's value. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **CLOSED — the curve was measured and Phase 5 is DONE (C1 → C2 → C3, then C5, 2026-07-10/12).** The banner's *"decisive **unmeasured** experiment"* framing no longer holds: `docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:942` records *"Phase 5 is **done**; the answer is DECLINING"*, and the per-shard ceiling at N=8 is pinned at **`R ∈ [2, 3)`** (`:34`, `:118`, `:274`) — 2/shard passes at 100%, 3/shard collapses, reproduced 3×. Since `R < 3 < 3.62/shard`, **N-sizing alone cannot reach the target rate**, which cleared the remaining rungs *by inequality* rather than by running them. Artifacts are in-repo under `docs/benchmarks/results/2026-07-12-throughput-c4-c7/`. ⚠️ **The `m7i.8xlarge` upsize this item still asks for was RETIRED** — the same document's rig table states it outright at `:1719`: *"Phase 5 is closed (DECLINING; `R ∈ [2, 3)`) — no further shard-curve runs are planned, so the m7i.8xlarge N=16 upsize is NOT needed."* Do not fund it. _(was 🔢 P2 · Value 7/10 · Difficulty 6/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** measure. **Severity:** high.
 
@@ -6555,7 +6559,7 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 218. 2-point shard probe (N=1 vs N=4) — the cheap early killer
 
-> 🔢 **Re-scored 2026-07-10 → P2.** Value **7/10** · Difficulty **6/10** · _big bet_. Cheapest experiment that could kill the shard-scaling thesis; the N=1 vs N=4 per-shard curve gates the full sweep and every lever. _(was P1 · unscored; filed by the 2026-07-10 throughput audit, PR #860)_
+> ✅ **CLOSED — the experiment RAN and answered (C1, 2026-07-10).** This is a *measurement* item, and the measurement is published: whole-fleet peak **11.33 → 15.42 ingress/s = 1.36× for 4× shards** (N=1 → N=4) — per-shard capacity **DECLINES** with N (`docs/benchmarks/THROUGHPUT-STATUS-2026-07-10.md:265`, expanded at `:878-881` where `claim_mean` rises 12.6 → 48.8 ms tracking the penalty). Direction is firm; the magnitudes are explicitly soft (both 900 s soaks collapsed, so climb-peak overstates — the doc says so at `:265`, and that caveat travels with the number). **Re-running it would re-derive a published verdict.** *(The two run artifacts named in that row, `c1-arm-a-n1.json` / `c1-arm-b-n4.json`, are held off-repo — they are not under `docs/benchmarks/results/` on `origin/main`.)* _(was 🔢 P2 · Value 7/10 · Difficulty 6/10.)_
 
 **Cluster:** Throughput & Scale. **Priority:** P1. **Verdict:** measure. **Severity:** high.
 
