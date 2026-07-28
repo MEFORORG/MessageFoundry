@@ -2522,7 +2522,7 @@ loop; relationship to the #16 Corepoint event-log gap analysis (2026-06-17) + AD
 
 ## 48. IDE "Insert Element" — grow the scaffold-snippet library + a most-used-idiom quick-pick (P2)
 
-> 🔢 **Re-scored 2026-07-10 → P3.** Value **4/10** · Difficulty **2/10** · _fill-in_. Base (#595) + L1 (#794) shipped: 36 idiom snippets, category quick-pick, keybinding, editor-title menu, CodeLens, router/handler filter — done. _(was P3 · V2/5 · D2/5)_
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** Base (#595) **and** the L1 expansion (#794) are both on `main`, so the 🔶 "EXPANDING" note below is historical: `ide/snippets/messagefoundry.code-snippets` holds **36** body-level idiom snippets (past the ~30 L1 target), and `ide/src/insertElement.ts` provides the category quick-pick (`buildPicks`, `:42`) plus the `@router`/`@handler` cursor-context filter (`detectContext`, `:69`, applied at `:114`) that reads the *same* snippets file — one source of truth. Stays inside CLAUDE.md §12 / #26: the snippets emit **editable Python**, never a declarative surface. _(was 🔢 P3 · Value 4/10 · Difficulty 2/10.)_
 
 > 🔶 **Base shipped (PR #595 — ~14 idioms + the `messagefoundry.insertElement` quick-pick); EXPANDING under [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md) L1.** L1 adds ~16 more editable-Python idioms (→ ~30: string format, `re.sub`, `match/case`, fan-out, `fhir_lookup`, non-HL7 body access, router idioms), surfaces *Insert Element…* in the editor-title dropdown + a keybinding + a discoverability CodeLens, and adds an `@router`/`@handler` cursor-context filter. Deterministic sibling for the AI `/transform` — see [`docs/AI-OFF-MATRIX.md`](AI-OFF-MATRIX.md). Stays inside #26 (emits editable Python, never a declarative surface).
 
@@ -4679,9 +4679,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 118. Test the alert mail server (send test email / SMTP verification)
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **2/10** · _quick win_. Only awkward workaround is provoking a real alert to test SMTP; small additive test-send endpoint reuses the built email sink. _(was P2 · V3/5 · D2/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28)** (commit `37613ef0`, PR #1200). The additive test-send endpoint is built exactly as scoped: `POST /alerts/test-email` (`messagefoundry/api/app.py:2427`) performs a live SMTP send of a synthetic, **PHI-free** message reusing the built email sink, with the connector `SecretProvider` exposed to it so a configured credential resolves (`:5453`). Its request/result models carry this item's number in their own docstrings (`messagefoundry/api/models.py:1063`, `:1072`); an empty body tests the configured server as-is. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 2/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5213,9 +5211,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 143. Alert suspend / mute (windowed)
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **4/10** · _quick win_. Real gap in alert-storm control; the only workaround is a static per-rule config edit plus engine reload — awkward but real. _(was P3 · V3/5 · D3/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0044](adr/0044-operator-alert-state.md) amendment. The windowed mute is built as a deliberately **notification-only** gate (`messagefoundry/pipeline/alert_sinks.py:842`, cache at `:598`) — a suspended alert stays open, counted and visible, so muting never hides a live condition. Driven by `POST /alerts/{alert_id}/suspend` (`messagefoundry/api/app.py:2372`, returning the updated `AlertInstanceInfo`; surfaced at `:2300`), with the window persisted **durably** as `suspended_until` on all three store backends (`messagefoundry/store/store.py:603`, column `:1444`, migrated at `:3038`; plus `store/postgres.py` and `store/sqlserver.py`) — so it survives a restart rather than living in the notifier's memory. _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 4/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -5231,9 +5227,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 144. Alert-triggered connection-control action
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **3/10** · _quick win_. Auto-remediation of a stopped/backed-up connection; the manual restart API works but keeps a human in the loop each time; additive on the alert+control seams. _(was P2 · V3/5 · D3/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0128](adr/0128-alert-rule-connection-control-action-auto-stop-restart-on-fire.md). An alert rule may now carry a control action from a closed, validated vocabulary — `_ALERT_CONTROL_ACTIONS = frozenset({"restart_inbound", "restart_outbound"})` (`messagefoundry/config/settings.py:2472`, rejected at `:2666` if the rule names anything else) — dispatched **off-worker and never-raising**, and deliberately **before** the transport-suppression return, so a rule can auto-remediate *quietly* (`transports=[]`) or alongside a page (`messagefoundry/pipeline/alert_sinks.py:945-947`). ⚠️ **The banner's *"notify-only"* characterisation is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -5251,9 +5245,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## 145. HA / DR failover event alert
 
-> 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **3/10** · _quick win_. Real failover blind spot; only workaround is external status-polling to catch the transition edge — awkward, not clean → 6. _(was P1 · V3/5 · D2/5)_
-
-> **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).** [ADR 0014](adr/0014-alerting-rules-engine.md) amendment. Both transition edges are first-class alert events, not log lines: `leadership_acquired` / `leadership_lost` (`messagefoundry/pipeline/alert_sinks.py:800`, with `leadership_lost` registered as the **auto-resolving inverse** of `leadership_acquired` at `:101-103`, so a step-down/clean-release/self-fence closes the open alert instead of leaving it stuck), and `dr_activated` / `dr_released` emitted by the `DrCoordinator` (`messagefoundry/pipeline/alerts.py:215`, `:223` — the fail-back auto-resolves and deliberately pages nobody). Payloads carry node / role / epoch only: cluster-topology facts, **no PHI**. ⚠️ **The banner's *"only log at INFO"* premise is FALSE against `origin/main` and is retracted here.** _(was 🔢 DEMAND-GATE · Value 6/10 · Difficulty 3/10.)_
 
 **Cluster:** Alerting. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** moderate.
 
@@ -6613,11 +6605,15 @@ The code read is done (`pipeline/stage_dispatcher.py:797-800`, `pipeline/wiring_
 
 ## 221. IDE native-surface polish — walkthrough, registered custom editors, status bar, TOML association (DX)
 
-> 🔢 **Open — Value 4/10 · Difficulty 2/10 · _fill-in_ (P3 by the ranked-table formula; scheduled anyway
-> as MULTISESSION-PLAN-8 Wave 1 — it is the cheap half of the Marketplace-publish gate).** Landed after
-> the 2026-07-10 re-score, like #206–#220 — awaiting the next scoring pass. DX / IDE. Verdict: build.
-> Filed by the 2026-07-10 IDE low-code deep-research
-> ([`docs/research/ide-low-code-options.md`](research/ide-low-code-options.md)).
+> ✅ **SHIPPED — verified against `origin/main` (2026-07-28).**
+> [ADR 0100](adr/0100-ide-native-surface-polish-and-open-to-messagefoundry-startup-experience-backlog-221.md)
+> is **Accepted (2026-07-12)**, names this item in its own filename and title, and every surface it
+> claims exists in `ide/`: **3** registered `customEditors` (`ide/package.json:527`) with
+> Reopen-With-Text; a **9**-step Get-Started walkthrough; the engine-target + `MEFOR Live` status-bar
+> items (`ide/src/statusBar.ts`); the keyboard-first QuickInput connection wizard
+> (`ide/src/multiStepInput.ts`, whose header cites "#221e" at `:5`); and the TOML language
+> association. This is IDE **chrome** around the code-first model — #26 untouched.
+> _(was 🔢 Open · Value 4/10 · Difficulty 2/10 · _fill-in_.)_
 
 **Type:** developer-experience feature — small, high-visibility wiring of sanctioned VS Code surfaces the
 extension doesn't use yet, plus one extension of a shipped one. No engine change.
@@ -6643,13 +6639,20 @@ the Marketplace-publish gate (the publish do-next explicitly waits on "planned I
 
 ## 222. Structured action-list lens over real Python Handlers — typed action vocabulary + custom editor (ADR 0076)
 
-> 🔢 **Open — Value 6/10 · Difficulty 6/10 overall · _big bet_ (phase 1 alone: 6/2, a _quick win_ —
-> P1 by the ranked-table formula; whole item P2).** Landed after the 2026-07-10 re-score, like
-> #206–#220 — awaiting the next scoring pass. DX / IDE + engine surface. Verdict: build phased
-> (MULTISESSION-PLAN-8 Waves 1–2). Filed by the 2026-07-10 IDE low-code deep-research
-> ([`docs/research/ide-low-code-options.md`](research/ide-low-code-options.md)). Requires the **#26
-> amendment** (same PR) ratified; **ADR 0076** (same PR, Accepted 2026-07-10) gates phases 2–3 — phase 1
-> requires only the amendment merge, though PLAN-8 bundles it with phase 2a after Acceptance.
+> ✅ **SHIPPED — all three phases, verified against `origin/main` (2026-07-28).** The typed action
+> vocabulary is `messagefoundry/actions.py` (**15** verbs: `set_field`, `copy_field`, `copy_segment`,
+> `delete_segment`, `code_lookup`, `format_date`, `date_diff_field`, `arith_field`, `split_field`,
+> `substring_field`, `pad_field`, `trim_field`, `append_to_field`, `convert_case`, `replace_literal`).
+> The projection engine is `messagefoundry/lens.py`, driven by a `messagefoundry lens` subcommand
+> (`messagefoundry/__main__.py:374`) that **statically parses** a config module into the per-`@handler`
+> row contract and never imports it. The custom editor is `ide/src/stepsView.ts`.
+> [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) plus
+> [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (phase-B
+> palette), [ADR 0108](adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md) and the
+> [ADR 0103](adr/0103-steps-view-row-context-menu.md) follow-up recorded below are all built. The
+> **#26 amendment** this required is ratified and recorded in CLAUDE.md §12: the Steps view is a
+> *projection* — plain `.py` stays the only artifact and the only execution path.
+> _(was 🔢 Open · Value 6/10 · Difficulty 6/10 · _big bet_.)_
 >
 > **Follow-up (2026-07-12, IDE v0.0.22, [ADR 0103](adr/0103-steps-view-row-context-menu.md)):** the
 > Steps view gains a right-click **row context menu** (Insert before/after, Delete, Move up/down) as a new
