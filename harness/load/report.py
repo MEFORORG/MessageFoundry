@@ -371,7 +371,9 @@ def build_report(
             slos.extend(_phase_slos(rec, profile.slo_for(rec.phase)))
 
     # Unconfirmed-send budget = the run's total client connection count (one pool of pool_size per
-    # target): at most ~one stranded in-flight frame per connection is a plausible teardown artifact.
+    # target). It is only the small-run FLOOR under `_reconcile`'s half-the-run excusal fraction —
+    # NOT "~one stranded in-flight frame per connection", a model retired because this sender's
+    # in-flight deque is unbounded. `_reconcile` requires `read >= sent // 2` regardless of it.
     no_loss = _reconcile(
         final_counters,
         poller,
@@ -470,10 +472,15 @@ def _phase_slos(rec: PhaseRecord, slo: Slo) -> list[SloCheck]:
         # a single transport blip (one reconnect's failed open / stranded in-flights — client-side
         # noise, not loss) is >1%, so any sane threshold flips on one event. Below the floor the check
         # is not emitted at all (no verdict beats a noise-driven one); real load profiles run thousands
-        # of messages per phase and keep the gate. A mass reset/timeout FLOOD on a small phase is not
-        # un-gated by this floor: the reconcile's bounded unconfirmed-send budget fails zero_loss when
-        # timeouts exceed ~one per connection. (max_nak_rate below deliberately has no floor — a NAK
-        # is a deterministic engine verdict, not transport noise, so even one is signal.)
+        # of messages per phase and keep the gate. A mass reset/timeout FLOOD is not un-gated by this
+        # floor on the runs that need it: the reconcile fails zero_loss when timeouts exceed its
+        # stranding budget, or when intake drops below its unconditional `read >= sent // 2` floor —
+        # and on a CI smoke the whole run IS that phase. Mind the scope difference, though: the
+        # reconcile is computed ONCE over the run's final counters, so a flood confined to a sub-floor
+        # MEASURED phase inside a large multi-phase run is gated by neither. No shipped profile has
+        # such a phase today (reference's only sub-floor phase is `warmup`, which is unmeasured), so
+        # that is a known scope gap rather than a live hole. (max_nak_rate below deliberately has no
+        # floor — a NAK is a deterministic engine verdict, not transport noise, so even one is signal.)
         er = errs / sent
         out.append(
             SloCheck(
@@ -585,24 +592,50 @@ def _reconcile(
     # zero-loss run (14 stranded of 90 against a budget of 4) and red the required windows-2025 leg.
     #
     # So bound it as a FRACTION of the run, floored by the caller's connection count for tiny runs:
-    # at most half the sends may be excused, which keeps `read >= sent // 2` ALWAYS required. A dead
-    # ACK path (`timeouts == sent`) still blows the cap and fails loudly, and a run that genuinely
-    # loses more than half its sends at intake is still caught. Observed teardown stranding is ~16%,
-    # so this is ~3x the worst seen — wide enough to stop flaking, far from vacuous.
+    # at most half the sends may be excused. Observed teardown stranding is ~16%, so half is ~3x the
+    # worst seen — wide enough to stop flaking, far from vacuous. A dead ACK path (`timeouts == sent`)
+    # blows that cap and fails loudly — but ONLY while the connection-count floor does not dominate:
+    # once `unconfirmed_budget >= sent` the max() forgives even a 100%-dead ACK path, and the intake
+    # floor below cannot catch that one either, because its signature is a HIGH read with no ACKs.
+    # Closing that half needs the floor ARM of the budget bounded; the floor below closes the INTAKE
+    # half only. Known gap, deliberately not fixed here — it would re-open PR #17's de-flake.
+    #
+    # That cap ALONE does NOT deliver `read >= sent // 2`, and the comment here used to claim it did.
+    # `max()` takes the connection count as a FLOOR, not a ceiling, and every call site passes a
+    # connection count (connscale and estate pass the step's `count` verbatim; this one passes
+    # pool_size x targets). A short, low-rate step sends barely more than one message per connection,
+    # so the count WINS the max() and the bound degrades to `read >= sent - connections` — at
+    # connscale-smoke's N=100 cell (~105 sends, budget max(100, 52) = 100) that is `read >= 5`, the
+    # very vacuity the cap exists to prevent. Nothing clamps `excused` to `sent` either, so
+    # `timeouts > sent` drives it to `read >= 0` outright.
+    #
+    # Hence the guarantee is enforced SEPARATELY below, as an intake floor the excusal cannot lower.
     unconfirmed = counters.timeouts
     budget = max(unconfirmed_budget, sent // 2)
     over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
+    # The anti-vacuity guarantee, enforced independently of the excusal AND of `tolerance` — the
+    # tolerance is an operator knob on the SHORTFALL, not a licence to lower the floor that makes
+    # "at least half the run was demonstrably ingested" true at every call site. `sent // 2` is 0 at
+    # sent == 0 (a run that sent nothing clears it trivially) and rounds DOWN on an odd `sent`, so
+    # the floor is never stricter than the documented bound.
+    floor_short = sent // 2 - read
     deliver_short = written - sink_received
     read_ok = read_short <= tolerance
+    floor_ok = floor_short <= 0
     deliver_ok = deliver_short <= tolerance
     drained = backlog == 0
-    ok = read_ok and deliver_ok and drained and not over_budget
+    ok = read_ok and floor_ok and deliver_ok and drained and not over_budget
     parts: list[str] = []
     if not read_ok:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+        )
+    if not floor_ok:
+        parts.append(
+            f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
+            f"the unconfirmed-send excusal cannot lower this floor"
         )
     if not deliver_ok:
         parts.append(

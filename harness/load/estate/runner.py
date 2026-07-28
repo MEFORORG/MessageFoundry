@@ -356,6 +356,9 @@ def _build_record(
 ) -> EstateRecord:
     c = metrics.counters.snapshot()
     base, final = poller.baseline, poller.final
+    # Budget = the step's connection count — the small-run FLOOR under the reconcile's half-the-run
+    # excusal fraction, never a per-connection stranding allowance. `read >= sent // 2` holds here
+    # regardless of it (an estate step CAN send on the order of its connection count).
     no_loss = _reconcile(c, base, final, unconfirmed_budget=profile.count)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
     read_per_s, written_per_s = _throughput_rates(samples)
@@ -432,18 +435,31 @@ def _reconcile(
     # budget it is a systemic no-ACK fault. The bound is a FRACTION of the run (at most half), floored
     # by the connection count — NOT "~one per connection", a model this sender breaks because
     # `_inflight` is an unbounded deque. Mirrors the connscale/report reconciles; see report.py.
+    #
+    # The floor arm means the budget does NOT by itself keep half the run unexcusable: this call site
+    # passes `profile.count` (the connection count), and an estate step whose sends are of the same
+    # order as its connection count lets the count win the max(), degrading the intake bound to
+    # `read >= sent - count`. The `read >= sent // 2` guarantee is therefore enforced separately below.
     unconfirmed = c.timeouts
     budget = max(unconfirmed_budget, sent // 2)
     over_budget = unconfirmed > budget
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
+    # Anti-vacuity floor the excusal cannot lower (see report.py's copy for the derivation): zero at
+    # sent == 0, rounds DOWN on an odd `sent`, and holds even when `timeouts > sent`.
+    floor_short = sent // 2 - read
     deliver_short = written - sink_received
     drained = backlog == 0
-    ok = read_short <= 0 and deliver_short <= 0 and drained and not over_budget
+    ok = read_short <= 0 and floor_short <= 0 and deliver_short <= 0 and drained and not over_budget
     parts: list[str] = []
     if read_short > 0:
         parts.append(
             f"engine_read {read} < confirmed sent {sent - excused} (lost {read_short} on intake)"
+        )
+    if floor_short > 0:
+        parts.append(
+            f"engine_read {read} < intake floor {sent // 2} (half of {sent} sent) — "
+            f"the unconfirmed-send excusal cannot lower this floor"
         )
     if deliver_short > 0:
         parts.append(
@@ -454,7 +470,16 @@ def _reconcile(
     if over_budget:
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({budget} = max(connections, half the run)) — systemic no-ACK fault"
+            f"({budget} = max(connections, half the run)) — systemic no-ACK fault "
+            f"(possible accepted-and-dropped); nothing excused"
+        )
+    elif unconfirmed > 0 and read < sent:
+        # Honest reporting, as in the two sibling copies: without this branch a bounded-excused run
+        # reported the flat "read>=sent, ..." detail while read was demonstrably BELOW sent — a claim
+        # false on its own numbers. The gap is attributed, never silently absorbed.
+        parts.append(
+            f"{unconfirmed} unconfirmed send(s) (no ACK before connection close) "
+            f"not observed at intake — not counted as loss"
         )
     detail = "; ".join(parts) if parts else "read>=sent, sink_received>=written, backlog drained"
     return NoLoss(ok, sent, read, written, sink_received, backlog, detail)

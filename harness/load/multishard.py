@@ -135,8 +135,9 @@ class MultiShardRecord:
     ack_p99_ms: float
 
     # Unconfirmed sends (in-flight at a connection close with no ACK seen). The reconcile excuses
-    # these from the intake bound only up to ~one per connection (engines × count); surfaced here so
-    # the tolerance width is visible on a PASSING record too. Default 0 for older artifacts.
+    # these from the intake bound up to max(total connections, half the run), and never below its
+    # `read >= sent // 2` intake floor; surfaced here so the tolerance width is visible on a PASSING
+    # record too. Default 0 for older artifacts.
     timeouts: int = 0
 
     # --- per-engine disjoint-lane attribution (the no-cross-engine-steal proof) ---
@@ -560,8 +561,9 @@ def _build_record(
 ) -> MultiShardRecord:
     c = metrics.counters.snapshot()
     base, final = poller.baseline, poller.final
-    # Budget = total connection count across every engine (at most ~one stranded in-flight per
-    # connection is a plausible teardown artifact; more is a systemic no-ACK fault).
+    # Budget = total connection count across every engine — a small-run FLOOR under the reconcile's
+    # half-the-run excusal fraction, not the retired "~one stranded in-flight per connection" model.
+    # Its independent intake floor keeps `read >= sent // 2` required whatever this value is.
     no_loss = _reconcile(c, base, final, unconfirmed_budget=engines * count_per_engine)
     in_pipeline_peak = max((s.in_pipeline for s in samples), default=0)
     # Aggregate achieved/delivered rate = the read/written delta across EXACTLY the hold window
