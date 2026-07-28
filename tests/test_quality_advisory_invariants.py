@@ -284,6 +284,48 @@ def test_mutmut_copies_the_package_not_just_the_mutated_file(code: str) -> None:
     assert "runner=" not in code, "mutmut 3 uses pytest_add_cli_args_test_selection"
 
 
+def test_every_measurement_job_emits_a_liveness_receipt(workflow: dict) -> None:
+    """A gate that reports a conclusion without recording that it measured anything is the exact
+    failure this workflow produced three times. Every measurement job must own a receipt."""
+    measurement_jobs = {"complexity", "clone", "coverage", "mutation"}
+    for name in measurement_jobs:
+        job = workflow["jobs"][name]
+        assert (job.get("outputs") or {}).get("receipt"), (
+            f"{name} exposes no liveness receipt output"
+        )
+        steps = [s for s in job["steps"] if s.get("id") == "receipt"]
+        assert len(steps) == 1, f"{name} must have exactly one step with id: receipt"
+        assert steps[0].get("if") == "always()", (
+            f"{name}'s receipt step must run even when the analysis step failed -- otherwise a dead "
+            "gate produces no receipt AND no explanation"
+        )
+
+
+def test_the_liveness_job_is_allowed_to_fail(workflow: dict) -> None:
+    """Every other job here is built so it cannot fail. This one is built so it CAN -- that is the
+    whole point. Adding continue-on-error would silently neuter it."""
+    job = workflow["jobs"]["liveness"]
+    assert job.get("if") == "always()", "liveness must rule even when a gate job died"
+    assert set(job["needs"]) == {"complexity", "clone", "coverage", "mutation"}
+    for step in job["steps"]:
+        assert step.get("continue-on-error") is not True, (
+            "the liveness step must be able to redden its job -- that is its only way to be loud"
+        )
+        body = step.get("run") or ""
+        if "liveness.py" in body:
+            assert "|| true" not in body, "swallowing the exit code defeats the entire check"
+
+
+def test_the_mutation_other_count_is_not_a_remainder(code: str) -> None:
+    """If `other` were computed as LISTED - SURVIVED - NOTESTS, the liveness reconciliation would be
+    true by construction and could never fire -- an identity-confirmation check that only looks like
+    a control. Counting each category independently is what keeps the sum meaningful."""
+    assert re.search(r"OTHER=.*grep -cE", code), "other must be counted independently, not derived"
+    assert "OTHER=$((LISTED" not in code, (
+        "deriving other as a remainder makes the check tautological"
+    )
+
+
 def test_the_killed_count_is_derived_not_grepped(code: str) -> None:
     """`mutmut results` lists ONLY the mutants worth looking at (survived / no tests / timeout /
     suspicious). Killed mutants are never listed, so counting `': killed'` returns 0 on a perfectly

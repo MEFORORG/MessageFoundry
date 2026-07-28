@@ -63,7 +63,44 @@ for diff-coverage and usually *not* true for complexity, so the two land in diff
 | Diff-coverage | **Inline on the Files changed tab**, one `::notice` per contiguous uncovered range of lines the PR changed, plus a step summary. Every line it flags is a line the PR touched, so this is the one signal that is reliably inline. |
 | Complexity (`C901`) | A **merge-base-vs-HEAD delta** — only functions this PR introduced over the threshold or made more complex. Findings anchor on the `def` line, which a body-only edit does not touch, so **most complexity annotations appear in the Checks tab and the step summary rather than inline**. The summary table is this signal's primary surface. Pre-existing findings are never reported; the full list stays in the job log. |
 | Duplication (`jscpd`) | Step summary only. jscpd emits one location per clone pair chosen by scan order, so annotating it would anchor on the untouched twin about half the time. |
+| **Gate liveness** | A pass/fail table proving each gate above actually *measured* something. See below — this is the only job in that workflow that can go red. |
 | Mutation (`mutmut`) | A **killed / survived / not-covered** table in the step summary, with the surviving mutants listed — those are injected bugs the tests did not catch. Runs on PRs too: measured at **461 mutants in 3 seconds** (87 killed, 19 survived) over the bounded scope, because mutmut 3 only runs the tests that cover each mutant. Repaired 2026-07-27 — `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 before generating a single mutant and, thanks to `\|\| true`, had been reporting success in 37s while measuring nothing. |
+
+### Gate liveness — the check that watches the checks
+
+Three defects across two of `quality-advisory.yml`'s gates spent months green. Two were gates
+**measuring nothing** — diff-coverage (a shallow fetch destroyed its merge base, and the resulting
+empty report looked clean) and mutation (the tool crashed before producing a single mutant, and
+`|| true` made that green in 37 seconds). The third was the close cousin: a gate that measured
+correctly and **published a wrong number** — a `grep` for a line the tool never prints, so a healthy
+461-mutant run reported "Killed 0".
+
+The rubric's anti-metric rule guards against trusting a *number* too much. Nothing guarded against
+trusting a *green check that never ran*. The `liveness` job is that control.
+
+Each measurement job emits a small **receipt** recording what it examined; the `liveness` job reads
+them all and demands either proof of execution or an explicit, reasoned "nothing to measure".
+
+- **Liveness is not "the gate found something."** A clean repo legitimately has zero clones. Receipts
+  count units **examined** — files scanned, mutants processed, changed lines analysed — which is
+  non-zero whenever the tool ran, whatever it concluded. A check that fires on good news gets muted.
+- **"Nothing to measure" passes — if it says why.** `no lines with coverage information in this diff`
+  is a real, correct outcome. A silent empty report is not. The two look identical on screen; the
+  reason is the difference.
+- **Numbers must reconcile, against an independent source.** Two checks, because the obvious one is
+  weaker than it looks. `killed + survived + no-tests + other` must equal the mutants processed — but
+  since `killed` is *derived* as total-minus-listed, that sum reduces algebraically to
+  "every listed mutant carries a recognised status" and never validates `killed` at all. So `killed`
+  is additionally reconciled against **mutmut's own counter**, parsed from its progress line: two
+  independent derivations that must agree. That second check is what would catch a recurrence of the
+  `killed=0` bug; the sum alone would not. `tests/test_gate_liveness.py` asserts both, including an
+  explicit test documenting the sum's blindness rather than hiding it.
+- **It is the one job there allowed to go red**, deliberately: it has no `continue-on-error` and no
+  `|| true`. A red mark still blocks nothing — it is not, and must never become, a required context.
+
+`tests/test_gate_liveness.py` replays all three historical incidents and asserts each is caught, and
+asserts the good-news cases pass. A liveness gate that cannot catch the failures it was built for
+would be exactly the thing it exists to prevent.
 
 ### The `CI gate` roll-up
 

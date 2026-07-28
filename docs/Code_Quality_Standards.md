@@ -69,7 +69,7 @@ The full standard follows: the evidence review, the AI failure-mode map, the com
 | **Applies to** | Any project developed under the [SDS](Secure_Development_Standards.md). **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
-| **Version** | 0.10 |
+| **Version** | 0.11 |
 | **Date** | July 27, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the metric evidence base or the AI toolchain. |
@@ -160,6 +160,37 @@ Each signal is a **risk → control → measure**, tagged by **gate type** (dete
 > **Context caveat, not a signal — delivery stability (DORA).** "Velocity ≠ delivered quality" is a real AI-slop concern (DORA 2024 associated AI adoption with lower delivery *stability*), but it measures **delivery outcomes**, not whether a given diff is slop — a different altitude from the code-artifact signals above, on weaker (correlational, partly-revised — §7) evidence, and **owned by the [AI companion §3](Secure_AI_Development_Standards.md)**. MEFOR's small-batch discipline (one coherent layer per commit) already covers the actionable part. It stays a §3 failure-mode entry, **not** a peer signal here.
 >
 > **Evidence & citations for the matrix.** Every signal and claim above maps to its supporting study in [**Appendix B.3**](#b.3-evidence-behind-each-rubric-element) (per-element evidence table), with full bibliographic citations in [**Appendix B.4**](#b.4-references), the derivation method in [**Appendix B.2**](#b.2-how-the-matrix-was-derived), and the claims that *failed* verification in [**Appendix B.5**](#b.5-what-was-refuted-the-verification-worked).
+
+### 4.0 The liveness rule (hard) — a gate that cannot fail is not a control
+
+**Every advisory gate must prove it measured something, or say why it could not.** A gate that reports
+a conclusion without recording that it performed a measurement is indistinguishable from one that
+worked, and it will stay that way indefinitely, because nobody investigates a green check.
+
+This rule was written from failure, not theory. Three defects across **two** of this document's own
+Tier 2 gates were found (2026-07-27) to have been green throughout: two gates measuring nothing (one
+of them for two full versions of this rubric, during which it was scored ✅ **Built** here — v0.10),
+and one gate that measured correctly but published a wrong derived number. Section 4.1 protects
+against trusting a *number* too much; nothing protected against trusting a *green check that never
+ran*. That is a distinct failure mode and it needs its own control:
+
+1. **Proof of execution, not of findings.** The receipt counts units *examined* — files scanned,
+   mutants processed, changed lines analysed — never units *found*. A clean codebase legitimately
+   reports zero clones, and a liveness check that fires on good news gets muted, leaving the project
+   worse off than before it existed.
+2. **"Nothing to measure" is acceptable only when stated.** An explicit, reasoned declaration passes;
+   a silent empty result fails. The two are visually identical, which is precisely why the reason is
+   load-bearing.
+3. **Reported numbers must reconcile against an INDEPENDENT source.** A gate can execute perfectly
+   and still emit a wrong derived figure. Two rules, because the obvious one is weaker than it looks:
+   parts must sum to the whole, each counted independently and never as a remainder (a remainder
+   makes the sum true by construction); *and* any derived headline figure must be cross-checked
+   against a second, independently produced measurement of the same quantity. A sum that includes a
+   derived term can be algebraically blind to that term — ours was, and the blindness is now asserted
+   by a test rather than assumed away.
+
+Applies to any gate, in any project adopting this rubric — a deferred or advisory gate that silently
+stops measuring is worse than an absent one, because the scorecard still counts it.
 
 ### 4.1 The anti-metric rule (hard)
 
@@ -270,7 +301,7 @@ The five gates this document adds (rubric rows 7–11) are *quality-measurement*
 
 Ordered by anti-slop leverage, not effort (build placement per §5). **✅ = shipped** (advisory; \#1028 or \#1040):
 
-1.  **Mutation testing** — highest leverage; directly counters shallow-test slop, extra weight under the solo-maintainer review deviation (A.4). ✅ **shipped** (#1040 — `mutmut` over a bounded, well-tested module, mirror-nightly + `workflow_dispatch`; widen the scope later).
+1.  **Mutation testing** — highest leverage; directly counters shallow-test slop, extra weight under the solo-maintainer review deviation (A.4). ✅ **shipped** (#1040 — `mutmut` over a bounded, well-tested module; runs on PRs + nightly cron + `workflow_dispatch`; widen the scope later). *(v0.11: was "mirror-nightly" — there is no mirror post-cutover, and the job no longer carries a repo-slug gate.)*
 2.  **Clone-detection on diffs** — ✅ **shipped** (`jscpd`, store-parity whitelisted) — catches the copy-instead-of-abstract signature the parallel-worktree workflow is most exposed to.
 3.  **Diff-coverage visibility** — measured on changed lines, guidance only (never a whole-repo % gate — §4.1). ✅ **shipped** (#1040 — `pytest-cov` + `diff-cover`, PR-only).
 4.  **Advisory** `C901` **complexity** — ✅ **shipped** (advisory triage).
@@ -366,6 +397,7 @@ The evidence caveats in **§7** are part of this appendix's basis: the metric-in
 
 | Version | Date | Change |
 |----|----|----|
+| 0.11 | July 27, 2026 | **Added the liveness rule (new section 4.0) and built the control.** v0.10 recorded that signal 7 had been scored ✅ Built for two versions while its tool crashed before producing a mutant. That is a failure mode this rubric had no defence against: section 4.1 forbids over-trusting a *number*, but nothing forbade over-trusting a *green check that never ran* — and three defects across two of the five Tier 2 gates turned out to have that shape (two measuring nothing, one publishing a wrong derived number). Section 4.0 now requires every advisory gate to prove it measured something (units **examined**, never units found — a clean repo reports zero and must still pass) or to declare explicitly, with a reason, that it had nothing to measure; and any derived headline figure must be cross-checked against an independently produced measurement of the same quantity. Implemented as the `liveness` job in `quality-advisory.yml` — the only job there permitted to go red — with `tests/test_gate_liveness.py` replaying the historical incidents to prove the check catches them, and the good-news cases to prove it does not fire on them. **The control was itself adversarially reviewed before merge, and the review found it carrying the same weakness it was built to catch, in three places** — a dead coverage gate could pass by claiming "not applicable", an empty mutmut results file reported a flawless score, and the reconciliation sum was algebraically blind to the very count it claimed to protect. All three are fixed and regression-tested; rule 3 above was rewritten because of the third. No scoring change (A− stands); the gates were repaired in v0.10, this is the control that keeps them honest. |
 | 0.10 | July 27, 2026 | **Restored to the repo, and corrected three claims that did not survive measurement.** This file had been absent from the repository's entire git history despite being cited by `quality-advisory.yml` and `pyproject.toml`; it is restored here from the maintained copy. Corrections, each measured rather than reasoned: **(a) Signal 7 was scored ✅ Built in 0.8 and 0.9 while producing nothing.** `mutmut<3` resolved to 2.5.1, which crashes on Python 3.14 in its pony-ORM cache (`cannot pickle 'itertools.count'`) *before generating a single mutant*; `\|\| true` made the job report success in 37s, so the gate looked green for two versions. Repaired on `mutmut==3.6.0` (+ `pytest-timeout`, and `source_paths` must be the package, not the one file, or the mutant copy cannot import `conftest`). Now genuinely measured: **461 mutants, 87 killed, 19 survived, 3 seconds** — so the "Expensive / never per-PR" cost model in §5 was also wrong, and mutation now runs on PRs. **(b) Signal 11's "85 functions over C901>10" is now 122 across 43 files**, and the raw list was found unusable as a diff signal (every finding anchors on one `def` line), so a merge-base delta was added that reports only PR-caused changes. **(c) Signal 8 now emits inline PR annotations** rather than console-only output. The A− verdict stands, but note that (a) is exactly the failure mode this rubric exists to catch — an advisory gate that reports success while measuring nothing — and it was caught by re-verification, not by the gate itself. |
 | 0.9 | July 14, 2026 | **Restatused signal 10 (lint breadth) to ✅ Built — all 11 signals now Built.** The `extend-select = [B,C4,SIM,UP,I]` sweep shipped (#1047): B008 handled via `extend-immutable-calls` + a route-layer per-file ignore, 515 auto-fixed, 235 grandfathered with `# noqa`, enforced by the required `ruff check` leg. Flipped the exec verdict, §5 gate table + callout, §6 map, and Appendix A.1 / A.2 (row 10 + Tier-2 roll-up) / A.3 (gaps list + "remaining gate" prose → rollout *record*). No scoring change (A− stands). |
 | 0.8 | July 14, 2026 | **Restatused signals 7 (mutation) + 8 (diff-coverage) to ✅ Built.** Both shipped as advisory jobs in `quality-advisory.yml` (#1040) — mutation over a bounded module (mirror-nightly + `workflow_dispatch`), diff-coverage on the diff's changed lines (PR-only). Flipped every place that called them deferred: the exec verdict, §5 gate table + callout, §6 map, and Appendix A.1 / A.2 (rows 7–8 + the Tier-2 roll-up) / A.3 (gaps list + DEP-1 note) / A.4. **Only signal 10 (lint breadth) remains designed-but-deferred → 10 of 11 signals now Built.** No scoring change (A− stands). |
