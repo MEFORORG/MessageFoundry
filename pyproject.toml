@@ -11,8 +11,10 @@ path = "messagefoundry/__init__.py"
 # `python -m build` packs every git-tracked file (docs/, tests/, scripts/, CLAUDE.md, .claude/ …) into the
 # sdist, and release.yml uploads that sdist to PUBLIC PyPI — which shipped the private security-posture
 # docs (docs/security/*, docs/reviews/*, Secure_Development_Standards.md — the publish-denylist set) on
-# every release 0.1.0..0.2.15. The mirror's leak gate (publish.ps1 + scan_forbidden.py) governs only the
-# git mirror, NOT the PyPI path, so the sdist is pinned here to the package + its metadata. (The wheel was
+# every release 0.1.0..0.2.15. The leak gate (scan_forbidden.py, in pre-commit and CI) governs what is
+# COMMITTED, NOT what an sdist packages, so the sdist is pinned here to the package + its metadata. That
+# separation is the whole point: those docs are git-ignored now, but an allowlist is what keeps a future
+# tracked-but-private file out of a release tarball. (The wheel was
 # already package-only.) pyproject.toml + PKG-INFO are always added by hatchling; LICENSE/NOTICE also ship
 # via [project].license-files. release.yml has a belt-and-suspenders "sdist is package-only" gate.
 [tool.hatch.build.targets.sdist]

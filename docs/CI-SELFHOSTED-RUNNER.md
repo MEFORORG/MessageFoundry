@@ -5,15 +5,15 @@
 > **The self-hosted runners described here have been de-registered and their services removed.** The repo
 > has **zero** self-hosted runners, and no workflow targets a self-hosted label for the `test` legs.
 >
-> **Why:** the OSS mirror is a **public** repo, where GitHub-hosted minutes are **free** — so the Windows
-> test matrix now runs on **hosted** runners there at no cost, and self-hosting bought nothing. It also
+> **Why:** this repo is **public**, where GitHub-hosted minutes are **free** — so the Windows test
+> matrix runs on **hosted** runners at no cost, and self-hosting bought nothing. It also
 > removed three liabilities: (1) a **SPOF** — self-hosted *required* checks had no hosted fallback, so an
 > offline box left PRs queued ~24h and then failing, freezing auto-merge repo-wide; (2) a **security**
 > concern — a self-hosted runner must never be reachable from a public repo (a fork PR would mean code
 > execution on the maintainer's LAN); (3) ongoing **maintenance** (tool caches, PATH, service accounts).
 >
-> The Windows `test` legs are now selected by a **per-repo matrix** in `ci.yml`: ubuntu-only on the private
-> source repo, full ubuntu + Windows on the public mirror.
+> The Windows `test` legs are selected by a **per-repo matrix** in `ci.yml`: full ubuntu + Windows here,
+> ubuntu-only on a fork (so a contributor's own minutes are not spent on the 2x-billed Windows legs).
 >
 > Follow this guide **only** if you are deliberately re-introducing a self-hosted runner. Note
 > `selfhosted-win2025-sql.yml` remains dispatch-only and is currently **runner-less**.

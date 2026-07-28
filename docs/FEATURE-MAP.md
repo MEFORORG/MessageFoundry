@@ -204,7 +204,7 @@ IDE are separate surfaces over the localhost API.
 | Feature | Status | Notes |
 |---------|:--:|-------|
 | AGPL-3.0 license + dual-licensing plan | ✅ | |
-| Public OSS mirror + curated publish pipeline (forbidden-string/gitleaks gate) | ✅ | Owner runs the push (exfil guard) |
+| Customer/PHI leak gate — forbidden-string + gitleaks, on every commit and in CI | ✅ | Fails closed with no token source |
 | CI: quartet (ruff/format/mypy/pytest) + security scans | ✅ | PG/SQL Server store jobs are service-container-gated |
 | Version single-sourcing (drop the duplicate literal) | 🔨 | Workstream F |
 | CHANGELOG.md + README roadmap refresh | 🔨 | Workstream F |
