@@ -11,6 +11,7 @@ validation, and the ``Timer(...)`` factory / wiring.
 from __future__ import annotations
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -356,19 +357,82 @@ def test_timer_timezone_requires_cron() -> None:
         )
 
 
-async def test_timer_cron_does_not_fire_immediately() -> None:
-    # With a real cron the first fire is the next scheduled minute — never t=0. Over a short window the
-    # every-minute cron must not have fired (its next fire is up to ~60s away).
+def test_cron_next_fire_is_always_strictly_future() -> None:
+    """The actual invariant, asserted purely: ``next_after`` never returns its own input.
+
+    This is what "a cron does not fire at t=0" MEANS, and it needs no clock and no sleeping. The
+    boundary offsets are the point — at :59.999 the next fire is a millisecond away, and that is
+    correct behaviour, not a bug to sleep through.
+    """
+    sched = _CronSchedule.parse("* * * * *")
+    base = datetime(2026, 7, 27, 12, 0)
+    for offset in (0.0, 0.001, 1.0, 30.0, 59.0, 59.999):
+        t = base + timedelta(seconds=offset)
+        nxt = sched.next_after(t)
+        assert nxt > t, f"next_after({t}) must be strictly future, got {nxt}"
+        assert (nxt.second, nxt.microsecond) == (0, 0), (
+            f"a minute cron fires on the minute, got {nxt}"
+        )
+
+
+async def test_timer_cron_does_not_fire_immediately(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The running loop must not fire at t=0 either — on a clock ANCHORED mid-minute.
+
+    This used to start a real ``* * * * *`` source, sleep 0.1s, and assert nothing had fired. That is
+    only reliable mid-minute: a minute cron fires ON the minute, so a run beginning within 100ms of the
+    boundary saw a fire that was entirely CORRECT and the test failed for being right — ~0.17% per run
+    per leg (a 0.1s window out of every 60s). It duly red-X'd a comments-only PR. Its own comment gave
+    it away: "its next fire is up to ~60s away". Up to. It can also be 50ms away.
+
+    THE CLOCK ADVANCES; ONLY ITS ORIGIN IS PINNED. A frozen clock was tried first and is WRONG: with
+    ``_now()`` constant, ``remaining`` never decreases, so ``_run_cron`` waits forever and cannot fire
+    at ANY pinned time — including :59.95, where firing is exactly what should happen. That version was
+    deterministic because it could not fail, which is worse than the flake it replaced. Anchoring the
+    origin at :30 and letting it advance in real time keeps the failure mode reachable (the sibling test
+    below pins that) while removing the dependence on where the wall clock happened to be.
+
+    The source is naive-clocked here (no ``timezone`` setting), so a naive datetime is the right shape.
+    """
     fired: list[bytes] = []
 
     async def handler(raw: bytes) -> None:
         fired.append(raw)
 
     src = _timer(body="X", cron_expression="* * * * *")
+    origin, t0 = datetime(2026, 7, 27, 12, 0, 30), time.monotonic()  # :30 — 30s short of a fire
+    monkeypatch.setattr(
+        type(src), "_now", lambda _self: origin + timedelta(seconds=time.monotonic() - t0)
+    )
     await src.start(handler)
     try:
         await asyncio.sleep(0.1)
         assert fired == []  # never fires at t=0
+    finally:
+        await src.stop()
+
+
+async def test_the_cron_no_fire_probe_can_actually_fail(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Guards the guard: anchored just BEFORE a fire, the same setup must fire.
+
+    Without this, the test above passes whether the loop is correct, broken, or wedged — and the first
+    attempt at fixing it (a frozen clock) was exactly that: unfalsifiable. Anchoring at :59.90 puts a
+    scheduled fire 100ms out, inside the window, so a fire is the CORRECT outcome and its absence means
+    the probe has stopped observing anything.
+    """
+    fired: list[bytes] = []
+
+    async def handler(raw: bytes) -> None:
+        fired.append(raw)
+
+    src = _timer(body="X", cron_expression="* * * * *")
+    origin, t0 = datetime(2026, 7, 27, 12, 0, 59, 900_000), time.monotonic()
+    monkeypatch.setattr(
+        type(src), "_now", lambda _self: origin + timedelta(seconds=time.monotonic() - t0)
+    )
+    await src.start(handler)
+    try:
+        await asyncio.sleep(0.6)  # generous: the fire is ~100ms in, the slack absorbs a slow runner
+        assert fired, "the no-fire probe above cannot fail — it would pass on a wedged loop too"
     finally:
         await src.stop()
 
