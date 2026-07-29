@@ -924,6 +924,12 @@ class SecurityPosture(BaseModel):
     # PHI-only gates are (defensibly) relaxed. Read-only; the IDE is the sole authoring surface.
     security: dict[str, object] = Field(default_factory=dict)
     loosenings: list[SecurityLoosening] = Field(default_factory=list)
+    # ``None`` = the loosening list above is COMPLETE. A string names what it could NOT see — set only
+    # when this engine has no loaded connection graph (an embedding, or an app queried before start),
+    # where the ADR 0153 per-connection ``cleartext_accepted`` declarations are unreadable. Reporting a
+    # settings-only subset with no marker would understate the posture, which is the one thing this
+    # route must not do; ``messagefoundry security show`` carries the same marker for the same reason.
+    loosenings_scope: str | None = None
     # Set WHERE handles_real_patient_data=false: the strict PHI-only controls (at-rest-encryption refusal,
     # deny-by-default egress, bounded retention) are relaxed because the instance carries no ePHI (AC-6).
     synthetic_relaxation: str | None = None

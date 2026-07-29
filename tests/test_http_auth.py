@@ -155,13 +155,22 @@ def test_oauth2_cleartext_token_endpoint_refused_on_prod_phi_even_with_escape(
     assert "s3cr3t" not in str(ei.value)  # never echo the secret in the refusal
 
 
-def test_oauth2_cleartext_token_endpoint_allowed_non_prod_with_escape(
+def test_oauth2_cleartext_token_endpoint_allowed_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Non-prod (staging) PHI with the clamped escape set downgrades REFUSE→WARN — permitted (as-is).
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with active_hop_posture(_STAGING_PHI):
-        p = _oauth_provider(token_url="http://auth.example.com/token")
+    """ADR 0153: the token-endpoint hop takes the same per-connection declaration as its delivery hop.
+
+    It replaces the escape this test used to rely on (decision 5 unhooked that). Threading the pair here
+    is deliberate even though a credential is worse on the wire than a body: without it, an operator
+    whose legacy peer needs OAuth2 over a cleartext segment would have to write a FALSE
+    `tls_hop_attested`, which is the exact defect ADR 0153 exists to remove."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(_PROD_PHI):
+        p = _oauth_provider(
+            token_url="http://auth.example.com/token",
+            cleartext_accepted=True,
+            cleartext_reason="legacy IdP has no TLS listener",
+        )
     assert isinstance(p, OAuth2ClientCredentialsProvider)
 
 
@@ -188,11 +197,19 @@ def test_digest_cleartext_refused_on_prod_phi_even_with_escape(
     assert "cleartext" in str(ei.value)
 
 
-def test_digest_cleartext_allowed_non_prod_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with active_hop_posture(_STAGING_PHI):
+def test_digest_cleartext_allowed_when_accepted(monkeypatch: pytest.MonkeyPatch) -> None:
+    # ADR 0153: the declaration (mirrored into the resolved settings by _dest_config) replaces the
+    # escape this test used to rely on. WARN + audit, not a silent crossing.
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(_PROD_PHI):
         h = digest_handler_from_settings(
-            {"http_auth": "digest", "http_auth_user": "u", "http_auth_password": "p"},
+            {
+                "http_auth": "digest",
+                "http_auth_user": "u",
+                "http_auth_password": "p",
+                "cleartext_accepted": True,
+                "cleartext_reason": "legacy device has no TLS listener",
+            },
             url="http://api.example.com/x",
         )
     assert h is not None  # WARN, not REFUSE — the challenge-answering handler is still built

@@ -35,11 +35,22 @@ from messagefoundry.config.settings import (
     AuthSettings,
     SecuritySettings,
     ServiceSettings,
+    StoreSettings,
     load_settings,
     security_loosenings,
 )
 from messagefoundry.netaddr import client_network_allowed, peer_ip_allowed
 from messagefoundry.pipeline import Engine
+
+
+def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
+    """``security_loosenings`` with the shipped [store]/[auth] defaults and an empty accepted set.
+
+    The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
+    deviation the registry cannot see is a second posture by the back door). The tests below are about
+    the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), ())
+
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy
 
@@ -154,7 +165,7 @@ def test_default_is_empty_and_is_not_a_loosening() -> None:
     assert s.allowed_client_networks == []
     assert s.client_networks == ()
     # An empty list on the default loopback bind is the SECURE position, not a loosening.
-    assert security_loosenings(s) == []
+    assert _loosenings(s) == []
 
 
 def test_entries_are_normalized_at_load() -> None:
@@ -207,14 +218,14 @@ def test_toml_load_and_malformed_toml_refusal(tmp_path: Path) -> None:
 
 def test_exposure_loosening_fires_on_exposure_not_on_the_bind() -> None:
     # R1: an off-box bind with no allow-list.
-    names = [n for n, _ in security_loosenings(SecuritySettings(local_access_only=False))]
+    names = [n for n, _ in _loosenings(SecuritySettings(local_access_only=False))]
     assert "allowed_client_networks" in names
     # R2 — the REGRESSION GUARD. The recommended off-box topology keeps the loopback bind and puts a
     # reverse proxy in front, so a `not local_access_only` test alone would never fire in the
     # most-exposed supported posture.
     names = [
         n
-        for n, _ in security_loosenings(
+        for n, _ in _loosenings(
             SecuritySettings(web_console_public_address="https://ops.example.com")
         )
     ]
@@ -226,7 +237,7 @@ def test_exposure_loosening_fires_on_exposure_not_on_the_bind() -> None:
             web_console_public_address="https://ops.example.com", allowed_client_networks=WARD
         ),
     ):
-        assert "allowed_client_networks" not in [n for n, _ in security_loosenings(sec)]
+        assert "allowed_client_networks" not in [n for n, _ in _loosenings(sec)]
 
 
 # --- the trusted_proxies pairing (a broad range would nullify the whole control) -------------------

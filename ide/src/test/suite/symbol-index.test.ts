@@ -5,6 +5,11 @@ import * as path from "node:path";
 
 import { buildSymbolIndex, matchSymbols, scanModuleSymbols, type SymbolDef } from "../../symbolIndex";
 
+// The REAL node:fs module object, for the descriptor test's spies. `import * as fs` compiles
+// (esModuleInterop, module=commonjs) to a namespace COPY whose members are forwarding getters onto this
+// object — so the copy cannot be assigned to, while a spy installed HERE is what symbolIndex.ts calls.
+const FS_MODULE: Record<string, unknown> = require("node:fs");
+
 // Pure (vscode-free) symbol scan for the sidebar name search (BACKLOG #228): find top-level
 // handler/router/transform `def`s so a search reveals a transform / differently-named handler that is
 // a Python symbol inside a role-combined feed module — not a connection filename or a graph element.
@@ -140,5 +145,90 @@ suite("symbolIndex — buildSymbolIndex (recurse, include _-prefixed, skip vendo
 
   test("a missing config dir yields an empty index, never throws", () => {
     assert.deepStrictEqual(buildSymbolIndex(path.join(root, "does-not-exist")), []);
+  });
+});
+
+// CodeQL js/file-system-race: the scan used to size-check with `statSync(path)` and then read with
+// `readFileSync(path)` — two independent path resolutions, so the file that was READ need not be the
+// file that was CHECKED. That voids the maxBytes guard with no attacker involved (a save, a formatter
+// or a codegen step rewriting a module between the two calls is routine in a live workspace).
+suite("symbolIndex — buildSymbolIndex resolves each file once (js/file-system-race)", () => {
+  let root: string;
+
+  suiteSetup(() => {
+    root = fs.mkdtempSync(path.join(os.tmpdir(), "mfsym-race-"));
+    fs.writeFileSync(path.join(root, "small.py"), "def xform_small(m):\n    return m\n");
+    // Comfortably over the 64-byte cap the tests below pass, so it takes the oversize path.
+    fs.writeFileSync(path.join(root, "big.py"), `def xform_big(m):\n    return m\n# ${"p".repeat(4096)}\n`);
+  });
+
+  suiteTeardown(() => {
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+
+  test("a file over maxBytes is skipped; smaller siblings still index", () => {
+    assert.deepStrictEqual(
+      buildSymbolIndex(root, { maxBytes: 64 }).map((d) => d.name),
+      ["xform_small"],
+    );
+  });
+
+  test("size-checks and reads the SAME descriptor, and closes every one it opens", () => {
+    const readArgs: fs.PathOrFileDescriptor[] = [];
+    const statPaths: string[] = [];
+    const opened: number[] = [];
+    const closed: number[] = [];
+
+    // Captured through the namespace import BEFORE patching, so they are the real, fully-typed
+    // functions; the spies delegate to these rather than to the (now patched) module members.
+    const origRead = fs.readFileSync;
+    const origStat = fs.statSync;
+    const origOpen = fs.openSync;
+    const origClose = fs.closeSync;
+
+    try {
+      FS_MODULE.readFileSync = (p: fs.PathOrFileDescriptor, o: BufferEncoding): string => {
+        readArgs.push(p);
+        return origRead(p, o);
+      };
+      FS_MODULE.statSync = (p: fs.PathLike): fs.Stats => {
+        statPaths.push(String(p));
+        return origStat(p);
+      };
+      FS_MODULE.openSync = (p: fs.PathLike, flags: fs.OpenMode): number => {
+        const fd = origOpen(p, flags);
+        opened.push(fd);
+        return fd;
+      };
+      FS_MODULE.closeSync = (fd: number): void => {
+        closed.push(fd);
+        origClose(fd);
+      };
+
+      assert.deepStrictEqual(
+        buildSymbolIndex(root, { maxBytes: 64 }).map((d) => d.name),
+        ["xform_small"],
+      );
+    } finally {
+      FS_MODULE.readFileSync = origRead;
+      FS_MODULE.statSync = origStat;
+      FS_MODULE.openSync = origOpen;
+      FS_MODULE.closeSync = origClose;
+    }
+
+    // Fail loudly rather than pass vacuously: if the scan read nothing, every check below is empty.
+    assert.ok(readArgs.length > 0, "the index build read no file — the checks below would be vacuous");
+    for (const a of readArgs) {
+      assert.strictEqual(
+        typeof a,
+        "number",
+        `readFileSync was handed a PATH (${String(a)}); the size check and the read must share one fd`,
+      );
+    }
+    assert.deepStrictEqual(statPaths, [], "a path-based statSync re-opens the TOCTOU window");
+    // Both files are opened (the oversize one too, to fstat it), so this also proves the `finally` in
+    // readCapped releases the descriptor on the skip path — the leak the fd rewrite could have added.
+    assert.strictEqual(opened.length, 2, "expected one open per .py file in the fixture tree");
+    assert.deepStrictEqual(closed, opened, "every opened descriptor must be closed, oversize path included");
   });
 });

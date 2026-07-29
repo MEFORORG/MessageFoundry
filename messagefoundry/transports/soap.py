@@ -333,13 +333,26 @@ class SoapDestination(DestinationConnector):
 
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
+        # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
+        # secure, and that is accepted (WARN + audit, never a silent ALLOW). Held on the instance because
+        # the WS-Security / body-secret credential hops below are decided in helper methods.
+        self._cleartext_accepted = config.cleartext_accepted
+        self._cleartext_reason = config.cleartext_reason
+        # Held for the same reason: the acceptance audit record names the declaring connection.
+        self._connection_name = config.name
+        accepted, accept_reason = self._cleartext_accepted, self._cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         self._validate_ws(scheme, s, attested=attested)
 
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
-            s, dest_scheme=scheme, attested=attested
+            s,
+            dest_scheme=scheme,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -350,10 +363,25 @@ class SoapDestination(DestinationConnector):
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.url, attested=attested)
+        refuse_cleartext_credentials(
+            scheme,
+            self._headers,
+            self.url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
         # host is refused even without credentials (loopback stays byte-identical). See rest.py.
-        self._hop_guard = refuse_cleartext_egress(scheme, self.url, attested=attested)
+        self._hop_guard = refuse_cleartext_egress(
+            scheme,
+            self.url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound envelope. None = off
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
@@ -422,7 +450,13 @@ class SoapDestination(DestinationConnector):
         self._token_provider = bearer_provider_from_settings(s, proxy=self._proxy)
         if self._token_provider is not None:
             refuse_cleartext_credentials(
-                scheme, {**self._headers, "Authorization": "Bearer"}, self.url, attested=attested
+                scheme,
+                {**self._headers, "Authorization": "Bearer"},
+                self.url,
+                attested=attested,
+                cleartext_accepted=accepted,
+                cleartext_reason=accept_reason,
+                connection=config.name,
             )
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
@@ -492,7 +526,13 @@ class SoapDestination(DestinationConnector):
         # like the WS-Security UsernameToken — refuse it under the same posture gate (loopback / attested
         # stay allowed, byte-identical).
         refuse_cleartext_credential_hop(
-            scheme, self.url, credential="SOAP body secret", attested=attested
+            scheme,
+            self.url,
+            credential="SOAP body secret",
+            attested=attested,
+            cleartext_accepted=self._cleartext_accepted,
+            cleartext_reason=self._cleartext_reason,
+            connection=self._connection_name,
         )
         return tuple(pairs)
 
@@ -565,6 +605,9 @@ class SoapDestination(DestinationConnector):
                 self.url,
                 credential="WS-Security UsernameToken credential",
                 attested=attested,
+                cleartext_accepted=self._cleartext_accepted,
+                cleartext_reason=self._cleartext_reason,
+                connection=self._connection_name,
             )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:

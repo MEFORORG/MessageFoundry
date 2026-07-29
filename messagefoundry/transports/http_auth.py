@@ -51,6 +51,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    cleartext_acceptance_from_settings,
     enforce_outbound_length_limits,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
@@ -126,6 +127,9 @@ class OAuth2ClientCredentialsProvider:
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
         attested: bool = False,
+        cleartext_accepted: bool = False,
+        cleartext_reason: str | None = None,
+        connection: str | None = None,
         proxy: ProxyConfig | None = None,
     ) -> None:
         if not token_url:
@@ -147,13 +151,23 @@ class OAuth2ClientCredentialsProvider:
         # subclasses, so the loader surfaces either identically. The message never carries the secret.
         try:
             refuse_cleartext_credential_hop(
-                scheme, token_url, credential="OAuth2 client_secret", attested=attested
+                scheme,
+                token_url,
+                credential="OAuth2 client_secret",
+                attested=attested,
+                # ADR 0153: the same per-connection declaration the delivery hop carries. Without it the
+                # token-endpoint hop would refuse a connection whose delivery hop was declared, leaving
+                # the operator no honest way to describe a legacy peer (see the note on
+                # refuse_cleartext_credential_hop).
+                cleartext_accepted=cleartext_accepted,
+                cleartext_reason=cleartext_reason,
+                connection=connection,
             )
         except InsecureHopRefused as exc:
             raise HttpAuthError(
                 "OAuth2 token endpoint over cleartext http would expose the client_secret; refused by "
-                "the instance security posture — a production-PHI hop cannot be escaped (use https, or "
-                "attest the hop as secure via tls_hop_attested)"
+                "the instance security posture (use https, attest the hop as secure via "
+                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
             ) from exc
         if not client_id:
             raise HttpAuthError("OAuth2 client-credentials requires an 'oauth2_client_id' setting")
@@ -283,6 +297,7 @@ def oauth2_cc_provider_from_settings(
         return None
     if not s.get("oauth2_enabled", True):
         return None
+    _accepted = cleartext_acceptance_from_settings(s)
     return OAuth2ClientCredentialsProvider(
         token_url=str(s.get("oauth2_token_url") or ""),
         client_id=str(s.get("oauth2_client_id") or ""),
@@ -296,6 +311,12 @@ def oauth2_cc_provider_from_settings(
         # __init__ (read from settings exactly as _dest_config / FhirLookup do). Default False → the hop
         # decides purely on posture.
         attested=bool(s.get("tls_hop_attested", False)),
+        # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings
+        # by the runner's _dest_config for exactly this kind of settings-driven seam (the connection name
+        # rides with it so the acceptance audit record can name the declaration that produced it).
+        cleartext_accepted=_accepted[0],
+        cleartext_reason=_accepted[1],
+        connection=_accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
     )
 
@@ -348,15 +369,24 @@ def digest_handler_from_settings(
     # (both are ``ValueError``s → the loader surfaces either identically). Runs at connector construction
     # under the gate's stamped posture (fail-closing to prod-PHI when unstamped).
     attested = bool(s.get("tls_hop_attested", False))
+    # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
+    # the runner's _dest_config for exactly this kind of settings-driven seam.
+    accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
     try:
         refuse_cleartext_credential_hop(
-            scheme, url, credential="digest credential", attested=attested
+            scheme,
+            url,
+            credential="digest credential",
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=accept_conn,
         )
     except InsecureHopRefused as exc:
         raise HttpAuthError(
             "HTTP Digest over cleartext http would expose the digest credential; refused by the "
-            "instance security posture — a production-PHI hop cannot be escaped (use https, or attest "
-            "the hop as secure via tls_hop_attested)"
+            "instance security posture (use https, attest the hop as secure via tls_hop_attested, or "
+            "declare cleartext_accepted with a cleartext_reason)"
         ) from exc
     user = str(s.get("http_auth_user") or "")
     password = str(s.get("http_auth_password") or "")

@@ -28,6 +28,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AiSettings,
@@ -40,7 +41,12 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     phi_read_hop_disposition,
 )
-from messagefoundry.config.wiring import DatabaseLookupSpec, FhirLookupSpec, Registry
+from messagefoundry.config.wiring import (
+    DatabaseLookupSpec,
+    FhirLookup,
+    FhirLookupSpec,
+    Registry,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -194,9 +200,28 @@ async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
     await s.close()
 
 
-def _fhir_registry() -> Registry:
+def _fhir_registry(*, accepted: bool = False) -> Registry:
+    """Build the lookup graph through the REAL authoring surface when a declaration is involved.
+
+    ADR 0153's pair is a ``FhirLookup()`` parameter, not a hand-written settings key: driving the
+    factory is what proves the surface an operator actually has works end to end (and that the
+    flag/reason coherence rule fires on it). The undeclared arm stays hand-built — there is nothing to
+    validate, and it keeps the refusal case independent of the factory."""
     reg = Registry()
-    reg.add_fhir_lookup(FhirLookupSpec("epic", {"url": CLEARTEXT_FHIR}))
+    if not accepted:
+        reg.add_fhir_lookup(FhirLookupSpec("epic", {"url": CLEARTEXT_FHIR}))
+        return reg
+    prev = wiring._active
+    wiring._active = reg
+    try:
+        FhirLookup(
+            "epic",
+            url=CLEARTEXT_FHIR,
+            cleartext_accepted=True,
+            cleartext_reason="legacy on-prem FHIR facade has no TLS",
+        )
+    finally:
+        wiring._active = prev
     return reg
 
 
@@ -229,10 +254,25 @@ async def test_runner_refuses_prod_phi_cleartext_fhir_lookup(store: MessageStore
         runner._build_fhir_lookup_executor()
 
 
-async def test_runner_allows_synthetic_cleartext_fhir_lookup(store: MessageStore) -> None:
-    # A synthetic instance is NOT false-closed: the same cleartext read builds fine. Before the residual
-    # the live-runner build was unstamped → fail-closed (prod-PHI) → this would have wrongly refused.
+async def test_runner_refuses_synthetic_cleartext_fhir_lookup(store: MessageStore) -> None:
+    """ADR 0153: the synthetic label no longer buys the cleartext read hop either.
+
+    The residual this test belongs to is about the live-runner build reading the STAMPED posture rather
+    than fail-closing — that is still what is under test. What changed is the expected answer for an
+    enforcing synthetic instance: the label is no longer an input, so it refuses."""
     runner = RegistryRunner(_fhir_registry(), store, poll_interval=0.02, hop_posture=SYNTHETIC)
+    with pytest.raises(InsecureHopRefused):
+        runner._build_fhir_lookup_executor()
+
+
+async def test_runner_allows_declared_cleartext_fhir_lookup(store: MessageStore) -> None:
+    """...and the live-runner build is NOT false-closed when the read hop carries a declaration.
+
+    This is the half of the residual that still matters: an unstamped build would fail closed and
+    wrongly refuse a legitimately-declared lane at serve, after build_check had already allowed it."""
+    runner = RegistryRunner(
+        _fhir_registry(accepted=True), store, poll_interval=0.02, hop_posture=PROD_PHI
+    )
     assert runner._build_fhir_lookup_executor() is not None
 
 
@@ -284,6 +324,30 @@ def handle(msg):
     return Send("OB", msg)
 """
 
+# The same graph with the ADR 0153 per-destination declaration, so the cleartext hop crosses with a
+# loud audited WARN instead of refusing — the honest escape for a peer that cannot do TLS.
+_CONFIG_MODULE_ACCEPTED = """
+from messagefoundry import MLLP, Rest, Send, handler, inbound, outbound, router
+
+inbound("IB", MLLP(port=15099), router="r")
+outbound(
+    "OB",
+    Rest(url="http://collector.example.org/ingest"),
+    cleartext_accepted=True,
+    cleartext_reason="legacy collector predates TLS",
+)
+
+
+@router("r")
+def route(msg):
+    return ["h"]
+
+
+@handler("h")
+def handle(msg):
+    return Send("OB", msg)
+"""
+
 # Egress allows the cleartext host so ONLY the posture-keyed hop refusal decides (not the allowlist).
 _TOML = """
 [ai]
@@ -297,10 +361,13 @@ bind_host = "127.0.0.1"
 """
 
 
-def _write_config(tmp_path: Path, *, env: str, synthetic: bool = False) -> Path:
+def _write_config(
+    tmp_path: Path, *, env: str, synthetic: bool = False, accepted: bool = False
+) -> Path:
     cfg = tmp_path / "config"
     cfg.mkdir()
-    (cfg / "feed.py").write_text(_CONFIG_MODULE, encoding="utf-8")
+    module = _CONFIG_MODULE_ACCEPTED if accepted else _CONFIG_MODULE
+    (cfg / "feed.py").write_text(module, encoding="utf-8")
     # GIVEN 1 (ADR 0148): dev derives PHI now, so a synthetic instance declares the opt-out explicitly.
     synthetic_line = "security.handles_real_patient_data = false\n" if synthetic else ""
     (tmp_path / "messagefoundry.toml").write_text(
@@ -324,14 +391,40 @@ def test_check_build_refuses_prod_phi_cleartext_hop(tmp_path: Path) -> None:
     assert not report.ok  # the whole gate fails on a blocking required check
 
 
-def test_check_build_allows_dev_cleartext_hop(tmp_path: Path) -> None:
+def test_check_build_refuses_dev_synthetic_cleartext_hop(tmp_path: Path) -> None:
     from messagefoundry.checks import run_checks
 
     cfg = _write_config(tmp_path, env="dev", synthetic=True)
     report = run_checks(cfg, run_lint=False)
     result = _build_result(report)
-    # A synthetic (dev) instance: the SAME cleartext hop is allowed — byte-identical, no false-close.
-    assert result.ok and not result.skipped
+    # ADR 0153: a synthetic dev instance no longer gets the SAME cleartext hop for free. This is the
+    # documented cost of the change ("a synthetic-data instance loses its blanket carve-out") — the
+    # remedy is a per-destination declaration, or [security].enforcement = warn.
+    assert result.required and not result.ok and not result.skipped
+
+
+def test_check_build_allows_declared_cleartext_hop(tmp_path: Path) -> None:
+    from messagefoundry.checks import run_checks
+
+    cfg = _write_config(tmp_path, env="prod", accepted=True)
+    report = run_checks(cfg, run_lint=False)
+    assert _build_result(report).ok
+    # ...and `check` SURFACES the whole accepted set, which is the mitigation ADR 0153 names for the
+    # risk that an operator declares the acceptance broadly enough to approximate the blanket escape.
+    surfaced = next(r for r in report.results if r.name == "cleartext-accepted")
+    assert surfaced.ok and not surfaced.required and not surfaced.skipped
+    assert "OB" in surfaced.detail and "legacy collector" in surfaced.detail
+
+
+def test_check_cleartext_accepted_reports_an_empty_set(tmp_path: Path) -> None:
+    from messagefoundry.checks import run_checks
+
+    # The surface must say "none" explicitly rather than go quiet: an absent line is indistinguishable
+    # from a check that did not run, which is how a green gate stops being evidence.
+    cfg = _write_config(tmp_path, env="prod")
+    report = run_checks(cfg, run_lint=False)
+    surfaced = next(r for r in report.results if r.name == "cleartext-accepted")
+    assert surfaced.ok and "no connection declares cleartext_accepted" in surfaced.detail
 
 
 def test_check_build_skips_without_service_toml(tmp_path: Path) -> None:

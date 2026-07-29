@@ -127,9 +127,14 @@ def _force_aad_bind_when_requested() -> Iterator[None]:
     ``mfenc:v2`` writer (``write_v2=True``) at its single construction chokepoint. Re-running the store
     round-trip suites under this flag turns every real write→read path into an AAD round-trip, so a
     mismatched encrypt/decrypt cell (a half-threaded ``cell_aad``) surfaces as a ``CipherError`` — the
-    decisive check that no cell was missed. OFF by default (the suite runs the frozen v1 writer,
-    byte-identical at rest), so the flag is opt-in for the dedicated aad_bind sweep and never perturbs
-    the default run or the v1-format assertions in ``test_store_encryption.py``."""
+    decisive check that no cell was missed.
+
+    The flag is OFF by default and stays meaningful even though ``[store].aad_bind`` now DEFAULTS TRUE
+    (ADR 0148 GIVEN 1). It is not a duplicate of that default: it patches ``AesGcmCipher.__init__``, so
+    it forces ``write_v2`` on ciphers built with an EXPLICIT ``write_v2=False`` — including the ones
+    ``test_store_encryption.py`` constructs directly to pin the v1 format. The settings default governs
+    what ``open_store`` builds; this flag governs every cipher in the process, which is what makes the
+    sweep exhaustive rather than merely representative."""
     if os.environ.get("MEFOR_TEST_FORCE_AAD_BIND") != "1":
         yield
         return

@@ -176,10 +176,21 @@ def test_mllp_blanket_env_allows_prod_phi(monkeypatch: pytest.MonkeyPatch) -> No
 def test_mllp_sets_revocation_guard_only_on_verify_path() -> None:
     # verify-ON TLS hop carries a revocation guard; a cleartext (tls off) hop does not (its cleartext
     # #200 guard handles it — the two guards are disjoint, never both set).
-    with active_hop_posture(SYNTHETIC):  # synthetic so neither guard refuses
+    #
+    # SYNTHETIC used to suppress BOTH gates. Since ADR 0153 the data label no longer relaxes the
+    # CLEARTEXT one, so the cleartext leg carries an explicit declaration instead. The revocation gate
+    # (ADR 0078) still reads the label and is deliberately OUT of 0153's scope — which is precisely what
+    # makes the asymmetry in this test the thing worth pinning.
+    with active_hop_posture(SYNTHETIC):
         verified = MLLPDestination(mllp_cfg(REMOTE))
         cleartext = MLLPDestination(
-            Destination(name="OB", type=ConnectorType.MLLP, settings={"host": REMOTE, "port": 5000})
+            Destination(
+                name="OB",
+                type=ConnectorType.MLLP,
+                settings={"host": REMOTE, "port": 5000},
+                cleartext_accepted=True,
+                cleartext_reason="legacy peer has no TLS",
+            )
         )
     assert verified._revocation_guard is not None and verified._hop_guard is None
     assert cleartext._revocation_guard is None and cleartext._hop_guard is not None

@@ -563,7 +563,8 @@ def test_marker_prefix_is_version_agnostic() -> None:
 # The v2 writer folds cell_aad(table, column, *pk) into the AES-GCM tag, so a ciphertext is bound to its
 # (table, column, row) cell: a blob cut-and-pasted into another cell fails the tag (CipherError) instead
 # of decrypting. v1 NEVER carries AAD (frozen, CRYPTO-1); decrypt dispatches AAD by marker version so
-# legacy v1 rows still read (dual-read). Opt-in via [store].aad_bind → write_v2 (off by default).
+# legacy v1 rows still read (dual-read). Selected by [store].aad_bind → write_v2 (ON by default
+# since ADR 0148 GIVEN 1; the tests below pass an explicit cipher, so they pin the format directly).
 
 
 def test_cell_aad_unambiguous_and_backend_agnostic() -> None:

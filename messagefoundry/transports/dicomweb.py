@@ -157,11 +157,19 @@ class DicomWebDestination(DestinationConnector):
         self.capture_response: bool = bool(s.get("capture_response", False))
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
+        # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
+        # secure, and that is accepted (WARN + audit, never a silent ALLOW).
+        accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
-            s, dest_scheme=scheme, attested=attested
+            s,
+            dest_scheme=scheme,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -173,10 +181,25 @@ class DicomWebDestination(DestinationConnector):
         # The multipart Content-Type (with the generated boundary) is set per-request in _post — it is not
         # operator-supplied, so it is excluded from the length check (which guards URL + supplied headers).
         enforce_outbound_length_limits(self.base_url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.base_url, attested=attested)
+        refuse_cleartext_credentials(
+            scheme,
+            self._headers,
+            self.base_url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         # ASVS 12.2.1: the STOW-RS multipart body carries the DICOM object (PHI), so a cleartext http
         # egress to a non-loopback host is refused even without credentials (loopback byte-identical).
-        self._hop_guard = refuse_cleartext_egress(scheme, self.base_url, attested=attested)
+        self._hop_guard = refuse_cleartext_egress(
+            scheme,
+            self.base_url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         if bool(s.get("verify_tls", True)):
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
             # does no OCSP/CRL revocation (stdlib ssl has none) — refuse an off-loopback production-PHI

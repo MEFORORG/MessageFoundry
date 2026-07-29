@@ -69,6 +69,7 @@ from messagefoundry.transports.rest import (
     _NoRedirectHandler,
     _redact_url,
     capture_response_headers,
+    cleartext_acceptance_from_settings,
     egress_route_from_settings,
     enforce_outbound_length_limits,
     enforce_send_time_length_limits,
@@ -260,11 +261,19 @@ class FhirDestination(DestinationConnector):
         self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
+        # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
+        # secure, and that is accepted (WARN + audit, never a silent ALLOW).
+        accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy (None → byte-identical).
         self._proxy: ProxyConfig | None = egress_route_from_settings(
-            s, dest_scheme=scheme, attested=attested
+            s,
+            dest_scheme=scheme,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -275,10 +284,25 @@ class FhirDestination(DestinationConnector):
             # Pre-emptive Proxy-Authorization (Basic; empty for Digest/none) — tunnelled for https (0126).
             self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.base_url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.base_url, attested=attested)
+        refuse_cleartext_credentials(
+            scheme,
+            self._headers,
+            self.base_url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         # ASVS 12.2.1: the FHIR resource/Bundle body is PHI, so a cleartext http egress to a
         # non-loopback host is refused even without credentials (loopback stays byte-identical).
-        self._hop_guard = refuse_cleartext_egress(scheme, self.base_url, attested=attested)
+        self._hop_guard = refuse_cleartext_egress(
+            scheme,
+            self.base_url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+            connection=config.name,
+        )
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
@@ -302,6 +326,9 @@ class FhirDestination(DestinationConnector):
                 {**self._headers, "Authorization": "Bearer"},
                 self.base_url,
                 attested=attested,
+                cleartext_accepted=accepted,
+                cleartext_reason=accept_reason,
+                connection=config.name,
             )
 
         if bool(s.get("verify_tls", True)):
@@ -774,9 +801,20 @@ class FhirLookupExecutor:
             self._encoding[cname] = str(s.get("encoding", "utf-8"))
             # #200 (ADR 0092): the per-connection insecure-hop attestation keys the posture-keyed refusal.
             attested = bool(s.get("tls_hop_attested", False))
+            # ADR 0153: a FhirLookup connection has no Destination, so its cleartext-acceptance pair
+            # rides the spec settings, written there by the FhirLookup() factory (which load-validates
+            # the flag/reason coherence, exactly as build_outbound_connection does for an outbound).
+            lk_accepted, lk_reason, _ = cleartext_acceptance_from_settings(s)
             # BACKLOG #112/#127/#128 (ADR 0126): per-connection forward/egress proxy for the read hop AND
             # the SMART token endpoint (None → byte-identical). Bypass resolved per target host (#128).
-            proxy = egress_route_from_settings(s, dest_scheme=scheme, attested=attested)
+            proxy = egress_route_from_settings(
+                s,
+                dest_scheme=scheme,
+                attested=attested,
+                cleartext_accepted=lk_accepted,
+                cleartext_reason=lk_reason,
+                connection=cname,
+            )
             base_host = urllib.parse.urlsplit(url).hostname or ""
             proxy_dest = proxy.for_host(base_host) if proxy is not None else None
             proxy_handlers = proxy_dest.opener_handlers() if proxy_dest is not None else ()
@@ -786,10 +824,25 @@ class FhirLookupExecutor:
             # The read sends Authorization (static or SMART) — refuse it over cleartext http.
             token = token_provider_from_settings(s, proxy=proxy)
             check_headers = {**headers, "Authorization": "Bearer"} if token is not None else headers
-            refuse_cleartext_credentials(scheme, check_headers, url, attested=attested)
+            refuse_cleartext_credentials(
+                scheme,
+                check_headers,
+                url,
+                attested=attested,
+                cleartext_accepted=lk_accepted,
+                cleartext_reason=lk_reason,
+                connection=cname,
+            )
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
             # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
-            self._hop_guard[cname] = refuse_cleartext_egress(scheme, url, attested=attested)
+            self._hop_guard[cname] = refuse_cleartext_egress(
+                scheme,
+                url,
+                attested=attested,
+                cleartext_accepted=lk_accepted,
+                cleartext_reason=lk_reason,
+                connection=cname,
+            )
             # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
             # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
             # headers were unbounded on both sides.

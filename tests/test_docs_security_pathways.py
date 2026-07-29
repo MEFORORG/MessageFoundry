@@ -222,8 +222,8 @@ def test_companion_table_covers_the_remaining_strength_dimensions() -> None:
         (
             AuthSettings,
             "ad_session_recheck_seconds",
-            0,
-            "`[auth].ad_session_recheck_seconds` (default **0 = off**)",
+            300,
+            "`[auth].ad_session_recheck_seconds` (default **300 s**)",
         ),
         (
             AuthSettings,
