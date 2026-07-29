@@ -62,6 +62,17 @@ section reference.
 | Enforcement dial | `enforcement` | `enforce` (refuse; `warn` = loud audited loosening) |
 | Posture lever | `handles_real_patient_data` | *derived from environment* |
 | | `production_instance` | *derived from environment* |
+| Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
+| | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
+| Per-connection | `cleartext_accepted` | `false` on every outbound (*connection-scoped* — see below) |
+
+**Three of these do not live in `[security]`.** `[store].aad_bind` and `[auth].ad_session_recheck_seconds`
+sit in their own sections for cohesion, and `cleartext_accepted` is a per-**connection** field, not a
+service setting at all. They are listed and reported here anyway, because the rule is *one shipped
+posture, loosen only* — a deviation the registry cannot see is a second posture by the back door. The
+first two are named by `security_loosenings()` from the loaded `[store]`/`[auth]` sections; the third is
+resolved from the loaded connection graph and passed in by name (see its entry below for exactly which
+surfaces see it, and which cannot).
 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
@@ -267,6 +278,77 @@ trail.
   **data-class** declaration, **orthogonal to `enforcement`** — it does not lower the AI data-scope ceiling or
   re-enable DEBUG-with-PHI logging (both keyed on the retained `production` tier fact, not on `data_class`).
 
+### `[store].aad_bind = false` — at-rest values are no longer bound to their cell
+- **What you lose:** the per-value GCM tag stops covering the `(table, column, row)` cell the value lives
+  in, so a ciphertext **cut and pasted from one cell into another decrypts successfully** instead of
+  failing its auth tag. An attacker (or a bug) with write access to the store can move a body, a TOTP
+  secret or an audit detail into a different row and have the engine accept it as that row's content.
+  Confidentiality is unchanged; what is lost is at-rest **integrity binding** (ASVS 11.3.3).
+- **When acceptable:** when you need the frozen `mfenc:v1` at-rest format specifically — a byte-identical
+  restore target, an external tool that parses the v1 marker, or a forensic comparison against a v1
+  backup. It is also a no-op either way with **no `[store].encryption_key`**: the identity cipher has no
+  tag to bind, so on a keyless store this switch changes nothing and reports nothing.
+- **Compensating controls:** database-level access control (the cell-move attack needs store write
+  access); `[store].cipher_provider = "vault_transit"`, which binds the AAD **unconditionally**
+  (`mfenc:v3`) regardless of this switch; the tamper-evident audit chain, which detects reordering of
+  audit rows independently.
+- **Reversible:** yes, in both directions. Legacy `v1` rows always decrypt (dual-read) and
+  `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, so turning it back on does not strand an
+  existing store. See [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md) (2026-07-28 amendment).
+
+### `[auth].ad_session_recheck_seconds = 0` **with `ad_enabled`** — directory revocation stops propagating
+> **Conditional**, like `allowed_client_networks`. With no directory to reconcile against, `0` is not a
+> weaker choice — it is the only meaningful one — so it is reported as a deviation **only** when
+> `[auth].ad_enabled` is true. The shipped `300` default is inert on a non-AD box (the reconciler also
+> requires an LDAP client), which is why it does not break one.
+- **What you lose:** an AD account that is **disabled or deleted keeps its live engine sessions**. The
+  only remaining bound is the `[security].max_session_hours` cap (12 h) and idle timeout — so a
+  terminated employee can hold an authenticated operator session, with PHI access, for up to half a day
+  after the directory says otherwise. The same loop also revokes on **group-membership change**, so role
+  removals stop propagating too.
+- **When acceptable:** a directory whose service-account bind budget genuinely cannot absorb one bind per
+  signed-in user per interval; a deployment where operator sessions are already short-lived by policy; or
+  a break-glass window while a DC problem is diagnosed. Prefer **raising the interval** (it is floored at
+  60 s, not capped) over turning it off.
+- **Compensating controls:** lower `[security].max_session_hours` and `sign_out_after_idle_minutes` so an
+  orphaned session expires sooner; revoke sessions manually on offboarding; keep the audit trail
+  (`auth.ad_session_revoked`) under review. The reconciler is **fail-open** on DC unavailability by
+  design, so it was never a substitute for these.
+- **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
+
+### `cleartext_accepted = true` on an outbound connection — a declared cleartext hop
+> **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
+> one outbound connection, declared next to the host it governs, with a mandatory `cleartext_reason`
+> recorded for the audit trail. [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
+- **What you lose:** the payload — and any credential that connection carries — crosses that hop
+  **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
+  partial protection here: it is plaintext PHI on the wire for that connection.
+- **When acceptable:** a peer that genuinely cannot do TLS — vendor firmware that predates it, or a
+  transport with no TLS support at all. For `Tcp()` and `X12()` the declaration is **permanent and
+  structural**: those connectors have no `tls` parameter, so there is nothing to migrate to
+  (BACKLOG #311). For MLLP / HTTP / DICOM / SMTP / FTP it should be **transitional** — it names work to
+  be done, and it should disappear when the peer gains TLS.
+- **Do not use it to describe a hop that *is* secure.** If a proxy terminates TLS in front of the hop, or
+  the segment is genuinely isolated, that is `tls_hop_attested` — a different field, with the opposite
+  claim, that ALLOWs the hop silently. The two are deliberately separate so the audit trail can tell a
+  proxy-terminated hop from plaintext on a flat network. Writing an attestation about a hop that is not
+  secure puts a false statement into the one field that exists to be trustworthy when audited.
+- **Compensating controls:** network segmentation and physical/link-layer controls on that specific path;
+  narrow the blast radius by declaring it on the single connection that needs it rather than broadly.
+- **It is never silent:** WARN + a dedicated audit record at **every** connector construction (naming the
+  connection, the host:port and the reason), a `cleartext-accepted` line in `messagefoundry check`
+  listing the **whole** accepted set, and a `cleartext_accepted` entry in `GET /security/posture`'s
+  loosening list naming every declaring connection.
+- **Where it is NOT reported, and why:** `messagefoundry security show` reads a settings file and never
+  loads the connection graph, so it cannot see these declarations; it says so explicitly in its
+  `loosenings_scope` output rather than reporting a settings-only list as if it were the whole posture.
+  The `serve`-time loosening warning fires before the graph is loaded for the same reason — the
+  construction gate's own per-connection WARN covers it moments later, at startup, with more detail.
+- **What it cannot do:** it never yields ALLOW. An accepted hop is always a WARN, so it can never become
+  invisible — an accepted risk that stops being visible has stopped being accepted and started being
+  forgotten. It also cannot relax a hop the ADR does not govern: inbound binds are still decided by the
+  exposed-gates, and revocation / weakened-TLS refusals are unaffected.
+
 ---
 
 ## Standards mapping (ASVS v5.0 · NIST SP 800-53r5 · HIPAA §164.312)
@@ -295,6 +377,9 @@ carried from that drive-to-pass, not re-derived here.**
 | `audit_all_authorization_decisions` | V16 Security Logging and Error Handling | **AU-2** Event Logging · **AU-3** Content of Audit Records | §164.312(b) Audit Controls |
 | `handles_real_patient_data`, `production_instance` (posture lever) | V13 Configuration (risk-based) | **RA-2** Security Categorization · **AC-6** Least Privilege (risk-based tailoring) | §164.308(a)(1) Risk Analysis / Management |
 | `enforcement` (refuse/warn dial) | V13 Configuration (secure defaults) | **CM-6** Configuration Settings · **CM-7** Least Functionality (secure-by-default) | §164.308(a)(1) Risk Analysis / Management |
+| `[store].aad_bind` (at-rest cell binding) | V11 Cryptography | **SC-28(1)** Cryptographic Protection · **SI-7** Software, Firmware, and Information Integrity | §164.312(c)(1) Integrity · §164.312(a)(2)(iv) Encryption and Decryption |
+| `[auth].ad_session_recheck_seconds` (directory revocation propagation) | V7 Session Management · V6 Authentication | **AC-2(3)** Disable Accounts · **AC-12** Session Termination | §164.312(a)(2)(i) Unique User Identification · §164.308(a)(3)(ii)(C) Termination Procedures |
+| `cleartext_accepted` (per-connection declared cleartext hop) | V12 Secure Communication | **SC-8** Transmission Confidentiality and Integrity · **SC-8(1)** Cryptographic Protection | §164.312(e)(1) Transmission Security · §164.312(e)(2)(ii) Encryption |
 
 > The synthetic-vs-PHI relaxation (a synthetic instance keeps the PHI-only gates relaxed) is **risk-based
 > tailoring** keyed on `handles_real_patient_data`: an instance carrying no ePHI is out of scope for the

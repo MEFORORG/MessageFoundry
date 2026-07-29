@@ -1,5 +1,19 @@
 # ADR 0092 — Posture-keyed transport-hop refusal (refuse the insecure PHI hop)
 
+> **AMENDED by [ADR 0153](0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
+> (built 2026-07-28) — decisions 1 and 2.** The precedence below is no longer current: arm 3
+> (`not is_phi → ALLOW`) is **deleted**, so `insecure_hop_disposition` no longer takes `is_phi`, and the
+> `audited_opt_out` arm went with it, so `MEFOR_ALLOW_INSECURE_TLS` can no longer influence a
+> cleartext-hop decision. The live precedence is: loopback → ALLOW, `hop_attested` → ALLOW,
+> `cleartext_accepted` → WARN, not `enforcing` → WARN, else REFUSE.
+>
+> Everything else in this ADR **stands**: the one-authority structure, the loopback carve-out
+> (decision 1 arm 1), the attestation (decision 3), the two-layer construction/send gating (decision 4)
+> and the no-loosen rule (decision 5) — which 0153 preserves *by construction*, since the only deleted
+> arm returned ALLOW. `MEFOR_ALLOW_INSECURE_TLS` itself is unhooked, not deleted: it survives for the
+> non-connection cells (engine→store TLS, LDAPS, the webhook alert sink, the AI broker, the `[logging]`
+> forwarder and the API PHI-read serve hop) that have nowhere to carry a per-connection declaration.
+
 **Status:** Accepted (2026-07-11) — owner-ratified design (a prior design pass + an adversarial security
 critic set the decisions below; they are not re-litigated here). CORE built (BACKLOG #200): the shared
 authority + escape clamp + per-hop attestation field + posture threading. The transport **cells** that

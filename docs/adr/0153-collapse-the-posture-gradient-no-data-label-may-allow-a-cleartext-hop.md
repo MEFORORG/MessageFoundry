@@ -1,8 +1,9 @@
 # ADR 0153 — Collapse the posture gradient: no data label may allow a cleartext hop
 
 **Status:** Accepted (2026-07-25) -- owner-ratified after an adversarial review returned REWORK on the first
-draft; the three open questions the rework raised were answered the same day and are folded in below. NOT yet
-built. Amends
+draft; the three open questions the rework raised were answered the same day and are folded in below.
+**BUILT 2026-07-28** (see *Build notes* at the end for the three implementation questions this ADR left
+open and how they were resolved). Amends
 [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decisions 1 and 2 —
 specifically the `is_phi` ALLOW arm and the escape clamp. Keeps 0092's one-authority structure, its loopback
 carve-out, its attestation (decision 3), its two-layer construction/send gating (decision 4) and its
@@ -211,3 +212,60 @@ hop is secure" about a hop that is not, and the attestation's only value is bein
 **Delete `MEFOR_ALLOW_INSECURE_TLS` outright.** Cleanest end state, rejected for now — six non-connection
 cells have no other expressible escape, and it would break roughly 17 CI legs and the container manifests in
 a change that is supposed to be about the hop authority.
+
+## Build notes (2026-07-28)
+
+Built as specified. Three questions the ADR did not settle had to be answered to implement it; each is
+recorded here because leaving them to an implementer's silent choice is exactly how a scope decision
+becomes an accident.
+
+**1. `rest._shipped_strict_disposition`'s no-loosen floor is re-keyed on `cleartext_accepted`.** The
+floor read `if disposition is WARN and not audited_opt_out: return REFUSE`, which is how
+`MEFOR_ALLOW_INSECURE_TLS` relaxed an HTTP-family cleartext hop. A naive port would have left
+`if disposition is WARN: return REFUSE`, converting decision 2's WARN straight back to REFUSE and making
+`cleartext_accepted` **inert** for REST, SOAP, FHIR, DICOMweb, the HTTP credential cells and the
+`fhir_lookup` read path — the largest cleartext-egress family in the product, and the only one where the
+declaration is a genuine escape (`Tcp()`/`X12()` never reach that cell). The floor is now keyed on
+`cleartext_accepted`, which preserves 0092 §5 exactly (a hop reaching WARN via the non-enforcing dial
+alone is still floored to REFUSE, as today) and makes decision 2 effective where it matters. The stated
+side effect: an instance that set `MEFOR_ALLOW_INSECURE_TLS` to cross a non-enforcing HTTP cleartext hop
+no longer can. That is a **tightening**, and it is what decision 5 asks for — it also stops the variable
+being alive on HTTP while dead on raw TCP. The out-of-scope table's note about this function means its
+*floor* is not being reworked, not that the HTTP family keeps a data-label carve-out.
+
+**2. The two out-of-scope *delegating* callers restate the deleted arm explicitly.**
+`phi_read_hop_disposition` and `settings.forward_hop_disposition` are the only out-of-scope consumers
+that **call** the authority rather than reading `HopPosture` directly, so dropping `is_phi` would have
+silently taken their synthetic-ALLOW arm with it — turning a synthetic instance's plaintext-UDP
+`[logging]` forwarder and its non-loopback API PHI-read hop into refusals under `enforce`, contradicting
+this ADR's own "keeps its inputs and its behaviour". Each now carries `if not posture.is_phi: return
+ALLOW` before delegating, and passes the clamped global escape as the new arm-3 argument (byte-identical
+— arm 3 occupies exactly the slot the old arm 4 did). Both are non-connections with nowhere to carry a
+declaration, so refusing them would create a deviation the loosening registry cannot express. Restated,
+not inherited: the scope limit is now a written decision at the one place it applies.
+
+**3. `cleartext_accepted` reaches the CREDENTIAL hops as well as the body hops.** The ADR is silent, and
+putting a password on the wire is a materially worse claim than putting a body on it. It is threaded
+anyway — to HTTP Digest, the OAuth2/SMART token endpoints, the forward-proxy credential and the SOAP
+WS-Security / body-secret cells — because the alternative leaves an operator whose legacy peer needs
+Basic auth over a cleartext segment with no honest declaration, and therefore pushes them toward writing
+a **false `tls_hop_attested`**: precisely the defect this ADR exists to remove. SMTP AUTH over cleartext
+remains refused **outright** in `transports/email.py`; that is a hard refusal, not a posture decision,
+and is untouched.
+
+**Also built, beyond the decision list.** The retro-fitted flag-implies-reason rule on
+`tls_hop_attested` (decision 2) reaches `[logging].forward_hop_attested` too — it shares
+`_check_hop_attestation`, is documented as "the `[logging]` sibling", and `docs/PHI.md` already described
+its reason as mandatory, so scoping the rule away from it would have left a documented guarantee
+unenforced exactly where an auditor would look. `mllp.InsecureHopGuard`'s and
+`rest._enforce_shipped_hop`'s attestation-audit branches dropped their `posture.is_phi` conjunct: with
+the authority no longer reading the label, gating the audit on it would have silenced the record for the
+very hops that newly depend on an attestation to cross.
+
+**Visibility surfaces (owner requirement).** A declared acceptance appears in: a WARN plus a dedicated
+audit record at **every** connector construction; the `cleartext-accepted` line of `messagefoundry
+check`, which lists the whole accepted set; and the `cleartext_accepted` entry in
+`security_loosenings()` / `GET /security/posture`, naming every declaring connection. Two surfaces
+cannot see it and say so rather than reporting a subset: `messagefoundry security show` (reads a
+settings file, never loads the graph) and the `serve`-time loosening warning (fires before the graph is
+loaded — the construction gate's per-connection WARN covers it moments later).
