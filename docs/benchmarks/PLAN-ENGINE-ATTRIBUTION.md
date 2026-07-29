@@ -279,5 +279,13 @@ That is not a consolation prize. **It retires the interpretation that drove C4, 
 
 - **Close #208** ("fix the per-PID engine CPU collector") **as superseded.** `py_all_cpu%` already gives an admissible aggregate engine-CPU verdict (≤0.36 cores/shard). Per-PID would refine a number we know is small.
 - **#220 stays P3.** It lives in `connscale`, which `shardcert` does not use, so it cannot block a shardcert-based throughput spec.
+
+> **⚠️ Both actions above are DONE (recorded 2026-07-29) — they are no longer open work.** **#208 is ✅
+> CLOSED** (shipped 2026-07-20; its only residual is *off-repo* measurement, so no in-repo change can
+> close it) and **#220 is ✅ SHIPPED**, not merely still-P3: `ProcSample.cpu_pids` records the exact PID
+> set summed per tick ([`harness/load/connscale/probe.py:57-70,261`](../../harness/load/connscale/probe.py))
+> with falsifiers in [`tests/test_connscale_cpu_probe.py`](../../tests/test_connscale_cpu_probe.py).
+> Left in place rather than deleted because this is a dated plan and its reasoning stands; only the
+> status is stale. Do not schedule either as a build.
 - **New:** adopt `MEMORY_OPTIMIZED TEMPDB_METADATA = ON` (§9).
 - **New:** the three harness defects in §4.2 (i)–(iii) are real bugs and should be fixed whatever happens to this plan.
