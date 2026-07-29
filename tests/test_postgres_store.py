@@ -264,11 +264,10 @@ async def test_complete_with_response_parity(store) -> None:
 
 async def test_record_ack_sent_aa_body_encrypted_at_rest_pg(store) -> None:
     # (1) An AA ack_body is persisted only on an ENCRYPTED store, and on disk it is ciphertext: it
-    # carries the v1 marker, is not the plaintext AA frame, and decrypts back to exactly it. A second,
-    # ciphered handle is needed because the fixture store is the identity cipher (unencrypted) — mirrors
-    # the existing at-rest encryption tests in this file.
+    # carries the mfenc: marker, is not the plaintext AA frame, and decrypts back to exactly it. A
+    # second, ciphered handle is needed because the fixture store is the identity cipher (unencrypted)
+    # — mirrors the existing at-rest encryption tests in this file.
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
@@ -290,14 +289,22 @@ async def test_record_ack_sent_aa_body_encrypted_at_rest_pg(store) -> None:
         assert ack.body == _ACK_AA  # decrypted round-trip
         # Raw column read (the ciphered handle's _fetchone does NOT decrypt) → ciphertext on disk. Assert
         # the deterministic decrypt round-trip, NOT `"MSA" not in <b64>` (base64 can contain that run).
-        disk = (
-            await s._fetchone(
-                "SELECT body FROM response WHERE message_id=$1 AND kind='ack_sent'", mid
-            )
-        )["body"]
-        assert disk.startswith(PREFIX)  # stored under the encrypted marker, not in the clear
+        # destination_name + response_seq come back alongside the body: they are the row half of the
+        # cell AAD the store binds it under (postgres.py record_ack_sent), and destination_name is a
+        # SENTINEL ("\x1fack:" + inbound_name), so read it rather than reconstructing it here.
+        row = await s._fetchone(
+            "SELECT body, destination_name, response_seq FROM response"
+            " WHERE message_id=$1 AND kind='ack_sent'",
+            mid,
+        )
+        disk = row["body"]
+        assert disk.startswith(MARKER_PREFIX)  # stored under the encrypted marker, not in the clear
         assert disk != _ACK_AA
-        assert cipher.decrypt(disk) == _ACK_AA  # and it genuinely encrypts the AA frame
+        # Decrypt under the SAME cell AAD the store wrote with (ASVS 11.3.3 / ADR 0019): a v2 value is
+        # bound to its (table, column, row) cell, so a bare decrypt fails closed on one. Harmless on a
+        # v1 value — that reader ignores the caller's aad by design (dual-read).
+        aad = cell_aad("response", "body", mid, row["destination_name"], row["response_seq"])
+        assert cipher.decrypt(disk, aad=aad) == _ACK_AA  # and it genuinely encrypts the AA frame
     finally:
         await s.close()
 
@@ -2141,7 +2148,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
     """EF-3: summary/metadata (direct MRN + patient name) are ciphered at rest on Postgres and
     decrypt on the detail + tracking-list read paths — parity with the SQLite suite."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
@@ -2153,8 +2160,8 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         )
         # at rest: ciphertext, with no MRN/name/site visible in the blob.
         row = await s._fetchone("SELECT summary, metadata FROM messages WHERE id=$1", mid)
-        assert row["summary"].startswith(PREFIX) and "999001" not in row["summary"]
-        assert row["metadata"].startswith(PREFIX) and "WESTWING" not in row["metadata"]
+        assert row["summary"].startswith(MARKER_PREFIX) and "999001" not in row["summary"]
+        assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
         assert rec["summary"] == summary and rec["metadata"] == metadata

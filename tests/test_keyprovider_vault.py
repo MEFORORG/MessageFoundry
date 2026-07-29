@@ -79,6 +79,8 @@ def test_vault_active_key_unwraps_and_decrypts_without_rotation(
     assert transit.calls == [(_TRANSIT_KEY, _WRAPPED_DEK)]
 
     # A row written under KEY_A decrypts with the provider's key — NO re-encryption, mfenc:v1 unchanged.
+    # DELIBERATELY v1 (do not sweep to MARKER_PREFIX): "an existing v1 row survives a KeyProvider swap
+    # byte-for-byte" is the claim, so the fixture being v1 is the premise of the test.
     token = make_cipher(KEY_A).encrypt(ADT)
     assert token.startswith(PREFIX)
     cipher = make_cipher(active, provider.retired_keys())

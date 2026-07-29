@@ -180,21 +180,36 @@ practical, or expect to re-dismiss every anchor below it. The two workflow fixes
 deliberately made line-neutral — one line deleted, one comment line added — which is why their rationale
 lives in `tests/test_ci_venv_pinning.py`'s module docstring rather than in the workflow.
 
-### Recommended hardening — identified, NOT done
+### Recommended hardening
 
 Recorded here because a `won't fix` dismissal makes an item invisible, and these were found *while*
-justifying those dismissals. None of them closes its alert; each reduces residual risk.
+justifying those dismissals. **None of them closes its alert** (see §3 — a version pin does not satisfy
+`PinnedDependenciesID`); each reduces residual risk.
 
-| Where | Recommendation | Why it matters |
-|---|---|---|
-| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
-| `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
-| `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
-| `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | Contained (disposable venv, version-compare only), but free to pin. |
-| `dependabot-auto-merge.yml` `security-events: read` | Remove the scope | Dead. Its comment claims it reads Dependabot alerts, but the gate calls the **global** `/advisories` endpoint, which is repo-scope-independent. Verified; least-privilege hygiene only. |
+**Status update 2026-07-29 — the four `release.yml` rows below are DONE.** They were built together
+with the guard that keeps them, and the "owner decision, not a drive-by" note that used to close this
+section is retired for them: it argued the pins are unvalidatable before a tag, and the answer was to
+make them PR-visible instead. The `dependabot-auto-merge.yml` scope row is still open.
 
-`sigstore`/`build`/`packaging` pins touch the **release critical path**, which no PR CI leg executes —
-see below — so they are an owner decision, not a drive-by.
+| Where | Recommendation | Status | Why it matters |
+|---|---|---|---|
+| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | **Done** — `sigstore==4.4.0`. Deliberately *not* the newer 4.5.0: `.github/dependabot.yml` sets `cooldown.default-days: 5`, 4.5.0 was <48 h old, and pinning the *signing* toolchain fresher than the repo's own update policy allows would invert that policy at the highest-privilege point. Re-evaluate once it ages out. | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
+| `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | **Done** — `pip==26.1.2 build==1.5.0`, in **both** the engine and harness build steps. | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
+| `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | **Done, both halves** — pin *derived from `constraints.lock`* (it is a DEP-1 transitive, so a literal would rot), and moved into `/tmp/harnesssmoke` mirroring `/tmp/relsmoke`. | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
+| `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | **Done** — same `constraints.lock`-derived pin. | Contained (disposable venv, version-compare only), but free to pin. |
+| `dependabot-auto-merge.yml` `security-events: read` | Remove the scope | **Open** | Dead. Its comment claims it reads Dependabot alerts, but the gate calls the **global** `/advisories` endpoint, which is repo-scope-independent. Verified; least-privilege hygiene only. |
+
+Two things the pins deliberately do **not** do. They pin only the **top** of each install —
+`sigstore`'s ~30 transitive dependencies still float at signing time — and, per §3, they move the
+Scorecard finding not at all. **Option B (a PEP 735 `release-tools` group flowing into `uv.lock` and a
+fifth hashed export) remains the only thing that closes the alert**, and remains an owner decision
+because it adds a lock artifact to the DEP-1 machinery.
+
+The `packaging` pins are **fail-closed on a tag**: `release.yml` `sed`s the version out of
+`constraints.lock` and `exit 1`s if the line is gone. `packaging` is not a declared dependency — it
+survives in that lock only as a `pytest` transitive — so
+`tests/test_ci_venv_pinning.py::test_constraints_lock_still_carries_the_packaging_pin` is the PR-time
+canary for a check that would otherwise first fire during a release.
 
 ### What no test can see
 
@@ -203,4 +218,6 @@ Both workflow fixes land on paths **no PR CI leg runs**: `security.yml`'s SBOM j
 swallowed), and `release.yml` runs only on a tag push. So the first real execution of either edit is a
 nightly or **a release**. `tests/test_ci_venv_pinning.py` is a text guard over the workflow source, not
 an execution. Before the next tag, run `security.yml`'s sbom job via `workflow_dispatch` and read its
-log — the install command there is byte-identical to `release.yml`'s.
+log — the install command there is byte-identical to `release.yml`'s, and
+`test_sbom_install_is_byte_identical_in_release_and_security` now enforces that identity, because the
+dry-run is evidence about the release step only for as long as the two commands are the same command.

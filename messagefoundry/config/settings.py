@@ -904,6 +904,30 @@ class ApiSettings(_Section):
         # Validate the DECLARED Posture-B proxy TLS floor for internal coherence (#200, ASVS 11.6.2) —
         # an attestation, but a *coherent* one (a NIST version floor; forward-secret ciphers if named).
         validate_proxy_tls_posture(self.proxy_tls_min_version, self.proxy_tls_ciphers)
+        # ASVS 3.4.1 — an IP-literal public_origin under a declared TLS posture makes HSTS INERT.
+        # RFC 6797 §8.1.1: a UA "MUST NOT note" an IP-literal host as a Known HSTS Host, so the
+        # Strict-Transport-Security header the engine emits for such an origin is required to be
+        # DISCARDED by every conforming browser. The control would report success while doing nothing —
+        # the exact shape this codebase keeps finding and refusing to ship.
+        #
+        # Checked HERE rather than in the public_origin field validator because the field alone cannot
+        # see the posture: a bare http:// loopback origin with no TLS declared is a legitimate dev
+        # flow, and only the model knows whether a TLS posture is in play.
+        if self.public_origin and (self.tls_terminated_upstream or self.tls_enabled):
+            host = urlsplit(self.public_origin).hostname or ""
+            try:
+                ipaddress.ip_address(host)
+            except ValueError:
+                pass  # a DNS name — HSTS is notable, nothing to refuse
+            else:
+                raise ValueError(
+                    f"[api].public_origin {self.public_origin!r} is an IP literal while a TLS posture "
+                    "is declared. RFC 6797 §8.1.1 forbids a browser from noting an IP-literal host as "
+                    "an HSTS host, so the Strict-Transport-Security header would be silently "
+                    "discarded and the console would have no HTTPS-downgrade protection (ASVS 3.4.1). "
+                    "Use a DNS hostname for the console — a dedicated subdomain, since "
+                    "includeSubDomains on a hospital apex forces https on every sibling host."
+                )
         return self
 
 
