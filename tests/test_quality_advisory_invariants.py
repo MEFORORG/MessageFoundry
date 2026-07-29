@@ -326,6 +326,56 @@ def test_the_mutation_other_count_is_not_a_remainder(code: str) -> None:
     )
 
 
+def test_the_complexity_delta_reports_its_own_outcome(workflow: dict) -> None:
+    """The delta is the POINT of the complexity job on a PR, and the receipt could not see it.
+
+    `--show-files` proves ruff enumerated files, which is true whether or not the delta ran — so a
+    delta that bailed on an unresolvable merge base left a green `measured` receipt and vanished.
+    That is this workflow's own failure mode reproduced inside its liveness control, so the delta
+    now writes an outcome marker and the receipt rules on it.
+    """
+    steps = {s.get("id"): s for s in workflow["jobs"]["complexity"]["steps"]}
+    delta = next(
+        s
+        for s in workflow["jobs"]["complexity"]["steps"]
+        if "c901_delta.py" in (s.get("run") or "")
+    )
+
+    # Split at the delta invocation: everything before it is the bail path, everything after is the
+    # success path. BOTH must write the marker, or its absence is ambiguous. Counting occurrences is
+    # NOT enough — the bail path writes twice on its own, so a count check passes even with the
+    # success-path marker deleted. (Found by negative-probing this very assertion.)
+    bail, _, success = delta["run"].partition("c901_delta.py")
+    assert "c901-delta.env" in bail, "the merge-base bail path must record that it bailed"
+    assert "c901-delta.env" in success, (
+        "the success path must record completion — written last, so its absence proves the delta died"
+    )
+
+    receipt = steps["receipt"]["run"]
+    assert "c901-delta.env" in receipt, "the receipt must consult the delta's outcome"
+    assert "--status failed" in receipt, "a vanished delta must be reported as a dead gate on a PR"
+
+
+def test_the_delta_marker_reason_is_quoted(code: str) -> None:
+    """The receipt SOURCES the marker file. An unquoted value containing spaces parses as a command
+    and leaves the variable unset — which silently reported "no reason recorded" and threw away the
+    only useful diagnostic. Found by executing the receipt shell, not by reading it."""
+    assert re.search(r"C901_DELTA_REASON='[^']+'", code), (
+        "the reason must be single-quoted so `source` yields the whole string"
+    )
+
+
+def test_the_non_pr_path_is_not_treated_as_a_dead_delta(workflow: dict) -> None:
+    """On cron/dispatch the delta legitimately does not run and the whole-repo triage IS the
+    measurement. Failing there would fire on good news, which gets a check muted."""
+    steps = {s.get("id"): s for s in workflow["jobs"]["complexity"]["steps"]}
+    env = steps["receipt"].get("env") or {}
+    assert any("event_name" in str(v) for v in env.values()), (
+        "the receipt must know whether this is a PR before ruling the delta missing"
+    )
+    assert "does not apply" in steps["receipt"]["run"]
+
+
 def test_the_killed_count_is_derived_not_grepped(code: str) -> None:
     """`mutmut results` lists ONLY the mutants worth looking at (survived / no tests / timeout /
     suspicious). Killed mutants are never listed, so counting `': killed'` returns 0 on a perfectly
