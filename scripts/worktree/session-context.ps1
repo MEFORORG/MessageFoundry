@@ -88,6 +88,27 @@ if ($root) {
                 }
                 $lines += "  Full roster:  pwsh -NoProfile -File scripts\coord\presence.ps1 -All"
             }
+
+            # WHAT they are building, not just where they are. The roster above prevents you editing
+            # the same FILE; this is the only thing that prevents you building the same THING. That is
+            # the collision that actually cost this project rework -- three sessions independently
+            # fixing one npm advisory, in DIFFERENT files, so nothing file-shaped could have caught it.
+            # Sourced from each session's own task list, so no one has to declare anything.
+            $overlap = Join-Path $PSScriptRoot "..\coord\overlap.ps1"
+            if (Test-Path $overlap) {
+                $inflight = @()
+                try { $inflight = @(& $overlap -Json | ConvertFrom-Json) } catch { $inflight = @() }
+                $busy = @($inflight | Where-Object { $_.Live -and (@($_.Work).Count -gt 0 -or @($_.Files).Count -gt 0) })
+                if ($busy.Count -gt 0) {
+                    $lines += ""
+                    $lines += "WHAT THEY ARE BUILDING -- check before you start, so you don't build it twice:"
+                    foreach ($b in $busy) {
+                        $lines += "  $($b.Short) [$($b.Branch)] -- $(@($b.Files).Count) file(s) changed"
+                        foreach ($w in @($b.Work | Select-Object -First 3)) { $lines += "      $w" }
+                    }
+                    $lines += "  Everything in flight:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
+                }
+            }
         }
 
         # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
