@@ -1676,14 +1676,33 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived by slicing the
     approvals block out of the source and asserting it contains no ``return 2``, so promoting it to a
     refusal later reds the doc.
+
+    The slice is taken by **indentation**, not by "up to the next comment banner". The banner boundary
+    was not reference-invariant: it measured whatever happened to sit between the arm and the next
+    banner, so inserting an unrelated refusal after the arm (the ASVS 12.1.1 TLS-floor probe did
+    exactly this) turned the guard red and blamed the approvals arm for a ``return 2`` that was not in
+    it. A gate whose answer depends on unrelated neighbouring code is not measuring its subject.
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
     marker = "if admin_exposed and not settings.approvals.enabled"
-    start = source.index(marker)
-    tail = source[start:]
-    # the arm ends at the next top-level comment banner in the serve ladder
-    end = tail.index("\n    # ---", 1)
-    arm = tail[:end]
+    # Slice from the START OF THE LINE, not from the marker itself: the `if`'s own indentation is what
+    # defines its body, and `source.index` lands past the leading whitespace.
+    start = source.rindex("\n", 0, source.index(marker)) + 1
+    lines = source[start:].splitlines(keepends=True)
+    # The arm is the `if` statement and its own body, which is anything indented deeper than the `if`.
+    body_indent = " " * (len(lines[0]) - len(lines[0].lstrip()) + 1)
+    arm_lines = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and not line.startswith(body_indent):
+            break
+        arm_lines.append(line)
+    arm = "".join(arm_lines)
+    # Liveness receipt: a boundary bug that produced a 1-line slice would make the assertion below
+    # unfailable, so prove the slice actually captured the arm's body before trusting it.
+    assert "warning:" in arm and len(arm_lines) > 5, (
+        f"the arm slice looks wrong ({len(arm_lines)} lines) — the assertion below would pass "
+        f"vacuously. Slice was:\n{arm}"
+    )
     assert "return 2" not in arm, (
         "the approvals-at-exposure arm now REFUSES to start. Move its row out of the WARN action in "
         "docs/SECURITY.md's Table A (and re-check `_CONTEXT_TABLE_A_ROWS`) in the same change."
