@@ -24,6 +24,16 @@ param(
     [string]$HookPath = (Join-Path $env:USERPROFILE '.claude-hooks\worktree-selfheal.ps1')
 )
 $ErrorActionPreference = 'Stop'
+
+# Its sibling install-gate.ps1 has refused to run inside Claude Code since it shipped; this installer
+# never did, and it is the MORE privileged of the two. It wires a user-scope SessionStart hook that runs
+# `git checkout` on the shared primary unattended, and its canonical source is $PSScriptRoot -- the copy
+# in the calling session's own worktree, which that session may freely edit. The higher-privilege
+# component was the less protected one.
+if ($env:CLAUDECODE -eq '1') {
+    throw "Refusing to run inside Claude Code. This installs a user-scope hook that repairs the shared primary unattended, from a script the calling session can edit. Run it from a plain pwsh terminal."
+}
+
 if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config dir not found: $ConfigDir" }
 $settingsPath = Join-Path $ConfigDir 'settings.json'
 

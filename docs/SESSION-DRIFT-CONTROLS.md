@@ -444,9 +444,11 @@ analysis must be redone.
 | B4 | **Mostly done** | Per-line scanning, continuation folding, interpreter-argument recursion, quoted spans blanked. **Not** done: the split helper is still not shared with `block-blanket-git-stage.ps1`, so the two hooks can still disagree about what a command is. |
 | B5, B8 | **Done** | Rules 1a and 3c: the gate's own script and allowlist are governed, and the `git config` keys that disarm the shared repo are denied from any worktree. **Not** done: `~/.claude/settings.json` is deliberately left writable — the `update-config` skill exists to edit it, and blocking it would break a supported workflow to close a hole needing a far more deliberate act. |
 | B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
-| B6, B10, B11 | **Not started** | B6 (worktree-first entry point) has the largest durable effect and no code in it. |
+| B10 | **Done** | One allowlist, shared by the gate and the backstop, with the legacy path kept as a fallback so a version-skewed installed copy cannot silently disarm the backstop. `install-selfheal.ps1` gained the `CLAUDECODE` refusal its sibling always had — the *higher*-privilege installer was the unprotected one. |
+| B6 | **Started** | `.worktreeinclude` added, so the leak gate's gitignored token list reaches every worktree Claude Code creates itself (`--worktree`, desktop sessions, `isolation: worktree` subagents) — previously only `new.ps1`'s own worktrees got it, and a fresh first-party worktree could not commit at all. **Not** done: worktree-first as the documented default entry point, and `new.ps1` calling `git worktree lock` while a session is live. |
+| B11 | **Not started** | Verb and teardown holes (G9, G11). |
 
-Remaining order: B6, then B10, B11, then the B1/B3/B4 remainders.
+Remaining order: the rest of B6, then B11, then the B1/B3/B4 remainders.
 
 Each shipped fix was proved to catch its own regression by mutation — five mutations applied to the shipped
 script one at a time, all five went red — and an adversarial review of the first attempt found three
