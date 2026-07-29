@@ -14,7 +14,11 @@ import ssl
 
 from messagefoundry.auth.trust_anchors import api_client_anchor_spec, enforce_anchor
 from messagefoundry.config.settings import ApiSettings
-from messagefoundry.config.tls_policy import harden_kex_groups, harden_verify_flags
+from messagefoundry.config.tls_policy import (
+    harden_cipher_suites,
+    harden_kex_groups,
+    harden_verify_flags,
+)
 
 __all__ = ["build_api_ssl_context"]
 
@@ -49,6 +53,7 @@ def build_api_ssl_context(api: ApiSettings, *, enforcing: bool = True) -> ssl.SS
     if api.tls_ciphers:
         ctx.set_ciphers(api.tls_ciphers)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where the runtime supports it (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="API/UI listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 cert validation (ASVS 12.1.4)
     client_ca = api_client_anchor_spec(api)
     if client_ca is not None:

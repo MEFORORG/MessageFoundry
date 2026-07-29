@@ -59,6 +59,7 @@ from messagefoundry.config.settings import (
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     build_verifying_client_context,
+    harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
     relax_verify_expiry,
@@ -210,6 +211,9 @@ def _ftps_ssl_context(
         pw_arg = key_password if key_password is not None else (lambda: b"")
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(
+        ctx, connector="remote-file (FTPS) connection"
+    )  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
         harden_verify_flags(ctx)
         # #129 (ADR 0094): opt-in granular expiry-only relaxation — accept an expired server cert while

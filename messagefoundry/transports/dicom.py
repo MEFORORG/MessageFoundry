@@ -59,6 +59,7 @@ from messagefoundry.config.models import ConnectorType, Destination, Source
 from messagefoundry.config.tls_policy import (
     TrustAnchorPolicy,
     build_verifying_client_context,
+    harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
     relax_verify_expiry,
@@ -141,6 +142,7 @@ def _server_ssl_context(s: dict[str, Any]) -> ssl.SSLContext | None:
         ctx.load_verify_locations(cafile=str(ca))
         ctx.verify_mode = ssl.CERT_REQUIRED
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="DICOM listener")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
     return ctx
 
@@ -439,6 +441,7 @@ def _client_ssl_context(
         )
         ctx.load_cert_chain(certfile=str(cert), keyfile=str(key) if key else None, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="DICOM destination")  # assert forward secrecy (ASVS 12.1.2)
     harden_verify_flags(ctx)  # strict RFC 5280 validation of the peer's server cert (ASVS 12.1.4)
     # #129 (ADR 0094): opt-in granular expiry-only relaxation — honour an expired downstream PACS cert
     # while STILL validating chain + hostname (verification stays ON; default off = byte-identical).

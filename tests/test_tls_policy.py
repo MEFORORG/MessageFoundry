@@ -8,6 +8,7 @@ import inspect
 import ssl
 import types
 from itertools import product
+from pathlib import Path
 
 import pytest
 
@@ -417,3 +418,126 @@ def test_active_hop_posture_stamps_and_restores() -> None:
             assert current_hop_posture() is None
         assert current_hop_posture() is posture
     assert current_hop_posture() is None
+
+
+# --- ASVS 12.1.2: forward secrecy is ASSERTED on every shipped context, not inherited ---------------
+
+
+def test_every_shipped_context_shape_negotiates_only_forward_secret_suites() -> None:
+    """The evidence an assessor actually wants: the suite count and the non-FS count, PRINTED.
+
+    ``validate_tls_ciphers`` already rejects a *configured* string that admits static RSA/DH — but it
+    only fires when an operator sets the knob. A context built without one inherits the interpreter's
+    default list and nothing checked it. That inheritance-without-assertion is the real 12.1.2
+    residual (the residual of record overstates it as "no cipher knob at all", which is false).
+
+    This prints rather than merely asserting because a green dot proves nothing to a reader: the
+    output states what was examined, so "0 non-forward-secret" is a measurement rather than a claim.
+    """
+    from messagefoundry.config.tls_policy import _is_forward_secret
+
+    shapes = {
+        "PROTOCOL_TLS_SERVER": ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER),
+        "default(SERVER_AUTH)": ssl.create_default_context(ssl.Purpose.SERVER_AUTH),
+        "default(CLIENT_AUTH)": ssl.create_default_context(ssl.Purpose.CLIENT_AUTH),
+        "PROTOCOL_TLS_CLIENT": ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT),
+    }
+    findings: list[str] = []
+    examined = 0
+    for name, ctx in shapes.items():
+        suites = ctx.get_ciphers()
+        non_fs = sorted({str(c.get("name", "?")) for c in suites if not _is_forward_secret(c)})
+        print(f"{name}: {len(suites)} suites examined, {len(non_fs)} non-forward-secret")
+        assert suites, f"{name} resolved to NO suites — the measurement is vacuous"
+        examined += 1
+        if non_fs:
+            findings.append(f"{name}: {non_fs}")
+    # Deliberately NOT capsys: capturing the report would verify it was produced while hiding it from
+    # the reader, which defeats the point. pytest shows these lines with -s (and on failure), so
+    # `pytest -s -k forward_secret` IS the evidence artefact.
+    assert examined == len(shapes), f"expected {len(shapes)} shapes measured, got {examined}"
+    assert not findings, (
+        f"shipped TLS context shape(s) would negotiate non-forward-secret suites: {findings}. "
+        f"A suite admitting static RSA/DH lets a future key compromise decrypt recorded PHI traffic."
+    )
+
+
+def test_harden_cipher_suites_raises_on_a_non_forward_secret_context() -> None:
+    """The assertion must actually fire — proven by building a context that violates it rather than
+    by trusting that it would.
+
+    Mutation: delete the raise in ``harden_cipher_suites``. Red: DID NOT RAISE. Without this test the
+    function is only ever exercised on contexts that pass, so it could be a no-op and every call site
+    would still look green.
+    """
+    from messagefoundry.config.tls_policy import harden_cipher_suites
+
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    try:
+        ctx.set_ciphers("AES256-SHA:@SECLEVEL=0")  # static-RSA kx, no forward secrecy
+    except ssl.SSLError:
+        pytest.skip(
+            "this OpenSSL build cannot enable a static-RSA suite — nothing to assert against"
+        )
+    if all(_fs(c) for c in ctx.get_ciphers()):  # pragma: no cover - build-dependent
+        pytest.skip("this OpenSSL build resolved the static-RSA request to FS suites only")
+    with pytest.raises(ValueError, match="non-forward-secret"):
+        harden_cipher_suites(ctx, connector="test listener")
+
+
+def _fs(cipher: object) -> bool:
+    from messagefoundry.config.tls_policy import _is_forward_secret
+
+    assert isinstance(cipher, dict)
+    return _is_forward_secret(cipher)
+
+
+def test_every_context_that_pins_kex_groups_also_asserts_forward_secrecy() -> None:
+    """Call-site coverage — the half the function-level tests cannot see.
+
+    Mutation-proven gap: deleting ``harden_cipher_suites`` from one MLLP context site left the whole
+    TLS suite GREEN, because the other tests exercise the FUNCTION, not its wiring. A new listener or
+    destination could ship a context with no forward-secrecy assertion and nothing would notice —
+    which is precisely how the original 12.1.2 residual arose (inheritance without assertion).
+
+    Derived, not a hardcoded site list: ``harden_kex_groups(ctx)`` already marks every place the
+    engine builds and hardens a TLS context, so the two must be co-located. A new context that pins
+    groups but skips the assertion fails here.
+    """
+    pkg = Path(tls_policy.__file__).resolve().parent.parent
+    problems: list[str] = []
+    for path in sorted(pkg.rglob("*.py")):
+        if path.name == "tls_policy.py":
+            continue  # the definitions themselves
+        text = path.read_text(encoding="utf-8")
+        kex = [
+            n
+            for n, ln in enumerate(text.splitlines(), 1)
+            if "harden_kex_groups(" in ln and not ln.lstrip().startswith(("#", "*"))
+        ]
+        assertions = text.count("harden_cipher_suites(")
+        if kex and assertions < len(kex):
+            rel = path.relative_to(pkg.parent).as_posix()
+            problems.append(
+                f"{rel}: {len(kex)} kex-pin site(s) at lines {kex}, {assertions} assertion(s)"
+            )
+    assert not problems, (
+        f"TLS context site(s) that pin key-exchange groups but do NOT assert forward secrecy: "
+        f"{problems}. Every built context must be checked (ASVS 12.1.2) — the suite list is inherited "
+        f"from the interpreter unless something asserts it."
+    )
+
+
+def test_the_call_site_scan_examined_real_files() -> None:
+    """Liveness receipt for the scan above: it is a `not found` over an rglob, so a moved package or a
+    changed helper name would make it pass over nothing."""
+    pkg = Path(tls_policy.__file__).resolve().parent.parent
+    sites = sum(
+        1
+        for p in pkg.rglob("*.py")
+        for ln in p.read_text(encoding="utf-8").splitlines()
+        if "harden_kex_groups(ctx)" in ln and not ln.lstrip().startswith("#")
+    )
+    assert sites >= 5, (
+        f"expected the known TLS context sites, found {sites} — the scan is not landing"
+    )
