@@ -39,7 +39,13 @@ param(
     # a parameter-binding error instead of returning a path. In a PARAMETER DEFAULT that is evaluated
     # during binding, so it would kill the hook before its first line -- and a hook that exits
     # non-zero-but-not-2 lets the tool call through SILENTLY. The gate would be off with nothing to say so.
-    [string]$ReposFile = (Join-Path (
+    # NB `$( ... )`, not `( ... )`. A bare paren opens a COMMAND-INVOCATION group, so PowerShell parses the
+    # `if` as a command NAME and fails with "The term 'if' is not recognized". A statement needs a
+    # subexpression. This shipped broken and was invisible to 192 tests, because every one of them passes
+    # -ReposFile explicitly and a parameter default is not evaluated when a value is supplied -- so nothing
+    # ever exercised the production path. The gate was OFF on every real tool call for the length of one
+    # install. tests/test_worktree_gate_default_reposfile.py now runs it with NO arguments.
+    [string]$ReposFile = (Join-Path $(
         if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
     ) ".claude/hooks/worktree-gate.repos.txt")
 )
