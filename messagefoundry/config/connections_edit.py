@@ -86,6 +86,12 @@ _SCALAR_FIELDS = (
     # DR priority tier (#61, ADR 0048) + engine-shard partition tag (ADR 0037/0073).
     "priority",
     "shard",
+    # ADR 0153: the per-outbound cleartext-hop acceptance (outbound-only). It MUST be written back —
+    # silently dropping it on the next GUI/CLI save would turn a declared, reviewed, audited cleartext
+    # hop into a REFUSED one at the next reload, and the operator would watch a lane fail for a reason
+    # nothing in their edit explains. `cleartext_reason` rides with it; the pair is validated together.
+    "cleartext_accepted",
+    "cleartext_reason",
 )
 # Sub-tables follow the scalars. ``schedule`` is deliberately LAST — it nests ``windows`` as an array
 # of inline tables, visually the heaviest entry, so the simple knobs stay greppable above it.

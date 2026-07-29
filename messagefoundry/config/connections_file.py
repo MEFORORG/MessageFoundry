@@ -140,6 +140,12 @@ _OUTBOUND_KEYS = frozenset(
         # Cosmetic "Waiting for Reply" pre-display delay (#136, ADR 0065 amendment) — default 0.0, so an
         # existing table without it is byte-identical. Display-only; no delivery effect.
         "waiting_display_delay",
+        # ADR 0153 decision 2: the per-outbound cleartext-hop acceptance. TOP-LEVEL keys (as the ADR's
+        # TOML sample shows them), NOT under [settings] — a hop *policy* declaration belongs beside the
+        # connection's other governance keys, and [settings] is the transport factory's own schema
+        # (see _build_spec: "the factory IS the schema"), which no factory would accept.
+        "cleartext_accepted",
+        "cleartext_reason",
     }
 )
 
@@ -251,6 +257,11 @@ def _outbound_from_table(table: dict[str, Any], source: str) -> OutboundConnecti
         flagged=_require_bool(table, "flagged", where, default=False),
         # #136: the cosmetic waiting-for-reply pre-display delay; absent = 0.0 (show immediately).
         waiting_display_delay=_optional_float(table, "waiting_display_delay", where) or 0.0,
+        # ADR 0153: the cleartext-hop acceptance pair; absent = off, so an existing table is
+        # byte-identical. The flag/reason coherence rules live once in build_outbound_connection, so
+        # this surface and the code-first outbound() surface cannot drift.
+        cleartext_accepted=_require_bool(table, "cleartext_accepted", where, default=False),
+        cleartext_reason=_optional_str(table, "cleartext_reason", where),
         source_file=source,
         source_line=None,
     )

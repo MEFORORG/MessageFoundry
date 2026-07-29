@@ -13,10 +13,13 @@ transports now consume the ONE pure authority (``config.tls_policy``) through th
   cleartext hop off-loopback; and
 * a zero-I/O send-time backstop re-asserts it at the byte crossing.
 
-Loopback / synthetic / per-connection-attested hops ALLOW (byte-identical); a non-production PHI hop
-WARNs (crosses, loud-logged); the global escape may only downgrade REFUSE→WARN on non-production. A hop
-built OUTSIDE the stamped gate (a live serve build after the pre-flight, or a direct test/embedding —
-posture unstamped) is a no-op, so no existing lane breaks.
+**Amended by ADR 0153**: the authority no longer reads the data label, so a ``synthetic`` instance is
+NOT carved out any more — it refuses exactly like a PHI one. Loopback and per-connection-attested hops
+still ALLOW (byte-identical); a non-enforcing instance WARNs (crosses, loud-logged); a per-connection
+``cleartext_accepted`` declaration WARNs + audits even under ENFORCE; and ``MEFOR_ALLOW_INSECURE_TLS``
+can no longer influence the decision at all. A hop built OUTSIDE the stamped gate (a live serve build
+after the pre-flight, or a direct test/embedding — posture unstamped) is still a no-op, so no existing
+lane breaks.
 """
 
 from __future__ import annotations
@@ -37,10 +40,12 @@ from messagefoundry.transports.remotefile import RemoteFileDestination, _anon_ft
 from messagefoundry.transports.tcp import TcpDestination
 from messagefoundry.transports.x12 import X12Destination
 
-# The three postures the gradient keys on (the AI-derived is_phi/production).
+# The three postures. Only `enforcing` reaches the cleartext authority now (ADR 0153) — `is_phi` is
+# retained on HopPosture for the revocation / inbound-bind / verify-off gates, which still read it.
 PROD_PHI = HopPosture(is_phi=True, enforcing=True)
 STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
-SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always ALLOW
+# Pre-0153 this was the blanket carve-out ("not is_phi → ALLOW"). It is enforcing, so it now REFUSES.
+SYNTHETIC = HopPosture(is_phi=False, enforcing=True)
 
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as remote/off-box)
 LOOPBACK = "127.0.0.1"
@@ -49,12 +54,39 @@ LOOPBACK = "127.0.0.1"
 # --- config builders (one plaintext outbound per transport) ------------------
 
 
+# ADR 0153 retro-fitted "the flag REQUIRES a reason" onto tls_hop_attested, so every builder below
+# supplies a default reason whenever its flag is set rather than leaving the pair incoherent at load.
+_ATTEST_REASON = "proxy-terminated trusted segment"
+_ACCEPT_REASON = "vendor firmware predates TLS; segment is not isolated"
+
+
+def _hop_fields(
+    attested: bool, reason: str | None, accepted: bool, accept_reason: str | None
+) -> dict[str, object]:
+    """The four hop-declaration fields every Destination builder below shares.
+
+    ``reason``/``accept_reason`` fall back to a non-empty string whenever their flag is set, because
+    BOTH pairs are now load-validated as flag-implies-reason (ADR 0153 decision 2)."""
+    return {
+        "tls_hop_attested": attested,
+        "tls_hop_attested_reason": (
+            reason if reason is not None or not attested else _ATTEST_REASON
+        ),
+        "cleartext_accepted": accepted,
+        "cleartext_reason": (
+            accept_reason if accept_reason is not None or not accepted else _ACCEPT_REASON
+        ),
+    }
+
+
 def mllp_cfg(
     host: str,
     *,
     tls: bool = False,
     attested: bool = False,
     reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
     revocation_attested: bool = False,
 ) -> Destination:
     settings: dict[str, object] = {"host": host, "port": 5000}
@@ -64,34 +96,51 @@ def mllp_cfg(
         name="OB_MLLP",
         type=ConnectorType.MLLP,
         settings=settings,
-        tls_hop_attested=attested,
-        tls_hop_attested_reason=reason,
         tls_revocation_attested=revocation_attested,
+        **_hop_fields(attested, reason, accepted, accept_reason),
     )
 
 
-def tcp_cfg(host: str, *, attested: bool = False, reason: str | None = None) -> Destination:
+def tcp_cfg(
+    host: str,
+    *,
+    attested: bool = False,
+    reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
+) -> Destination:
     return Destination(
         name="OB_TCP",
         type=ConnectorType.TCP,
         settings={"host": host, "port": 5000, "framing": "stx_etx"},
-        tls_hop_attested=attested,
-        tls_hop_attested_reason=reason,
+        **_hop_fields(attested, reason, accepted, accept_reason),
     )
 
 
-def x12_cfg(host: str, *, attested: bool = False, reason: str | None = None) -> Destination:
+def x12_cfg(
+    host: str,
+    *,
+    attested: bool = False,
+    reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
+) -> Destination:
     return Destination(
         name="OB_X12",
         type=ConnectorType.X12,
         settings={"host": host, "port": 5000},
-        tls_hop_attested=attested,
-        tls_hop_attested_reason=reason,
+        **_hop_fields(attested, reason, accepted, accept_reason),
     )
 
 
 def dicom_cfg(
-    host: str, *, tls: bool = False, attested: bool = False, reason: str | None = None
+    host: str,
+    *,
+    tls: bool = False,
+    attested: bool = False,
+    reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
 ) -> Destination:
     settings: dict[str, object] = {"ae_title": "MF_SCU", "host": host, "port": 104}
     if tls:
@@ -100,24 +149,31 @@ def dicom_cfg(
         name="OB_DICOM",
         type=ConnectorType.DIMSE,
         settings=settings,
-        tls_hop_attested=attested,
-        tls_hop_attested_reason=reason,
+        **_hop_fields(attested, reason, accepted, accept_reason),
     )
 
 
 def ftp_cfg(
-    host: str, *, attested: bool = False, reason: str | None = None, protocol: str = "ftp"
+    host: str,
+    *,
+    attested: bool = False,
+    reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
+    protocol: str = "ftp",
 ) -> Destination:
     settings: dict[str, object] = {
         "host": host,
         "remote_dir": "/in",
         "protocol": protocol,
     }
+    fields = _hop_fields(attested, reason, accepted, accept_reason)
     if attested:
+        # The anonymous-ftp guard reads the ATTESTATION off the settings mapping (that is how the
+        # runner threads it for this transport), so mirror it there exactly as _dest_config does.
         settings["tls_hop_attested"] = True
-        if reason is not None:
-            settings["tls_hop_attested_reason"] = reason
-    return Destination(name="OB_FTP", type=ConnectorType.REMOTEFILE, settings=settings)
+        settings["tls_hop_attested_reason"] = fields["tls_hop_attested_reason"]
+    return Destination(name="OB_FTP", type=ConnectorType.REMOTEFILE, settings=settings, **fields)
 
 
 # Each entry builds ONE plaintext outbound connector from a config-builder; used to run the whole
@@ -151,9 +207,14 @@ def test_construction_allows_loopback(build_cfg, connector) -> None:
 
 
 @pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
-def test_construction_allows_synthetic_instance(build_cfg, connector) -> None:
-    with active_hop_posture(SYNTHETIC):
-        connector(build_cfg(REMOTE))  # not is_phi → no PHI on the wire → ALLOW
+def test_construction_refuses_synthetic_instance(build_cfg, connector) -> None:
+    """ADR 0153's headline: a ``synthetic`` data label no longer buys a cleartext hop.
+
+    This test asserted ALLOW before 0153. The label is authored in the same file as the hosts it
+    governs, by the same hand, and a typo in it was indistinguishable from a declaration — with every
+    transport hop in the product as its blast radius. The instance is enforcing, so it now refuses."""
+    with active_hop_posture(SYNTHETIC), pytest.raises(InsecureHopRefused):
+        connector(build_cfg(REMOTE))
 
 
 # --- construction gate: WARN (cross) a non-production PHI hop -----------------
@@ -207,15 +268,102 @@ def test_dicom_tls_has_no_hop_guard() -> None:
 # --- escape clamp: MEFOR_ALLOW_INSECURE_TLS only downgrades on NON-production --
 
 
-def test_escape_downgrades_staging_phi_but_never_prod(monkeypatch) -> None:
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    # Non-production PHI is already WARN; the escape keeps it crossing (still no refusal).
+def test_global_escape_can_no_longer_influence_a_cleartext_hop(monkeypatch) -> None:
+    """ADR 0153 decision 5: the variable is UNHOOKED from this authority (not deleted).
+
+    Asserted in BOTH directions — that it does not relax an enforcing hop, and that it does not change
+    the non-enforcing one either. A one-directional check would still pass if the escape were quietly
+    re-hooked as a WARN arm, which is exactly the regression the decision forbids."""
     with active_hop_posture(STAGING_PHI):
-        TcpDestination(tcp_cfg(REMOTE))
-    # Production PHI: the escape is CLAMPED to non-production, so it can NEVER satisfy a prod-PHI hop —
-    # the production REFUSE arm still wins even with the escape set (decision 2 behaviour change).
+        TcpDestination(tcp_cfg(REMOTE))  # non-enforcing → WARN, escape unset
     with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
-        TcpDestination(tcp_cfg(REMOTE))
+        TcpDestination(tcp_cfg(REMOTE))  # enforcing → REFUSE, escape unset
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with active_hop_posture(STAGING_PHI):
+        TcpDestination(tcp_cfg(REMOTE))  # unchanged by the escape
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        TcpDestination(tcp_cfg(REMOTE))  # STILL refuses with the escape set
+
+
+# --- ADR 0153 decision 2: the honest per-connection acceptance ----------------
+
+
+@pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
+def test_cleartext_accepted_crosses_an_enforcing_hop_and_is_audited(
+    build_cfg, connector, caplog
+) -> None:
+    """It yields WARN, never ALLOW — crossed, but logged AND audited at every construction."""
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        connector(build_cfg(REMOTE, accepted=True, accept_reason="vendor firmware predates TLS"))
+    # The generic WARN half...
+    assert any("insecure transport hop permitted" in r.message for r in caplog.records)
+    # ...and the DEDICATED audit record naming the declaration + its reason, which is what tells an
+    # auditor this hop was crossed on an operator's accepted risk rather than on a warn-mode dial.
+    audit = [
+        r for r in caplog.records if "cleartext hop crossed on an operator acceptance" in r.message
+    ]
+    assert audit, "an accepted cleartext hop must produce an audit record at every construction"
+    assert "vendor firmware predates TLS" in audit[0].getMessage()
+
+
+@pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
+def test_the_acceptance_record_names_the_declaring_connection(build_cfg, connector, caplog) -> None:
+    """The record must lead back to the LINE TO FIX, or it is not much of a record.
+
+    ``cell`` is a static family label ("TCP outbound", "HTTP cleartext egress") and the HTTP-family
+    message carries a host with no port — so with two destinations to the same host an auditor could
+    not tell which declaration produced the crossing. docs/SECURITY-LOOSENING.md and docs/CONNECTIONS.md
+    both promise the connection name; this is what makes that true."""
+    cfg = build_cfg(REMOTE, accepted=True, accept_reason="vendor firmware predates TLS")
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        connector(cfg)
+    audit = [
+        r.getMessage()
+        for r in caplog.records
+        if "cleartext hop crossed on an operator acceptance" in r.message
+    ]
+    assert audit
+    assert cfg.name in audit[0], f"the acceptance record must name {cfg.name!r}: {audit[0]}"
+
+
+def test_acceptance_and_attestation_are_distinguishable_in_the_trail(caplog) -> None:
+    """The one distinction the audit trail exists to preserve (ADR 0153 decision 2's table).
+
+    ``tls_hop_attested`` = "this hop IS secure by means the engine cannot see" → ALLOW, and its record
+    says *attestation*. ``cleartext_accepted`` = "this hop is NOT secure and we accept that" → WARN, and
+    its record says *accepted*. Collapsing the two would leave the trail unable to tell a
+    proxy-terminated hop from plaintext PHI on a flat network."""
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        TcpDestination(tcp_cfg(REMOTE, attested=True, reason="proxy-terminated trusted segment"))
+    attested_records = [r.getMessage() for r in caplog.records]
+    assert any("operator attestation" in m for m in attested_records)
+    assert not any("cleartext hop crossed on an operator acceptance" in m for m in attested_records)
+
+    caplog.clear()
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        TcpDestination(tcp_cfg(REMOTE, accepted=True, accept_reason="no TLS on this device"))
+    accepted_records = [r.getMessage() for r in caplog.records]
+    assert any("cleartext hop crossed on an operator acceptance" in m for m in accepted_records)
+    assert not any("operator attestation" in m for m in accepted_records)
+
+
+def test_tcp_and_x12_acceptance_is_permanent_not_transitional() -> None:
+    """ADR 0153 decision 4: Tcp()/X12() have NO TLS support, so there is no `tls = true` to migrate to.
+
+    Pinned as a test so a future reader cannot mistake the standing declaration for unfinished
+    migration work: neither factory accepts a `tls` argument (BACKLOG #311 tracks adding one)."""
+    import inspect
+
+    from messagefoundry.config.wiring import X12, Tcp
+
+    assert "tls" not in inspect.signature(Tcp).parameters
+    assert "tls" not in inspect.signature(X12).parameters
+    # ...and without the declaration the hop simply refuses under ENFORCE — there is no other escape
+    # short of an attestation, which would be a false statement about a plaintext-only transport.
+    with active_hop_posture(PROD_PHI), pytest.raises(InsecureHopRefused):
+        X12Destination(x12_cfg(REMOTE))
+    with active_hop_posture(PROD_PHI):
+        X12Destination(x12_cfg(REMOTE, accepted=True, accept_reason="X12 VAN link has no TLS"))
 
 
 # --- send-time backstop (zero-I/O, before the first payload byte) -------------
@@ -297,7 +445,9 @@ def test_assert_send_matrix() -> None:
 
 
 def test_guard_disposition_precedence() -> None:
-    def disp(host: str, *, posture: HopPosture, attested: bool) -> HopDisposition:
+    def disp(
+        host: str, *, posture: HopPosture, attested: bool, accepted: bool = False
+    ) -> HopDisposition:
         g = InsecureHopGuard(
             host=host,
             port=1,
@@ -306,14 +456,19 @@ def test_guard_disposition_precedence() -> None:
             attested=attested,
             attested_reason=None,
             posture=posture,
+            cleartext_accepted=accepted,
         )
         return g._disposition(posture)
 
     assert disp(LOOPBACK, posture=PROD_PHI, attested=False) is HopDisposition.ALLOW
     assert disp(REMOTE, posture=PROD_PHI, attested=True) is HopDisposition.ALLOW
-    assert disp(REMOTE, posture=SYNTHETIC, attested=False) is HopDisposition.ALLOW
+    # ADR 0153: the synthetic carve-out is GONE — an enforcing instance refuses whatever its label.
+    assert disp(REMOTE, posture=SYNTHETIC, attested=False) is HopDisposition.REFUSE
     assert disp(REMOTE, posture=PROD_PHI, attested=False) is HopDisposition.REFUSE
     assert disp(REMOTE, posture=STAGING_PHI, attested=False) is HopDisposition.WARN
+    # ...and the new arm 3: an acceptance WARNs (crosses) even under ENFORCE, and never ALLOWs.
+    assert disp(REMOTE, posture=PROD_PHI, attested=False, accepted=True) is HopDisposition.WARN
+    assert disp(LOOPBACK, posture=PROD_PHI, attested=False, accepted=True) is HopDisposition.ALLOW
 
 
 # --- anonymous-ftp guard: encrypted / credentialed protocols carry no guard ---

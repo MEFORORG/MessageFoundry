@@ -260,3 +260,33 @@ cannot reach everyone rotates least-recently-probed-first, degrading to a longer
 - **Not changed.** `_mfa_required_for` still returns False for every non-LOCAL provider — AD MFA stays
   delegated to the directory (ADR 0002). Local sessions, the loopback default, and every path with
   `ad_session_recheck_seconds = 0` are byte-identical.
+
+## Amendment 2026-07-28 — `[auth].ad_session_recheck_seconds` now defaults to 300 (ADR 0148 GIVEN 1)
+
+**What changed.** `[auth].ad_session_recheck_seconds` flips `0` (off) → **`300`** (five minutes), the
+value this ADR and `docs/SECURITY.md` already recommended for an off-loopback PHI deployment. Everything
+else about mechanism 2 — the 60 s floor, `ad_session_recheck_strikes`, `ad_session_recheck_max_users`,
+the mass-revoke breaker, the fail-open-on-DC-unavailability posture — is unchanged.
+
+**Why.** ADR 0148 GIVEN 1: the hardened path is the shipped path. Left at `0`, directory revocation did
+not propagate at all — an AD account disabled or deleted kept its live engine sessions until the
+`[security].max_session_hours` cap. A recommendation that must be typed to take effect is a control that
+is off in most deployments.
+
+**Why the shipped default does not break a non-AD deployment.** The loop requires an LDAP client:
+`AuthService.should_reconcile()` checks for one, so a deployment that never enables `ad_enabled` creates
+no task and issues no bind. The default is therefore **inert** without AD.
+
+**The cross-field refusal is re-keyed, not removed.** `ad_session_recheck_seconds` without `ad_enabled`
+used to fail startup — correctly, because an operator who typed it believed directory revocation now
+propagated, and a silently-dead security control is worse than one never enabled. With a non-zero
+*shipped* default that rule would fail startup on every non-AD box. It is now keyed on
+`model_fields_set`: an **explicitly configured** value without `ad_enabled` still refuses (the case the
+rule exists for), while an untouched default — which carries no operator belief to falsify, and is inert
+anyway — does not.
+
+**Visibility.** `ad_session_recheck_seconds = 0` **with** `ad_enabled` is a **loosening**:
+`security_loosenings()` names it, so it appears in the serve-time warning and in
+`GET /security/posture`, with an entry in [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md). It is
+deliberately conditional — with no directory to reconcile against, `0` is not a weaker choice, it is the
+only meaningful one, so it is not reported as a deviation on a non-AD instance.

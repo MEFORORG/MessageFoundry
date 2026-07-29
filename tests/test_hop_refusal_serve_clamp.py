@@ -37,6 +37,9 @@ from messagefoundry.store.sqlserver import connection_string
 PROD_PHI = HopPosture(is_phi=True, enforcing=True)
 STAGING_PHI = HopPosture(is_phi=True, enforcing=False)
 SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # dev / synthetic instance (no PHI)
+# ADR 0153: an ENFORCING instance that merely carries a synthetic label. Pre-0153 the label alone
+# allowed every cleartext hop; now only `enforcing` reaches the authority, so this one refuses.
+SYNTHETIC_ENFORCING = HopPosture(is_phi=False, enforcing=True)
 REMOTE = "10.0.0.5"  # a non-loopback host (never resolves; treated as off-box)
 
 
@@ -65,19 +68,42 @@ async def test_serve_refuses_prod_phi_cleartext_tcp_outbound(store: MessageStore
         await runner.stop()
 
 
-async def test_serve_allows_synthetic_cleartext_http_outbound(store: MessageStore) -> None:
-    # Finding 6: a synthetic (non-PHI) instance's cleartext http egress PASSES build_check, so it must
-    # also come up at serve. Before the fix the HTTP cell fail-closed to prod-PHI when unstamped and
-    # wrongly degraded the lane at serve.
+async def test_serve_allows_declared_cleartext_http_outbound(store: MessageStore) -> None:
+    # Finding 6: a cleartext http egress that PASSES build_check must also come up at serve. Before the
+    # fix the HTTP cell fail-closed to prod-PHI when unstamped and wrongly degraded the lane at serve.
+    #
+    # The lane used to qualify via the synthetic data label; since ADR 0153 it qualifies via the
+    # per-destination declaration instead. The finding under test — that the LIVE build reads the
+    # stamped posture rather than fail-closing — is unchanged, and the declaration is a sharper probe
+    # of it: it must survive the trip through build_outbound_connection into the live rebuild.
     reg = Registry()
     reg.add_outbound(
-        build_outbound_connection("OB_REST", Rest(url="http://partner.example.com/ingest"))
+        build_outbound_connection(
+            "OB_REST",
+            Rest(url="http://partner.example.com/ingest"),
+            cleartext_accepted=True,
+            cleartext_reason="legacy partner endpoint has no TLS",
+        )
     )
-    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=SYNTHETIC)
+    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=PROD_PHI)
     await runner.start()
     try:
         assert runner.connection_failed("OB_REST") is None  # lane built + live, not refused
         assert "OB_REST" not in runner.degraded_connections()
+    finally:
+        await runner.stop()
+
+
+async def test_serve_degrades_synthetic_cleartext_http_outbound(store: MessageStore) -> None:
+    """ADR 0153 at serve: the synthetic label no longer keeps an undeclared cleartext lane alive."""
+    reg = Registry()
+    reg.add_outbound(
+        build_outbound_connection("OB_REST", Rest(url="http://partner.example.com/ingest"))
+    )
+    runner = RegistryRunner(reg, store, poll_interval=0.02, hop_posture=SYNTHETIC_ENFORCING)
+    await runner.start()
+    try:
+        assert "OB_REST" in runner.degraded_connections()
     finally:
         await runner.stop()
 
@@ -108,7 +134,12 @@ async def test_reload_rebuild_stamps_posture_no_spurious_refusal(store: MessageS
         reg1 = Registry()
         reg1.add_outbound(build_outbound_connection("OB_TCP", Tcp(host="127.0.0.1", port=5000)))
         reg1.add_outbound(
-            build_outbound_connection("OB_REST", Rest(url="http://partner.example.com/ingest"))
+            build_outbound_connection(
+                "OB_REST",
+                Rest(url="http://partner.example.com/ingest"),
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner endpoint has no TLS",
+            )
         )
         await runner.reload(reg1)  # must not raise InsecureHopRefused
         assert runner.connection_failed("OB_REST") is None

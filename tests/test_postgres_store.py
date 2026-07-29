@@ -3569,6 +3569,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     (retired key dropped) — end-to-end proof."""
     from messagefoundry.__main__ import main
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.postgres import PostgresStore
 
     monkeypatch.chdir(
@@ -3576,7 +3577,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     )  # isolate from any stray ./messagefoundry.toml (env wins, but be safe)
     settings = load_settings(environ=os.environ).store
     key_a, key_b = generate_key(), generate_key()
-    active_id_b = make_cipher(key_b).active_key_id
+    # The rotation writer is NOT an object this test holds: main(["rotate-key"]) -> open_store ->
+    # build_store_cipher(settings), i.e. write_v2=[store].aad_bind. Mirror that posture so the marker
+    # this test expects is the one the CLI actually wrote, whichever way the aad_bind default sits.
+    cipher_b = make_cipher(key_b, write_v2=settings.aad_bind)
+    assert isinstance(cipher_b, AesGcmCipher)
 
     seed = await PostgresStore.open(settings, cipher=make_cipher(key_a))
     try:
@@ -3590,9 +3595,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out
 
-    verify = await PostgresStore.open(
-        settings, cipher=make_cipher(key_b)
-    )  # key_b alone, no retired
+    verify = await PostgresStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
         assert len(await verify.list_messages()) == 1
         assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
@@ -3602,7 +3605,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         assert blobs  # at least messages.raw + the one outbound payload
         for r in blobs:
             assert r["v"].startswith(MARKER_PREFIX)
-            assert r["v"].split(":", 3)[2] == active_id_b  # mfenc:v1:<active_id>:<blob>
+            assert r["v"].startswith(cipher_b.active_marker_prefix)  # active key, active format
     finally:
         await verify.close()
 

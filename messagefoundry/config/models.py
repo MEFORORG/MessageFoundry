@@ -175,19 +175,61 @@ class InternalErrorPolicy(str, Enum):  # noqa: UP042
 
 
 def _check_hop_attestation(attested: bool, reason: str | None) -> None:
-    """Load-validate the per-connection insecure-hop attestation pair (#200, ADR 0092).
+    """Load-validate the per-connection insecure-hop attestation pair (#200, ADR 0092 / 0153).
 
-    A ``tls_hop_attested_reason`` is only meaningful alongside ``tls_hop_attested=true`` — a reason
-    without the flag is a config mistake (the operator meant to attest but didn't), so it fails loud at
-    load. A blank/whitespace-only reason is likewise rejected: an attestation that suppresses a would-be
-    production-PHI refusal should carry a real justification for the audit trail."""
+    Three rules, all fail-loud at load:
+
+    #. a reason without the flag is a config mistake (the operator meant to attest but didn't);
+    #. a blank/whitespace-only reason is rejected;
+    #. **the flag without a reason is rejected** (ADR 0153 decision 2, retro-fitted). An attestation
+       asserting *this hop is secure by means the engine cannot see* is precisely the claim that most
+       needs a written justification when it is audited — it is the one input that can silently ALLOW
+       an enforcing cleartext hop. Nothing is deployed, so there is no config to migrate.
+
+    Shared verbatim with ``[logging].forward_hop_attested`` (``settings.LoggingSettings``), which
+    re-raises under its own field names. Rule 3 reaches that sibling **deliberately**: it is documented
+    as "the ``[logging]`` sibling of a connection's ``tls_hop_attested``" and ``docs/PHI.md`` already
+    described its reason as mandatory, so scoping the rule away from it would keep a documented
+    guarantee un-enforced in exactly the place an auditor would look."""
     if reason is not None and not attested:
         raise ValueError(
             "tls_hop_attested_reason is set without tls_hop_attested=true — set the flag to attest "
             "the hop is secure, or drop the reason"
         )
+    if attested and reason is None:
+        raise ValueError(
+            "tls_hop_attested=true requires tls_hop_attested_reason — an attestation that this hop is "
+            "secure by means the engine cannot see must record WHY, for the audit trail (ADR 0153)"
+        )
     if attested and reason is not None and not reason.strip():
         raise ValueError("tls_hop_attested_reason must be non-empty when provided")
+
+
+def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
+    """Load-validate the per-outbound cleartext-acceptance pair (ADR 0153 decision 2).
+
+    The exact inverse of :func:`_check_hop_attestation`, with the opposite claim: ``tls_hop_attested``
+    says *this hop IS secure by means the engine cannot see* (ALLOW, silent); ``cleartext_accepted``
+    says *this hop is NOT secure and we accept that* (WARN, logged + audited at every construction).
+    They are deliberately separate fields — collapsing them would leave the audit trail unable to
+    distinguish a proxy-terminated hop from plaintext PHI on a flat network, which is the one
+    distinction it exists to preserve.
+
+    Same three fail-loud rules: the flag without a reason, a blank/whitespace-only reason, and a reason
+    without the flag. The engine can check a reason is *present and non-blank*; it cannot check that it
+    is *true* — a placeholder reason is a review problem, not a load problem."""
+    if reason is not None and not accepted:
+        raise ValueError(
+            "cleartext_reason is set without cleartext_accepted=true — set the flag to accept the "
+            "cleartext hop, or drop the reason"
+        )
+    if accepted and reason is None:
+        raise ValueError(
+            "cleartext_accepted=true requires cleartext_reason — an accepted risk that stops being "
+            "visible has stopped being accepted and started being forgotten (ADR 0153)"
+        )
+    if accepted and reason is not None and not reason.strip():
+        raise ValueError("cleartext_reason must be non-empty when provided")
 
 
 class Source(BaseModel):
@@ -560,6 +602,18 @@ class Destination(BaseModel):
     # even on production-PHI. Default False → keyed purely on posture (existing outbounds byte-identical).
     tls_hop_attested: bool = False
     tls_hop_attested_reason: str | None = None
+    # ADR 0153 decision 2 — the HONEST escape for a peer that cannot do TLS, and the exact opposite
+    # claim to tls_hop_attested above: "this hop is NOT secure, and we accept that". It yields WARN,
+    # never ALLOW — the hop is crossed, but loudly logged at EVERY construction and audited, because an
+    # accepted risk that stops being visible has stopped being accepted. DESTINATION-ONLY: inbound
+    # binds are governed by _inbound_insecure_bind_permitted + the four exposed-gates, so the same pair
+    # on Source would be a setting nothing consumes. For Tcp()/X12() — which have no TLS support at all
+    # — this is a PERMANENT, STRUCTURAL declaration, not a transitional one: there is no `tls = true`
+    # for them to migrate to (BACKLOG #311). Default off → nothing changes shape until an operator
+    # declares something. Surfaced as a loosening (security_loosenings / GET /security/posture) and
+    # listed by `messagefoundry check`, so the accepted set is never invisible.
+    cleartext_accepted: bool = False
+    cleartext_reason: str | None = None
     # #201 (ADR 0078 amendment): per-connection attestation that a revocation-checking PKI backs a
     # VERIFYING outbound TLS hop (MLLP-over-TLS / https REST-SOAP-FHIR). The engine performs no OCSP/CRL
     # (stdlib ssl has none), so an off-loopback production-PHI verified hop is REFUSED at construction /
@@ -585,6 +639,7 @@ class Destination(BaseModel):
     @model_validator(mode="after")
     def _validate_hop_attestation(self) -> Destination:
         _check_hop_attestation(self.tls_hop_attested, self.tls_hop_attested_reason)
+        _check_cleartext_acceptance(self.cleartext_accepted, self.cleartext_reason)
         return self
 
 

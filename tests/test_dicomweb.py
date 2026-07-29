@@ -168,20 +168,24 @@ def test_dicomweb_cleartext_http_loopback_allowed() -> None:
     assert isinstance(dest, DicomWebDestination)
 
 
-def test_dicomweb_cleartext_http_nonloopback_allowed_with_escape(
+def test_dicomweb_cleartext_http_nonloopback_allowed_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    # #200 (ADR 0092): the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
+    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
+    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
+    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",
                 type=ConnectorType.DICOMWEB,
                 settings=DICOMweb(url="http://pacs.example.org/dicom-web").settings,
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner endpoint has no TLS",
             )
         )
-    assert isinstance(dest, DicomWebDestination)  # built (warns loudly), not refused
+    assert isinstance(dest, DicomWebDestination)  # built (warns loudly + audits), not refused
 
 
 # --- multipart framing -------------------------------------------------------
