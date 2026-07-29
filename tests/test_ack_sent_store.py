@@ -54,8 +54,11 @@ async def test_aa_body_encrypted_when_store_encrypted(tmp_path: Path) -> None:
         # marker, is not the plaintext frame, and decrypts back to exactly it. Assert the decrypt
         # round-trip (deterministic) rather than `"MSA" not in <ciphertext>` — that old substring check
         # flaked because a base64 ciphertext randomly contains that 3-char run (alphabet includes M/S/A).
-        # The claim is encryptedness, so anchor on the VERSION-AGNOSTIC marker: the at-rest format
-        # follows [store].aad_bind (v2 by default), and a v1-only prefix would silently fail on it.
+        # The claim is encryptedness, so anchor on the VERSION-AGNOSTIC marker. WHICH mfenc format gets
+        # written is the cipher's business, not this assertion's: v1 here (make_cipher's writer default
+        # is still the frozen v1 one), v2 wherever the store builds its cipher through build_cipher
+        # (write_v2=[store].aad_bind, now on) or under the MEFOR_TEST_FORCE_AAD_BIND leg. Format pinning
+        # is owned by the CRYPTO-1 tests in test_store_encryption.py, not here.
         disk = next(r for r in _response_rows(db) if r[1] == "ack_sent")
         assert disk[4].startswith(MARKER_PREFIX)  # under the encrypted marker, not in the clear
         assert disk[4] != AA

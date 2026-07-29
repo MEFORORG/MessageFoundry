@@ -193,8 +193,9 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
     con = sqlite3.connect(db)
     try:
         raw = con.execute("SELECT reason FROM alert_instance").fetchone()[0]
-        # Version-agnostic marker: the claim is "enciphered at rest", and the at-rest format follows
-        # [store].aad_bind (v2 by default) — a v1-only prefix would be a latent false failure.
+        # Version-agnostic marker: the claim is "enciphered at rest", not which mfenc format wrote it.
+        # That belongs to the cipher — v1 from make_cipher's default here, v2 wherever the store builds
+        # its cipher via build_cipher (write_v2=[store].aad_bind) or under MEFOR_TEST_FORCE_AAD_BIND.
         assert isinstance(raw, str) and raw.startswith(MARKER_PREFIX)  # ciphertext on disk
         assert "refused" not in raw
     finally:

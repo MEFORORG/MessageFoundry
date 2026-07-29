@@ -1171,14 +1171,22 @@ async def test_record_ack_sent_aa_body_encrypted_at_rest_ss(store) -> None:
         assert ack.body == _ACK_AA  # decrypted round-trip
         # Raw column read (the ciphered handle's _fetchone does NOT decrypt) → ciphertext on disk. Assert
         # the deterministic decrypt round-trip, NOT `"MSA" not in <b64>` (base64 can contain that run).
-        disk = (
-            await s._fetchone(
-                "SELECT body FROM response WHERE message_id=? AND kind=?", (mid, "ack_sent")
-            )
-        )["body"]
+        # destination_name + response_seq come back alongside the body: they are the row half of the
+        # cell AAD the store binds it under (sqlserver.py record_ack_sent), and destination_name is a
+        # SENTINEL ("\x1fack:" + inbound_name), so read it rather than reconstructing it here.
+        row = await s._fetchone(
+            "SELECT body, destination_name, response_seq FROM response"
+            " WHERE message_id=? AND kind=?",
+            (mid, "ack_sent"),
+        )
+        disk = row["body"]
         assert disk.startswith(MARKER_PREFIX)  # stored under the encrypted marker, not in the clear
         assert disk != _ACK_AA
-        assert cipher.decrypt(disk) == _ACK_AA  # and it genuinely encrypts the AA frame
+        # Decrypt under the SAME cell AAD the store wrote with (ASVS 11.3.3 / ADR 0019): a v2 value is
+        # bound to its (table, column, row) cell, so a bare decrypt fails closed on one. Harmless on a
+        # v1 value — that reader ignores the caller's aad by design (dual-read).
+        aad = cell_aad("response", "body", mid, row["destination_name"], row["response_seq"])
+        assert cipher.decrypt(disk, aad=aad) == _ACK_AA  # and it genuinely encrypts the AA frame
     finally:
         await s.close()
 
@@ -1538,9 +1546,11 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
 # --- H4: error / last_error / message_events.detail encrypted at rest ----------
 # SQL Server parity with SQLite/Postgres: the three nullable disposition-text columns route through the
 # SAME store cipher — at-rest ciphertext in whichever mfenc format that cipher writes, decrypt-on-read,
-# rotated on rekey, and legacy plaintext migrated on open. (Naming a version here would be wrong: the
-# format follows [store].aad_bind, so it is v2 by default.) The prior "SQL Server keeps these
-# plaintext" residual is retired.
+# rotated on rekey, and legacy plaintext migrated on open. (Naming a version here would be wrong: these
+# tests hand the store a make_cipher() handle, whose writer default is still the frozen v1; the SHIPPED
+# store builds its cipher via build_cipher with write_v2=[store].aad_bind, now on. The claim is which
+# columns are enciphered, which holds either way.) The prior "SQL Server keeps these plaintext"
+# residual is retired.
 
 
 async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> None:
@@ -1566,7 +1576,8 @@ async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> No
         await s.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)  # -> DEAD
 
         # AT REST: every value is mfenc:... ciphertext — the cleartext phrase never appears in the col.
-        # (Version-agnostic per the section header: the format follows [store].aad_bind, v2 by default.)
+        # (Version-agnostic per the section header: the marker version belongs to the cipher, not to
+        # this claim — v1 here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND.)
         erow = (await s._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
         assert erow["error"].startswith(MARKER_PREFIX) and "bad parse" not in erow["error"]
         qrow = (await s._fetchall("SELECT last_error FROM queue WHERE message_id=?", (mid,)))[0]

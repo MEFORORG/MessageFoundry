@@ -274,7 +274,8 @@ async def test_state_value_encrypted_at_rest_and_read_back(tmp_path: Path) -> No
     finally:
         await store.close()
     # On disk: ciphertext (version-agnostic marker present, plaintext value not visible). Same rule as
-    # the rotation test below — a v1-only spelling misreads the v2 value [store].aad_bind makes default.
+    # the rotation test below — the marker version is the cipher's choice (v1 from make_cipher's default
+    # here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND), not this test's claim.
     at_rest = _state_at_rest(db, "patient_anon", "MRN-DOE")
     assert at_rest.startswith(MARKER_PREFIX)
     assert "ANON-XYZ" not in at_rest

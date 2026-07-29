@@ -171,8 +171,8 @@ async def test_base64_pdf_encrypted_at_rest(tmp_path: Path) -> None:
         await store.close()
 
     # On disk the PDF base64 is AES-256-GCM ciphertext, never plaintext. Anchor on the version-agnostic
-    # mfenc: marker — the claim is the algorithm/encryptedness, and the marker format follows
-    # [store].aad_bind (v2 by default), so pinning v1 here would be a latent false failure.
+    # mfenc: marker — the claim is encryptedness, and the marker format is the cipher's choice (v1 from
+    # make_cipher's default here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND).
     at_rest_raw = _raw_at_rest(db, column="raw", table="messages")
     at_rest_payload = _raw_at_rest(db, column="payload", table="queue")
     assert at_rest_raw.startswith(MARKER_PREFIX)

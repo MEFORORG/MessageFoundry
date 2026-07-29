@@ -91,7 +91,8 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
         assert _col_at_rest(db, "connection") == "IB"
         reason_disk = _col_at_rest(db, "reason")
         # The version-agnostic marker: which columns are enciphered is the claim, not which mfenc
-        # format the writer emits (that follows [store].aad_bind, v2 by default).
+        # format the writer emits. That is the cipher's choice — v1 from make_cipher's default here,
+        # v2 via build_cipher (write_v2=[store].aad_bind) or under MEFOR_TEST_FORCE_AAD_BIND.
         assert isinstance(reason_disk, str) and reason_disk.startswith(MARKER_PREFIX)
         assert "boom" not in reason_disk
         # …and the read path decrypts it back

@@ -577,8 +577,10 @@ async def test_poison_rows_dead_lettered_dropped_and_lane_rearmed(
     try:
         # The injected "mfenc:v1:not-base64-$$$" payloads below are undecryptable ON PURPOSE, and the
         # v1 marker is DELIBERATE (do not "sweep" it to a bare mfenc:): the version must be one the
-        # cipher DISPATCHES on, so the failure lands in the base64 decode inside decrypt. A bare
-        # "mfenc:" takes the unknown-marker-version branch — a different fail-closed path.
+        # cipher DISPATCHES on. Measured: it parses to key_id="not-base64-$$$" with an EMPTY blob (no
+        # second colon), so base64 decoding succeeds and AESGCM raises ValueError("Nonce must be between
+        # 8 and 128 bytes"). A bare "mfenc:" never reaches that — _parse rejects the version first with
+        # CipherError, a different fail-closed branch.
         # Lane 1: a single poison HEAD → dropped + DEAD + the lane re-arms.
         a = await _seed_ingress(enc, "IB_HP1", [100.0])
         await enc._db.execute(

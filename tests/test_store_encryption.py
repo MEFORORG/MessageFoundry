@@ -141,8 +141,12 @@ async def test_claim_ready_dead_letters_undecryptable_row(tmp_path: Path) -> Non
         cur = await store._db.execute("SELECT status, last_error FROM queue WHERE id=?", (bad_id,))
         row = await cur.fetchone()
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is itself ciphered now (WP-5), so decrypt it before checking the reason.
-        assert "undecryptable" in store._cipher.decrypt(row["last_error"] or "")
+        # last_error is itself ciphered (WP-5) AND cell-bound (ASVS 11.3.3 / ADR 0019), so decrypt it
+        # under the SAME (table, column, row) AAD the store wrote with — a bare decrypt fails closed on
+        # a v2 value. Harmless on v1: that reader ignores the caller's aad by design (dual-read).
+        assert "undecryptable" in store._cipher.decrypt(
+            row["last_error"] or "", aad=cell_aad("queue", "last_error", bad_id)
+        )
     finally:
         await store.close()
 
@@ -171,8 +175,11 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
         )
         row = await cur.fetchone()
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is itself ciphered now (WP-5), so decrypt it before checking the reason.
-        assert "undecryptable" in store._cipher.decrypt(row["last_error"] or "")
+        # Ciphered (WP-5) and cell-bound (ADR 0019) — decrypt under the row's own AAD, see the outbound
+        # poison-row test above.
+        assert "undecryptable" in store._cipher.decrypt(
+            row["last_error"] or "", aad=cell_aad("queue", "last_error", ingress_id)
+        )
         # Dead ingress row with no outbound rows → the message is finalized to ERROR.
         assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
     finally:
@@ -418,8 +425,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     raw_b = _raw_at_rest(db)
     # Re-encrypted under the ACTIVE (new) key — not merely "still ciphertext". Take the expected marker
     # from the rotating cipher itself: active_marker_prefix carries key B's fingerprint in the right
-    # position for whichever format the writer emits (v1, or the v2 that [store].aad_bind makes the
-    # default). A bare MARKER_PREFIX would drop the under-the-new-key half of the proof.
+    # position for whichever format that cipher writes (v1 here, v2 when the store is handed a
+    # build_cipher handle or run under MEFOR_TEST_FORCE_AAD_BIND — the field order differs between the
+    # two). A bare MARKER_PREFIX would drop the under-the-new-key half of the proof.
     assert raw_b.startswith(rotating_cipher.active_marker_prefix) and raw_b != raw_a
 
     # B alone (no retired key) now reads everything — the bridge key is no longer needed.
@@ -452,10 +460,16 @@ async def test_rotation_without_prior_key_raises(tmp_path: Path) -> None:
 #
 # The hard constraint is CRYPTO-1: the mfenc:v1 WRITER is frozen — existing v1 ciphertext and new v1
 # writes stay byte-identical. M9 adds *agility infrastructure only*: a version/alg-dispatching cipher
-# that is DECODE-CAPABLE of mfenc:v2 and CAN write it (opt-in), but WRITES v1 BY DEFAULT. AES-256-GCM
-# stays the only registered algorithm. These tests pin: (1) v1 byte-identical (frozen fixture); (2) v2
-# round-trip; (3) a v2-active cipher reads v1 with no rotation; (4) mixed v1+v2 rows; (5) fail-closed
-# CipherError on an unknown marker version AND an unknown alg id.
+# that is DECODE-CAPABLE of mfenc:v2 and CAN write it (opt-in). AES-256-GCM stays the only registered
+# algorithm. These tests pin: (1) v1 byte-identical (frozen fixture); (2) v2 round-trip; (3) a v2-active
+# cipher reads v1 with no rotation; (4) mixed v1+v2 rows; (5) fail-closed CipherError on an unknown
+# marker version AND an unknown alg id.
+#
+# TWO DIFFERENT "defaults" — do not collapse them. `make_cipher`'s `write_v2` PARAMETER still defaults
+# False (the frozen v1 writer), which is what the assertions below pin and what keeps CRYPTO-1 testable
+# from a bare `make_cipher(key)`. The SHIPPED at-rest format is no longer v1: `build_cipher` passes
+# `write_v2=[store].aad_bind`, and ADR 0148 flipped that setting's default to True, so a store opened
+# the normal way writes mfenc:v2. Everything in this section is about the former.
 
 # A FROZEN FIXTURE: a v1 blob written by the pre-M9 writer for plaintext "LEGACY-V1" under the key below
 # (nonce fixed to 12 zero bytes). Hardcoded so a regression in the v1 reader is caught against a value
@@ -499,7 +513,9 @@ def test_v1_writer_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_default_writer_is_v1_not_v2() -> None:
-    # The shipping default never emits a v2 marker — no at-rest format change ships with M9.
+    # `make_cipher`'s write_v2 PARAMETER default — the frozen v1 writer, CRYPTO-1. NOT a claim about the
+    # shipped store: that builds its cipher through build_cipher(write_v2=[store].aad_bind), which ADR
+    # 0148 defaulted to True, so a normally-opened store writes v2. This pins the library default only.
     token = make_cipher(generate_key()).encrypt("x")
     assert token.startswith(PREFIX)  # mfenc:v1:
     assert not token.startswith("mfenc:v2:")
@@ -855,8 +871,11 @@ async def test_foreign_key_at_runtime_dead_letters_rather_than_degrading(tmp_pat
         )
         dead = await cur.fetchone()
         assert dead["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it.
-        assert "undecryptable" in store._cipher.decrypt(dead["last_error"] or "")
+        # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it —
+        # under the row's own cell AAD (ADR 0019), which a v2 value requires and a v1 value ignores.
+        assert "undecryptable" in store._cipher.decrypt(
+            dead["last_error"] or "", aad=cell_aad("queue", "last_error", row["id"])
+        )
     finally:
         await store.close()
 
@@ -1038,7 +1057,8 @@ async def test_migration_encrypts_existing_state_value(tmp_path: Path) -> None:
     store = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # reopen → migrate
     try:
         at_rest = _state_at_rest(db)
-        # sealed on disk (version-agnostic: the format follows [store].aad_bind, v2 by default)
+        # sealed on disk — version-agnostic, because the marker version is whatever cipher the store was
+        # handed writes (v1 here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND)
         assert at_rest.startswith(MARKER_PREFIX) and "SECRETSTATEMRN" not in at_rest
         assert store.state_view()[("ns", "k")] == {"mrn": "SECRETSTATEMRN"}  # decrypts on read
     finally:
