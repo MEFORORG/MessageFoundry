@@ -121,11 +121,16 @@ def test_hostile_disposition_header_parses_in_linear_time() -> None:
     scaling multiplies by ~16 when the input quadruples; linear scaling stays near ~4.
     """
 
-    def elapsed(n: int) -> float:
+    def elapsed(n: int, reps: int = 3) -> float:
+        """Best-of-``reps``: a scheduling hiccup can only inflate a sample, never deflate one, so the
+        MINIMUM is the noise-free estimate — one slow slice on a loaded runner cannot fake a red."""
         line = "content-disposition: " + "a" * n
-        start = time.perf_counter()
-        _DISPOSITION_PARAM.findall(line)
-        return time.perf_counter() - start
+        best = float("inf")
+        for _ in range(reps):
+            start = time.perf_counter()
+            _DISPOSITION_PARAM.findall(line)
+            best = min(best, time.perf_counter() - start)
+        return best
 
     base_n = 20_000
     elapsed(base_n)  # warm the regex cache / JIT-free interpreter paths
