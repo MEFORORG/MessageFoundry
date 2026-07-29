@@ -74,7 +74,7 @@ jobs:
           # reproducible, tamper-evident install. Exercises the lockfile as an actual install path
           # instead of only auditing it, so a lockfile that doesn't resolve/install is caught (low-26).
           python -m venv /tmp/lockcheck
-          /tmp/lockcheck/bin/pip install --upgrade pip
+          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
       - name: Audit the locked dependencies (DEP-1)
         run: |
@@ -136,11 +136,7 @@ jobs:
           # pulls; the all-extras requirements.lock stays covered by the pip-audit job above. cyclonedx-bom
           # ~=7.3 → lxml 6.x (cp314 wheels) so the 3.14 runner doesn't source-build lxml. ADR 0149.
           python -m pip install --upgrade pip "cyclonedx-bom~=7.3"
-          # No `pip install --upgrade pip` in this scratch venv (Scorecard PinnedDependencies): its only
-          # install is a fully `==`-pinned, hash-verified lock, and --require-hashes performs no
-          # resolution, so ensurepip's bundled pip is enough — the upgrade was a redundant UNPINNED PyPI
-          # fetch. Do NOT swap in `python -m venv --upgrade-deps`: same unpinned fetch, just invisible to
-          # the scanner (the "invisible filter" ADR 0034 rejected).
+          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
