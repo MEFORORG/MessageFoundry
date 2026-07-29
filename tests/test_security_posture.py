@@ -79,6 +79,35 @@ _NEUTERING = (
     (re.compile(r"--fail-under=0\b"), "--fail-under=0"),
 )
 
+#: A `$( ... )` command substitution on one line. What is inside CANNOT set the step's exit status —
+#: it sets the substitution's, which the surrounding assignment then consumes.
+_SUBSTITUTION = re.compile(r"\$\([^()]*\)")
+
+#: A trailing shell comment. Approximate on purpose (a `#` inside a quoted string is not a comment),
+#: and safe in this direction: stripping a comment can only REMOVE text from the scan, and a real
+#: `cmd || true  # note` still reads as `cmd || true` afterwards.
+_TRAILING_COMMENT = re.compile(r"(?:^|\s)#.*$")
+
+
+def _gating_text(line: str) -> str:
+    """A step line reduced to the part whose exit status can actually reach the step.
+
+    Two things are removed before the neutering patterns are applied, because both produced false
+    positives that would have been "fixed" by weakening a real gate:
+
+    * **Command substitutions.** `claim="$(… | grep -oiE 'BACKLOG #[0-9]+' | head -1 || true)"` is the
+      idiomatic guard for `grep` exiting 1 on no-match under `set -euo pipefail`; without it the script
+      aborts on the ordinary "no claim in this PR" path. It cannot mask the step's status — the gating
+      decision is the explicit `exit 0` / `exit 1` further down. Flagging it suggested "confine it to
+      its own step", which is impossible for a variable assignment and would have meant deleting the
+      guard from a correct script.
+    * **Comments.** The rationale comments in these workflows quote the very idiom being prohibited, so
+      a raw scan reports the explanation as the offence — a detector counting itself.
+
+    A standalone `gating_cmd || true`, which is the actual hazard, survives both strips and is caught.
+    """
+    return _TRAILING_COMMENT.sub("", _SUBSTITUTION.sub("", line))
+
 
 def _required_jobs() -> dict[tuple[str, str], dict]:
     """Every job backing a required context, keyed by (workflow file, job key)."""
@@ -170,15 +199,20 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
                 name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
                 offenders.append(f"{wf}:{key} — step {name!r} has continue-on-error")
     # Liveness receipt. NOT `examined == len(required_contexts())`: the three `test (<os>, py3.14)`
-    # contexts are ONE matrix job, so 12 contexts collapse to 10 jobs. Pinned rather than derived so
+    # contexts are ONE matrix job, so 13 contexts collapse to 11 jobs. Pinned rather than derived so
     # that a change in the collapse — a matrix split, or a context that quietly stops resolving —
     # forces a look here instead of passing on a self-consistent count.
+    #
+    # 13/11 since 2026-07-29, when backlog-hygiene was promoted to a required context. Promoting one
+    # brings its job under every rule in this module for the first time, which is the point: it
+    # immediately surfaced a `|| true` in that job (a false positive, as it turned out — see
+    # _gating_text — but the review it forced is exactly what promotion should trigger).
     print(
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 10, (
-        f"expected the 12 required contexts to resolve to 10 distinct jobs (the 3 `test` legs share one "
+    assert examined == 11, (
+        f"expected the 13 required contexts to resolve to 11 distinct jobs (the 3 `test` legs share one "
         f"matrix job); got {examined}. If the workflow layout genuinely changed, update this count."
     )
     assert not offenders, (
@@ -205,10 +239,17 @@ def test_required_jobs_have_no_neutered_steps() -> None:
             if not run:
                 continue
             scanned_steps += 1
-            for pattern, label in _NEUTERING:
-                if pattern.search(run):
-                    name = (step or {}).get("name") or "<unnamed step>"
-                    offenders.append(f"{wf}:{key} — step {name!r} contains {label}")
+            # Per LINE, against the gating text only — see _gating_text for why a whole-body scan
+            # reported two false positives, each of which would have been "fixed" by deleting a
+            # correct guard or a rationale comment.
+            for raw_line in run.splitlines():
+                gating = _gating_text(raw_line)
+                for pattern, label in _NEUTERING:
+                    if pattern.search(gating):
+                        name = (step or {}).get("name") or "<unnamed step>"
+                        offenders.append(
+                            f"{wf}:{key} — step {name!r} contains {label}: {raw_line.strip()!r}"
+                        )
     print(f"[security-posture] scanned {scanned_steps} run steps across required jobs")
     assert scanned_steps > 0, "scanned ZERO run steps — the parser stopped seeing steps, not a pass"
     assert not offenders, (

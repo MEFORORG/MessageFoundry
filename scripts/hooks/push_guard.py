@@ -6,7 +6,7 @@ there is no publish step left between a push and the public internet. A push to 
 publication, immediately and irreversibly (deleting a ref later does not un-publish content that was
 fetched, mirrored or indexed in between).
 
-Branch protection on the server requires a PR and 12 status checks. ``enforce_admins`` is now TRUE
+Branch protection on the server requires a PR and 13 status checks. ``enforce_admins`` is now TRUE
 (enabled 2026-07-28), so a direct push to ``main`` is refused server-side and ``gh pr merge --admin``
 no longer works. This hook is therefore DEFENCE-IN-DEPTH rather than the only guard -- it still earns
 its place by failing FAST and LOCALLY, with an explanation, instead of after a round-trip; and it

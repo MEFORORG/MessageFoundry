@@ -45,6 +45,7 @@ The stable contexts required on `main` are — mirroring
 - `semgrep (project SAST rules)`
 - `crypto-inventory (ASVS 11.1.3 discovery gate)`
 - `forbidden-content (customer/PHI leak guard)`
+- `a PR that implements BACKLOG #N must update BACKLOG.md`
 - `cla`
 
 That last string is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection

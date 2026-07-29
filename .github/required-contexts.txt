@@ -3,9 +3,17 @@
 # WHY THIS FILE EXISTS. Branch protection lives on the server, so "is this check blocking?" was
 # unanswerable from a clone -- and five places in this repo answered it differently: docs/CI.md
 # listed 8 contexts, .github/workflows/manifest-lint.yml said 4, docs/design/freethread.md said 7,
-# tests/test_push_guard.py said 12. The live API says 12. With `required_approving_review_count: 0`
-# and auto-merge armed, required-set membership is the ONLY thing separating "reviewed" from
-# "merged unread", so a wrong answer here mis-ranks which gates a change can safely touch.
+# tests/test_push_guard.py said 12. With `required_approving_review_count: 0` and auto-merge armed,
+# required-set membership is the ONLY thing separating "reviewed" from "merged unread", so a wrong
+# answer here mis-ranks which gates a change can safely touch.
+#
+# It stopped being hypothetical within hours of this file landing. On 2026-07-29 branch protection was
+# briefly reduced to a SINGLE required context -- the backlog-hygiene check -- dropping all twelve
+# gates, every test leg and security scanner among them, while auto-merge stayed armed and approvals
+# stayed at 0. Several PRs merged in that window. What surfaced it was reconciling a CI wait against
+# `required_status_checks.contexts` and seeing the count come back as 1: a monitor that had waited for
+# "nothing pending" would have reported green without ever waiting for a test leg, because with one
+# required context there was nothing to wait for. Count what SHOULD gate the merge, not what does.
 #
 # This file is not the enforcement -- the server is. It is the CHECKED-IN CLAIM that every in-repo
 # statement must agree with, which is what `tests/test_required_contexts.py` asserts. When branch
@@ -43,23 +51,28 @@ forbidden-content (customer/PHI leak guard)
 # --- cla.yml --------------------------------------------------------------------------------------
 cla
 
-# PENDING PROMOTION -- owner's decision, NOT yet applied. This file mirrors the LIVE server, so the
-# context below is deliberately absent until branch protection actually changes; adding it here first
-# would make the file lie in the one direction it exists to prevent.
+# --- backlog-hygiene.yml ---------------------------------------------------------------------------
+# PROMOTED 2026-07-29 (verified against the live API the same day). Before that it hard-failed and
+# nothing waited for it, so it was decoration -- auto-merge blocks only on REQUIRED contexts. It exists
+# because #60 shipped while its banner still read "PRE-RESERVED", and that stale banner was then
+# repeated as fact in a merged PR; in a repo where the ledger is the only memory shared across isolated
+# sessions, a stale banner makes another session rebuild work that is already merged.
 #
-#   "a PR that implements BACKLOG #N must update BACKLOG.md"   (backlog-hygiene.yml)
-#
-#   WHY PROMOTE: it hard-fails today and nothing waits for it, so it is decoration -- auto-merge only
-#   blocks on REQUIRED contexts. It exists because #60 shipped while its banner still read
-#   "PRE-RESERVED", and that stale banner was then repeated as fact in a merged PR. In a repo where the
-#   ledger is the only memory shared across isolated sessions, a stale banner makes another session
-#   rebuild work that is already merged.
-#   SAFE TO PROMOTE: it triggers on `pull_request: branches: [main]` with NO paths filter and no `if:`,
-#   so it always reports -- no required-but-absent trap. (Its STRUCTURAL half, "every item declares
+# The quoting in backlog-hygiene.yml is load-bearing: the job name contains " #", which YAML would
+# truncate at the comment marker, and the job NAME is the context string.
+a PR that implements BACKLOG #N must update BACKLOG.md
+
+# (Historical note, kept because it is the reasoning that made the promotion safe: it triggers on
+#   `pull_request: branches: [main]` with NO paths filter and no `if:`, so it always reports -- no
+#   required-but-absent trap. Its STRUCTURAL half, "every item declares
 #   exactly one status", is already enforced inside the required test legs by
-#   tests/test_backlog_status_check.py; only the behavioural half is unguarded.)
-#   TO APPLY: add the context to branch protection, then move the line above into the ci/security list
-#   and update the count pinned in tests/test_required_contexts.py.
+#   tests/test_backlog_status_check.py; only the behavioural half was unguarded.)
+#
+# ADDING ANOTHER ONE LATER: add the context to branch protection FIRST, then add the line here and
+# update the count pinned in tests/test_required_contexts.py, in the same PR. In that order, because
+# this file mirrors the live server -- a line added here first is exactly the lie the file exists to
+# prevent. Adding to protection is all-or-nothing: the REST endpoint 422s with `already_exists` if any
+# context in the request is already required, and then adds NONE of them, so send only the missing ones.
 
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
