@@ -10,8 +10,16 @@ version, hash or marker, and its ``-Status`` printed an uncalibrated count of ho
   enforcing it forever, while every test correctly reports it gone.
 
 These tests are LOCAL-MACHINE tests. On CI there is no installed gate and they skip -- which is honest,
-because the drift they detect is a developer-box condition, not a repository one. They print what they
-scanned so a skip can never be mistaken for a pass.
+because the drift they detect is a developer-box condition, not a repository one.
+
+**What CI therefore does NOT guard**: installed-vs-source parity, wired-matcher correctness, and
+unwired-rule detection. Only the source-only OPT_IN_TOOLS sanity check runs there. Say that plainly rather
+than let three green-looking dots imply coverage.
+
+Every test announces what it scanned BEFORE it can skip, so the reason is in the output either way. That
+ordering is the whole mitigation and it is easy to undo by accident: a print placed after a skip never
+runs, and the repo's pytest config carries no ``-rs``, so the skip reason would not be shown either. It
+rendered as a bare ``sss.`` until this was fixed.
 
 Parity is asserted only when the source script is COMMITTED. Mid-change the two are *supposed* to differ,
 and a test that nagged on every edit would be re-run with ``-k`` until someone deleted it.
@@ -88,19 +96,23 @@ def source_is_committed() -> bool:
 
 
 def test_the_installed_gate_matches_the_committed_source() -> None:
+    # Announce the target BEFORE any skip. A print after a skip never runs, and with no -rs in the pytest
+    # config the reason is not shown either -- the file then renders as a bare "sss." on CI, which is the
+    # exact skip-reads-as-pass ambiguity this suite exists to remove.
+    print(f"scanning: {INSTALLED_GATE} vs {SOURCE_GATE}")
     if not INSTALLED_GATE.is_file():
         pytest.skip(
-            f"no gate installed at {INSTALLED_GATE} -- nothing is enforcing; nothing to compare"
+            f"SKIP (nothing compared): no gate installed at {INSTALLED_GATE} -- nothing is enforcing"
         )
     if not source_is_committed():
         pytest.skip(
-            f"{SOURCE_GATE.relative_to(ROOT)} has uncommitted changes -- the installed copy is SUPPOSED "
-            f"to differ mid-edit. Re-run after committing."
+            f"SKIP (nothing compared): {SOURCE_GATE.relative_to(ROOT)} has uncommitted changes -- the "
+            f"installed copy is SUPPOSED to differ mid-edit. Re-run after committing."
         )
 
     installed = hashlib.sha256(INSTALLED_GATE.read_bytes()).hexdigest()
     source = hashlib.sha256(SOURCE_GATE.read_bytes()).hexdigest()
-    print(f"scanned: {INSTALLED_GATE} ({installed[:12]}) vs {SOURCE_GATE} ({source[:12]})")
+    print(f"compared: installed={installed[:12]} source={source[:12]}")
 
     assert installed == source, (
         f"The RUNNING gate is not this checkout's script.\n"
@@ -116,15 +128,17 @@ def test_every_wired_matcher_names_a_tool_the_gate_handles() -> None:
     """The inverse drift: a matcher for a tool the script ignores burns a pwsh subprocess on every call,
     and -- worse -- reads as coverage that does not exist."""
     dirs = config_dirs()
+    print(f"scanning {len(dirs)} config dir(s) against {INSTALLED_GATE}")
     if not dirs:
-        pytest.skip("no Claude config dirs on this box -- nothing is wired, so nothing to check")
+        pytest.skip("SKIP (nothing scanned): no Claude config dirs on this box -- nothing is wired")
     if not INSTALLED_GATE.is_file():
         pytest.skip(
-            f"no gate installed at {INSTALLED_GATE} -- matchers cannot be judged against it"
+            f"SKIP (nothing scanned): no gate at {INSTALLED_GATE} -- matchers have nothing to be judged "
+            f"against"
         )
 
     handled = handled_tools(INSTALLED_GATE.read_text(encoding="utf-8"))
-    print(f"scanned {len(dirs)} config dir(s) against {len(handled)} rule(s) in the INSTALLED gate")
+    print(f"compared against {len(handled)} rule(s) in the INSTALLED gate")
     stray: dict[str, set[str]] = {}
     for d in dirs:
         wired = wired_matchers(d / "settings.json")
@@ -139,16 +153,19 @@ def test_every_non_optional_rule_is_wired_in_every_config_dir() -> None:
     check that would have caught rule 4 on day one -- the repo-side wiring test could not, because it
     compares the installer to the script and never looks at what is actually installed."""
     dirs = config_dirs()
+    print(
+        f"scanning {len(dirs)} config dir(s); opt-in (absence is not drift): {sorted(OPT_IN_TOOLS)}"
+    )
     if not dirs:
-        pytest.skip("no Claude config dirs on this box -- nothing is wired, so nothing to check")
+        pytest.skip("SKIP (nothing scanned): no Claude config dirs on this box -- nothing is wired")
     if not INSTALLED_GATE.is_file():
-        pytest.skip(f"no gate installed at {INSTALLED_GATE} -- there is no live rule set to wire")
+        pytest.skip(
+            f"SKIP (nothing scanned): no gate at {INSTALLED_GATE} -- no live rule set to wire"
+        )
 
     handled = handled_tools(INSTALLED_GATE.read_text(encoding="utf-8"))
     required = handled - OPT_IN_TOOLS
-    print(
-        f"scanned {len(dirs)} config dir(s); require {sorted(required)}; opt-in {sorted(OPT_IN_TOOLS)}"
-    )
+    print(f"required in every dir: {sorted(required)}")
 
     unwired: dict[str, list[str]] = {}
     for d in dirs:

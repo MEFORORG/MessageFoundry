@@ -41,7 +41,8 @@ Four layers. Only the middle two enforce anything.
 
 ### Prevention — `PreToolUse` hooks
 
-**[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1)** (417 lines) is installed at
+**[`scripts/hooks/worktree_gate.ps1`](../scripts/hooks/worktree_gate.ps1)** (417 lines when this audit
+ran; 609 after the fixes below) is installed at
 **user scope** by [`install-gate.ps1`](../scripts/worktree/install-gate.ps1) into `~/.claude/settings.json`
 *and* every `~/.claude-account-*/settings.json`. User scope is deliberate: a project-scoped hook is
 git-tracked, so it lives on one branch and a worktree cut from an older base would carry no gate at all.
@@ -121,7 +122,7 @@ reading the emitted decision — not by reading source alone.
 | `session-context.ps1` banner | project | LIVE where the branch carries the file |
 | Claim / alloc / ledger gates | git hooks | LIVE |
 | `new.ps1` / `remove.ps1` / `prune-merged.ps1` | manual | LIVE, **sibling-layout only** |
-| `tests/test_worktree_gate*.py`, `test_install_gate_wiring.py` | CI + local | **85 green, and blind** — every one binds the repo copy; nothing reads the installed copy or any live `settings.json` |
+| `tests/test_worktree_gate*.py`, `test_install_gate_wiring.py` | CI + local | Was **85 green, and blind** — every one bound the repo copy; nothing read the installed copy or any live `settings.json`. Now 91 across six files, plus the local-only parity check below |
 
 Rule 4 being inert is **deliberate and announced** — the commit that landed it says "ships INERT …
 nothing changes until `install-gate.ps1` is re-run." It is listed as INERT here because a control that
@@ -136,7 +137,7 @@ closed and probe-verified. So is the literal-spelling tree swap: `git checkout m
 `git -C <abs primary> checkout main`, `git -C ../../.. checkout zzz`, and `cd <abs primary> && git checkout main`
 all DENY. Fan-out from the primary is closed for the three named dispatch tools. Duplicate-branch checkout
 across worktrees is closed — though git enforces that one for free, so rule 3b fills a narrower gap than
-its 90 lines suggest.
+its 73 lines suggest.
 
 **Only nominally closed.**
 
@@ -431,13 +432,23 @@ analysis must be redone.
 | **B10** | **Collapse the two allowlists; harden the second installer.** One allowlist path referenced by both scripts; `-Uninstall` removes it; give `install-selfheal.ps1` the `CLAUDECODE` throw, the multi-config-dir discovery loop, a `-Status` and an `-Uninstall`. Extend B1's check to assert the set of dirs carrying a gate matcher equals the set carrying the selfheal hook. | G8 | S | none |
 | **B11** | **Close the verb and teardown holes.** A second alternation for hyphenated/two-token forms (`sparse-checkout`, `worktree remove|move`, `branch -f`, `update-ref`, `read-tree`, `rm`, `mv`, `checkout-index`, `bisect`), with its own message for `worktree remove` (cross-session destruction, not a tree swap); teach the detector about `gh`. Give `prune-merged.ps1` a **loud failure** when its root is not the primary instead of a green no-op, and add nested-worktree teardown. Correct the false rationale comment. | G9, G11 | M | low |
 
-**Status.** B1, B2, B3, B4 and B9 are **built and merged to this branch**, with tests; each fix was proved
-to catch its own regression by mutation (five mutations applied to the shipped script one at a time, all
-five went red). B7 is **half done** — rule 4 is now opt-in rather than retired, which preserves the owner's
-decision while removing the trap where re-installing would activate it. B5, B6, B8, B10 and B11 are **not
-started**; B6 (worktree-first entry point) is the one with the largest durable effect and no code in it.
+**Status**, stated exactly — an overstated one here is worse than none, because the next session acts on it.
 
-Remaining order: B6, then B8 (cross-worktree blast radius), then B5, B10, B11.
+| | State | What is actually true |
+|---|---|---|
+| B2, B9 | **Done** | Receipts (sanitised, one record per line, retried under contention) and the deny-message fix, with tests. |
+| B1 | **Mostly done** | Parity check, `-Status` audit, `-EnterWorktreeGate` opt-in. **Not** done: it emits no liveness receipt through `scripts/quality/liveness.py`, so on CI it is three honest skips rather than a tracked result. |
+| B3 | **Mostly done** | Shared resolver, case-sensitive `-C`, `cd`/`pushd` from the prefix only, `--work-tree` / `GIT_WORK_TREE` / `--git-dir` as additional candidates. **Not** done: `GIT_DIR=` is unhandled. Rule 3b's early return is now moot — both rules resolve through the same function — rather than literally inverted. |
+| B4 | **Mostly done** | Per-line scanning, continuation folding, interpreter-argument recursion, quoted spans blanked. **Not** done: the split helper is still not shared with `block-blanket-git-stage.ps1`, so the two hooks can still disagree about what a command is. |
+| B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
+| B5, B6, B8, B10, B11 | **Not started** | B6 (worktree-first entry point) has the largest durable effect and no code in it. |
+
+Remaining order: B6, then B8 (cross-worktree blast radius), then B5, B10, B11, then the B1/B3/B4 remainders.
+
+Each shipped fix was proved to catch its own regression by mutation — five mutations applied to the shipped
+script one at a time, all five went red — and an adversarial review of the first attempt found three
+regressions it had introduced, since fixed and pinned by
+[`tests/test_worktree_gate_shell_semantics.py`](../tests/test_worktree_gate_shell_semantics.py).
 
 One caveat carried forward: **none of the merged work is live until the gate is re-installed.** That is the
 same property that made rule 4 inert, now with a test watching it.

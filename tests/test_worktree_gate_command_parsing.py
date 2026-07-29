@@ -95,6 +95,8 @@ def test_a_config_override_whose_value_looks_like_an_outside_path_still_denies(
     )
 
 
+# Not a bypass fix -- a regression guard. This case denied before the change too, and it is here so a
+# future edit to the config-override parsing cannot break the ordinary path while fixing the exotic one.
 def test_a_config_override_does_not_break_an_ordinary_deny(primary: Path, repos_file: Path) -> None:
     assert_denied(
         run_gate(shell("git -c advice.detachedHead=false switch main", cwd=primary), repos_file)
@@ -117,9 +119,9 @@ def test_a_relative_cd_to_the_primary_is_denied(
     nested: Path, repos_file: Path, command: str
 ) -> None:
     """The whole point of the fix. `../../..` from a nested worktree IS the primary, but the in-text
-    fallback only ever matched the primary's LITERAL spelling, so none of these named it. Note the list
-    spans nine verbs: rule 3b handles only checkout/switch, so for the other seven there was never even a
-    hand-off to bow out of -- they were plain misses."""
+    fallback only ever matched the primary's LITERAL spelling, so none of these named it. The seven cases
+    span seven verbs, and rule 3b handles only checkout/switch -- so for five of them there was never even
+    a hand-off to bow out of; they were plain misses."""
     reason = assert_denied(run_gate(shell(command, cwd=nested), repos_file))
     assert "SHARED PRIMARY" in reason
 

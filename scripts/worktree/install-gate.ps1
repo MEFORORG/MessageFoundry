@@ -136,8 +136,10 @@ function Get-GateHash([string]$Path) {
     (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
 }
 
-# Every tool the gate script branches on. Read from the SOURCE, so -Status can say which implemented rules
-# are unwired rather than printing a bare count nobody can calibrate.
+# Every tool a gate script branches on. -Status calls this on the INSTALLED copy, deliberately: the
+# question it answers is "which rules does the gate that is RUNNING have, and are they all wired", and the
+# source's rule set is not evidence for either. That is the whole point of the audit -- rule 4 was in the
+# source, declared by this installer, and covered by tests, while the running gate had never heard of it.
 function Get-HandledTools([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return @() }
     $text = Get-Content -LiteralPath $Path -Raw

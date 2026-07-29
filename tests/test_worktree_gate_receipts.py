@@ -12,6 +12,7 @@ steering the next action, and it was steering it back at the tree the gate had j
 
 from __future__ import annotations
 
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -95,6 +96,69 @@ def test_each_rule_stamps_its_own_id(
         payload = shell("git checkout somebranch", cwd=primary)
     assert_denied(run_gate(payload, repos_file))
     assert expected_rule in receipts(repos_file)[0]
+
+
+def test_rule_4_stamps_its_own_id(primary: Path, repos_file: Path) -> None:
+    """Rules 3b and 4 were the two the first version of this file left unattributed."""
+    payload = {
+        "session_id": "s-1",
+        "cwd": str(primary),
+        "tool_name": "EnterWorktree",
+        "tool_input": {"name": "wt-1"},
+    }
+    assert_denied(run_gate(payload, repos_file))
+    assert "rule=4" in receipts(repos_file)[0]
+
+
+@pytest.mark.skipif(shutil.which("git") is None, reason="needs git on PATH")
+def test_rule_3b_stamps_its_own_id(tmp_path: Path) -> None:
+    """3b needs a REAL worktree -- it asks git whether the target is a governed linked worktree."""
+
+    def git(*args: str, cwd: Path | None = None) -> None:
+        subprocess.run(
+            ["git", *args],
+            cwd=str(cwd) if cwd else None,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+    primary = tmp_path / "Primary"
+    git("init", "-b", "main", str(primary))
+    git("config", "user.email", "t@example.com", cwd=primary)
+    git("config", "user.name", "t", cwd=primary)
+    (primary / "seed.txt").write_text("seed\n", encoding="utf-8")
+    git("add", "-A", cwd=primary)
+    git("commit", "-m", "seed", cwd=primary)
+    git("branch", "claude/other-branch", cwd=primary)
+    wt = tmp_path / "Primary-wt"
+    git("worktree", "add", "-b", "wt-branch", str(wt), cwd=primary)
+    repos = tmp_path / "repos.txt"
+    repos.write_text(f"{primary}\n", encoding="utf-8")
+
+    assert_denied(run_gate(shell("git checkout claude/other-branch", cwd=wt), repos))
+    line = receipts(repos)[0]
+    assert "rule=3b" in line, line
+    assert "git checkout" in line
+
+
+def test_every_receipt_carries_the_gate_version(primary: Path, repos_file: Path) -> None:
+    """The version stamp is how `install-gate.ps1 -Status` names the build that is running. If it stops
+    being written, a log full of denials cannot be attributed to a rule set."""
+    assert_denied(run_gate(edit(primary / "x.py", primary), repos_file))
+    line = receipts(repos_file)[0]
+    assert re.search(r"\tv\d{4}\.\d{2}\.\d{2}\.\d+\t", line), line
+    assert re.search(r"\tpid=\d+\t", line), line
+
+
+def test_rule_1_governs_the_primarys_own_git_hooks_directory(
+    primary: Path, repos_file: Path
+) -> None:
+    """The gate's enforcement surface must not be editable through the gate. `<primary>/.git/hooks` is
+    under a governed root and is NOT under the `.claude/worktrees/` exemption, so rule 1 denies a write
+    there -- docs/SESSION-DRIFT-CONTROLS.md asserts this, and nothing was asserting it."""
+    assert_denied(run_gate(edit(primary / ".git" / "hooks" / "pre-commit", primary), repos_file))
+    assert_denied(run_gate(edit(primary / ".claude" / "hooks" / "x.ps1", primary), repos_file))
 
 
 def test_the_receipt_never_records_the_raw_command(primary: Path, repos_file: Path) -> None:
