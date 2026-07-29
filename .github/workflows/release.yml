@@ -403,7 +403,7 @@ jobs:
             if [ -z "$PKG_PIN" ]; then
               echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
             fi
-            python -m pip install --quiet "packaging==$PKG_PIN\"
+            python -m pip install --quiet "packaging==$PKG_PIN"
             python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
