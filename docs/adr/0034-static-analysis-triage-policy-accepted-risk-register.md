@@ -221,3 +221,35 @@ an execution. Before the next tag, run `security.yml`'s sbom job via `workflow_d
 log — the install command there is byte-identical to `release.yml`'s, and
 `test_sbom_install_is_byte_identical_in_release_and_security` now enforces that identity, because the
 dry-run is evidence about the release step only for as long as the two commands are the same command.
+
+## Amendment — 2026-07-29: `py/insecure-protocol` on the ASVS 12.1.1 TLS-floor probe
+
+**Alert 145 — `py/insecure-protocol`, HIGH, `messagefoundry/config/tls_probe.py`. Dismissed `won't fix`.**
+
+CodeQL is factually right and the finding does not apply. `tls_probe.py` is the **measurement** for ASVS
+12.1.1: at startup, on a PHI instance behind a *declared* upstream TLS terminator under `enforce`, it dials
+the operator's own `public_origin` and offers TLS 1.0 and 1.1. **A successful handshake is the finding** —
+it proves the front door accepts a protocol NIST SP 800-52r2 withdrew, and the engine refuses to serve.
+Offering the withdrawn version *is* the control; there is no implementation that measures whether a peer
+accepts TLS 1.0 without asking it to.
+
+Two settings the rule flags are load-bearing and mutation-proven in `tests/test_tls_floor_probe.py`:
+
+- `minimum_version == maximum_version == TLSv1` **plus `ALL:@SECLEVEL=0`** — without the security-level
+  drop, modern OpenSSL will not even *send* the ClientHello, so the probe would measure **our** refusal to
+  ask rather than **their** refusal to answer, and a permissive front door would read as clean. Dropping
+  `SECLEVEL=0` is one of the five mutations that turn the suite red.
+- `CERT_NONE` — the probe measures the **protocol floor**. An internal CA the engine does not trust would
+  abort the handshake *before the version was settled*, reporting "TLS 1.0 refused" for a door that was
+  never knocked on. Chain validation is a separate control (12.1.4 / `harden_verify_flags`).
+
+**Scope, which is what makes the dismissal safe:** client contexts only, constructed in this module, used
+for exactly one handshake, never returned to a caller, carrying no application data and no PHI. This is
+**not a data path** and these settings must never be reused for one — the module docstring says so, and
+the crypto-inventory row (`scripts/security/crypto_inventory_check.py`) repeats the warning at the place a
+future author would look. Every TLS scanner (`testssl.sh`, `sslyze`, `nmap ssl-enum-ciphers`) is built the
+same way; suppressing this rule for a scanner is the industry-standard disposition, not a local shortcut.
+
+**Convergence note (per the rule above):** the anchor is `tls_probe.py:146`, inside `_offer_context`. That
+module is new and small, so expect this to re-fire as a fresh alert number the first time anything is
+inserted above line 146. Re-dismiss with this rationale rather than re-triaging from scratch.
