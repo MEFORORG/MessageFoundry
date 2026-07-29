@@ -105,6 +105,19 @@ It is **read-only**: a roster, not a channel. It never writes a registry file an
 session. Note the corollary of having no heartbeat anywhere on this host: a `DEAD`/`STALE` verdict is a
 hint for a human, and must never by itself authorise a destructive action such as reclaiming a claim.
 
+The fence itself lives in [../scripts/coord/session-registry.ps1](../scripts/coord/session-registry.ps1)
+and is shared with `sessions.ps1` — one copy on purpose, because two copies of a safety check drift and
+the one that drifts is the one nobody is testing.
+
+**`sessions.ps1 -Rehome` no longer trusts transcript mtime alone.** Moving a transcript out from under a
+running session corrupts it *and* relocates a live session — the exact injury `sessions.ps1` exists to
+repair. Its old guard used file mtime, which is **not** a liveness signal here: subagent and workflow
+output is filed under `<sessionId>/subagents/`, so a session running a long workflow barely touches its
+own transcript. Measured on this host: a verifiably-live session sat **32 minutes** idle by mtime — three
+times the 10-minute `-MinIdleMinutes` default — while its process was alive and fenced. The guard now
+consults the registry *and* mtime, and **refuses if either says live**, because nothing here can prove a
+session is gone; only the positive answer is trustworthy.
+
 **Creating a worktree is serialised.** `git worktree add -b <name> <base>` writes `.git/config`, so two
 sessions creating worktrees at once race `.git/config.lock` — on Windows that surfaces as `could not
 lock config file .git/config: File exists`, leaving orphaned branches behind. `new.ps1` wraps that call

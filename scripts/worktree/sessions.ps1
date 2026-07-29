@@ -229,9 +229,34 @@ if ($Rehome) {
     if ($hit.Count -gt 1) { throw "'$Rehome' matches $($hit.Count) sessions. Use a longer id prefix." }
     $s = $hit[0]
 
-    # Moving a transcript out from under a RUNNING session's writer corrupts it. Recent writes are the only
-    # signal we have that the session is live, so treat them as one. Under -WhatIf we only PREVIEW, so the
-    # liveness guard is relaxed there -- nothing is moved, and you still see what the move would do.
+    # Moving a transcript out from under a RUNNING session's writer corrupts it -- and relocating a live
+    # session is precisely the injury this script exists to REPAIR, so a false "it's idle" here is the
+    # worst failure it can have. Two INDEPENDENT signals, and EITHER may veto. Under -WhatIf we only
+    # PREVIEW, so both are relaxed there -- nothing is moved, and you still see what the move would do.
+    #
+    # (1) The session registry, fenced on pid + process start time (scripts/coord/session-registry.ps1).
+    #     This is the authoritative POSITIVE signal, and adding it is the point of this guard: transcript
+    #     mtime is NOT liveness. Subagent and workflow output is written under <sessionId>/subagents/, so
+    #     a session running a long workflow barely touches its own transcript. Measured on this host: a
+    #     verifiably-live session sat 32 minutes idle by mtime while its process was alive and fenced --
+    #     three times -MinIdleMinutes, i.e. the old guard would have waved the move straight through.
+    #
+    # (2) Transcript mtime, the original signal, KEPT rather than replaced. A session that exits cleanly
+    #     unlinks its registry file, so "no record" is indistinguishable from "never registered" and
+    #     cannot stand on its own either.
+    #
+    # Refusing when EITHER says live is deliberate: nothing on this host can PROVE a session is gone
+    # (no heartbeat, and registry writes are event-driven), so only the positive answer is trustworthy.
+    # A negative from one signal must never by itself authorise a destructive move.
+    . "$PSScriptRoot\..\coord\session-registry.ps1"
+    $reg = Get-SessionLiveness -SessionId $s.Id
+    if ($reg.State -in @("LIVE", "UNVERIFIED") -and -not $Force -and -not $WhatIfPreference) {
+        throw ("Session $($s.Id) is $($reg.State) in the session registry (pid $($reg.Record.pid)" +
+               "$(if ($reg.Detail) { "; $($reg.Detail)" })) -- it is still RUNNING and moving its " +
+               "transcript would corrupt it. Its transcript may look idle: subagent output is filed " +
+               "elsewhere, so mtime is not liveness. Close that window, then retry (or -Force).")
+    }
+
     $idle = (Get-Date) - $s.Last
     if ($idle.TotalMinutes -lt $MinIdleMinutes -and -not $Force -and -not $WhatIfPreference) {
         throw ("Session $($s.Id) was written $([int]$idle.TotalMinutes) min ago and may still be RUNNING; " +
