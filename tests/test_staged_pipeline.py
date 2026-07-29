@@ -28,7 +28,7 @@ from messagefoundry.config.wiring import (
     WiringError,
     inbound,
 )
-from messagefoundry.store.crypto import PREFIX, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, make_cipher
 from messagefoundry.store.store import MessageStatus, MessageStore, OutboxStatus, Stage
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -841,7 +841,7 @@ async def test_legacy_outbox_migrates_to_queue_with_encryption(tmp_path: Path) -
         item = await store.claim_next_fifo("OB_A")
         assert item is not None and item.payload == "PLAINPAYLOAD"
         on_disk = sqlite3.connect(path).execute("SELECT payload FROM queue").fetchone()[0]
-        assert str(on_disk).startswith(PREFIX)  # encrypted at rest after migration
+        assert str(on_disk).startswith(MARKER_PREFIX)  # encrypted at rest after migration
     finally:
         await store.close()
 

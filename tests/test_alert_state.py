@@ -17,7 +17,7 @@ from pathlib import Path
 
 from messagefoundry.config.settings import AlertRule, AlertSeverity
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 # --- store lifecycle ---------------------------------------------------------
@@ -193,7 +193,9 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
     con = sqlite3.connect(db)
     try:
         raw = con.execute("SELECT reason FROM alert_instance").fetchone()[0]
-        assert isinstance(raw, str) and raw.startswith(PREFIX)  # ciphertext on disk
+        # Version-agnostic marker: the claim is "enciphered at rest", and the at-rest format follows
+        # [store].aad_bind (v2 by default) — a v1-only prefix would be a latent false failure.
+        assert isinstance(raw, str) and raw.startswith(MARKER_PREFIX)  # ciphertext on disk
         assert "refused" not in raw
     finally:
         con.close()

@@ -264,11 +264,10 @@ async def test_complete_with_response_parity(store) -> None:
 
 async def test_record_ack_sent_aa_body_encrypted_at_rest_pg(store) -> None:
     # (1) An AA ack_body is persisted only on an ENCRYPTED store, and on disk it is ciphertext: it
-    # carries the v1 marker, is not the plaintext AA frame, and decrypts back to exactly it. A second,
-    # ciphered handle is needed because the fixture store is the identity cipher (unencrypted) — mirrors
-    # the existing at-rest encryption tests in this file.
+    # carries the mfenc: marker, is not the plaintext AA frame, and decrypts back to exactly it. A
+    # second, ciphered handle is needed because the fixture store is the identity cipher (unencrypted)
+    # — mirrors the existing at-rest encryption tests in this file.
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
@@ -295,7 +294,7 @@ async def test_record_ack_sent_aa_body_encrypted_at_rest_pg(store) -> None:
                 "SELECT body FROM response WHERE message_id=$1 AND kind='ack_sent'", mid
             )
         )["body"]
-        assert disk.startswith(PREFIX)  # stored under the encrypted marker, not in the clear
+        assert disk.startswith(MARKER_PREFIX)  # stored under the encrypted marker, not in the clear
         assert disk != _ACK_AA
         assert cipher.decrypt(disk) == _ACK_AA  # and it genuinely encrypts the AA frame
     finally:
@@ -2141,7 +2140,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
     """EF-3: summary/metadata (direct MRN + patient name) are ciphered at rest on Postgres and
     decrypt on the detail + tracking-list read paths — parity with the SQLite suite."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.postgres import PostgresStore
 
     settings = load_settings(environ=os.environ).store
@@ -2153,8 +2152,8 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         )
         # at rest: ciphertext, with no MRN/name/site visible in the blob.
         row = await s._fetchone("SELECT summary, metadata FROM messages WHERE id=$1", mid)
-        assert row["summary"].startswith(PREFIX) and "999001" not in row["summary"]
-        assert row["metadata"].startswith(PREFIX) and "WESTWING" not in row["metadata"]
+        assert row["summary"].startswith(MARKER_PREFIX) and "999001" not in row["summary"]
+        assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
         assert rec["summary"] == summary and rec["metadata"] == metadata

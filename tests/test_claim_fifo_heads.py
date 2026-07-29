@@ -575,6 +575,10 @@ async def test_poison_rows_dead_lettered_dropped_and_lane_rearmed(
     key = base64.b64encode(b"\x11" * 32).decode("ascii")
     enc = await MessageStore.open(tmp_path / "heads.db", cipher=make_cipher(key, []))
     try:
+        # The injected "mfenc:v1:not-base64-$$$" payloads below are undecryptable ON PURPOSE, and the
+        # v1 marker is DELIBERATE (do not "sweep" it to a bare mfenc:): the version must be one the
+        # cipher DISPATCHES on, so the failure lands in the base64 decode inside decrypt. A bare
+        # "mfenc:" takes the unknown-marker-version branch — a different fail-closed path.
         # Lane 1: a single poison HEAD → dropped + DEAD + the lane re-arms.
         a = await _seed_ingress(enc, "IB_HP1", [100.0])
         await enc._db.execute(

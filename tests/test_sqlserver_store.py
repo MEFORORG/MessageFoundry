@@ -1146,11 +1146,10 @@ async def test_correlate_orders_by_seq_and_decrypts(store) -> None:
 
 async def test_record_ack_sent_aa_body_encrypted_at_rest_ss(store) -> None:
     # (1) An AA ack_body is persisted only on an ENCRYPTED store, and on disk it is ciphertext: it
-    # carries the v1 marker, is not the plaintext AA frame, and decrypts back to exactly it. A second,
-    # ciphered handle is needed because the fixture store is the identity cipher (unencrypted) — mirrors
-    # the existing at-rest encryption tests in this file.
+    # carries the mfenc: marker, is not the plaintext AA frame, and decrypts back to exactly it. A
+    # second, ciphered handle is needed because the fixture store is the identity cipher (unencrypted)
+    # — mirrors the existing at-rest encryption tests in this file.
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1177,7 +1176,7 @@ async def test_record_ack_sent_aa_body_encrypted_at_rest_ss(store) -> None:
                 "SELECT body FROM response WHERE message_id=? AND kind=?", (mid, "ack_sent")
             )
         )["body"]
-        assert disk.startswith(PREFIX)  # stored under the encrypted marker, not in the clear
+        assert disk.startswith(MARKER_PREFIX)  # stored under the encrypted marker, not in the clear
         assert disk != _ACK_AA
         assert cipher.decrypt(disk) == _ACK_AA  # and it genuinely encrypts the AA frame
     finally:
@@ -1474,7 +1473,7 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
     """EF-3: summary/metadata (direct MRN + patient name) ciphered at rest on SQL Server and
     decrypt on the detail + tracking-list read paths — parity with the SQLite/PG suites."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1486,8 +1485,8 @@ async def test_summary_metadata_encrypted_at_rest_and_decrypt(store) -> None:
         )
         # at rest: ciphertext, with no MRN/name/site visible in the blob.
         row = (await s._fetchall("SELECT summary, metadata FROM messages WHERE id=?", (mid,)))[0]
-        assert row["summary"].startswith(PREFIX) and "999001" not in row["summary"]
-        assert row["metadata"].startswith(PREFIX) and "WESTWING" not in row["metadata"]
+        assert row["summary"].startswith(MARKER_PREFIX) and "999001" not in row["summary"]
+        assert row["metadata"].startswith(MARKER_PREFIX) and "WESTWING" not in row["metadata"]
         # decrypt on the read paths.
         rec = await s.get_message(mid)
         assert rec["summary"] == summary and rec["metadata"] == metadata
@@ -1549,7 +1548,7 @@ async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> No
     Server and decrypt on every read path — parity with the SQLite/PG suites. Error strings are plain
     (no HL7 delimiters) so safe_text leaves them intact and the round-trip is exact."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1566,17 +1565,18 @@ async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> No
         fail = "delivery refused by partner endpoint"
         await s.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)  # -> DEAD
 
-        # AT REST: every value is mfenc:v1:... ciphertext — the cleartext phrase never appears in the col.
+        # AT REST: every value is mfenc:... ciphertext — the cleartext phrase never appears in the col.
+        # (Version-agnostic per the section header: the format follows [store].aad_bind, v2 by default.)
         erow = (await s._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
-        assert erow["error"].startswith(PREFIX) and "bad parse" not in erow["error"]
+        assert erow["error"].startswith(MARKER_PREFIX) and "bad parse" not in erow["error"]
         qrow = (await s._fetchall("SELECT last_error FROM queue WHERE message_id=?", (mid,)))[0]
-        assert qrow["last_error"].startswith(PREFIX) and "refused" not in qrow["last_error"]
+        assert qrow["last_error"].startswith(MARKER_PREFIX) and "refused" not in qrow["last_error"]
         drows = await s._fetchall(
             "SELECT detail FROM message_events WHERE detail IS NOT NULL ORDER BY id"
         )
         assert drows, "expected at least one event with a detail"
         for d in drows:
-            assert d["detail"].startswith(PREFIX)  # no plaintext detail at rest
+            assert d["detail"].startswith(MARKER_PREFIX)  # no plaintext detail at rest
             assert "bad parse" not in d["detail"] and "refused" not in d["detail"]
 
         # DECRYPT ON READ: every read path returns the cleartext.
@@ -1641,7 +1641,7 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
     _encrypt_existing_rows (the message_events.detail pass is keyed on the INT IDENTITY id). After the
     keyed open, the at-rest columns are ciphertext and reads still return the original cleartext."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1657,9 +1657,10 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
         )
         item = (await plain.claim_ready(now=100.0))[0]
         await plain.mark_failed(item.id, fail, RetryPolicy(max_attempts=1), now=110.0)
-        # sanity: stored plaintext (no cipher prefix) before the migration runs.
+        # sanity: stored plaintext (no cipher prefix) before the migration runs. A NEGATIVE assert, so
+        # it must exclude EVERY marker version — a v1-only spelling would pass on an encrypted v2 value.
         erow = (await plain._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
-        assert erow["error"] == err and not erow["error"].startswith(PREFIX)
+        assert erow["error"] == err and not erow["error"].startswith(MARKER_PREFIX)
     finally:
         await plain.close()
 
@@ -1667,11 +1668,11 @@ async def test_legacy_plaintext_error_detail_migrated_on_open(store) -> None:
     keyed = await SqlServerStore.open(settings, cipher=AesGcmCipher(b"k" * 32))
     try:
         erow = (await keyed._fetchall("SELECT error FROM messages WHERE id=?", (eid,)))[0]
-        assert erow["error"].startswith(PREFIX) and "bad parse" not in erow["error"]
+        assert erow["error"].startswith(MARKER_PREFIX) and "bad parse" not in erow["error"]
         qrow = (await keyed._fetchall("SELECT last_error FROM queue WHERE message_id=?", (mid,)))[0]
-        assert qrow["last_error"].startswith(PREFIX)
+        assert qrow["last_error"].startswith(MARKER_PREFIX)
         drows = await keyed._fetchall("SELECT detail FROM message_events WHERE detail IS NOT NULL")
-        assert drows and all(d["detail"].startswith(PREFIX) for d in drows)
+        assert drows and all(d["detail"].startswith(MARKER_PREFIX) for d in drows)
         # reads still return the original cleartext after the in-place migration.
         assert (await keyed.get_message(eid))["error"] == err
         assert (await keyed.list_dead())[0]["last_error"] == fail
@@ -1894,7 +1895,7 @@ async def test_reference_snapshot_encrypted_at_rest(store) -> None:
     """Reference values (may carry PHI for patient-keyed sets) are mfenc ciphertext at rest while
     reference_view() serves plaintext — SQLite/PG parity (test_reference_sets.py analog)."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1905,7 +1906,7 @@ async def test_reference_snapshot_encrypted_at_rest(store) -> None:
             assert s.reference_view()["codes"]["MRN"] == "SECRET999"  # cache is plaintext
             # The value column at rest is ciphertext (no PHI visible in the blob).
             row = (await s._fetchall("SELECT value FROM reference"))[0]
-            assert row["value"].startswith(PREFIX) and "SECRET999" not in row["value"]
+            assert row["value"].startswith(MARKER_PREFIX) and "SECRET999" not in row["value"]
         finally:
             await s.close()
         # Reopening with the same cipher decrypts back into the cache.
@@ -2012,14 +2013,15 @@ async def test_reference_plaintext_migrated_on_keyed_reopen(store) -> None:
     IdentityCipher writes plaintext JSON, and the first keyed open's _encrypt_existing_rows reference
     pass encrypts them in place (the no-key -> key transition)."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import PREFIX, AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     try:
-        # (1) The keyless fixture handle writes plaintext JSON at rest.
+        # (1) The keyless fixture handle writes plaintext JSON at rest. A NEGATIVE assert, so it must
+        # exclude EVERY marker version — a v1-only spelling would pass on an encrypted v2 value.
         await store.write_reference_snapshot(name="codes", version="v1", rows={"MRN": "SECRET999"})
         row = (await store._fetchall("SELECT value FROM reference"))[0]
-        assert row["value"] == '"SECRET999"' and not row["value"].startswith(PREFIX)
+        assert row["value"] == '"SECRET999"' and not row["value"].startswith(MARKER_PREFIX)
 
         # (2) Re-open WITH a key: open() runs the _encrypt_existing_rows reference pass and
         # migrates it.
@@ -2028,7 +2030,7 @@ async def test_reference_plaintext_migrated_on_keyed_reopen(store) -> None:
         )
         try:
             row = (await keyed._fetchall("SELECT value FROM reference"))[0]
-            assert row["value"].startswith(PREFIX) and "SECRET999" not in row["value"]
+            assert row["value"].startswith(MARKER_PREFIX) and "SECRET999" not in row["value"]
             assert keyed.reference_view()["codes"]["MRN"] == "SECRET999"  # decrypts on cache load
         finally:
             await keyed.close()

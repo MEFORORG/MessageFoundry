@@ -247,6 +247,9 @@ def test_faked_provider_key_decrypts_existing_mfenc_v1_rows_without_rotation() -
             return self._retired
 
     # A row written by today's cipher under KEY_A...
+    # DELIBERATELY v1 (do not sweep to MARKER_PREFIX): the acceptance criterion this test is named for
+    # is "decrypts an EXISTING mfenc:v1 row with NO rotation", so establishing that the fixture really
+    # is v1 is the premise, not incidental. make_cipher's default writer is the frozen v1 one.
     token = make_cipher(KEY_A).encrypt(ADT)
     assert token.startswith(PREFIX)
 

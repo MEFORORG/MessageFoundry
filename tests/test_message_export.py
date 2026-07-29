@@ -25,7 +25,7 @@ from messagefoundry.auth.service import AuthService
 from messagefoundry.auth.tokens import hash_token
 from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
@@ -174,7 +174,10 @@ async def test_export_save_all_streams_decrypted_bodies(engine: Engine) -> None:
         raws = {row["control_id"]: row["raw"] for row in rows}
         assert "DOE^JANE" in str(raws["MSGA"])
         assert str(raws["MSGA"]).startswith("MSH")  # not the mfenc: ciphertext
-        assert PREFIX not in str(raws["MSGA"])
+        # A NEGATIVE leak check, so it must exclude EVERY at-rest marker version: a v1-only spelling
+        # would pass silently on a leaked v2 blob instead of failing. Non-vacuous — the synthetic ADT
+        # plaintext contains no "mfenc:" at all, and the startswith("MSH") above pins the shape.
+        assert MARKER_PREFIX not in str(raws["MSGA"])
 
 
 async def test_export_save_selected_by_ids(engine: Engine) -> None:

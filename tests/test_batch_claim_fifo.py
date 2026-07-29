@@ -311,6 +311,10 @@ async def test_t8_undecryptable_interior_dead_lettered_tail_survives(
     channel = "IB_T8"
     mids = await _seed_ingress(enc, channel, [100.0, 101.0, 102.0])
     # Corrupt row2's payload to an undecryptable blob (keep the marker so it routes through decrypt).
+    # The v1 marker is DELIBERATE (do not "sweep" it to a bare mfenc:): the version must be one the
+    # cipher DISPATCHES on, so the failure lands in the base64 decode inside decrypt. A bare "mfenc:"
+    # takes the unknown-marker-version branch instead — a different fail-closed path than the one
+    # this test claims to exercise.
     await enc._db.execute(
         "UPDATE queue SET payload=? WHERE message_id=? AND stage=?",
         ("mfenc:v1:not-base64-$$$", mids[1], Stage.INGRESS.value),

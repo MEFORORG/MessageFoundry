@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, cell_aad, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -22,8 +22,11 @@ AA = "MSH|^~\\&|R|RF|S|F|20260101||ACK^A01|MSG1|P|2.5.1\rMSA|AA|MSG1\r"
 def _response_rows(db_path: Path) -> list[tuple]:
     con = sqlite3.connect(db_path)
     try:
+        # message_id + response_seq trail the display columns so existing positional indices hold;
+        # they are the row half of the cell AAD the body is bound under (ADR 0019).
         return con.execute(
-            "SELECT destination_name, kind, ack_code, ack_phase, body FROM response"
+            "SELECT destination_name, kind, ack_code, ack_phase, body, message_id, response_seq "
+            "FROM response"
         ).fetchall()
     finally:
         con.close()
@@ -47,14 +50,20 @@ async def test_aa_body_encrypted_when_store_encrypted(tmp_path: Path) -> None:
         ack = next(r for r in rows if r.kind == "ack_sent")
         assert ack.ack_code == "AA" and ack.ack_phase == "ingest"
         assert ack.body == AA  # decrypted round-trip
-        # On disk the body is ciphertext, never the plaintext ACK: it carries the v1 encrypted marker,
-        # is not the plaintext frame, and decrypts back to exactly it. Assert the decrypt round-trip
-        # (deterministic) rather than `"MSA" not in <ciphertext>` — that old substring check flaked
-        # because a base64 ciphertext randomly contains that 3-char run (base64 alphabet includes M/S/A).
+        # On disk the body is ciphertext, never the plaintext ACK: it carries the mfenc: encrypted
+        # marker, is not the plaintext frame, and decrypts back to exactly it. Assert the decrypt
+        # round-trip (deterministic) rather than `"MSA" not in <ciphertext>` — that old substring check
+        # flaked because a base64 ciphertext randomly contains that 3-char run (alphabet includes M/S/A).
+        # The claim is encryptedness, so anchor on the VERSION-AGNOSTIC marker: the at-rest format
+        # follows [store].aad_bind (v2 by default), and a v1-only prefix would silently fail on it.
         disk = next(r for r in _response_rows(db) if r[1] == "ack_sent")
-        assert disk[4].startswith(PREFIX)  # stored under the encrypted marker, not in the clear
+        assert disk[4].startswith(MARKER_PREFIX)  # under the encrypted marker, not in the clear
         assert disk[4] != AA
-        assert cipher.decrypt(disk[4]) == AA  # and it genuinely encrypts the AA frame
+        # Decrypt under the SAME cell AAD the store wrote with (ASVS 11.3.3 / ADR 0019): a v2 value is
+        # bound to its (table, column, row) cell, so a bare decrypt fails closed on one. Harmless on a
+        # v1 value — that reader ignores the caller's aad by design (dual-read).
+        aad = cell_aad("response", "body", disk[5], disk[0], disk[6])
+        assert cipher.decrypt(disk[4], aad=aad) == AA  # and it genuinely encrypts the AA frame
     finally:
         await store.close()
 
