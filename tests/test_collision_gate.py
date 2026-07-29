@@ -223,6 +223,73 @@ def test_status_reports_installed_state(settings: Path) -> None:
     assert "INSTALLED" in run_installer(settings, "-Status")
 
 
+def shim_for(settings: Path, matcher_prefix: str, tmp_path: Path, name: str) -> Path:
+    cmd = next(
+        g["hooks"][0]["command"]
+        for g in load(settings)["hooks"]["PreToolUse"]
+        if g.get("matcher", "").startswith(matcher_prefix)
+    )
+    p = tmp_path / name
+    p.write_text(cmd, encoding="utf-8")
+    return p
+
+
+def test_shim_runs_the_primary_checkouts_script_not_the_worktrees(
+    settings: Path, tmp_path: Path
+) -> None:
+    """A worktree on a branch that predates a coordination change has none of the scripts.
+
+    Measured: a cwd-resolved shim found nothing there and exited silently -- no banner, no gate, and
+    no indication either was missing. Coordination is infrastructure and must be uniform, so the shim
+    resolves the PRIMARY checkout (which tracks main) rather than whatever branch the caller is on.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git_init(primary)
+    # Only the PRIMARY gets a gate script; the worktree deliberately does not have one.
+    (primary / "scripts" / "hooks").mkdir(parents=True)
+    (primary / "scripts" / "hooks" / "collision_gate.ps1").write_text(
+        "Write-Output 'PRIMARY-SCRIPT-RAN'\n", encoding="utf-8"
+    )
+    wt = tmp_path / "old-branch-wt"
+    subprocess.run(
+        ["git", "-C", str(primary), "worktree", "add", "-q", "-b", "old", str(wt)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not (wt / "scripts" / "hooks" / "collision_gate.ps1").exists()
+
+    run_installer(settings)
+    shim = shim_for(settings, "Edit", tmp_path, "shim.ps1")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(shim)],
+        cwd=str(wt),
+        input=json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "x.py"}}),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert "PRIMARY-SCRIPT-RAN" in proc.stdout, (
+        f"shim did not reach the primary checkout's script: {proc.stdout!r} {proc.stderr!r}"
+    )
+
+
+def _git_init(repo: Path) -> None:
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "init"], check=True, capture_output=True
+    )
+
+
 def test_installed_shim_is_inert_outside_a_git_repo(settings: Path, tmp_path: Path) -> None:
     """User settings are global: this hook runs in every unrelated project on the machine and must
     do nothing there rather than erroring on each tool call."""

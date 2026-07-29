@@ -17,10 +17,16 @@
     THE FIX: wire the hooks at USER level (~/.claude/settings.json), which is per-machine and loads in
     every worktree regardless of how it was created -- the same place the worktree gate already lives.
 
-    NO INSTALLED COPY. Each hook is a one-line shim that resolves the repo from the session's cwd and
-    runs THAT checkout's script. So there is nothing to go stale: after a `git pull` the hook is
-    current, everywhere, immediately. This is deliberate -- the worktree gate's installer copies its
-    script, and running it from a stale checkout has already silently downgraded the live gate once.
+    NO INSTALLED COPY. Each hook is a one-line shim that locates the script in a checkout and runs it,
+    so there is nothing to go stale: after a `git pull` the hook is current everywhere, immediately.
+    This is deliberate -- the worktree gate's installer copies its script, and running it from a stale
+    checkout has already silently downgraded the live gate once.
+
+    THE SHIM RESOLVES THE PRIMARY CHECKOUT, not the calling worktree. Coordination is infrastructure
+    and must be uniform across sessions. Measured 2026-07-29: a worktree sitting on a branch that
+    predated the coordination merge had none of these scripts, so a cwd-resolved shim found nothing
+    and exited silently -- that session got no banner and no gate, and nothing reported the absence.
+    The primary tracks main, so every session runs the same current code whatever branch it is on.
 
     WHAT GETS WIRED
       SessionStart                          -> scripts/worktree/session-context.ps1  (who is live, what they build)
@@ -47,16 +53,27 @@ $ErrorActionPreference = "Stop"
 # another tool (or another session) added to the same file.
 $MARKER = "mefor-coord"
 
-# The shim. Resolves the repo from the session's cwd, so one wiring serves every worktree and there is
-# no copy to fall behind the checkout. Silent and exit-0 outside a repo: this file is user-global and
-# will run in unrelated projects, where it must do nothing at all.
+# The shim. No installed copy: it locates the script in a checkout and runs it, so a `git pull` updates
+# the hook everywhere with nothing to fall stale. Silent and exit-0 outside a repo, because this file is
+# user-global and runs in every unrelated project on the machine.
+#
+# IT RESOLVES THE PRIMARY CHECKOUT, NOT THE CURRENT WORKTREE, and that order matters. Coordination is
+# INFRASTRUCTURE and has to be uniform: two sessions running different versions of the collision
+# protocol is the drift the shared liveness fence exists to prevent. Measured 2026-07-29: a worktree
+# sitting on a branch that predated the coordination merge had none of the scripts, so a cwd-resolved
+# shim found nothing and exited silently -- the session got no banner and no gate, and nothing said so.
+# The primary tracks main, so every session runs the same current code whatever its own branch is.
+# The current worktree is kept only as a fallback, for a layout where the primary is unavailable.
 function New-ShimCommand([string]$RelativeScript) {
     return (
         "# $MARKER`n" +
-        '$r = (& git rev-parse --show-toplevel 2>$null); ' +
-        'if ($LASTEXITCODE -eq 0 -and $r) { ' +
-        "`$s = Join-Path `$r '$RelativeScript'; " +
-        'if (Test-Path -LiteralPath $s) { & $s } }'
+        '$c = (& git rev-parse --path-format=absolute --git-common-dir 2>$null); ' +
+        'if ($LASTEXITCODE -eq 0 -and $c) { ' +
+        '$bases = @((Split-Path $c.Trim() -Parent), (& git rev-parse --path-format=absolute --show-toplevel 2>$null)); ' +
+        'foreach ($b in $bases) { ' +
+        'if (-not $b) { continue } ' +
+        "`$s = Join-Path `$b.Trim() '$RelativeScript'; " +
+        'if (Test-Path -LiteralPath $s) { & $s; break } } }'
     )
 }
 
