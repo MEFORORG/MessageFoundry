@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import inspect
 import ssl
 import types
 from itertools import product
@@ -227,70 +228,139 @@ def test_is_loopback_hop_host(host: str, expected: bool) -> None:
     assert is_loopback_hop_host(host) is expected
 
 
+def _legacy_insecure_hop_disposition(
+    *,
+    is_phi: bool,
+    enforcing: bool,
+    is_loopback_hop: bool,
+    hop_attested: bool,
+    audited_opt_out: bool,
+) -> HopDisposition:
+    """The PRE-ADR-0153 precedence, kept verbatim as the reference for the no-loosen property test.
+
+    This is the only place the deleted ``not is_phi -> ALLOW`` arm still exists. Comparing the shipped
+    authority against it across the whole OLD input space is what turns ADR 0153's central claim —
+    "strictly stricter, provably" — into a check that can FAIL, rather than a sentence in a document.
+    """
+    if is_loopback_hop:
+        return HopDisposition.ALLOW
+    if hop_attested:
+        return HopDisposition.ALLOW
+    if not is_phi:
+        return HopDisposition.ALLOW
+    if audited_opt_out:
+        return HopDisposition.WARN
+    if enforcing:
+        return HopDisposition.REFUSE
+    return HopDisposition.WARN
+
+
 def test_insecure_hop_disposition_full_precedence_table() -> None:
-    """Exhaustively assert the owner-ratified precedence over every input combination."""
-    for is_phi, production, is_loopback_hop, hop_attested, audited_opt_out in product(
-        [False, True], repeat=5
+    """Exhaustively assert the ADR 0153 precedence over every input combination (2**4, not 2**5)."""
+    for enforcing, is_loopback_hop, hop_attested, cleartext_accepted in product(
+        [False, True], repeat=4
     ):
         got = insecure_hop_disposition(
+            enforcing=enforcing,
+            is_loopback_hop=is_loopback_hop,
+            hop_attested=hop_attested,
+            cleartext_accepted=cleartext_accepted,
+        )
+        # Explicit early-return precedence: loopback -> attested -> accepted -> not-enforcing -> REFUSE.
+        if is_loopback_hop or hop_attested:
+            expected = HopDisposition.ALLOW
+        elif cleartext_accepted or not enforcing:
+            expected = HopDisposition.WARN
+        else:
+            expected = HopDisposition.REFUSE
+        assert got is expected, (enforcing, is_loopback_hop, hop_attested, cleartext_accepted)
+
+
+def test_insecure_hop_disposition_no_longer_takes_a_data_label() -> None:
+    """ADR 0153 decisions 1 + 5, as a detector that CAN fail if either parameter is reintroduced.
+
+    Asserting the arms alone would not catch a re-added ``is_phi=False -> ALLOW`` arm hidden behind a
+    defaulted parameter, because every existing call site would keep passing. The signature IS the
+    contract, so the signature is what is pinned."""
+    params = set(inspect.signature(insecure_hop_disposition).parameters)
+    assert "is_phi" not in params, (
+        "no data label may reach the cleartext-hop authority (ADR 0153 #1)"
+    )
+    assert "audited_opt_out" not in params, (
+        "MEFOR_ALLOW_INSECURE_TLS may no longer influence a cleartext-hop decision (ADR 0153 #5)"
+    )
+    assert params == {"enforcing", "is_loopback_hop", "hop_attested", "cleartext_accepted"}
+
+
+def test_insecure_hop_disposition_is_strictly_stricter_than_before() -> None:
+    """ADR 0153's central claim: over the OLD input space, no input moves toward ALLOW.
+
+    "Because the deleted arm returned ALLOW, removing it can only ever turn a crossing into a WARN or a
+    REFUSE, never the reverse" — i.e. ADR 0092 decision 5 (no-loosen) holds by construction. This is the
+    executable form of that sentence: for every one of the old 32 rows the new disposition is never
+    *weaker* than the old one. ``cleartext_accepted`` is held FALSE throughout, since it is the new
+    deliberate loosening and would correctly relax a REFUSE to WARN."""
+    strictness = {HopDisposition.ALLOW: 0, HopDisposition.WARN: 1, HopDisposition.REFUSE: 2}
+    for is_phi, enforcing, is_loopback_hop, hop_attested, audited_opt_out in product(
+        [False, True], repeat=5
+    ):
+        before = _legacy_insecure_hop_disposition(
             is_phi=is_phi,
-            enforcing=production,
+            enforcing=enforcing,
             is_loopback_hop=is_loopback_hop,
             hop_attested=hop_attested,
             audited_opt_out=audited_opt_out,
         )
-        # Explicit early-return precedence: loopback -> attested -> synthetic -> opt-out -> prod -> else.
-        if is_loopback_hop or hop_attested or not is_phi:
-            expected = HopDisposition.ALLOW
-        elif audited_opt_out:
-            expected = HopDisposition.WARN
-        elif production:
-            expected = HopDisposition.REFUSE
-        else:
-            expected = HopDisposition.WARN
-        assert got is expected, (is_phi, production, is_loopback_hop, hop_attested, audited_opt_out)
-
-
-def test_insecure_hop_prod_phi_refuses_and_escape_cannot_relax() -> None:
-    """The headline case: a prod-PHI hop refuses, and the (clamped-to-False on prod) escape cannot help."""
-    base = dict(is_phi=True, enforcing=True, is_loopback_hop=False, hop_attested=False)  # noqa: C408
-    # The escape (audited_opt_out) is clamped to False on prod upstream (settings.hop_insecure_escape_
-    # downgrades), so the realistic prod input is False here → REFUSE.
-    assert insecure_hop_disposition(**base, audited_opt_out=False) is HopDisposition.REFUSE
-    # Attestation is the ONLY per-hop way across a prod-PHI hop:
-    assert (
-        insecure_hop_disposition(
-            is_phi=True,
-            enforcing=True,
-            is_loopback_hop=False,
-            hop_attested=True,
-            audited_opt_out=False,
+        after = insecure_hop_disposition(
+            enforcing=enforcing,
+            is_loopback_hop=is_loopback_hop,
+            hop_attested=hop_attested,
+            cleartext_accepted=False,
         )
+        assert strictness[after] >= strictness[before], (
+            is_phi,
+            enforcing,
+            is_loopback_hop,
+            hop_attested,
+            audited_opt_out,
+            before,
+            after,
+        )
+
+
+def test_insecure_hop_enforcing_refuses_and_only_attestation_or_acceptance_crosses() -> None:
+    """The headline case: an enforcing cleartext hop refuses, whatever the instance's data label."""
+    base = dict(enforcing=True, is_loopback_hop=False)  # noqa: C408
+    assert (
+        insecure_hop_disposition(**base, hop_attested=False, cleartext_accepted=False)
+        is HopDisposition.REFUSE
+    )
+    # Attestation ("this hop IS secure by other means") crosses it silently...
+    assert (
+        insecure_hop_disposition(**base, hop_attested=True, cleartext_accepted=False)
         is HopDisposition.ALLOW
+    )
+    # ...and acceptance ("this hop is NOT secure and we accept that") crosses it LOUDLY, never as an
+    # ALLOW. That difference is the whole reason the two stay separate fields (ADR 0153 decision 2).
+    assert (
+        insecure_hop_disposition(**base, hop_attested=False, cleartext_accepted=True)
+        is HopDisposition.WARN
     )
 
 
-def test_insecure_hop_staging_phi_still_refuses_only_when_prod() -> None:
-    # Non-prod PHI (staging/dev-with-phi) WARNs, it does not refuse — the gradient adds coverage, it
-    # never turns a staging hop that only warns today into a refusal.
+def test_insecure_hop_non_enforcing_warns_and_acceptance_still_only_warns() -> None:
+    # The [security].enforcement dial of ADR 0148 is deliberately RETAINED as arm 4: a non-enforcing
+    # instance warns rather than refuses, and still logs + audits every hop. Nothing goes silent.
     assert (
         insecure_hop_disposition(
-            is_phi=True,
-            enforcing=False,
-            is_loopback_hop=False,
-            hop_attested=False,
-            audited_opt_out=False,
+            enforcing=False, is_loopback_hop=False, hop_attested=False, cleartext_accepted=False
         )
         is HopDisposition.WARN
     )
-    # ...and a non-prod audited opt-out also WARNs (the escape relaxes REFUSE->WARN only, non-prod).
+    # An acceptance on a non-enforcing instance is still WARN — it can never escalate to ALLOW.
     assert (
         insecure_hop_disposition(
-            is_phi=True,
-            enforcing=False,
-            is_loopback_hop=False,
-            hop_attested=False,
-            audited_opt_out=True,
+            enforcing=False, is_loopback_hop=False, hop_attested=False, cleartext_accepted=True
         )
         is HopDisposition.WARN
     )

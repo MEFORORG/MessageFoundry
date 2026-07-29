@@ -5688,6 +5688,17 @@ def _dest_config(
     # ADR 0126: merge the site-wide forward-proxy default (a per-connection proxy wins). This is the one
     # choke point feeding start/check/dry-run, so the same effective proxy is built at all three.
     _apply_egress_proxy_default(settings, egress)
+    # ADR 0153: MIRROR the cleartext-acceptance declaration into the resolved settings. The connectors
+    # read the typed Destination fields below, but the deep settings-driven seams — the forward-proxy
+    # credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers — receive only a
+    # settings mapping, exactly as they already do for `tls_hop_attested`. The connection NAME rides
+    # with it so the acceptance audit record those seams emit can still name the declaration that
+    # produced it. Written ONLY when the flag is set, so an outbound that declared nothing carries no
+    # new keys and is byte-identical.
+    if oc.cleartext_accepted:
+        settings["cleartext_accepted"] = True
+        settings["cleartext_reason"] = oc.cleartext_reason
+        settings["cleartext_connection"] = oc.name
     return Destination(
         name=oc.name,
         type=oc.spec.type,
@@ -5702,6 +5713,13 @@ def _dest_config(
         # legitimately-secure egress hop even on production-PHI. Default False → keyed purely on posture.
         tls_hop_attested=bool(settings.get("tls_hop_attested", False)),
         tls_hop_attested_reason=_hop_attested_reason(settings),
+        # ADR 0153 decision 2: the per-outbound cleartext-hop ACCEPTANCE ("this hop is NOT secure and we
+        # accept that"). A TOP-LEVEL outbound key, not a transport setting, so it is read off the
+        # OutboundConnection rather than the env-resolved settings dict — one authoring surface, and no
+        # env() indirection on a governance declaration that must be legible in review. Default off →
+        # byte-identical.
+        cleartext_accepted=oc.cleartext_accepted,
+        cleartext_reason=oc.cleartext_reason,
         # #201 (ADR 0078 amendment): per-connection attestation that revocation is checked for a VERIFYING
         # outbound TLS hop, typed here so the connector's revocation gate can ALLOW it even on prod-PHI.
         # Default False → keyed purely on posture (existing verifying outbounds byte-identical).

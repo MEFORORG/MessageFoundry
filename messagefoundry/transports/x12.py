@@ -110,9 +110,10 @@ class X12Destination(DestinationConnector):
         self._closed = False
         #: Reconnects observed (stale-detect, post-error discard, desync guard) — log-only.
         self.reconnects: int = 0
-        # #200 (ADR 0092): X12-over-TCP has NO TLS at all, so every off-loopback egress is a cleartext PHI
-        # hop. Refuse a production-PHI hop at the enforced construction gate; allow loopback / synthetic /
-        # per-connection-attested hops (tls_hop_attested for a trusted-segment / proxy-terminated hop).
+        # #200 (ADR 0092): X12-over-TCP has NO TLS at all, so every off-loopback egress is a cleartext
+        # hop. Refuse it at the enforced construction gate; allow loopback / per-connection-attested hops
+        # (tls_hop_attested for a trusted-segment / proxy-terminated hop), or cross it with a loud,
+        # audited WARN on a `cleartext_accepted` declaration. ADR 0153: no data label relaxes this.
         self._hop_guard = InsecureHopGuard.capture(
             host=self.host,
             port=self.port,
@@ -120,6 +121,11 @@ class X12Destination(DestinationConnector):
             description="cleartext X12-over-TCP egress",
             attested=config.tls_hop_attested,
             attested_reason=config.tls_hop_attested_reason,
+            # ADR 0153 decision 4: X12-over-TCP has NO TLS support at all, so `cleartext_accepted` is a
+            # PERMANENT, STRUCTURAL declaration here — there is no `tls = true` to migrate to (#311).
+            cleartext_accepted=config.cleartext_accepted,
+            cleartext_reason=config.cleartext_reason,
+            connection=config.name,
         )
         self._hop_guard.enforce_construction()
 

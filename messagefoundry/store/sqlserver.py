@@ -1949,8 +1949,9 @@ class SqlServerStore:
     # '' through unchanged on read (so a no-key -> key restart reads pre-existing plaintext correctly).
 
     # Cell-bound AAD (ASVS 11.3.3, ADR 0019): `aad` is REQUIRED so mypy-strict flags any un-threaded
-    # site; the caller passes cell_aad(table, column, *pk). Ignored while aad_bind is off (v1 writer +
-    # v1 dual-read), so passing it is always safe. Mirrors MessageStore._enc/_dec.
+    # site; the caller passes cell_aad(table, column, *pk). Bound on the shipped aad_bind=true default;
+    # ignored when an operator sets aad_bind false (v1 writer + v1 dual-read), so passing it is always
+    # safe either way. Mirrors MessageStore._enc/_dec.
 
     def _enc(self, value: str | None, *, aad: bytes) -> str | None:
         if not value:  # None or "" → leave blank (covers purged/empty values)

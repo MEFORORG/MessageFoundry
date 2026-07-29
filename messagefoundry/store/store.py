@@ -1800,8 +1800,9 @@ class MessageStore:
     # Cell-bound AAD (ASVS 11.3.3, ADR 0019): `aad` is a REQUIRED keyword — the caller passes
     # cell_aad(table, column, *pk) for the exact cell being written/read, so a v2 ciphertext is bound to
     # its (table, column, row). Making it required (not defaulted) makes mypy-strict flag any un-threaded
-    # site — a half-threaded cell would fail closed under aad_bind. With aad_bind OFF the cipher writes v1
-    # and ignores `aad` (dual-read of every legacy row), so passing it is always safe.
+    # site — a half-threaded cell fails closed under the shipped aad_bind=true default. With aad_bind
+    # false the cipher writes v1 and ignores `aad` (dual-read of every legacy row), so passing it is
+    # always safe either way.
 
     def _enc(self, value: str | None, *, aad: bytes) -> str | None:
         if not value:  # None or "" → leave blank (covers purged/empty values)

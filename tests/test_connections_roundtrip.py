@@ -120,6 +120,10 @@ _OUTBOUND_CASES: dict[str, Any] = {
     "deployed": False,
     "flagged": True,  # #131 (ADR 0007 amendment): the object-of-interest flag round-trips too.
     "waiting_display_delay": 2.5,  # #136 (ADR 0065 amendment): the cosmetic waiting-for-reply delay.
+    # ADR 0153: the per-outbound cleartext-hop acceptance. It MUST round-trip — dropping it on a GUI
+    # save would silently turn a declared, reviewed hop into a refused one at the next reload.
+    "cleartext_accepted": True,
+    "cleartext_reason": "legacy partner has no TLS listener",
 }
 
 _IB_MAX: dict[str, Any] = {**_IB_BASE, **_INBOUND_CASES}
@@ -129,12 +133,16 @@ _OB_MAX: dict[str, Any] = {**_OB_BASE, **_OUTBOUND_CASES}
 # a pruning size threshold does nothing without its window, so the loader rejects it alone.
 _COMPANIONS: dict[str, dict[str, Any]] = {
     "prune_documents_min_bytes": {"prune_documents_after": 30},
+    # ADR 0153's pair is load-validated TOGETHER (flag without reason, or reason without flag, both fail
+    # loud), so each half needs the other for its single-key round-trip to be load-legal.
+    "cleartext_accepted": {"cleartext_reason": "legacy partner has no TLS listener"},
+    "cleartext_reason": {"cleartext_accepted": True},
 }
 
 
 def test_case_tables_cover_the_read_schema_exactly() -> None:
     """Completeness pin: the parametrized cases (plus the base's name/transport) must cover the read
-    schema exactly — 33 distinct keys (25 inbound + 16 outbound, 8 shared; 41 per-direction slots).
+    schema exactly — 35 distinct keys (25 inbound + 18 outbound, 8 shared; 43 per-direction slots).
     A key added to _INBOUND_KEYS/_OUTBOUND_KEYS without a round-trip case fails HERE."""
     assert set(_INBOUND_CASES) | {"name", "transport"} == _INBOUND_KEYS
     assert set(_OUTBOUND_CASES) | {"name", "transport"} == _OUTBOUND_KEYS
@@ -155,7 +163,9 @@ def test_inbound_key_roundtrips(tmp_path: Path, key: str) -> None:
 @pytest.mark.parametrize("key", sorted(_OUTBOUND_CASES))
 def test_outbound_key_roundtrips(tmp_path: Path, key: str) -> None:
     cfg = _config(tmp_path)
-    obj = {**_OB_BASE, key: _OUTBOUND_CASES[key]}
+    # _COMPANIONS applies on BOTH directions: ADR 0153's cleartext pair is the first OUTBOUND key whose
+    # read schema requires a companion, so this call site had none to honour until now.
+    obj = {**_OB_BASE, **_COMPANIONS.get(key, {}), key: _OUTBOUND_CASES[key]}
     upsert_connection(cfg, obj, validate=_noop_validate)
     [entry] = list_connections(cfg)
     assert entry[key] == _OUTBOUND_CASES[key]

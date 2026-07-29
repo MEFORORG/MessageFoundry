@@ -481,6 +481,9 @@ reuse the same `hvac` extra.
 
 ## Amendment 2026-07-17 — cell-bound AES-GCM AAD at rest is now BUILT, opt-in (ASVS 11.3.3, ADR 0115 / WP #244)
 
+> **Superseded in part (2026-07-28):** the `[store].aad_bind` default described below as **off** is
+> now **on**. See *Amendment 2026-07-28* at the end of this ADR. Everything else in this section stands.
+
 **BUILT (opt-in, default off) — supersedes the deferred-hardening posture below.** ASVS 11.3.3 (bind
 associated data into the at-rest AEAD tag) is now a shipped, tested control on the `mfenc:v2` writer,
 gated by a new `[store].aad_bind` knob (env `MEFOR_STORE_AAD_BIND`; default **off**, so the at-rest
@@ -666,3 +669,30 @@ and the in-process bulk-crypto DEK-in-heap deferred to 11.7.1 / WP-BL3-28). The 
 [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) / [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md)
 / [PHI.md](../PHI.md) §4/§11 / [CONFIGURATION.md](../CONFIGURATION.md) / [SECURITY.md](../SECURITY.md) row
 updates are the **Coordinator's** single-writer task — this ADR edits no score doc.*
+
+## Amendment 2026-07-28 — `[store].aad_bind` now defaults ON (ADR 0148 GIVEN 1)
+
+**What changed.** `[store].aad_bind` flips `false` → **`true`**. New at-rest AES-256-GCM writes use the
+cell-bound `mfenc:v2` writer by default; the frozen `mfenc:v1` writer is now the *opt-out*.
+
+**Why.** ADR 0148 GIVEN 1: there is exactly ONE shipped posture, and it is the hardened one. A control
+that ships off is a control first exercised in production, by the deployment least able to absorb a
+surprise. Keeping the hardened path as the default means it is the path every test, every CI leg and
+every dogfood instance runs.
+
+**Why it is safe to flip.** The format change is additive and dual-read: legacy `mfenc:v1` rows still
+decrypt unchanged, `messagefoundry rotate-key` upgrades them `v1`→`v2` in place, and `aad_bind` is a
+no-op without an encryption key (the identity cipher has nothing to bind). An existing store therefore
+keeps working across the upgrade, and the flip is reversible by setting the knob back.
+
+**What it costs.** CRYPTO-1's "byte-identical at rest" property no longer describes the *default* — it
+describes `aad_bind = false`. That is the deliberate trade: byte-identity was a migration-safety
+property, and dual-read already provides the safety it was protecting.
+
+**Visibility.** `aad_bind = false` is a **loosening**, not a neutral choice: `security_loosenings()`
+names it, so it appears in the serve-time warning and in `GET /security/posture`, and it has an entry in
+[docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md). Setting it is allowed; setting it silently is
+not.
+
+**Scope.** This amends the *default* only. The `cell_aad` builder, the `mfenc:v2` format, the dual-read
+dispatch, the rotation upgrade path and the three-backend threading are all unchanged.

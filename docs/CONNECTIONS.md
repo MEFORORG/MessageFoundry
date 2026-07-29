@@ -1000,7 +1000,7 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
-| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated: it needs the explicit opt-in (`MEFOR_ALLOW_INSECURE_TLS`, now read through the **clamped** check — inert on an enforcing production-PHI instance — or the connection's `tls_hop_attested`), **and** the hop itself goes through the shared posture gradient (#200, ADR 0092): refused on an enforcing PHI instance, warned on a non-enforcing PHI one, allowed for loopback / synthetic / attested. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
+| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated: it needs an explicit opt-in (`MEFOR_ALLOW_INSECURE_TLS` read through the **clamped** check, the connection's `tls_hop_attested`, or its `cleartext_accepted` declaration), **and** the hop itself goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback and attested hops ALLOW, a `cleartext_accepted` hop WARNs + audits, a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | |
 
@@ -1369,6 +1369,79 @@ inbound("IB-LOOP_PAYER_ELIG", Loopback(), router="route_elig_result", content_ty
 outbound("MLLP-OUT_PAYER_ELIG", MLLP(host=env("payer_host"), port=2575, reingress_to="IB-LOOP_PAYER_ELIG"))
 # a Handler Sends the eligibility query to MLLP-OUT_PAYER_ELIG; its reply re-ingresses into IB-LOOP_PAYER_ELIG.
 ```
+
+## Declaring a cleartext hop (`cleartext_accepted`)
+
+An **outbound** connection whose hop has no TLS is **refused** at `messagefoundry check` / dry-run /
+reload / the serve pre-flight under the default `[security].enforcement = enforce`
+([ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)). No data
+label relaxes that — `data_class = "synthetic"` used to allow every cleartext hop silently, and no longer
+does. There are exactly three ways such a hop crosses:
+
+| | claim | disposition |
+|---|---|---|
+| the hop is **on-box** (loopback / `localhost` / empty host) | not a network exposure | ALLOW |
+| `cleartext_accepted = true` + `cleartext_reason` | this hop is **not** secure, and we accept that | **WARN** — crossed, loudly logged **and recorded at every construction** |
+| `[security].enforcement = warn` | the instance-wide refuse/warn dial is at `warn` | WARN — but **only for the raw transports** (`MLLP()`, `Tcp()`, `X12()`, `DICOM()`, `Email()`, `Ftp()`). The HTTP family (`Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`, `FhirLookup()`) shipped these refusals unconditionally, and ADR 0092 decision 5 forbids a cell getting weaker, so a no-loosen floor turns that WARN back into a REFUSE there. The dial is **not** a substitute for the declaration |
+
+A fourth route exists in the engine but has **no authoring surface on a connection today**:
+`tls_hop_attested` ("this hop *is* secure by means the engine cannot see" — proxy-terminated TLS, a
+genuinely isolated segment) yields a silent ALLOW, but no transport factory takes it and it is not a
+`connections.toml` key, so you cannot set it on an inbound or outbound. Do **not** reach for it; use
+`cleartext_accepted`. (The `[logging].forward_hop_attested` sibling in `messagefoundry.toml` *is*
+settable — see [CONFIGURATION.md](CONFIGURATION.md).)
+
+The two claims are deliberately **separate fields with opposite meanings**. Do not describe a peer that
+simply cannot do TLS as attested: that writes a false statement into the one field that exists to be
+trustworthy when it is audited, and it leaves the audit trail unable to tell a proxy-terminated hop from
+plaintext on a flat network.
+
+Both surfaces accept the pair — code-first on `outbound(...)`, or as **top-level** keys in
+`connections.toml` (they are governance declarations, not transport settings, so they do **not** go under
+`[outbound.settings]`). A `FhirLookup(...)` read connection takes the same two keyword arguments:
+
+```python
+outbound(
+    "OB_LEGACY_LAB",
+    Tcp(host=env("lab_host"), port=env("lab_port")),
+    cleartext_accepted=True,
+    cleartext_reason="vendor firmware predates TLS; segment is not isolated",
+)
+```
+
+```toml
+[[outbound]]
+name = "OB_LEGACY_LAB"
+transport = "tcp"
+cleartext_accepted = true
+cleartext_reason   = "vendor firmware predates TLS; segment is not isolated"
+  [outbound.settings]
+  host = "10.4.2.15"
+  port = 5000
+```
+
+| Key | Dir | Type | Default | Meaning |
+|-----|-----|------|---------|---------|
+| `cleartext_accepted` | out | bool | `false` | this outbound's hop is cleartext and that is accepted. Yields **WARN, never ALLOW** — the hop crosses, but every construction logs it and records a line naming the connection, the cell, the host and the reason. It does **not** reach a `verify_tls = false` hop (encrypted-but-unauthenticated, not cleartext — that keeps the clamped `MEFOR_ALLOW_INSECURE_TLS` escape) or an SMTP `AUTH` over cleartext (refused outright) |
+| `cleartext_reason` | out | str | — | **mandatory** when the flag is set (and rejected without it). The engine checks a reason is present and non-blank; it cannot check that it is *true* — a placeholder is a review problem, not a load problem |
+
+**`Tcp()` and `X12()`: the declaration is permanent, not transitional.** Those connectors have **no TLS
+support at all** — no `tls` parameter, no `ssl` import — so there is no `tls = true` for them to migrate
+to. On every other **outbound** transport (`MLLP()`, `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()`,
+`DICOM()`, `Email()`, `Ftp()`, `FhirLookup()`) the declaration should be read as **naming work to be
+done**, and removed when the peer gains TLS. Adding TLS to raw TCP and X12 is tracked as BACKLOG #311.
+
+Two caveats on that list. `Http()` is an **inbound listener only** — it binds rather than dials, so it
+has no hop to declare; inbound binds are governed by `--allow-insecure-bind` and the four exposed-gates,
+not by this declaration (ADR 0153 decision 2 is Destination-only). And on `Ftp()` the declaration reaches
+the **anonymous** plain-ftp hop only: a *credentialed* plain-ftp connection is refused outright, because
+the credential itself would cross in the clear.
+
+**It is never invisible.** A declared hop appears in `messagefoundry check` (a `cleartext-accepted` line
+listing the **whole** accepted set, so a broad rollout is obvious in review), in the connector's
+construction WARN + audit record, and in `GET /security/posture`'s loosening list — with a deviation
+entry in [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md). That visibility is the mitigation: nothing stops
+an operator declaring it on every destination, and the engine does not try to.
 
 ## Per-connection retention, document pruning & diagnostics overrides
 

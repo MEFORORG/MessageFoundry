@@ -367,7 +367,7 @@ _PINNED_THRESHOLDS: tuple[tuple[str, str, object, str], ...] = (
     # These three were documented but unpinned — precisely the defaults the trailing lanes plan to
     # move (#297's 8.3.2 route proposes an ADR-0080-style derived ad_session_recheck_seconds), so a
     # change would have made the row false with zero CI signal.
-    ("auth", "ad_session_recheck_seconds", 0, "**0 = off**"),
+    ("auth", "ad_session_recheck_seconds", 300, "**300 s**"),
     ("auth", "phi_read_rate_limit_global", 0, "`0` = **off**"),
     ("auth", "phi_read_rate_limit_window_seconds", 60.0, "60 s"),
     ("auth", "oidc_flow_cache_max", 512, "**512**"),

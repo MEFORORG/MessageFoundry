@@ -466,7 +466,7 @@ def test_cited_settings_names_resolve() -> None:
 def test_documented_defaults_match_the_shipped_defaults() -> None:
     """A default flip must force the §3/§8 wording to be revisited, not rot silently."""
     settings = ServiceSettings()
-    assert settings.store.aad_bind is False, "§3 says cell binding is OFF by default"
+    assert settings.store.aad_bind is True, "§3 says cell binding is ON by default"
     assert settings.store.cipher_provider == "aesgcm", (
         "§3 says the default cipher is in-process AES-GCM"
     )

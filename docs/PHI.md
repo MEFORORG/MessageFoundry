@@ -146,12 +146,12 @@ store's cipher registry — derived from the `cell_aad(...)` call sites and each
 `_CIPHER_COLUMNS` / migration / rotation passes — so they cannot diverge. See
 [§3](#3-encryption-at-rest).
 
-**Cell binding is off by default.** Every write site above passes a cell AAD, but the AAD is **ignored**
-unless `[store].aad_bind = true` — the default (`false`) runs the frozen `mfenc:v1` writer, which binds
-no associated data. The AAD tuples are documented because they are what *would* bind, and what *does*
-bind under `aad_bind = true` (`mfenc:v2`) and under `[store].cipher_provider = "vault_transit"`
-(`mfenc:v3`, where the AAD is forwarded to Transit unconditionally). See
-[§3](#3-encryption-at-rest).
+**Cell binding is ON by default** (`[store].aad_bind = true`, ADR 0148 GIVEN 1). Every write site
+above passes a cell AAD and, on the shipped default, that AAD is **bound** — writes use the `mfenc:v2`
+writer. Setting `aad_bind = false` selects the frozen `mfenc:v1` writer, which binds no associated data
+(the AAD is then computed and ignored), and is a **declared loosening** that `security_loosenings()`
+names. The AAD is bound unconditionally under `[store].cipher_provider = "vault_transit"` (`mfenc:v3`,
+where it is forwarded to Transit). See [§3](#3-encryption-at-rest).
 
 **Body format is irrelevant to the at-rest tier — they all ride the same cipher.** The `raw`/`payload`
 rows above are payload-agnostic, so non-HL7 PHI bodies are stored through the **same encrypting store
@@ -241,14 +241,16 @@ for defense-in-depth without swapping the `aiosqlite` connector.
    version-agnostic `mfenc:` prefix (so a v2 row is recognised as already-encrypted), and the rotation
    scan anchors on the cipher's active-format prefix through the key fingerprint (so a v2-active rotation
    matches v2 rows and terminates).
-   **Cell binding — `[store].aad_bind`, default OFF (ASVS 11.3.3, ADR 0019).** Every store write site
-   already passes `cell_aad(table, column, *pk)` (the tuples are documented per row in §2), but the
-   **frozen `mfenc:v1` writer passes no associated data, so with the default `aad_bind = false` the AAD
-   is computed and then ignored — at-rest values are NOT cell-bound.** Set `[store].aad_bind = true` and
-   new writes become **`mfenc:v2` with the cell AAD bound**: a ciphertext cut-and-pasted from one cell
-   into another fails the GCM tag (dead-lettered, never silently accepted). Legacy `v1` rows stay
-   readable (dual-read) and **`messagefoundry rotate-key` upgrades them v1→v2**. `aad_bind` has no
-   effect without an encryption key (the identity cipher has nothing to bind).
+   **Cell binding — `[store].aad_bind`, default ON (ASVS 11.3.3, ADR 0019 as amended by ADR 0148
+   GIVEN 1).** Every store write site passes `cell_aad(table, column, *pk)` (the tuples are documented
+   per row in §2), and on the shipped default new writes are **`mfenc:v2` with the cell AAD bound**: a
+   ciphertext cut-and-pasted from one cell into another fails the GCM tag (dead-lettered, never silently
+   accepted). Setting `aad_bind = false` selects the **frozen `mfenc:v1` writer, which passes no
+   associated data — the AAD is then computed and ignored, and at-rest values are NOT cell-bound**; that
+   is a declared loosening, named by `security_loosenings()`. Legacy `v1` rows stay readable (dual-read)
+   and **`messagefoundry rotate-key` upgrades them v1→v2**, so the default is safe on an existing store
+   and reversible. `aad_bind` has no effect without an encryption key (the identity cipher has nothing
+   to bind).
    **A third at-rest tier ships — `[store].cipher_provider = "vault_transit"` (`mfenc:v3`, ADR 0138).**
    This does not merely source the key: it **replaces the cipher object**
    ([store/crypto_transit.py](../messagefoundry/store/crypto_transit.py)), so every encrypt/decrypt runs
@@ -355,10 +357,10 @@ application log files (`[logging].log_dir`).
 
 - **Encryption**, stated per tier rather than as one blanket rule:
   - *Database cells and the `[store].uploads_dir` sidecars* — the store cipher (AES-256-GCM, or
-    Transit under `vault_transit`) with the per-cell AAD in §2, keyed by the store DEK — **bound only
-    under `[store].aad_bind = true` (`mfenc:v2`) or `cipher_provider = "vault_transit"` (`mfenc:v3`);
-    under the shipped default `aad_bind = false` the AAD is computed and then ignored by the frozen
-    `mfenc:v1` writer.**
+    Transit under `vault_transit`) with the per-cell AAD in §2, keyed by the store DEK — **bound on the
+    shipped default (`[store].aad_bind = true` → `mfenc:v2`) and unconditionally under
+    `cipher_provider = "vault_transit"` (`mfenc:v3`); an operator who sets `aad_bind = false` selects the
+    frozen `mfenc:v1` writer, and the AAD is then computed and ignored.**
   - *`.mfbak` archives* — **a separate streaming codec, NOT the store cipher**
     ([store/backup_codec.py](../messagefoundry/store/backup_codec.py), whose own docstring says the
     cipher *mechanism* is net-new): chunked AES-256-GCM under the store DEK resolved directly by
@@ -436,7 +438,8 @@ application log files (`[logging].log_dir`).
 | `alert_instance.reason` | `safe_text(…)[:200]` | `GET /alerts/active` under **`monitoring:diagnose`** — again not a PHI permission | same window, **RESOLVED instances only** — an open or acknowledged alert is never aged out |
 
 - **Encryption + integrity** for every row above: store cipher + per-value GCM tag, with the cell AAD in
-  §2 (bound only under `aad_bind = true` / `vault_transit`).
+  §2 (bound on the shipped `aad_bind = true` default and under `vault_transit`; unbound only where an
+  operator has set `aad_bind = false`).
 - **Privacy note.** The two `reason` columns are the one place where a *sensitive* free-text field is
   readable under a **monitoring-tier** permission rather than a PHI-tier one. That is why they are
   scrubbed **twice** before the cipher and bounded to 200 characters, and why the tables are documented
@@ -851,6 +854,15 @@ a local rsyslog/Vector/SIEM agent add TLS" deployment is preserved byte-identica
 connection's `tls_hop_attested`), **synthetic instance → ALLOW**, **clamped global escape → WARN**,
 **enforcing PHI instance → REFUSE (`serve` exits 2)**, **non-enforcing PHI → WARN**. The three named
 remedies are therefore: native TLS, a loopback agent, or an attested hop.
+
+> **Why this cell still reads the data label, when the transport cells no longer do.**
+> [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md) removed
+> the `synthetic → ALLOW` arm from the shared cleartext-hop authority, and its *Explicitly out of scope*
+> table keeps this forwarder on the old keying **deliberately**: it is not a connection, so it has
+> nowhere to carry a per-hop `cleartext_accepted` declaration, and refusing it instead would create a
+> deviation the loosening registry cannot express. The arm is therefore restated explicitly inside
+> `forward_hop_disposition` rather than inherited from the authority. A `[logging]` sibling of
+> `cleartext_accepted` is the recorded follow-up.
 
 **Availability.** The forwarder never blocks the engine *indefinitely* — UDP is fire-and-forget; a `tcp`
 **or `tls`** collector that is **unreachable at startup** (or whose certificate fails to verify —

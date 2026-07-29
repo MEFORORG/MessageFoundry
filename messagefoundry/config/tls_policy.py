@@ -61,6 +61,7 @@ __all__ = [
     "TrustAnchorPolicy",
     "active_hop_posture",
     "build_verifying_client_context",
+    "cleartext_acceptance_audit_sink",
     "current_hop_posture",
     "enforce_insecure_hop",
     "harden_kex_groups",
@@ -328,11 +329,12 @@ _LOOPBACK_HOP_HOST_NAMES = frozenset({"localhost", ""})
 class HopDisposition(enum.Enum):
     """What a cell must do with an insecure (cleartext / unverified-TLS) transport hop.
 
-    ``ALLOW`` — cross it silently (no PHI on the hop, a proven-loopback on-box hop, or an audited
-    attestation that the hop is secure by other means). ``WARN`` — cross it but log loudly + audit (a
-    non-production PHI hop, or a non-prod audited opt-out via the clamped global escape). ``REFUSE`` —
-    do not cross it: a production PHI hop with no attestation. Produced by
-    :func:`insecure_hop_disposition`; acted on by :func:`enforce_insecure_hop`."""
+    ``ALLOW`` — cross it silently (a proven-loopback on-box hop, or an audited attestation that the hop
+    is secure by other means). ``WARN`` — cross it but log loudly + audit (an operator-declared
+    ``cleartext_accepted`` hop, or a non-enforcing instance). ``REFUSE`` — do not cross it: an enforcing
+    hop with neither an attestation nor an acceptance. Produced by :func:`insecure_hop_disposition`;
+    acted on by :func:`enforce_insecure_hop`. (ADR 0153: the data label no longer appears here — no
+    ``data_class`` value can ALLOW a cleartext hop.)"""
 
     ALLOW = "allow"
     WARN = "warn"
@@ -398,43 +400,48 @@ def is_loopback_hop_host(host: str) -> bool:
 
 def insecure_hop_disposition(
     *,
-    is_phi: bool,
     enforcing: bool,
     is_loopback_hop: bool,
     hop_attested: bool,
-    audited_opt_out: bool,
+    cleartext_accepted: bool,
 ) -> HopDisposition:
-    """Decide what to do with an insecure transport hop, keyed on posture (#200, ADR 0092 — PURE).
+    """Decide what to do with a cleartext transport hop (#200, ADR 0092 — amended by ADR 0153; PURE).
 
     The single authority every insecure-egress cell consumes, so all decide identically. Explicit,
     early-return precedence (the order is load-bearing — the owner-ratified gradient):
 
     #. ``is_loopback_hop`` → :attr:`~HopDisposition.ALLOW` — an on-box hop is not a network exposure.
     #. ``hop_attested`` → :attr:`~HopDisposition.ALLOW` — a per-connection, load-validated, audited
-       attestation that this hop is legitimately secure (a proxy-terminated / trusted-segment hop).
-    #. not ``is_phi`` (synthetic instance) → :attr:`~HopDisposition.ALLOW` — no PHI rides the hop.
-    #. ``audited_opt_out`` → :attr:`~HopDisposition.WARN` — the global escape, **already clamped by the
-       caller** to non-enforcing (see ``settings.hop_insecure_escape_downgrades``); under ENFORCE the
-       caller passes ``False`` here, so this arm never fires for an enforcing PHI hop.
-    #. ``enforcing`` → :attr:`~HopDisposition.REFUSE` — an enforcing PHI hop with no attestation: do
-       not put PHI on the wire in the clear.
-    #. else (non-enforcing PHI — the WARN posture) → :attr:`~HopDisposition.WARN`.
+       attestation that this hop *is* legitimately secure (a proxy-terminated / trusted-segment hop).
+    #. ``cleartext_accepted`` → :attr:`~HopDisposition.WARN` — the opposite claim (ADR 0153 decision
+       2): this hop is **not** secure and the operator accepts that. Crossed, but logged at EVERY
+       construction and audited — an accepted risk that stops being visible has stopped being accepted.
+    #. not ``enforcing`` → :attr:`~HopDisposition.WARN` — the ``[security].enforcement`` dial of ADR
+       0148, deliberately retained: it is an explicit operator dial (not a data-classification label)
+       and it still logs and audits every hop, so nothing goes silent.
+    #. else → :attr:`~HopDisposition.REFUSE` — an enforcing hop with neither an attestation nor an
+       acceptance: do not put the payload on the wire in the clear.
 
-    Note the escape (``audited_opt_out``) can never satisfy an enforcing PHI hop: it is clamped to
-    ``False`` under ENFORCE upstream, so the ``enforcing`` arm always wins there (decision 2).
-    Attestation (``hop_attested``) is the *only* per-hop way to cross an enforcing PHI hop, and it is
+    **ADR 0153 removed two parameters.** ``is_phi`` is gone: no data label may permit a cleartext hop,
+    because ``data_class`` is authored in the same file as the hosts it governs and a typo in it is
+    indistinguishable from a declaration, with every transport hop in the product as its blast radius.
+    ``audited_opt_out`` is gone with it, so the blunt global ``MEFOR_ALLOW_INSECURE_TLS`` escape can no
+    longer influence a cleartext-hop decision (decision 5 — the variable survives for the six
+    non-connection cells that have no per-connection field to carry a declaration).
+
+    Only an arm that returned ALLOW was deleted, so removing it can only ever turn a crossing into a
+    WARN or a REFUSE, never the reverse: ADR 0092 decision 5 (no-loosen) holds **by construction**.
+    ``hop_attested`` remains the only per-hop way to cross an enforcing hop *silently*, and it is
     audited when it suppresses a would-be enforcing refusal (the cell audits at that point)."""
     if is_loopback_hop:
         return HopDisposition.ALLOW
     if hop_attested:
         return HopDisposition.ALLOW
-    if not is_phi:
-        return HopDisposition.ALLOW
-    if audited_opt_out:
+    if cleartext_accepted:
         return HopDisposition.WARN
-    if enforcing:
-        return HopDisposition.REFUSE
-    return HopDisposition.WARN
+    if not enforcing:
+        return HopDisposition.WARN
+    return HopDisposition.REFUSE
 
 
 def enforce_insecure_hop(
@@ -464,6 +471,46 @@ def enforce_insecure_hop(
     logger.warning("insecure transport hop permitted — %s", detail)
     if audit_sink is not None:
         audit_sink(detail)
+
+
+def cleartext_acceptance_audit_sink(
+    reason: str | None, *, connection: str | None = None
+) -> Callable[[str], None]:
+    """The ``audit_sink`` :func:`enforce_insecure_hop` records an accepted cleartext hop through.
+
+    ADR 0153 decision 2 requires a ``cleartext_accepted`` hop to be "logged at every construction and
+    recorded in the audit trail". This is the audit half: a distinct, structured record that names the
+    DECLARATION and its reason, so an auditor can tell an operator-accepted cleartext hop apart from a
+    hop that merely warned because the instance is not enforcing — the two produce the same
+    :attr:`~HopDisposition.WARN` and would otherwise be indistinguishable in the log.
+
+    ``connection`` names the declaring connection. It is what makes the record ACTIONABLE: ``cell`` is a
+    static family label and the HTTP-family ``message`` carries a host but no port, so with two
+    destinations to the same host an auditor could otherwise not tell which declaration produced the
+    crossing — and the whole point of the record is to lead back to the line to fix. Every cell that can
+    know the name passes it; ``None`` renders as ``(unnamed)`` rather than a misleading blank.
+
+    Built as a plain ``Callable`` so this stays a pure ``config``-level helper that never imports the
+    engine's ``AlertSink`` (one-way dependency boundary), and shared by BOTH insecure-hop guards (the
+    raw-transport one in ``transports.mllp`` and the HTTP-family one in ``transports.rest``) so the
+    record is never re-forked. ``reason`` is operator-authored text — it is logged verbatim as a
+    parameter, never interpolated into the format string, and the caller's ``detail`` carries only a
+    PHI-free cell label plus scheme/host/port, never a body or a credential.
+
+    The marker is deliberately **lower-case**: the PHI redaction filter (``redaction._NAME_RUN``) treats
+    two or more adjacent ALL-CAPS tokens as a possible name run and replaces them with ``[redacted]``,
+    so a shouted marker would be scrubbed out of the very record it exists to make findable."""
+
+    def _record(detail: str) -> None:
+        logger.warning(
+            "cleartext hop crossed on an operator acceptance — connection %s: %s "
+            "(cleartext_accepted; reason: %s)",
+            connection or "(unnamed)",
+            detail,
+            reason or "(none provided)",
+        )
+
+    return _record
 
 
 #: The instance posture in force during connector construction. Stamped by the construction gate
@@ -519,15 +566,27 @@ def phi_read_hop_disposition(
     authority's on-box carve-out (``is_loopback_hop``): a loopback / TLS / proxy-terminated serve hop is
     not an insecure network exposure, so PHI may cross (the serve-start exposed-gate already vetted it).
     There is no per-hop attestation for the API serve hop — the serve gate's proxy/TLS declarations are
-    what prove it secure — so ``hop_attested`` is always ``False`` here."""
+    what prove it secure — so ``hop_attested`` is always ``False`` here.
+
+    **ADR 0153 leaves this cell keyed on the data label, deliberately** (its *Explicitly out of scope*
+    table): the API serve hop is not a connection, so it has nowhere to carry a per-hop
+    ``cleartext_accepted`` declaration, and refusing it instead would create a deviation the loosening
+    registry cannot express. The ``not is_phi`` ALLOW arm 0153 deleted from the shared authority is
+    therefore restated HERE, explicitly, rather than inherited — so the scope limit is a written
+    decision at the one place it applies, not an accident of a signature. A ``[security]``-level
+    declaration for this cell is the recorded follow-up."""
     if posture is None:
         return HopDisposition.ALLOW
+    if not posture.is_phi:
+        return HopDisposition.ALLOW
     return insecure_hop_disposition(
-        is_phi=posture.is_phi,
         enforcing=posture.enforcing,
         is_loopback_hop=serve_hop_secure,
         hop_attested=False,
-        audited_opt_out=audited_opt_out,
+        # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
+        # relaxation this non-connection cell has. Byte-identical to the pre-0153 arm 4 — WARN, ahead
+        # of the enforcing REFUSE — because arm 3 of the new precedence sits in exactly that slot.
+        cleartext_accepted=audited_opt_out,
     )
 
 

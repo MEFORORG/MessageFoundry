@@ -199,7 +199,13 @@ def _src(conn: ConnectorType, *, host: str = "0.0.0.0", tls: bool = False, attes
     settings: dict[str, object] = {"host": host}
     if tls:
         settings["tls"] = True
-    return Source(type=conn, settings=settings, tls_hop_attested=attested)
+    return Source(
+        type=conn,
+        settings=settings,
+        tls_hop_attested=attested,
+        # ADR 0153 retro-fitted flag-implies-reason onto the attestation pair.
+        tls_hop_attested_reason="dedicated management VLAN" if attested else None,
+    )
 
 
 _INBOUND_CHECKS = {

@@ -85,10 +85,85 @@ def test_destination_blank_reason_rejected() -> None:
 
 
 def test_source_attestation_field() -> None:
-    s = Source(type=ConnectorType.REMOTEFILE, settings={}, tls_hop_attested=True)
+    s = Source(
+        type=ConnectorType.REMOTEFILE,
+        settings={},
+        tls_hop_attested=True,
+        tls_hop_attested_reason="terminated at the mesh sidecar",
+    )
     assert s.tls_hop_attested is True
     with pytest.raises(ValueError, match="without"):
         Source(type=ConnectorType.REMOTEFILE, settings={}, tls_hop_attested_reason="x")
+
+
+def test_attestation_now_requires_a_reason() -> None:
+    """ADR 0153 decision 2, retro-fitted: the flag alone is no longer a valid attestation.
+
+    An attestation asserting *this hop is secure by means the engine cannot see* is the one input that
+    can silently ALLOW an enforcing cleartext hop, so it is precisely the claim that must carry a
+    written justification when it is audited. Both models enforce it, and so does [logging]'s sibling."""
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        Source(type=ConnectorType.REMOTEFILE, settings={}, tls_hop_attested=True)
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        Destination(
+            name="OB", type=ConnectorType.REST, settings={"url": "http://x"}, tls_hop_attested=True
+        )
+
+
+# --- ADR 0153 decision 2: the cleartext-acceptance pair, load-validated ------------------------
+def test_destination_cleartext_acceptance_defaults_off() -> None:
+    d = Destination(name="OB", type=ConnectorType.REST, settings={"url": "https://x"})
+    assert d.cleartext_accepted is False
+    assert d.cleartext_reason is None
+
+
+def test_destination_cleartext_acceptance_with_reason_ok() -> None:
+    d = Destination(
+        name="OB",
+        type=ConnectorType.REST,
+        settings={"url": "http://legacy.internal"},
+        cleartext_accepted=True,
+        cleartext_reason="vendor firmware predates TLS; segment is not isolated",
+    )
+    assert d.cleartext_accepted is True
+    assert d.cleartext_reason is not None
+
+
+def test_destination_cleartext_acceptance_rejects_incoherent_pairs() -> None:
+    """All three fail-loud rules: flag without reason, blank reason, reason without flag."""
+    with pytest.raises(ValueError, match="requires cleartext_reason"):
+        Destination(
+            name="OB",
+            type=ConnectorType.REST,
+            settings={"url": "http://x"},
+            cleartext_accepted=True,
+        )
+    with pytest.raises(ValueError, match="must be non-empty"):
+        Destination(
+            name="OB",
+            type=ConnectorType.REST,
+            settings={"url": "http://x"},
+            cleartext_accepted=True,
+            cleartext_reason="   ",
+        )
+    with pytest.raises(ValueError, match="without cleartext_accepted"):
+        Destination(
+            name="OB",
+            type=ConnectorType.REST,
+            settings={"url": "http://x"},
+            cleartext_reason="orphaned reason",
+        )
+
+
+def test_cleartext_acceptance_is_destination_only() -> None:
+    """ADR 0153 decision 2 is explicit: putting the pair on Source would be a setting nothing consumes.
+
+    Inbound binds are governed by a different mechanism (_inbound_insecure_bind_permitted plus the four
+    exposed-gates), which this ADR does not change. Pinned so a later "symmetry" refactor cannot add a
+    dead inbound knob that reads like a working control."""
+    assert "cleartext_accepted" not in Source.model_fields
+    assert "cleartext_reason" not in Source.model_fields
+    assert "cleartext_accepted" in Destination.model_fields
 
 
 # --- decision 7: the [ai]->HopPosture mapping (is_phi from data_class; enforcing from [security]) --
@@ -181,3 +256,184 @@ def test_build_check_registry_none_posture_leaves_unstamped(
     )
     # Unstamped -> None; the cell fail-closes on its own (treats the hop as prod-PHI).
     assert seen == [None]
+
+
+# --- ADR 0153 decision 2: the AUTHORING surfaces for the cleartext-acceptance pair --------------
+
+
+def test_outbound_factory_accepts_the_pair_and_validates_it() -> None:
+    """`outbound()` / `build_outbound_connection` is the code-first surface. The coherence rules are
+    enforced at THIS choke point (not only on the model), so a bad pair fails at `messagefoundry check`
+    / dry-run with the connection name attached rather than at connector construction."""
+    from messagefoundry.config.wiring import Tcp, WiringError
+
+    oc = build_outbound_connection(
+        "OB",
+        Tcp(host="10.0.0.5", port=5000),
+        cleartext_accepted=True,
+        cleartext_reason="vendor firmware predates TLS",
+    )
+    assert oc.cleartext_accepted is True and oc.cleartext_reason is not None
+
+    with pytest.raises(WiringError, match="requires cleartext_reason"):
+        build_outbound_connection("OB", Tcp(host="10.0.0.5", port=5000), cleartext_accepted=True)
+    with pytest.raises(WiringError, match="without cleartext_accepted"):
+        build_outbound_connection("OB", Tcp(host="10.0.0.5", port=5000), cleartext_reason="why")
+
+
+def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """ADR 0007's promise: the TOML surface desugars through the SAME factories into an identical
+    Registry entry. Asserted on the DISPOSITION, not just the field, so a pair that survives the loader
+    but never reaches the hop authority would still fail here."""
+    from messagefoundry.config.wiring import Tcp, load_config
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    (tmp_path / "logic.py").write_text(
+        "from messagefoundry import Send, handler, router\n\n"
+        '@router("r")\n'
+        "def route(msg):\n"
+        '    return ["h"]\n\n'
+        '@handler("h")\n'
+        "def handle(msg):\n"
+        '    return Send("OB", msg)\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "connections.toml").write_text(
+        "[[outbound]]\n"
+        'name = "OB"\n'
+        'transport = "tcp"\n'
+        "cleartext_accepted = true\n"
+        'cleartext_reason = "vendor firmware predates TLS"\n'
+        "  [outbound.settings]\n"
+        '  host = "10.0.0.5"\n'
+        "  port = 5000\n",
+        encoding="utf-8",
+    )
+    from_toml = load_config(tmp_path).outbound["OB"]
+    from_code = build_outbound_connection(
+        "OB",
+        Tcp(host="10.0.0.5", port=5000),
+        cleartext_accepted=True,
+        cleartext_reason="vendor firmware predates TLS",
+    )
+    assert (from_toml.cleartext_accepted, from_toml.cleartext_reason) == (
+        from_code.cleartext_accepted,
+        from_code.cleartext_reason,
+    )
+    # ...and both reach the typed Destination the connectors decide on.
+    for oc in (from_toml, from_code):
+        dest = _dest_config(oc, {})
+        assert dest.cleartext_accepted is True
+        assert dest.cleartext_reason == "vendor firmware predates TLS"
+
+
+def test_toml_rejects_the_pair_under_settings(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """They are TOP-LEVEL outbound keys, not transport settings. Under `[settings]` they are passed to
+    the transport factory (which IS the settings schema) and rejected — pinned so the two surfaces
+    cannot silently diverge into accepting both spellings with different semantics.
+
+    Driven through the LOADER, not through a factory signature: a signature check is a proxy that would
+    still pass if `_build_spec` ever grew a pass-through for unknown keys, which is the drift this test
+    is for."""
+    from messagefoundry.config.wiring import WiringError, load_config
+
+    (tmp_path / "logic.py").write_text(
+        "from messagefoundry import Send, handler, router\n\n"
+        '@router("r")\n'
+        "def route(msg):\n"
+        '    return ["h"]\n\n'
+        '@handler("h")\n'
+        "def handle(msg):\n"
+        '    return Send("OB", msg)\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "connections.toml").write_text(
+        "[[outbound]]\n"
+        'name = "OB"\n'
+        'transport = "tcp"\n'
+        "  [outbound.settings]\n"
+        '  host = "10.0.0.5"\n'
+        "  port = 5000\n"
+        "  cleartext_accepted = true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="cleartext_accepted"):
+        load_config(tmp_path)
+
+
+# --- ADR 0153 decision 3: NO TLS default is flipped --------------------------------------------
+
+
+def test_no_transport_factory_flips_its_tls_default() -> None:
+    """ADR 0153's most emphatic non-goal, pinned so it cannot rot.
+
+    An earlier draft proposed `tls: bool = True` on the transport factories. It was sized and REJECTED:
+    it is redundant (an undeclared cleartext hop already refuses), it hard-fails every inbound MLLP
+    listener (`_mllp_ssl_context(server=True)` raises before any policy runs — including on the loopback
+    binds arm 1 exempts), and it disarms the four inbound exposed-gates, which early-return when
+    `settings["tls"]` is truthy. "Secure by default" is delivered by the REFUSAL, not by this default.
+    """
+    import inspect
+
+    from messagefoundry.config.wiring import DICOM, MLLP, Ftp, Http
+
+    for factory in (MLLP, Http, DICOM, Ftp):
+        param = inspect.signature(factory).parameters["tls"]
+        assert param.default is False, (
+            f"{factory.__name__}() now defaults tls={param.default!r}. ADR 0153 decision 3 keeps it "
+            "False on all four factories — see the ADR before changing this."
+        )
+
+
+def test_dest_config_mirrors_the_declaration_into_the_resolved_settings() -> None:
+    """The runner's settings MIRROR is the only path a graph-authored declaration takes to the deep
+    settings-driven seams — HTTP Digest, the OAuth2 / SMART token endpoints, the forward-proxy
+    credential. Nothing else covers it: those seams' own tests hand the settings dict in by hand, and
+    the desugaring test asserts only the typed `Destination` fields. Without this, that mirroring could
+    be deleted and a declared connection using `http_auth=digest` or `oauth2_*` over cleartext would die
+    at construction with no test noticing."""
+    from messagefoundry.config.wiring import Tcp
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    declared = build_outbound_connection(
+        "OB_LEGACY",
+        Tcp(host="10.0.0.5", port=5000),
+        cleartext_accepted=True,
+        cleartext_reason="vendor firmware predates TLS",
+    )
+    settings = _dest_config(declared, {}).settings
+    assert settings["cleartext_accepted"] is True
+    assert settings["cleartext_reason"] == "vendor firmware predates TLS"
+    # The NAME rides with it, so the acceptance audit record those seams emit can name the declaration.
+    assert settings["cleartext_connection"] == "OB_LEGACY"
+
+
+def test_dest_config_writes_no_mirror_keys_when_nothing_is_declared() -> None:
+    """The other half: an undeclared outbound must be byte-identical — no empty governance keys in the
+    resolved settings, which several surfaces render."""
+    from messagefoundry.config.wiring import Tcp
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    plain = build_outbound_connection("OB_PLAIN", Tcp(host="10.0.0.5", port=5000))
+    settings = _dest_config(plain, {}).settings
+    assert "cleartext_accepted" not in settings
+    assert "cleartext_reason" not in settings
+    assert "cleartext_connection" not in settings
+
+
+def test_logging_forward_hop_attestation_also_requires_a_reason() -> None:
+    """Rule 3 of the retro-fit reaches `[logging].forward_hop_attested` — the documented `[logging]`
+    sibling of a connection's `tls_hop_attested`, sharing the same validator.
+
+    Asserted here rather than claimed in a sibling test's docstring: docs/PHI.md already described this
+    reason as mandatory, so an unenforced rule would leave a documented guarantee false exactly where an
+    auditor looks."""
+    from messagefoundry.config.settings import LoggingSettings
+
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        LoggingSettings(forward_hop_attested=True)
+    # ...and the coherent pair still loads.
+    ok = LoggingSettings(
+        forward_hop_attested=True, forward_hop_attested_reason="management segment is isolated"
+    )
+    assert ok.forward_hop_attested is True

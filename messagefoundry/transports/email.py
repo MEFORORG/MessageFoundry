@@ -124,13 +124,23 @@ class EmailDestination(DestinationConnector):
         # process-wide env var — without this, attestation would be dead config on EMAIL alone.
         self._hop_guard: InsecureHopGuard | None = None
         if not self.use_tls:
-            if not (weakened_tls_escape_permitted_here() or config.tls_hop_attested):
+            # ADR 0153: `cleartext_accepted` joins this disjunction. The pre-gate fires BEFORE the shared
+            # authority below, so without this arm an SMTP outbound that declared the acceptance would
+            # still be refused here and the declaration would be dead config on EMAIL alone — exactly the
+            # trap `tls_hop_attested` was added to this gate to avoid. Passing the pre-gate is not
+            # permission to cross: the guard below still decides the hop, and an accepted hop is WARNed
+            # and audited there, never silently allowed.
+            if not (
+                weakened_tls_escape_permitted_here()
+                or config.tls_hop_attested
+                or config.cleartext_accepted
+            ):
                 raise ValueError(
                     "Email destination use_tls=false sends the message (and any credentials) over "
                     f"cleartext SMTP; refused unless {INSECURE_TLS_ESCAPE_ENV} is set "
-                    "(dev/trusted-network only) or the connection sets tls_hop_attested=true — use "
-                    "STARTTLS (the default). Refused on a production-PHI instance even with the "
-                    "escape (#200)."
+                    "(dev/trusted-network only), or the connection sets tls_hop_attested=true (the hop "
+                    "IS secure by other means) or cleartext_accepted=true with a cleartext_reason (the "
+                    "hop is NOT secure and that is accepted) — use STARTTLS (the default)."
                 )
             # Credentials over an un-encrypted channel are never allowed, even with the escape: a
             # cleartext AUTH puts the password on the wire (the refuse_cleartext_credentials rule).
@@ -154,6 +164,9 @@ class EmailDestination(DestinationConnector):
                 description="cleartext SMTP egress (use_tls=false)",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,
+                cleartext_accepted=config.cleartext_accepted,
+                cleartext_reason=config.cleartext_reason,
+                connection=config.name,
             )
             self._hop_guard.enforce_construction()
         else:

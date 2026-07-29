@@ -25,7 +25,7 @@ import os
 import re
 import string
 import tomllib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import date
 from enum import Enum
 from pathlib import Path
@@ -194,12 +194,18 @@ def hop_insecure_escape_downgrades(*, enforcing: bool) -> bool:
 
     The **clamp** on the blunt global escape for the posture-keyed hop refusal (ADR 0092, decision 2):
     the escape may only relax a hop REFUSE to WARN when the security dial is **not enforcing**. Under
-    ENFORCE it is **inert** for hop refusal — it can NEVER satisfy an enforcing PHI hop (a deliberate
-    behaviour change from the pre-#200 global escape, which silenced the refusal in every environment).
-    Cells pass the result as
-    :func:`~messagefoundry.config.tls_policy.insecure_hop_disposition`'s ``audited_opt_out`` argument,
-    so under ENFORCE that argument is always ``False`` and the ``enforcing`` REFUSE arm wins.
-    Attestation (per-connection ``tls_hop_attested``) is the only way to cross an enforcing PHI hop."""
+    ENFORCE it is **inert** — it can NEVER satisfy an enforcing hop (a deliberate behaviour change from
+    the pre-#200 global escape, which silenced the refusal in every environment).
+
+    **Scope after ADR 0153 (decision 5): the TRANSPORT cells no longer consult this at all.** The
+    cleartext-hop authority lost its ``audited_opt_out`` parameter, so the variable cannot influence a
+    connection's cleartext-hop decision; the per-connection ``cleartext_accepted`` declaration replaced
+    it there. This clamp survives for the two **non-connection** cells that still key on the escape and
+    have nowhere to carry a per-hop declaration — the ``[logging]`` forwarder
+    (:func:`forward_hop_disposition`) and the API PHI-read serve hop
+    (:func:`~messagefoundry.config.tls_policy.phi_read_hop_disposition`) — plus the verify-off cells via
+    :func:`weakened_tls_escape_permitted`. On a connection, ``tls_hop_attested`` (ALLOW) or
+    ``cleartext_accepted`` (WARN + audit) is now the only way across an enforcing hop."""
     return insecure_tls_allowed() and not enforcing
 
 
@@ -364,13 +370,15 @@ class StoreSettings(_Section):
     # the env key takes precedence. Empty = use `encryption_key` (the cross-platform default).
     encryption_key_file: str | None = None
     # Bind each at-rest AES-256-GCM value to its (table, column, row) cell via GCM Associated Data
-    # (ASVS 11.3.3, ADR 0019). Off by default → the frozen mfenc:v1 writer, byte-identical at rest
-    # (CRYPTO-1). When true, NEW writes use the mfenc:v2 writer with cell-bound AAD (it sets the cipher's
-    # `write_v2`), so a ciphertext cut-and-pasted into another cell fails the auth tag (dead-lettered,
-    # not silently accepted); legacy v1 rows still decrypt (dual-read) and `messagefoundry rotate-key`
-    # upgrades them v1→v2. No effect without an encryption key (the identity cipher has nothing to bind).
-    # The hardened (Posture B) setting — see docs/security/OFF-LOOPBACK-DEPLOYMENT.md.
-    aad_bind: bool = False
+    # (ASVS 11.3.3, ADR 0019). **On by default** (ADR 0148 GIVEN 1: the default configuration runs the
+    # hardened path, so it is exercised everywhere and not first in production): NEW writes use the
+    # mfenc:v2 writer with cell-bound AAD (it sets the cipher's `write_v2`), so a ciphertext cut-and-pasted
+    # into another cell fails the auth tag (dead-lettered, not silently accepted). Legacy v1 rows still
+    # decrypt (dual-read) and `messagefoundry rotate-key` upgrades them v1→v2, so the flip is safe on an
+    # existing store and reversible. No effect without an encryption key (the identity cipher has nothing
+    # to bind). Setting it false selects the frozen mfenc:v1 writer (byte-identical at rest, CRYPTO-1) and
+    # is a LOOSENING — `security_loosenings()` names it, so the opt-out is never silent.
+    aad_bind: bool = True
     # KeyProvider seam (ADR 0019, ASVS 13.3.3): selects HOW the active/retired DEK bytes are *sourced* —
     # never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged). `auto` (the
     # default) is the env-then-DPAPI ladder, BYTE-IDENTICAL to the pre-seam behavior; `env`/`dpapi` pin a
@@ -1770,11 +1778,17 @@ class AuthSettings(_Section):
     # principal that still holds a live session and revokes the sessions of accounts that have been
     # disabled or deleted. See docs/adr/0079-kerberos-idp-session-coordination.md.
     #
-    # How often a reconciliation pass runs, in seconds. **0 = OFF, the default** — the loop is never
-    # created and an upgrade is byte-identical. A non-zero value is floored at 60 s: the pass costs one
-    # LDAP bind per signed-in directory user, and a fat-fingered `1` would be a DC denial-of-service.
-    # 300 (five minutes) is the recommended setting for an off-loopback PHI deployment.
-    ad_session_recheck_seconds: int = 0
+    # How often a reconciliation pass runs, in seconds. **300 (five minutes) by default** (ADR 0148
+    # GIVEN 1 — the hardened path is the shipped path), floored at 60 s: the pass costs one LDAP bind per
+    # signed-in directory user, and a fat-fingered `1` would be a DC denial-of-service. `0` disables the
+    # loop entirely and is a LOOSENING once AD is enabled — `security_loosenings()` names it.
+    #
+    # The default is INERT without AD: `AuthService.should_reconcile()` also requires an LDAP client, so a
+    # deployment that never enables `ad_enabled` creates no task and issues no bind. That is why the
+    # cross-field check below refuses only an EXPLICIT non-zero value without `ad_enabled` — refusing the
+    # shipped default would break every non-AD deployment at startup, while an operator who deliberately
+    # typed a value still gets told their control would be dead.
+    ad_session_recheck_seconds: int = 300
     # How many CONSECUTIVE passes must fail to find a principal before its sessions are revoked. A
     # single ambiguous result never revokes: `resolve_principal` collapses "disabled", "deleted" and
     # "the search returned nothing" into one `None`, so requiring two agreeing probes costs at most one
@@ -2034,9 +2048,19 @@ class AuthSettings(_Section):
             )
         if self.kerberos_enabled and not self.ad_enabled:
             raise ValueError("kerberos_enabled requires ad_enabled (SSO resolves roles via AD)")
-        if self.ad_session_recheck_seconds and not self.ad_enabled:
+        if (
+            self.ad_session_recheck_seconds
+            and not self.ad_enabled
+            and "ad_session_recheck_seconds" in self.model_fields_set
+        ):
             # Refuse rather than no-op: an operator who set this believes directory revocation now
             # propagates. A silently-dead security control is worse than never having enabled it.
+            #
+            # Keyed on model_fields_set, not on the value, since the hardened SHIPPED default (300, ADR
+            # 0148 GIVEN 1) is non-zero: refusing it unconditionally would fail startup on every
+            # deployment that does not use AD, which is most of them. An untouched default carries no
+            # operator belief to falsify, and it is inert anyway — should_reconcile() also requires an
+            # LDAP client. An explicitly typed value still refuses, which is the case the rule is for.
             raise ValueError(
                 "ad_session_recheck_seconds requires ad_enabled (the reconciler re-resolves "
                 "principals through the same LDAP service-account bind)"
@@ -2297,37 +2321,50 @@ def forward_hop_disposition(log: LoggingSettings, posture: HopPosture) -> HopDis
     CA-anchored), so a secure transport is available and this is a *default* problem, not a
     capability gap.
 
-    The decision is delegated verbatim to :func:`~messagefoundry.config.tls_policy.
-    insecure_hop_disposition` — the SAME authority the transports consume — so the forwarder decides
-    identically to every other egress cell. A hop is treated as **secure** (and never gated) only when
-    it is TLS *with verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false``
-    opt-out are both MITM-able and go to the gradient:
+    The decision is delegated to :func:`~messagefoundry.config.tls_policy.insecure_hop_disposition` —
+    the SAME authority the transports consume — so the forwarder decides identically to every other
+    egress cell. A hop is treated as **secure** (and never gated) only when it is TLS *with
+    verification on*; plaintext ``udp``/``tcp`` and the ``forward_tls_verify=false`` opt-out are both
+    MITM-able and go to the gradient:
 
     #. loopback collector → ALLOW — the ADR 0080 "point ``tcp``/``udp`` at ``127.0.0.1`` and let a
        local rsyslog/Vector agent add TLS" deployment is explicitly preserved, byte-identical.
+    #. synthetic instance (not ``is_phi``) → ALLOW — silent, nothing sensitive rides the hop. Applied
+       HERE (not by the shared authority, which ADR 0153 stripped of the label) — see below.
     #. ``forward_hop_attested`` → ALLOW — the acknowledged, reasoned opt-out (a trusted management
        segment), the ``[logging]`` sibling of a connection's ``tls_hop_attested``.
-    #. synthetic instance (not ``is_phi``) → ALLOW — silent, nothing sensitive rides the hop.
     #. the CLAMPED global escape → WARN (never fires under ENFORCE — see
        :func:`hop_insecure_escape_downgrades`).
     #. enforcing PHI → REFUSE. #. else (non-enforcing PHI) → WARN.
 
     Callers that have not resolved a posture pass the fail-closed one; ``serve`` supplies
-    :func:`hop_posture_from_ai`. Pure so the gate is unit-testable without standing up ``serve``."""
+    :func:`hop_posture_from_ai`. Pure so the gate is unit-testable without standing up ``serve``.
+
+    **ADR 0153 leaves this cell keyed on the data label, deliberately** (its *Explicitly out of scope*
+    table: "Stays keyed on posture; a ``[logging]`` sibling of ``cleartext_accepted`` is a follow-up").
+    The forwarder is not a connection, so it has nowhere to carry a per-hop declaration, and refusing
+    it instead would create a deviation the loosening registry cannot express. The ``not is_phi`` ALLOW
+    arm 0153 deleted from the shared authority is therefore restated HERE, explicitly, rather than
+    inherited — the scope limit is a written decision at the one place it applies, not an emergent
+    property of a signature change."""
     if log.forward_protocol is SyslogProtocol.TLS and log.forward_tls_verify:
         # Verified, CA-anchored TLS (ADR 0080) — an encrypted+authenticated hop, nothing to gate.
         return HopDisposition.ALLOW
+    if not posture.is_phi:
+        # ADR 0153 scope carve-out — see the docstring. Restated here, not inherited.
+        return HopDisposition.ALLOW
     return insecure_hop_disposition(
-        is_phi=posture.is_phi,
         enforcing=posture.enforcing,
         # An unset forward_host cannot happen with forwarding on (the validator requires it), and the
         # empty string is treated as loopback by the shared predicate — so an unconfigured forwarder
         # can never be refused.
         is_loopback_hop=is_loopback_hop_host(log.forward_host or ""),
         hop_attested=log.forward_hop_attested,
-        # Clamped upstream to non-enforcing, so under ENFORCE this is always False and the blunt
-        # global escape can never cross an enforcing PHI hop (ADR 0092 decision 2).
-        audited_opt_out=hop_insecure_escape_downgrades(enforcing=posture.enforcing),
+        # The global escape keeps its arm HERE (same scope carve-out): it is the only expressible
+        # relaxation this non-connection cell has. Clamped upstream to non-enforcing, so under ENFORCE
+        # it is always False and can never cross an enforcing PHI hop (ADR 0092 decision 2). It rides
+        # the new arm 3, which occupies exactly the pre-0153 arm-4 slot, so this is byte-identical.
+        cleartext_accepted=hop_insecure_escape_downgrades(enforcing=posture.enforcing),
     )
 
 
@@ -3876,8 +3913,40 @@ def _desugar_security(data: dict[str, dict[str, Any]]) -> None:
         _set("ai", "data_class", "phi" if sec.handles_real_patient_data else "synthetic")
 
 
-def security_loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
-    """Every ``[security]`` switch currently at its INSECURE value, as ``(switch, plain-language risk)``.
+def security_loosenings(
+    sec: SecuritySettings,
+    store: StoreSettings,
+    auth: AuthSettings,
+    cleartext_hops: Sequence[str],
+) -> list[tuple[str, str]]:
+    """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
+    section, as ``(switch, plain-language risk)``.
+
+    **Scope, stated precisely so the gap is visible rather than implied.** This registry covers *every*
+    ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
+    that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
+    ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[auth].ad_session_recheck_seconds``, and the per-connection ``cleartext_accepted``. It is NOT yet
+    an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
+    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
+    ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
+    ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
+    enumerated in the floor test's exemption set so the gap is a written decision that a new switch
+    cannot silently join.
+
+    Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
+    and an operator may only loosen from it, so a deviation that this registry cannot see is a second
+    posture by the back door. An optional parameter is a detector that silently fails to fire; a required
+    one makes omission a type error at every call site.
+
+    ``cleartext_hops`` is the list of CONNECTION NAMES that declare ``cleartext_accepted`` (ADR 0153) —
+    the one connection-scoped deviation in this otherwise settings-scoped registry. It arrives as plain
+    names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the caller
+    resolves them (``config.wiring.accepted_cleartext_hops`` is the shared reader, which walks both
+    outbound connections and ``FhirLookup`` read connections). A caller that genuinely has no graph —
+    ``messagefoundry security show``, which reads a settings file and never loads the connection config
+    — passes an empty sequence and SAYS SO in its output, rather than reporting a subset as if it were
+    everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
     view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
@@ -3995,6 +4064,40 @@ def security_loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
         )
     if sec.allow_keeping_phi_indefinitely:
         out.append(("allow_keeping_phi_indefinitely", "unbounded PHI retention is permitted"))
+    # --- switches outside [security] that are still posture deviations (ADR 0148: one posture, loosen
+    # only). They live in [store]/[auth] for cohesion, but an operator turning either off is loosening the
+    # shipped posture, so they belong in the same registry rather than a parallel one that could drift.
+    if not store.aad_bind:
+        out.append(
+            (
+                "aad_bind",
+                "at-rest values are NOT bound to their (table, column, row) cell — a ciphertext moved "
+                "between cells decrypts instead of failing its auth tag (no effect without a store key)",
+            )
+        )
+    # Conditional on ad_enabled, like allowed_client_networks above: with no directory there is nothing to
+    # reconcile against, so 0 is not a weaker choice, it is the only meaningful one.
+    if auth.ad_enabled and not auth.ad_session_recheck_seconds:
+        out.append(
+            (
+                "ad_session_recheck_seconds",
+                "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
+                "live engine sessions until they expire on their own",
+            )
+        )
+    # --- the one CONNECTION-scoped deviation (ADR 0153 decision 2). It is not a [security] switch, but
+    # it is a declared departure from the one shipped posture, so it belongs in the one registry an
+    # operator reads — a deviation the registry cannot see is a second posture by the back door.
+    if cleartext_hops:
+        named = ", ".join(sorted(cleartext_hops))
+        out.append(
+            (
+                "cleartext_accepted",
+                f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
+                f"({named}) — the payload, and any credential the connection carries, ride those hops "
+                "unencrypted and readable by anything on the path",
+            )
+        )
     return out
 
 
