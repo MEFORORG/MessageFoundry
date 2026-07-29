@@ -37,10 +37,33 @@ param(
     [string]$ReposFile = (Join-Path $env:USERPROFILE ".claude\hooks\worktree-gate.repos.txt")
 )
 
+# Bumped whenever a RULE's behaviour changes, so `install-gate.ps1 -Status` can report which build is
+# actually installed. The installed gate is a COPY (see install-gate.ps1); without a version stamp the only
+# way to tell a stale copy from a current one is a byte compare, and nothing was doing one -- which is how
+# rule 4 sat unshipped for five days while every test reported it present.
+$GateVersion = "2026.07.29.1"
+
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
 
-function Write-Deny([string]$Reason) {
+function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") {
+    # Leave a RECEIPT before denying. Until this existed the gate was unfalsifiable: it wrote its decision
+    # to stdout and exited 0, so nothing on the box could answer "how many drift events did we prevent",
+    # "is the false-positive rate 1/day or 1/1000", or "did that fix change anything" -- and every severity
+    # ranking about this machinery was therefore an opinion. Best-effort and never load-bearing: the log
+    # lives beside the allowlist, and if the append fails the deny still goes out.
+    #
+    # Deliberately NOT logged: the raw command or file contents. Each rule passes a $Detail it composed
+    # itself (a verb, a target path), so an argument carrying a secret cannot end up in a plaintext log.
+    try {
+        $logDir = Split-Path -Parent $ReposFile
+        if ($logDir -and (Test-Path -LiteralPath $logDir)) {
+            $stamp = (Get-Date).ToString("s")
+            $line = "$stamp`tv$GateVersion`trule=$Rule`ttool=$tool`tcwd=$cwdRaw`t$Detail"
+            Add-Content -LiteralPath (Join-Path $logDir "worktree-gate.log") -Value $line -Encoding utf8
+        }
+    } catch { }
+
     # The hookSpecificOutput WRAPPER IS MANDATORY. A bare {"permissionDecision":"deny"} is silently
     # ignored and the tool call proceeds (measured, and reported upstream as #4669 / #37210).
     $payload = @{
@@ -101,7 +124,7 @@ $cwdRaw = [string]$hook.cwd                        # original case: for `git -C`
 # wired in install-gate.ps1 alongside this change; delete it there and the wiring test goes red.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("EnterWorktree")) {
-    Write-Deny @"
+    Write-Deny -Rule "4" -Detail "relocate-session" -Reason @"
 BLOCKED: EnterWorktree relocates this live session into a worktree, which re-files its chat transcript
 under the worktree's slug and drops it from THIS window's session list (nothing is deleted -- it just
 stops appearing where you started). Do not relocate a running session.
@@ -201,7 +224,7 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$CwdRaw) {
     if ($dest -eq $head) { return }
 
     $newHint = "$($gov.Display)\scripts\worktree\new.ps1"
-    Write-Deny @"
+    Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
 BLOCKED: 'git $Verb $dest' would switch a LINKED WORKTREE ($selfTopRaw) onto the existing branch '$dest'.
 
 That worktree belongs to another session, which is building on '$head' right now. Switching it swaps every
@@ -228,7 +251,7 @@ if ($tool -in @("Task", "Agent", "Workflow")) {
     $root = Test-Governed $cwd
     if ($root) {
         $display = $root.Display
-        Write-Deny @"
+        Write-Deny -Rule "2" -Detail "dispatch $tool" -Reason @"
 BLOCKED: this session is running in the SHARED PRIMARY checkout ($display), so it may not dispatch
 subagents. A subagent inherits this cwd, cannot create a worktree for itself, and its blocked edits do
 not reliably surface back to you -- the fan-out would appear to succeed while writing nothing.
@@ -332,7 +355,7 @@ if ($tool -in @("Bash", "PowerShell")) {
     }
 
     $display = $root.Display
-    Write-Deny @"
+    Write-Deny -Rule "3" -Detail "git $verb" -Reason @"
 BLOCKED: 'git $verb' would change the working tree of the SHARED PRIMARY checkout ($display).
 
 Other sessions are standing in that directory right now. Switching its branch (or resetting, stashing or
@@ -383,7 +406,12 @@ try {
         & git -C $display worktree list --porcelain 2>$null |
             Select-String -Pattern '^worktree (.+)$' |
             ForEach-Object { $_.Matches[0].Groups[1].Value } |
-            Where-Object { (Get-ComparablePath $_) -ne $root }
+            # `$root` is the PSCustomObject from Test-Governed, NOT a string -- comparing a path to it was
+            # always -ne, so the filter never removed anything and the PRIMARY ITSELF was listed first under
+            # "REUSE one if it is yours", displacing a real worktree off the 8-item cap below. The one part
+            # of this hook whose entire job is steering the next action was steering it back at the tree we
+            # had just refused. Compare against the canonicalised form.
+            Where-Object { (Get-ComparablePath $_) -ne $root.Compare }
     )
 } catch { $worktrees = @() }
 
@@ -392,7 +420,7 @@ $worktreeHint = if ($worktrees.Count -gt 0) {
     (($worktrees | Select-Object -First 8 | ForEach-Object { "    $_" }) -join "`n")
 } else { "" }
 
-Write-Deny @"
+Write-Deny -Rule "1" -Detail $target -Reason @"
 BLOCKED: this write targets the SHARED PRIMARY checkout ($display), where concurrent sessions collide.
 This is a hard gate. Re-issuing the same edit will fail again -- do not retry it, and do not route around
 it with a shell command; that only hides the collision.
