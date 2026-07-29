@@ -162,18 +162,36 @@ def test_rest_verify_tls_false_refused_without_escape(monkeypatch: pytest.Monkey
 
 
 def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
-    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
-    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    """A verify-off hop keeps the CLAMPED global escape — ADR 0153 does not govern this cell.
+
+    0153 unhooked ``MEFOR_ALLOW_INSECURE_TLS`` from the CLEARTEXT hop decision. A ``verify_tls=false``
+    hop is encrypted-but-unauthenticated, not cleartext, so it is explicitly out of that scope and
+    decides exactly as the MLLP/FTPS ``tls_verify=false`` cells do."""
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
+        dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
+    assert dest._opener is not None
+
+
+def test_rest_verify_tls_false_not_relaxed_by_a_cleartext_declaration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``cleartext_accepted`` must NOT cross a verify-off hop, in any posture.
+
+    Threading it here would have been a LOOSENING — this hop REFUSES on an enforcing instance today,
+    and ADR 0092 decision 5 forbids a cell getting weaker. It would also have attached an operator's
+    written "this peer cannot do TLS" reason to a peer that plainly does TLS, and split the HTTP family
+    from MLLP, which decides the same question through ``weakened_tls_escape_permitted_here()``."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    # verify_tls=false is decided exactly like a cleartext hop, so the declaration crosses it too.
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
-        dest = _dest(
+    with (
+        active_hop_posture(HopPosture(is_phi=True, enforcing=True)),
+        pytest.raises(ValueError, match="verify_tls=false"),
+    ):
+        _dest(
             verify_tls=False,
             _cleartext_accepted=True,
             _cleartext_reason="legacy partner endpoint has no TLS",
-        )  # builds a no-verify opener; no exception
-    assert dest._opener is not None
+        )
 
 
 def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -189,7 +207,7 @@ def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
         )
 
 
-def test_rest_credentials_over_cleartext_http_allowed_with_escape(
+def test_rest_credentials_over_cleartext_http_allowed_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
@@ -248,7 +266,7 @@ def test_rest_cleartext_http_nonloopback_refused_without_escape(
         )
 
 
-def test_rest_cleartext_http_nonloopback_allowed_with_escape(
+def test_rest_cleartext_http_nonloopback_allowed_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop

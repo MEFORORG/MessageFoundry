@@ -327,15 +327,38 @@ def test_connections_toml_desugars_to_the_same_declaration(tmp_path) -> None:  #
         assert dest.cleartext_reason == "vendor firmware predates TLS"
 
 
-def test_toml_rejects_the_pair_under_settings() -> None:
-    """They are TOP-LEVEL outbound keys, not transport settings. Under `[settings]` they would be passed
-    to the transport factory (which is the settings schema) and rejected — pinned so the two surfaces
-    cannot silently diverge into accepting both spellings with different semantics."""
-    import inspect
+def test_toml_rejects_the_pair_under_settings(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """They are TOP-LEVEL outbound keys, not transport settings. Under `[settings]` they are passed to
+    the transport factory (which IS the settings schema) and rejected — pinned so the two surfaces
+    cannot silently diverge into accepting both spellings with different semantics.
 
-    from messagefoundry.config.wiring import Tcp
+    Driven through the LOADER, not through a factory signature: a signature check is a proxy that would
+    still pass if `_build_spec` ever grew a pass-through for unknown keys, which is the drift this test
+    is for."""
+    from messagefoundry.config.wiring import WiringError, load_config
 
-    assert "cleartext_accepted" not in inspect.signature(Tcp).parameters
+    (tmp_path / "logic.py").write_text(
+        "from messagefoundry import Send, handler, router\n\n"
+        '@router("r")\n'
+        "def route(msg):\n"
+        '    return ["h"]\n\n'
+        '@handler("h")\n'
+        "def handle(msg):\n"
+        '    return Send("OB", msg)\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "connections.toml").write_text(
+        "[[outbound]]\n"
+        'name = "OB"\n'
+        'transport = "tcp"\n'
+        "  [outbound.settings]\n"
+        '  host = "10.0.0.5"\n'
+        "  port = 5000\n"
+        "  cleartext_accepted = true\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(WiringError, match="cleartext_accepted"):
+        load_config(tmp_path)
 
 
 # --- ADR 0153 decision 3: NO TLS default is flipped --------------------------------------------
@@ -360,3 +383,57 @@ def test_no_transport_factory_flips_its_tls_default() -> None:
             f"{factory.__name__}() now defaults tls={param.default!r}. ADR 0153 decision 3 keeps it "
             "False on all four factories — see the ADR before changing this."
         )
+
+
+def test_dest_config_mirrors_the_declaration_into_the_resolved_settings() -> None:
+    """The runner's settings MIRROR is the only path a graph-authored declaration takes to the deep
+    settings-driven seams — HTTP Digest, the OAuth2 / SMART token endpoints, the forward-proxy
+    credential. Nothing else covers it: those seams' own tests hand the settings dict in by hand, and
+    the desugaring test asserts only the typed `Destination` fields. Without this, that mirroring could
+    be deleted and a declared connection using `http_auth=digest` or `oauth2_*` over cleartext would die
+    at construction with no test noticing."""
+    from messagefoundry.config.wiring import Tcp
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    declared = build_outbound_connection(
+        "OB_LEGACY",
+        Tcp(host="10.0.0.5", port=5000),
+        cleartext_accepted=True,
+        cleartext_reason="vendor firmware predates TLS",
+    )
+    settings = _dest_config(declared, {}).settings
+    assert settings["cleartext_accepted"] is True
+    assert settings["cleartext_reason"] == "vendor firmware predates TLS"
+    # The NAME rides with it, so the acceptance audit record those seams emit can name the declaration.
+    assert settings["cleartext_connection"] == "OB_LEGACY"
+
+
+def test_dest_config_writes_no_mirror_keys_when_nothing_is_declared() -> None:
+    """The other half: an undeclared outbound must be byte-identical — no empty governance keys in the
+    resolved settings, which several surfaces render."""
+    from messagefoundry.config.wiring import Tcp
+    from messagefoundry.pipeline.wiring_runner import _dest_config
+
+    plain = build_outbound_connection("OB_PLAIN", Tcp(host="10.0.0.5", port=5000))
+    settings = _dest_config(plain, {}).settings
+    assert "cleartext_accepted" not in settings
+    assert "cleartext_reason" not in settings
+    assert "cleartext_connection" not in settings
+
+
+def test_logging_forward_hop_attestation_also_requires_a_reason() -> None:
+    """Rule 3 of the retro-fit reaches `[logging].forward_hop_attested` — the documented `[logging]`
+    sibling of a connection's `tls_hop_attested`, sharing the same validator.
+
+    Asserted here rather than claimed in a sibling test's docstring: docs/PHI.md already described this
+    reason as mandatory, so an unenforced rule would leave a documented guarantee false exactly where an
+    auditor looks."""
+    from messagefoundry.config.settings import LoggingSettings
+
+    with pytest.raises(ValueError, match="requires tls_hop_attested_reason"):
+        LoggingSettings(forward_hop_attested=True)
+    # ...and the coherent pair still loads.
+    ok = LoggingSettings(
+        forward_hop_attested=True, forward_hop_attested_reason="management segment is isolated"
+    )
+    assert ok.forward_hop_attested is True

@@ -317,21 +317,26 @@ def test_fhir_lookup_attested_read_allowed_on_prod(monkeypatch: pytest.MonkeyPat
 def test_fhir_lookup_cleartext_accepted_read_allowed_on_prod(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A FhirLookup connection has no Destination, so its declaration rides the spec settings.
+    """A FhirLookup connection has no Destination, so its declaration is a ``FhirLookup()`` parameter.
 
-    Same surface its ``tls_hop_attested`` already used. Without this the read path would be the one
-    cleartext-egress cell with no expressible declaration at all."""
+    Driven through the FACTORY, not a hand-built settings dict: a settings key an operator has no way
+    to write would be an escape that exists only in the test, unvalidated and invisible to the
+    loosening registry. Without this the read path would be the one cleartext-egress cell with no
+    expressible declaration at all."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.wiring import FhirLookup, Registry
+
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    reg = Registry()
+    monkeypatch.setattr(wiring, "_active", reg)
+    FhirLookup(
+        "L",
+        url="http://fhir.example.org/fhir",
+        cleartext_accepted=True,
+        cleartext_reason="legacy on-prem FHIR facade has no TLS",
+    )
     with active_hop_posture(_PROD):
-        ex = FhirLookupExecutor(
-            {
-                "L": {
-                    "url": "http://fhir.example.org/fhir",
-                    "cleartext_accepted": True,
-                    "cleartext_reason": "legacy on-prem FHIR facade has no TLS",
-                }
-            }
-        )
+        ex = FhirLookupExecutor({"L": reg.fhir_lookups["L"].settings})
     assert ex.connections == frozenset({"L"})
 
 

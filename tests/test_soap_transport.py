@@ -245,7 +245,7 @@ def test_soap_cleartext_http_loopback_allowed() -> None:
     assert isinstance(dest, SoapDestination)
 
 
-def test_soap_cleartext_http_nonloopback_allowed_with_escape(
+def test_soap_cleartext_http_nonloopback_allowed_when_accepted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop

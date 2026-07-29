@@ -268,7 +268,7 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
     # It must NAME the connections. "some connections cross a cleartext hop" is not actionable — an
     # operator has to know WHICH, because the remedy is per-connection.
     assert "OB_LEGACY" in risk and "OB_LAB" in risk
-    assert "2 outbound connection(s)" in risk
+    assert "2 connection(s)" in risk
 
 
 def test_no_declared_hops_is_not_a_loosening() -> None:
@@ -326,3 +326,177 @@ async def test_posture_route_reports_declared_cleartext_hops(engine: Engine) -> 
         if e["switch"] == "cleartext_accepted"  # type: ignore[index]
     )
     assert "OB_LEGACY" in entry["risk"]  # type: ignore[index]
+
+
+def test_declared_fhir_lookup_read_hops_are_named_too() -> None:
+    """A ``FhirLookup`` is a connection that crosses a PHI-bearing read hop, and the read executor
+    honours the declaration — so if this reader skipped ``registry.fhir_lookups`` a live cleartext hop
+    would cross while `check`, `security_loosenings()` and `GET /security/posture` all reported the
+    accepted set as EMPTY. That is precisely "a deviation the registry cannot see"."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.wiring import FhirLookup, Registry, accepted_cleartext_hops
+
+    reg = Registry()
+    prev = wiring._active
+    wiring._active = reg
+    try:
+        FhirLookup("quiet", url="https://fhir.example.org/fhir")
+        FhirLookup(
+            "legacy",
+            url="http://fhir.example.org/fhir",
+            cleartext_accepted=True,
+            cleartext_reason="on-prem facade has no TLS listener",
+        )
+    finally:
+        wiring._active = prev
+    assert accepted_cleartext_hops(reg) == [
+        ("fhir_lookup:legacy", "on-prem facade has no TLS listener")
+    ]
+
+
+def test_fhir_lookup_declaration_is_load_validated() -> None:
+    """The factory is the ONE authoring surface, so the flag/reason coherence rule must fire there.
+
+    Before this, the only way to declare it on a lookup was mutating ``spec.settings`` by hand — an
+    escape with no validation and nothing for the registry to name."""
+    from messagefoundry.config import wiring
+    from messagefoundry.config.wiring import FhirLookup, Registry, WiringError
+
+    reg = Registry()
+    prev = wiring._active
+    wiring._active = reg
+    try:
+        with pytest.raises(WiringError, match="requires cleartext_reason"):
+            FhirLookup("x", url="http://f.example.org/fhir", cleartext_accepted=True)
+        with pytest.raises(WiringError, match="without cleartext_accepted"):
+            FhirLookup("y", url="http://f.example.org/fhir", cleartext_reason="why")
+        with pytest.raises(WiringError, match="must be non-empty"):
+            FhirLookup(
+                "z",
+                url="http://f.example.org/fhir",
+                cleartext_accepted=True,
+                cleartext_reason="   ",
+            )
+    finally:
+        wiring._active = prev
+
+
+def test_every_store_and_auth_bool_is_reported_or_exempt() -> None:
+    """The completeness floor, extended over the two OTHER sections this registry reaches into.
+
+    The floor above covers ``[security]`` only. Without this one, the registry's reach into
+    ``[store]``/``[auth]`` would be exactly the leak-gate-blindness shape one section over: a green
+    "no deviations" that has never looked. The exemption set below is the honest part — it enumerates
+    the switches that are NOT reported today, so the gap is a written decision rather than an
+    accident, and a NEW switch in either section cannot silently join it."""
+    #: Not reported by security_loosenings() today. Each is gated elsewhere; extending the registry
+    #: over them is real work with its own SECURITY-LOOSENING.md entries, and is recorded as owed
+    #: rather than done silently here. A new field in either section reds this test until it is
+    #: either reported or added here with a reason.
+    exempt_store = {
+        # Not security switches at all — FIFO-claim performance levers and pool knobs.
+        "fifo_claim_fold_reset",
+        "fifo_claim_proc",
+        "fifo_claim_prepared",
+        "multi_subnet_failover",
+        "warm_pool",
+        # HARDENINGS at their non-default value (turning them ON tightens), so a flip is not a loosening.
+        "require_encryption",
+        "require_managed_identity",
+        # Security-relevant and gated ELSEWHERE, not by this registry. Extending it over them is real
+        # work with its own SECURITY-LOOSENING.md entries — recorded as owed, not done silently.
+        "encrypt",  # the keyless-PHI serve gate refuses it in its own right
+        "trust_server_certificate",  # gated by weakened_tls_escape_permitted (the ADR 0092 clamp)
+        "allow_unencrypted_phi",  # reported via [security].allow_unencrypted_phi (ADR 0118 move)
+    }
+    exempt_auth = {
+        # HARDENINGS / topology choices — a flip is not a weakening of the shipped posture.
+        "require_action_step_up",
+        "admin_new_ip_step_up",
+        "ad_enabled",
+        "ad_use_nested_groups",
+        "kerberos_enabled",
+        "oidc_enabled",
+        "oidc_username_strip_domain",
+        "notify_security_events",
+        # Password-policy composition rules: individually neither secure nor insecure (the policy is
+        # scored as a whole), and none is a posture switch.
+        "password_require_uppercase",
+        "password_require_lowercase",
+        "password_require_digit",
+        "password_require_symbol",
+        "password_check_context",
+        "password_check_username",
+        "password_check_breached",
+        # Security-relevant and gated ELSEWHERE, not by this registry — same owed note as [store].
+        "enabled",  # the serve-time exposed-gates refuse an exposed auth-off instance outright
+        "require_mfa",  # refused at exposure by the __main__ posture gates
+        "ad_tls_verify",  # gated by weakened_tls_escape_permitted
+        "ad_allow_insecure_ldap",  # gated by the same clamp
+        "oidc_require_mfa_claim",  # gated by the OIDC serve gate
+        "login_rate_limit_enabled",  # DoS hardening with its own serve-time defaults
+        "phi_read_rate_limit_enabled",
+        "admin_write_rate_limit_enabled",
+    }
+    for model, exempt, section in (
+        (StoreSettings, exempt_store, "store"),
+        (AuthSettings, exempt_auth, "auth"),
+    ):
+        for field, info in model.model_fields.items():
+            if field in exempt or not isinstance(info.default, bool):
+                continue
+            flipped = model(**{field: not info.default})  # type: ignore[arg-type]
+            kwargs = {"store": flipped} if section == "store" else {"auth": flipped}
+            assert field in _names(**kwargs), (  # type: ignore[arg-type]
+                f"[{section}].{field} at its insecure value ({not info.default}) is NOT named by "
+                "security_loosenings(). Add it to the registry, or add it to this test's exemption "
+                "set with the reason — silence is not an option."
+            )
+
+
+async def test_posture_route_declares_its_scope_when_no_graph_is_loaded(engine: Engine) -> None:
+    """An engine with no registry runner cannot see the connection-scoped declarations, so it SAYS so.
+
+    Reporting a settings-only list with no marker is the failure this whole lane exists to prevent:
+    a subset that reads as the whole posture. `security show` carries the same marker for the same
+    reason, and this pins that the route does not quietly differ from it."""
+    body = await _posture_body(engine)
+    assert body["loosenings_scope"] is not None
+    assert "cleartext_accepted" in str(body["loosenings_scope"])
+
+
+async def test_posture_route_scope_is_none_once_a_graph_is_loaded(engine: Engine) -> None:
+    """The complementary arm — the marker must CLEAR, or it degrades into permanent noise."""
+    from messagefoundry.config.wiring import Registry
+
+    engine.add_registry(Registry())
+    body = await _posture_body(engine)
+    assert body["loosenings_scope"] is None
+
+
+async def test_managed_app_stashes_auth_settings_for_the_registry(tmp_path: Path) -> None:
+    """Drive the REAL wiring: `create_managed_app` must stash `auth_settings` on app.state, or the
+    route silently falls back to `AuthSettings()` defaults and the auth deviation is never reported.
+
+    The targeted route test above sets `app.state.auth_settings` by hand, so it cannot fail if the
+    stash regresses. This one goes through the lifespan, which is the only thing that proves the
+    production path is wired."""
+    from messagefoundry.api import create_managed_app
+
+    app = create_managed_app(
+        db_path=tmp_path / "managed_posture.db",
+        poll_interval=0.05,
+        # enabled=False so the route stays reachable without a session; the stash is deliberately
+        # OUTSIDE the `enabled` guard, and that is exactly what this pins — a settings object that
+        # exists but is disabled is still the resolved settings the registry must read.
+        auth_settings=_ad(ad_session_recheck_seconds=0, enabled=False),
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with (
+        httpx.AsyncClient(transport=transport, base_url="http://t") as client,
+        app.router.lifespan_context(app),
+    ):
+        resp = await client.get("/security/posture")
+    assert resp.status_code == 200
+    switches = [entry["switch"] for entry in resp.json()["loosenings"]]
+    assert "ad_session_recheck_seconds" in switches

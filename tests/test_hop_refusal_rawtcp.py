@@ -306,6 +306,26 @@ def test_cleartext_accepted_crosses_an_enforcing_hop_and_is_audited(
     assert "vendor firmware predates TLS" in audit[0].getMessage()
 
 
+@pytest.mark.parametrize(("build_cfg", "connector"), PLAINTEXT_BUILDERS)
+def test_the_acceptance_record_names_the_declaring_connection(build_cfg, connector, caplog) -> None:
+    """The record must lead back to the LINE TO FIX, or it is not much of a record.
+
+    ``cell`` is a static family label ("TCP outbound", "HTTP cleartext egress") and the HTTP-family
+    message carries a host with no port — so with two destinations to the same host an auditor could
+    not tell which declaration produced the crossing. docs/SECURITY-LOOSENING.md and docs/CONNECTIONS.md
+    both promise the connection name; this is what makes that true."""
+    cfg = build_cfg(REMOTE, accepted=True, accept_reason="vendor firmware predates TLS")
+    with active_hop_posture(PROD_PHI), caplog.at_level("WARNING"):
+        connector(cfg)
+    audit = [
+        r.getMessage()
+        for r in caplog.records
+        if "cleartext hop crossed on an operator acceptance" in r.message
+    ]
+    assert audit
+    assert cfg.name in audit[0], f"the acceptance record must name {cfg.name!r}: {audit[0]}"
+
+
 def test_acceptance_and_attestation_are_distinguishable_in_the_trail(caplog) -> None:
     """The one distinction the audit trail exists to preserve (ADR 0153 decision 2's table).
 

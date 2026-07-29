@@ -28,6 +28,7 @@ import httpx
 import pytest
 
 from messagefoundry.api import create_app
+from messagefoundry.config import wiring
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     AiSettings,
@@ -40,7 +41,12 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     phi_read_hop_disposition,
 )
-from messagefoundry.config.wiring import DatabaseLookupSpec, FhirLookupSpec, Registry
+from messagefoundry.config.wiring import (
+    DatabaseLookupSpec,
+    FhirLookup,
+    FhirLookupSpec,
+    Registry,
+)
 from messagefoundry.pipeline import Engine
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStore
@@ -195,14 +201,27 @@ async def store(tmp_path: Path):  # type: ignore[no-untyped-def]
 
 
 def _fhir_registry(*, accepted: bool = False) -> Registry:
+    """Build the lookup graph through the REAL authoring surface when a declaration is involved.
+
+    ADR 0153's pair is a ``FhirLookup()`` parameter, not a hand-written settings key: driving the
+    factory is what proves the surface an operator actually has works end to end (and that the
+    flag/reason coherence rule fires on it). The undeclared arm stays hand-built — there is nothing to
+    validate, and it keeps the refusal case independent of the factory."""
     reg = Registry()
-    settings: dict[str, object] = {"url": CLEARTEXT_FHIR}
-    if accepted:
-        # A FhirLookup connection has no Destination, so its ADR 0153 declaration rides the spec
-        # settings — the same surface its tls_hop_attested already uses.
-        settings["cleartext_accepted"] = True
-        settings["cleartext_reason"] = "legacy on-prem FHIR facade has no TLS"
-    reg.add_fhir_lookup(FhirLookupSpec("epic", settings))
+    if not accepted:
+        reg.add_fhir_lookup(FhirLookupSpec("epic", {"url": CLEARTEXT_FHIR}))
+        return reg
+    prev = wiring._active
+    wiring._active = reg
+    try:
+        FhirLookup(
+            "epic",
+            url=CLEARTEXT_FHIR,
+            cleartext_accepted=True,
+            cleartext_reason="legacy on-prem FHIR facade has no TLS",
+        )
+    finally:
+        wiring._active = prev
     return reg
 
 
@@ -405,7 +424,7 @@ def test_check_cleartext_accepted_reports_an_empty_set(tmp_path: Path) -> None:
     cfg = _write_config(tmp_path, env="prod")
     report = run_checks(cfg, run_lint=False)
     surfaced = next(r for r in report.results if r.name == "cleartext-accepted")
-    assert surfaced.ok and "no outbound connection declares cleartext_accepted" in surfaced.detail
+    assert surfaced.ok and "no connection declares cleartext_accepted" in surfaced.detail
 
 
 def test_check_build_skips_without_service_toml(tmp_path: Path) -> None:
