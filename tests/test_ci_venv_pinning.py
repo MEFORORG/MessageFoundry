@@ -36,12 +36,24 @@ built wheel's own declared closure resolves, so feeding it a lock would defeat i
 `packaging` install is covered by the version-pin rule below. Pure text checks, no network.
 
 SCOPE, stated so it is a boundary rather than an oversight: the version-pin rule is the RELEASE path.
-`security.yml` keeps four `--upgrade pip` bootstraps plus unpinned `uv` and `pip-audit`; those jobs are
-`contents: read`, schedule/dispatch-only, and produce nothing anyone installs. They are registered in
-`SECURITY_YML_ACCEPTED_UNPINNED` instead of pinned, so a NEW unpinned install there still fails — the
-exception is enumerated, not open-ended. The one `security.yml` install held to the release rule is the
-SBOM step, because ADR 0034 makes it the pre-tag dry-run for `release.yml`'s and the two must stay the
-same command.
+`security.yml` keeps its `--upgrade pip` bootstraps, registered in `SECURITY_YML_ACCEPTED_UNPINNED`
+rather than pinned, so a NEW unpinned install there still fails — the exception is enumerated, not
+open-ended. Two `security.yml` installs are held to the release rule anyway: the SBOM step, because
+ADR 0034 makes it the pre-tag dry-run for `release.yml`'s and the two must stay the same command; and
+the scanners the blocking jobs install for themselves (below).
+
+**Correction, 2026-07-29.** This module previously registered `uv` and `pip-audit` as accepted-unpinned
+on the reasoning that `security.yml`'s jobs are "schedule/dispatch-only" and "produce nothing anyone
+installs". The first half is **wrong**: `security.yml` triggers on `pull_request` and seven of its jobs
+are REQUIRED contexts, `pip-audit` among them. So those two installs were unpinned dependency intake
+inside the very gate whose purpose is proving nothing unpinned enters the tree, running on every PR —
+and `uv` is the resolver that produces every lockfile that job then audits, so an implicit upgrade can
+change the exported set and red the `git diff --exit-code` for a reason unrelated to the change. Both
+are now `==`-pinned and removed from the registry. `semgrep` is pinned exactly for the same reason a
+range is not a pin here: a new 1.x can add rules or change taint propagation and red a green PR.
+
+The gitleaks/trivy downloads are the non-pip half of the same intake, covered by
+`test_release_asset_downloads_in_blocking_jobs_are_checksum_verified` at the end of this module.
 """
 
 from __future__ import annotations
@@ -157,15 +169,26 @@ RELEASE_PINNED_TOOLS = (
     ("release.yml", "cyclonedx-bom"),
     ("release.yml", "packaging"),
     ("security.yml", "cyclonedx-bom"),
+    # The scanners the BLOCKING jobs install for themselves. These run on every `pull_request` and
+    # three of them back required contexts, so they are held to the release rule despite not being on
+    # the release path — see the 2026-07-29 correction in the module docstring.
+    ("security.yml", "pip-audit"),
+    ("security.yml", "uv"),
+    ("security.yml", "semgrep"),
+    ("security.yml", "bandit"),
 )
 
-#: `security.yml`'s OWN unpinned installs, registered rather than pinned. That file's jobs run on a
-#: schedule/dispatch with `contents: read`, no publishing identity and no artifact anyone consumes, so
-#: they are off the release-path rule by decision — but registering them means a NEW unpinned install
-#: added to that file still reds `test_security_yml_unpinned_installs_are_registered`. The scope call
-#: is recorded here instead of being invisible. (`pip` also appears PINNED in that file's SBOM step,
-#: which must stay byte-identical to release.yml's — see the twin test below.)
-SECURITY_YML_ACCEPTED_UNPINNED = frozenset({"pip", "uv", "pip-audit"})
+#: `security.yml`'s OWN unpinned installs, registered rather than pinned. Only the `pip` bootstraps
+#: remain: `python -m pip install --upgrade pip` alongside a pinned tool, where pip is the installer
+#: rather than an input to any gate's verdict. Registering it means a NEW unpinned install added to
+#: that file still reds `test_security_yml_unpinned_installs_are_registered` — the exception is a
+#: decision someone made, not a gap nobody noticed. (`pip` also appears PINNED in that file's SBOM
+#: step, which must stay byte-identical to release.yml's — see the twin test below.)
+#:
+#: `uv` and `pip-audit` were HERE until 2026-07-29 and are now pinned instead; the reasoning that put
+#: them here — that this file's jobs are schedule/dispatch-only — was factually wrong (it triggers on
+#: `pull_request` and `pip-audit` is a required context). See the module docstring.
+SECURITY_YML_ACCEPTED_UNPINNED = frozenset({"pip"})
 
 
 def _install_targets(line: str) -> list[str]:
@@ -273,12 +296,10 @@ def test_release_toolchain_pin_is_present(workflow: str, package: str) -> None:
 
 
 def test_security_yml_unpinned_installs_are_registered() -> None:
-    """`security.yml` is deliberately NOT held to the release-path rule — but its exceptions are a
-    registered set, so a new unpinned install there still fails.
+    """`security.yml`'s remaining unpinned installs are a registered set, so a new one still fails.
 
-    The disclosure matters: `security.yml` keeps `--upgrade pip` in four places and installs `uv` and
-    `pip-audit` unpinned. Those jobs are `contents: read`, scheduled/dispatch-only, and produce no
-    artifact anyone installs, which is why they were left alone. Recording that decision here is the
+    The disclosure matters: `security.yml` keeps `--upgrade pip` bootstraps alongside its now-pinned
+    tools, where pip is the installer rather than an input to any gate's verdict. Recording that is the
     difference between a scope boundary and an oversight.
     """
     lines = [ln for ln in _code_lines(_WORKFLOWS / "security.yml") if _PIP_INSTALL.search(ln)]
@@ -295,6 +316,61 @@ def test_security_yml_unpinned_installs_are_registered() -> None:
         f"security.yml gained unpinned install target(s) {unregistered}. Pin them, or add them to "
         f"SECURITY_YML_ACCEPTED_UNPINNED with the reason — the point of the registry is that the "
         f"exception is a decision someone made, not a gap nobody noticed."
+    )
+
+
+# --- the non-pip half of the same intake: fetched release assets ----------------------------------
+
+
+def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> None:
+    """A version tag says WHICH artifact to fetch, not that the bytes received are that artifact.
+
+    `curl … | tar -xz` inside a required gate executes third-party bytes with no integrity check, and
+    it is dependency intake no lockfile in this repo covers — the same class the pip rules above
+    address, arriving by a different route. The sbomqs step in this same workflow already verifies
+    against the release's own checksums file, so this was unfinished scope rather than an accepted
+    risk, and that step is the template any download here must follow.
+
+    Scoped to BLOCKING jobs. An advisory job cannot turn a required context green while compromised,
+    so `trivy` (`continue-on-error: true`, schedule/dispatch-gated) is deliberately out — worth
+    hardening, but not on this rule.
+    """
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((_WORKFLOWS / "security.yml").read_text(encoding="utf-8"))
+    jobs = wf.get("jobs") or {}
+
+    checked = 0
+    offenders: list[str] = []
+    for job_key, job in jobs.items():
+        if (job or {}).get("continue-on-error") is True:
+            continue
+        for step in (job or {}).get("steps") or []:
+            raw = str((step or {}).get("run") or "")
+            # Comments OUT before matching. The rationale comments in these workflows quote the very
+            # command being prohibited — the gitleaks step explains the `curl | tar` it replaced — so a
+            # whole-body match reports the explanation as the offence: a detector counting itself.
+            body = "\n".join(ln for ln in raw.splitlines() if not ln.strip().startswith("#"))
+            if "releases/download" not in body:
+                continue
+            checked += 1
+            name = (step or {}).get("name") or "<unnamed step>"
+            if "sha256sum -c" not in body:
+                offenders.append(f"security.yml:{job_key} — step {name!r} verifies no checksum")
+            if re.search(r"\|\s*tar\b", body):
+                offenders.append(
+                    f"security.yml:{job_key} — step {name!r} pipes the download straight into tar, "
+                    "so there is no file left to verify"
+                )
+
+    # Liveness: report what was EXAMINED. "no offenders" and "nothing was scanned" otherwise produce
+    # the same green.
+    print(f"[ci-venv-pinning] examined {checked} release-asset download step(s) in blocking jobs")
+    assert checked > 0, (
+        "no blocking job in security.yml downloads a release asset — if that is now true this guard is "
+        "obsolete, but an empty scan must not read as a pass"
+    )
+    assert not offenders, "unverified release-asset download in a blocking job:\n  " + "\n  ".join(
+        offenders
     )
 
 
