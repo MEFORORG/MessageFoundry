@@ -34,7 +34,14 @@
 [CmdletBinding()]
 param(
     # Newline-delimited list of primary checkouts to govern. Absent or empty => the gate is OFF.
-    [string]$ReposFile = (Join-Path $env:USERPROFILE ".claude\hooks\worktree-gate.repos.txt")
+    #
+    # Resolved null-safely: $env:USERPROFILE is Windows-only and is NULL elsewhere, where Join-Path throws
+    # a parameter-binding error instead of returning a path. In a PARAMETER DEFAULT that is evaluated
+    # during binding, so it would kill the hook before its first line -- and a hook that exits
+    # non-zero-but-not-2 lets the tool call through SILENTLY. The gate would be off with nothing to say so.
+    [string]$ReposFile = (Join-Path (
+        if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    ) ".claude/hooks/worktree-gate.repos.txt")
 )
 
 # Bumped whenever a RULE's behaviour changes, so `install-gate.ps1 -Status` can report which build is

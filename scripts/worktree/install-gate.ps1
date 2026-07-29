@@ -74,7 +74,10 @@ $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # The gate SCRIPT + its allowlist live ONCE, shared, under ~/.claude\hooks -- referenced by absolute path
 # from every config dir's settings.json, so a single copy (and a single kill switch) governs all accounts.
-$HooksDir  = Join-Path $env:USERPROFILE ".claude\hooks"
+# Null-safely: $env:USERPROFILE is Windows-only and NULL elsewhere, where Join-Path throws a
+# parameter-binding error instead of returning a path. Same idiom as its sibling scripts.
+$HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 
@@ -83,9 +86,9 @@ $Marker = "worktree_gate.ps1"
 
 # Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-* (the VS Code launchers).
 if (-not $ConfigDir -or $ConfigDir.Count -eq 0) {
-    $cands = @( (Join-Path $env:USERPROFILE ".claude") )
+    $cands = @( (Join-Path $HomeDir ".claude") )
     $cands += @(
-        Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
             ForEach-Object { $_.FullName }
     )
     $ConfigDir = @($cands | Where-Object { Test-Path -LiteralPath $_ -PathType Container })

@@ -45,8 +45,12 @@ param(
 )
 
 if (-not $ReposFile) {
-    $shared = Join-Path $env:USERPROFILE '.claude\hooks\worktree-gate.repos.txt'
-    $legacy = Join-Path $env:USERPROFILE '.claude-hooks\worktree-gate.repos.txt'
+    # Null-safely: $env:USERPROFILE is Windows-only and is NULL elsewhere, where Join-Path then throws a
+    # parameter-binding error rather than returning a path. Honour the env var when set (tests and account
+    # swaps override it) and fall back to the .NET accessor, which resolves $HOME on Unix.
+    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    $shared = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
+    $legacy = Join-Path $homeDir '.claude-hooks/worktree-gate.repos.txt'
     $ReposFile = if (Test-Path -LiteralPath $shared) { $shared } else { $legacy }
 }
 
