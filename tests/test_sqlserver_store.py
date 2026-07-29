@@ -1012,8 +1012,10 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
     finally:
         await old.close()
 
-    active_id = AesGcmCipher(k2).active_key_id
-    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    # Assert against the very cipher that does the rewriting, via the marker prefix IT writes — so the
+    # check pins version + alg + key id together and stays right whatever at-rest format is active.
+    active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+    rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         # messages.raw + the outbound queue.payload + state.value (3 core) + the 3 lifecycle-event
         # message_events.detail rows this flow writes — all now ciphered under H4 — = 6 under the
@@ -1027,7 +1029,7 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
             " UNION ALL SELECT payload FROM queue WHERE payload <> ''"
         )
         for r in blobs:
-            assert r["v"].split(":", 3)[2] == active_id, r["v"]  # mfenc:v1:<active_id>:<blob>
+            assert r["v"].startswith(active_cipher.active_marker_prefix), r["v"]
         assert dict(rotated.state_view())[("ns", "k")] == {"v": 1}  # still decrypts
         assert await rotated.reencrypt_to_active() == 0  # idempotent
     finally:
@@ -1366,14 +1368,16 @@ async def test_response_rotation_and_purge(store) -> None:
     finally:
         await old.close()
 
-    active_id = AesGcmCipher(k2).active_key_id
-    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    # Assert through the rotating cipher's own marker prefix (version + alg + key id), not a hand-rolled
+    # split of one field — the shipped accessor tracks whatever at-rest format the writer emits.
+    active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+    rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()  # rotates response.body + detail (among others)
         blobs = await rotated._fetchall("SELECT body, detail FROM response")
         for b in blobs:
-            assert b["body"].split(":", 3)[2] == active_id  # mfenc:v1:<active_id>:...
-            assert b["detail"].split(":", 3)[2] == active_id
+            assert b["body"].startswith(active_cipher.active_marker_prefix)
+            assert b["detail"].startswith(active_cipher.active_marker_prefix)
         r = (await rotated.correlate_response(mid))[0]
         assert (
             r.body == "secret-reply" and r.detail == "secret-detail"
@@ -1438,13 +1442,14 @@ async def test_reencrypt_skips_null_response_detail(store) -> None:
     finally:
         await old.close()
 
-    active_id = AesGcmCipher(k2).active_key_id
-    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+    rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()  # must not crash on / mis-handle the NULL detail
         row = (await rotated._fetchall("SELECT body, detail FROM response"))[0]
         assert row["detail"] is None  # NULL skipped (IS NOT NULL guard), not crashed
-        assert row["body"].split(":", 3)[2] == active_id  # body rotated to the active key
+        # The row itself was NOT skipped: body carries the rotating cipher's active marker prefix.
+        assert row["body"].startswith(active_cipher.active_marker_prefix)
         r = (await rotated.correlate_response(mid))[0]
         assert r.body == "reply-body" and r.detail is None
     finally:
@@ -1500,13 +1505,14 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
     finally:
         await old.close()
 
-    active_id = AesGcmCipher(k2).active_key_id
-    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+    rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()
         row = (await rotated._fetchall("SELECT summary, metadata FROM messages"))[0]
-        assert row["summary"].split(":", 3)[2] == active_id  # mfenc:v1:<active_id>:<blob>
-        assert row["metadata"].split(":", 3)[2] == active_id
+        # Under the ACTIVE key in the ACTIVE marker format — the prefix the rotating cipher writes.
+        assert row["summary"].startswith(active_cipher.active_marker_prefix)
+        assert row["metadata"].startswith(active_cipher.active_marker_prefix)
         [m] = await rotated.list_messages()
         assert (
             m["summary"] == summary and m["metadata"] == metadata
@@ -1587,11 +1593,12 @@ async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
     finally:
         await old.close()
 
-    active_id = AesGcmCipher(k2).active_key_id
-    rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+    active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+    rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()
-        # every non-null disposition-text value now carries the ACTIVE key id (mfenc:v1:<active>:...).
+        # every non-null disposition-text value now carries the ACTIVE key id, in the marker format the
+        # rotating cipher writes (v1 or v2 — active_marker_prefix spans version, alg and fingerprint).
         blobs = await rotated._fetchall(
             "SELECT error AS v FROM messages WHERE error IS NOT NULL"
             " UNION ALL SELECT last_error FROM queue WHERE last_error IS NOT NULL"
@@ -1599,7 +1606,7 @@ async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
         )
         assert blobs, "expected rotated disposition-text values"
         for r in blobs:
-            assert r["v"].split(":", 3)[2] == active_id, r["v"]
+            assert r["v"].startswith(active_cipher.active_marker_prefix), r["v"]
         # still decrypts under the new key on the read paths.
         assert any(m["error"] == err for m in await rotated.list_messages())
         assert (await rotated.list_dead())[0]["last_error"] == fail
@@ -2034,14 +2041,15 @@ async def test_reference_rows_rotate_on_reencrypt_to_active(store) -> None:
         finally:
             await old.close()
 
-        active_id = AesGcmCipher(k2).active_key_id
-        rotated = await SqlServerStore.open(settings, cipher=AesGcmCipher(k2, retired_keys=[k1]))
+        active_cipher = AesGcmCipher(k2, retired_keys=[k1])
+        rotated = await SqlServerStore.open(settings, cipher=active_cipher)
         try:
             assert await rotated.reencrypt_to_active() == 2  # exactly the two reference rows
             rows = await rotated._fetchall("SELECT value FROM reference")
             assert len(rows) == 2
             for r in rows:
-                assert r["value"].split(":", 3)[2] == active_id  # mfenc:v1:<active_id>:<blob>
+                # under the ACTIVE key, in the ACTIVE marker format; no plaintext PHI visible
+                assert r["value"].startswith(active_cipher.active_marker_prefix)
                 assert "M-SECRET-1" not in r["value"]
             assert rotated.reference_view()["codes"]["P1"] == {"mrn": "M-SECRET-1"}  # decrypts
             assert await rotated.reencrypt_to_active() == 0  # idempotent
@@ -3563,6 +3571,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     and the message decrypts under key_b ALONE (retired key dropped) — end-to-end proof."""
     from messagefoundry.__main__ import main
     from messagefoundry.config.settings import load_settings
+    from messagefoundry.store.crypto import AesGcmCipher
     from messagefoundry.store.sqlserver import SqlServerStore
 
     monkeypatch.chdir(
@@ -3570,7 +3579,11 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     )  # isolate from any stray ./messagefoundry.toml (env wins, but be safe)
     settings = load_settings(environ=os.environ).store
     key_a, key_b = generate_key(), generate_key()
-    active_id_b = make_cipher(key_b).active_key_id
+    # The rotation writer is NOT an object this test holds: main(["rotate-key"]) -> open_store ->
+    # build_store_cipher(settings), i.e. write_v2=[store].aad_bind. Mirror that posture so the marker
+    # this test expects is the one the CLI actually wrote, whichever way the aad_bind default sits.
+    cipher_b = make_cipher(key_b, write_v2=settings.aad_bind)
+    assert isinstance(cipher_b, AesGcmCipher)
 
     seed = await SqlServerStore.open(settings, cipher=make_cipher(key_a))
     try:
@@ -3584,9 +3597,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
     assert rc == 0
     assert "re-encrypted" in capsys.readouterr().out
 
-    verify = await SqlServerStore.open(
-        settings, cipher=make_cipher(key_b)
-    )  # key_b alone, no retired
+    verify = await SqlServerStore.open(settings, cipher=cipher_b)  # key_b alone, no retired
     try:
         assert len(await verify.list_messages()) == 1
         assert (await verify.get_message(mid))["raw"] == RAW  # decrypts under the new key alone
@@ -3596,7 +3607,7 @@ async def test_rotate_key_cli_reencrypts_server_store(store, capsys, monkeypatch
         assert blobs  # at least messages.raw + the one outbound payload
         for r in blobs:
             assert r["v"].startswith(MARKER_PREFIX)
-            assert r["v"].split(":", 3)[2] == active_id_b  # mfenc:v1:<active_id>:<blob>
+            assert r["v"].startswith(cipher_b.active_marker_prefix)  # active key, active format
     finally:
         await verify.close()
 
