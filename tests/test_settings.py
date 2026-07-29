@@ -11,6 +11,7 @@ import pytest
 from pydantic import ValidationError
 
 from messagefoundry.config.settings import (
+    ApiSettings,
     AuthSettings,
     DrSettings,
     ServiceSettings,
@@ -1169,3 +1170,59 @@ def test_copy_on_send_default_is_on() -> None:
         ).pipeline.snapshot_on_send
         is False
     )
+
+
+# --- ASVS 3.4.1: HSTS must not be emitted for an origin the browser will discard it for -------------
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://10.20.30.40:8443",
+        "https://192.168.1.10",
+        "https://[2001:db8::1]",
+        "https://[::1]:8443",
+    ],
+)
+def test_an_ip_literal_public_origin_is_refused_under_a_declared_tls_posture(origin: str) -> None:
+    """RFC 6797 §8.1.1: a UA **MUST NOT** note an IP-literal host as a Known HSTS Host.
+
+    So for an IP-literal `public_origin` the engine's `Strict-Transport-Security` header is required
+    to be DISCARDED by every conforming browser — the console would have no HTTPS-downgrade
+    protection while the header, the config and the scorecard all reported the control as present.
+    A control that reports success while doing nothing is worse than an absent one, because nothing
+    prompts anyone to look.
+
+    Mutation: delete the IP-literal block in `_check_tls_cert_dependency`. Red: DID NOT RAISE.
+    """
+    with pytest.raises(ValidationError, match="IP literal"):
+        ApiSettings(
+            public_origin=origin,
+            tls_terminated_upstream=True,
+            trusted_proxies=["127.0.0.1"],
+            serve_ui=True,
+        )
+
+
+def test_a_dns_public_origin_is_accepted_under_a_declared_tls_posture() -> None:
+    """The positive control. Without it the refusal above could be over-broad and nothing would say so.
+
+    Mutation: refuse every host rather than only IP literals. Red: this raises."""
+    s = ApiSettings(
+        public_origin="https://ops.example.com",
+        tls_terminated_upstream=True,
+        trusted_proxies=["127.0.0.1"],
+        serve_ui=True,
+    )
+    assert s.public_origin == "https://ops.example.com"
+
+
+def test_an_ip_literal_origin_is_still_fine_with_no_tls_posture_declared() -> None:
+    """The boundary that keeps this shippable. A loopback dev flow declares no TLS posture, emits no
+    HSTS, and must stay working — the refusal is about a header that would be silently discarded, not
+    about IP literals as such.
+
+    Mutation: drop the `tls_terminated_upstream or tls_enabled` condition. Red: this raises, and every
+    developer running on 127.0.0.1 is locked out."""
+    s = ApiSettings(public_origin="http://127.0.0.1:8765", serve_ui=True)
+    assert s.public_origin == "http://127.0.0.1:8765"

@@ -12,7 +12,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 ADT = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100^^^H^MR||DOE^JANE\r"
@@ -90,7 +90,10 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
         assert _col_at_rest(db, "kind") == "framing_error"
         assert _col_at_rest(db, "connection") == "IB"
         reason_disk = _col_at_rest(db, "reason")
-        assert isinstance(reason_disk, str) and reason_disk.startswith(PREFIX)
+        # The version-agnostic marker: which columns are enciphered is the claim, not which mfenc
+        # format the writer emits. That is the cipher's choice — v1 from make_cipher's default here,
+        # v2 via build_cipher (write_v2=[store].aad_bind) or under MEFOR_TEST_FORCE_AAD_BIND.
+        assert isinstance(reason_disk, str) and reason_disk.startswith(MARKER_PREFIX)
         assert "boom" not in reason_disk
         # …and the read path decrypts it back
         events = await store.list_connection_events()

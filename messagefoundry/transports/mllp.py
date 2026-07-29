@@ -48,6 +48,7 @@ from messagefoundry.config.tls_policy import (
     cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
+    harden_cipher_suites,
     harden_kex_groups,
     harden_verify_flags,
     insecure_hop_disposition,
@@ -540,6 +541,7 @@ def _mllp_ssl_context(
             ctx.load_verify_locations(cafile=ca)
             ctx.verify_mode = ssl.CERT_REQUIRED
         harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+        harden_cipher_suites(ctx, connector="MLLP listener")  # assert forward secrecy (ASVS 12.1.2)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of any mTLS client cert (ASVS 12.1.4)
         return ctx
     # Outbound (client): verify the server cert unless explicitly — and loudly — disabled. #200 (ADR
@@ -578,6 +580,7 @@ def _mllp_ssl_context(
     if cert:  # optional client identity for mTLS
         ctx.load_cert_chain(certfile=cert, keyfile=key, password=pw_arg)
     harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector="MLLP destination")  # assert forward secrecy (ASVS 12.1.2)
     if verify:  # skip the tls_verify=false / CERT_NONE path — nothing to validate (ASVS 12.1.4)
         harden_verify_flags(ctx)  # strict RFC 5280 validation of the server cert
         # #129 (ADR 0094): granular expiry-only relaxation — honour a partner cert whose notAfter has

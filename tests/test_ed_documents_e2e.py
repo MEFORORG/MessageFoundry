@@ -37,7 +37,7 @@ from messagefoundry.generators.documents import oru_with_pdf, synthetic_pdf
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
 from messagefoundry.store import MessageStatus, MessageStore
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.transports import DeliveryError
 from messagefoundry.transports.mllp import MLLPDestination, MLLPSource, build_ack
 
@@ -170,11 +170,13 @@ async def test_base64_pdf_encrypted_at_rest(tmp_path: Path) -> None:
     finally:
         await store.close()
 
-    # On disk the PDF base64 is AES-256-GCM ciphertext, never plaintext.
+    # On disk the PDF base64 is AES-256-GCM ciphertext, never plaintext. Anchor on the version-agnostic
+    # mfenc: marker — the claim is encryptedness, and the marker format is the cipher's choice (v1 from
+    # make_cipher's default here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND).
     at_rest_raw = _raw_at_rest(db, column="raw", table="messages")
     at_rest_payload = _raw_at_rest(db, column="payload", table="queue")
-    assert at_rest_raw.startswith(PREFIX)
-    assert at_rest_payload.startswith(PREFIX)
+    assert at_rest_raw.startswith(MARKER_PREFIX)
+    assert at_rest_payload.startswith(MARKER_PREFIX)
     assert source_b64 not in at_rest_raw  # the document never hits disk in the clear
     assert source_b64 not in at_rest_payload
 

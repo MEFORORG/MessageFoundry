@@ -33,7 +33,7 @@ from messagefoundry.parsing.binary import (
 )
 from messagefoundry.pipeline.dryrun import route_only, transform_one
 from messagefoundry.pipeline.wiring_runner import RegistryRunner
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 # Byte fixtures that break a latin-1/TEXT round-trip: every value 0x00–0xFF (incl. NUL + high bytes),
@@ -186,7 +186,7 @@ async def test_binary_carriage_survives_encrypted_store(tmp_path: Path) -> None:
         record = await store.get_message(mid)
     finally:
         await store.close()
-    assert _raw_at_rest(db).startswith(PREFIX)  # outer layer: encrypted on disk
+    assert _raw_at_rest(db).startswith(MARKER_PREFIX)  # outer layer: encrypted on disk
     assert record is not None and record["raw"] == carried  # decrypts to the inner mfb64: form
     assert RawMessage(record["raw"], "dicom").raw_bytes == DICOM_LIKE
 

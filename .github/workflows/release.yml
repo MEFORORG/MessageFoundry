@@ -96,7 +96,12 @@ jobs:
 
       - name: Build sdist + wheel
         run: |
-          python -m pip install --upgrade pip build
+          # PINNED (Scorecard PinnedDependenciesID; ADR 0034 §3). This runs in the job holding
+          # contents/id-token/attestations: write, and `build` produces the artifact that is signed and
+          # published — an unpinned resolve here picks whatever PyPI serves at tag time. Neither tool is
+          # in any DEP-1 lock, so `==` is drift-free (and Dependabot cannot bump an inline workflow
+          # install: re-check these by hand when bumping, tests/test_ci_venv_pinning.py keeps them pinned).
+          python -m pip install "pip==26.1.2" "build==1.5.0"
           python -m build
           ls -l dist/
 
@@ -134,9 +139,21 @@ jobs:
           # the module attribute and the wheel filename could not all be canonical at once. Version()
           # normalises both sides, so canonical "0.3.0rc1" in __init__.py matches tag v0.3.0-rc1 and the
           # check still fails loudly on a genuine mismatch.
+          # `packaging` pin DERIVED from constraints.lock, never hardcoded — it IS a DEP-1 dependency
+          # (requirements.lock + constraints.lock both pin it), so a literal here would drift silently on
+          # the next Dependabot bump. Same run-time-read pattern as quality-advisory.yml's ruff pin, but
+          # FAIL-CLOSED rather than falling back to an unpinned fetch: this is the release path. Installed
+          # OUTSIDE the tag guard so a workflow_dispatch dry-run exercises the pinned install — the guard
+          # below is what stays tag-only, and an install this step never reaches cannot be validated
+          # before the tag that depends on it.
+          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$PKG_PIN" ]; then
+            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+          fi
+          echo "packaging pin from constraints.lock: $PKG_PIN"
+          /tmp/relsmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            /tmp/relsmoke/bin/pip install --quiet packaging
             /tmp/relsmoke/bin/python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
@@ -180,7 +197,14 @@ jobs:
           # The core lock is the honest closure a `pip install messagefoundry` pulls (the all-extras
           # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
           # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
-          python -m pip install --upgrade "cyclonedx-bom~=7.3"
+          # ~=7.3.1 (not ~=7.3): the looser form floats the whole 7.x minor range, and a 7.4 could change
+          # the CycloneDX JSON shape sbom_finalize.py parses — which exits non-zero and FAILS the release.
+          # ~=7.3.1 still takes patch fixes and keeps the lxml-6.x/cp314 floor rationale above intact.
+          # BYTE-IDENTICAL to security.yml's SBOM install, and kept that way by a test. Nothing in PR CI
+          # executes release.yml (tag push only), so ADR 0034's documented pre-tag check is to dispatch
+          # security.yml's sbom job and read ITS log — which only proves anything while the two install
+          # commands are the same command.
+          python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"
           # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
@@ -219,7 +243,16 @@ jobs:
 
       - name: Sign artifacts with Sigstore (keyless, GitHub OIDC)
         run: |
-          python -m pip install sigstore
+          # PINNED — the sharpest of these installs: this step is unconditional (every tag AND every
+          # dispatch) and the very next command signs the release artifacts with the job's OIDC identity,
+          # the same identity that publishes to PyPI below. 4.4.0, not the newer 4.5.0: .github/
+          # dependabot.yml sets a 5-day supply-chain cooldown to dodge a package compromised shortly
+          # after publish, and 4.5.0 is <48h old — hard-pinning the SIGNING toolchain to a fresher
+          # artifact than the repo's own routine-update policy allows inverts that policy at the highest-
+          # privilege point in the pipeline. Re-evaluate to 4.5.0 once it has aged past the window.
+          # NOTE: this pins the TOP only; sigstore's ~30 transitive deps still float at signing time.
+          # Closing the Scorecard alert outright needs the hashed release-tools lock (ADR 0034 option B).
+          python -m pip install "sigstore==4.4.0"
           # Sign the wheel + sdist AND the SBOM + VEX, so an operator can verify the provenance of the
           # bill-of-materials and the exploitability assessment too — not just the code artifacts (ADR 0149).
           python -m sigstore sign dist/*.tar.gz dist/*.whl \
@@ -346,7 +379,10 @@ jobs:
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
-          python -m pip install --upgrade pip build
+          # Pinned like every other build job on this path: this workflow's jobs hold contents/id-token
+          # write and publish the release artifacts, so an unpinned resolve takes whatever PyPI serves at
+          # tag time (Scorecard PinnedDependenciesID, ADR 0034 §3). Guarded by tests/test_ci_venv_pinning.py.
+          python -m pip install "pip==26.1.2" "build==1.5.0"
           # Wheel-only for the same reason as the harness: messagefoundry_webconsole/ lives OUTSIDE this
           # project dir and is pulled in via force-include, so an sdist would not be self-contained.
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
@@ -361,7 +397,13 @@ jobs:
           # (tag webconsole-v0.3.0-rc1 -> 0.3.0rc1), so a string compare could never match a pre-release.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#webconsole-v}"
-            python -m pip install --quiet packaging
+            # Derived from the lock, exactly as the relsmoke/harnesssmoke jobs do, so one bump moves
+            # every release-path packaging install together instead of drifting apart.
+            PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+            if [ -z "$PKG_PIN" ]; then
+              echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+            fi
+            python -m pip install --quiet "packaging==$PKG_PIN\"
             python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
@@ -464,7 +506,9 @@ jobs:
 
       - name: Build the harness wheel (wheel-only — harness/ is force-included from the repo root)
         run: |
-          python -m pip install --upgrade pip build
+          # PINNED, same rationale as the engine's build step: this job also holds contents/id-token:
+          # write, and it publishes the harness wheel when PUBLISH_HARNESS is set.
+          python -m pip install "pip==26.1.2" "build==1.5.0"
           # Wheel-only on purpose: the harness source (harness/) lives OUTSIDE this project dir (it is
           # force-included from ../../harness), so an sdist would not be self-contained. Pure-Python, so a
           # wheel suffices. Version is read from messagefoundry/__init__.py (lockstep with the engine).
@@ -481,10 +525,26 @@ jobs:
           # and a string compare could NEVER match — this job failed on every pre-release tag by
           # construction, whatever __version__ said. With PUBLISH_HARNESS=true it also runs after the
           # engine has already uploaded, so the failure would land half-published.
+          # Pin DERIVED from constraints.lock + installed outside the tag guard — see the engine job's
+          # wheel smoke above for the full rationale. (`build` already pulls packaging>=24.0 into this
+          # same interpreter, so the install is near-redundant; pinning it beats deleting it, which would
+          # leave the dependency implicit and unpinned via build's own resolve.)
+          #
+          # …and into a THROWAWAY VENV, not this job's interpreter, which is the other half of ADR 0034's
+          # recommendation. This job holds contents: write + id-token: write and the steps AFTER this one
+          # attach the wheel to the release and publish it to PyPI, so an install resolved into the main
+          # interpreter here sits inside the publishing identity. The engine job already does it this way
+          # (/tmp/relsmoke); the compare script needs nothing but packaging.version + stdlib.
+          PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+          if [ -z "$PKG_PIN" ]; then
+            echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+          fi
+          echo "packaging pin from constraints.lock: $PKG_PIN"
+          python -m venv /tmp/harnesssmoke
+          /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            python -m pip install --quiet packaging
-            python - "$built" "$want" <<'PYVER'
+            /tmp/harnesssmoke/bin/python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
 

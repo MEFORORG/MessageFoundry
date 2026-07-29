@@ -340,7 +340,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 ## 13. Deployment & operations
 
-- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.1.0"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution — **from the source tree** (`pip install -e packaging/messagefoundry-webconsole`) until the release phase publishes it; the name is not yet claimed on PyPI.
+- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.1.0"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
 - **Run headless:** python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on http://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 

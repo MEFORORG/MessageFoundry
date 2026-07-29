@@ -162,8 +162,14 @@ if ($Status) {
     $iVer = Get-GateVersion $GateDst ; $sVer = Get-GateVersion $srcGate
     $iSha = Get-GateHash    $GateDst ; $sSha = Get-GateHash    $srcGate
 
-    Write-Host "installed   : $(if ($iSha) { "$GateDst  v$iVer" } else { 'NOT installed' })"
-    Write-Host "source      : $(if ($sSha) { "$srcGate  v$sVer" } else { 'NOT FOUND' })"
+    # Print the SHA alongside the version. The version is a hand-bumped label and can disagree with
+    # reality -- it did: three rules shipped without a bump, so both lines read the same version directly
+    # above a STALE verdict. Showing the hash makes agreement VISIBLE instead of asserted.
+    # Lowercased: Get-FileHash returns uppercase, and every other hash a reader sees here (git, the
+    # parity test's output) is lowercase. Two spellings of the same digest invite a false "these differ".
+    $shortSha = { param($h) if ($h) { " sha $($h.Substring(0, 12).ToLowerInvariant())" } else { "" } }
+    Write-Host "installed   : $(if ($iSha) { "$GateDst  v$iVer$(& $shortSha $iSha)" } else { 'NOT installed' })"
+    Write-Host "source      : $(if ($sSha) { "$srcGate  v$sVer$(& $shortSha $sSha)" } else { 'NOT FOUND' })"
     if ($iSha -and $sSha) {
         if ($iSha -eq $sSha) {
             Write-Host "parity      : IN SYNC" -ForegroundColor Green

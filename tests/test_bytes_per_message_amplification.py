@@ -39,7 +39,9 @@ Converting copies to durable bytes requires three multipliers this module does n
 1. **Character width.** `queue.payload` / `messages.raw` are `NVARCHAR(MAX)` on SQL Server with no UTF-8
    collation, i.e. UTF-16: **2 bytes per ASCII character.** SQLite `TEXT` is UTF-8: 1.
 2. **Cipher expansion.** With `MEFOR_STORE_ENCRYPTION_KEY` set, each copy becomes
-   `mfenc:v1:<key_id>:<base64(nonce||ct||tag)>` — roughly `4/3 * raw + ~64` bytes. Default is identity.
+   `mfenc:v2:<alg>:<key_id>:<base64(nonce||ct||tag)>` — the shipped at-rest format since ADR 0148
+   defaulted `[store].aad_bind` on; `aad_bind=false` selects the frozen `mfenc:v1:<key_id>:<b64>`
+   writer. Either way roughly `4/3 * raw + ~64` bytes. Default cipher is identity (no key set).
 3. **Everything the database writes that is not the body**: row and page overhead, indexes, and above all
    the **transaction log**, which durably records each of the `3 + 2H + 2N` transactions.
 
