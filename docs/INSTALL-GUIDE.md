@@ -249,7 +249,10 @@ It ships as a separate, version-matched wheel (`messagefoundry-webconsole`) that
 in-process; install it alongside the engine and turn on `[api].serve_ui`:
 
 ```powershell
-pip install "messagefoundry-webconsole==0.1.0"   # the /ui web console, into the same venv
+pip install -e packaging/messagefoundry-webconsole   # the /ui web console, into the same venv
+# NOTE: the console is NOT on PyPI yet — install it from the source tree, as above. Installing it
+# by bare name from an index would resolve an UNCLAIMED distribution, i.e. whatever a third party
+# has uploaded under that name, with its build backend executing at install time (ASVS 15.2.4).
 # then set [api].serve_ui = true in your service settings and (re)start the engine
 ```
 

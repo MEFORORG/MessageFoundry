@@ -874,6 +874,7 @@ def _doc_side_bounds() -> list[tuple[str, object, str]]:
         ("**HL7 parse**", peek.DEFAULT_MAX_MESSAGE_BYTES // mib, "16 MiB"),
         ("**HL7 parse**", peek.DEFAULT_MAX_SEGMENTS, "10,000"),
         ("**HL7 escape expansion**", _builtin_hl7.MAX_ESCAPE_REPEAT, "512"),
+        ("**HL7 escape expansion**", _builtin_hl7.MAX_COUNTED_ESCAPE_OPENERS, "100,000"),
         ("**MLLP listener**", mllp.DEFAULT_MAX_CONNECTIONS, "256"),
         ("**MLLP listener**", int(mllp.DEFAULT_RECEIVE_TIMEOUT), "60"),
         ("**HTTP inbound listener**", http_listener.DEFAULT_MAX_BODY_BYTES // mib, "16 MiB"),
@@ -978,6 +979,67 @@ def test_every_quoted_bound_appears_in_its_own_doc_row(heading: str, which: str)
         f"docs/security/THREAT-MODEL.md's {which} rows disagree with the values this guard pins: "
         f"{problems}. A doc-side edit is the rot mode that matters for a cell scored on the "
         "documentation, and the code-side check alone cannot see it."
+    )
+
+
+#: Each entry: (import path, dotted symbol, what it implements, phrases the doc must NOT contain).
+#: Every guard above pins a value that IS rendered, so all of them are structurally blind to a
+#: sentence asserting a bound's ABSENCE. That is not hypothetical: the HL7 escape-expansion row
+#: asserted "There is no aggregate per-message budget" for the entire life of
+#: ``peek.enforce_expansion_budget``, and re-inserting that exact sentence left all 81 tests green
+#: (verified 2026-07-28). Because ASVS 15.1.3 scores the DOCUMENT, the stale sentence was itself the
+#: control defect — a false claim about the most attacker-exposed bound in the product.
+_ABSENCE_CLAIMS: list[tuple[str, str, str, tuple[str, ...]]] = [
+    (
+        "messagefoundry.parsing.peek",
+        "enforce_expansion_budget",
+        "aggregate HL7 escape-expansion budget (ASVS 1.3.3)",
+        (
+            "no aggregate per-message budget",
+            "there is no aggregate",
+            "has no aggregate",
+        ),
+    ),
+]
+
+
+def test_the_document_does_not_deny_a_bound_the_code_implements() -> None:
+    """A shipped bound must not be described as absent.
+
+    The symbol's existence is ASSERTED, not merely probed, and that is deliberate. If the guard
+    skipped when the symbol went missing, deleting the control would silently disable the only test
+    that notices — the guard would pass hardest exactly when the bound disappeared. Asserting instead
+    means removing the budget reds this test and forces the author to say so in the document, which is
+    the outcome the requirement wants either way.
+
+    Scope honesty: this catches a fixed phrase list, not paraphrase. It is a tripwire for the specific
+    claims we have already seen rot, not a proof that the document contains no false negative claim.
+    """
+    import importlib
+
+    text = _doc_text().lower()
+    scanned: list[str] = []
+    problems: list[str] = []
+    for module_path, symbol, description in ((c[0], c[1], c[2]) for c in _ABSENCE_CLAIMS):
+        module = importlib.import_module(module_path)
+        assert hasattr(module, symbol), (
+            f"{module_path}.{symbol} is gone — it implements {description}. If the bound was removed "
+            "on purpose, update docs/security/THREAT-MODEL.md to say so and retire this entry; do not "
+            "delete the assertion and leave the document claiming a control that no longer exists."
+        )
+        scanned.append(f"{module_path}.{symbol}")
+    for _module_path, symbol, description, phrases in _ABSENCE_CLAIMS:
+        for phrase in phrases:
+            if phrase.lower() in text:
+                problems.append(f"{phrase!r} contradicts the shipped {description} ({symbol})")
+    # Liveness receipt: name what was examined, so a future reader can tell an empty scan from a
+    # clean one. A guard that reports "nothing found" without saying what it looked at is the
+    # failure mode this file exists to prevent.
+    assert scanned, "the absence-claim table is empty — this guard examined nothing"
+    assert not problems, (
+        f"docs/security/THREAT-MODEL.md denies a bound the code implements: {problems}. Examined "
+        f"{len(scanned)} shipped control(s): {scanned}. ASVS 15.1.3 scores this document, so a stale "
+        "claim that a control is missing is a control defect, not a typo."
     )
 
 

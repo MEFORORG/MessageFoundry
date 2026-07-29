@@ -287,3 +287,75 @@ def test_rotation_docstring_guard_self_test() -> None:
         "The store DEK is tracked live-by-default off a persisted tracked-since stamp."
     )
     assert not any(lie in fixed for lie in ("deny-by-default", "NOT tracked here yet"))
+
+
+# --- ASVS 13.3.4: the fingerprinting arm must cover the fixed env secrets -------------------------
+
+#: Fixed ``MEFOR_*`` critical secrets deliberately NOT fingerprinted by the rotation watcher, each with
+#: the reason. Kept HERE rather than only in the module so the exclusion is a reviewed decision with a
+#: test behind it: dropping a name into ``_ENV_SECRET_CLASSES``'s exclusion comment alone changes
+#: nothing, but silently *removing* a real secret from the tracked set would otherwise go unnoticed.
+_NOT_FINGERPRINTED: dict[str, str] = {
+    "MEFOR_STORE_ENCRYPTION_KEY": (
+        "the DEK itself — tracked by its own arm (_maybe_escalate_dek), which reasons over the wrapped "
+        "key's age rather than an env fingerprint; listing it here too would double-count it"
+    ),
+    "MEFOR_STORE_ENCRYPTION_KEYS_RETIRED": (
+        "a decrypt-only tail of superseded keys — rotating it is meaningless, and flagging it 'due' "
+        "would tell an operator to destroy their own recovery path"
+    ),
+    "MEFOR_STORE_VAULT_TRANSIT_KEY": "a Vault Transit KEK NAME, not a secret value",
+    "MEFOR_STORE_TRANSIT_KEY": "a Vault Transit data-key NAME, not a secret value",
+    "MEFOR_STORE_TRANSIT_AUDIT_KEY": "a Vault Transit audit-key NAME, not a secret value",
+    "MEFOR_PFX_PASSWORD": (
+        "a one-shot passphrase for the `cert import` CLI — the running service never holds it, so "
+        "there is nothing to fingerprint"
+    ),
+}
+
+
+def test_every_fixed_env_secret_is_fingerprinted_or_explicitly_excused() -> None:
+    """The gap this closes was live and silent.
+
+    ``MEFOR_AI_API_KEY`` was a registered critical secret **with a documented rotation cadence** in the
+    schedule above, and yet was absent from ``_ENV_SECRET_CLASSES`` — so the watcher never fingerprinted
+    the one credential the documentation explicitly tells operators to rotate. Enumeration completeness
+    (which this module already guarded) and *rotation* coverage are different properties, and nothing
+    checked the second.
+
+    Mutation: remove ``MEFOR_AI_API_KEY`` from ``_ENV_SECRET_CLASSES``. Red: it appears in the
+    "registered ... but neither fingerprinted nor excused" list below.
+    """
+    from messagefoundry.pipeline.secret_rotation import _ENV_SECRET_CLASSES
+
+    fingerprinted = {name for name, _label in _ENV_SECRET_CLASSES}
+    fixed_env = {k for k in CRITICAL_SECRETS if k.startswith("MEFOR_")}
+
+    unaccounted = sorted(fixed_env - fingerprinted - set(_NOT_FINGERPRINTED))
+    assert not unaccounted, (
+        f"registered critical secret(s) neither fingerprinted by the rotation watcher nor excused: "
+        f"{unaccounted}. Add each to _ENV_SECRET_CLASSES in messagefoundry/pipeline/secret_rotation.py, "
+        f"or to _NOT_FINGERPRINTED here WITH the reason it cannot be rotated. A documented rotation "
+        f"cadence with no fingerprint is a reminder nothing can ever emit."
+    )
+
+    # The exclusion list must not rot into a place to park real secrets: every name in it has to still
+    # be a registered critical secret, and must NOT also be fingerprinted (which would be contradictory).
+    stale = sorted(set(_NOT_FINGERPRINTED) - fixed_env)
+    assert not stale, f"_NOT_FINGERPRINTED names that are no longer registered secrets: {stale}"
+    both = sorted(set(_NOT_FINGERPRINTED) & fingerprinted)
+    assert not both, f"names both excused AND fingerprinted — the excuse is false: {both}"
+
+
+def test_every_fingerprinted_env_secret_is_a_registered_critical_secret() -> None:
+    """The other direction: the watcher must not fingerprint something the registry does not know
+    about, or the rotation alert names a secret with no documented cadence to measure it against.
+
+    Mutation: add a fabricated ``MEFOR_NOT_REAL`` to ``_ENV_SECRET_CLASSES``. Red: named below."""
+    from messagefoundry.pipeline.secret_rotation import _ENV_SECRET_CLASSES
+
+    unregistered = sorted({n for n, _ in _ENV_SECRET_CLASSES} - set(CRITICAL_SECRETS))
+    assert not unregistered, (
+        f"fingerprinted secret(s) missing from the CRITICAL_SECRETS registry: {unregistered}. "
+        f"Register each (and give it a rotation-schedule row) so the alert has a cadence to cite."
+    )

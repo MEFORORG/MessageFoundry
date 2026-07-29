@@ -760,7 +760,7 @@ Recommended tests to close gaps:
 | HTTPFHIR-3 | REST/SOAP/FHIR response capture (accepted/no_reply, encrypted at rest) | 0013,0003 | test_response_capture.py, test_response_headers_capture.py, test_fhir_transport.py, test_soap_wssecurity.py | covered | backend: encryption-at-rest SQLite-only | med | M |
 | HTTPFHIR-4 | Captured response-header allow-list (#154) | 0013 | test_response_headers_capture.py | covered | SOAP/FHIR wiring not separately driven | low | S |
 | HTTPFHIR-5 | Per-message dynamic HTTP headers (#68): projection + injection safety | 0081 | test_rest_transport.py, test_fhir_transport.py | covered | — | med | S |
-| HTTPFHIR-6 | Outbound URL/header length limits (ASVS 4.2.5) | 0003 | test_rest_transport.py over-length url/header | covered | SOAP/FHIR share helper, no own assertion | low | S |
+| HTTPFHIR-6 | Outbound URL/header length limits, construction **and send time** (ASVS 4.2.5) | 0003 | test_rest_transport.py over-length url/header + the send-time gate (message header, minted bearer, signature); test_fhir_lookup.py read-URL bound; test_apiclient.py constant parity | covered | SOAP/FHIR share the helper and have no own send-time assertion; _probe paths asserted only indirectly | low | S |
 | HTTPFHIR-7 | SOAP plain mode: envelope POST + version headers | 0003,0015 | test_soap_transport.py 1.1/1.2 headers + send | covered | — | med | S |
 | HTTPFHIR-8 | SOAP Fault classification + no fault-body echo | 0015 | test_soap_transport.py, test_soap_wssecurity.py | covered | phi: no canary assertion on fault body | med | S |
 | HTTPFHIR-9 | SOAP WS-Addressing/WS-Security stamping (purity, PasswordText/Digest, escaping) | 0015 | test_soap_wssecurity.py | covered | — | high | S |

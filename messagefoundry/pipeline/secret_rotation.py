@@ -116,7 +116,23 @@ _ENV_SECRET_CLASSES: tuple[tuple[str, str], ...] = (
     ("MEFOR_API_TLS_KEY_PASSWORD", "off-loopback TLS private-key passphrase"),
     ("MEFOR_STORE_VAULT_TOKEN", "Vault token — store DEK provider"),
     ("MEFOR_SECRETS_VAULT_TOKEN", "Vault token — connector KV provider"),
+    ("MEFOR_AI_API_KEY", "engine-broker LLM provider credential"),
 )
+
+# Deliberately NOT rotation-inventoried, recorded here so the omissions are decisions rather than
+# oversights a later reader re-litigates. The test that pins this list checks the classification, not
+# just the membership:
+#   MEFOR_STORE_ENCRYPTION_KEY          the DEK itself -- it has its own arm (_maybe_escalate_dek),
+#                                       which reasons over the wrapped key's age, not an env
+#                                       fingerprint. Adding it here would double-count it.
+#   MEFOR_STORE_ENCRYPTION_KEYS_RETIRED a DECRYPT-ONLY tail of superseded keys. Rotating it is
+#                                       meaningless -- it exists precisely so old ciphertext stays
+#                                       readable -- and flagging it as "due" would tell an operator to
+#                                       destroy their own recovery path.
+#   MEFOR_STORE_TRANSIT_KEY             Transit key NAMES, not secret values. The secret lives in
+#   MEFOR_STORE_TRANSIT_AUDIT_KEY       Vault and rotates there; the engine holds only the label.
+#   MEFOR_PFX_PASSWORD                  a one-shot passphrase for the `cert import` CLI. The running
+#                                       service never holds it, so there is nothing to fingerprint.
 
 _FP_HEX_LEN = (
     32  # hex chars of the HMAC-SHA256 fingerprint kept (128-bit — ample, keeps the row compact)

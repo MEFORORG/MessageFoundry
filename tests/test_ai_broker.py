@@ -325,3 +325,33 @@ async def test_ai_chat_requires_ai_assist_permission(
         )
     assert denied.status_code == 403  # viewer lacks ai:assist
     assert ok.status_code == 200  # coding role holds ai:assist
+
+
+# --- ASVS 4.2.5: outbound length bound --------------------------------------
+
+
+def test_broker_refuses_an_over_length_api_key() -> None:
+    """The key ships as `x-api-key` on every provider call and is operator-supplied via env(), so an
+    env value that resolved to an unexpected blob would otherwise surface as an opaque provider-side
+    failure on the first chat rather than as a config error.
+
+    Mutation: delete the `find_outbound_length_violation` block in `AiBroker.__init__`. Red: DID NOT
+    RAISE. The assertion below also pins that the KEY is never echoed."""
+    with pytest.raises(AiBrokerError, match="over the 8192-char limit") as exc:
+        AiBroker(endpoint=_ENDPOINT, api_key="k" * 9000, allowed_endpoints=["ai.internal"])
+    assert "kkkkkkkkkkkkkkkkkkkk" not in str(exc.value)
+
+
+def test_broker_refuses_an_over_length_endpoint() -> None:
+    with pytest.raises(AiBrokerError, match="over the 8192-char limit"):
+        AiBroker(
+            endpoint=_ENDPOINT + "?q=" + "a" * 9000,
+            api_key="k",
+            allowed_endpoints=["ai.internal"],
+        )
+
+
+def test_broker_ordinary_construction_still_works() -> None:
+    """Byte-identity control. Mutation: drop MAX_OUTBOUND_URL_LEN to 8 -> this reds."""
+    broker = AiBroker(endpoint=_ENDPOINT, api_key="k", allowed_endpoints=["ai.internal"])
+    assert broker.endpoint_host == "ai.internal"

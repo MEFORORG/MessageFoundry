@@ -75,6 +75,15 @@ def _build_client(addr: str | None, token: str | None) -> Any:
     a live Vault. ``addr``/``token`` are passed through; when ``None``, hvac falls back to its own
     ``VAULT_ADDR``/``VAULT_TOKEN`` environment conventions."""
     hvac = _import_hvac()
+    # ASVS 4.2.5: ``token`` ships as an ``X-Vault-Token`` request header on EVERY Transit
+    # encrypt/decrypt/HMAC call, and ``addr`` becomes the request URL -- both from MEFOR_* env, and
+    # neither was ever measured (the outbound length gate lived only in transports/). An env value
+    # that resolved to an unexpected blob is exactly the misconfiguration the bound exists to surface
+    # early, and here it would otherwise surface as an opaque Vault-side failure on the first
+    # store read. Imported lazily so store/ does not take a transports/ import at module scope.
+    from messagefoundry.transports.rest import enforce_outbound_length_limits
+
+    enforce_outbound_length_limits(addr or "", {"X-Vault-Token": token} if token else {})
     # hvac.Client() reads VAULT_ADDR/VAULT_TOKEN from the environment when url/token are None.
     client: Any = hvac.Client(url=addr, token=token)
     return client

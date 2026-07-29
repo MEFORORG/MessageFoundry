@@ -225,6 +225,13 @@ def test_without_a_nonce_the_binding_rung_skips_and_later_rungs_are_not_claimed_
     [
         ({"iss": "https://evil.example"}, "fed.replay.claims"),
         ({"aud": "someone-else"}, "fed.replay.claims"),
+        # ASVS 9.2.2: an RFC 8417 SET verifies its signature and passes key selection, so the report
+        # must indict the CLAIMS rung. Mapped to the signature rung instead, `verify` would tell the
+        # operator the token was forged.
+        (
+            {"events": {"http://schemas.openid.net/event/backchannel-logout": {}}},
+            "fed.replay.claims",
+        ),
         ({"amr": ["pwd"]}, "fed.replay.mfa"),
         ({"preferred_username": "Administrator@attacker.example"}, "fed.replay.username"),
     ],
