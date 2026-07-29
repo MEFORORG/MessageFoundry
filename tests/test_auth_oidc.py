@@ -330,6 +330,135 @@ def test_every_reason_slug_is_declared() -> None:
         claims_mod.ClaimsError("not_a_real_reason")
 
 
+# --- claims: token-class assertion (ASVS 9.2.2) ----------------------------------------------------
+
+#: Sentinel for "mint this token with NO typ header at all" — distinct from ``typ: null``.
+_OMIT_TYP = object()
+
+
+def _mint_with_typ(
+    key: rsa.RSAPrivateKey, kid: str, claims: Mapping[str, Any], typ: Any = _OMIT_TYP
+) -> str:
+    """Mint a **properly signed** compact JWS carrying an arbitrary ``typ`` header.
+
+    ``CompactJwtSigner.sign`` hardcodes ``{"alg": ..., "typ": "JWT"}``, so the shipped signer cannot
+    express the wrong-class token this rung exists to refuse. The signature below is computed over
+    the real header bytes, so a refusal proves the **typ assertion** fired — not that a retargeted or
+    hand-spliced signature failed to verify, which would make every test here pass for the wrong
+    reason and stay green if the assertion were deleted.
+    """
+    from messagefoundry.transports.signing import _b64u_encode, _sign
+
+    header: dict[str, Any] = {"alg": SignatureAlgorithm.RS256.value, "kid": kid}
+    if typ is not _OMIT_TYP:
+        header["typ"] = typ
+    header_b64 = _b64u_encode(json.dumps(header, separators=(",", ":"), sort_keys=True).encode())
+    claims_b64 = _b64u_encode(
+        json.dumps(dict(claims), separators=(",", ":"), sort_keys=True).encode()
+    )
+    signature = _sign(key, SignatureAlgorithm.RS256, f"{header_b64}.{claims_b64}".encode("ascii"))
+    return f"{header_b64}.{claims_b64}.{_b64u_encode(signature)}"
+
+
+def test_the_hand_mint_helper_produces_a_genuinely_valid_token(rsa_key: rsa.RSAPrivateKey) -> None:
+    """Guard-the-guard: without this, every ``_mint_with_typ`` test could be passing because the
+    helper mints garbage rather than because the assertion under test fired."""
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ="JWT")
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+@pytest.mark.parametrize(
+    "typ",
+    [
+        "at+jwt",  # RFC 9068 access token — same issuer, same key, passes every other rung
+        "application/at+jwt",  # the RFC 7515 §4.1.9 long form of the same
+        "logout+jwt",  # OIDC back-channel logout token
+        "secevent+jwt",  # RFC 8417 security event token
+        "JOSE",
+        "",  # declared-but-empty is a declaration, not an absence
+        123,  # non-string
+    ],
+)
+def test_a_declared_non_id_token_typ_is_refused(rsa_key: rsa.RSAPrivateKey, typ: Any) -> None:
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ=typ)
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "wrong_token_type"
+
+
+def test_an_absent_typ_still_validates(rsa_key: rsa.RSAPrivateKey) -> None:
+    """RFC 7519 §5.1 makes ``typ`` advisory and OIDC Core does not mandate it, so a conforming IdP
+    that omits it must still authenticate. Making ``typ`` mandatory is a federation outage."""
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims())
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+@pytest.mark.parametrize("typ", ["JWT", "jwt", "application/jwt", "Application/JWT", "  JWT  "])
+def test_a_media_type_prefixed_or_differently_cased_typ_still_validates(
+    rsa_key: rsa.RSAPrivateKey, typ: str
+) -> None:
+    """``Application/JWT`` is the case that pins the normalisation ORDER: lower-case must happen
+    BEFORE ``removeprefix("application/")``. Swap the two and this value alone still carries the
+    prefix, so a conforming token is refused — the other four spellings pass either way."""
+    jws = _mint_with_typ(rsa_key, "k1", _good_claims(), typ=typ)
+    principal = oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert principal.username == "jdoe"
+
+
+def test_an_events_bearing_claim_set_is_refused_under_its_own_slug(
+    rsa_key: rsa.RSAPrivateKey,
+) -> None:
+    """A Security Event Token (RFC 8417) is not an id_token even when the issuer and key match."""
+    jws = _mint(
+        rsa_key,
+        "k1",
+        _good_claims(events={"http://schemas.openid.net/event/backchannel-logout": {}}),
+    )
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unexpected_events_claim"
+
+
+def test_the_events_rejection_precedes_the_nonce_rung(rsa_key: rsa.RSAPrivateKey) -> None:
+    """A real back-channel logout token carries ``events`` and NO ``nonce``. If the events check ran
+    in ladder order it would be refused as ``nonce_mismatch`` — indicting the browser binding and
+    telling the operator the wrong thing about why the login failed."""
+    logout_ish = _good_claims(events={"http://schemas.openid.net/event/backchannel-logout": {}})
+    del logout_ish["nonce"]
+    jws = _mint(rsa_key, "k1", logout_ish)
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "unexpected_events_claim"
+
+
+@pytest.mark.parametrize(
+    ("drop", "reason"),
+    [("sub", "claim_sub_missing"), ("iat", "claim_not_numeric")],
+)
+def test_a_token_missing_a_required_id_token_claim_is_refused(
+    rsa_key: rsa.RSAPrivateKey, drop: str, reason: str
+) -> None:
+    """The positive arm. ``sub`` and ``iat`` are REQUIRED of an id_token by OIDC Core 2. Before this,
+    a token with no ``sub`` minted ``FederatedPrincipal(subject="")`` and that empty string was
+    written into the ``auth.login_success`` audit as though it were evidence."""
+    without = _good_claims()
+    del without[drop]
+    jws = _mint(rsa_key, "k1", without)
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == reason
+
+
+@pytest.mark.parametrize("bad_sub", ["", 12345, None])
+def test_a_non_string_or_empty_sub_is_refused(rsa_key: rsa.RSAPrivateKey, bad_sub: Any) -> None:
+    jws = _mint(rsa_key, "k1", _good_claims(sub=bad_sub))
+    with pytest.raises(oidc.ClaimsError) as exc:
+        oidc.validate_id_token(jws, _policy(), _cache_for(rsa_key), clock=lambda: 1_000_100)
+    assert exc.value.reason == "claim_sub_missing"
+
+
 # --- flow: PKCE + the flow cache -------------------------------------------------------------------
 
 

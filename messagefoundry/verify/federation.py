@@ -33,8 +33,18 @@ from messagefoundry.verify.model import CheckResult, Status
 _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     (
         "fed.replay.key",
-        "id_token key selection (kid -> JWKS)",
-        frozenset({"malformed_token", "unknown_kid", "ambiguous_kid", "key_rejected"}),
+        "id_token type + key selection (typ -> kid -> JWKS)",
+        frozenset(
+            {
+                "malformed_token",
+                # The typ assertion runs at the top of key selection, so a token declaring a
+                # non-id_token class indicts THIS rung and no other (ASVS 9.2.2).
+                "wrong_token_type",
+                "unknown_kid",
+                "ambiguous_kid",
+                "key_rejected",
+            }
+        ),
     ),
     (
         "fed.replay.signature",
@@ -43,14 +53,19 @@ _RUNGS: tuple[tuple[str, str, frozenset[str]], ...] = (
     ),
     (
         "fed.replay.claims",
-        "iss / aud / azp / exp / iat / nbf",
+        "token class (events) / iss / aud / azp / exp / iat / nbf / sub",
         frozenset(
             {
+                # An ``events`` claim means an RFC 8417 SET, not an id_token. Checked at the TOP of
+                # this rung, before the nonce compare, so a logout token is not misreported as a
+                # browser-binding failure (ASVS 9.2.2).
+                "unexpected_events_claim",
                 "claim_iss",
                 "claim_aud",
                 "claim_azp",
                 "expired",
                 "claim_not_numeric",
+                "claim_sub_missing",
                 "not_yet_valid",
                 "issued_in_future",
             }
