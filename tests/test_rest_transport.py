@@ -26,10 +26,24 @@ from messagefoundry.transports.rest import RestDestination
 URL = "https://api.example.com/ingest"
 
 
-def _dest(**over: object) -> RestDestination:
-    """Build a RestDestination from Rest(...) settings (env() refs already 'resolved' = literals)."""
+def _dest(
+    *, _cleartext_accepted: bool = False, _cleartext_reason: str | None = None, **over: object
+) -> RestDestination:
+    """Build a RestDestination from Rest(...) settings (env() refs already 'resolved' = literals).
+
+    ``_cleartext_accepted``/``_cleartext_reason`` (ADR 0153) are underscore-prefixed because they are
+    NOT transport settings — they are top-level outbound keys threaded onto the Destination, and mixing
+    them into ``**over`` would send them to the ``Rest(...)`` factory, which rightly rejects them."""
     settings = Rest(url=URL, **over).settings  # type: ignore[arg-type]
-    d = build_destination(Destination(name="OB_REST", type=ConnectorType.REST, settings=settings))
+    d = build_destination(
+        Destination(
+            name="OB_REST",
+            type=ConnectorType.REST,
+            settings=settings,
+            cleartext_accepted=_cleartext_accepted,
+            cleartext_reason=_cleartext_reason,
+        )
+    )
     assert isinstance(d, RestDestination)
     return d
 
@@ -148,11 +162,17 @@ def test_rest_verify_tls_false_refused_without_escape(monkeypatch: pytest.Monkey
 
 
 def test_rest_verify_tls_false_allowed_with_escape(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    # #200 (ADR 0092): the global escape now only DOWNGRADES REFUSE→WARN on a NON-production instance
-    # (decision 2). Under a non-prod PHI posture it warns-and-builds; on production it would refuse.
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
-        dest = _dest(verify_tls=False)  # builds a no-verify opener; no exception
+    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
+    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
+    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    # verify_tls=false is decided exactly like a cleartext hop, so the declaration crosses it too.
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+        dest = _dest(
+            verify_tls=False,
+            _cleartext_accepted=True,
+            _cleartext_reason="legacy partner endpoint has no TLS",
+        )  # builds a no-verify opener; no exception
     assert dest._opener is not None
 
 
@@ -172,17 +192,21 @@ def test_rest_credentials_over_cleartext_http_refused(monkeypatch: pytest.Monkey
 def test_rest_credentials_over_cleartext_http_allowed_with_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
+    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
+    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
+    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",
                 type=ConnectorType.REST,
                 settings=Rest(url="http://api.example.com/x", bearer_token="tok").settings,
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner endpoint has no TLS",
             )
         )
-    assert isinstance(dest, RestDestination)  # built (warns), not refused
+    assert isinstance(dest, RestDestination)  # built (warns + audits), not refused
 
 
 def test_rest_cleartext_http_without_credentials_is_allowed() -> None:
@@ -227,17 +251,21 @@ def test_rest_cleartext_http_nonloopback_refused_without_escape(
 def test_rest_cleartext_http_nonloopback_allowed_with_escape(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    # #200: the escape downgrades REFUSE→WARN only on a NON-production instance (decision 2).
-    with active_hop_posture(HopPosture(is_phi=True, enforcing=False)):
+    # ADR 0153: the blunt MEFOR_ALLOW_INSECURE_TLS escape no longer influences a cleartext-hop
+    # decision (decision 5). The per-connection declaration is what crosses it now — loudly, and
+    # recorded in the audit trail, instead of a process-wide env var nobody sees in review.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
         dest = build_destination(
             Destination(
                 name="OB",
                 type=ConnectorType.REST,
                 settings=Rest(url="http://api.example.com/x").settings,
+                cleartext_accepted=True,
+                cleartext_reason="legacy partner endpoint has no TLS",
             )
         )
-    assert isinstance(dest, RestDestination)  # built (warns loudly), not refused
+    assert isinstance(dest, RestDestination)  # built (warns loudly + audits), not refused
 
 
 def test_rest_egress_allowlist_blocks_unlisted_host() -> None:

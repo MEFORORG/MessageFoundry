@@ -18,11 +18,23 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.settings import (
+    AuthSettings,
     SecuritySettings,
     ServiceSettings,
+    StoreSettings,
     load_settings,
     security_loosenings,
 )
+
+
+def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
+    """``security_loosenings`` with the shipped [store]/[auth] defaults and an empty accepted set.
+
+    The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
+    deviation the registry cannot see is a second posture by the back door). The tests below are about
+    the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), ())
+
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
 
@@ -194,14 +206,12 @@ def test_loosening_warns_and_prod_phi_refuses(
 ) -> None:
     # security_loosenings() names each opt-out in plain language (the serve warning + the posture view
     # both consume it) — audit_all_authorization_decisions=false is NOT a loosening (secure default).
-    loos = dict(
-        security_loosenings(SecuritySettings(require_mfa=False, block_unlisted_outbound=False))
-    )
+    loos = dict(_loosenings(SecuritySettings(require_mfa=False, block_unlisted_outbound=False)))
     assert "require_mfa" in loos and "single-factor" in loos["require_mfa"]
     assert (
         "block_unlisted_outbound" in loos and "any destination" in loos["block_unlisted_outbound"]
     )
-    assert security_loosenings(SecuritySettings()) == []  # all-secure defaults → nothing named
+    assert _loosenings(SecuritySettings()) == []  # all-secure defaults → nothing named
 
     # The serve-time consolidated warning fires naming the loosened switch (AC-4). It rides the logging
     # path (post-configure_logging), which routes to stdout — the gate REFUSE messages print to stderr.
@@ -243,7 +253,7 @@ def test_production_acks_are_loosenings_when_set() -> None:
     # allow_keeping_phi. Each appears exactly once (guards against a duplicate-append bug).
     switches = [
         k
-        for k, _ in security_loosenings(
+        for k, _ in _loosenings(
             SecuritySettings(
                 allow_single_factor_admin_when_exposed=True,
                 allow_unencrypted_phi_under_strict_enforcement=True,
@@ -254,7 +264,7 @@ def test_production_acks_are_loosenings_when_set() -> None:
     # is genuinely verified, per ADR 0140 AC-6.
     assert switches.count("allow_single_factor_admin_when_exposed") == 1
     assert switches.count("allow_unencrypted_phi_under_strict_enforcement") == 1
-    assert security_loosenings(SecuritySettings()) == []  # acks off => nothing named
+    assert _loosenings(SecuritySettings()) == []  # acks off => nothing named
 
 
 # --- AC-6: handles_real_patient_data=false relaxes the PHI-only gates (and it is posture-visible) --
@@ -314,12 +324,10 @@ def test_enforcement_default_and_env_override(tmp_path: Path) -> None:
 def test_enforcement_warn_is_named_as_a_loosening_once() -> None:
     from messagefoundry.config.ai_policy import SecurityEnforcement
 
-    switches = [
-        k for k, _ in security_loosenings(SecuritySettings(enforcement=SecurityEnforcement.WARN))
-    ]
+    switches = [k for k, _ in _loosenings(SecuritySettings(enforcement=SecurityEnforcement.WARN))]
     assert switches.count("enforcement") == 1
     # ENFORCE (the secure default) is NOT a loosening.
-    assert "enforcement" not in dict(security_loosenings(SecuritySettings()))
+    assert "enforcement" not in dict(_loosenings(SecuritySettings()))
 
 
 def test_enforcement_decouples_refuse_warn_from_tier(

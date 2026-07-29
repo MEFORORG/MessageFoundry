@@ -6,11 +6,14 @@ Covers the four HTTP destinations (REST / SOAP / FHIR / DICOMweb) and the ``Fhir
 which shipped escape-only, construction-only cleartext/verify-off refusals and are re-keyed onto the ONE
 authority (``tls_policy.insecure_hop_disposition``). Verifies, per cell:
 
-* the posture gradient at CONSTRUCTION — production PHI REFUSES, a per-hop attestation / on-box loopback /
-  synthetic instance ALLOWs, the clamped global escape only downgrades a NON-prod PHI hop to WARN;
-* **decision 5 (no-loosen)** — a *staging* (non-prod) PHI cleartext hop that refused today STILL refuses,
-  the gradient's non-prod WARN is floored back to REFUSE unless the escape/attestation applies;
-* **decision 2 (escape clamp)** — ``MEFOR_ALLOW_INSECURE_TLS`` is inert on production;
+* the gradient at CONSTRUCTION — an enforcing cleartext hop REFUSES, a per-hop attestation / on-box
+  loopback ALLOWs, and (ADR 0153) a per-connection ``cleartext_accepted`` declaration crosses it with a
+  loud, audited WARN;
+* **ADR 0153 decision 1** — the data label is gone: a ``synthetic`` instance no longer gets a blanket
+  cleartext carve-out on any of these cells;
+* **decision 5 (no-loosen)** — a hop that reaches WARN only via the non-enforcing dial is still floored
+  back to REFUSE by ``_shipped_strict_disposition`` unless it carries a declaration;
+* **ADR 0153 decision 5** — ``MEFOR_ALLOW_INSECURE_TLS`` can no longer influence any of these decisions;
 * the fail-closed default — an UNSTAMPED posture is treated as production PHI;
 * the zero-I/O SEND-TIME re-assertion (decision 4) fires at the byte-crossing, before any wire I/O.
 
@@ -70,6 +73,7 @@ def _build(
     spec: tuple[Any, Any, str],
     *,
     attested: bool = False,
+    accepted: bool = False,
     revocation_attested: bool = False,
     **over: Any,
 ) -> object:
@@ -81,6 +85,12 @@ def _build(
             type=ctype,
             settings=settings,
             tls_hop_attested=attested,
+            # ADR 0153 retro-fitted flag-implies-reason onto the attestation, so supply one whenever the
+            # flag is set rather than leaving the pair incoherent at load.
+            tls_hop_attested_reason="proxy-terminated trusted segment" if attested else None,
+            # ADR 0153 decision 2: the opposite declaration — this hop is NOT secure and we accept that.
+            cleartext_accepted=accepted,
+            cleartext_reason="vendor firmware predates TLS" if accepted else None,
             # #201 (ADR 0078 amendment): a VERIFYING https hop now also carries a revocation refusal;
             # tests that build a prod-PHI verified remote hop and expect SUCCESS attest revocation here
             # so the (distinct) cleartext #200 assertions stay the subject under test.
@@ -115,14 +125,20 @@ def test_cleartext_prod_phi_refuses(cell: str, monkeypatch: pytest.MonkeyPatch) 
 def test_escape_inert_on_production(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
     with active_hop_posture(_PROD), pytest.raises(InsecureHopRefused):
-        _build(_CLEARTEXT[cell])  # escape cannot satisfy a prod-PHI hop
+        _build(_CLEARTEXT[cell])  # escape cannot satisfy an enforcing hop
 
 
 @pytest.mark.parametrize("cell", _CELLS)
-def test_escape_downgrades_on_non_prod(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_escape_is_inert_on_non_prod_too(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR 0153 decision 5, for the HTTP family: the env var no longer relaxes ANY cleartext hop.
+
+    This asserted the opposite before 0153 (the escape downgraded a non-prod hop to a crossing WARN).
+    ``_shipped_strict_disposition``'s no-loosen floor is now keyed on ``cleartext_accepted`` instead of
+    on the escape, which is what makes decision 2's per-connection declaration effective here — and what
+    stops the blunt env var being alive on HTTP while dead on raw TCP. It is a deliberate TIGHTENING."""
     monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(_STAGING):
-        assert _build(_CLEARTEXT[cell]) is not None  # warns-and-builds, not refused
+    with active_hop_posture(_STAGING), pytest.raises(InsecureHopRefused):
+        _build(_CLEARTEXT[cell])
 
 
 # --- the ALLOW arms: loopback, per-hop attestation, synthetic (non-PHI) -------------------------------
@@ -145,11 +161,47 @@ def test_attestation_allows_prod_phi_cleartext(cell: str, monkeypatch: pytest.Mo
 
 
 @pytest.mark.parametrize("cell", _CELLS)
-def test_synthetic_instance_allows_cleartext(cell: str, monkeypatch: pytest.MonkeyPatch) -> None:
-    # No PHI rides the hop → allowed (the gradient's arm 3), even off-loopback with no escape.
+def test_synthetic_instance_no_longer_allows_cleartext(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0153 decision 1 on the HTTP family: no data label may permit a cleartext hop.
+
+    This asserted ALLOW before 0153 — and note the posture here is non-enforcing too, so BOTH of the
+    old relaxations are gone: the label no longer allows, and the non-enforcing WARN is floored."""
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    with active_hop_posture(_SYNTHETIC):
-        assert _build(_CLEARTEXT[cell]) is not None
+    with active_hop_posture(_SYNTHETIC), pytest.raises(InsecureHopRefused):
+        _build(_CLEARTEXT[cell])
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_cleartext_accepted_crosses_an_enforcing_http_hop(
+    cell: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ADR 0153 decision 2 on the HTTP family — the largest cleartext-egress family in the product.
+
+    This is the case ``_shipped_strict_disposition``'s re-keyed floor exists for: without it the
+    declaration would be silently inert for REST/SOAP/FHIR/DICOMweb, i.e. everywhere it is a genuine
+    escape (Tcp()/X12() never reach that cell)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        assert _build(_CLEARTEXT[cell], accepted=True) is not None
+
+
+@pytest.mark.parametrize("cell", _CELLS)
+def test_cleartext_accepted_is_audited_at_every_construction(
+    cell: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """WARN + a DEDICATED audit record, so an accepted risk cannot quietly stop being visible."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD), caplog.at_level("WARNING"):
+        _build(_CLEARTEXT[cell], accepted=True)
+    audit = [
+        r.getMessage()
+        for r in caplog.records
+        if "cleartext hop crossed on an operator acceptance" in r.getMessage()
+    ]
+    assert audit, "an accepted cleartext hop must produce an audit record at every construction"
+    assert "vendor firmware predates TLS" in audit[0]
 
 
 # --- fail-closed: an UNSTAMPED posture is treated as production PHI -----------------------------------
@@ -262,6 +314,27 @@ def test_fhir_lookup_attested_read_allowed_on_prod(monkeypatch: pytest.MonkeyPat
     assert ex.connections == frozenset({"L"})
 
 
+def test_fhir_lookup_cleartext_accepted_read_allowed_on_prod(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A FhirLookup connection has no Destination, so its declaration rides the spec settings.
+
+    Same surface its ``tls_hop_attested`` already used. Without this the read path would be the one
+    cleartext-egress cell with no expressible declaration at all."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        ex = FhirLookupExecutor(
+            {
+                "L": {
+                    "url": "http://fhir.example.org/fhir",
+                    "cleartext_accepted": True,
+                    "cleartext_reason": "legacy on-prem FHIR facade has no TLS",
+                }
+            }
+        )
+    assert ex.connections == frozenset({"L"})
+
+
 # --- the send-time guard object (zero-I/O re-assertion, decision 4) -----------------------------------
 
 
@@ -272,16 +345,18 @@ def test_send_guard_refuses_prod_phi_hop(monkeypatch: pytest.MonkeyPatch) -> Non
         guard.assert_send("api.example.com", "http://api.example.com/x")
 
 
-def test_send_guard_allows_attested_and_synthetic_and_loopback(
+def test_send_guard_allows_attested_accepted_and_loopback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
-    # attested → ALLOW even on prod PHI
+    # attested → ALLOW even on an enforcing instance
     InsecureHopGuard(posture=_PROD, attested=True, cell="c").assert_send(
         "api.example.com", "http://api.example.com/x"
     )
-    # synthetic → ALLOW
-    InsecureHopGuard(posture=_SYNTHETIC, attested=False, cell="c").assert_send(
+    # declared cleartext_accepted → WARN (crosses) rather than REFUSE, so the send is permitted. The
+    # send-time guard must carry the SAME declaration the construction gate decided on, or a permitted
+    # connection would blow up at the byte-crossing instead.
+    InsecureHopGuard(posture=_PROD, attested=False, cell="c", cleartext_accepted=True).assert_send(
         "api.example.com", "http://api.example.com/x"
     )
     # loopback host → ALLOW (on-box)
@@ -290,16 +365,32 @@ def test_send_guard_allows_attested_and_synthetic_and_loopback(
     )
 
 
+def test_send_guard_refuses_a_synthetic_instance_now(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The send-time backstop tracks the authority: no data label crosses it either (ADR 0153)."""
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    guard = InsecureHopGuard(posture=_SYNTHETIC, attested=False, cell="c")
+    with pytest.raises(InsecureHopRefused):
+        guard.assert_send("api.example.com", "http://api.example.com/x")
+
+
 # --- helper-level: refuse_cleartext_egress / refuse_verify_off return a guard only when PERMITTED -----
 
 
 def test_refuse_cleartext_egress_returns_guard_when_permitted(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    # Permitted now means DECLARED (the env escape no longer permits anything here) — and the returned
+    # guard must carry the declaration forward so the send-time re-assertion agrees with construction.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
     with active_hop_posture(_STAGING):
-        guard = refuse_cleartext_egress("http", "http://api.example.com/x")
+        guard = refuse_cleartext_egress(
+            "http",
+            "http://api.example.com/x",
+            cleartext_accepted=True,
+            cleartext_reason="legacy peer",
+        )
     assert isinstance(guard, InsecureHopGuard)
+    assert guard.cleartext_accepted is True
 
 
 def test_refuse_cleartext_egress_no_guard_for_loopback_or_https(
@@ -357,19 +448,27 @@ class _Opener:
 async def test_rest_send_time_assertion_blocks_before_wire(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Build a permitted cleartext REST dest (staging + escape → WARN), then revoke the escape: the
-    # zero-I/O send-time re-assertion must REFUSE at the byte-crossing, before the opener is ever called.
-    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
-    with active_hop_posture(_STAGING):
-        dest = _build(_CLEARTEXT["REST"])
+    # Build a PERMITTED cleartext REST dest (an enforcing instance + a cleartext_accepted declaration →
+    # WARN), then swap in a guard whose captured state REFUSES: the zero-I/O send-time re-assertion must
+    # fire at the byte-crossing, before the opener is ever called.
+    #
+    # Pre-ADR-0153 this test revoked MEFOR_ALLOW_INSECURE_TLS between the two sends. That lever no longer
+    # exists (decision 5 unhooked it), and swapping the guard is the better test of 0092 decision 4
+    # anyway: it exercises the re-assertion itself rather than a since-removed env read inside it.
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(_PROD):
+        dest = _build(_CLEARTEXT["REST"], accepted=True)
     opener = _Opener()
     dest._opener = opener  # type: ignore[attr-defined]
     assert dest._hop_guard is not None  # type: ignore[attr-defined]
 
-    await dest.send("payload")  # escape still set → permitted, reaches the (fake) wire
+    await dest.send("payload")  # declared → permitted, reaches the (fake) wire
     assert opener.calls == 1
 
-    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    # A reload / per-message re-target could leave a guard whose decision is now REFUSE.
+    dest._hop_guard = InsecureHopGuard(  # type: ignore[attr-defined]
+        posture=_PROD, attested=False, cell="HTTP cleartext egress", cleartext_accepted=False
+    )
     with pytest.raises(InsecureHopRefused):
-        await dest.send("payload")  # escape revoked → send-time refusal, before any I/O
+        await dest.send("payload")  # send-time refusal, before any I/O
     assert opener.calls == 1  # the opener was NOT called on the refused send

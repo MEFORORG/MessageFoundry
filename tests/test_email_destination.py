@@ -224,7 +224,12 @@ SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # not is_phi → always AL
 
 
 def _cleartext_dest(
-    *, host: str = "smtp.partner.org", attested: bool = False, reason: str | None = None
+    *,
+    host: str = "smtp.partner.org",
+    attested: bool = False,
+    reason: str | None = None,
+    accepted: bool = False,
+    accept_reason: str | None = None,
 ) -> Destination:
     return Destination(
         name="OB_EMAIL",
@@ -237,6 +242,8 @@ def _cleartext_dest(
         },
         tls_hop_attested=attested,
         tls_hop_attested_reason=reason,
+        cleartext_accepted=accepted,
+        cleartext_reason=accept_reason,
     )
 
 
@@ -274,12 +281,26 @@ def test_staging_phi_cleartext_smtp_warns_and_crosses(monkeypatch: pytest.Monkey
     assert d._hop_guard is not None
 
 
-def test_synthetic_cleartext_smtp_allowed(monkeypatch: pytest.MonkeyPatch) -> None:
-    # No PHI rides the hop → ALLOW, silently (the historical explicit-opt-in escape still applies).
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
-    with active_hop_posture(SYNTHETIC):
-        d = EmailDestination(_cleartext_dest())
+def test_cleartext_smtp_crosses_on_a_declaration(monkeypatch: pytest.MonkeyPatch) -> None:
+    """ADR 0153: the declaration crosses an ENFORCING cleartext SMTP hop; the data label no longer does.
+
+    It also has to satisfy EmailDestination's own pre-gate, which fires BEFORE the shared authority — a
+    declaration that passed the authority but not the pre-gate would be dead config on SMTP alone."""
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(PROD_PHI):
+        d = EmailDestination(
+            _cleartext_dest(accepted=True, accept_reason="legacy relay has no STARTTLS")
+        )
     assert d.use_tls is False
+    assert d._hop_guard is not None  # crossed under a WARN, still guarded at send
+
+
+def test_synthetic_cleartext_smtp_now_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SYNTHETIC here is ENFORCING. Pre-0153 the label alone allowed this hop; now only `enforcing`
+    # reaches the authority, so it refuses — and the escape cannot rescue it either (decision 5).
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with active_hop_posture(SYNTHETIC), pytest.raises(ValueError, match="cleartext"):
+        EmailDestination(_cleartext_dest())
 
 
 def test_unstamped_posture_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -300,10 +321,13 @@ async def test_send_time_backstop_refuses_at_the_byte_crossing(
 ) -> None:
     # Defense in depth: a reload that flips the instance to enforcing production-PHI must not put the
     # body on the wire just because construction happened under a laxer posture.
-    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
     _install_fake(monkeypatch)
+    # Constructed under a declaration (ADR 0153) rather than the retired synthetic carve-out.
     with active_hop_posture(SYNTHETIC):
-        d = EmailDestination(_cleartext_dest())
+        d = EmailDestination(
+            _cleartext_dest(accepted=True, accept_reason="legacy relay has no STARTTLS")
+        )
     assert d._hop_guard is not None
     d._hop_guard = InsecureHopGuard(
         host=d.host,
