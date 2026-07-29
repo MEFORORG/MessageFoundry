@@ -56,6 +56,40 @@ if ($root) {
         $lines += "All worktrees sharing this .git/history/remote:"
         $wt | ForEach-Object { $lines += "  $_" }
 
+        # WHO IS ACTUALLY HERE. The worktree list above is the set of checkouts, not the set of live
+        # sessions -- most worktrees usually have nobody in them, and the one collision that matters
+        # (someone editing the shared primary right now) is invisible from it. presence.ps1 is the only
+        # roster that spans surfaces: the Desktop app's own session tooling never registers a session it
+        # did not spawn, so a VS Code session working in this repo does not appear in it at all.
+        $presence = Join-Path $PSScriptRoot "..\coord\presence.ps1"
+        if (Test-Path $presence) {
+            $peers = @()
+            # A SessionStart hook must never fail loudly: whatever this prints IS the chat's starting
+            # context, so a throw here would replace the coordination banner with a stack trace.
+            try { $peers = @(& $presence -Json | ConvertFrom-Json) } catch { $peers = @() }
+
+            $others = @($peers | Where-Object { -not $_.IsSelf })
+            if ($others.Count -gt 0) {
+                $lines += ""
+                $lines += "LIVE sessions in this repo right now ($($others.Count) besides you):"
+                foreach ($p in $others) {
+                    $where = if ($p.IsPrimary) { "the SHARED PRIMARY" } else { $p.Worktree }
+                    $flag = if ($p.State -ne "LIVE") { "  [$($p.State)]" } else { "" }
+                    $lines += "  $($p.Short)  $($p.Surface)  in $where  [$($p.Branch)]$flag"
+                }
+                # The surfaces differ in what can reach them, and that changes how you coordinate.
+                if (@($others | Where-Object { $_.Surface -ne "desktop" }).Count -gt 0) {
+                    $lines += "  NOTE: a non-desktop (e.g. VS Code) session is live. It cannot be reached by"
+                    $lines += "        session messaging -- coordinate through a claim or the PR, not a message."
+                }
+                if (@($others | Where-Object { $_.IsPrimary }).Count -gt 0) {
+                    $lines += "  WARNING: a session is working in the SHARED PRIMARY checkout. Anything you do"
+                    $lines += "           there can collide with it -- stay in this worktree."
+                }
+                $lines += "  Full roster:  pwsh -NoProfile -File scripts\coord\presence.ps1 -All"
+            }
+        }
+
         # Nudge cleanup: count the <repo>-<name> siblings new.ps1 creates, so finished ones don't pile up.
         $rootFwd = ($root -replace '\\', '/')
         $siblingCount = @($wt | Where-Object { ($_ -replace '\\', '/') -like "$rootFwd-*" }).Count
