@@ -33,6 +33,17 @@ from dataclasses import dataclass, field
 # ``tests/test_multipart.py::test_disposition_param_regex_matches_legacy_semantics``.
 _DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
 
+#: Cap on one part's header block. RFC 2388 part headers are ``Content-Disposition`` plus at most a
+#: ``Content-Type``/``Content-Transfer-Encoding``, so 16 KiB is orders of magnitude more than any real
+#: client sends. Without it the block is bounded only by the request body cap — ``[store]
+#: .max_upload_bytes``, 25 MiB by default and up to 512 MiB — because that cap is applied to a part's
+#: *content*, only after its header has already been parsed. The scan is linear (see the guard above),
+#: but it runs synchronously on the asyncio event loop that also drives every listener and worker, and
+#: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
+#: ~7 s at the ceiling. Bounding the header keeps the cost microseconds and, incidentally, gives the
+#: ReDoS analysis a length-bounded source instead of an attacker-sized one.
+_MAX_PART_HEADER_BYTES = 16 * 1024
+
 
 class MultipartError(ValueError):
     """The body is not a well-formed single-file ``multipart/form-data`` request."""
@@ -114,6 +125,13 @@ def parse_multipart_form(
         head, sep, content = segment.partition(b"\r\n\r\n")
         if not sep:
             continue  # no header/body separator — skip a malformed part rather than 500
+        if len(head) > _MAX_PART_HEADER_BYTES:
+            # Refuse rather than skip: a header this size is never a real client, and skipping would
+            # surface as the confusing "no file part" error instead of naming the actual problem.
+            raise MultipartError(
+                f"multipart part header block is {len(head)} bytes; the limit is "
+                f"{_MAX_PART_HEADER_BYTES}"
+            )
         if content.endswith(b"\r\n"):
             content = content[:-2]  # trailing CRLF before the next delimiter
         name, filename = _disposition(head)

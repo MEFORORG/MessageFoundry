@@ -11,6 +11,7 @@ import pytest
 
 from messagefoundry.api.multipart import (
     _DISPOSITION_PARAM,
+    _MAX_PART_HEADER_BYTES,
     MultipartError,
     MultipartTooLargeError,
     parse_boundary,
@@ -114,11 +115,13 @@ def test_disposition_param_regex_matches_legacy_semantics(line: str) -> None:
 def test_hostile_disposition_header_parses_in_linear_time() -> None:
     """A Content-Disposition line of many word chars and no ``="`` must not blow up quadratically.
 
-    The header block is attacker-supplied and bounded only by ``[store].max_upload_bytes`` (25 MiB
-    default), and ``parse_single_file_upload`` runs synchronously on the asyncio event loop — so a
-    quadratic scan here is a whole-engine denial of service, not a slow request. Assert the growth
-    ratio rather than a wall-clock budget so the test is not flaky on a loaded CI runner: quadratic
-    scaling multiplies by ~16 when the input quadruples; linear scaling stays near ~4.
+    The header block is attacker-supplied and ``parse_single_file_upload`` runs synchronously on the
+    asyncio event loop, so a quadratic scan here is a whole-engine denial of service, not a slow
+    request. ``_MAX_PART_HEADER_BYTES`` now bounds the input as well, but the two controls are
+    independent on purpose: the cap is a size policy someone could reasonably raise, while this asserts
+    the scan itself stays linear at any size. Assert the growth ratio rather than a wall-clock budget so
+    the test is not flaky on a loaded CI runner: quadratic scaling multiplies by ~16 when the input
+    quadruples; linear scaling stays near ~4.
     """
 
     def elapsed(n: int, reps: int = 3) -> float:
@@ -137,3 +140,36 @@ def test_hostile_disposition_header_parses_in_linear_time() -> None:
     small = max(elapsed(base_n), 1e-6)
     large = elapsed(base_n * 4)
     assert large / small < 8.0, f"scaling looks super-linear: {small=} {large=}"
+
+
+def test_oversized_part_header_is_refused_not_parsed() -> None:
+    """A part header block past ``_MAX_PART_HEADER_BYTES`` is rejected before ``_disposition`` runs.
+
+    The per-part ``max_file_bytes`` cap applies to a part's *content*, and only AFTER its header has
+    been parsed — so without this bound the header scan's input is the whole request body (25 MiB by
+    default, 512 MiB at the ceiling) on the asyncio event loop. A real client never approaches it: a
+    Content-Disposition plus a Content-Type is a couple hundred bytes.
+    """
+    fat = b"X" * (_MAX_PART_HEADER_BYTES + 1)
+    part = (
+        b'Content-Disposition: form-data; name="file"; filename="a.hl7"\r\nX-Pad: '
+        + fat
+        + b"\r\n\r\nbody"
+    )
+    with pytest.raises(MultipartError, match="header block"):
+        parse_single_file_upload(
+            f"multipart/form-data; boundary={_B}", _body([part]), max_file_bytes=10_000_000
+        )
+
+
+def test_realistic_part_header_is_well_under_the_cap() -> None:
+    """Non-vacuity for the cap: an ordinary upload's header must be nowhere near the limit, so the
+    bound can never start rejecting legitimate traffic."""
+    head = b'Content-Disposition: form-data; name="file"; filename="acme.hl7"\r\nContent-Type: application/octet-stream'
+    assert len(head) * 50 < _MAX_PART_HEADER_BYTES
+    file = parse_single_file_upload(
+        f"multipart/form-data; boundary={_B}",
+        _body([head + b"\r\n\r\nMSH|body"]),
+        max_file_bytes=1024,
+    )
+    assert file.filename == "acme.hl7"
