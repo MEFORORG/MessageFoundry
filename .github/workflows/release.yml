@@ -192,7 +192,11 @@ jobs:
           # ~=7.3.1 (not ~=7.3): the looser form floats the whole 7.x minor range, and a 7.4 could change
           # the CycloneDX JSON shape sbom_finalize.py parses — which exits non-zero and FAILS the release.
           # ~=7.3.1 still takes patch fixes and keeps the lxml-6.x/cp314 floor rationale above intact.
-          python -m pip install --upgrade "cyclonedx-bom~=7.3.1"
+          # BYTE-IDENTICAL to security.yml's SBOM install, and kept that way by a test. Nothing in PR CI
+          # executes release.yml (tag push only), so ADR 0034's documented pre-tag check is to dispatch
+          # security.yml's sbom job and read ITS log — which only proves anything while the two install
+          # commands are the same command.
+          python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"
           # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
@@ -393,15 +397,22 @@ jobs:
           # wheel smoke above for the full rationale. (`build` already pulls packaging>=24.0 into this
           # same interpreter, so the install is near-redundant; pinning it beats deleting it, which would
           # leave the dependency implicit and unpinned via build's own resolve.)
+          #
+          # …and into a THROWAWAY VENV, not this job's interpreter, which is the other half of ADR 0034's
+          # recommendation. This job holds contents: write + id-token: write and the steps AFTER this one
+          # attach the wheel to the release and publish it to PyPI, so an install resolved into the main
+          # interpreter here sits inside the publishing identity. The engine job already does it this way
+          # (/tmp/relsmoke); the compare script needs nothing but packaging.version + stdlib.
           PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
           if [ -z "$PKG_PIN" ]; then
             echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
           fi
           echo "packaging pin from constraints.lock: $PKG_PIN"
-          python -m pip install --quiet "packaging==$PKG_PIN"
+          python -m venv /tmp/harnesssmoke
+          /tmp/harnesssmoke/bin/pip install --quiet "packaging==$PKG_PIN"
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#v}"
-            python - "$built" "$want" <<'PYVER'
+            /tmp/harnesssmoke/bin/python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
 
