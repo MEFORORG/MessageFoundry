@@ -6,6 +6,24 @@ pinned to engine commit `98bec81`, P0 to engine build `28f860e` ·
 **Method:** multi-agent audit of every ADR, commit, bench artifact and rig handback, with each measurement
 adversarially verified and validity-tagged.
 
+> ## ⚠️ SUPERSEDED IN ONE RESPECT (correction added 2026-07-29) — the #220 instrument now EXISTS
+>
+> This document repeatedly states that the per-process CPU-attribution instrument **"DOES NOT EXIST YET —
+> it must be BUILT"** and calls building it *"the next piece of work"*. **That was true on 2026-07-10. It
+> is not true now.** The rest of the document is left exactly as written — it is a dated status record, and
+> rewriting its findings would falsify the account of what was known when the decisions were made.
+>
+> **What shipped:** `ProcSample.cpu_pids` records the exact PID set summed each tick
+> ([`harness/load/connscale/probe.py:57-70,261`](../../harness/load/connscale/probe.py)), the piecewise
+> `max(0, Δcpu)` fold is in `connscale/runner.py`, and falsifiers live in
+> [`tests/test_connscale_cpu_probe.py`](../../tests/test_connscale_cpu_probe.py). BACKLOG **#220 is ✅
+> SHIPPED** and **#208 is ✅ CLOSED**.
+>
+> **Why this correction is here at all:** an instruction to *build* something that already exists is how
+> merged work gets rebuilt. Anyone reading a "must be BUILT" line below should stop and check the code
+> first. The residual on #208 is **off-repo measurement** — no in-repo change can close it, so it is not a
+> build task either.
+
 > **Artifact provenance — read before quoting any C4–C7 number.**
 >
 > - **The C5/C6/C7 raw artifacts are held OUTSIDE this repository**, under
@@ -376,7 +394,7 @@ changed underneath.
 > `node_pids` for an external capture, and the old `0.00` **rendering** bug was **fixed in #861**. So there is **no
 > broken collector to fix**; there is **nothing there to fix**. `max_core%` is the validated whole-box substitute,
 > and it can **BOUND** engine CPU but cannot **ATTRIBUTE** it to a component. **The instrument required to pose an
-> engine-side falsifier DOES NOT EXIST YET — it must be BUILT** (residual **#220**). *(Do not go looking for a
+> engine-side falsifier DOES NOT EXIST YET — it must be BUILT** (residual **#220**). ⚠️ **[SUPERSEDED 2026-07-29 — the instrument EXISTS; #220 is ✅ SHIPPED. See the correction at the top before acting on this.]** *(Do not go looking for a
 > collector that reads `0.00`; you will not find one.)*
 
 ---
@@ -1651,7 +1669,7 @@ box.**
 > whole-box substitute.** ⚠️ **`max_core%` can BOUND engine CPU; it cannot ATTRIBUTE it to a component.** So the
 > honest statement is: **the instrument required to pose an engine-side falsifier DOES NOT EXIST YET, and building
 > it is the next piece of work** (residual **#220** — differencing subtree CPU sums over *different* process sets
-> is not a delta). **Build the instrument, then pose the falsifier. Do not guess the mechanism first.**
+> is not a delta). **Build the instrument, then pose the falsifier. Do not guess the mechanism first.** ⚠️ **[SUPERSEDED 2026-07-29 — the instrument EXISTS; #220 is ✅ SHIPPED. See the correction at the top before acting on this.]**
 
 **Why this is a GOOD outcome.** A **large, permanent, 3-backend build was stopped by a measurement that cost zero
 production code.** F2's own plan called it *"the real cost of this plan… not 'flip a flag'"* — 3 backends × 3
@@ -1800,7 +1818,7 @@ cost, an 8xlarge ≈ 4×; verify current pricing before the campaign). Two cauti
 its instance-store data drive** (stop/start loses `D:`; the SQL rebuild is a ~15-minute runbook step, but
 plan it), and — **BUILD the per-process CPU attribution instrument first.** ⚠️ **Not "fix the per-PID collector":
 there is none to fix.** shardcert has **no in-harness per-PID sampler** (the `0.00` *rendering* bug was fixed in
-#861); the instrument **must be built** (residual **#220**). On a bigger box with more processes, whole-box
+#861); the instrument **must be built** (residual **#220**). ⚠️ **[SUPERSEDED 2026-07-29 — the instrument EXISTS; #220 is ✅ SHIPPED. See the correction at the top before acting on this.]** On a bigger box with more processes, whole-box
 percentages alone cannot attribute anything.
 
 ### Do not do
@@ -1832,7 +1850,7 @@ percentages alone cannot attribute anything.
 >
 > ⭐ **#2 — "WHERE IS THE WALL?" — is now the ONLY question that matters**, and it has a concrete, unglamorous
 > answer-shape: **not the store; the engine side has never been attributed; the instrument to attribute it does
-> not exist.** **Build the instrument, then pose an ENGINE-side falsifier.**
+> not exist.** **Build the instrument, then pose an ENGINE-side falsifier.** ⚠️ **[SUPERSEDED 2026-07-29 — the instrument EXISTS; #220 is ✅ SHIPPED. See the correction at the top before acting on this.]**
 >
 > ⚠️ **The numbering below is UNCHANGED on purpose** — this document is cross-referenced by ADRs and reviews that
 > cite "§9 #1" and "§9 #2". **Read the ⭐ markers, not the ordinals**, for what is live.
