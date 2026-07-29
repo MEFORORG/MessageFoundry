@@ -110,7 +110,7 @@ pip install -e ".[dicom]"        # DICOM C-STORE SCP + codec — headers/SR only
 pip install -e ".[otel]"         # OpenTelemetry/OTLP export seam (the /metrics endpoint itself needs no extra)
 ```
 
-(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.1.0"`, and the web console installs from the source tree with `pip install -e packaging/messagefoundry-webconsole` — it is **not published to an index yet**, so installing it by bare name would resolve an unclaimed distribution.) SQLite is the zero-dependency default — you need no extra to run the sample config.
+(For a deployment wheel, the same extras apply: `pip install "messagefoundry[harness]==0.1.0"`, and the web console installs as its own wheel `pip install "messagefoundry-webconsole==0.2.15"`.) SQLite is the zero-dependency default — you need no extra to run the sample config.
 
 ### 3. Run the engine headless (dev)
 

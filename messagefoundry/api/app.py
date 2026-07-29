@@ -4942,8 +4942,7 @@ def create_app(
             # install, which is what actually works today and resolves no index at all.
             raise RuntimeError(
                 "serve_ui requires the web console, which is not installed. It ships as a separate "
-                "distribution: install it from the source tree with "
-                "`pip install -e packaging/messagefoundry-webconsole`, or set [api].serve_ui=false "
+                "distribution: `pip install messagefoundry-webconsole`, or set [api].serve_ui=false "
                 "to run JSON-only."
             ) from exc
 
