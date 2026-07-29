@@ -95,3 +95,117 @@ def test_scratch_venvs_do_not_hide_an_unpinned_pip_fetch(workflow: str) -> None:
         f"unpinned exactly like the deleted `pip install --upgrade pip`, but the scanner cannot see it. "
         f"ADR 0034 requires a visible dismissal over an invisible filter."
     )
+
+
+# --- the blocking gates' OWN toolchain -------------------------------------------------------------
+#
+# The tests above cover the lock-only scratch venvs. They say nothing about how the blocking jobs
+# install the scanners THEMSELVES, and that was its own gap: the pip-audit job — whose entire purpose
+# is proving nothing unpinned enters the tree — installed its auditor with a bare `pip install
+# pip-audit`, the DEP-1 step bootstrapped the resolver with a bare `uv`, semgrep rode a
+# compatible-release range, and gitleaks was a `curl | tar` with no integrity check. All four are
+# dependency intake that no audited lockfile covers, inside REQUIRED contexts.
+
+#: ``pip install`` invocations in these jobs must name an exact version. Interpreter-level installs
+#: (not into a lock-fed venv) can never be hash-verified, so `==` is the available control.
+_PINNED_INSTALL_JOBS = ("pip-audit", "bandit", "semgrep")
+
+
+def _run_bodies(workflow: str, job_key: str) -> list[str]:
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((_WORKFLOWS / workflow).read_text(encoding="utf-8"))
+    job = (wf.get("jobs") or {}).get(job_key)
+    assert job is not None, (
+        f"{workflow} has no job {job_key!r} — re-point this guard at whatever replaced it rather than "
+        f"letting it pass vacuously"
+    )
+    return [str(step["run"]) for step in (job.get("steps") or []) if "run" in step]
+
+
+@pytest.mark.parametrize("job_key", _PINNED_INSTALL_JOBS)
+def test_blocking_jobs_pin_the_tools_they_install(job_key: str) -> None:
+    """No bare or range-specified `pip install` inside a blocking security job.
+
+    An unpinned scanner changes its own findings between two runs of the SAME commit, which shows up
+    as a mystery red on an unrelated PR — the failure that got bandit pinned to 1.9.4 after an implicit
+    upgrade changed `# nosec` parsing and broke a green branch.
+    """
+    bodies = _run_bodies("security.yml", job_key)
+    assert bodies, f"job {job_key!r} has no run steps"
+
+    unpinned: list[str] = []
+    for body in bodies:
+        for line in body.splitlines():
+            code = line.strip()
+            if code.startswith("#") or "pip install" not in code:
+                continue
+            args = code.split("pip install", 1)[1]
+            # A requirements-file install is pinned BY the file, and the lock-only-venv tests above
+            # already assert --require-hashes on those. Checking the file's name for `==` here would
+            # flag `-r requirements.lock` — the most rigorously pinned install in the whole workflow.
+            if re.search(r"(?:^|\s)(?:-r|--requirement)\s", args) or "--require-hashes" in args:
+                continue
+            targets = [token.strip("\"'") for token in args.split() if not token.startswith("-")]
+            for target in targets:
+                # `pip` itself is the bootstrap the existing dismissal covers; a path target is a
+                # local install, not a registry fetch.
+                if target == "pip" or target.startswith(("/", ".")):
+                    continue
+                if "==" not in target:
+                    unpinned.append(f"{job_key}: {target!r} in {code!r}")
+
+    assert not unpinned, (
+        "a blocking security job installs a tool without an exact `==` pin:\n  "
+        + "\n  ".join(unpinned)
+        + "\nPin it (and bump deliberately, in a PR that also clears any new findings). A range like "
+        "`semgrep~=1.90` silently adopts every new minor, so the gate's behaviour changes without a "
+        "diff — and this is dependency intake no lockfile in the repo covers."
+    )
+
+
+def test_release_asset_downloads_in_blocking_jobs_are_checksum_verified() -> None:
+    """A version tag says WHICH artifact to fetch, not that the bytes are that artifact.
+
+    `curl … | tar -xz` inside a required gate executes third-party bytes with no integrity check. The
+    sbomqs step in this same workflow already verifies against the release's own checksums file, so any
+    download here must do the same.
+    """
+    yaml = pytest.importorskip("yaml")
+    wf = yaml.safe_load((_WORKFLOWS / "security.yml").read_text(encoding="utf-8"))
+    jobs = wf.get("jobs") or {}
+
+    checked = 0
+    offenders: list[str] = []
+    for job_key, job in jobs.items():
+        # Advisory jobs are out of scope here: they cannot turn a required context green while
+        # compromised. `trivy` is deliberately excluded for that reason and noted in its own comment.
+        if (job or {}).get("continue-on-error") is True:
+            continue
+        for step in (job or {}).get("steps") or []:
+            raw = str((step or {}).get("run") or "")
+            # Comments OUT before matching. A rationale comment in these workflows quotes the very
+            # command being prohibited (the gitleaks step explains the `curl | tar` it replaced), so a
+            # whole-body match reports the explanation as the offence — a detector counting itself.
+            body = "\n".join(line for line in raw.splitlines() if not line.strip().startswith("#"))
+            if "releases/download" not in body:
+                continue
+            checked += 1
+            name = (step or {}).get("name") or "<unnamed step>"
+            if "sha256sum -c" not in body:
+                offenders.append(f"security.yml:{job_key} — step {name!r} verifies no checksum")
+            if re.search(r"\|\s*tar\b", body):
+                offenders.append(
+                    f"security.yml:{job_key} — step {name!r} pipes the download straight into tar, "
+                    "so there is no file left to verify"
+                )
+
+    # Liveness: if no blocking job downloads a release asset any more, say so rather than pass on an
+    # empty scan.
+    print(f"[ci-venv-pinning] examined {checked} release-asset download step(s) in blocking jobs")
+    assert checked > 0, (
+        "no blocking job in security.yml downloads a release asset — if that is now true this guard is "
+        "obsolete, but an empty scan must not read as a pass"
+    )
+    assert not offenders, "unverified release-asset download in a blocking job:\n  " + "\n  ".join(
+        offenders
+    )

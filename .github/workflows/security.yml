@@ -60,7 +60,10 @@ jobs:
           python-version: "3.14"
       - name: Check the lockfile is in sync with pyproject (DEP-1)
         run: |
-          python -m pip install --upgrade pip uv
+          # uv is PINNED: it is the resolver that produces every lockfile this job then audits, so an
+          # unpinned upgrade lets a new resolver silently change the exported set mid-PR and reds the
+          # `git diff --exit-code` below for a reason unrelated to the change. Bump deliberately.
+          python -m pip install --upgrade pip "uv==0.12.0"
           # Fails if pyproject changed without re-running `uv lock` (drift guard).
           uv lock --check
           # Re-export to the same path and fail if it differs from what's committed (keeps the
@@ -86,7 +89,11 @@ jobs:
           /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
       - name: Audit the locked dependencies (DEP-1)
         run: |
-          pip install pip-audit
+          # PINNED. This job exists to prove nothing unpinned enters the tree, and it was installing
+          # its own auditor with a bare `pip install pip-audit` — dependency intake that none of the
+          # lockfiles it checks actually covers. `==` also makes the audit reproducible: an unpinned
+          # auditor can change its advisory database handling between two runs of the same commit.
+          python -m pip install --upgrade pip "pip-audit==2.10.1"
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           pip-audit -r requirements.lock --desc
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
@@ -326,13 +333,25 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0 # full history so the scan also covers earlier commits, not just the tip
-      - name: Install gitleaks (pinned)
+      - name: Install gitleaks (pinned + checksum-verified)
         run: |
           # Pin the release; bump deliberately. Verify the tag exists if this step 404s.
+          #
+          # VERIFIED, not just version-pinned. This was `curl ... | tar -xz` straight into a pipe: a
+          # tag pin says WHICH artifact to fetch, not that the bytes received are that artifact, and
+          # this runs inside a REQUIRED gate. The sbomqs step in this same file already had the answer
+          # (download the release's own checksums file and sha256sum -c it), so this was unfinished
+          # scope rather than an accepted risk. Mirroring that shape exactly.
           VER=8.18.4
-          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${VER}/gitleaks_${VER}_linux_x64.tar.gz" \
-            | tar -xz -C /tmp gitleaks
-          sudo install -m 0755 /tmp/gitleaks /usr/local/bin/gitleaks
+          asset="gitleaks_${VER}_linux_x64.tar.gz"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "$asset"
+          curl -sSfL "${base}/gitleaks_${VER}_checksums.txt" -o gitleaks_checksums.txt
+          # Keep the asset's canonical name: sha256sum -c verifies BY the filename in the line, so a
+          # renamed download would silently verify nothing.
+          grep " ${asset}$" gitleaks_checksums.txt | sha256sum -c -
+          tar -xzf "$asset" gitleaks
+          sudo install -m 0755 gitleaks /usr/local/bin/gitleaks
           gitleaks version
       - name: Scan repository for secrets
         run: gitleaks detect --config .gitleaks.toml --redact --verbose --no-banner
@@ -348,7 +367,12 @@ jobs:
           python-version: "3.14"
       - name: Run the MessageFoundry rules
         run: |
-          python -m pip install --upgrade pip "semgrep~=1.90"
+          # PINNED to an exact version, not `~=1.90`. A compatible-release range silently adopts every
+          # new 1.x, and a new semgrep release can add rules or change taint propagation — which reds a
+          # green PR for a reason that has nothing to do with its diff. Same posture as bandit==1.9.4
+          # above and zizmor==1.5.2: bump deliberately, in a PR that also clears any new findings.
+          # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
+          python -m pip install --upgrade pip "semgrep==1.172.0"
           # --error: any finding fails the step — and the job, now that this gate is blocking.
           # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
           # dangerous-sink rules as the engine.
