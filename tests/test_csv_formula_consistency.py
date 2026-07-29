@@ -253,8 +253,8 @@ def _spreadsheet_writer_sites_in(source: str) -> bool:
     return False
 
 
-def _is_skipped(path: Path) -> bool:
-    """True if `path` lies under a skipped directory, judged RELATIVE TO THE REPO ROOT.
+def _is_skipped(path: Path, root: Path = _REPO) -> bool:
+    """True if `path` lies under a skipped directory, judged RELATIVE TO `root`.
 
     Relative is load-bearing, and the absolute form is actively wrong. docs/WORKTREES.md puts sibling
     worktrees at `.claude/worktrees/<name>/`, so when the suite runs FROM one of them the checkout
@@ -265,8 +265,16 @@ def _is_skipped(path: Path) -> bool:
     Both directions still work relatively: from the main checkout a sibling worktree's file is
     `.claude/worktrees/<x>/foo.py` and is excluded; from inside a worktree the same file is
     `harness/foo.py` and is kept.
+
+    `root` is a PARAMETER rather than a hardcoded `_REPO` so the guard below can drive this exact
+    function from both vantage points using synthetic paths. That matters more than it looks: with
+    `_REPO` baked in, a test can only re-implement the rule and assert against its own copy — which
+    passes no matter what this function does. The two forms are also indistinguishable from the main
+    checkout (measured: both keep the same 960 files), so CI cannot tell them apart either, and a
+    silent revert to `path.parts` would go unnoticed everywhere. `scripts/security/scan_forbidden.py`
+    settled on the same repo-relative rule for the same reason.
     """
-    return bool(_SKIP_DIRS & set(path.relative_to(_REPO).parts))
+    return bool(_SKIP_DIRS & set(path.relative_to(root).parts))
 
 
 def _spreadsheet_writer_sites() -> set[str]:
@@ -534,21 +542,25 @@ def test_the_skip_filter_is_judged_relative_to_the_repo_root() -> None:
     Both directions are asserted here because fixing only one is what makes this subtle: the guard
     must still exclude a sibling worktree when run from the MAIN checkout, which is its whole purpose.
     Neither case is observable from the other, and CI only ever sees the main-checkout one.
+
+    Every assertion drives the SHIPPED `_is_skipped` via its `root` parameter, never a local
+    re-implementation of the rule. A copy of the rule inside the test would pass however the real
+    function behaves, which is the same defect one level up: a check that holds because of how it is
+    written rather than because of what the code does. Synthetic paths keep it filesystem-free, so
+    unlike `test_repo_root_scans_exclude_nested_worktrees` — which can only catch this when the suite
+    happens to run FROM a worktree — this one has teeth in CI.
     """
     main = Path("/repo")
     sibling = main / ".claude" / "worktrees" / "other" / "harness" / "report.py"
     own = main / "harness" / "report.py"
 
-    def skipped_relative_to(root: Path, path: Path) -> bool:
-        return bool(_SKIP_DIRS & set(path.relative_to(root).parts))
-
     # From the main checkout: a sibling worktree's file is excluded, our own is not.
-    assert skipped_relative_to(main, sibling), "a sibling worktree must not be scanned"
-    assert not skipped_relative_to(main, own), "the repo's own files must be scanned"
+    assert _is_skipped(sibling, main), "a sibling worktree must not be scanned"
+    assert not _is_skipped(own, main), "the repo's own files must be scanned"
 
     # From INSIDE that worktree the same file is `harness/report.py` — it must be scanned, not skipped.
     worktree = main / ".claude" / "worktrees" / "other"
-    assert not skipped_relative_to(worktree, sibling), (
+    assert not _is_skipped(sibling, worktree), (
         "running from a worktree must not exclude that worktree's own files"
     )
 
