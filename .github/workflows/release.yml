@@ -379,11 +379,39 @@ jobs:
           PYVER
           fi
 
-      - name: Attach the console wheel to the GitHub release
+      # CREATE-OR-UPDATE, and it must CREATE — unlike release-harness, this job has no `needs: release`,
+      # so on a `webconsole-v*` tag NO engine job has run and NO GitHub release exists. A bare
+      # `gh release upload` (what the harness can safely use, because `needs: release` guarantees the
+      # release) would fail with "release not found" on every console tag, killing the job BEFORE the
+      # publish step below — i.e. the one job whose purpose is to claim the PyPI name could never claim it.
+      #
+      # The update arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
+      # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
+      # re-run cannot even test the fix it exists to verify). Step ORDER is deliberate and matches the
+      # engine: the reversible action (a GitHub release, deletable) precedes the irreversible one (a PyPI
+      # upload burns that version forever).
+      - name: Create or update the console GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${GITHUB_REF_NAME}" webconsole-dist/*.whl --clobber
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#webconsole-v}"
+          # Notes come from the CONSOLE's own changelog, not the engine's — separate cadence, separate
+          # version root, separate release notes.
+          awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}'             packaging/messagefoundry-webconsole/CHANGELOG.md > notes.md || true
+          [ -s notes.md ] || echo "MessageFoundry web console $tag" > notes.md
+          case "$ver" in
+            *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
+            *)   pre_create="";             pre_edit="--prerelease=false" ;;
+          esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — updating in place (this is a re-run)."
+            gh release edit "$tag" --title "$tag" --notes-file notes.md "$pre_edit"
+            gh release upload "$tag" webconsole-dist/*.whl --clobber
+          else
+            gh release create "$tag" webconsole-dist/*.whl --title "$tag" --notes-file notes.md $pre_create
+          fi
 
       - name: Upload console artifact (dry-run / always)
         if: always()
