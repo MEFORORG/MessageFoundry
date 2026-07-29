@@ -10,9 +10,13 @@
 > Everything else in this ADR **stands**: the one-authority structure, the loopback carve-out
 > (decision 1 arm 1), the attestation (decision 3), the two-layer construction/send gating (decision 4)
 > and the no-loosen rule (decision 5) — which 0153 preserves *by construction*, since the only deleted
-> arm returned ALLOW. `MEFOR_ALLOW_INSECURE_TLS` itself is unhooked, not deleted: it survives for the
-> non-connection cells (engine→store TLS, LDAPS, the webhook alert sink, the AI broker, the `[logging]`
-> forwarder and the API PHI-read serve hop) that have nowhere to carry a per-connection declaration.
+> arm returned ALLOW. `MEFOR_ALLOW_INSECURE_TLS` itself is unhooked from the **cleartext** decision, not
+> deleted. It survives for the non-connection cells (engine→store TLS, LDAPS, the webhook alert sink, the
+> AI broker, the `[logging]` forwarder and the API PHI-read serve hop) that have nowhere to carry a
+> per-connection declaration, **and for the weakened-TLS cells** — `verify_tls=false` on
+> REST/SOAP/FHIR/DICOMweb, `tls_verify=false` on MLLP and FTPS, `trust_server_certificate` on the store.
+> A verify-off hop is encrypted-but-unauthenticated rather than cleartext, so it sits outside 0153's
+> stated scope: it keeps this ADR's clamped escape unchanged, and `cleartext_accepted` does not reach it.
 
 **Status:** Accepted (2026-07-11) — owner-ratified design (a prior design pass + an adversarial security
 critic set the decisions below; they are not re-litigated here). CORE built (BACKLOG #200): the shared

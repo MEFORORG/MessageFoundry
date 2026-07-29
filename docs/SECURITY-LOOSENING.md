@@ -64,7 +64,7 @@ section reference.
 | | `production_instance` | *derived from environment* |
 | Outside `[security]` | `[store].aad_bind` | `true` (at-rest values bound to their cell) |
 | | `[auth].ad_session_recheck_seconds` | `300` s (*conditional* — a loosening only once `ad_enabled`) |
-| Per-connection | `cleartext_accepted` | `false` on every outbound (*connection-scoped* — see below) |
+| Per-connection | `cleartext_accepted` | `false` on every outbound / `FhirLookup` (*connection-scoped* — see below) |
 
 **Three of these do not live in `[security]`.** `[store].aad_bind` and `[auth].ad_session_recheck_seconds`
 sit in their own sections for cohesion, and `cleartext_accepted` is a per-**connection** field, not a
@@ -73,6 +73,15 @@ posture, loosen only* — a deviation the registry cannot see is a second postur
 first two are named by `security_loosenings()` from the loaded `[store]`/`[auth]` sections; the third is
 resolved from the loaded connection graph and passed in by name (see its entry below for exactly which
 surfaces see it, and which cannot).
+
+> **Scope, stated plainly.** The registry covers *every* `[security]` switch (a completeness floor in
+> `tests/test_security_posture_defaults.py` fails on an unreported, unexempted one) plus the three
+> enumerated deviations above. It is **not yet** an exhaustive register of every security-relevant
+> switch in every section: `[store].encrypt` / `trust_server_certificate` and
+> `[auth].enabled` / `require_mfa` / `ad_tls_verify` / `ad_allow_insecure_ldap` /
+> `oidc_require_mfa_claim` are gated by their own serve-time refusals and are **not** reported here.
+> That gap is enumerated in the floor test's exemption set, so it is a written decision rather than an
+> accident, and a *new* switch in either section cannot join it silently. Closing it is owed work.
 
 `enforcement` (ADR 0148 GIVEN 2) is the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
 escape-clamp key, defaulting to `enforce` (byte-identical to the former production-tier refusal). It is
@@ -287,7 +296,10 @@ trail.
 - **When acceptable:** when you need the frozen `mfenc:v1` at-rest format specifically — a byte-identical
   restore target, an external tool that parses the v1 marker, or a forensic comparison against a v1
   backup. It is also a no-op either way with **no `[store].encryption_key`**: the identity cipher has no
-  tag to bind, so on a keyless store this switch changes nothing and reports nothing.
+  tag to bind, so on a keyless store this switch changes nothing. The registry still *reports* it (the
+  key is env-only and not on `[store]`, so `security_loosenings()` cannot gate on it) — the risk text
+  carries the caveat instead, so a keyless dev box reads "no effect without a store key" rather than a
+  weakness it does not have.
 - **Compensating controls:** database-level access control (the cell-move attack needs store write
   access); `[store].cipher_provider = "vault_transit"`, which binds the AAD **unconditionally**
   (`mfenc:v3`) regardless of this switch; the tamper-evident audit chain, which detects reordering of
@@ -316,10 +328,11 @@ trail.
   design, so it was never a substitute for these.
 - **See:** [ADR 0079](adr/0079-kerberos-idp-session-coordination.md) (2026-07-28 amendment).
 
-### `cleartext_accepted = true` on an outbound connection — a declared cleartext hop
+### `cleartext_accepted = true` on a connection — a declared cleartext hop
 > **Connection-scoped, unlike every other entry here.** It is not a `[security]` switch; it is a field on
-> one outbound connection, declared next to the host it governs, with a mandatory `cleartext_reason`
-> recorded for the audit trail. [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
+> one connection — an `outbound(...)` or a `FhirLookup(...)` — declared next to the host it governs, with
+> a mandatory `cleartext_reason` recorded for the audit trail.
+> [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md).
 - **What you lose:** the payload — and any credential that connection carries — crosses that hop
   **unencrypted and unauthenticated**, readable and modifiable by anything on the path. There is no
   partial protection here: it is plaintext PHI on the wire for that connection.
@@ -329,25 +342,40 @@ trail.
   (BACKLOG #311). For MLLP / HTTP / DICOM / SMTP / FTP it should be **transitional** — it names work to
   be done, and it should disappear when the peer gains TLS.
 - **Do not use it to describe a hop that *is* secure.** If a proxy terminates TLS in front of the hop, or
-  the segment is genuinely isolated, that is `tls_hop_attested` — a different field, with the opposite
-  claim, that ALLOWs the hop silently. The two are deliberately separate so the audit trail can tell a
-  proxy-terminated hop from plaintext on a flat network. Writing an attestation about a hop that is not
-  secure puts a false statement into the one field that exists to be trustworthy when audited.
+  the segment is genuinely isolated, that is a different claim entirely — `tls_hop_attested`, which ALLOWs
+  the hop silently. The two are deliberately separate so the audit trail can tell a proxy-terminated hop
+  from plaintext on a flat network. Writing an attestation about a hop that is not secure puts a false
+  statement into the one field that exists to be trustworthy when audited.
+  **Note (accurate as of 2026-07-28):** `tls_hop_attested` has **no authoring surface on a connection**
+  today — no transport factory takes it and it is not a `connections.toml` key, so an inbound/outbound
+  cannot set it (the `[logging].forward_hop_attested` sibling *is* settable). `cleartext_accepted` is
+  therefore the only per-connection declaration an operator can currently write. Giving attestation an
+  authoring surface would add a **silent-ALLOW** loosening and needs its own registry entry here first;
+  it is owed, not shipped.
 - **Compensating controls:** network segmentation and physical/link-layer controls on that specific path;
   narrow the blast radius by declaring it on the single connection that needs it rather than broadly.
-- **It is never silent:** WARN + a dedicated audit record at **every** connector construction (naming the
-  connection, the host:port and the reason), a `cleartext-accepted` line in `messagefoundry check`
-  listing the **whole** accepted set, and a `cleartext_accepted` entry in `GET /security/posture`'s
-  loosening list naming every declaring connection.
+- **It is never silent:** WARN + a dedicated record at **every** connector construction, naming the
+  declaring connection, the cell, the host and the reason; a `cleartext-accepted` line in
+  `messagefoundry check` listing the **whole** accepted set (outbound connections *and* `FhirLookup`
+  read connections); and a `cleartext_accepted` entry in `GET /security/posture`'s loosening list naming
+  every declaring connection. The construction record is a distinct WARNING **log line**, not a
+  tamper-evident `audit` table row — the hop decision is pure `config/`-level code and cannot reach the
+  engine's store across the one-way dependency boundary. The ADR 0092 attestation record has the same
+  shape for the same reason.
 - **Where it is NOT reported, and why:** `messagefoundry security show` reads a settings file and never
   loads the connection graph, so it cannot see these declarations; it says so explicitly in its
   `loosenings_scope` output rather than reporting a settings-only list as if it were the whole posture.
+  `GET /security/posture` carries the same `loosenings_scope` marker in the one case it is blind — an
+  engine with no loaded graph (an embedding, or a query before start); it is `null` on a running engine.
   The `serve`-time loosening warning fires before the graph is loaded for the same reason — the
   construction gate's own per-connection WARN covers it moments later, at startup, with more detail.
 - **What it cannot do:** it never yields ALLOW. An accepted hop is always a WARN, so it can never become
   invisible — an accepted risk that stops being visible has stopped being accepted and started being
-  forgotten. It also cannot relax a hop the ADR does not govern: inbound binds are still decided by the
-  exposed-gates, and revocation / weakened-TLS refusals are unaffected.
+  forgotten. It also cannot relax a hop ADR 0153 does not govern: inbound binds are still decided by the
+  exposed-gates, and **revocation / weakened-TLS (`verify_tls = false`) refusals are unaffected** — a
+  verify-off hop is encrypted-but-unauthenticated, not cleartext, so it keeps the clamped
+  `MEFOR_ALLOW_INSECURE_TLS` escape and this declaration does not reach it. Nor does it reach an SMTP
+  `AUTH` over cleartext, which is refused outright.
 
 ---
 
