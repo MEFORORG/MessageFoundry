@@ -194,6 +194,12 @@ def outbound_headers_from_metadata(metadata: Mapping[str, str] | None) -> dict[s
 # the first delivery. 8 KiB comfortably exceeds any legitimate endpoint URL or Basic/Bearer credential.
 MAX_OUTBOUND_URL_LEN = 8192
 MAX_OUTBOUND_HEADER_VALUE_LEN = 8192
+# Header NAMES are bounded too. Values were bounded from the start, but a name is equally
+# attacker-influenceable at send time -- ``outbound_headers_from_metadata`` derives it from a
+# message-metadata key suffix, and ``_HEADER_NAME_TOKEN`` bounds its CHARSET, not its length. An
+# unbounded name overflows the same header block the value bound exists to protect. Generous: the
+# longest name anything here emits is ``X-Idempotency-Key``.
+MAX_OUTBOUND_HEADER_NAME_LEN = 256
 
 # 4xx statuses worth retrying anyway: the server is up but momentarily unwilling, not a hard reject.
 _RETRYABLE_4XX = frozenset({408, 429})
@@ -491,23 +497,164 @@ def refuse_unrevoked_verified_hop(
     ).enforce_construction()
 
 
+@dataclass(frozen=True, slots=True)
+class OutboundLengthViolation:
+    """One over-length outbound value: which kind, which name, how long, against what limit.
+
+    Measurement is separated from raising because the SAME measurement serves two gates with
+    different disclosure rules. At construction every value is operator-supplied, so the message may
+    name the offending header. At send time a header name can be message-derived, so it may not —
+    see :func:`enforce_send_time_length_limits`.
+    """
+
+    kind: str  # "url" | "header-name" | "header-value"
+    name: str
+    length: int
+    limit: int
+
+
+def find_outbound_length_violation(
+    url: str, headers: Mapping[str, str]
+) -> OutboundLengthViolation | None:
+    """The pure measurement behind both length gates: the FIRST violation, or ``None``."""
+    if len(url) > MAX_OUTBOUND_URL_LEN:
+        return OutboundLengthViolation("url", "", len(url), MAX_OUTBOUND_URL_LEN)
+    for name, value in headers.items():
+        if len(name) > MAX_OUTBOUND_HEADER_NAME_LEN:
+            return OutboundLengthViolation(
+                "header-name", name, len(name), MAX_OUTBOUND_HEADER_NAME_LEN
+            )
+        if len(value) > MAX_OUTBOUND_HEADER_VALUE_LEN:
+            return OutboundLengthViolation(
+                "header-value", name, len(value), MAX_OUTBOUND_HEADER_VALUE_LEN
+            )
+    return None
+
+
 def enforce_outbound_length_limits(url: str, headers: dict[str, str]) -> None:
     """Reject an over-length outbound URL or request-header value at connector construction (ASVS
     4.2.5). Shared by the REST and SOAP destinations (SOAP reuses REST's HTTP plumbing). Raises
     :class:`ValueError` with a PHI-free message naming only the limit and the offending header name —
-    never the value (a header may carry a credential)."""
-    if len(url) > MAX_OUTBOUND_URL_LEN:
+    never the value (a header may carry a credential).
+
+    This gate sees only what is **statically configured**. Everything added later — per-message
+    headers, a per-call FHIR URL, the server-minted SMART bearer, the detached-JWS headers — is
+    bounded by :func:`enforce_send_time_length_limits` instead.
+    """
+    violation = find_outbound_length_violation(url, headers)
+    if violation is None:
+        return
+    if violation.kind == "url":
         raise ValueError(
-            f"outbound URL is {len(url)} chars, over the {MAX_OUTBOUND_URL_LEN}-char limit; "
+            f"outbound URL is {violation.length} chars, over the {violation.limit}-char limit; "
             "check the configured 'url' / its env() value"
         )
-    for name, value in headers.items():
-        if len(value) > MAX_OUTBOUND_HEADER_VALUE_LEN:
-            raise ValueError(
-                f"outbound header {name!r} is {len(value)} chars, over the "
-                f"{MAX_OUTBOUND_HEADER_VALUE_LEN}-char limit; check the configured header / "
-                "credential value"
+    if violation.kind == "header-name":
+        # The name itself is the over-length value, so it is summarised rather than echoed.
+        raise ValueError(
+            f"an outbound header NAME is {violation.length} chars, over the "
+            f"{violation.limit}-char limit; check the configured headers"
+        )
+    raise ValueError(
+        f"outbound header {violation.name!r} is {violation.length} chars, over the "
+        f"{violation.limit}-char limit; check the configured header / credential value"
+    )
+
+
+def enforce_send_time_length_limits(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    connector: str,
+    message_header_names: frozenset[str] = frozenset(),
+    url_is_message_derived: bool = False,
+    minted_credential_names: frozenset[str] = frozenset(),
+) -> None:
+    """Re-measure the FINAL request line and header block, immediately before it goes on the wire.
+
+    Three classes of value are added AFTER the construction gate and are unbounded without this:
+    per-message headers merged from message metadata, the per-call URL a FHIR read builds, and the
+    server-minted SMART bearer / detached-JWS headers stamped in just before the request is built.
+
+    **The failure class decides the disposition, so it is computed, not guessed:**
+
+    * *message-derived* → a **permanent** reject. The same message overflows on every retry, so
+      retrying is a guaranteed-futile loop that also keeps the lane busy.
+    * *server-minted credential* → **permanent + credential_fault**, so the delivery worker applies
+      ``credential_fault_policy`` instead of hammering the IdP. A plain transient would re-sign a
+      client assertion and POST the token endpoint on every retry, forever.
+    * *anything else* → a plain :class:`DeliveryError`. Static values are already caught at
+      construction, so this arm is belt-and-braces.
+
+    **The message-derived arm must not name the offending header.** At construction a header name is
+    operator-static; at send time ``outbound_headers_from_metadata`` derives it from a message-
+    metadata key suffix (``_HEADER_NAME_TOKEN`` bounds the charset, not the content). This message
+    travels through ``safe_exc`` into ``last_error`` and ``message_events.detail``, and on the
+    ``DeliveryError`` arm through ``_note_lane_unhealthy`` → ``connection_error`` → the webhook
+    AlertSink, i.e. **off-box**. ``redaction.py`` concedes single-token identifiers are its
+    acknowledged residual, so only the class and the length may leave.
+    """
+    violation = find_outbound_length_violation(url, headers)
+    if violation is None:
+        return
+
+    if violation.kind == "url":
+        if url_is_message_derived:
+            raise NegativeAckError(
+                f"{connector} built a {violation.length}-char request URL, over the "
+                f"{violation.limit}-char limit",
+                code="MF-URI-LEN",
+                permanent=True,
             )
+        raise DeliveryError(
+            f"{connector} request URL is {violation.length} chars, over the "
+            f"{violation.limit}-char limit"
+        )
+
+    if violation.name in minted_credential_names:
+        raise NegativeAckError(
+            f"{connector} minted a {violation.length}-char {violation.name} header, over the "
+            f"{violation.limit}-char limit",
+            code="MF-HDR-LEN",
+            permanent=True,
+            credential_fault=True,
+        )
+
+    if violation.name in message_header_names:
+        # Class + length ONLY -- never violation.name. See the docstring.
+        kind = "name" if violation.kind == "header-name" else "value"
+        raise NegativeAckError(
+            f"{connector} built a per-message request-header {kind} of {violation.length} chars, "
+            f"over the {violation.limit}-char limit",
+            code="MF-HDR-LEN",
+            permanent=True,
+        )
+
+    raise DeliveryError(
+        f"{connector} request header {violation.name!r} is {violation.length} chars, over the "
+        f"{violation.limit}-char limit"
+    )
+
+
+def enforce_signature_header_limits(signer: object | None, *, connector: str) -> None:
+    """Bound the detached-JWS headers at **construction** (ASVS 4.2.5).
+
+    Construction is the right place because the signature header's length is **message-independent**:
+    the JWS is detached, so the body contributes only its fixed-width hash. An RS256 header measured
+    over an empty body is the same length as one over a 100 KB body, which is exactly what
+    ``test_signature_header_length_is_message_independent`` pins. Re-measuring per send would burn a
+    signing operation on the hot path to re-derive an answer that cannot change.
+
+    An over-length signature header is therefore a **configuration** fault (an absurd ``sign_key_id``
+    is the reachable cause), and surfaces as the same ``ValueError`` the rest of the construction gate
+    raises — before the connector is ever handed a message.
+    """
+    if signer is None:
+        return
+    headers = getattr(signer, "signature_headers", None)
+    if headers is None:  # pragma: no cover - every MessageSigner implements it
+        return
+    enforce_outbound_length_limits("", dict(headers(b"")))
 
 
 # --- forward/egress web proxy (BACKLOG #112/#127/#128, ADR 0126) -----------------------------------
@@ -881,6 +1028,9 @@ class RestDestination(DestinationConnector):
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
+        # Message-independent, so they are bounded once here rather than on every send.
+        enforce_signature_header_limits(self._signer, connector="REST destination")
         # ADR 0024 + #65: opt-in bearer-token auth — SMART Backend Services (asymmetric JWT) OR OAuth2
         # client-credentials (symmetric secret), unified behind the one bearer seam. None = off (byte-
         # identical). Lazy import breaks the rest <-> http_auth/smart cycle (they reuse rest's opener);
@@ -1087,6 +1237,34 @@ class RestDestination(DestinationConnector):
                 self.url, data=data, headers=headers, method=self.method
             )
         )
+        # ASVS 4.2.5: bound what ACTUALLY ships. The construction gate saw only the static config; the
+        # per-message headers, the SMART bearer and the JWS headers above are all added after it.
+        # Measured on req.full_url rather than self.url because _ech_request re-addresses the request
+        # at the sidecar, so self.url is not what goes on the wire.
+        try:
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"REST {_redact_url(self.url)}",
+                message_header_names=frozenset(dynamic_headers or ()),
+                # Classification keys on the header NAME, which is sound only because
+                # outbound_headers_from_metadata REFUSES to emit Authorization (see
+                # _HEADER_NAME_TOKEN's call site). If that refusal is ever removed, a message could
+                # impersonate the credential class and convert its own permanent failure into an
+                # unbounded retry.
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                # The provider CACHES (see smart.py's access_token). Without dropping it, every retry
+                # re-sends the byte-identical over-length token and the failure is unfixable by any
+                # amount of retrying.
+                self._token_provider.invalidate()
+            raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 # Read the body (drains the connection for clean close; returned for capture). 2xx ⇒

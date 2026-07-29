@@ -88,6 +88,8 @@ from messagefoundry.transports.rest import (
     capture_response_headers,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    enforce_send_time_length_limits,
+    enforce_signature_header_limits,
     normalize_header_allowlist,
     refuse_cleartext_credential_hop,
     refuse_cleartext_credentials,
@@ -356,6 +358,9 @@ class SoapDestination(DestinationConnector):
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
         # signature is minted in _post over the FINAL wire bytes (the WS-* wrapped envelope, ADR 0015).
         self._signer: MessageSigner | None = signer_from_destination(config)
+        # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
+        # Message-independent, so they are bounded once here rather than on every send.
+        enforce_signature_header_limits(self._signer, connector="SOAP destination")
 
         # #201 (ADR 0078 amendment): the verify-ON https hops below (mTLS + the shared verifying opener)
         # validate the peer cert but do no OCSP/CRL revocation (stdlib ssl has none) — refuse an
@@ -746,6 +751,24 @@ class SoapDestination(DestinationConnector):
             headers=headers,
             method="POST",
         )
+        # ASVS 4.2.5: bound what actually ships. SOAP has no message-derived header class (see send()
+        # -- metadata is documented as unused here), so the only values added after the construction
+        # gate are the minted bearer and the JWS headers.
+        try:
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"SOAP {_redact_url(self.url)}",
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 body = resp.read().decode(self.encoding, errors="replace")

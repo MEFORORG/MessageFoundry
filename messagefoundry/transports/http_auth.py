@@ -51,6 +51,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    enforce_outbound_length_limits,
     proxy_auth_handler_from_settings,
     refuse_cleartext_credential_hop,
 )
@@ -229,6 +230,10 @@ class OAuth2ClientCredentialsProvider:
             form["client_id"] = self.client_id
             form["client_secret"] = self._client_secret
         data = urllib.parse.urlencode(form).encode("ascii")
+        # ASVS 4.2.5: the token URL and the Basic client-credential header are operator-supplied via
+        # env(), so an env value that resolved to an unexpected blob would otherwise surface as an
+        # opaque IdP-side failure on the first mint rather than as a clear config error.
+        enforce_outbound_length_limits(self.token_url, dict(headers))
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) above
             self.token_url, data=data, headers=headers, method="POST"
         )

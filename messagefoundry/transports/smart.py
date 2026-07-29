@@ -55,6 +55,7 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    enforce_outbound_length_limits,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -203,6 +204,11 @@ class SmartBackendTokenProvider:
         if self.scope:
             form["scope"] = self.scope
         data = urllib.parse.urlencode(form).encode("ascii")
+        # ASVS 4.2.5: the token URL is operator-supplied via env(), and the signed client assertion
+        # rides the FORM body (not a header), so only the URL and the proxy credential are measurable
+        # here -- both are config, so a blob-valued env() surfaces as a config error rather than an
+        # opaque IdP failure on the first mint.
+        enforce_outbound_length_limits(self.token_url, dict(self._proxy_auth))
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             self.token_url,
             data=data,

@@ -20,6 +20,7 @@ from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
 from messagefoundry.config.wiring import Rest, WiringError
 from messagefoundry.pipeline.wiring_runner import check_egress_allowed
 from messagefoundry.transports import build_destination
+from messagefoundry.transports import rest as rest_mod
 from messagefoundry.transports.base import DeliveryError, NegativeAckError
 from messagefoundry.transports.rest import RestDestination
 
@@ -139,6 +140,161 @@ def test_rest_rejects_over_length_header_value() -> None:
     # the message names the header — never its value (it may be a secret).
     with pytest.raises(ValueError, match="outbound header 'Authorization'"):
         _dest(bearer_token="x" * 9000)
+
+
+# --- ASVS 4.2.5: the SEND-TIME half of the length bound -------------------------------------------
+#
+# The construction gate above sees only statically configured values. Three classes are added AFTER
+# it — per-message headers, the server-minted SMART bearer, and the detached-JWS headers — and were
+# unbounded until the send-time gate. Each test below names the mutation that reds it.
+
+
+async def test_rest_over_length_message_header_is_a_permanent_nak() -> None:
+    """Mutation: delete the `enforce_send_time_length_limits` call in `_post`. Red: DID NOT RAISE —
+    the send completes and ships a 9000-char header. Permanent, not transient: the same message
+    overflows on every retry, so retrying is a guaranteed-futile loop that also holds the lane."""
+    dest = _dest()
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x", metadata={"http.header.X-Case-Ref": "v" * 9000})
+    assert exc.value.permanent is True
+    assert exc.value.credential_fault is False
+    assert "over the 8192-char limit" in str(exc.value)
+
+
+async def test_the_message_header_arm_never_names_the_header() -> None:
+    """PHI egress. At construction a header name is operator-static, so naming it is safe. At send
+    time `outbound_headers_from_metadata` derives it from a message-metadata key suffix, and this
+    string reaches `last_error`, `message_events.detail` and — on the DeliveryError arm — the webhook
+    AlertSink, i.e. OFF-BOX. Only the class and the length may leave.
+
+    Mutation: put `violation.name` back in the message-derived branch. Red: the `not in` below."""
+    dest = _dest()
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x", metadata={"http.header.X-Patient-MRN-12345": "v" * 9000})
+    text = str(exc.value)
+    assert "X-Patient-MRN-12345" not in text
+    assert "MRN" not in text
+    assert "per-message request-header value of 9000 chars" in text
+
+
+async def test_rest_send_time_gate_does_not_disturb_the_ordinary_path() -> None:
+    """Byte-identity control. Mutation: drop MAX_OUTBOUND_HEADER_VALUE_LEN to 64 — the 100-char
+    header below reds, proving the gate is on the ordinary path and not dead code."""
+    dest = _dest(headers={"X-Idempotency-Key": "k" * 100})
+    opener = _FakeOpener()
+    dest._opener = opener  # type: ignore[assignment]
+    await dest.send("x", metadata={"http.header.X-Case-Ref": "ok"})
+    assert len(opener.requests) == 1
+    assert opener.requests[0].full_url == URL
+
+
+async def test_the_first_violation_found_is_the_dynamic_one_not_content_type(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control, and it is fiddly for a reason. `_build_headers` seeds `Content-Type:
+    application/json` FIRST and `_post` does `dict(self._headers)` then `.update(dynamic)`, so with
+    the limit patched below Content-Type's own length the FIRST violation found is Content-Type — a
+    connection-static value, which raises the *base* DeliveryError and would make this test assert
+    the wrong arm entirely. `application/json` is 16 chars, so the limit is patched to 18 and the
+    dynamic value made 20. Construct FIRST, patch SECOND: patching before construction would trip the
+    construction gate instead."""
+    dest = _dest()
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    monkeypatch.setattr(rest_mod, "MAX_OUTBOUND_HEADER_VALUE_LEN", 18)
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x", metadata={"http.header.X-Case-Ref": "v" * 20})
+    assert "20 chars" in str(exc.value)
+    assert "Content-Type" not in str(exc.value)
+
+
+async def test_rest_over_length_minted_bearer_is_a_credential_fault_and_is_invalidated() -> None:
+    """The only test that proves PLACEMENT. Mutation: move the guard from `_post` back into `send`
+    (the naive fix). Red: DID NOT RAISE — `send` cannot see a bearer the provider mints inside
+    `_post`.
+
+    `credential_fault=True`, not a plain transient: the provider CACHES, so without `invalidate()`
+    every retry re-sends the byte-identical over-length token forever; and with `invalidate()` but no
+    `credential_fault`, every retry re-signs a client assertion and POSTs the IdP forever. The
+    delivery worker's `credential_fault_policy` exists to stop exactly that re-auth storm."""
+
+    class _Provider:
+        def __init__(self) -> None:
+            self.token: str | None = "T" * 9000
+            self.invalidated = False
+
+        def access_token(self) -> str:
+            return self.token or ""
+
+        def invalidate(self) -> None:
+            self.invalidated = True
+            self.token = None
+
+    dest = _dest()
+    provider = _Provider()
+    dest._token_provider = provider  # type: ignore[assignment]
+    dest._opener = _FakeOpener()  # type: ignore[assignment]
+    with pytest.raises(NegativeAckError) as exc:
+        await dest.send("x")
+    assert exc.value.permanent is True
+    assert exc.value.credential_fault is True
+    assert provider.invalidated is True
+    assert "T" * 20 not in str(exc.value)  # never echo the credential
+
+
+def _signing_pem() -> str:
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+
+    return (
+        rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        .private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        .decode("ascii")
+    )
+
+
+def _signing_dest(pem: str, key_id: str) -> RestDestination:
+    """Built from FLAT ``sign_*`` settings — the `Rest()` spec has no signing arm, and
+    ``signer_from_destination`` falls back to these for a directly-built Destination."""
+    d = build_destination(
+        Destination(
+            name="OB_REST_SIGNED",
+            type=ConnectorType.REST,
+            settings={"url": URL, "sign_private_key": pem, "sign_key_id": key_id},
+        )
+    )
+    assert isinstance(d, RestDestination)
+    return d
+
+
+def test_over_length_sign_key_id_is_refused_at_construction() -> None:
+    """An absurd `sign_key_id` is the reachable cause of an over-length signature header, and it is a
+    CONFIG fault — caught before the connector is ever handed a message.
+
+    Mutation: delete the `enforce_signature_header_limits` call in `RestDestination.__init__`. Red:
+    DID NOT RAISE."""
+    with pytest.raises(ValueError, match="over the 8192-char limit"):
+        _signing_dest(_signing_pem(), "k" * 9000)
+
+
+def test_signature_header_length_is_message_independent() -> None:
+    """This is what legitimises bounding the signature at CONSTRUCTION rather than per send: the JWS
+    is detached, so the body contributes only its fixed-width hash.
+
+    Mutation: make the JWS attached (sign over the body instead of its digest). Red: the set below
+    grows and `assert len(...) == 1` fails."""
+    signer = _signing_dest(_signing_pem(), "k1")._signer
+    assert signer is not None
+    lengths = {
+        len(next(iter(signer.signature_headers(body).values())))
+        for body in (b"", b"x" * 10, b"y" * 100_000)
+    }
+    assert len(lengths) == 1, f"signature header length varies with the body: {lengths}"
 
 
 def test_rest_verify_tls_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:

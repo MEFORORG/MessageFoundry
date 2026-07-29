@@ -71,6 +71,9 @@ from messagefoundry.transports.rest import (
     capture_response_headers,
     egress_route_from_settings,
     enforce_outbound_length_limits,
+    enforce_send_time_length_limits,
+    enforce_signature_header_limits,
+    find_outbound_length_violation,
     normalize_header_allowlist,
     outbound_headers_from_metadata,
     refuse_cleartext_credentials,
@@ -279,6 +282,9 @@ class FhirDestination(DestinationConnector):
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing; None = off (byte-identical). Built here so
         # a bad key fails loud at construction; the signature is minted in _post over the body bytes.
         self._signer: MessageSigner | None = signer_from_destination(config)
+        # ASVS 4.2.5: the detached-JWS headers are added after the URL/header gate above.
+        # Message-independent, so they are bounded once here rather than on every send.
+        enforce_signature_header_limits(self._signer, connector="FHIR destination")
         # ADR 0024 + #65: opt-in bearer-token auth — SMART (asymmetric JWT) OR OAuth2 client-credentials
         # (symmetric secret), unified behind the one bearer seam. None = off (byte-identical). Lazy import
         # breaks the rest <-> http_auth/smart cycle; built here so a bad key/secret/token_url fails loud.
@@ -519,6 +525,28 @@ class FhirDestination(DestinationConnector):
             # ASVS 4.1.5 (ADR 0018): detached JWS over the body bytes, minted off-loop past the queue
             # boundary so a retry re-mints it (re-run purity holds).
             headers = {**headers, **self._signer.signature_headers(data)}
+        # ASVS 4.2.5: FHIR is the one destination whose URL is genuinely per-message -- _resolve_request
+        # builds it from the resource type and id, and _FHIR_TYPE_RE bounds that grammar but not its
+        # LENGTH. The construction gate only ever saw base_url, so without this a crafted resourceType
+        # ships an unbounded request line. Placed before the try below because these raise
+        # NegativeAckError/DeliveryError, which its handlers deliberately do not catch.
+        try:
+            enforce_send_time_length_limits(
+                url,
+                headers,
+                connector=f"FHIR {_redact_url(self.base_url)}",
+                url_is_message_derived=True,
+                message_header_names=frozenset(extra_headers),
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
         try:
             req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
                 url,
@@ -742,6 +770,10 @@ class FhirLookupExecutor:
             # ASVS 12.2.1: a cleartext read pulls the PHI resource/searchset back over the wire, so a
             # cleartext http read to a non-loopback host is refused too (loopback stays byte-identical).
             self._hop_guard[cname] = refuse_cleartext_egress(scheme, url, attested=attested)
+            # ASVS 4.2.5: this executor never called the construction gate at all -- fhir.py's only
+            # call site was the DESTINATION's __init__, so a lookup connection's base URL and static
+            # headers were unbounded on both sides.
+            enforce_outbound_length_limits(url, headers)
             self._headers[cname] = headers
             self._token[cname] = token
             if bool(s.get("verify_tls", True)):
@@ -834,6 +866,19 @@ class FhirLookupExecutor:
         token = self._token[connection]
         if token is not None:
             headers["Authorization"] = f"Bearer {token.access_token()}"
+        # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
+        # engine, and the minted bearer is added just above -- neither was ever measured. A
+        # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no
+        # message to dead-letter, the Handler sees the failure directly. The message carries the class
+        # and the length only, never the URL or the header name -- a lookup query can carry PHI.
+        violation = find_outbound_length_violation(url, headers)
+        if violation is not None:
+            if violation.name == "Authorization" and token is not None:
+                token.invalidate()  # cached; without this every retry re-sends the same bad token
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: the built {violation.kind} is {violation.length} "
+                f"chars, over the {violation.limit}-char limit"
+            )
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             url, headers=headers, method="GET"
         )
@@ -886,6 +931,19 @@ class FhirLookupExecutor:
         token = self._token[connection]
         if token is not None:
             headers["Authorization"] = f"Bearer {token.access_token()}"
+        # ASVS 4.2.5. ``url`` here is built per call, so it is the most message-derived URL in the
+        # engine, and the minted bearer is added just above -- neither was ever measured. A
+        # FhirLookupError (not a delivery error) because this read runs inside a Handler: there is no
+        # message to dead-letter, the Handler sees the failure directly. The message carries the class
+        # and the length only, never the URL or the header name -- a lookup query can carry PHI.
+        violation = find_outbound_length_violation(url, headers)
+        if violation is not None:
+            if violation.name == "Authorization" and token is not None:
+                token.invalidate()  # cached; without this every retry re-sends the same bad token
+            raise FhirLookupError(
+                f"fhir_lookup on {connection!r}: the built {violation.kind} is {violation.length} "
+                f"chars, over the {violation.limit}-char limit"
+            )
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             url, headers=headers, method="GET"
         )

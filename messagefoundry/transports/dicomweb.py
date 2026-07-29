@@ -206,6 +206,10 @@ class DicomWebDestination(DestinationConnector):
             )
             self._opener = _insecure_opener(*proxy_handlers)
         self._target_url = self._resolve_target_url()
+        # ASVS 4.2.5: the gate above measured base_url, but _target_url is DERIVED from it 33 lines
+        # later and is what actually ships on every STOW-RS POST and OPTIONS probe. Bounding only the
+        # base left the derived URL unmeasured -- an ordering gap, not a missing call.
+        enforce_outbound_length_limits(self._target_url, self._headers)
 
     def _resolve_target_url(self) -> str:
         """``{base}/studies`` (server assigns the study) or ``{base}/studies/{study_uid}`` when set."""
