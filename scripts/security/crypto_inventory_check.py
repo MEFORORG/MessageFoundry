@@ -85,6 +85,12 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the anonymizer's pseudonymization is consistent-within-a-dataset yet one-way (re-id-resistant).
     "messagefoundry/anon/keying.py": frozenset({"hashlib"}),
     "messagefoundry/api/tls.py": frozenset({"ssl"}),
+    # ASVS 12.1.1: the startup TLS-floor probe. Client contexts ONLY, and deliberately weakened ones —
+    # a withdrawn-version offer (minimum==maximum==TLSv1/1.1) at ALL:@SECLEVEL=0 with CERT_NONE, so the
+    # ClientHello is actually sent and an untrusted internal CA cannot abort before the version is
+    # settled. It measures the operator's proxy and carries NO application data; the contexts are built,
+    # used for one handshake, and never returned. Not a data path — do not reuse these settings.
+    "messagefoundry/config/tls_probe.py": frozenset({"ssl"}),
     "messagefoundry/auth/ldap.py": frozenset({"ssl"}),
     # ADR 0142 (OIDC relying party, BACKLOG #274): the federated-SSO layer.
     #   claims.py — hmac.compare_digest for the constant-time nonce comparison; cryptography only for

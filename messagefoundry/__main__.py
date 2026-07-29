@@ -1921,6 +1921,69 @@ def _serve(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
 
+    # --- startup TLS-floor probe of the declared front door (ASVS 12.1.1) ---------------------------
+    # ORDER MATTERS: this sits AFTER the config-only exposure refusals (auth-off, /ui exposure,
+    # MFA-at-exposure) deliberately. It is the only gate that makes NETWORK CALLS, and pre-empting
+    # a config refusal with three handshake round-trips means an operator fixes the TLS floor,
+    # restarts, and only then learns MFA was off — two trips for one boot. Cheap refusals first.
+    #
+    # The banner above is not decoration: test_startup_dual_control_arm_is_documented_as_warn_only
+    # slices the #189 approvals arm out of this file and asserts it contains no `return 2`. Without a
+    # banner here that slice ran straight through into this block and attributed THIS refusal to that
+    # arm. The guard has since been made to slice the arm by its own indentation, but every section in
+    # this ladder carries a banner and a new one must too.
+    #
+    # `proxy_tls_min_version` is an attestation: the operator types "1.2" and nothing checks it.
+    # Making an unverified declaration mandatory does not close the requirement, so the gate above
+    # is not the cell — this is. The probe dials `public_origin` and offers TLS 1.0 and 1.1; a
+    # SUCCESSFUL handshake is the failure, because it proves the front door accepts a protocol
+    # NIST SP 800-52r2 withdrew. It then asks what a default-capability client actually negotiates,
+    # which measures the proxy's PREFERENCE rather than merely its support.
+    #
+    # This is also what retires the loopback carve-out above. That arm warns because "the engine
+    # cannot distinguish loopback-behind-a-declared-proxy from loopback-and-genuinely-unexposed
+    # beyond the declaration itself" — true of a declaration, false of a measurement. A reachable
+    # front door that speaks TLS 1.0 is a fact, on loopback or not.
+    #
+    # Scope is deliberately the posture the requirement is about: a declared terminator, PHI, and
+    # `enforce`. Every other posture never reaches here and is byte-identical.
+    if (
+        settings.api.tls_terminated_upstream
+        and data_class is DataClass.PHI
+        and enforcing
+        and settings.api.public_origin
+    ):
+        from messagefoundry.config.tls_probe import TlsProbeUnavailable, probe_tls_floor
+
+        try:
+            probe = probe_tls_floor(settings.api.public_origin)
+        except TlsProbeUnavailable as exc:
+            # NOT a skip. See tls_probe's module docstring: a check that degrades to a no-op when
+            # its mechanism disappears reports success forever afterwards.
+            print(f"error: the ASVS 12.1.1 TLS-floor probe cannot run: {exc}", file=sys.stderr)
+            return 2
+        if not probe.ok:
+            # Unreachable refuses too, and the reason is start-ordering: if "unreachable" merely
+            # warned, an operator could always bring the engine up before the proxy and the check
+            # would never run — a gate that is trivially defeated is not a gate. The cost is real
+            # and is stated in the message rather than left for an assessor to find.
+            print(
+                f"error: refusing to serve on a PHI instance ({env_name!r}) behind a declared "
+                f"upstream TLS terminator whose TLS floor does not verify — {probe.describe()}. "
+                "The browser hop is the operator's proxy, so the engine measures it at startup "
+                "rather than trusting [api].proxy_tls_min_version (ASVS 12.1.1). Required: the "
+                "front door must refuse TLS 1.0 and 1.1 and negotiate TLS 1.3 with a "
+                "default-capability client. NOTE: this makes startup depend on the proxy being "
+                "reachable — deliberate, because warning on unreachable is defeated by start "
+                "ordering. See docs/security/OFF-LOOPBACK-DEPLOYMENT.md.",
+                file=sys.stderr,
+            )
+            return 2
+        print(
+            f"info: TLS-floor probe passed — {probe.describe()} (ASVS 12.1.1).",
+            file=sys.stderr,
+        )
+
     # --- #186(a) secure-by-default data retention (ASVS 14.2.4) --------------------------------------
     # RetentionSettings defaults every window to 0 (keep-forever) and RetentionRunner then purges
     # NOTHING, so a PHI instance accumulates PHI bodies indefinitely. Both PHI-body windows must be
