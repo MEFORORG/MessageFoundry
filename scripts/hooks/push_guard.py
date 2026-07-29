@@ -6,23 +6,31 @@ there is no publish step left between a push and the public internet. A push to 
 publication, immediately and irreversibly (deleting a ref later does not un-publish content that was
 fetched, mirrored or indexed in between).
 
-Branch protection on the server requires a PR and 12 status checks -- but ``enforce_admins`` is false,
-so the repository owner BYPASSES all of it. The realistic trigger is not malice, it is one click:
-VS Code's Sync/Push button does not distinguish "my feature branch" from "main", and the editor is
-where most pushes originate.
+Branch protection on the server requires a PR and 12 status checks. ``enforce_admins`` is now TRUE
+(enabled 2026-07-28), so a direct push to ``main`` is refused server-side and ``gh pr merge --admin``
+no longer works. This hook is therefore DEFENCE-IN-DEPTH rather than the only guard -- it still earns
+its place by failing FAST and LOCALLY, with an explanation, instead of after a round-trip; and it
+covers ``cla-signatures``, which branch protection does not.
+
+The realistic trigger was never malice, it is one click: VS Code's Sync/Push button does not
+distinguish "my feature branch" from "main", and the editor is where most pushes originate.
 
 This is the guard the old mirror clone's Gate-Provenance pre-push hook used to provide. That clone was
 quarantined at cutover, and nothing replaced it.
 
 WHAT THIS IS NOT. A guardrail, not a security boundary: ``git push --no-verify`` skips it, and it is
-local-only, so a different machine is unprotected. It removes the ACCIDENT, not the capability. The
-durable server-side fix is ``enforce_admins=true``, which was deliberately NOT enabled while an
-intermittent harness-monitor failure was blocking consecutive PRs -- removing the admin override while
-a flake can strand a merge trades an accidental-push risk for a cannot-ship risk. That failure turned
-out to be a livelock in ``MessagesPanel._apply`` rather than a flake, and is fixed
-(``tests/test_console_messages_refresh.py``), so the argument against ``enforce_admins`` is weaker now
-than when this was written. (An earlier revision of this note cited "BACKLOG #17" for it; that is the
-py3.11 pytest/aiosqlite deadlock, OBSOLETE and unrelated.)
+local-only, so a different machine relies on the server-side rule alone.
+
+HISTORY, because the reasoning inverted. This note used to say ``enforce_admins=true`` was deliberately
+NOT enabled, because an intermittent harness-monitor failure was blocking consecutive PRs and removing
+the admin override while a flake can strand a merge trades an accidental-push risk for a cannot-ship
+risk. That failure turned out to be a LIVELOCK in ``MessagesPanel._apply``, not a flake
+(``tests/test_console_messages_refresh.py``), so the premise dissolved and the setting was flipped. The
+cannot-ship risk is real but now accepted: a required check that goes permanently red blocks every
+merge until it is fixed or protection is relaxed --
+``gh api -X DELETE repos/MEFORORG/MessageFoundry/branches/main/protection/enforce_admins``.
+(An earlier revision cited "BACKLOG #17" for the failure; that is the py3.11 pytest/aiosqlite deadlock,
+OBSOLETE and unrelated.)
 
 Stdlib only, like the other gates -- most worktrees have no project .venv.
 
@@ -71,8 +79,9 @@ def main(argv: list[str]) -> int:
     print("", file=sys.stderr)
     print(
         "  This repo IS the published artifact — a push to main is publication, immediately, and\n"
-        "  cannot be taken back. Server-side branch protection requires a PR and 12 checks, but\n"
-        "  enforce_admins is false, so the owner bypasses it. Nothing else would have stopped this.\n"
+        "  cannot be taken back. Branch protection would refuse this server-side too (a PR + 12\n"
+        "  checks, enforce_admins ON); this hook just tells you now, locally, instead of after a\n"
+        "  round-trip — and it also covers cla-signatures, which protection does not.\n"
         "\n"
         "  Push a branch and open a PR instead:\n"
         "      git switch -c <branch> && git push -u origin <branch>\n"
