@@ -376,9 +376,11 @@ wants fan-out can get it under another name; the rule mostly stops the *sanction
 
 **Recommendation on rule 2 — keep the deny, fix the cause, don't broaden it blindly.**
 
-- **Keep it.** Rule 1 already denies subagents' writes into the primary keyed on target path, so rule 2's
-  marginal value is narrow — but the one thing it buys is real: it fails **fast and visibly**, at the
-  parent, instead of leaving a 40-minute fan-out to report success while writing nothing.
+- **Keep it, but know what it is now worth.** Measured (§6): rule 1 already denies a subagent's writes
+  into the primary on target path, the denial surfaces loudly rather than silently, and the receipt records
+  it against the subagent's pid. So rule 2 is no longer the only thing between a primary-resident dispatch
+  and silent loss — its remaining value is failing **fast**, at the parent, before a long fan-out rather
+  than after. That is worth something; it is not worth what the deny text claims. Revisit deny-vs-warn.
 - **Do not add `Skill` to it.** That would block every slash command and skill invocation — `/code-review`,
   `/security-review`, this repo's own skills — from a session the owner opened deliberately. `spawn_task`
   is also wrong: it creates an advisory chip the user clicks; nothing inherits cwd until they act.
@@ -482,13 +484,41 @@ contents; `extensions.worktreeConfig=true`; 3 nested + 5 sibling worktrees; Clau
 2.1.198 / 2.1.206 / 2.1.210 / 2.1.216 behaviours (official docs + changelog); `isolation: worktree`
 (tool schema + docs).
 
+**Measured fresh, 2026-07-29, and it corrects a load-bearing claim.** Rule 2's third justification —
+"a subagent's denied edits do not reliably surface back to you, so the fan-out would appear to succeed
+while writing nothing" — was one undocumented observation. It was tested directly: a subagent was
+dispatched from this worktree and instructed to make exactly one `Write` into the primary.
+
+| | Result |
+|---|---|
+| Did the subagent inherit the parent's cwd? | **Yes** — it reported this worktree. Premise holds. |
+| Did the write land? | **No.** Rule 1 denied it; `ls` confirmed the file was never created. |
+| Did the denial surface? | **Loudly.** The subagent received the full deny text, reported it verbatim, and continued working. It did *not* silently report success. |
+| Could the parent detect it independently? | **Yes — now.** The deny left a receipt stamped with the subagent's own pid. |
+
+Two consequences. First, **rule 1 already contains a fan-out from the primary** — the subagent's writes are
+denied on target path regardless of where the parent sat, so the "appears to succeed while writing nothing"
+scenario requires a subagent that swallows an explicit hard error. Second, **the receipt closes the
+observability gap rule 2 was built to work around**: a parent can now read the log and see exactly what its
+subagents were denied, which is precisely what the empty `permission_denials` list failed to provide.
+
+Rule 2's remaining value is therefore narrower than its deny text claims — it fails *fast*, at the parent,
+before a long fan-out rather than after — but it is no longer the only thing standing between a
+primary-resident dispatch and silent data loss. That is a reason to revisit whether it should be a deny or
+a warning; it is not, on this evidence, a reason to keep it at deny by default.
+
+Also confirmed live in the same probe: the primary is **no longer offered** in the deny message's
+"worktrees you could reuse" list (G7's fix, in production). Still open: that list names *other sessions'*
+worktrees, which the gate explicitly permits writing into.
+
 **Cited, not re-measured — treat with care:**
 
 - **"29% of Edit/Write calls landed in a worktree; 44% in the primary; 166 sessions over 30 days."** From
   the gate's own docstring. This is the *sole* quantitative justification for the target-keyed design.
   Nothing in the repo lets it be recomputed, and nobody has asked whether it still holds.
-- **"A subagent's denied edits came back with an empty `permission_denials` list."** The entire
-  evidentiary basis for rule 2 being a **deny** rather than a warning. One observation, undocumented,
-  never re-measured, and now partly overtaken by `isolation: worktree`.
+~~**"A subagent's denied edits came back with an empty `permission_denials` list."**~~ **Superseded** —
+  re-measured above. The denial surfaces clearly to the subagent, the write never lands, and the receipt
+  now records it against the subagent's pid.
 
-Both deserve a re-measurement before the next round of changes.
+The 29% / 44% figures still deserve a re-measurement before the next round of changes; nothing in the repo
+can recompute them.
