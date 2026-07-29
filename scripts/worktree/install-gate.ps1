@@ -185,6 +185,7 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 $matchers = @(
     "Write|Edit|MultiEdit|NotebookEdit"   # rule 1 -- writes INTO the primary's tree
     "Bash|PowerShell"                     # rules 3 + 3b -- git verbs that swap the primary / hijack a worktree
+    "EnterWorktree"                       # rule 4 -- relocating a live session (loses its transcript)
 )
 if (-not $NoDispatchGate) {
     $matchers += "Task|Agent|Workflow"    # rule 2 -- subagent dispatch FROM the primary

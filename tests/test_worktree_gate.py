@@ -184,6 +184,55 @@ def test_dispatch_from_a_worktree_is_allowed(tmp_path: Path, repos_file: Path) -
     assert run_gate(payload, repos_file) is None
 
 
+# --------------------------------------------------------------------------- rule 4: EnterWorktree
+
+
+def enter_worktree(cwd: Path | str, name: str = "wt-1") -> dict[str, Any]:
+    return {
+        "session_id": "s-1",
+        "cwd": str(cwd),
+        "hook_event_name": "PreToolUse",
+        "tool_name": "EnterWorktree",
+        "tool_input": {"name": name},
+    }
+
+
+def test_enter_worktree_is_denied(primary: Path, repos_file: Path) -> None:
+    """Relocating a live session re-files its transcript and drops the chat from its window's list."""
+    reason = assert_denied(run_gate(enter_worktree(cwd=primary), repos_file))
+    assert "EnterWorktree" in reason
+    assert "sessions.ps1" in reason  # the deny must point at the recovery path, not just say no
+
+
+def test_enter_worktree_denied_even_from_a_worktree_cwd(tmp_path: Path, repos_file: Path) -> None:
+    """Rule 4 keys on the TOOL, not cwd -- relocation loses the chat wherever you start it."""
+    assert_denied(run_gate(enter_worktree(cwd=tmp_path / "Repo-alerts"), repos_file))
+
+
+def test_exit_worktree_is_allowed(primary: Path, repos_file: Path) -> None:
+    """ExitWorktree is a safe keep; only EnterWorktree is denied."""
+    payload = {
+        "session_id": "s-1",
+        "cwd": str(primary),
+        "tool_name": "ExitWorktree",
+        "tool_input": {},
+    }
+    assert run_gate(payload, repos_file) is None
+
+
+def test_enter_worktree_allowed_when_gate_is_off(primary: Path, empty_repos: Path) -> None:
+    """Kill switch wins: no allowlist -> even EnterWorktree passes."""
+    assert run_gate(enter_worktree(cwd=primary), empty_repos) is None
+
+
+def test_normal_edit_still_allowed_alongside_rule_4(
+    tmp_path: Path, primary: Path, repos_file: Path
+) -> None:
+    """Adding rule 4 must not disturb the 29% case: a write into a sibling worktree stays allowed."""
+    worktree = tmp_path / "Repo-alerts" / "src" / "app.py"
+    assert run_gate(edit(worktree, cwd=primary), repos_file) is None
+
+
 # --------------------------------------------------------------------------- rule 3: git tree-swaps
 
 

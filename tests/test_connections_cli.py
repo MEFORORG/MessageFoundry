@@ -195,6 +195,12 @@ def test_hand_comment_survives_gui_upsert(cfg: Path, capsys: pytest.CaptureFixtu
         "name": "OB",
         "transport": "mllp",
         "settings": {"host": "epic.example", "port": 2700},
+        # ADR 0153: `connection upsert` validates the edit through the posture-stamped build_check, and
+        # a plaintext MLLP hop to an off-box host now REFUSES with no data-label carve-out. Declaring
+        # the acceptance is what makes the edit load-legal — and proves the new keys survive the
+        # comment-preserving writer, which is the property this test is really about.
+        "cleartext_accepted": True,
+        "cleartext_reason": "legacy partner has no MLLP-over-TLS listener",
     }
     assert _upsert(cfg, obj, capsys, svc=_svc(cfg))[0] == 0
     text = (cfg / "connections.toml").read_text(encoding="utf-8")
@@ -317,6 +323,8 @@ def test_cli_end_to_end_maximal_with_commented_sibling(
             transport = "mllp"
             ordering = "fifo"
             dead_letter_days = 7
+            cleartext_accepted = true
+            cleartext_reason = "legacy partner has no MLLP-over-TLS listener"
               [outbound.settings]
               host = "epic.example"
               port = 2700

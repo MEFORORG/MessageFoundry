@@ -221,10 +221,13 @@ def test_breaker_ceiling_reports_the_larger_of_the_two_thresholds() -> None:
 # --- settings --------------------------------------------------------------------
 
 
-def test_reconciler_is_off_by_default() -> None:
-    """The upgrade must be byte-identical: 0 = disabled, and every safety knob has a default."""
+def test_reconciler_is_on_by_default() -> None:
+    """The shipped default runs the reconciler (ADR 0148 GIVEN 1), and every safety knob has a default.
+
+    300 s, not 0: the hardened path is the shipped path. It stays INERT without AD — `should_reconcile`
+    also requires an LDAP client — so a non-AD deployment creates no task and issues no bind."""
     defaults = AuthSettings()
-    assert defaults.ad_session_recheck_seconds == 0
+    assert defaults.ad_session_recheck_seconds == 300
     assert defaults.ad_session_recheck_strikes == 2
     assert defaults.ad_session_revoke_max == 5
     assert defaults.ad_session_revoke_max_fraction == pytest.approx(0.34)

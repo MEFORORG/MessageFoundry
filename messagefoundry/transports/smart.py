@@ -45,7 +45,7 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING, Any
 
 from messagefoundry.config.models import ConnectorType, Destination, SignatureAlgorithm
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.tls_policy import InsecureHopRefused
 from messagefoundry.transports.base import DeliveryError
 
 # Reuse rest.py's hardened opener + URL redaction (no new HTTP plumbing) — exactly as fhir.py/soap.py
@@ -55,6 +55,8 @@ from messagefoundry.transports.rest import (
     ProxyConfig,
     _no_redirect_opener,
     _redact_url,
+    cleartext_acceptance_from_settings,
+    refuse_cleartext_credential_hop,
 )
 from messagefoundry.transports.signing import CompactJwtSigner
 
@@ -109,6 +111,10 @@ class SmartBackendTokenProvider:
         private_key_password: str | None = None,
         expiry_skew_seconds: float = _DEFAULT_EXPIRY_SKEW,
         timeout_seconds: float = _DEFAULT_TOKEN_TIMEOUT,
+        attested: bool = False,
+        cleartext_accepted: bool = False,
+        cleartext_reason: str | None = None,
+        connection: str | None = None,
         proxy: ProxyConfig | None = None,
     ) -> None:
         if not token_url:
@@ -116,12 +122,30 @@ class SmartBackendTokenProvider:
         scheme = urllib.parse.urlsplit(token_url).scheme.lower()
         if scheme not in ("http", "https"):
             raise SmartAuthError(f"smart_token_url must be http or https, got scheme {scheme!r}")
-        if scheme == "http" and not insecure_tls_allowed():
-            # The client_assertion JWT is a credential — refuse to send it over cleartext.
-            raise SmartAuthError(
-                "SMART token endpoint over cleartext http would expose the client_assertion; "
-                f"refused unless {INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+        # The client_assertion JWT is a credential, so this hop goes through the ONE posture-keyed
+        # authority — exactly like its OAuth2 sibling in http_auth.py and the delivery cells. It used to
+        # read the raw, UNCLAMPED `MEFOR_ALLOW_INSECURE_TLS`, which meant one process-wide environment
+        # variable put a signed client_assertion on cleartext http even on an enforcing PHI instance,
+        # and left the variable alive here while ADR 0153 decision 5 unhooked it everywhere else.
+        # `refuse_cleartext_credential_hop` raises `InsecureHopRefused` (a `tls_policy` `ValueError`) on
+        # REFUSE; re-raise as `SmartAuthError` to preserve THIS seam's error contract (both are
+        # `ValueError` subclasses, so the loader surfaces either identically). Never echoes the key.
+        try:
+            refuse_cleartext_credential_hop(
+                scheme,
+                token_url,
+                credential="SMART client_assertion",
+                attested=attested,
+                cleartext_accepted=cleartext_accepted,
+                cleartext_reason=cleartext_reason,
+                connection=connection,
             )
+        except InsecureHopRefused as exc:
+            raise SmartAuthError(
+                "SMART token endpoint over cleartext http would expose the client_assertion; refused "
+                "by the instance security posture (use https, attest the hop as secure via "
+                "tls_hop_attested, or declare cleartext_accepted with a cleartext_reason)"
+            ) from exc
         if not client_id:
             raise SmartAuthError("SMART Backend Services requires a 'smart_client_id' setting")
         if not private_key:
@@ -263,6 +287,10 @@ def token_provider_from_settings(
         return None
     if not s.get("smart_enabled", True):
         return None
+    # ADR 0153: the same per-connection declaration the delivery hop carries, mirrored into these
+    # resolved settings by the runner's _dest_config (with the connection name, so the acceptance audit
+    # record names the declaration). Read exactly as the OAuth2 sibling does.
+    accepted = cleartext_acceptance_from_settings(s)
     return SmartBackendTokenProvider(
         token_url=str(s.get("smart_token_url") or ""),
         client_id=str(s.get("smart_client_id") or ""),
@@ -276,6 +304,12 @@ def token_provider_from_settings(
         ),
         expiry_skew_seconds=float(s.get("smart_expiry_skew_seconds", _DEFAULT_EXPIRY_SKEW)),
         timeout_seconds=float(s.get("smart_timeout_seconds", _DEFAULT_TOKEN_TIMEOUT)),
+        # #200: the per-connection insecure-hop attestation keys the posture-keyed cleartext refusal in
+        # __init__ (read from settings exactly as _dest_config / the OAuth2 provider do).
+        attested=bool(s.get("tls_hop_attested", False)),
+        cleartext_accepted=accepted[0],
+        cleartext_reason=accepted[1],
+        connection=accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
     )
 

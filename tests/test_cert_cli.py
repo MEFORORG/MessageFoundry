@@ -218,8 +218,11 @@ def test_inventory_lists_facts_and_flags_expired(
     certs = {c["path"]: c for c in json.loads(capsys.readouterr().out)["certs"]}
 
     g = certs[str(good_path)]
-    assert "good.example.org" in g["subject"]
-    assert "good.example.org" in g["issuer"]
+    # Exact DN, not a substring: a substring match also passes for a lookalike CN (the SAN
+    # `www.good.example.org` contains `good.example.org`), so it would not catch the wrong name
+    # being reported. `_make_cert` is self-issued, so issuer == subject.
+    assert g["subject"] == "CN=good.example.org"
+    assert g["issuer"] == "CN=good.example.org"
     assert g["sans"] == ["good.example.org", "www.good.example.org"]
     assert g["expired"] is False
     assert g["days_remaining"] >= 40
@@ -238,7 +241,10 @@ def test_inventory_human_output_renders_facts(
 
     assert main(["cert", "inventory", "--cert", str(cert_path)]) == 0
     printed = capsys.readouterr().out
-    assert "human.example.org" in printed
+    # Assert the CN on the SUBJECT line specifically: a bare `"human.example.org" in printed` is
+    # satisfied by the SAN line alone, so it would still pass if the subject stopped being rendered.
+    subject_line = next(ln for ln in printed.splitlines() if ln.strip().startswith("subject:"))
+    assert subject_line.split(":", 1)[1].strip() == "CN=human.example.org"
     assert "SAN(DNS)" in printed
     assert "notAfter" in printed
 

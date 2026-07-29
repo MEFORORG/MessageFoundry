@@ -507,15 +507,25 @@ def _make_client(
     raise ValueError(f"REMOTEFILE protocol must be one of {_PROTOCOLS}, got {protocol!r}")
 
 
-def _anon_ftp_guard(s: dict[str, Any]) -> InsecureHopGuard | None:
+def _anon_ftp_guard(
+    s: dict[str, Any],
+    *,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
+    connection: str | None = None,
+) -> InsecureHopGuard | None:
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
 
     Credentialed plain-ftp is already refused by :func:`_validate_common` (it puts the credential itself
     on the wire in the clear); ``ftps``/``sftp`` are encrypted. The remaining gap #200 closes is an
     ANONYMOUS plain-ftp hop — no credential, but the message BODY is still PHI over a cleartext channel.
-    Keyed on the posture gradient off-loopback (refuse production-PHI, warn non-prod PHI, allow
-    synthetic / loopback / per-connection-attested)."""
+    Keyed on the shared gradient off-loopback: loopback / per-connection-attested ALLOW, an ADR 0153
+    ``cleartext_accepted`` declaration WARNs (loudly, audited), everything else REFUSES under ENFORCE.
+
+    The acceptance pair arrives as arguments rather than out of ``s``: it is a top-level OUTBOUND key,
+    not a transport setting, and it is **Destination-only** (ADR 0153 decision 2), so the inbound
+    ``RemoteFileSource`` path leaves it at its default."""
     if str(s.get("protocol", "sftp")).lower() != "ftp":
         return None
     if s.get("username") or s.get("password"):
@@ -528,12 +538,26 @@ def _anon_ftp_guard(s: dict[str, Any]) -> InsecureHopGuard | None:
         description="cleartext anonymous FTP egress",
         attested=bool(s.get("tls_hop_attested", False)),
         attested_reason=None if reason is None else str(reason),
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
+        connection=connection,
     )
 
 
-def _validate_common(s: dict[str, Any]) -> str:
+def _validate_common(
+    s: dict[str, Any],
+    *,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
+    connection: str | None = None,
+) -> str:
     """Shared construction-time validation: required ``host``/``remote_dir``, a known ``protocol``, and
-    the cleartext-FTP credential guard. Returns the normalized protocol."""
+    the cleartext-FTP credential guard. Returns the normalized protocol.
+
+    The ADR 0153 acceptance pair is threaded through to the anonymous-ftp hop guard below — it must
+    reach the ENFORCED gate that runs here, not just the destination's send-time backstop, or a declared
+    acceptance would be refused at construction and never take effect. Defaults off, so the inbound
+    ``RemoteFileSource`` path (which has no such field — Destination-only) is byte-identical."""
     for req in ("host", "remote_dir"):
         if not s.get(req):
             raise ValueError(f"REMOTEFILE connector requires a {req!r} setting")
@@ -560,7 +584,12 @@ def _validate_common(s: dict[str, Any]) -> str:
     # cleartext. Refuse a production-PHI hop off-loopback at the ENFORCED construction gate (the
     # credentialed case above is the orthogonal credential-on-the-wire guard). No-op for ftps/sftp/
     # credentialed-ftp, and byte-identical off the enforced gate (posture unstamped).
-    guard = _anon_ftp_guard(s)
+    guard = _anon_ftp_guard(
+        s,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
+        connection=connection,
+    )
     if guard is not None:
         guard.enforce_construction()
     return protocol
@@ -571,10 +600,20 @@ class RemoteFileDestination(DestinationConnector):
 
     def __init__(self, config: Destination) -> None:
         s = config.settings
-        _validate_common(s)
+        _validate_common(
+            s,
+            cleartext_accepted=config.cleartext_accepted,
+            cleartext_reason=config.cleartext_reason,
+            connection=config.name,
+        )
         # #200 send-time backstop for an anonymous plain-ftp hop (the enforced refusal already fired in
         # _validate_common at the construction gate). None for ftps/sftp/credentialed-ftp.
-        self._hop_guard = _anon_ftp_guard(s)
+        self._hop_guard = _anon_ftp_guard(
+            s,
+            cleartext_accepted=config.cleartext_accepted,
+            cleartext_reason=config.cleartext_reason,
+            connection=config.name,
+        )
         # Constructing the SFTP client validates the host-key escape posture fail-fast (build_check).
         # #190 (ADR 0093): pass the instance [tls] internal-CA trust-anchor policy so an FTPS hop that
         # names no tls_ca_file of its own verifies against the org internal CA.

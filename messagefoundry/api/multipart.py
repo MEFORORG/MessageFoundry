@@ -19,7 +19,30 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 
-_DISPOSITION_PARAM = re.compile(r'(\w+)="([^"]*)"')
+# The leading ``(?<!\w)`` is a **ReDoS guard**, not a semantic filter (CodeQL py/polynomial-redos).
+# Without it, ``(\w+)="…"`` is quadratic on a hostile Content-Disposition line: the scan restarts at
+# every offset inside a word run, and at each one ``\w+`` walks the rest of the run before failing —
+# O(n^2) on a header of n word characters. That header block is attacker-supplied and bounded only by
+# ``[store].max_upload_bytes`` (25 MiB default), and it is parsed synchronously on the asyncio event
+# loop, so a single request could wedge the whole engine for days. The lookbehind is O(1) and fails
+# every offset *inside* a run immediately, leaving one ``\w+`` walk per run — O(n) overall.
+#
+# It removes no match: ``=`` is not a word character, so ``\w+`` starting anywhere inside a run can
+# only ever succeed at that run's end — i.e. an interior offset matches iff the run's first offset
+# does, and the leftmost scan always reaches the first offset earlier. Equivalence is pinned by
+# ``tests/test_multipart.py::test_disposition_param_regex_matches_legacy_semantics``.
+_DISPOSITION_PARAM = re.compile(r'(?<!\w)(\w+)="([^"]*)"')
+
+#: Cap on one part's header block. RFC 2388 part headers are ``Content-Disposition`` plus at most a
+#: ``Content-Type``/``Content-Transfer-Encoding``, so 16 KiB is orders of magnitude more than any real
+#: client sends. Without it the block is bounded only by the request body cap — ``[store]
+#: .max_upload_bytes``, 25 MiB by default and up to 512 MiB — because that cap is applied to a part's
+#: *content*, only after its header has already been parsed. The scan is linear (see the guard above),
+#: but it runs synchronously on the asyncio event loop that also drives every listener and worker, and
+#: linear is not free at that size: a single request would block the engine for ~0.35 s at 25 MiB and
+#: ~7 s at the ceiling. Bounding the header keeps the cost microseconds and, incidentally, gives the
+#: ReDoS analysis a length-bounded source instead of an attacker-sized one.
+_MAX_PART_HEADER_BYTES = 16 * 1024
 
 
 class MultipartError(ValueError):
@@ -102,6 +125,13 @@ def parse_multipart_form(
         head, sep, content = segment.partition(b"\r\n\r\n")
         if not sep:
             continue  # no header/body separator — skip a malformed part rather than 500
+        if len(head) > _MAX_PART_HEADER_BYTES:
+            # Refuse rather than skip: a header this size is never a real client, and skipping would
+            # surface as the confusing "no file part" error instead of naming the actual problem.
+            raise MultipartError(
+                f"multipart part header block is {len(head)} bytes; the limit is "
+                f"{_MAX_PART_HEADER_BYTES}"
+            )
         if content.endswith(b"\r\n"):
             content = content[:-2]  # trailing CRLF before the next delimiter
         name, filename = _disposition(head)

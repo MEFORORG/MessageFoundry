@@ -64,6 +64,12 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 - **AC-3** — IF a static-analysis finding is triaged as a non-issue (false positive / test-only) or an accepted risk, THEN THE SYSTEM SHALL record it as a dismissal with a written justification rather than leave it open or silently filter it.
   → `docs/adr/0034-static-analysis-triage-policy-accepted-risk-register.md` (this register) + the mirror's code-scanning dismissal log
 - **AC-4** — IF a finding is in the PHI-to-log (`clear-text-logging`) or `path-injection` class, THEN it SHALL NOT be dismissed without first confirming the untrusted-source→sink dataflow is mitigated.
+- **AC-5** — WHERE a CI step builds a scratch venv whose only install is a committed lockfile, THE SYSTEM SHALL install into it exclusively with `--require-hashes`, and SHALL NOT bootstrap it with an unpinned `pip install --upgrade pip` (in any spelling) or hide that fetch behind `venv --upgrade-deps`.
+  → `tests/test_ci_venv_pinning.py`
+- **AC-6** — WHEN the multipart parser reads an uploaded part, THE SYSTEM SHALL bound that part's header block before parsing it, so the header scan's input size is set by the parser and not by the request-body cap.
+  → `tests/test_multipart.py::test_oversized_part_header_is_refused_not_parsed`
+- **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so in time linear in the line's length.
+  → `tests/test_multipart.py::test_hostile_disposition_header_parses_in_linear_time`
 
 ## Options considered
 
@@ -78,3 +84,123 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
 **Negative / risks** — a register can go stale: it MUST be updated whenever new findings are triaged, or it misleads. The accepted risk (#5) remains a cleartext-at-rest credential — mitigated by owner-only perms + forced first-login rotation, but a residual to revisit if the bootstrap flow changes.
 
 **Out of scope** — enabling GHAS on the private repo; pursuing the *proper* Docker/Fuzzing/badge hardening above (deferred, not warranted now); and the operational mirror **publish** that re-runs CodeQL/Scorecard and auto-closes the fixed/stale findings (`publish.ps1`, owner-run).
+
+---
+
+## Amendment — 2026-07-28: second triage round (32 open findings)
+
+Everything above records the **2026-06-26** state and is left intact as the record of its day. This
+section is the delta. Where the two disagree, this section governs.
+
+### Topology correction — the "read-only mirror" premise is retired
+
+The Context and the Scorecard register above are written against a topology that no longer exists:
+`MEFORORG/MessageFoundry` was a read-only publish target fed by force-pushed snapshots. Since the
+**cutover (2026-07-27)** it is the **primary development repo** — `scripts/publish/publish.ps1` and the
+release-sync check are gone, and changes arrive as reviewed PRs with branch protection and required
+checks. Scorecard therefore now measures the **right** repo.
+
+Consequence, and it is not cosmetic: the three Scorecard dismissals whose recorded reason rests
+*entirely* on that premise — **`BranchProtectionID` (#33)**, **`CodeReviewID` (#77)**,
+**`MaintainedID` (#78)**, all reasoned "measured on the read-only mirror … enforced on the private
+upstream" — now carry a justification that is no longer true. Under the Decision above, a dismissal
+with a false reason is worse than an open finding. **They must be re-triaged against the real repo, not
+renewed.** They were out of scope for this round (they are not among the 32 open findings).
+
+### Outcome of the second triage (32 findings): 7 fixed, 25 dismissed
+
+**Fixed (7):**
+
+| Rule | Where | Why it was real |
+|---|---|---|
+| `py/polynomial-redos` | `messagefoundry/api/multipart.py` | `(\w+)="([^"]*)"` scanned a part's `Content-Disposition` line quadratically (`=` is not a word char, so every offset inside a word run walked to the run's end before failing). The header block is attacker-supplied and was bounded only by the request-body cap, and it is parsed **synchronously on the asyncio event loop** that also drives every listener, router, transform and delivery worker — so one request could wedge the whole engine. Fixed with a `(?<!\w)` lookbehind (provably match-equivalent) **and** a `_MAX_PART_HEADER_BYTES` bound, so the scan is linear *and* its input is sized by the parser rather than by the uploader. |
+| `js/file-system-race` | `ide/src/symbolIndex.ts` | `statSync(path)` + `readFileSync(path)` resolved the path twice with a window between them. Low exploitability (no privilege boundary; the guard is a resource cap, not an authorization decision), but genuinely unsound in a live workspace where a save or a formatter rewrites a module between the calls. Now one `openSync` with `fstatSync(fd)`/`readFileSync(fd)`. |
+| `PinnedDependenciesID` ×2 | `release.yml`, `security.yml` (SBOM scratch venv) | See the `PinnedDependenciesID` correction below. |
+| `py/incomplete-url-substring-sanitization` ×3 | `tests/test_cert_cli.py` | **Not** the modelled vulnerability — the flagged values are X.509 DNs, not URLs, and the `cert inventory` command makes no trust decision from them. Tightened rather than dismissed because the *assertions* were genuinely weak: `"good.example.org" in subject` also passes for a lookalike CN, and the same test mints the SAN `www.good.example.org`, which contains the asserted substring. Now exact-equality. |
+
+**Dismissed (25)** — see the class rationales below plus the per-alert dismissal comments, which remain
+canonical.
+
+### Class-rationale corrections (these supersede the wording above)
+
+**1. `log-injection` — narrowed to the rendered message.** The 2026-06-26 register says control
+characters "in every emitted record" are neutralized by `ControlCharScrubFilter`. Stated precisely:
+that filter scrubs the **rendered message** — it reads `record.getMessage()` (so the lazy `%`-args are
+covered) and rewrites `record.msg`. It does **not** touch `record.exc_text` or `record.stack_info`.
+`RedactionFilter` renders and PHI-redacts those, but `redact` rewrites only HL7/date/name-shaped spans;
+it does not escape control characters, and `logging.Formatter.format` then appends `exc_text` verbatim.
+Verified by execution: a `ValueError("boom\nforged-record-marker …")` logged with `exc_info=True`
+reaches the stdout handler with the payload on its **own physical line**, while the same payload passed
+as a `%`-arg comes out escaped.
+
+All four `log-injection` alerts in this round (94, 95, 104, 107) are lazy `%`-arg / `json.dumps` sinks
+with **no** `exc_info`, so those dismissals stand on their own trace. The point of recording this is that
+the class rationale **must not be inherited** by a future finding on a `log.exception(...)` /
+`exc_info=True` site — the engine has many (the delivery/router/transform catches, the `_on_*_worker_done`
+callbacks, the pollers). `JsonFormatter` escapes `exc_text` through `json.dumps`, so the off-box
+forwarder (JSON by default) is unaffected; the residual is the human-readable stdout/NSSM text log.
+**Open hardening (not done):** apply `_CTRL_TRANSLATION` to `exc_text`/`stack_info` in
+`ControlCharScrubFilter` — it runs after `RedactionFilter`, so `exc_text` is already populated. It is a
+few lines, but it collapses every traceback to one physical line, which is an operator-facing
+readability change and wants an explicit decision rather than a drive-by edit.
+
+**2. `PinnedDependenciesID` — the blanket rationale was applied too widely.** "CI installs editably
+(`pip install -e .[extras]`), which cannot use `--require-hashes`" is true of the editable installs and
+structurally unfixable there. It was **not** true of three CI steps that build a scratch venv whose
+*only* install is a committed, `==`-pinned, hash-verified lock and yet preceded it with
+`<venv>/bin/pip install --upgrade pip` — an unpinned, unverified PyPI fetch that bought nothing
+(`--require-hashes` rejects any un-hashed requirement and so performs no resolution at all, making the
+`ensurepip` pip sufficient). Two were open alerts 115/118 and are fixed. The third is
+`security.yml`'s `/tmp/lockcheck`, which carries **already-dismissed alert #71** whose recorded reason
+is the editable-install text — factually wrong for that line, since the very next line *is* a
+`--require-hashes` install. It has been fixed here too, and **#71 must be closed as fixed rather than
+renewed**. All three are pinned by `tests/test_ci_venv_pinning.py`, which also blocks the
+`<venv>/bin/python -m pip` spelling and the `venv --upgrade-deps` variant (option 3's invisible filter).
+
+**3. A version pin does not satisfy this check.** Proven by the repo's own alert data: `bandit==1.9.4`
+is exactly pinned and still flagged (#74), as is `zizmor==1.5.2` (alert 96), while the two
+`--require-hashes` installs are flagged in neither the open nor the dismissed set. Closing the remaining
+`PinnedDependenciesID` findings therefore needs a **hash-pinned lock for CI tooling**, which is coupled
+to DEP-1: the four committed lock artifacts are all `uv export`ed from `uv.lock`, diff-gated in CI and
+auto-resynced by Dependabot, so a hand-maintained fifth lock outside that machinery would rot into a
+pinned, **stale, unpatched** toolchain — worse posture than floating. The correct fix is to route CI
+tooling through a `pyproject` dependency group so it flows into `uv.lock` and the exports. Deferred,
+recorded here as the convergence target.
+
+### Convergence rule: line drift re-fires a dismissal as a new alert
+
+This repo's scanner raises the **same expression at a new line** as a **new alert number**, so a
+dismissal does not survive the file growing above it. Two confirmed instances: dismissed **#18**
+(`__main__.py:976`) re-fired as open **122** (`__main__.py:1535`, byte-identical expression), and
+dismissed **#39** (`dependabot-auto-merge.yml:28`) re-fired as open **87** (line 44) because a comment
+block above it grew. Both re-fires are pure line drift, no behaviour change.
+
+Therefore: **when editing a file that carries dismissed alerts, keep the edit line-neutral** where
+practical, or expect to re-dismiss every anchor below it. The two workflow fixes in this round were
+deliberately made line-neutral — one line deleted, one comment line added — which is why their rationale
+lives in `tests/test_ci_venv_pinning.py`'s module docstring rather than in the workflow.
+
+### Recommended hardening — identified, NOT done
+
+Recorded here because a `won't fix` dismissal makes an item invisible, and these were found *while*
+justifying those dismissals. None of them closes its alert; each reduces residual risk.
+
+| Where | Recommendation | Why it matters |
+|---|---|---|
+| `release.yml` `pip install sigstore` | Pin `sigstore==<version>` | The **highest residual in the group**: a completely unpinned install inside the job holding `contents: write` + `id-token: write` + `attestations: write`, resolved immediately before it signs the wheel, sdist, SBOM and VEX. A malicious release fetched at that moment runs with the OIDC identity used to publish. |
+| `release.yml` `pip install --upgrade pip build` | Pin `build==<version>` | Unpinned PEP 517 frontend that produces the published wheel/sdist. |
+| `release.yml` `pip install --quiet packaging` (harness job) | Pin `packaging==<version>`; install into a throwaway venv as the engine job already does | Resolved into the **publishing** job's main interpreter rather than a scratch venv. |
+| `release.yml` `pip install --quiet packaging` (`/tmp/relsmoke`) | Pin `packaging==<version>` | Contained (disposable venv, version-compare only), but free to pin. |
+| `dependabot-auto-merge.yml` `security-events: read` | Remove the scope | Dead. Its comment claims it reads Dependabot alerts, but the gate calls the **global** `/advisories` endpoint, which is repo-scope-independent. Verified; least-privilege hygiene only. |
+
+`sigstore`/`build`/`packaging` pins touch the **release critical path**, which no PR CI leg executes —
+see below — so they are an owner decision, not a drive-by.
+
+### What no test can see
+
+Both workflow fixes land on paths **no PR CI leg runs**: `security.yml`'s SBOM job is
+`schedule`/`workflow_dispatch` only *and* `continue-on-error: true` (a failure there is yellow and
+swallowed), and `release.yml` runs only on a tag push. So the first real execution of either edit is a
+nightly or **a release**. `tests/test_ci_venv_pinning.py` is a text guard over the workflow source, not
+an execution. Before the next tag, run `security.yml`'s sbom job via `workflow_dispatch` and read its
+log — the install command there is byte-identical to `release.yml`'s.

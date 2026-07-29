@@ -314,6 +314,69 @@ def test_cleartext_token_url_refused(rsa_pem: str) -> None:
         )
 
 
+def test_cleartext_token_url_is_decided_by_the_one_authority(
+    monkeypatch: pytest.MonkeyPatch, rsa_pem: str
+) -> None:
+    """The SMART token endpoint used to read the RAW, UNCLAMPED ``MEFOR_ALLOW_INSECURE_TLS``.
+
+    One process-wide environment variable therefore put a signed ``client_assertion`` on cleartext http
+    even on an enforcing PHI instance — the exact "variable alive here, dead there" asymmetry ADR 0153
+    decision 5 removes everywhere else, and it was invisible to the loosening registry. This cell now
+    goes through ``refuse_cleartext_credential_hop`` like its OAuth2 sibling, so the blunt escape cannot
+    cross it."""
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    monkeypatch.setenv("MEFOR_ALLOW_INSECURE_TLS", "1")
+    with (
+        active_hop_posture(HopPosture(is_phi=True, enforcing=True)),
+        pytest.raises(SmartAuthError, match="cleartext"),
+    ):
+        SmartBackendTokenProvider(
+            token_url="http://auth.example/token", client_id="c", private_key=rsa_pem
+        )
+
+
+def test_cleartext_token_url_crosses_on_a_per_connection_declaration(
+    monkeypatch: pytest.MonkeyPatch, rsa_pem: str
+) -> None:
+    """The other arm: the connection's OWN declaration crosses it — loudly, audited, and named by the
+    loosening registry. Without it, an operator whose legacy IdP has no TLS listener would be pushed
+    into writing a false ``tls_hop_attested``, the defect ADR 0153 exists to remove."""
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+
+    monkeypatch.delenv("MEFOR_ALLOW_INSECURE_TLS", raising=False)
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+        provider = SmartBackendTokenProvider(
+            token_url="http://auth.example/token",
+            client_id="c",
+            private_key=rsa_pem,
+            cleartext_accepted=True,
+            cleartext_reason="legacy IdP has no TLS listener",
+            connection="OB_LEGACY",
+        )
+    assert provider.token_url == "http://auth.example/token"
+
+
+def test_token_provider_from_settings_reads_the_declaration(rsa_pem: str) -> None:
+    """The settings-driven seam: `_dest_config` mirrors the declaration (and the connection name) into
+    the resolved settings, and this factory must READ it — otherwise the graph-authored pair never
+    reaches the token-endpoint gate and a declared connection dies at construction."""
+    from messagefoundry.config.tls_policy import HopPosture, active_hop_posture
+    from messagefoundry.transports.smart import token_provider_from_settings
+
+    settings = {
+        "smart_token_url": "http://auth.example/token",
+        "smart_client_id": "c",
+        "smart_private_key": rsa_pem,
+        "cleartext_accepted": True,
+        "cleartext_reason": "legacy IdP has no TLS listener",
+        "cleartext_connection": "OB_LEGACY",
+    }
+    with active_hop_posture(HopPosture(is_phi=True, enforcing=True)):
+        provider = token_provider_from_settings(settings)
+    assert provider is not None
+
+
 def test_missing_client_id_refused(rsa_pem: str) -> None:
     with pytest.raises(SmartAuthError, match="client_id"):
         SmartBackendTokenProvider(token_url=TOKEN_URL, client_id="", private_key=rsa_pem)

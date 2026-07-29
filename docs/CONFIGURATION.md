@@ -63,7 +63,7 @@ backend-limited.
 | `fifo_claim_prepared` | bool | `false` | **SQL Server only** (ADR 0114 sub-lever B). Stabilizes the pooled claim's statement text (one JSON lanes parameter) and retains a prepared claim cursor on store-owned dedicated connections (INGRESS/ROUTED; the non-DDL fallback lane to `fifo_claim_proc`). **Logs + no-ops unless `fifo_claim_fold_reset` is on** (without the fold the finally-guard's reset would evict the one-slot prepare cache every call). `false` = byte-identical. Flip only after its own §8 gate (AC-14). |
 | `encryption_key` | secret | — | **env only** (`MEFOR_STORE_ENCRYPTION_KEY`); base64 32-byte **active** key — when set, PHI columns (`raw`/`payload` + `error`/`last_error`/`detail`) are AES-256-GCM-encrypted at rest. Mint one with `messagefoundry gen-key`. Empty = off. See [PHI.md §3](PHI.md#3-encryption-at-rest). |
 | `encryption_keys_retired` | secret | — | **env only** (`MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`); comma-separated base64 **decrypt-only** keys kept available during a rotation until `messagefoundry rotate-key` finishes re-encrypting under the active key (ASVS 11.2.2). |
-| `aad_bind` | bool | `false` | **not a secret** (`MEFOR_STORE_AAD_BIND`); the hardened **Posture-B** setting (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). When `true`, new at-rest AES-256-GCM writes use the cell-bound `mfenc:v2` writer — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. Off by default → the frozen `mfenc:v1` writer (byte-identical at rest). No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1`→`v2`. |
+| `aad_bind` | bool | `true` | **not a secret** (`MEFOR_STORE_AAD_BIND`); cell binding (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). New at-rest AES-256-GCM writes use the cell-bound `mfenc:v2` writer — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. **On by default** (ADR 0148 GIVEN 1: the shipped configuration runs the hardened path). Setting it `false` selects the frozen `mfenc:v1` writer (byte-identical at rest) and is a **loosening** — `security_loosenings()` names it, so the opt-out is never silent. No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1`→`v2`, so the default is safe and reversible on an existing store. |
 | `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env`/`dpapi` pin a single built-in source; `aws_kms`·`azure_kv`·`gcp_kms`·`vault`·`pkcs11` envelope-decrypt a wrapped DEK inside an HSM/KMS/Vault (lazy **optional extras — not built yet**; selecting one **fails closed** at `serve`, never a silent downgrade). Names a *provider*, not key material, so it is **not** a secret. |
 | `require_encryption` | bool | `false` | when `true`, `serve` **refuses to start** without an encryption key in **any** environment, even a synthetic one. Off by default. |
 | `allow_unencrypted_phi` | | | **→ moved to `[security].allow_unencrypted_phi`** (ADR 0118) — set it there; no longer accepted in `[store]`. |
@@ -456,7 +456,7 @@ including the surfaces that remain **unbounded** at this release — is
 | `ad_allow_insecure_ldap` | bool | `false` | explicit opt-in to a non-`ldaps://` bind (trusted-network dev only) |
 | `ad_connect_timeout` | float | `10.0` | seconds — bounds the LDAP/LDAPS **TCP connect** on every `ldap3` `Server` the authenticator builds (ASVS 13.1.3). Must be finite and `> 0`; `0`, negative, `inf` and `NaN` are refused at config load. `ldap3`'s own default is `None` (wait forever), so without this an unresponsive DC pinned a thread-pool worker indefinitely |
 | `ad_receive_timeout` | float | `10.0` | seconds — bounds **each LDAP response read** (both binds and every search) on every `ldap3` `Connection`. Same finite-positive validation |
-| `ad_session_recheck_seconds` | int | `0` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`0` = OFF, the default** (no task, byte-identical upgrade); a non-zero value is floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). Requires `ad_enabled` — refused otherwise rather than silently dead. **Recommended `300` for an off-loopback PHI deployment.** |
+| `ad_session_recheck_seconds` | int | `300` | **Directory session reconciliation** ([ADR 0079](adr/0079-kerberos-idp-session-coordination.md) mechanism 2). How often to re-resolve directory principals holding **live** sessions and revoke those AD has disabled or deleted — without it, an AD disable does not take effect until the `[security].max_session_hours` cap (12 h). **`300` (five minutes) is the default** (ADR 0148 GIVEN 1 — the hardened path is the shipped path), floored at **60 s** (a pass costs one LDAP bind per signed-in directory user). `0` disables the loop and is a **loosening** once AD is on — `security_loosenings()` names it. The default is **inert without AD** (`should_reconcile()` also needs an LDAP client), so a non-AD deployment is unaffected; an **explicit** non-zero value without `ad_enabled` is still refused rather than left silently dead. |
 | `ad_session_recheck_strikes` | int | `2` | Consecutive passes a principal must fail to resolve before its sessions are revoked. The directory lookup collapses *disabled*, *deleted* and *the search matched nothing* into one answer, so a single ambiguous result must never revoke. Range 1–10. |
 | `ad_session_recheck_max_users` | int | `200` | Per-pass bind budget. Beyond this, remaining users are picked up by later passes (least-recently-probed first), so a large estate degrades to a longer effective interval instead of a bind storm. |
 | `ad_session_revoke_max` | int | `5` | **Mass-revoke circuit breaker**, absolute half. A bad search base / moved OU / service account that lost read rights answers "not found" for *every* user — indistinguishable from "everyone was disabled". |
@@ -525,7 +525,7 @@ the rest are forward-compat placeholders for the future engine broker (accepted-
 | `forward_tls_verify` | bool | `true` | verify + hostname-check the collector's certificate. `false` is the documented **insecure** opt-out (`CERT_NONE`, no CA file needed) — lab / pinned-network only |
 | `forward_tls_client_cert` | str | — | optional PEM cert+key chain for **mutual** TLS to the collector |
 | `forward_hop_attested` | bool | `false` | **acknowledged opt-out** for a plaintext / unverified-TLS collector hop (#200, ADR 0092 — the `[logging]` sibling of a connection's `tls_hop_attested`). A hop that is not verified TLS is now decided by the shared posture gradient: **refused** on an enforcing PHI instance, warned on a non-enforcing PHI instance, allowed for loopback / synthetic. Set this (with a reason) to affirm the hop is secure by other means — e.g. a dedicated out-of-band management VLAN |
-| `forward_hop_attested_reason` | str | — | why the hop is secure, recorded for the audit trail. Only valid **with** `forward_hop_attested = true`, and must be non-empty |
+| `forward_hop_attested_reason` | str | — | why the hop is secure, recorded for the audit trail. **Mandatory when `forward_hop_attested = true`** (ADR 0153 retro-fitted the flag-implies-reason rule: an attestation that suppresses a refusal must record WHY, or it is worthless when audited) — the flag alone now fails at load. Rejected without the flag, and must be non-empty |
 | `require_time_sync` | bool | `false` | **opt-in** startup clock-sync gate (ASVS 16.2.2, ADR 0080): before listeners start, probe `ntp_peer` and warn on skew. Requires `ntp_peer`. Default = no-op |
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
@@ -700,15 +700,20 @@ checked against the resolved (`env()`-substituted) destination.
 > The webhook/SMTP **alert** sinks carry no message bodies (no PHI) and keep their own host allowlists
 > in `[alerts]` (`webhook_allowed_hosts` / `smtp_allowed_hosts`).
 
-> **Cleartext (`http://`) egress is refused only on a PHI posture (ASVS 12.2.1).** Separately from
-> this allowlist, a plaintext `http://` outbound to a **non-loopback** host is decided by the instance
-> PHI posture in [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py)
-> (`insecure_hop_disposition`), enforced at construction by `refuse_cleartext_egress`
-> ([`transports/rest.py`](../messagefoundry/transports/rest.py)): a loopback / on-box, per-hop-attested,
-> or **non-PHI (synthetic)** hop is **allowed**; a **production PHI** hop with no attestation is
-> **refused** (fail-closed); a non-production PHI hop refuses unless the clamped audited escape
-> downgrades it to a warning. A non-PHI instance therefore keeps cleartext http egress **by design**
-> (ADR 0115 forbids unconditionally refusing it), so 12.2.1 stays Partial on a non-PHI Posture-A box.
+> **Cleartext (`http://`) egress is refused, whatever the data label (ASVS 12.2.1,
+> [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)).**
+> Separately from this allowlist, a plaintext `http://` outbound to a **non-loopback** host is decided by
+> [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py)'s `insecure_hop_disposition`, enforced
+> at construction by `refuse_cleartext_egress`
+> ([`transports/rest.py`](../messagefoundry/transports/rest.py)). The precedence is: a loopback / on-box
+> hop is **allowed**; a per-connection `tls_hop_attested` hop is **allowed** (the operator asserts it is
+> secure by other means); a per-connection `cleartext_accepted` hop is **crossed with a loud, audited
+> WARN** (the operator accepts that it is not secure); a non-enforcing instance
+> (`[security].enforcement = warn`) **warns**; everything else is **refused** (fail-closed).
+> **`data_class` is no longer read here** — a `synthetic` label used to allow every cleartext hop
+> silently, which made a typo in one file indistinguishable from a deliberate declaration, with every
+> transport hop in the product as its blast radius. `MEFOR_ALLOW_INSECURE_TLS` no longer influences this
+> decision either; it survives for the non-connection cells that have nowhere to carry a declaration.
 
 ### `[shadow]`
 Parallel-run / **shadow-instance** egress suppression (#15). A *shadow* MessageFoundry processes real

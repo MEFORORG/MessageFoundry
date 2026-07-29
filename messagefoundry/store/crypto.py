@@ -32,8 +32,10 @@ not *dispatched on*.)
 cryptographically bound to the cell it lives in — a blob cut-and-pasted into another row/column/table
 fails the auth tag (``CipherError``) instead of decrypting. ``v1`` never carries AAD and stays frozen;
 :meth:`~AesGcmCipher.decrypt` dispatches the AAD by marker version (v1→``None``, v2→caller-supplied), so
-legacy v1 rows still read (dual-read). Bound writes are opt-in via ``[store].aad_bind`` (which sets
-``write_v2``); off by default, so the default at-rest format is unchanged (CRYPTO-1).
+legacy v1 rows still read (dual-read). Bound writes are selected by ``[store].aad_bind`` (which sets
+``write_v2``); **ON by default** since ADR 0148 GIVEN 1, so the default at-rest format is ``mfenc:v2``.
+Setting the knob false selects the frozen v1 writer — byte-identical at rest (CRYPTO-1), and a declared
+loosening.
 
 **Key rotation (WP-5, ASVS 11.2.2).** The cipher is a **keyring**: it encrypts with the single
 *active* key and decrypts with whichever configured key matches (active + any retired decrypt-only

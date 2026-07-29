@@ -54,7 +54,10 @@ def _rsa_pem() -> str:
     ).decode()
 
 
-_SYNTHETIC = HopPosture(is_phi=False, enforcing=False)  # no PHI on the wire → no dest-side refusals
+# ADR 0153: the data label no longer relaxes a cleartext hop, so the permissive posture for these
+# PROXY-behaviour tests is the non-enforcing dial (which still WARNs, never refuses). Renamed from
+# _SYNTHETIC so nothing here reads as if the label were still doing the work.
+_WARN_DIAL = HopPosture(is_phi=False, enforcing=False)
 _PROD = HopPosture(
     is_phi=True, enforcing=True
 )  # production PHI → the cleartext-proxy-hop guard bites
@@ -76,10 +79,14 @@ def _build(
     ctype: ConnectorType,
     url: str,
     *,
-    posture: HopPosture = _SYNTHETIC,
+    posture: HopPosture = _WARN_DIAL,
     attested: bool = False,
+    accepted: bool = False,
     **over: object,
 ) -> object:
+    """Build one outbound. ``accepted`` is ADR 0153's per-connection cleartext declaration — needed by
+    the tests whose PROXY hop is plain http, since the proxy crossing is decided by the same authority
+    as the destination crossing."""
     settings = _FACTORY[ctype](url=url, **over).settings  # type: ignore[operator]
     with active_hop_posture(posture):
         return build_destination(
@@ -88,6 +95,9 @@ def _build(
                 type=ctype,
                 settings=settings,
                 tls_hop_attested=attested,
+                tls_hop_attested_reason="proxy-terminated trusted segment" if attested else None,
+                cleartext_accepted=accepted,
+                cleartext_reason="on-prem proxy listener has no TLS" if accepted else None,
                 tls_revocation_attested=True,  # isolate the proxy behaviour from the #201 revocation gate
             )
         )
@@ -148,6 +158,9 @@ def test_basic_proxy_auth_preemptive_header() -> None:
     dest = _build(
         ConnectorType.REST,
         HTTPS_DEST,
+        # The PROXY hop is cleartext http and carries a credential, so under ADR 0153 it needs the
+        # connection's declaration to cross — the destination hop here is https and unaffected.
+        accepted=True,
         proxy=PROXY,
         proxy_user="pu",
         proxy_password="pw",
@@ -300,11 +313,17 @@ def test_proxy_bypasses_unit() -> None:
 
 def test_token_endpoint_is_proxied() -> None:
     """AC-8: the OAuth2 token-endpoint call is routed through the connection's forward proxy too (opener
-    ProxyHandler + pre-emptive Proxy-Authorization)."""
-    with active_hop_posture(_SYNTHETIC):
+    ProxyHandler + pre-emptive Proxy-Authorization).
+
+    The proxy hop here is cleartext http and carries a credential, so it needs the ADR 0153 declaration
+    to cross — the proxy-credential chain reads it off the resolved settings, the same mapping it
+    already reads ``tls_hop_attested`` from."""
+    with active_hop_posture(_WARN_DIAL):
         cfg = proxy_config_from_settings(
             {"proxy_url": PROXY, "proxy_user": "pu", "proxy_password": "pw"},
             dest_scheme="https",
+            cleartext_accepted=True,
+            cleartext_reason="on-prem proxy listener has no TLS",
         )
     assert isinstance(cfg, ProxyConfig)
     provider = OAuth2ClientCredentialsProvider(
@@ -321,10 +340,12 @@ def test_token_endpoint_is_proxied() -> None:
 def test_smart_token_endpoint_is_proxied() -> None:
     """AC-8 (SMART leg): the SMART Backend Services token-endpoint POST is proxied too — its OWN opener
     carries the ProxyHandler and its own pre-emptive Proxy-Authorization (distinct wiring from OAuth2)."""
-    with active_hop_posture(_SYNTHETIC):
+    with active_hop_posture(_WARN_DIAL):
         cfg = proxy_config_from_settings(
             {"proxy_url": PROXY, "proxy_user": "pu", "proxy_password": "pw"},
             dest_scheme="https",
+            cleartext_accepted=True,
+            cleartext_reason="on-prem proxy listener has no TLS",
         )
     assert isinstance(cfg, ProxyConfig)
     provider = SmartBackendTokenProvider(
@@ -361,7 +382,7 @@ def test_egress_default_proxy() -> None:
 
 def test_fhir_lookup_executor_proxied() -> None:
     """The fhir_lookup read hop (and its SMART token endpoint) traverse the proxy too."""
-    with active_hop_posture(_SYNTHETIC):
+    with active_hop_posture(_WARN_DIAL):
         ex = FhirLookupExecutor(
             {
                 "epic": {

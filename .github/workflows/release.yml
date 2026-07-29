@@ -173,8 +173,8 @@ jobs:
           # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
           # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
           python -m pip install --upgrade "cyclonedx-bom~=7.3"
+          # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           python -m venv /tmp/sbomenv
-          /tmp/sbomenv/bin/pip install --upgrade pip
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
             --pyproject pyproject.toml --mc-type application \

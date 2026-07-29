@@ -125,3 +125,45 @@ def test_set_rejects_the_allowlist_beside_a_broad_trusted_proxies(
     rc, _ = _set(toml, {"allowed_client_networks": ["10.20.0.0/16"]}, capsys)
     assert rc == 1
     assert "[security]" not in toml.read_text(encoding="utf-8")  # rolled back
+
+
+def test_show_declares_that_it_cannot_see_connection_scoped_deviations(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`security show` reads a SETTINGS file and never loads the connection graph, so it cannot see the
+    ADR 0153 per-connection ``cleartext_accepted`` declarations.
+
+    The marker is the whole mitigation: without it this subcommand reports a settings-only list that
+    READS as the complete posture, which under "one posture, loosen only" is exactly how a deviation
+    stops being visible. Nothing else pins it, so it could otherwise be dropped silently."""
+    toml = tmp_path / "mf.toml"
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is False
+    assert "cleartext_accepted" in data["loosenings_scope"]
+    assert "messagefoundry check" in data["loosenings_scope"]
+
+
+def test_show_reports_store_and_auth_deviations_from_the_whole_file(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The registry reaches into [store]/[auth], so this subcommand must resolve the WHOLE file rather
+    than [security] alone — otherwise it under-reports the posture it exists to display."""
+    toml = tmp_path / "mf.toml"
+    toml.write_text("[store]\naad_bind = false\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert "aad_bind" in [entry["switch"] for entry in data["loosenings"]]
+
+
+def test_show_declares_a_partial_report_when_the_file_will_not_load(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A file invalid OUTSIDE [security] must not break `security show` — but the degraded report has to
+    SAY it is degraded, not quietly fall back to shipped defaults and look complete."""
+    toml = tmp_path / "mf.toml"
+    # Valid TOML, invalid SETTINGS, and invalid entirely outside [security]: an explicit
+    # ad_session_recheck_seconds with no ad_enabled is the ADR 0079 cross-field refusal.
+    toml.write_text("[auth]\nad_session_recheck_seconds = 300\n", encoding="utf-8")
+    data = _show(toml, capsys)
+    assert data["loosenings_partial"] is True
+    # ...and it still prints a usable [security] view rather than failing the subcommand.
+    assert data["values"]["require_mfa"] is True

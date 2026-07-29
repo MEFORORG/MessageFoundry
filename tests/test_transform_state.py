@@ -316,16 +316,20 @@ async def test_key_rotation_reencrypts_state_and_reads_still_work(tmp_path: Path
     await store.close()
     # Reopen with a NEW active key, old kept as retired (decrypt-only) — the rotation scenario.
     new = generate_key()
-    store2 = await MessageStore.open(db, cipher=make_cipher(new, [old]))
+    rotating = make_cipher(new, [old])
+    store2 = await MessageStore.open(db, cipher=rotating)
     try:
         # Before rotation the value is still under the old key but reads work (keyring).
         assert store2.state_view()[("ns", "k")] == "secret"
         rotated = await store2.reencrypt_to_active()
         assert rotated >= 1  # the state value (among others) re-encrypted
-        # On disk it is now under the NEW key id, and reads still resolve.
-        new_id = make_cipher(new).active_key_id  # type: ignore[attr-defined]
+        # On disk it is now under the NEW key id, and reads still resolve. Take the expected marker
+        # from the rotating cipher itself instead of hand-building f"{PREFIX}{new_id}:" — that spelling
+        # bakes in the v1 field order and misreads a v2 value (mfenc:v2:<alg>:<key_id>:), which is what
+        # [store].aad_bind makes the default at rest. `old_id not in` keeps the independent proof that
+        # rotation actually moved the value, derived from active_key_id rather than the prefix.
         at_rest = _state_at_rest(db, "ns", "k")
-        assert at_rest.startswith(f"{PREFIX}{new_id}:")
+        assert at_rest.startswith(rotating.active_marker_prefix)  # type: ignore[attr-defined]
         assert old_id not in at_rest
         assert store2.state_view()[("ns", "k")] == "secret"
     finally:

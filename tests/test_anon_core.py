@@ -52,7 +52,15 @@ def synthetic_site_prefix(monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
     monkeypatch.setenv("MEFOR_FORBIDDEN_TOKENS", "[site_prefix]\n99\n")
     surrogates.reload_site_prefixes()
     yield "99"
-    monkeypatch.delenv("MEFOR_FORBIDDEN_TOKENS", raising=False)
+    # Undo the patch BEFORE recomputing, and recompute from the environment that is actually restored.
+    # `delenv` + reload was wrong in a way that only shows up when a real token source is configured:
+    # it left the module globals derived from an environment with NO token source, and monkeypatch then
+    # restored the real value afterwards with nothing to recompute the globals again. The engine's
+    # `_SITE_PREFIXES` stayed stale for the rest of the session while the vendored `tee/anon` copy kept
+    # its import-time value, so `test_anon_parity` — the engine/tee divergence guard — failed on an
+    # unrelated message hundreds of tests later. `monkeypatch.undo()` puts the real environment back
+    # first, so the reload below sees the same source the module saw at import.
+    monkeypatch.undo()
     surrogates.reload_site_prefixes()
 
 
@@ -291,3 +299,28 @@ def test_anonymize_with_explicit_rules_only_touches_those_fields() -> None:
     assert "DOE" not in pid.split("|")[5]  # PID-5 scrubbed
     assert "12345" in pid  # PID-3 left intact (not in the explicit rule set)
     assert "DOE^JANE" in out  # NK1-2 untouched (only PID-5 was in scope)
+
+
+def test_site_prefix_fixture_leaves_module_globals_consistent_with_the_environment() -> None:
+    """Regression guard for a cross-module leak that cost a full-suite failure hundreds of tests later.
+
+    ``synthetic_site_prefix`` patches ``MEFOR_FORBIDDEN_TOKENS`` and recomputes the ``surrogates``
+    module globals from it. Its teardown used to ``delenv`` and reload BEFORE monkeypatch restored the
+    real value, leaving ``_SITE_PREFIXES`` derived from an environment that no longer existed. Nothing
+    recomputed them afterwards, so on any box with a real token source configured the engine's globals
+    stayed stale for the rest of the session while the vendored ``tee/anon`` copy kept its import-time
+    value — and ``test_anon_parity`` (the engine/tee divergence guard) failed on an unrelated message.
+
+    Declared last in this module so it runs after every fixture user: it asserts the live globals still
+    agree with a fresh recomputation from the CURRENT environment. It is only meaningful where a token
+    source is actually configured, which is exactly the condition the original bug needed — and is why
+    CI, which does not set one for the test job, never saw the failure.
+    """
+    from messagefoundry.anon import surrogates
+
+    live = surrogates._SITE_PREFIXES
+    surrogates.reload_site_prefixes()
+    assert live == surrogates._SITE_PREFIXES, (
+        "surrogates._SITE_PREFIXES drifted from what the current environment yields — a fixture "
+        "recomputed them under a patched environment and did not restore them afterwards"
+    )
