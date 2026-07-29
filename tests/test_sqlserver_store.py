@@ -1013,7 +1013,8 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
         await old.close()
 
     # Assert against the very cipher that does the rewriting, via the marker prefix IT writes — so the
-    # check pins version + alg + key id together and stays right whatever at-rest format is active.
+    # check pins marker + version + key id together (and the alg too, on v2) and stays right whatever
+    # at-rest format is active. The `== 6` below is the independent proof that rotation really ran.
     active_cipher = AesGcmCipher(k2, retired_keys=[k1])
     rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
@@ -1354,7 +1355,7 @@ async def test_reingress_depth_cap_dead_letters(store) -> None:
 
 async def test_response_rotation_and_purge(store) -> None:
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher, _fingerprint
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1368,16 +1369,22 @@ async def test_response_rotation_and_purge(store) -> None:
     finally:
         await old.close()
 
-    # Assert through the rotating cipher's own marker prefix (version + alg + key id), not a hand-rolled
-    # split of one field — the shipped accessor tracks whatever at-rest format the writer emits.
+    # Assert through the rotating cipher's own marker prefix, not a hand-rolled split of one field —
+    # the shipped accessor tracks whatever at-rest format the writer emits (v1 pins marker+version+key
+    # id; v2 pins the alg too). Paired with the retired fingerprint's ABSENCE, which is derived from a
+    # DIFFERENT property (_fingerprint, not active_marker_prefix) so the two still cross-check: were
+    # the prefix ever to go over-broad, rotation would silently no-op and startswith pass vacuously.
+    retired_id = _fingerprint(k1)
     active_cipher = AesGcmCipher(k2, retired_keys=[k1])
     rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()  # rotates response.body + detail (among others)
         blobs = await rotated._fetchall("SELECT body, detail FROM response")
+        assert blobs, "expected a rotated response row"
         for b in blobs:
-            assert b["body"].startswith(active_cipher.active_marker_prefix)
-            assert b["detail"].startswith(active_cipher.active_marker_prefix)
+            for v in (b["body"], b["detail"]):
+                assert v.startswith(active_cipher.active_marker_prefix), v
+                assert retired_id not in v
         r = (await rotated.correlate_response(mid))[0]
         assert (
             r.body == "secret-reply" and r.detail == "secret-detail"
@@ -1429,7 +1436,7 @@ async def test_reingress_peek_failed_errors_child_and_skips_ingress(store) -> No
 
 async def test_reencrypt_skips_null_response_detail(store) -> None:
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher, _fingerprint
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1442,14 +1449,18 @@ async def test_reencrypt_skips_null_response_detail(store) -> None:
     finally:
         await old.close()
 
+    retired_id = _fingerprint(k1)
     active_cipher = AesGcmCipher(k2, retired_keys=[k1])
     rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()  # must not crash on / mis-handle the NULL detail
         row = (await rotated._fetchall("SELECT body, detail FROM response"))[0]
         assert row["detail"] is None  # NULL skipped (IS NOT NULL guard), not crashed
-        # The row itself was NOT skipped: body carries the rotating cipher's active marker prefix.
+        # The row itself was NOT skipped: body carries the rotating cipher's active marker prefix,
+        # and no longer the retired fingerprint (checked off _fingerprint, so it cross-checks the
+        # prefix rather than restating it — an over-broad prefix would make startswith vacuous).
         assert row["body"].startswith(active_cipher.active_marker_prefix)
+        assert retired_id not in row["body"]
         r = (await rotated.correlate_response(mid))[0]
         assert r.body == "reply-body" and r.detail is None
     finally:
@@ -1491,7 +1502,7 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
     """EF-3: summary/metadata are rotated under the active key like the body — not stranded under a
     retired key (which a later retired-key drop would make undecryptable)."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher, _fingerprint
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1505,14 +1516,18 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
     finally:
         await old.close()
 
+    retired_id = _fingerprint(k1)
     active_cipher = AesGcmCipher(k2, retired_keys=[k1])
     rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()
         row = (await rotated._fetchall("SELECT summary, metadata FROM messages"))[0]
-        # Under the ACTIVE key in the ACTIVE marker format — the prefix the rotating cipher writes.
-        assert row["summary"].startswith(active_cipher.active_marker_prefix)
-        assert row["metadata"].startswith(active_cipher.active_marker_prefix)
+        # Under the ACTIVE key in the ACTIVE marker format — the prefix the rotating cipher writes —
+        # and no longer under the retired one. The second check comes off _fingerprint, not
+        # active_marker_prefix, so it independently proves rotation ran rather than restating it.
+        for v in (row["summary"], row["metadata"]):
+            assert v.startswith(active_cipher.active_marker_prefix), v
+            assert retired_id not in v
         [m] = await rotated.list_messages()
         assert (
             m["summary"] == summary and m["metadata"] == metadata
@@ -1523,8 +1538,10 @@ async def test_reencrypt_rotates_summary_and_metadata(store) -> None:
 
 # --- H4: error / last_error / message_events.detail encrypted at rest ----------
 # SQL Server parity with SQLite/Postgres: the three nullable disposition-text columns route through the
-# SAME store cipher (mfenc:v1) — at-rest ciphertext, decrypt-on-read, rotated on rekey, and legacy
-# plaintext migrated on open. The prior "SQL Server keeps these plaintext" residual is retired.
+# SAME store cipher — at-rest ciphertext in whichever mfenc format that cipher writes, decrypt-on-read,
+# rotated on rekey, and legacy plaintext migrated on open. (Naming a version here would be wrong: the
+# format follows [store].aad_bind, so it is v2 by default.) The prior "SQL Server keeps these
+# plaintext" residual is retired.
 
 
 async def test_error_lasterror_detail_encrypted_at_rest_and_decrypt(store) -> None:
@@ -1578,7 +1595,7 @@ async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
     """H4: the three disposition-text columns are rotated to the active key on rekey like the body —
     not stranded under a retired key (which a later retired-key drop would make undecryptable)."""
     from messagefoundry.config.settings import load_settings
-    from messagefoundry.store.crypto import AesGcmCipher
+    from messagefoundry.store.crypto import AesGcmCipher, _fingerprint
     from messagefoundry.store.sqlserver import SqlServerStore
 
     settings = load_settings(environ=os.environ).store
@@ -1593,12 +1610,15 @@ async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
     finally:
         await old.close()
 
+    retired_id = _fingerprint(k1)
     active_cipher = AesGcmCipher(k2, retired_keys=[k1])
     rotated = await SqlServerStore.open(settings, cipher=active_cipher)
     try:
         await rotated.reencrypt_to_active()
-        # every non-null disposition-text value now carries the ACTIVE key id, in the marker format the
-        # rotating cipher writes (v1 or v2 — active_marker_prefix spans version, alg and fingerprint).
+        # every non-null disposition-text value now carries the ACTIVE key id, in whichever marker
+        # format the rotating cipher writes (active_marker_prefix spans marker + version + fingerprint,
+        # plus the alg on v2) — and none still carries the RETIRED fingerprint. That second check is
+        # derived from _fingerprint rather than the prefix, so it cross-checks rotation actually ran.
         blobs = await rotated._fetchall(
             "SELECT error AS v FROM messages WHERE error IS NOT NULL"
             " UNION ALL SELECT last_error FROM queue WHERE last_error IS NOT NULL"
@@ -1607,6 +1627,7 @@ async def test_reencrypt_rotates_error_lasterror_detail(store) -> None:
         assert blobs, "expected rotated disposition-text values"
         for r in blobs:
             assert r["v"].startswith(active_cipher.active_marker_prefix), r["v"]
+            assert retired_id not in r["v"], r["v"]
         # still decrypts under the new key on the read paths.
         assert any(m["error"] == err for m in await rotated.list_messages())
         assert (await rotated.list_dead())[0]["last_error"] == fail
