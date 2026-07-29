@@ -82,10 +82,19 @@ repos:
   # The upstream hook already scopes itself to `types: [yaml]` + `files: ^\.github/workflows/`, so no
   # `files:` override is needed here — and adding one would be the scope drift
   # tests/test_lint_scope_parity.py exists to prevent.
+  #
+  # `-shellcheck=` disables actionlint's shellcheck integration, matching the CI step in zizmor.yml.
+  # actionlint shells out to shellcheck for every `run:` body IF shellcheck is on PATH — so without
+  # this flag the same hook is a DIFFERENT linter on a machine that has shellcheck than on one that
+  # does not, and different again on a GitHub runner (which ships it). That is how the CI step first
+  # landed red on ~30 pre-existing findings after passing locally. Whether to adopt shellcheck over
+  # every `run:` body is a real question, but it is a separate PR that also clears the backlog — not a
+  # side effect of which tools happen to be installed. Keep both sides carrying this flag.
   - repo: https://github.com/rhysd/actionlint
     rev: v1.7.12
     hooks:
       - id: actionlint
+        args: ["-shellcheck="]
 
   # Python SAST — the SAME skips AND the same excluded paths as the CI bandit job (security.yml).
   # It said "same ... as CI" before and was not: CI scanned `-r messagefoundry tee` while this hook

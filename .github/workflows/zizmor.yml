@@ -63,7 +63,28 @@ jobs:
           tar -xzf "$asset" actionlint
           sudo install -m 0755 actionlint /usr/local/bin/actionlint
           actionlint --version
-          actionlint
+          # `-shellcheck=` DISABLES actionlint's shellcheck integration, deliberately.
+          #
+          # actionlint shells out to shellcheck for every `run:` body IF shellcheck is on PATH. GitHub
+          # runners ship it; a local actionlint binary generally does not. So the same command is a
+          # different linter in the two places -- this step passed locally and failed in CI on ~30
+          # PRE-EXISTING findings in ci.yml and release.yml that have nothing to do with the change that
+          # added it. That asymmetry is the exact defect class this repo keeps hitting: a gate whose
+          # reach depends on its environment.
+          #
+          # Scope is the reason, not the noise. This step exists for the workflow-syntax class in
+          # docs/CI.md -- an invalid GitHub expression interpolation that aborts workflow COMPILATION so
+          # required contexts never appear. Adopting shellcheck's whole ruleset over every `run:` body is
+          # a separate decision, and several of its findings here are it misparsing a GitHub
+          # interpolation inside a shell script (release.yml:392 "'(' is invalid here"). Turning it on
+          # repo-wide belongs in its own PR that also clears or annotates the backlog.
+          #
+          # NB -- do NOT write a literal empty interpolation (dollar-brace-brace) in this comment to
+          # illustrate the point: actionlint parses expressions in `run:` bodies INCLUDING comments, so
+          # the illustration is itself the defect. Writing one here is how this very step first went red.
+          #
+          # Now identical locally and in CI, which is what makes a green here mean something.
+          actionlint -shellcheck=
       - name: Analyze the workflows
         env:
           # Lets zizmor run its online audits (e.g. unpinned / known-problematic action refs).
