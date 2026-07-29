@@ -19,6 +19,20 @@ tree under everyone simultaneously.
 Companion docs: [WORKTREES.md](WORKTREES.md) (how to use worktrees), [WORKTREE-GATE.md](WORKTREE-GATE.md)
 (the gate's own design rationale and backout), [LEDGER-GATE.md](LEDGER-GATE.md) (the number space).
 
+> **Fixed since this audit ran** — G2, G3, G7 and G12 are closed in the repo, and rule 4 is now opt-in
+> (`install-gate.ps1 -EnterWorktreeGate`) so re-installing cannot activate it by accident. Each fixed gap
+> is marked below.
+>
+> **They are not live yet.** The gate executes from an installed copy; none of it takes effect until, from
+> a plain terminal:
+>
+> ```powershell
+> pwsh -NoProfile -File scripts\worktree\install-gate.ps1
+> ```
+>
+> `tests/test_gate_installed_parity.py` is **red until that runs** — deliberately. That test is the fix for
+> G1, and the first thing it detected was itself.
+
 ---
 
 ## 1. The estate
@@ -96,9 +110,11 @@ reading the emitted decision — not by reading source alone.
 |---|---|---|
 | Rule 1 — write into primary | user | **LIVE** (probe-verified DENY) |
 | Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY) |
-| Rule 3 — git verbs vs primary | user | **LIVE but partial** — DENY on literal spellings, ALLOW on several others (§3) |
+| Rule 3 — git verbs vs primary | user | **LIVE, partial** — the `-c` and relative-`cd` holes are fixed in source (G2/G3); enumerated-verb gaps remain (G9) |
 | Rule 3b — worktree hijack | user | **LIVE but narrow** — 2 of 11 verbs, existing-local-branch destinations only |
-| Rule 4 — `EnterWorktree` | — | **INERT, twice over** — absent from the installed script *and* unmatched in all 5 config dirs |
+| Rule 4 — `EnterWorktree` | — | **INERT BY DESIGN** — now opt-in behind `-EnterWorktreeGate`; was inert by accident (absent from the installed script *and* unmatched in all 5 config dirs) |
+| Deny receipts (`worktree-gate.log`) | user | **NEW** — every deny logs rule/tool/cwd/detail; never the raw command |
+| Installed-vs-source parity check | local test | **NEW** — `tests/test_gate_installed_parity.py`; skips on CI, red on a stale box |
 | Blanket-stage guard | project | **LIVE but leaky** — 7 of 8 trivial rephrasings bypass it |
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
@@ -156,7 +172,7 @@ pattern, reproduced inside the drift machinery itself.
 Ranked by expected harm × likelihood. G1–G4 survived an adversarial verification pass; the rest are
 probe- or source-verified.
 
-### G1 — Nothing can observe what is actually installed *(root cause)*
+### G1 — Nothing can observe what is actually installed *(root cause)* — **FIXED IN SOURCE**
 
 `install-gate.ps1` copies the script with no version, hash, or marker. `-Status` prints an **uncalibrated
 count** of hook entries — it reports "3" where 4 is now expected, and states no expectation. Worse, the
@@ -167,7 +183,7 @@ installed copy keeps enforcing it forever while every test correctly reports it 
 Measured today: installed 23,430 B (Jul 24) vs repo 25,423 B (Jul 29). This is why rule 4 is inert, and it
 will recur for the next rule.
 
-### G2 — `cd` to the primary by a non-literal spelling defeats rule 3
+### G2 — `cd` to the primary by a non-literal spelling defeats rule 3 — **FIXED**
 
 Rule 3 resolves the target from cwd or `-C` only; `cd <primary> && git …` is caught solely by an in-text
 scan for the allowlist root's canonical spelling. Rule 3b *does* resolve `cd`, then returns with the
@@ -181,7 +197,7 @@ Probe-verified ALLOW from a nested worktree, where `../../..` **is** the primary
 to name the repo root, so this is reachable **by accident**. [WORKTREE-GATE.md](WORKTREE-GATE.md) asserts
 coverage of exactly this shape.
 
-### G3 — `git -c <cfg>` redirects rule 3's target off the primary *(one-character fix)*
+### G3 — `git -c <cfg>` redirects rule 3's target off the primary — **FIXED**
 
 Rule 3 parses `-C <path>` with `-match`, which is case-**in**sensitive in PowerShell, so git's lowercase
 global `-c name=value` is captured as if it were a path. `git -c core.pager=cat checkout main` at
@@ -234,7 +250,7 @@ Upstream draws this boundary explicitly — the worktrees documentation states t
 repository's `.git` and that sandboxing allows those writes, which is exactly why `hooks/` and config need
 their own rule.
 
-### G7 — Rule 1's deny message advertises the primary as a worktree to reuse
+### G7 — Rule 1's deny message advertises the primary as a worktree to reuse — **FIXED**
 
 The "worktrees that already exist — REUSE one if it is yours" filter compares a string to the
 `PSCustomObject` returned by `Test-Governed`, so the comparison is always true and the primary is never
@@ -265,7 +281,7 @@ requires whitespace before the verb; a hyphen precedes `checkout`). `gh pr check
 token and exits early. Rules 1 and 2 key on tool *names*, so any tool not in those lists is unmatched at
 **both** the settings matcher and the rule — the hook never runs, and nothing says so.
 
-### G10 — False positives train sessions to route around the only control on the shell path
+### G10 — False positives train sessions to route around the only control on the shell path — **FIXED**
 
 The verb scan's exclusion class does not exclude newline, so `git status\necho about to merge stuff`
 denies with verb=`merge` from prose on line 2. The git-detection class includes quote characters, so
@@ -287,7 +303,7 @@ and `prune-merged.ps1` are sibling-only, so the nested population — where ever
 — has creation but no scripted teardown, and `prune-merged.ps1` run from a worktree prints a green
 "No sibling worktrees to consider" and exits 0. A wrong-cwd run reports a clean bill of health.
 
-### G12 — The gate has never produced a receipt
+### G12 — The gate has never produced a receipt — **FIXED**
 
 `Write-Deny` writes JSON to stdout and exits 0. There is no log, no counter, no audit file. Nothing can
 answer "how many drift events were prevented last month", "is G10's false-positive rate 1/day or 1/1000",
@@ -415,9 +431,16 @@ analysis must be redone.
 | **B10** | **Collapse the two allowlists; harden the second installer.** One allowlist path referenced by both scripts; `-Uninstall` removes it; give `install-selfheal.ps1` the `CLAUDECODE` throw, the multi-config-dir discovery loop, a `-Status` and an `-Uninstall`. Extend B1's check to assert the set of dirs carrying a gate matcher equals the set carrying the selfheal hook. | G8 | S | none |
 | **B11** | **Close the verb and teardown holes.** A second alternation for hyphenated/two-token forms (`sparse-checkout`, `worktree remove|move`, `branch -f`, `update-ref`, `read-tree`, `rm`, `mv`, `checkout-index`, `bisect`), with its own message for `worktree remove` (cross-session destruction, not a tree swap); teach the detector about `gh`. Give `prune-merged.ps1` a **loud failure** when its root is not the primary instead of a green no-op, and add nested-worktree teardown. Correct the false rationale comment. | G9, G11 | M | low |
 
-**Order:** B1 and B2 first, together. Without them, none of the rest can be confirmed to have reached
-production, and no severity claim in §3 is falsifiable. Then B9 (one character), B3+B4 as a pair, then
-B5–B8, then B11.
+**Status.** B1, B2, B3, B4 and B9 are **built and merged to this branch**, with tests; each fix was proved
+to catch its own regression by mutation (five mutations applied to the shipped script one at a time, all
+five went red). B7 is **half done** — rule 4 is now opt-in rather than retired, which preserves the owner's
+decision while removing the trap where re-installing would activate it. B5, B6, B8, B10 and B11 are **not
+started**; B6 (worktree-first entry point) is the one with the largest durable effect and no code in it.
+
+Remaining order: B6, then B8 (cross-worktree blast radius), then B5, B10, B11.
+
+One caveat carried forward: **none of the merged work is live until the gate is re-installed.** That is the
+same property that made rule 4 inert, now with a test watching it.
 
 ### Considered, not worth doing now
 
