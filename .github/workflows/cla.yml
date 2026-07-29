@@ -5,8 +5,11 @@ name: CLA Assistant
 # needed — the default GITHUB_TOKEN (with contents: write below) is sufficient.
 #
 # NOTE: pull_request_target workflows only run from the DEFAULT branch, so this takes effect
-# once it is merged to main. To make signing mandatory, add the "CLA Assistant" status check
-# to main's branch-protection required checks.
+# once it is merged to main. Signing IS already mandatory: the required status-check context is
+# `cla` -- the JOB key below, because that job declares no `name:`. It is NOT "CLA Assistant",
+# which is this WORKFLOW's name and matches no status check; adding that string to branch
+# protection would wedge every PR forever (docs/CI.md, "the required-but-absent trap").
+# See .github/required-contexts.txt.
 
 on:
   issue_comment:

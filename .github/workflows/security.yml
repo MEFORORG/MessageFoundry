@@ -5,6 +5,14 @@ name: Security
 #   All four are BLOCKING — their first CI run was clean (bandit: 0; gitleaks: 0; semgrep: 0 across
 #   5 rules; pip-audit: no known CVEs), so each now fails the build on a regression rather than
 #   merging unnoticed. To temporarily downgrade one, add `continue-on-error: true` back to its job.
+#
+#   READ THAT LAST SENTENCE AS A TRAP, not a procedure. Every job here except `sbom` and `trivy` is a
+#   REQUIRED context, and GitHub reports a continue-on-error job as SUCCESS — so that one line leaves
+#   branch protection green while the scanner's findings are discarded, and with auto-merge armed and
+#   zero required approvals the PR merges unread. `tests/test_security_posture.py` now REFUSES it (and
+#   `|| true`, `--exit-zero`, and a skippable job-level `if:`) for any job in the required set. To take
+#   a gate off the merge path, remove its context from branch protection AND
+#   `.github/required-contexts.txt` — deliberately, in a reviewed diff. Never neuter it in place.
 # CodeQL and native push-protection secret scanning need GitHub Advanced Security on this private
 # repo; gitleaks below is the no-GHAS secret scanner. See docs/SECURITY.md.
 #

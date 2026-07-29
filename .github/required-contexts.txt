@@ -1,0 +1,73 @@
+# The status-check contexts REQUIRED to merge into `main`.
+#
+# WHY THIS FILE EXISTS. Branch protection lives on the server, so "is this check blocking?" was
+# unanswerable from a clone -- and five places in this repo answered it differently: docs/CI.md
+# listed 8 contexts, .github/workflows/manifest-lint.yml said 4, docs/design/freethread.md said 7,
+# tests/test_push_guard.py said 12. The live API says 12. With `required_approving_review_count: 0`
+# and auto-merge armed, required-set membership is the ONLY thing separating "reviewed" from
+# "merged unread", so a wrong answer here mis-ranks which gates a change can safely touch.
+#
+# This file is not the enforcement -- the server is. It is the CHECKED-IN CLAIM that every in-repo
+# statement must agree with, which is what `tests/test_required_contexts.py` asserts. When branch
+# protection changes, change this file in the same PR; the test will name every prose claim that
+# then needs updating.
+#
+# FORMAT. One context string per line, `#` starts a comment, blank lines ignored. These are the
+# exact strings branch protection matches -- the JOB NAME (`name:`), not the workflow name and not
+# the workflow file. Two ways that bites:
+#   * The CLA context is `cla` (the job key, because cla.yml's job declares no `name:`), NOT
+#     "CLA Assistant" (the workflow name). docs/CI.md claimed the latter for months.
+#   * A job name containing " #" must be QUOTED in YAML or it truncates at the comment marker --
+#     see .github/workflows/backlog-hygiene.yml, whose name is deliberately quoted for this reason.
+#
+# ADDING ONE: see the required-but-absent trap in docs/CI.md. A required check that never reports
+# blocks every PR forever, so confirm the job reports on a real PR (no `paths:` filter that can skip
+# it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
+
+# --- ci.yml ---------------------------------------------------------------------------------------
+CI gate
+test (ubuntu-latest, py3.14)
+test (windows-2022, py3.14)
+test (windows-2025, py3.14)
+
+# --- security.yml (every non-advisory job in that file; the advisory `sbom` and `trivy` jobs are
+# --- deliberately absent -- they declare `continue-on-error: true`) -------------------------------
+bandit (Python SAST)
+pip-audit (dependency vulnerabilities)
+npm-audit (ide dependency vulnerabilities)
+gitleaks (secret scan)
+semgrep (project SAST rules)
+crypto-inventory (ASVS 11.1.3 discovery gate)
+forbidden-content (customer/PHI leak guard)
+
+# --- cla.yml --------------------------------------------------------------------------------------
+cla
+
+# PENDING PROMOTION -- owner's decision, NOT yet applied. This file mirrors the LIVE server, so the
+# context below is deliberately absent until branch protection actually changes; adding it here first
+# would make the file lie in the one direction it exists to prevent.
+#
+#   "a PR that implements BACKLOG #N must update BACKLOG.md"   (backlog-hygiene.yml)
+#
+#   WHY PROMOTE: it hard-fails today and nothing waits for it, so it is decoration -- auto-merge only
+#   blocks on REQUIRED contexts. It exists because #60 shipped while its banner still read
+#   "PRE-RESERVED", and that stale banner was then repeated as fact in a merged PR. In a repo where the
+#   ledger is the only memory shared across isolated sessions, a stale banner makes another session
+#   rebuild work that is already merged.
+#   SAFE TO PROMOTE: it triggers on `pull_request: branches: [main]` with NO paths filter and no `if:`,
+#   so it always reports -- no required-but-absent trap. (Its STRUCTURAL half, "every item declares
+#   exactly one status", is already enforced inside the required test legs by
+#   tests/test_backlog_status_check.py; only the behavioural half is unguarded.)
+#   TO APPLY: add the context to branch protection, then move the line above into the ci/security list
+#   and update the count pinned in tests/test_required_contexts.py.
+
+# DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
+#   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
+#                                 tokens lack, so requiring them would block every fork PR.
+#   zizmor.yml                 -- paths-filtered to `.github/**`, so it does not report on most PRs.
+#   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
+#                                 pinned by tests/test_quality_advisory_invariants.py.
+#   freethread-smoke.yml       -- a 3.14t canary; informational only.
+#   manifest-lint.yml          -- paths-filtered to the k8s manifests.
+#   nightly / path-gated legs  -- server-DB store, load/throughput, service-smoke, DICOM/FHIR
+#                                 breadth: they do not run on every PR (required-but-absent trap).
