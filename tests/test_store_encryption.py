@@ -46,7 +46,9 @@ def _raw_at_rest(db_path: Path, column: str = "raw", table: str = "messages") ->
 def test_cipher_round_trip_and_hides_plaintext() -> None:
     cipher = make_cipher(generate_key())
     token = cipher.encrypt(ADT)
-    assert token.startswith(PREFIX)
+    # "Enciphered at all" — the version-agnostic marker. Format pinning is owned separately by the M9
+    # section below (test_default_writer_is_v1_not_v2 / test_v1_writer_is_byte_identical).
+    assert token.startswith(MARKER_PREFIX)
     # PHI-hidden, asserted deterministically: the whole plaintext can never appear in the token
     # (it contains non-base64 bytes like '|' and '\r'), and the round-trip proves real encryption.
     # NEVER assert short-substring absence ("MSH"/"DOE") — a random base64 body contains any given
@@ -90,8 +92,8 @@ async def test_bodies_encrypted_at_rest(tmp_path: Path) -> None:
         await store.close()
     raw = _raw_at_rest(db)
     payload = _raw_at_rest(db, column="payload", table="queue")
-    assert raw.startswith(PREFIX) and "DOE" not in raw  # body is ciphertext on disk
-    assert payload.startswith(PREFIX)
+    assert raw.startswith(MARKER_PREFIX) and "DOE" not in raw  # body is ciphertext on disk
+    assert payload.startswith(MARKER_PREFIX)
 
 
 async def test_reads_and_delivery_decrypt(tmp_path: Path) -> None:
@@ -139,8 +141,12 @@ async def test_claim_ready_dead_letters_undecryptable_row(tmp_path: Path) -> Non
         cur = await store._db.execute("SELECT status, last_error FROM queue WHERE id=?", (bad_id,))
         row = await cur.fetchone()
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is itself ciphered now (WP-5), so decrypt it before checking the reason.
-        assert "undecryptable" in store._cipher.decrypt(row["last_error"] or "")
+        # last_error is itself ciphered (WP-5) AND cell-bound (ASVS 11.3.3 / ADR 0019), so decrypt it
+        # under the SAME (table, column, row) AAD the store wrote with — a bare decrypt fails closed on
+        # a v2 value. Harmless on v1: that reader ignores the caller's aad by design (dual-read).
+        assert "undecryptable" in store._cipher.decrypt(
+            row["last_error"] or "", aad=cell_aad("queue", "last_error", bad_id)
+        )
     finally:
         await store.close()
 
@@ -169,8 +175,11 @@ async def test_claim_ingress_dead_letters_undecryptable_row(tmp_path: Path) -> N
         )
         row = await cur.fetchone()
         assert row["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is itself ciphered now (WP-5), so decrypt it before checking the reason.
-        assert "undecryptable" in store._cipher.decrypt(row["last_error"] or "")
+        # Ciphered (WP-5) and cell-bound (ADR 0019) — decrypt under the row's own AAD, see the outbound
+        # poison-row test above.
+        assert "undecryptable" in store._cipher.decrypt(
+            row["last_error"] or "", aad=cell_aad("queue", "last_error", ingress_id)
+        )
         # Dead ingress row with no outbound rows → the message is finalized to ERROR.
         assert (await store.get_message(mid))["status"] == MessageStatus.ERROR.value
     finally:
@@ -189,8 +198,9 @@ async def test_migration_encrypts_existing_rows(tmp_path: Path) -> None:
     key = generate_key()
     encrypted = await MessageStore.open(db, cipher=make_cipher(key))  # reopen with a key → migrate
     try:
-        assert _raw_at_rest(db).startswith(PREFIX)  # existing row now encrypted on disk
-        assert _raw_at_rest(db, column="payload", table="queue").startswith(PREFIX)
+        # The migration's own guard is the version-agnostic `mfenc:%` anchor, so assert the same shape.
+        assert _raw_at_rest(db).startswith(MARKER_PREFIX)  # existing row now encrypted on disk
+        assert _raw_at_rest(db, column="payload", table="queue").startswith(MARKER_PREFIX)
         record = await encrypted.get_message(mid)
         assert record is not None and record["raw"] == ADT  # still readable
     finally:
@@ -219,8 +229,8 @@ async def test_error_and_event_detail_encrypted_at_rest_and_decrypt(tmp_path: Pa
         # messages.error and the message_events.detail copy are both ciphertext on disk...
         err_at_rest = _raw_at_rest(db, column="error")
         det_at_rest = _raw_at_rest(db, column="detail", table="message_events")
-        assert err_at_rest.startswith(PREFIX) and "SECRET" not in err_at_rest
-        assert det_at_rest.startswith(PREFIX) and "SECRET" not in det_at_rest
+        assert err_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in err_at_rest
+        assert det_at_rest.startswith(MARKER_PREFIX) and "SECRET" not in det_at_rest
         # ...and decrypt on every read path.
         assert (await store.get_message(mid))["error"] == PHI_ERR
         assert any(m["error"] == PHI_ERR for m in await store.list_messages())
@@ -238,7 +248,7 @@ async def test_last_error_encrypted_at_rest_and_decrypts(tmp_path: Path) -> None
         await store.claim_ready()
         await store.dead_letter_now(row["id"], PHI_ERR)
         at_rest = _raw_at_rest(db, column="last_error", table="queue")
-        assert at_rest.startswith(PREFIX) and "SECRET" not in at_rest
+        assert at_rest.startswith(MARKER_PREFIX) and "SECRET" not in at_rest
         dead = await store.list_dead()
         assert dead and dead[0]["last_error"] == PHI_ERR  # dead-letter view decrypts
         assert (await store.outbox_for(mid))[0]["last_error"] == PHI_ERR  # detail view decrypts
@@ -290,8 +300,8 @@ async def test_summary_and_metadata_encrypted_at_rest_and_decrypt(tmp_path: Path
         # ...ciphertext on disk (no MRN/name/site visible)...
         sm = _raw_at_rest(db, column="summary")
         md = _raw_at_rest(db, column="metadata")
-        assert sm.startswith(PREFIX) and "999001" not in sm and "DOE" not in sm
-        assert md.startswith(PREFIX) and "WESTWING" not in md
+        assert sm.startswith(MARKER_PREFIX) and "999001" not in sm and "DOE" not in sm
+        assert md.startswith(MARKER_PREFIX) and "WESTWING" not in md
         # ...and decrypt on the detail + tracking-list read paths.
         rec = await store.get_message(mid)
         assert rec is not None and rec["summary"] == EF3_SUMMARY and rec["metadata"] == EF3_METADATA
@@ -330,8 +340,8 @@ async def test_migration_encrypts_existing_summary_metadata(tmp_path: Path) -> N
 
     encrypted = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # reopen → migrate
     try:
-        assert _raw_at_rest(db, column="summary").startswith(PREFIX)  # migrated on disk
-        assert _raw_at_rest(db, column="metadata").startswith(PREFIX)
+        assert _raw_at_rest(db, column="summary").startswith(MARKER_PREFIX)  # migrated on disk
+        assert _raw_at_rest(db, column="metadata").startswith(MARKER_PREFIX)
         [m] = await encrypted.list_messages()
         assert m["summary"] == EF3_SUMMARY and m["metadata"] == EF3_METADATA  # still readable
     finally:
@@ -365,12 +375,19 @@ def test_key_id_is_a_fingerprint_not_zero() -> None:
     key_b64 = generate_key()
     token = make_cipher(key_b64).encrypt("x")
     fp = _fingerprint(base64.b64decode(key_b64))
+    # DELIBERATELY v1 (do not sweep to MARKER_PREFIX): these pin the key_id's POSITION in the marker,
+    # and `mfenc:v1:<fp>:` is a v1-only field order (v2 is `mfenc:v2:<alg>:<key_id>:`). A version-
+    # agnostic `mfenc:<fp>:` is a string no writer ever emits, so the positive assert could never pass
+    # and the negative one could never fail — strictly weaker, not wider. The v2 layout is pinned
+    # separately by test_active_marker_prefix_v1_and_v2.
     assert token.startswith(f"{PREFIX}{fp}:")  # self-identifying key_id
     assert not token.startswith(f"{PREFIX}0:")  # not the old hardcoded "0"
 
 
 def test_legacy_key_id_zero_decrypts_via_fallback() -> None:
     # A pre-WP-5 row was tagged key_id '0'. The keyring's try-all fallback still decrypts it.
+    # DELIBERATELY v1 (do not sweep): a legacy row IS v1 by definition — v2 postdates WP-5 — and a
+    # version-agnostic `mfenc:0:` would be rejected by _parse as an unknown marker version instead.
     import base64
     import os
 
@@ -396,7 +413,9 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
 
     # Reopen with B active + A retired: existing A-rows still read (decrypt via the retired key),
     # then rotate them to B.
-    rotating = await MessageStore.open(db, cipher=make_cipher(key_b, [key_a]))
+    rotating_cipher = make_cipher(key_b, [key_a])
+    assert isinstance(rotating_cipher, AesGcmCipher)
+    rotating = await MessageStore.open(db, cipher=rotating_cipher)
     try:
         assert (await rotating.get_message(mid))["raw"] == ADT
         assert await rotating.reencrypt_to_active() >= 2  # raw + the outbound payload
@@ -404,7 +423,12 @@ async def test_rotation_reencrypts_and_retired_key_bridges(tmp_path: Path) -> No
     finally:
         await rotating.close()
     raw_b = _raw_at_rest(db)
-    assert raw_b.startswith(PREFIX) and raw_b != raw_a  # re-encrypted under the new key
+    # Re-encrypted under the ACTIVE (new) key — not merely "still ciphertext". Take the expected marker
+    # from the rotating cipher itself: active_marker_prefix carries key B's fingerprint in the right
+    # position for whichever format that cipher writes (v1 here, v2 when the store is handed a
+    # build_cipher handle or run under MEFOR_TEST_FORCE_AAD_BIND — the field order differs between the
+    # two). A bare MARKER_PREFIX would drop the under-the-new-key half of the proof.
+    assert raw_b.startswith(rotating_cipher.active_marker_prefix) and raw_b != raw_a
 
     # B alone (no retired key) now reads everything — the bridge key is no longer needed.
     final = await MessageStore.open(db, cipher=make_cipher(key_b))
@@ -436,10 +460,16 @@ async def test_rotation_without_prior_key_raises(tmp_path: Path) -> None:
 #
 # The hard constraint is CRYPTO-1: the mfenc:v1 WRITER is frozen — existing v1 ciphertext and new v1
 # writes stay byte-identical. M9 adds *agility infrastructure only*: a version/alg-dispatching cipher
-# that is DECODE-CAPABLE of mfenc:v2 and CAN write it (opt-in), but WRITES v1 BY DEFAULT. AES-256-GCM
-# stays the only registered algorithm. These tests pin: (1) v1 byte-identical (frozen fixture); (2) v2
-# round-trip; (3) a v2-active cipher reads v1 with no rotation; (4) mixed v1+v2 rows; (5) fail-closed
-# CipherError on an unknown marker version AND an unknown alg id.
+# that is DECODE-CAPABLE of mfenc:v2 and CAN write it (opt-in). AES-256-GCM stays the only registered
+# algorithm. These tests pin: (1) v1 byte-identical (frozen fixture); (2) v2 round-trip; (3) a v2-active
+# cipher reads v1 with no rotation; (4) mixed v1+v2 rows; (5) fail-closed CipherError on an unknown
+# marker version AND an unknown alg id.
+#
+# TWO DIFFERENT "defaults" — do not collapse them. `make_cipher`'s `write_v2` PARAMETER still defaults
+# False (the frozen v1 writer), which is what the assertions below pin and what keeps CRYPTO-1 testable
+# from a bare `make_cipher(key)`. The SHIPPED at-rest format is no longer v1: `build_cipher` passes
+# `write_v2=[store].aad_bind`, and ADR 0148 flipped that setting's default to True, so a store opened
+# the normal way writes mfenc:v2. Everything in this section is about the former.
 
 # A FROZEN FIXTURE: a v1 blob written by the pre-M9 writer for plaintext "LEGACY-V1" under the key below
 # (nonce fixed to 12 zero bytes). Hardcoded so a regression in the v1 reader is caught against a value
@@ -483,7 +513,9 @@ def test_v1_writer_is_byte_identical(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_default_writer_is_v1_not_v2() -> None:
-    # The shipping default never emits a v2 marker — no at-rest format change ships with M9.
+    # `make_cipher`'s write_v2 PARAMETER default — the frozen v1 writer, CRYPTO-1. NOT a claim about the
+    # shipped store: that builds its cipher through build_cipher(write_v2=[store].aad_bind), which ADR
+    # 0148 defaulted to True, so a normally-opened store writes v2. This pins the library default only.
     token = make_cipher(generate_key()).encrypt("x")
     assert token.startswith(PREFIX)  # mfenc:v1:
     assert not token.startswith("mfenc:v2:")
@@ -507,6 +539,9 @@ def test_v2_active_decrypts_v1_without_rotation() -> None:
     # forced migration). Same key, so the v2-active cipher decrypts the v1 blob it did not write.
     key = generate_key()
     v1_token = make_cipher(key).encrypt(ADT)  # written by a v1 cipher
+    # DELIBERATELY v1 (do not sweep): this establishes the PREMISE that the row really is v1. Under a
+    # version-agnostic prefix a v2 token would satisfy it and the dual-read proof below collapses into
+    # a vacuous v2-reads-v2 tautology.
     assert v1_token.startswith(PREFIX)
     v2_cipher = make_cipher(key, write_v2=True)
     assert v2_cipher.decrypt(v1_token) == ADT  # decoded with no rotation
@@ -836,8 +871,11 @@ async def test_foreign_key_at_runtime_dead_letters_rather_than_degrading(tmp_pat
         )
         dead = await cur.fetchone()
         assert dead["status"] == OutboxStatus.DEAD.value  # poison row dead-lettered, not stranded
-        # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it.
-        assert "undecryptable" in store._cipher.decrypt(dead["last_error"] or "")
+        # last_error is ciphered (WP-5) under the ACTIVE key B, so the reopened store decrypts it —
+        # under the row's own cell AAD (ADR 0019), which a v2 value requires and a v1 value ignores.
+        assert "undecryptable" in store._cipher.decrypt(
+            dead["last_error"] or "", aad=cell_aad("queue", "last_error", row["id"])
+        )
     finally:
         await store.close()
 
@@ -1019,7 +1057,9 @@ async def test_migration_encrypts_existing_state_value(tmp_path: Path) -> None:
     store = await MessageStore.open(db, cipher=make_cipher(generate_key()))  # reopen → migrate
     try:
         at_rest = _state_at_rest(db)
-        assert at_rest.startswith(PREFIX) and "SECRETSTATEMRN" not in at_rest  # sealed on disk
+        # sealed on disk — version-agnostic, because the marker version is whatever cipher the store was
+        # handed writes (v1 here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND)
+        assert at_rest.startswith(MARKER_PREFIX) and "SECRETSTATEMRN" not in at_rest
         assert store.state_view()[("ns", "k")] == {"mrn": "SECRETSTATEMRN"}  # decrypts on read
     finally:
         await store.close()
@@ -1043,7 +1083,7 @@ async def test_state_migration_skips_already_encrypted_values(tmp_path: Path) ->
     first = await MessageStore.open(db, cipher=make_cipher(key))  # migrate plaintext -> ciphertext
     await first.close()
     sealed = _state_at_rest(db)
-    assert sealed.startswith(PREFIX)
+    assert sealed.startswith(MARKER_PREFIX)  # same shape as the `mfenc:%` guard under test
 
     second = await MessageStore.open(db, cipher=make_cipher(key))  # re-run the migration
     try:

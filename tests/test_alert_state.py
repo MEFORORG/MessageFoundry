@@ -17,7 +17,7 @@ from pathlib import Path
 
 from messagefoundry.config.settings import AlertRule, AlertSeverity
 from messagefoundry.pipeline.alert_sinks import NotifierAlertSink
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 # --- store lifecycle ---------------------------------------------------------
@@ -193,7 +193,10 @@ async def test_reason_encrypted_at_rest(tmp_path: Path) -> None:
     con = sqlite3.connect(db)
     try:
         raw = con.execute("SELECT reason FROM alert_instance").fetchone()[0]
-        assert isinstance(raw, str) and raw.startswith(PREFIX)  # ciphertext on disk
+        # Version-agnostic marker: the claim is "enciphered at rest", not which mfenc format wrote it.
+        # That belongs to the cipher — v1 from make_cipher's default here, v2 wherever the store builds
+        # its cipher via build_cipher (write_v2=[store].aad_bind) or under MEFOR_TEST_FORCE_AAD_BIND.
+        assert isinstance(raw, str) and raw.startswith(MARKER_PREFIX)  # ciphertext on disk
         assert "refused" not in raw
     finally:
         con.close()

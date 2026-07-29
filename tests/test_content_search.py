@@ -31,7 +31,7 @@ from messagefoundry.store.content_search import (
     make_spec,
     row_matches,
 )
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStore
 
 PW = "a-strong-test-passphrase"  # ≥15, satisfies the ASVS policy
@@ -120,7 +120,7 @@ async def test_content_match_on_encrypted_store(tmp_path: Path) -> None:
             at_rest = [str(r[0]) for r in con.execute("SELECT raw FROM messages").fetchall()]
         finally:
             con.close()
-        assert all(v.startswith(PREFIX) and "JANE" not in v for v in at_rest)
+        assert all(v.startswith(MARKER_PREFIX) and "JANE" not in v for v in at_rest)
 
         spec = make_spec(content="JANE", field_path=None, field_value=None)
         result = await store.search_messages(spec)

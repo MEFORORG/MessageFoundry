@@ -134,8 +134,13 @@ jobs:
           # `requirements <lockfile>` parser has no metadata and emits license-less components. The core lock
           # (docker/locks/requirements-core.lock) is the honest runtime closure `pip install messagefoundry`
           # pulls; the all-extras requirements.lock stays covered by the pip-audit job above. cyclonedx-bom
-          # ~=7.3 → lxml 6.x (cp314 wheels) so the 3.14 runner doesn't source-build lxml. ADR 0149.
-          python -m pip install --upgrade pip "cyclonedx-bom~=7.3"
+          # ~=7.3.1 → lxml 6.x (cp314 wheels) so the 3.14 runner doesn't source-build lxml. ADR 0149.
+          # PINNED and BYTE-IDENTICAL to release.yml's SBOM install (enforced by
+          # tests/test_ci_venv_pinning.py). ~=7.3.1 rather than ~=7.3 so a 7.4 cannot change the JSON
+          # shape sbom_finalize.py parses. This job is ADR 0034's pre-tag dry-run for the release SBOM
+          # step, so the two must stay the SAME command — if they drift, dispatching this one proves
+          # nothing about the release.
+          python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"
           # No unpinned pip bootstrap: --require-hashes resolves nothing (tests/test_ci_venv_pinning.py).
           python -m venv /tmp/sbomenv
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock

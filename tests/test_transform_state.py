@@ -33,7 +33,7 @@ from messagefoundry.config.wiring import (
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run, transform_one
 from messagefoundry.pipeline.retention import RetentionRunner
-from messagefoundry.store.crypto import PREFIX, generate_key, make_cipher
+from messagefoundry.store.crypto import MARKER_PREFIX, generate_key, make_cipher
 from messagefoundry.store.store import MessageStatus, MessageStore, Stage
 
 RAW = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A01|MSG1|P|2.5.1\rPID|1||100||DOE^JANE\r"
@@ -273,9 +273,11 @@ async def test_state_value_encrypted_at_rest_and_read_back(tmp_path: Path) -> No
         )
     finally:
         await store.close()
-    # On disk: ciphertext (prefix present, plaintext value not visible).
+    # On disk: ciphertext (version-agnostic marker present, plaintext value not visible). Same rule as
+    # the rotation test below — the marker version is the cipher's choice (v1 from make_cipher's default
+    # here, v2 via build_cipher/[store].aad_bind or MEFOR_TEST_FORCE_AAD_BIND), not this test's claim.
     at_rest = _state_at_rest(db, "patient_anon", "MRN-DOE")
-    assert at_rest.startswith(PREFIX)
+    assert at_rest.startswith(MARKER_PREFIX)
     assert "ANON-XYZ" not in at_rest
 
 
@@ -324,7 +326,7 @@ async def test_key_rotation_reencrypts_state_and_reads_still_work(tmp_path: Path
         rotated = await store2.reencrypt_to_active()
         assert rotated >= 1  # the state value (among others) re-encrypted
         # On disk it is now under the NEW key id, and reads still resolve. Take the expected marker
-        # from the rotating cipher itself instead of hand-building f"{PREFIX}{new_id}:" — that spelling
+        # from the rotating cipher itself instead of hand-building f"mfenc:v1:{new_id}:" — that spelling
         # bakes in the v1 field order and misreads a v2 value (mfenc:v2:<alg>:<key_id>:), which is what
         # [store].aad_bind makes the default at rest. `old_id not in` keeps the independent proof that
         # rotation actually moved the value, derived from active_key_id rather than the prefix.
