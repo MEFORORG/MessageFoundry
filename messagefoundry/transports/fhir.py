@@ -489,6 +489,26 @@ class FhirDestination(DestinationConnector):
         req = urllib.request.Request(  # noqa: S310  # nosec B310 — scheme constrained to http(s) in __init__
             url, headers=headers, method="GET"
         )
+        # ASVS 4.2.5: this probe MINTS a real bearer above (so reachability reflects the actual
+        # credentials), and that token is the one value the construction gate could not see -- the URL
+        # and the static headers were already bounded there. Gated here so an operator's "test
+        # connection" fails with the real reason rather than an opaque wire error. The SOAP probe
+        # deliberately has no equivalent: it mints nothing, so a gate there could not fire.
+        try:
+            enforce_send_time_length_limits(
+                req.full_url,
+                headers,
+                connector=f"FHIR {_redact_url(self.base_url)} probe",
+                minted_credential_names=(
+                    frozenset({"Authorization"})
+                    if self._token_provider is not None
+                    else frozenset()
+                ),
+            )
+        except NegativeAckError as exc:
+            if exc.credential_fault and self._token_provider is not None:
+                self._token_provider.invalidate()
+            raise
         try:
             with self._opener.open(req, timeout=self.timeout) as resp:
                 resp.read()

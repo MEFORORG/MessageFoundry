@@ -128,6 +128,15 @@ def make_probe_client(engine_url: str, timeout: float = DEFAULT_TIMEOUT_S) -> ht
     engine URL gets a verifying TLS context (see :func:`build_verify`); a failed verification
     surfaces as an ``httpx.HTTPError`` and therefore as ``DOWN``/``UNKNOWN``, never as a silent
     downgrade to an unverified connection.
+
+    **ASVS 4.2.5 — a NAMED residual, not an oversight.** ``engine_url`` is not length-bounded the way
+    the outbound transports and ``apiclient`` are. Three facts make that proportionate rather than a
+    gap, and all three must stay true or this needs revisiting: the client is **tokenless** (no
+    credential can overflow), the URL is **local operator config** pointing at this host's own engine
+    (not attacker-influenceable and not message-derived), and ``tray/`` is deliberately stdlib+httpx
+    only (ADR 0113) — importing ``transports/`` to share the constant would breach the same layering
+    ADR 0088 protects for ``apiclient``, and a third copy of an 8192 that nothing pins is worse than
+    a documented absence. If the tray ever carries a token or takes a remote URL, close it.
     """
     return httpx.Client(
         base_url=engine_url.rstrip("/"),

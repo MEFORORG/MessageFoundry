@@ -325,3 +325,18 @@ def test_alerts_email_recipients_split_from_env_string() -> None:
 def test_alerts_password_via_env(monkeypatch: pytest.MonkeyPatch) -> None:
     settings = load_settings(environ={"MEFOR_ALERTS_EMAIL_PASSWORD": "s3cret"})
     assert settings.alerts.email_password == "s3cret"
+
+
+def test_webhook_url_length_is_bounded_at_construction() -> None:
+    """ASVS 4.2.5. Construction-only is sufficient and not a shortcut: the URL is operator config and
+    the sole header is a fixed Content-Type, so nothing is added between construction and the wire.
+
+    Mutation: delete the `enforce_outbound_length_limits` call in `WebhookTransport.__init__`. Red:
+    DID NOT RAISE."""
+    with pytest.raises(ValueError, match="over the 8192-char limit"):
+        WebhookTransport("https://hooks.example/x?q=" + "a" * 9000, timeout=5.0)
+
+
+def test_webhook_ordinary_url_still_constructs() -> None:
+    """Byte-identity control. Mutation: drop MAX_OUTBOUND_URL_LEN to 8 -> this reds."""
+    assert WebhookTransport("https://hooks.example/x", timeout=5.0).name == "webhook"

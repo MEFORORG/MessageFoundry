@@ -45,7 +45,11 @@ from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls
 
 # Reuse rest.py's hardened, TLS-verifying, no-redirect opener + URL redaction (no new HTTP plumbing) —
 # exactly as smart.py / fhir.py / soap.py do. No import cycle: rest.py never imports this module.
-from messagefoundry.transports.rest import _NO_REDIRECT_OPENER, _redact_url
+from messagefoundry.transports.rest import (
+    _NO_REDIRECT_OPENER,
+    _redact_url,
+    find_outbound_length_violation,
+)
 
 if TYPE_CHECKING:  # only for the from-settings factory annotation
     from messagefoundry.config.settings import AiSettings
@@ -137,6 +141,16 @@ class AiBroker:
             raise AiBrokerError(
                 "[ai].endpoint over cleartext http would expose the api_key; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
+            )
+        # ASVS 4.2.5. Both values are operator-supplied via env() and both ship on every provider call
+        # -- the endpoint as the request line, the key as the ``x-api-key`` header. Bounded here rather
+        # than per call because neither varies per prompt. Raised as AiBrokerError (a ValueError
+        # subclass) so the API surface keeps its single error type, and the key is NEVER echoed.
+        violation = find_outbound_length_violation(endpoint, {"x-api-key": api_key})
+        if violation is not None:
+            raise AiBrokerError(
+                f"[ai] {violation.kind} is {violation.length} chars, over the "
+                f"{violation.limit}-char limit; check [ai].endpoint / the api_key env() value"
             )
         self.endpoint = endpoint
         self.api_key = api_key
