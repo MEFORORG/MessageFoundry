@@ -16,10 +16,13 @@ surface (`security`/`models`/`auth_models`/`_ui_seam`), `messagefoundry.auth`, a
 ## Install
 
 ```
-pip install messagefoundry[webconsole]        # engine + console
-# or, explicitly:
-pip install messagefoundry messagefoundry-webconsole
+pip install -e packaging/messagefoundry-webconsole    # from the source tree, alongside the engine
 ```
+
+> **Not on PyPI yet.** This distribution has never been published, so its name is **unclaimed**.
+> Installing it by bare name from an index would resolve whatever a third party has uploaded under
+> that name — and an sdist executes its build backend during `pip install`, before any engine process
+> exists. Install from the source tree until the name is registered (ASVS 15.2.4).
 
 A plain `pip install messagefoundry` stays byte-identical: with the console absent and `serve_ui`
 default-off, the JSON API is unchanged; `serve_ui=true` without the console fails LOUD at startup.

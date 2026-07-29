@@ -4934,9 +4934,17 @@ def create_app(
         try:
             from messagefoundry_webconsole import assert_engine_seam, mount_ui
         except ImportError as exc:  # pragma: no cover
+            # ASVS 15.2.4: this string is an INSTALL INSTRUCTION the operator will paste. It named a
+            # `webconsole` EXTRA that does not exist (pyproject deliberately withholds it until the
+            # wheel is published — see the note beside [project.optional-dependencies]),
+            # so the command failed; and an instruction to fetch an UNPUBLISHED distribution name from
+            # a public index is the dependency-confusion surface this cell is about. Point at the path
+            # install, which is what actually works today and resolves no index at all.
             raise RuntimeError(
-                "serve_ui requires the web console — install it: "
-                "pip install messagefoundry[webconsole]"
+                "serve_ui requires the web console, which is not installed. It ships as a separate "
+                "distribution: install it from the source tree with "
+                "`pip install -e packaging/messagefoundry-webconsole`, or set [api].serve_ui=false "
+                "to run JSON-only."
             ) from exc
 
         # Assert the seam BEFORE building the deps bundle (review fix): a package that changed the
