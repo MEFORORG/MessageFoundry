@@ -91,17 +91,10 @@ function ConvertTo-Norm([string]$p) {
     return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
-# --- Config roots -------------------------------------------------------------------------------
-# Discovered, not hardcoded: several logins can coexist (~\.claude for Desktop, ~\.claude-account-N for
-# CLI/VS Code subscriptions) and a session is only ever visible to the login that owns it.
-function Get-ConfigRoots {
-    if ($ConfigRoot) { return @($ConfigRoot | Where-Object { Test-Path $_ }) }
-    return @(
-        Get-ChildItem -Path $env:USERPROFILE -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
-            Where-Object { Test-Path (Join-Path $_.FullName "sessions") } |
-            ForEach-Object { $_.FullName }
-    )
-}
+# --- Registry access + the liveness fence -------------------------------------------------------
+# Shared with sessions.ps1, which needs the SAME answer to "is this session alive" before it moves a
+# transcript. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
+. "$PSScriptRoot\session-registry.ps1"
 
 function Get-LoginLabel([string]$RootPath) {
     $leaf = Split-Path $RootPath -Leaf
@@ -118,38 +111,6 @@ function Get-SurfaceLabel([string]$Entrypoint) {
         '^$' { return "?" }
         default { return $Entrypoint -replace '^claude-', '' }
     }
-}
-
-# --- The fence ----------------------------------------------------------------------------------
-# LIVE requires the pid to resolve AND the process start time to be consistent with the recorded
-# session start. Without the second half this is just a pid check, and a reused pid reads as alive.
-function Get-Liveness([int]$ProcId, [object]$StartedAtMs, [int]$SkewMinutes) {
-    if (-not $ProcId) { return @{ State = "DEAD"; Detail = "no pid in record" } }
-    $proc = Get-Process -Id $ProcId -EA SilentlyContinue
-    if (-not $proc) { return @{ State = "DEAD"; Detail = "pid $ProcId not running" } }
-
-    $procStart = $null
-    try { $procStart = $proc.StartTime } catch { }
-    if (-not $procStart) {
-        # Access can be denied for a process owned by another context. Report the uncertainty rather
-        # than upgrading it to LIVE -- an unverifiable fence is not a passed fence.
-        return @{ State = "UNVERIFIED"; Detail = "pid $ProcId alive; start time unreadable" }
-    }
-    if ($null -eq $StartedAtMs) {
-        return @{ State = "UNVERIFIED"; Detail = "pid $ProcId alive; record has no startedAt" }
-    }
-
-    $registered = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$StartedAtMs).LocalDateTime
-    # A process cannot have started after the session it hosts registered (allow a small forward slop
-    # for clock jitter). Started much later => this pid was recycled onto a different process.
-    $delta = ($procStart - $registered).TotalMinutes
-    if ($delta -gt 1) {
-        return @{ State = "STALE"; Detail = "pid $ProcId reused (process started $([int]$delta)m after the session)" }
-    }
-    if ($delta -lt (-1 * $SkewMinutes)) {
-        return @{ State = "STALE"; Detail = "pid $ProcId start precedes the session by $([int](-$delta))m" }
-    }
-    return @{ State = "LIVE"; Detail = "" }
 }
 
 # --- Which of these sessions is the caller ------------------------------------------------------
@@ -194,10 +155,9 @@ $primaryNorm = ConvertTo-Norm $worktrees[0].Path
 $selfPids = Get-SelfPids $SelfPid
 
 $rows = @()
-foreach ($root in (Get-ConfigRoots)) {
-    $sessDir = Join-Path $root "sessions"
-    foreach ($f in @(Get-ChildItem $sessDir -Filter *.json -EA SilentlyContinue)) {
-        try { $rec = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+foreach ($entry in (Get-SessionRecords -ConfigRoot $ConfigRoot)) {
+        $rec = $entry.Record
+        $root = $entry.Root
         if (-not $rec.cwd) { continue }
 
         # Scope: cwd inside one of this repo's worktrees. Exact match on the worktree root, or a
@@ -211,7 +171,7 @@ foreach ($root in (Get-ConfigRoots)) {
         }
         if (-not $match) { continue }
 
-        $live = Get-Liveness ([int]$rec.pid) $rec.startedAt $StartSkewMinutes
+        $live = Test-RecordLiveness -Record $rec -StartSkewMinutes $StartSkewMinutes
         $matchNorm = ConvertTo-Norm $match.Path
         $rows += [pscustomobject]@{
             State     = $live.State
@@ -229,7 +189,6 @@ foreach ($root in (Get-ConfigRoots)) {
             IsSelf    = ($selfPids -contains [int]$rec.pid)
             StartedAt = if ($null -ne $rec.startedAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$rec.startedAt).LocalDateTime.ToString("o") } else { "" }
         }
-    }
 }
 
 $order = @{ "LIVE" = 0; "UNVERIFIED" = 1; "STALE" = 2; "DEAD" = 3 }
