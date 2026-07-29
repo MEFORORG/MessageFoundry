@@ -122,6 +122,16 @@ jobs:
           # leave a reason in the log, since nobody watches a green advisory job for absence.
           if ! MERGE_BASE="$(git merge-base HEAD "origin/$BASE_REF" 2>/dev/null)"; then
             echo "::notice title=Complexity delta skipped::could not resolve a merge base against origin/$BASE_REF"
+            # Record the bail so the liveness receipt can SEE it. Without this the step exits 0, the
+            # receipt still reports "measured" off the whole-repo triage, and the PR-caused delta --
+            # the entire point of this step on a PR -- goes quiet behind a green check. That is the
+            # failure mode this workflow's liveness job exists to catch, sitting inside it.
+            # QUOTE the reason: the receipt SOURCES this file, and an unquoted value containing
+            # spaces parses as a command, silently leaving the variable unset -- which reported
+            # "no reason recorded" and threw away the one useful diagnostic. Caught by executing
+            # the receipt shell, not by reading it.
+            echo "C901_DELTA=skipped" > c901-delta.env
+            echo "C901_DELTA_REASON='could not resolve a merge base against origin/$BASE_REF'" >> c901-delta.env
             exit 0
           fi
           echo "merge base: $MERGE_BASE"
@@ -138,9 +148,23 @@ jobs:
             --head c901-head.json \
             --repo-root . \
             --summary-file "$GITHUB_STEP_SUMMARY"
+          # Written LAST, so it exists only if every step above actually completed. Its absence is
+          # therefore proof the delta died somewhere, which the receipt reports as a dead gate.
+          BASE_N="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' c901-base.json)"
+          HEAD_N="$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))))' c901-head.json)"
+          {
+            echo "C901_DELTA=ok"
+            echo "C901_DELTA_MERGE_BASE=$MERGE_BASE"
+            echo "C901_DELTA_BASE_N=$BASE_N"
+            echo "C901_DELTA_HEAD_N=$HEAD_N"
+          } > c901-delta.env
       - name: Record gate liveness
         id: receipt
         if: always()
+        # Routed through env, not interpolated into the shell body (zizmor: template injection).
+        env:
+          IS_PR: ${{ github.event_name == 'pull_request' }}
+          EVENT_NAME: ${{ github.event_name }}
         continue-on-error: true
         run: |
           # Units count what was EXAMINED, never what was found: a repo with zero functions over the
@@ -149,11 +173,37 @@ jobs:
           FILES="$(ruff check --select C901 --show-files messagefoundry 2>/dev/null | wc -l)"
           FINDINGS="$(ruff check --select C901 --output-format=json --exit-zero messagefoundry \
             | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))')"
+          # THE DELTA IS THE POINT ON A PR, and until now this receipt could not see it. `--show-files`
+          # proves ruff enumerated files, which is true whether or not the delta step ran -- so a delta
+          # that bailed on an unresolvable merge base left a green "measured" receipt and vanished.
+          # That is this workflow's own failure mode reproduced inside its liveness control.
+          #
+          # On a non-PR event the delta legitimately does not run and the whole-repo triage IS the
+          # measurement. On a PR its silence is a dead gate, not an absence of news.
+          if [ "$IS_PR" != "true" ]; then
+            python3 scripts/quality/liveness.py record \
+              --signal complexity --status measured \
+              --units "$FILES" --unit-name "files scanned" \
+              --evidence "ruff C901 scanned $FILES files; $FINDINGS over the threshold (whole-repo triage; the PR delta does not apply on $EVENT_NAME)" \
+              --extra "{\"findings\":$FINDINGS}"
+            exit 0
+          fi
+          if [ ! -s c901-delta.env ]; then
+            python3 scripts/quality/liveness.py record --signal complexity --status failed \
+              --reason "the PR complexity delta produced no outcome marker; it did not complete (see the job log)"
+            exit 0
+          fi
+          . ./c901-delta.env
+          if [ "$C901_DELTA" != "ok" ]; then
+            python3 scripts/quality/liveness.py record --signal complexity --status failed \
+              --reason "the PR complexity delta did not run: ${C901_DELTA_REASON:-no reason recorded}"
+            exit 0
+          fi
           python3 scripts/quality/liveness.py record \
             --signal complexity --status measured \
             --units "$FILES" --unit-name "files scanned" \
-            --evidence "ruff C901 scanned $FILES files; $FINDINGS over the threshold" \
-            --extra "{\"findings\":$FINDINGS}"
+            --evidence "ruff C901 scanned $FILES files ($FINDINGS over the threshold); delta compared ${C901_DELTA_BASE_N} base vs ${C901_DELTA_HEAD_N} head findings against ${C901_DELTA_MERGE_BASE}" \
+            --extra "{\"findings\":$FINDINGS,\"delta_base_n\":${C901_DELTA_BASE_N},\"delta_head_n\":${C901_DELTA_HEAD_N}}"
 
   clone:
     # Signal 9 - duplication / clone detection. Flags copy-pasted blocks (the "copy-instead-of-abstract"
