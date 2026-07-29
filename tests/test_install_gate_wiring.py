@@ -56,6 +56,7 @@ def test_the_gate_handles_the_tools_we_expect() -> None:
         "Workflow",
         "Bash",
         "PowerShell",
+        "EnterWorktree",
     }
 
 
