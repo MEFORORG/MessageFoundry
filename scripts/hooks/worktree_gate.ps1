@@ -58,9 +58,30 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
     try {
         $logDir = Split-Path -Parent $ReposFile
         if ($logDir -and (Test-Path -LiteralPath $logDir)) {
+            # ONE RECORD IS ONE LINE, always. $Detail is composed from tool input, so an embedded newline
+            # or tab would let a crafted path forge extra records in a log whose whole purpose is counting.
+            # Strip both and cap the length before composing.
+            $clean = {
+                param($s)
+                $t = ("$s" -replace '[\r\n\t]', ' ')
+                if ($t.Length -gt 400) { $t.Substring(0, 400) + '...' } else { $t }
+            }
             $stamp = (Get-Date).ToString("s")
-            $line = "$stamp`tv$GateVersion`trule=$Rule`ttool=$tool`tcwd=$cwdRaw`t$Detail"
-            Add-Content -LiteralPath (Join-Path $logDir "worktree-gate.log") -Value $line -Encoding utf8
+            $line = "$stamp`tv$GateVersion`tpid=$PID`trule=$(& $clean $Rule)`ttool=$(& $clean $tool)" +
+                    "`tcwd=$(& $clean $cwdRaw)`t$(& $clean $Detail)"
+            # Every session on the box shares this file, so concurrent denies race. Add-Content silently
+            # dropped records under contention -- and a lossy counter is worse than none, because it reads
+            # as a measurement. Retry a bounded number of times, then give up quietly: the deny matters,
+            # the receipt does not.
+            $path = Join-Path $logDir "worktree-gate.log"
+            for ($i = 0; $i -lt 5; $i++) {
+                try {
+                    [System.IO.File]::AppendAllText($path, $line + [Environment]::NewLine)
+                    break
+                } catch {
+                    Start-Sleep -Milliseconds (10 * ($i + 1))
+                }
+            }
         }
     } catch { }
 
@@ -106,32 +127,87 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
 #
 # Returns the RAW (original-case) path: rule 3b shells `git -C` with it, and on a case-sensitive
 # filesystem a lowercased path misses the real directory and the whole rule silently fails open.
-function Get-GitActedOnPathRaw([string]$Cmd, [string]$FallbackCwdRaw) {
-    # git's global `-C <path>` wins, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
-    # git's lowercase `-c name=value` config override was captured as if it were a path: the "target"
-    # resolved to a nonexistent relative directory, which is not governed, and `git -c core.pager=cat
-    # checkout main` in the primary was ALLOWED (measured). Rule 3b already used -cmatch here for this
-    # exact reason; the rule protecting the SHARED tree never got the fix.
-    if ($Cmd -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?')             { return $Matches[1] }
-    if ($Cmd -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { return $Matches[1] }
-    if ($Cmd -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { return $Matches[1] }
-    # `cd`/`pushd` are shell builtins, so match them case-insensitively (PowerShell accepts `CD`).
-    if ($Cmd -match '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)') {
-        return $Matches[1].Trim()
+# Every path a git command could be acting on, in priority order, as RAW (original-case) strings.
+#
+# It returns a SET, not a winner, and the caller denies if ANY member is governed. That is the whole
+# correction: `--work-tree` / `GIT_WORK_TREE` say where FILES land, they do NOT say which repository is
+# mutated -- GIT_DIR still resolves from the cwd, so `git --work-tree=/tmp/x reset --hard` run in the
+# primary still moves the SHARED repo's HEAD and index. Treating them as a replacement target turned a
+# one-token flag into a bypass of the whole rule (measured DENY -> ALLOW). Only `-C` genuinely relocates
+# both, so only `-C` replaces the cwd.
+#
+# $Prefix is the text BEFORE the git invocation on the same line, and a `cd` is honoured only from there.
+# Reading `cd` from the whole command made the resolver order-blind: `git checkout main && cd ../elsewhere`
+# resolved to `../elsewhere` and allowed a swap of the tree the git call had already acted on. A prefix
+# that is ambiguous -- `popd`, `cd -`, a subshell, or more than one `cd` -- falls back to the session cwd,
+# which is the DENY-side default.
+function Get-GitTargetCandidatesRaw([string]$Line, [string]$Prefix, [string]$CwdRaw) {
+    $out = @()
+
+    # git's global `-C <path>`, read CASE-SENSITIVELY. `-match` is case-INsensitive in PowerShell, so
+    # git's lowercase `-c name=value` config override was captured as if it were a path -- and being the
+    # first match it also shadowed a real `-C` later in the same command.
+    if ($Line -cmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') {
+        $out += $Matches[1]
+    } else {
+        $cd = $null
+        if ($Prefix -notmatch '(?:^|\s)(?:popd|cd\s+-(?:\s|$))' -and $Prefix -notmatch '[({]') {
+            $cds = [regex]::Matches($Prefix, '(?:^|\s)(?:cd|pushd)\s+"?([^"&|;]+?)"?\s*(?:&&|;|\||$)')
+            if ($cds.Count -eq 1) { $cd = $cds[0].Groups[1].Value.Trim() }
+        }
+        $out += $(if ($cd) { $cd } else { $CwdRaw })
     }
-    return $FallbackCwdRaw
+
+    # ADDITIONAL, never instead of: see the note above.
+    if ($Line -cmatch '(?:^|\s)--work-tree[=\s]+"?([^"\s]+)"?') { $out += $Matches[1]; $out += $CwdRaw }
+    if ($Line -cmatch '(?:^|\s)GIT_WORK_TREE="?([^"\s]+)"?')    { $out += $Matches[1]; $out += $CwdRaw }
+    # --git-dir names the repo; the tree is its parent. Add both rather than reason about which.
+    if ($Line -cmatch '(?:^|\s)--git-dir[=\s]+"?([^"\s]+)"?') {
+        $out += $Matches[1]
+        $out += (Join-Path $Matches[1] "..")
+    }
+    $out | Where-Object { $_ }
 }
 
-# Decide from the COMMAND, never from prose inside it. Three false positives were measured against the raw
-# string: a two-line command whose second line read `echo about to merge stuff` denied with verb=merge (the
-# scan class excludes `|;&` but not newline); `echo "git checkout main"` denied; and
-# `git commit -m "chore: clean up dead code"` denied on `clean`. Each one teaches a session to route around
-# the gate -- and per the design notes the deny text is the ONLY control on the shell-write path, so
-# eroding compliance with it is not a nuisance, it is the guard itself. The sibling hook
-# block-blanket-git-stage.ps1 already splits on newlines; these two must not disagree about what a command
-# is.
-function Get-ScannableCommandLines([string]$Cmd) {
-    foreach ($line in ($Cmd -split '\r?\n')) {
+# Decide from the COMMAND, never from prose inside it -- but "prose" and "code" are not the same as
+# "quoted" and "unquoted", and conflating them was a measured regression.
+#
+# Three false positives came from scanning the raw string: a two-line command whose second line read
+# `echo about to merge stuff` denied with verb=merge; `echo "git checkout main"` denied; and
+# `git commit -m "chore: clean up dead code"` denied on `clean`. Blanking every quoted span fixed those --
+# and broke something worse. The argument of an interpreter flag (`pwsh -Command "..."`, `bash -c "..."`,
+# `cmd /c "..."`) is quoted, but it is CODE THAT RUNS: blanking it made `pwsh -Command "git reset --hard"`
+# in the primary ALLOW where it had always denied, across rules 3 AND 3b. That is precisely the
+# route-around the rule-3 deny text warns against, spelled in this repo's own house idiom.
+#
+# So an interpreter argument is not blanked, it is RECURSED INTO: its contents come back as an extra
+# scan line, judged on its own terms. Everything else quoted stays inert.
+#
+# Each entry carries BOTH forms. Scan is for deciding whether a git verb is present; Raw is for parsing
+# PATHS out of the same line, since the blanking that stops a commit message supplying a verb would also
+# erase the path.
+function Get-ScannableSegments([string]$Cmd) {
+    # Fold line continuations FIRST, or the per-line split below separates `git \` from its verb and the
+    # rule stops seeing the command at all. Prose does not end a line with a continuation character, so
+    # this does not resurrect the `echo about to merge stuff` false positive.
+    $folded = $Cmd -replace '\\\r?\n[ \t]*', ' '
+    $folded = $folded -replace '`\r?\n[ \t]*', ' '
+
+    $lines = @($folded -split '\r?\n')
+
+    # One level of interpreter recursion. `-c`/`-lc`/`-Command`/`/c`/`/k` and their quoted argument.
+    $inner = @()
+    foreach ($ln in $lines) {
+        foreach ($pat in @(
+            '(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+"([^"]*)"',
+            "(?:^|\s)(?:-c|-lc|-ec|-Command|-EncodedCommand)\s+'([^']*)'",
+            '(?:^|\s)/[ckCK]\s+"([^"]*)"'
+        )) {
+            foreach ($m in [regex]::Matches($ln, $pat)) { $inner += $m.Groups[1].Value }
+        }
+    }
+
+    foreach ($line in @($lines + $inner)) {
         # A quoted PROGRAM path must keep its git token -- `"C:\Program Files\Git\bin\git.exe" checkout
         # main` is a real spelling and blanking it wholesale would be a false NEGATIVE. Collapse that form
         # to a bare token first, then blank every remaining quoted span.
@@ -139,7 +215,7 @@ function Get-ScannableCommandLines([string]$Cmd) {
         $s = $s -replace "'[^']*[\\/](git(?:\.exe)?)'", '$1'
         $s = $s -replace '"[^"]*"', '""'
         $s = $s -replace "'[^']*'", "''"
-        $s
+        [pscustomobject]@{ Raw = $line; Scan = $s }
     }
 }
 
@@ -177,9 +253,13 @@ $cwdRaw = [string]$hook.cwd                        # original case: for `git -C`
 # only an exact tool match reaches Write-Deny.
 #
 # Expressed as `$tool -in @("EnterWorktree")` so tests/test_install_gate_wiring.py SEES this tool as
-# handled and ENFORCES that install-gate.ps1 registers a matcher for it -- rule 3 shipped dead once by
-# implementing a rule with no matcher, and that tripwire exists to prevent exactly this. The matcher is
-# wired in install-gate.ps1 alongside this change; delete it there and the wiring test goes red.
+# handled -- rule 3 shipped dead once by implementing a rule with no matcher, and that tripwire exists to
+# prevent exactly this.
+#
+# NB the matcher is OPT-IN (`install-gate.ps1 -EnterWorktreeGate`), so this rule does not fire on a bare
+# install. That is deliberate and pinned by test_the_default_install_wires_rules_1_2_and_3_and_nothing_else
+# plus OPT_IN_TOOLS in tests/test_gate_installed_parity.py -- turning it on is a decision, not a side
+# effect of re-installing. Rationale: docs/SESSION-DRIFT-CONTROLS.md section 4.
 # ---------------------------------------------------------------------------------------------------
 if ($tool -in @("EnterWorktree")) {
     Write-Deny -Rule "4" -Detail "relocate-session" -Reason @"
@@ -222,16 +302,16 @@ function Test-Governed([string]$Candidate) {
 # The gate cannot tell a worktree's rightful session from a squatter (both share the cwd), so it blocks
 # the move for both; the rightful owner's escape hatch is a PLAIN terminal (never gated) or a fresh
 # worktree for the other branch. Returns normally to ALLOW; calls Write-Deny (which exits) to block.
-function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$CwdRaw) {
+function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     if ($Verb -notin @("checkout", "switch")) { return }
 
-    # Which working tree does the command act on? Get-GitActedOnPathRaw is now shared with rule 3 -- see
-    # its comment for why having two copies of this let a real tree swap fall between the rules. It keeps
-    # the RAW (original-case) path, which every `git -C` below MUST use: a Get-ComparablePath value is
-    # lowercased, and on a case-sensitive filesystem (Linux CI) `git -C /tmp/.../primary-wt` misses the
-    # real `.../Primary-wt` dir and the whole rule silently fails open.
-    $wtRaw = Get-GitActedOnPathRaw $Cmd $CwdRaw
-    if (-not $wtRaw) { return }
+    # $WtRaw is resolved ONCE by rule 3 (Get-GitTargetCandidatesRaw) and handed down, so the two rules
+    # cannot disagree about which tree a command acts on -- they used to have separate parsers, and a real
+    # tree swap fell into the gap between them. It is the RAW (original-case) path, which every `git -C`
+    # below MUST use: a Get-ComparablePath value is lowercased, and on a case-sensitive filesystem
+    # (Linux CI) `git -C /tmp/.../primary-wt` misses the real `.../Primary-wt` and the rule fails open.
+    if (-not $WtRaw) { return }
+    $wtRaw = $WtRaw
 
     # Everything AFTER the first verb, up to the next command separator (so `git checkout x && ...`
     # does not drag the next command's tokens in). Parsing args here -- not the whole command -- keeps
@@ -346,29 +426,51 @@ if ($tool -in @("Bash", "PowerShell")) {
     # `[^|;&]*?` keeps the scan inside one command, so `git log | grep reset` is not a false positive.
     $verbs = 'cherry-pick|checkout|switch|reset|restore|stash|clean|rebase|merge|revert|am|apply'
 
-    # Scan LINE BY LINE, with quoted spans blanked (Get-ScannableCommandLines). A verb must come from a
-    # git invocation on the same line and outside quotes, or prose supplies it.
-    $verb = $null
-    foreach ($scan in (Get-ScannableCommandLines $cmd)) {
+    # Scan SEGMENT BY SEGMENT (Get-ScannableSegments): per line, with quoted spans blanked, plus the
+    # contents of any interpreter argument recursed into. A verb must come from a git invocation on the
+    # same segment and outside inert quotes, or prose supplies it.
+    # Evaluate EVERY verb-bearing segment, not just the first. `git -C ../x checkout main ; git checkout
+    # main` has two invocations and only the second touches this tree; stopping at the first match judged
+    # the wrong one. Deny on the first segment whose target set contains a governed tree.
+    $verb = $null ; $verbLine = $null ; $targetRaw = $cwdRaw ; $root = $null
+    # True once some segment's target had to be INFERRED (from cwd or a cd) rather than stated with `-C`.
+    # An explicit `-C` is authoritative about which repository git acts on, so the in-text fallback below
+    # must not second-guess it -- `cd <primary> && git -C <sibling> rebase` acts on the sibling, and
+    # denying it because the primary's path appears in the `cd` is a false positive.
+    $anyInferredTarget = $false
+    $gitToken = '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)'
+    foreach ($seg in (Get-ScannableSegments $cmd)) {
         # Match a git invocation however it is spelled: git, git.exe, or an absolute path to either.
-        if ($scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
-        if ($scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
-        $verb = $Matches['verb']
-        break
+        if ($seg.Scan -cnotmatch $gitToken) { continue }
+        if ($seg.Scan -cnotmatch "\bgit(\.exe)?\b[^|;&]*?\s(?<verb>$verbs)(?=\s|$)") { continue }
+        $segVerb = $Matches['verb']
+
+        # Everything BEFORE the git invocation on this line. A `cd` is honoured only from here -- reading
+        # it from the whole command made the resolver order-blind (see Get-GitTargetCandidatesRaw).
+        $at = [regex]::Match($seg.Raw, $gitToken)
+        $segPrefix = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
+
+        if ($seg.Raw -cnotmatch '(?:^|\s)-C\s+"?([^"\s]+)"?') { $anyInferredTarget = $true }
+
+        # Path parsing runs on the RAW line, never on the blanked scan string: the blanking that stops a
+        # commit message supplying a verb would also erase the path. Deny if ANY candidate is governed --
+        # a `--work-tree` elsewhere does not stop the cwd's repo being mutated.
+        $cands = @(Get-GitTargetCandidatesRaw $seg.Raw $segPrefix $cwdRaw)
+        if (-not $verb) {
+            $verb = $segVerb ; $verbLine = $seg.Raw
+            if ($cands.Count -gt 0) { $targetRaw = $cands[0] }
+        }
+        foreach ($c in $cands) {
+            $hit = Test-Governed (Get-ComparablePath $c $cwdRaw)
+            if ($hit) { $root = $hit ; $verb = $segVerb ; $verbLine = $seg.Raw ; $targetRaw = $c ; break }
+        }
+        if ($root) { break }
     }
     if (-not $verb) { exit 0 }
 
-    # Which repo does it act on? `-C` > `--work-tree` > `cd`/`pushd` > the session's cwd -- otherwise a
-    # session sitting in a worktree could reach INTO the primary with `git -C <primary> checkout x` and
-    # sail straight past a cwd-only check. Path parsing runs on the RAW command, never on the blanked
-    # scan string: the blanking that stops a commit message supplying a verb would also erase the path.
-    $targetRaw = Get-GitActedOnPathRaw $cmd $cwdRaw
-    $target = Get-ComparablePath $targetRaw $cwdRaw
-
-    $root = Test-Governed $target
     # `cd <primary>; git checkout ...` and `pushd` defeat both of the above, so also treat any command
-    # that NAMES a governed primary as targeting it.
-    if (-not $root) {
+    # that NAMES a governed primary as targeting it -- but only where the target was inferred.
+    if (-not $root -and $anyInferredTarget) {
         $normalized = ($cmd -replace '\\', '/').ToLowerInvariant()
         foreach ($r in $roots) {
             # Match the primary path only at a DIRECTORY BOUNDARY, never as a raw prefix substring. A
@@ -410,8 +512,9 @@ if ($tool -in @("Bash", "PowerShell")) {
     if (-not $root) {
         # Not the shared primary. It may still be a governed LINKED WORKTREE being hijacked onto an
         # existing branch (rule 3b) -- Write-Deny + exit if so; otherwise this returns and we allow.
-        # Pass the RAW cwd: rule 3b shells `git -C` and must not use a lowercased path (Linux CI).
-        Test-WorktreeHijack $verb $cmd $cwdRaw
+        # Hand down the LINE the verb was found on and the tree already resolved from it, so 3b judges
+        # the same command rule 3 did (including one recursed out of an interpreter argument).
+        Test-WorktreeHijack $verb $verbLine $targetRaw
         exit 0
     }
 

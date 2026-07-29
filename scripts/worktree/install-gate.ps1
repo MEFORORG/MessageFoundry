@@ -189,10 +189,19 @@ if ($Status) {
                 foreach ($t in "$($e.matcher)".Split("|")) { if ($t) { $null = $wired.Add($t) } }
             }
         }
-        $missing = @($handled | Where-Object { -not $wired.Contains($_) } | Sort-Object)
+        # Rules that are deliberately unwired are reported as such, never as UNWIRED. A status line that
+        # cries wolf about a known-and-intended state is one a reader learns to skip, which is how a real
+        # UNWIRED would go unnoticed -- the exact failure this whole block exists to surface.
+        $optIn   = @("EnterWorktree")
+        $absent  = @($handled | Where-Object { -not $wired.Contains($_) })
+        $missing = @($absent  | Where-Object { $optIn -notcontains $_ } | Sort-Object)
+        $offByChoice = @($absent | Where-Object { $optIn -contains $_ } | Sort-Object)
         $stray   = @($wired   | Where-Object { $handled -notcontains $_ } | Sort-Object)
         Write-Host "wiring      : $sp"
         Write-Host "              matched  : $(@($wired | Sort-Object) -join ', ')"
+        if ($offByChoice) {
+            Write-Host "              opt-in   : $($offByChoice -join ', ')  <- off by default, add -EnterWorktreeGate to enable"
+        }
         if ($missing) {
             Write-Host "              UNWIRED  : $($missing -join ', ')  <- implemented but NEVER FIRES" -ForegroundColor Yellow
         }
