@@ -379,7 +379,10 @@ jobs:
 
       - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
         run: |
-          python -m pip install --upgrade pip build
+          # Pinned like every other build job on this path: this workflow's jobs hold contents/id-token
+          # write and publish the release artifacts, so an unpinned resolve takes whatever PyPI serves at
+          # tag time (Scorecard PinnedDependenciesID, ADR 0034 §3). Guarded by tests/test_ci_venv_pinning.py.
+          python -m pip install "pip==26.1.2" "build==1.5.0"
           # Wheel-only for the same reason as the harness: messagefoundry_webconsole/ lives OUTSIDE this
           # project dir and is pulled in via force-include, so an sdist would not be self-contained.
           python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
@@ -394,7 +397,13 @@ jobs:
           # (tag webconsole-v0.3.0-rc1 -> 0.3.0rc1), so a string compare could never match a pre-release.
           if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
             want="${GITHUB_REF_NAME#webconsole-v}"
-            python -m pip install --quiet packaging
+            # Derived from the lock, exactly as the relsmoke/harnesssmoke jobs do, so one bump moves
+            # every release-path packaging install together instead of drifting apart.
+            PKG_PIN="$(sed -n 's/^packaging==\([^ ;]*\).*/\1/p' constraints.lock | head -1)"
+            if [ -z "$PKG_PIN" ]; then
+              echo "::error::no packaging== pin in constraints.lock — refusing an unpinned install on the release path"; exit 1
+            fi
+            python -m pip install --quiet "packaging==$PKG_PIN\"
             python - "$built" "$want" <<'PYVER'
           import sys
           from packaging.version import InvalidVersion, Version
