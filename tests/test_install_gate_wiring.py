@@ -13,8 +13,13 @@ that works in isolation silently never runs in production.
 
 from __future__ import annotations
 
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path
+
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 GATE = ROOT / "scripts" / "hooks" / "worktree_gate.ps1"
@@ -134,4 +139,40 @@ def test_every_opt_in_tool_is_guarded_by_a_plain_switch() -> None:
     assert opt_in == {"EnterWorktree"}, f"unexpected opt-in set: {sorted(opt_in)}"
     assert re.search(r"if \(\$EnterWorktreeGate\)", matcher_block()), (
         "EnterWorktree must be added inside an `if ($EnterWorktreeGate)` block"
+    )
+
+
+# ----------------------------------------------------------------------------- the -Status audit
+
+
+def test_status_prints_a_sha_beside_each_version() -> None:
+    """`-Status` is the only way to see whether the RUNNING gate matches this checkout, and nothing
+    exercised it. It also shipped a defect worth pinning: `$GateVersion` is bumped by hand, and rules 1a,
+    3c and 3d were added without a bump -- so it printed the SAME version on both lines directly above a
+    *** STALE *** verdict. The SHA comparison caught the drift, but a label that disagrees with the verdict
+    beside it is the ambiguity this whole audit exists to remove.
+
+    Asserting the SHA is printed makes agreement visible rather than asserted. Read-only and safe to run
+    anywhere: `-Status` sits above the CLAUDECODE refusal precisely so a session can audit but not install.
+    """
+    if shutil.which("pwsh") is None:
+        pytest.skip("SKIP (nothing run): pwsh not on PATH")
+    r = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(INSTALLER), "-Status"],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env={**os.environ, "CLAUDECODE": "1"},
+    )
+    assert r.returncode == 0, f"-Status must never fail:\n{(r.stderr + r.stdout)[:800]}"
+    out = r.stdout
+    print(out)
+    assert "installed   :" in out and "source      :" in out
+    # The source line always resolves (this checkout), so it must always carry a hash.
+    src_line = next(ln for ln in out.splitlines() if ln.startswith("source      :"))
+    assert re.search(r"\bsha [0-9a-f]{12}\b", src_line), (
+        f"the source line must show its hash, not just a hand-bumped version: {src_line!r}"
+    )
+    assert re.search(r"\bv\d{4}\.\d{2}\.\d{2}\.\d+", src_line), (
+        f"version label missing: {src_line!r}"
     )

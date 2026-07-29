@@ -44,11 +44,15 @@ param(
     ) ".claude/hooks/worktree-gate.repos.txt")
 )
 
-# Bumped whenever a RULE's behaviour changes, so `install-gate.ps1 -Status` can report which build is
-# actually installed. The installed gate is a COPY (see install-gate.ps1); without a version stamp the only
-# way to tell a stale copy from a current one is a byte compare, and nothing was doing one -- which is how
-# rule 4 sat unshipped for five days while every test reported it present.
-$GateVersion = "2026.07.29.1"
+# A HUMAN LABEL, not the parity check. `install-gate.ps1 -Status` compares SHA-256 and that comparison is
+# authoritative; this string exists so the output is readable, and it is bumped by hand.
+#
+# Which means it can lie, and immediately did: rules 1a, 3c and 3d were added without bumping it, so
+# -Status printed the SAME version on both sides directly above a *** STALE *** verdict. The SHA caught
+# the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
+# exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
+# asserted, and this label can never again be the only thing a reader compares.
+$GateVersion = "2026.07.29.2"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
