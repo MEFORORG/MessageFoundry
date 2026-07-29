@@ -105,6 +105,56 @@ async def _login_token(service: AuthService, username: str) -> str:
     return (await service.login(username, PW)).token
 
 
+#: Bound on waiting for the server's FIRST stats frame. Generous on purpose: this is a scheduling wait
+#: on a possibly-loaded CI runner, not a behavioural timeout. The pytest-level timeout (60 s) is the
+#: real backstop against a hang, and the deliberately-slow-`stats()` regression test below is what
+#: proves the wait is load-bearing rather than decorative.
+_FIRST_FRAME_TIMEOUT = 10.0
+
+#: The harness's own budget must exceed the first-frame wait PLUS the close it then waits for, or the
+#: harness would time out while we were still legitimately waiting and the failure would point at the
+#: route instead of at the clock.
+_HARNESS_TIMEOUT = 20.0
+
+
+async def _wait_for_first_frame(harness: _WSHarness, task: asyncio.Task[None]) -> None:
+    """Wait until the server has actually sent a frame, instead of sleeping a fixed 50 ms and hoping.
+
+    The fixed sleep was a race, and it FAILED on `main` @ ``be2fc08c``, ``test (windows-2022,
+    py3.14)``::
+
+        assert harness.frames, "expected at least one stats frame before revocation"
+        AssertionError: assert []
+
+    50 ms had to cover scheduling the harness task, the handshake, the handshake-time authorize *and*
+    the ``store.stats()`` query the first frame is built from — none of which these tests are
+    measuring. Polling the **actual asserted condition** makes the precondition deterministic without
+    weakening it: a frame is still required, and still required *before* the revocation. It also makes
+    what the test exercises deterministic, which the sleep did not — on a slow box the revocation
+    landed before the first send, silently exercising the pre-first-send path that
+    ``test_revoke_before_first_send_yields_no_frames`` already owns.
+
+    If the task dies first, surface THAT: a route that raised would otherwise be indistinguishable
+    from a slow one, and "timed out waiting for a frame" is the least useful description of a
+    traceback.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + _FIRST_FRAME_TIMEOUT
+    while not harness.frames:
+        if task.done():
+            task.result()  # re-raise the real failure if the route blew up
+            raise AssertionError(
+                f"the /ws/stats task finished before sending any frame "
+                f"(close_code={harness.close_code})"
+            )
+        if loop.time() >= deadline:
+            raise AssertionError(
+                f"no stats frame within {_FIRST_FRAME_TIMEOUT}s "
+                f"(close_code={harness.close_code}, frames={harness.frames})"
+            )
+        await asyncio.sleep(0.01)
+
+
 async def test_revoked_session_is_closed_promptly(
     engine: Engine, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -114,9 +164,9 @@ async def test_revoked_session_is_closed_promptly(
     token = await _login_token(service, "op")
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
-    task = asyncio.create_task(harness.run(timeout=5.0))
-    # let the first frame land, then revoke the session server-side
-    await asyncio.sleep(0.05)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    # Wait for the first frame to actually land, then revoke the session server-side.
+    await _wait_for_first_frame(harness, task)
     assert harness.frames, "expected at least one stats frame before revocation"
     await service.revoke_sessions_for_user(uid, actor="admin")
     await task
@@ -130,10 +180,50 @@ async def test_disabled_account_is_closed(engine: Engine, monkeypatch: pytest.Mo
     token = await _login_token(service, "op")
     app = create_app(engine, auth=service)
     harness = _WSHarness(app, token)
-    task = asyncio.create_task(harness.run(timeout=5.0))
-    await asyncio.sleep(0.05)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    # Wait for a frame first, so "mid-stream" is a fact rather than an aspiration. With the old fixed
+    # sleep this test still PASSED on a slow box while exercising the wrong path — the account was
+    # disabled before the first send, so the close came from the pre-first-send re-check instead of the
+    # mid-stream revalidation. Same 1008 either way, so nothing failed and the coverage quietly moved.
+    await _wait_for_first_frame(harness, task)
     # disable the account mid-stream → identity_for_token returns None → the feed must close
     await engine.store.set_user_disabled(uid, disabled=True)
+    await task
+    assert harness.close_code == 1008
+
+
+async def test_a_slow_first_stats_build_does_not_break_the_precondition(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reproduce the CI failure deterministically, so the fix is proven rather than observed.
+
+    The first frame cannot be sent until ``store.stats()`` returns — the route awaits it, builds the
+    frame, then sends. The old fixed 50 ms sleep had to cover that query *plus* task scheduling, the
+    handshake and the handshake-time authorize. Stall the query well past 50 ms and the old form fails
+    **every time** instead of once per loaded runner.
+
+    This is the property the original flake never had: revert ``_wait_for_first_frame`` to
+    ``await asyncio.sleep(0.05)`` and this test goes red on any machine, which is why it is worth more
+    than a green CI run. A load-dependent failure that only reproduces on a busy Windows runner is not
+    something you can iterate against.
+    """
+    real_stats = engine.store.stats
+
+    async def slow_stats() -> dict[str, int]:
+        await asyncio.sleep(0.4)  # 8x the old budget — deterministic on any machine
+        return await real_stats()
+
+    monkeypatch.setattr(engine.store, "stats", slow_stats)
+    monkeypatch.setattr(app_module, "_WS_REVALIDATE_SECONDS", 0.1)
+    service = await _service(engine)
+    uid = await _add(service, "op", Role.OPERATOR)
+    token = await _login_token(service, "op")
+    app = create_app(engine, auth=service)
+    harness = _WSHarness(app, token)
+    task = asyncio.create_task(harness.run(timeout=_HARNESS_TIMEOUT))
+    await _wait_for_first_frame(harness, task)
+    assert harness.frames, "the slow stats build must still yield a frame, just later"
+    await service.revoke_sessions_for_user(uid, actor="admin")
     await task
     assert harness.close_code == 1008
 
