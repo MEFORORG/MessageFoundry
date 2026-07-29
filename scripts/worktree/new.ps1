@@ -57,6 +57,17 @@ if ($LASTEXITCODE -ne 0) {
 # Reuse an existing branch if it's there, else create it from -Base.
 $branchExists = & git -C $RepoRoot branch --list $Name
 Write-Host "Creating worktree '$WorktreePath' on branch '$Name'..."
+
+# SERIALIZED ACROSS SESSIONS. `git worktree add -b <name> <base>` writes .git/config (the new
+# branch's upstream), and concurrent adds race .git/config.lock. Reported and reproduced on Windows:
+# parallel adds against one common .git fail with "could not lock config file .git/config: File
+# exists" / "unable to write upstream branch configuration", leaving ORPHANED branches behind and
+# callers that never run. Several worktrees already share this .git, so this is a live hazard, not a
+# theoretical one. 90s is generous for an operation that takes seconds -- if we wait that long,
+# something is genuinely wrong and the throw is the right outcome.
+. "$PSScriptRoot\..\coord\lock.ps1"
+$addLock = Enter-CoordLock -Name "worktree-add" -TimeoutSeconds 90 -Repo $RepoRoot
+try {
 if ($branchExists) {
     & git -C $RepoRoot worktree add $WorktreePath $Name
 } else {
@@ -74,6 +85,7 @@ if ($branchExists) {
     }
     & git -C $RepoRoot worktree add $WorktreePath -b $Name $Base
 }
+} finally { Exit-CoordLock $addLock }
 if ($LASTEXITCODE -ne 0) { throw "git worktree add failed (exit $LASTEXITCODE)" }
 
 # Record this worktree's HOME branch in its PRIVATE git dir (<repo>/.git/worktrees/<id>/), so the
