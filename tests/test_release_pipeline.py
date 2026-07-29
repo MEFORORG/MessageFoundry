@@ -38,6 +38,18 @@ EXPECTED_ONLY_INCLUDE = {"messagefoundry", "README.md", "CHANGELOG.md", "LICENSE
 PRIVATE_CANARY = "docs/security/THREAT-MODEL.md"
 
 
+def _executed_shell(text: str) -> str:
+    """`text` with comment lines removed — what the runner would actually EXECUTE.
+
+    Both release-shape guards below were fooled by the workflow's own prose: the comments explaining
+    the v0.3.1 deadlock contain the literal `gh release create`, so a job chunk read as "creates a
+    release" even with the command deleted. Mutation-proven: reverting the console to a bare
+    `gh release upload` left the guard GREEN until this stripping was applied. Count executed shell,
+    never narration.
+    """
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
 def _pyproject() -> dict:
     return tomllib.loads(PYPROJECT.read_text(encoding="utf-8"))
 
@@ -426,3 +438,71 @@ def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
     assert (
         "startsWith(github.ref, 'refs/tags/')" in console and "vars.PUBLISH_WEBCONSOLE" in console
     ), "the console publish must be tag-gated AND variable-gated"
+
+
+def test_a_job_without_needs_release_must_create_its_own_github_release() -> None:
+    """The asymmetry that broke the console job on first write, and would break the next one too.
+
+    ``release-harness`` may use a bare ``gh release upload`` because ``needs: release`` guarantees the
+    engine already created the GitHub release. ``release-webconsole`` deliberately has NO ``needs`` (it
+    fires on its own tag namespace), so on a console tag no release exists — a bare upload fails with
+    "release not found", the job dies BEFORE its publish step, and the one job whose purpose is to
+    claim the PyPI name can never claim it.
+
+    Derived, not hardcoded to the console: ANY release job that uploads assets without depending on the
+    engine release must create-or-update its own. Mutation: replace the console's create-or-update with
+    a bare ``gh release upload``. Red here.
+    """
+    import yaml
+
+    body = RELEASE_YML.read_text(encoding="utf-8")
+    jobs = yaml.safe_load(body)["jobs"]
+    names = list(jobs)
+    # Job chunks are sliced on the LINE-ANCHORED `^  <name>:` header. `body.index(f"{name}:")` -- what
+    # this did first -- matches the earliest substring anywhere, including the header comment prose, so
+    # every chunk started at the top of the file and contained every job. The guard then found a
+    # `gh release create` in all of them and passed while the console job carried a bare upload: it did
+    # not catch the exact defect it was written for. Proven by mutation before this fix, not assumed.
+    starts = {
+        m.group(1): m.start()
+        for m in re.finditer(r"^  ([a-z][\w-]*):$", body, re.M)
+        if m.group(1) in jobs
+    }
+    assert set(starts) == set(jobs), (
+        f"could not line-anchor every job: {sorted(set(jobs) - set(starts))}"
+    )
+    problems: list[str] = []
+    for i, name in enumerate(names):
+        nxt = names[i + 1] if i + 1 < len(names) else None
+        chunk = _executed_shell(body[starts[name] : (starts[nxt] if nxt else len(body))])
+        if "gh release upload" not in chunk and "gh release create" not in chunk:
+            continue  # attaches nothing to a GitHub release
+        if "release" in (jobs[name].get("needs") or []):
+            continue  # the engine release ran first and created it
+        if "gh release create" not in chunk:
+            problems.append(name)
+    assert not problems, (
+        f"release job(s) that attach assets without `needs: release` and without creating the release "
+        f"themselves: {problems}. On their own tag no GitHub release exists, so the upload fails and "
+        f"the job dies before its publish step."
+    )
+
+
+def test_every_release_creating_job_is_rerunnable() -> None:
+    """A bare ``gh release create`` turns one PyPI failure into a permanent retry deadlock: every
+    re-run dies on "a release with the same tag name already exists" and SKIPS the publish, so the
+    re-run cannot test the fix it exists to verify. Observed on v0.3.1.
+
+    Mutation: drop the ``gh release view`` / ``gh release edit`` arm from any creating job. Red here.
+    """
+    # COMMENT LINES ARE STRIPPED FIRST. The workflow's own prose explains the v0.3.1 deadlock and names
+    # `gh release create` twice while doing so; counting raw occurrences therefore found 4 "creators"
+    # against 2 real ones and failed on documentation. Count executed shell, not narration.
+    body = RELEASE_YML.read_text(encoding="utf-8")
+    code = "\n".join(ln for ln in body.splitlines() if not ln.lstrip().startswith("#"))
+    creators = code.count("gh release create")
+    assert creators, "no job creates a GitHub release — the workflow shape moved"
+    assert code.count("gh release view") >= creators, (
+        f"{creators} job(s) run `gh release create` but only {code.count('gh release view')} check for "
+        f"an existing release first — a re-run will deadlock before the publish step"
+    )
