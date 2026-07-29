@@ -173,8 +173,13 @@ jobs:
           # requirements.lock drags PySide6/dev tooling the wheel never requires); pip-audit still audits
           # the all-extras set. See docs/SUPPLY-CHAIN.md + ADR 0149.
           python -m pip install --upgrade "cyclonedx-bom~=7.3"
+          # No `pip install --upgrade pip` in this scratch venv (Scorecard PinnedDependencies): the only
+          # thing it ever installs is a fully `==`-pinned, hash-verified lock, and --require-hashes needs
+          # no resolution at all, so ensurepip's bundled pip suffices. The upgrade bought nothing while
+          # adding an UNPINNED, unverified PyPI install to the job that holds contents/id-token/
+          # attestations: write. Do NOT swap in `python -m venv --upgrade-deps` — same unpinned fetch,
+          # just invisible to the scanner (the "invisible filter" ADR 0034 rejected).
           python -m venv /tmp/sbomenv
-          /tmp/sbomenv/bin/pip install --upgrade pip
           /tmp/sbomenv/bin/pip install --require-hashes -r docker/locks/requirements-core.lock
           python -m cyclonedx_py environment /tmp/sbomenv/bin/python \
             --pyproject pyproject.toml --mc-type application \
