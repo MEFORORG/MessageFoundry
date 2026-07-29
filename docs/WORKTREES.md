@@ -78,6 +78,41 @@ share this `.git`** it appends the parallel-session block: which worktree/branch
 full worktree list, and the shared-memory write rule above. With a single worktree it prints only the
 working-default line.
 
+**Who is actually live — `presence.ps1`.** The worktree list above is the set of *checkouts*, not the
+set of *sessions*: most worktrees usually have nobody in them, and the collision that matters — someone
+editing the shared primary right now — is invisible from it. The banner therefore also lists **live
+sessions**, from [../scripts/coord/presence.ps1](../scripts/coord/presence.ps1). Run it directly any time:
+
+```powershell
+pwsh -NoProfile -File scripts\coord\presence.ps1        # live sessions in this repo
+pwsh -NoProfile -File scripts\coord\presence.ps1 -All   # include stale/dead registry entries
+```
+
+Two things make it worth having over the Desktop app's own session list:
+
+- **It sees VS Code sessions.** The Desktop app's `list_sessions` enumerates an in-memory map of
+  sessions *the app itself spawned*; a session launched by the VS Code extension is never entered into
+  it — not filtered out, never registered — so it is invisible there and cannot be messaged. Verified
+  against a live VS Code session sharing the **default** config root, so this is not a per-login split.
+  `<config-root>/sessions/<pid>.json` is the only registry carrying every surface, and that is what
+  `presence.ps1` reads (discovering config roots dynamically, since several logins can coexist).
+- **Liveness is fenced, not a pid check.** PIDs get reused and those records outlive their process, so
+  it compares each process's real start time against the recorded session start. Claude Code ships a
+  `procStart` field for exactly this, but here it serialises as absent and its guard passes
+  unconditionally — a bare pid check reports a recycled pid as a live session.
+
+It is **read-only**: a roster, not a channel. It never writes a registry file and never contacts another
+session. Note the corollary of having no heartbeat anywhere on this host: a `DEAD`/`STALE` verdict is a
+hint for a human, and must never by itself authorise a destructive action such as reclaiming a claim.
+
+**Creating a worktree is serialised.** `git worktree add -b <name> <base>` writes `.git/config`, so two
+sessions creating worktrees at once race `.git/config.lock` — on Windows that surfaces as `could not
+lock config file .git/config: File exists`, leaving orphaned branches behind. `new.ps1` wraps that call
+in a cross-session mutex ([../scripts/coord/lock.ps1](../scripts/coord/lock.ps1)), which uses the same
+atomic exclusive-create as `claim.ps1`. It **retries and never steals**: on timeout it fails loudly and
+names the holder, because breaking a lock you cannot prove is abandoned re-opens the very race it exists
+to close — and on this host there is no reliable liveness signal to prove it with.
+
 **Cross-session staging guard.** A `PreToolUse` hook (same `settings.json`,
 [../scripts/hooks/block-blanket-git-stage.ps1](../scripts/hooks/block-blanket-git-stage.ps1)) refuses
 blanket `git add -A`/`.`/`-u`/`--all` and `git commit -a`/`-am`/`--all` in **every** session, so even two
