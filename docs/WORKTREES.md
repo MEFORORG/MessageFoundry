@@ -111,9 +111,50 @@ registers it as a `PreToolUse` hook in the **user-scope** `~/.claude/settings.js
 2. a **`Task`/`Agent`/`Workflow` dispatch made from the primary** — a subagent inherits the parent's cwd,
    can't create a worktree for itself, and its blocked edits don't reliably surface back to the parent, so
    a fan-out from the primary would *appear* to succeed while writing nothing.
+3. an **`EnterWorktree` tool call**, which relocates a **live** session into a worktree — that re-files the
+   session's chat transcript under the worktree's slug, so the conversation drops out of the session list of
+   the window it was born in (nothing is deleted; the window just stops looking there). Open a **fresh**
+   session directly on the worktree instead. Any session already relocated and gone missing is recoverable —
+   see the recovery tool below. (Fail-open like the rest: an unrecognised payload never wedges the tool call.)
 
 Reads are never gated: asking a question or planning in the primary stays frictionless. Only building is
 blocked.
+
+> **Rule 3 ships INERT — activating it is a deliberate, separate decision.** The live hook is a *copy* at
+> `~/.claude/hooks/worktree_gate.ps1`; `install-gate.ps1` is what overwrites it. Merging this rule changes
+> nothing until that script is re-run, which is why the code can land ahead of the call.
+>
+> Weigh it with rules 2 and 3 together before you activate. Rule 2 denies a fan-out **from** the primary and
+> rule 3 denies relocating **into** a worktree, so with both live a primary-resident session has **no
+> in-session path to a subagent at all** — it must be *started* in a worktree. That is the safe pattern, but
+> it is a hard stop rather than a nudge, and it makes workflow-by-default impossible from the directory
+> sessions naturally open in.
+>
+> The counter-case is that `EnterWorktree` → dispatch → `ExitWorktree keep` is genuinely safe: the transcript
+> follows the cwd **both** ways, so a relocated session is only lost if it *ends* while still inside. Rule 3
+> cannot know you will exit properly — but `sessions.ps1` below now makes that outcome **recoverable**, which
+> is the thing that was missing when ten sessions were stranded and the rule was first designed. Ship the
+> cure, then decide whether you still want the prohibition.
+
+### Recovering a relocated session — `sessions.ps1`
+
+If a session was relocated into a worktree before rule 3 existed (or by a plain terminal, which the gate
+never governs) and vanished from its window's list, [`sessions.ps1`](../scripts/worktree/sessions.ps1) finds
+and rescues it. It scans **every** login on the box (`~\.claude` plus each `~\.claude-account-*`) and reads
+only the head of each transcript, so it is fast and read-only by default:
+
+```powershell
+pwsh -NoProfile -File scripts\worktree\sessions.ps1                 # every session for this repo, newest first
+pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Relocated      # only the ones that moved (missing from a window)
+pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Id <prefix>    # detail for one session
+pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Rehome <prefix> -WhatIf  # preview the move, touch nothing
+pwsh -NoProfile -File scripts\worktree\sessions.ps1 -Rehome <prefix>          # put it back in the primary's session list
+```
+
+`-Rehome` is the one destructive action: it moves the transcript (and its sidecar dir) back under the
+**primary's** slug so it reappears in the main window's session list. A bare invocation only ever **lists** —
+it never moves anything — and `-Rehome` refuses on a session that still looks live (written within
+`-MinIdleMinutes`, default 10; override with `-Force`) and honours `-WhatIf` for a no-op preview.
 
 **It keys on the write's target path, never on the session's cwd.** In that same 30-day window, **29% of
 writes came from a session sitting in the primary but landed inside a sibling worktree by absolute

@@ -84,6 +84,35 @@ $tool   = [string]$hook.tool_name
 $cwd    = Get-ComparablePath ([string]$hook.cwd)   # canonicalised: allowlist comparison only
 $cwdRaw = [string]$hook.cwd                        # original case: for `git -C` in rule 3b
 
+# ---------------------------------------------------------------------------------------------------
+# Rule 4 -- deny the EnterWorktree tool. Relocating a LIVE session into a worktree re-files its
+# transcript under the worktree's slug, so the conversation drops out of the window it was born in
+# (measured: a 5,159-line transcript moved out, leaving a 103-byte stub). Open a FRESH session in the
+# worktree instead; scripts\worktree\sessions.ps1 -Rehome recovers any session already relocated.
+#
+# Keys on the TOOL, not the cwd: relocation loses the chat wherever you start it, so once the gate is
+# on (roots non-empty, guarded above) EnterWorktree is denied unconditionally. ExitWorktree is a safe
+# keep and must NOT be caught. Fail-open is preserved: any earlier parse error already exited 0, and
+# only an exact tool match reaches Write-Deny.
+#
+# Expressed as `$tool -in @("EnterWorktree")` so tests/test_install_gate_wiring.py SEES this tool as
+# handled and ENFORCES that install-gate.ps1 registers a matcher for it -- rule 3 shipped dead once by
+# implementing a rule with no matcher, and that tripwire exists to prevent exactly this. The matcher is
+# wired in install-gate.ps1 alongside this change; delete it there and the wiring test goes red.
+# ---------------------------------------------------------------------------------------------------
+if ($tool -in @("EnterWorktree")) {
+    Write-Deny @"
+BLOCKED: EnterWorktree relocates this live session into a worktree, which re-files its chat transcript
+under the worktree's slug and drops it from THIS window's session list (nothing is deleted -- it just
+stops appearing where you started). Do not relocate a running session.
+
+Instead:
+  * Open a NEW Claude Code window/session directly on the worktree and continue there.
+  * If a session has already been relocated and vanished, recover it:
+        pwsh -NoProfile -File $($roots[0].Display)\scripts\worktree\sessions.ps1 -Rehome <id-prefix>
+"@
+}
+
 # A worktree that git nests INSIDE the primary's path (.claude/worktrees/<name>, the first-party
 # mechanism) is a legitimate worktree even though its path starts with the primary's. Never gate it.
 function Test-Governed([string]$Candidate) {
