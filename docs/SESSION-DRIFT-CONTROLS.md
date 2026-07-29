@@ -112,6 +112,7 @@ reading the emitted decision — not by reading source alone.
 | Rule 1 — write into primary | user | **LIVE** (probe-verified DENY) |
 | Rule 1a — write to the gate's own script or allowlist | user | **NEW** — the kill switch sat outside every governed root, so rule 1 allowed an `Edit` to it |
 | Rule 3c — `git config` that disarms the shared repo | user | **NEW** — `core.hooksPath` / `core.worktree` / `alias.*` / `include.path`; asks git for the common dir, so a *linked worktree* is covered too |
+| Rule 3d — `git worktree remove` / `move` on another session's checkout | user | **NEW** — every other rule protects a tree from being *swapped*; this protects it from being *deleted* |
 | Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY) |
 | Rule 3 — git verbs vs primary | user | **LIVE, partial** — the `-c` and relative-`cd` holes are fixed in source (G2/G3); enumerated-verb gaps remain (G9) |
 | Rule 3b — worktree hijack | user | **LIVE but narrow** — 2 of 11 verbs, existing-local-branch destinations only |
@@ -448,9 +449,9 @@ analysis must be redone.
 | B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
 | B10 | **Done** | One allowlist, shared by the gate and the backstop, with the legacy path kept as a fallback so a version-skewed installed copy cannot silently disarm the backstop. `install-selfheal.ps1` gained the `CLAUDECODE` refusal its sibling always had — the *higher*-privilege installer was the unprotected one. |
 | B6 | **Started** | `.worktreeinclude` added, so the leak gate's gitignored token list reaches every worktree Claude Code creates itself (`--worktree`, desktop sessions, `isolation: worktree` subagents) — previously only `new.ps1`'s own worktrees got it, and a fresh first-party worktree could not commit at all. **Not** done: worktree-first as the documented default entry point, and `new.ps1` calling `git worktree lock` while a session is live. |
-| B11 | **Not started** | Verb and teardown holes (G9, G11). |
+| B11 | **Started** | Rule 3d closes the worst of G9: `git worktree remove` / `move` on another session's checkout. **Not** done: the rest of the absent verbs (`rm`, `mv`, `sparse-checkout`, `checkout-index`, `bisect`, `branch -f`, `update-ref`, `read-tree`), `gh pr checkout`, and G11's teardown half — `prune-merged.ps1` is still sibling-only and still prints a green "nothing to consider" when run from the wrong cwd. |
 
-Remaining order: the rest of B6, then B11, then the B1/B3/B4 remainders.
+Remaining order: the rest of B6, the rest of B11, then the B1/B3/B4 remainders.
 
 Each shipped fix was proved to catch its own regression by mutation — five mutations applied to the shipped
 script one at a time, all five went red — and an adversarial review of the first attempt found three

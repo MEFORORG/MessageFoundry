@@ -193,3 +193,78 @@ def test_a_non_repo_cwd_fails_open(tmp_path: Path, repo: SimpleNamespace) -> Non
     plain = tmp_path / "NotARepo"
     plain.mkdir()
     assert run_gate(shell("git config core.hooksPath /dev/null", cwd=plain), repo.repos) is None
+
+
+# --------------------------------------------------------------- rule 3d: destroying another worktree
+
+
+def test_removing_another_sessions_worktree_is_denied(repo: SimpleNamespace) -> None:
+    """Every other rule protects a tree from being SWAPPED. This one protects it from being DELETED,
+    which is strictly worse and was entirely unguarded: `git worktree remove` takes the directory and its
+    branch with any uncommitted work in them, and the session using it finds out when its next read
+    fails. The verb list could never have caught it -- `worktree remove` is two tokens where every other
+    entry is one."""
+    reason = assert_denied(
+        run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.primary), repo.repos)
+    )
+    assert "ANOTHER SESSION" in reason
+    assert "prune-merged.ps1" in reason  # offer the maintenance path, do not merely refuse
+
+
+def test_force_removing_and_moving_are_denied_too(repo: SimpleNamespace) -> None:
+    assert_denied(
+        run_gate(shell(f'git worktree remove --force "{repo.wt}"', cwd=repo.primary), repo.repos)
+    )
+    assert_denied(
+        run_gate(shell(f'git worktree move "{repo.wt}" ../elsewhere', cwd=repo.primary), repo.repos)
+    )
+
+
+def test_reading_the_worktree_list_is_untouched(repo: SimpleNamespace) -> None:
+    """`worktree list` is how you find out whether one is in use -- the deny message recommends it, so it
+    must not itself be blocked."""
+    assert run_gate(shell("git worktree list", cwd=repo.primary), repo.repos) is None
+    assert run_gate(shell("git worktree list --porcelain", cwd=repo.primary), repo.repos) is None
+
+
+def test_adding_a_worktree_is_untouched(repo: SimpleNamespace, tmp_path: Path) -> None:
+    """Creating one is the sanctioned path out of every other deny in this file."""
+    assert (
+        run_gate(
+            shell(f"git worktree add {tmp_path / 'New'} -b newbranch", cwd=repo.primary), repo.repos
+        )
+        is None
+    )
+
+
+def test_removing_a_worktree_of_an_UNGOVERNED_repo_is_allowed(
+    tmp_path: Path, repo: SimpleNamespace
+) -> None:
+    other = tmp_path / "Unrelated"
+    subprocess.run(["git", "init", "-b", "main", str(other)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(other), "config", "user.email", "t@e.com"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(other), "config", "user.name", "t"], check=True, capture_output=True
+    )
+    (other / "s.txt").write_text("s", encoding="utf-8")
+    subprocess.run(["git", "-C", str(other), "add", "-A"], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(other), "commit", "-m", "s"], check=True, capture_output=True)
+    owt = tmp_path / "Unrelated-wt"
+    subprocess.run(
+        ["git", "-C", str(other), "worktree", "add", "-b", "b", str(owt)],
+        check=True,
+        capture_output=True,
+    )
+    assert run_gate(shell(f'git worktree remove "{owt}"', cwd=other), repo.repos) is None
+
+
+def test_a_nonexistent_path_fails_open(repo: SimpleNamespace, tmp_path: Path) -> None:
+    """git cannot classify a path that is not a worktree, and every git failure must ALLOW."""
+    assert (
+        run_gate(shell(f'git worktree remove "{tmp_path / "nope"}"', cwd=repo.primary), repo.repos)
+        is None
+    )

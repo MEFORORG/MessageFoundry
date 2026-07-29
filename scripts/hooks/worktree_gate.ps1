@@ -475,6 +475,62 @@ What to do instead:
 "@
     }
 
+    # -----------------------------------------------------------------------------------------------
+    # Rule 3d -- `git worktree remove` / `move`, which DESTROYS OR RELOCATES ANOTHER SESSION'S CHECKOUT.
+    # Every rule above protects a tree from being swapped; this one protects it from being deleted, which
+    # is strictly worse and was entirely unguarded. The verb list could never have caught it: `worktree`
+    # is two tokens (`worktree remove`) where every other entry is one, and git refuses to remove the
+    # worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed
+    # at somebody else's.
+    #
+    # The target is the PATH ARGUMENT, not the cwd, and it cannot be judged with Test-Governed: a linked
+    # worktree is exempt there (correctly, for tree swaps) and a sibling worktree falls outside the roots
+    # entirely. Ask git whether the path is a registered worktree of a governed repo instead. Any git
+    # failure -- a path that is not a worktree, or does not exist -- falls through to ALLOW.
+    # -----------------------------------------------------------------------------------------------
+    foreach ($seg in (Get-ScannableSegments $cmd)) {
+        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
+        if ($seg.Scan -cnotmatch '\bworktree\s+(?<wtverb>remove|move)(?=\s|$)') { continue }
+        $wtVerb = $Matches['wtverb']
+
+        # First positional (non-flag) token after the subcommand is the worktree being acted on.
+        $after = ($seg.Raw -replace ('(?s)^.*?\bworktree\s+' + $wtVerb + '\b'), '')
+        $after = ($after -split '(?:&&|\|\||;|\|)', 2)[0]
+        $victimRaw = $null
+        foreach ($tok in @($after -split '\s+' | Where-Object { $_ })) {
+            if ($tok.StartsWith('-')) { continue }
+            $victimRaw = $tok.Trim('"', "'")
+            break
+        }
+        if (-not $victimRaw) { continue }
+
+        $victimCommon = "$(& git -C $victimRaw rev-parse --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $victimCommon) { continue }
+        $victimCmp = Get-ComparablePath $victimCommon $victimRaw
+        $govWt = $null
+        foreach ($r in $roots) {
+            if ($victimCmp -eq $r.Compare -or $victimCmp.StartsWith("$($r.Compare)/")) { $govWt = $r; break }
+        }
+        if (-not $govWt) { continue }
+
+        Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that belongs to
+ANOTHER SESSION -- git refuses to remove the worktree you are standing in, so this one is not yours.
+
+Removing it deletes that session's working tree and its branch, along with any uncommitted work in them.
+There is no undo, and the session using it finds out when its next file read fails.
+
+What to do instead:
+  * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
+    READ what it proposes before applying anything:
+        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\prune-merged.ps1
+  * To find out whether a worktree is still in use, look rather than delete:
+        git -C "$($govWt.Display)" worktree list
+  * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
+    "I want to remove the worktree $victimRaw and I need you to confirm it is not in use."
+"@
+    }
+
     # The verb must be a whole SUBCOMMAND. `\bmerge\b` is not enough: a hyphen counts as a word boundary,
     # so it also matches the `merge` inside `merge-base` and `merge-tree` -- both of which are READ-ONLY
     # and are exactly what a session should be using instead of a checkout. Require the verb to end at
