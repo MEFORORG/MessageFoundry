@@ -1432,12 +1432,19 @@ def _serve(args: argparse.Namespace) -> int:
     # plain language, so a deliberate opt-out is never silent. Advisory only — the posture GATES below
     # still refuse a production-PHI weakening (the ADR 0092 clamp is unchanged). The shared
     # security_loosenings() feeds both this warning and the read-only GET /security/posture view.
-    _loosenings = security_loosenings(settings.security)
+    # The connection graph is NOT loaded yet here (the Engine loads it inside the ASGI lifespan, well
+    # below), so this early warning covers the SETTINGS-scoped switches only and passes an empty
+    # cleartext-hop list. That is not a silent subset: every ADR 0153 acceptance is reported moments
+    # later — per connection, with its reason — by the construction gate's own loud WARN + audit record,
+    # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
+    _loosenings = security_loosenings(settings.security, settings.store, settings.auth, ())
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
             "[security] posture loosened from the secure defaults (%d): %s — see "
-            "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below.",
+            "docs/SECURITY-LOOSENING.md. Production-PHI weakenings are still refused below. "
+            "Per-connection cleartext_accepted declarations (ADR 0153) are reported separately by "
+            "the connector construction gate.",
             len(_loosenings),
             "; ".join(f"{name} ({risk})" for name, risk in _loosenings),
         )
@@ -4170,12 +4177,46 @@ def _security(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from messagefoundry.config import security_edit
-    from messagefoundry.config.settings import SecuritySettings, load_settings, security_loosenings
+    from messagefoundry.config.settings import (
+        AuthSettings,
+        SecuritySettings,
+        StoreSettings,
+        load_settings,
+        security_loosenings,
+    )
 
     path = args.service_config
 
+    # This subcommand edits [security], but security_loosenings() also reports [store]/[auth] deviations
+    # (ADR 0148: one posture). Resolve those from the whole file so the list is complete. If the file will
+    # not load — it may be invalid OUTSIDE [security], which must not break `security show` — fall back to
+    # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
+    # reporting a subset as if it were everything.
+    _loosenings_partial = False
+    try:
+        _full = load_settings(config_path=path)
+        _store, _auth = _full.store, _full.auth
+    except Exception:  # noqa: BLE001 - any load failure degrades to a declared-partial report
+        _store, _auth = StoreSettings(), AuthSettings()
+        _loosenings_partial = True
+
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
-        return [{"switch": s, "risk": r} for s, r in security_loosenings(sec)]
+        # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see the ADR
+        # 0153 per-connection cleartext_accepted declarations — it passes an empty list and declares the
+        # gap in `loosenings_scope` below, instead of reporting a settings-only view as if it were the
+        # whole posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
+        return [{"switch": s, "risk": r} for s, r in security_loosenings(sec, _store, _auth, ())]
+
+    #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
+    #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
+    #: read at all (the file did not load); `connections_not_loaded` is the standing limitation above.
+    _loosenings_scope = {
+        "loosenings_partial": _loosenings_partial,
+        "loosenings_scope": (
+            "settings only ([security]/[store]/[auth]); per-connection cleartext_accepted "
+            "declarations are NOT included — see `messagefoundry check` or GET /security/posture"
+        ),
+    }
 
     if args.action == "show":
         try:
@@ -4191,6 +4232,7 @@ def _security(args: argparse.Namespace) -> int:
                 "set": sorted(raw.keys()),
                 "defaults": SecuritySettings().model_dump(),
                 "loosenings": _loosenings(resolved),
+                **_loosenings_scope,
             },
             compact=args.json,
         )
@@ -4221,6 +4263,7 @@ def _security(args: argparse.Namespace) -> int:
             return _emit_error(f"invalid [security] value: {exc}", as_json=args.json)
         result = security_edit.set_security(path, updates, validate=validate)
         result["loosenings"] = _loosenings(SecuritySettings.model_validate(merged))
+        result.update(_loosenings_scope)
     except json.JSONDecodeError as exc:
         return _emit_error(f"invalid security update JSON: {exc}", as_json=args.json)
     except (security_edit.SecurityEditError, FileNotFoundError, ValueError, OSError) as exc:

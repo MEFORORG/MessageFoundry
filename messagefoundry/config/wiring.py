@@ -70,6 +70,7 @@ from messagefoundry.config.models import (
     Schedule,
     StallThreshold,
     Validation,
+    _check_cleartext_acceptance,
 )
 from messagefoundry.config.send_snapshot import snapshot_on_send_active
 from messagefoundry.parsing.message import Message, RawMessage, snapshot_payload
@@ -133,6 +134,7 @@ __all__ = [
     "MessageTypeError",
     "load_config",
     "validate_config",
+    "accepted_cleartext_hops",
 ]
 
 _logger = logging.getLogger(__name__)
@@ -2566,6 +2568,13 @@ class OutboundConnection:
     # around its ACK read). DISPLAY ONLY — no delivery effect, independent of `timeout_seconds`/pacing.
     # Default 0.0. Threaded to the Destination by _dest_config. Code-first AND connections.toml.
     waiting_display_delay: float = 0.0
+    # ADR 0153 decision 2: this outbound's hop is cleartext, is NOT secure, and the operator accepts
+    # that (with a written reason). WARN, never ALLOW — crossed, but logged at every construction and
+    # audited. The opposite claim to `tls_hop_attested` ("this hop IS secure by means the engine cannot
+    # see"), deliberately kept a separate field so the audit trail can tell a proxy-terminated hop from
+    # plaintext on a flat network. Outbound-only. Threaded to the Destination by _dest_config.
+    cleartext_accepted: bool = False
+    cleartext_reason: str | None = None
     source_file: str | None = None
     source_line: int | None = None
 
@@ -2887,6 +2896,24 @@ def _active_registry() -> Registry:
             "via load_config()"
         )
     return _active
+
+
+def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
+    """Every outbound connection that DECLARES ``cleartext_accepted``, as ``(name, reason)`` (ADR 0153).
+
+    The SINGLE reader of the accepted set, shared by ``messagefoundry check``'s ``cleartext-accepted``
+    surface and by the API's ``GET /security/posture`` loosening registry, so the two can never report
+    different sets. Sorted by connection name for a stable, diffable list.
+
+    Pure — it reads the loaded graph and touches nothing else. It lives HERE, beside the ``Registry`` it
+    reads, rather than in ``checks`` or ``api``, so neither of those has to import the other: the
+    acceptance is connection-scoped by construction, which is exactly why the settings-scoped
+    ``security_loosenings`` takes the resolved NAMES rather than a graph."""
+    return sorted(
+        (oc.name, oc.cleartext_reason or "(none recorded)")
+        for oc in registry.outbound.values()
+        if oc.cleartext_accepted
+    )
 
 
 def _call_site() -> tuple[str | None, int | None]:
@@ -3322,6 +3349,8 @@ def build_outbound_connection(
     metadata: Mapping[str, Any] | None = None,
     flagged: bool = False,
     waiting_display_delay: float = 0.0,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
     source_file: str | None = None,
     source_line: int | None = None,
 ) -> OutboundConnection:
@@ -3329,6 +3358,15 @@ def build_outbound_connection(
 
     The shared core of code-first :func:`outbound` **and** the ``connections.toml`` loader (ADR 0007).
     Pure — it does not touch the active registry; the caller is responsible for ``add_outbound``."""
+    # ADR 0153 decision 2: the cleartext-acceptance pair is coherence-checked HERE, the one choke point
+    # both authoring surfaces pass through, so a flag with no reason (or a reason with no flag) fails at
+    # `messagefoundry check` / dry-run rather than at connector construction. Re-raised as a WiringError
+    # so it surfaces with the connection name attached, exactly like every other wiring invariant; the
+    # Destination model re-validates it independently (defense in depth for a hand-built Destination).
+    try:
+        _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+    except ValueError as exc:
+        raise WiringError(f"outbound connection {name!r}: {exc}") from exc
     if dead_letter_days is not None and dead_letter_days < 0:
         # Per-connection dead-letter retention override (#34, ADR 0027). None = inherit
         # [retention].dead_letter_days; 0 = keep forever; >0 = days. A negative window is meaningless —
@@ -3521,6 +3559,8 @@ def build_outbound_connection(
         metadata=metadata,
         flagged=flagged,
         waiting_display_delay=waiting_display_delay,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
         source_file=source_file,
         source_line=source_line,
     )
@@ -3545,6 +3585,8 @@ def outbound(
     metadata: Mapping[str, Any] | None = None,
     flagged: bool = False,
     waiting_display_delay: float = 0.0,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> None:
     """Declare an outbound connection that Handlers can ``Send`` to.
 
@@ -3572,7 +3614,16 @@ def outbound(
     builds it, never resolves its ``env()`` values and spawns no delivery worker — a ``Send`` to it is
     declined and logged rather than queued. Unlike ``simulate=True`` (the lane IS built and DOES take
     rows) and unlike a DR/scheduler park (rows are retained and retried), **nothing queues to it at
-    all**. It **wins** over ``auto_start``. Also a ``connections.toml`` key."""
+    all**. It **wins** over ``auto_start``. Also a ``connections.toml`` key.
+
+    ``cleartext_accepted`` (ADR 0153) declares that **this** outbound's hop is cleartext, is NOT secure,
+    and the operator accepts that — with a mandatory ``cleartext_reason`` recorded for the audit trail.
+    It yields a loud WARN at every construction (never a silent ALLOW) and lets the hop cross even under
+    ``[security].enforcement = enforce``. It is the opposite claim to a connection's ``tls_hop_attested``
+    ("this hop *is* secure by means the engine cannot see", which ALLOWs), and the two are deliberately
+    separate so the audit trail can tell a proxy-terminated hop from plaintext on a flat network. For
+    ``Tcp()``/``X12()``, which have no TLS support at all, it is a **permanent, structural** declaration
+    — there is no ``tls = true`` for them to migrate to (BACKLOG #311). Also a ``connections.toml`` key."""
     file, line = _call_site()
     _active_registry().add_outbound(
         build_outbound_connection(
@@ -3593,6 +3644,8 @@ def outbound(
             metadata=metadata,
             flagged=flagged,
             waiting_display_delay=waiting_display_delay,
+            cleartext_accepted=cleartext_accepted,
+            cleartext_reason=cleartext_reason,
             source_file=file,
             source_line=line,
         )

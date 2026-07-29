@@ -41,12 +41,12 @@ from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
     InsecureHopRefused,
     RevocationHopGuard,
+    cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
     insecure_hop_disposition,
@@ -294,26 +294,41 @@ def _current_hop_posture_fail_closed() -> HopPosture:
 
 
 def _shipped_strict_disposition(
-    posture: HopPosture, *, host: str, attested: bool
+    posture: HopPosture,
+    *,
+    host: str,
+    attested: bool,
+    cleartext_accepted: bool = False,
 ) -> HopDisposition:
-    """The floored posture-keyed disposition for an ALREADY-SHIPPED insecure-egress cell (#200).
+    """The floored disposition for an ALREADY-SHIPPED insecure-egress cell (#200, amended by ADR 0153).
 
-    Runs the instance ``posture`` through the ONE authority (:func:`insecure_hop_disposition`) with the
-    global escape CLAMPED to non-production (:func:`hop_insecure_escape_downgrades`), then applies
-    decision 5's no-loosen floor: a cell that refused BOTH staging and production PHI today must keep
-    REFUSE for a non-prod PHI hop that reaches the gradient's WARN *without* the escape (arm 6). Only the
-    non-prod escape (arm 4 → WARN), a per-hop attestation, on-box loopback, or a synthetic instance
-    (all → ALLOW) relaxes it. Pure — no I/O — so the send-time guard can reuse it verbatim."""
-    audited_opt_out = hop_insecure_escape_downgrades(enforcing=posture.enforcing)
+    Runs the instance ``posture`` through the ONE authority (:func:`insecure_hop_disposition`), then
+    applies ADR 0092 decision 5's no-loosen floor: a cell that refused BOTH staging and production PHI
+    today must keep REFUSE for a hop that only reaches the gradient's WARN because the instance is not
+    enforcing. Pure — no I/O — so the send-time guard can reuse it verbatim.
+
+    **The floor is now keyed on ``cleartext_accepted``, not on the global escape.** Before ADR 0153 it
+    read ``not audited_opt_out``, which is how ``MEFOR_ALLOW_INSECURE_TLS`` relaxed an HTTP-family
+    cleartext hop. 0153 decision 5 says the variable "can no longer influence a cleartext-hop decision",
+    and these cells — REST/SOAP/FHIR/DICOMweb bodies, HTTP credentials, ``verify_tls=false`` — *are*
+    cleartext-hop decisions: the ADR's out-of-scope note about this function means its **floor** is not
+    being reworked, not that the HTTP family keeps a data-label carve-out. Re-keying it (a) keeps 0092
+    §5 exactly (a non-enforcing hop that reaches WARN with no declaration is still floored to REFUSE, as
+    today), and (b) makes decision 2's escape effective on the largest cleartext-egress family in the
+    product — the only one where it is a genuine escape, since Tcp()/X12() never reach this cell.
+
+    Side effect, stated plainly: an instance that set ``MEFOR_ALLOW_INSECURE_TLS`` to cross a
+    non-enforcing HTTP cleartext hop no longer can. That is a TIGHTENING, and it is intended — it is
+    also what makes the raw-transport guards and this one agree again, rather than leaving the blunt env
+    var alive on HTTP and dead on raw TCP."""
     disposition = insecure_hop_disposition(
-        is_phi=posture.is_phi,
         enforcing=posture.enforcing,
         is_loopback_hop=is_loopback_hop_host(host),
         hop_attested=attested,
-        audited_opt_out=audited_opt_out,
+        cleartext_accepted=cleartext_accepted,
     )
-    if disposition is HopDisposition.WARN and not audited_opt_out:
-        # arm-6 WARN (non-prod PHI, no escape) — this shipped cell REFUSED it; keep it strict.
+    if disposition is HopDisposition.WARN and not cleartext_accepted:
+        # A WARN reached via the non-enforcing dial alone — this shipped cell REFUSED it; keep it strict.
         return HopDisposition.REFUSE
     return disposition
 
@@ -333,11 +348,19 @@ class InsecureHopGuard:
     posture: HopPosture
     attested: bool
     cell: str
+    # ADR 0153 decision 2 — captured with the posture so the send-time re-assertion sees exactly the
+    # declaration the construction gate decided on.
+    cleartext_accepted: bool = False
 
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture."""
         if (
-            _shipped_strict_disposition(self.posture, host=host, attested=self.attested)
+            _shipped_strict_disposition(
+                self.posture,
+                host=host,
+                attested=self.attested,
+                cleartext_accepted=self.cleartext_accepted,
+            )
             is HopDisposition.REFUSE
         ):
             raise InsecureHopRefused(
@@ -347,42 +370,92 @@ class InsecureHopGuard:
 
 
 def _enforce_shipped_hop(
-    host: str, *, cell: str, message: str, attested: bool
+    host: str,
+    *,
+    cell: str,
+    message: str,
+    attested: bool,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> tuple[HopDisposition, HopPosture]:
     """Decide + enforce an already-shipped insecure hop at CONSTRUCTION, returning (disposition, posture).
 
     Keys on the active (fail-closed) posture, applies the decision-5 floor, then acts via
     :func:`enforce_insecure_hop` (raise on REFUSE, loud-log on WARN, no-op on ALLOW). When a per-hop
-    attestation SUPPRESSES a would-be production-PHI refusal it is recorded loudly — the audited opt-in
-    that replaces the blunt global escape for the production case (decision 3)."""
+    attestation SUPPRESSES a would-be refusal it is recorded loudly — the audited opt-in that replaced
+    the blunt global escape (ADR 0092 decision 3). When an ADR 0153 ``cleartext_accepted`` declaration is
+    what produced the WARN, that is recorded too, at every construction."""
     posture = _current_hop_posture_fail_closed()
-    disposition = _shipped_strict_disposition(posture, host=host, attested=attested)
+    disposition = _shipped_strict_disposition(
+        posture, host=host, attested=attested, cleartext_accepted=cleartext_accepted
+    )
+    # The `posture.is_phi` conjunct this branch used to carry went with ADR 0153: the authority no longer
+    # reads the label, so gating the audit on it would silence the record for exactly the hops that
+    # newly depend on the attestation to cross.
     if (
         disposition is HopDisposition.ALLOW
         and attested
-        and posture.is_phi
         and posture.enforcing
         and not is_loopback_hop_host(host)
     ):
         logger.warning(
-            "insecure transport hop ATTESTED secure (suppresses a production-PHI refusal) — %s: %s",
+            "insecure transport hop ATTESTED secure (suppresses an enforcing refusal) — %s: %s",
             cell,
             message,
         )
-    enforce_insecure_hop(disposition, message=message, cell=cell)
+    enforce_insecure_hop(
+        disposition,
+        message=message,
+        cell=cell,
+        audit_sink=(
+            cleartext_acceptance_audit_sink(cleartext_reason)
+            if disposition is HopDisposition.WARN and cleartext_accepted
+            else None
+        ),
+    )
     return disposition, posture
 
 
+def cleartext_acceptance_from_settings(s: Mapping[str, Any]) -> tuple[bool, str | None]:
+    """``(cleartext_accepted, cleartext_reason)`` read off an ``env()``-resolved settings mapping.
+
+    ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
+    credential chain, the HTTP Digest / OAuth2 token-endpoint providers, and the ``FhirLookup`` read
+    executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``. The
+    runner's ``_dest_config`` mirrors the declaration into those resolved settings (and only when it is
+    set, so an outbound that declared nothing is byte-identical), and this is the single reader, so the
+    mirror is never re-parsed by hand at four call sites. A ``FhirLookup`` connection, which has no
+    ``Destination``, carries the pair as a spec setting directly — the same surface its
+    ``tls_hop_attested`` already uses."""
+    reason = s.get("cleartext_reason")
+    return bool(s.get("cleartext_accepted", False)), None if reason is None else str(reason)
+
+
 def refuse_cleartext_credential_hop(
-    scheme: str, url: str, *, credential: str, attested: bool = False
+    scheme: str,
+    url: str,
+    *,
+    credential: str,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> None:
-    """Refuse a named ``credential`` riding a cleartext (``http``) hop (posture-keyed, #200).
+    """Refuse a named ``credential`` riding a cleartext (``http``) hop (#200, amended by ADR 0153).
 
     The header-agnostic core of :func:`refuse_cleartext_credentials`, reused for a credential that does
-    NOT ride the ``Authorization`` header (a SOAP WS-Security UsernameToken in the body). Re-keyed onto
-    the ONE authority: a production-PHI hop is REFUSED (the clamped global escape can no longer silence
-    it — decision 2), a non-prod PHI hop is refused unless the escape downgrades it to a loud WARN, and an
-    on-box loopback / per-hop-attested / synthetic hop is allowed."""
+    NOT ride the ``Authorization`` header (a SOAP WS-Security UsernameToken in the body). Keyed on the
+    ONE authority: an enforcing hop is REFUSED, an on-box loopback / per-hop-attested hop is allowed, and
+    an ADR 0153 ``cleartext_accepted`` declaration crosses it with a loud, audited WARN.
+
+    **``cleartext_accepted`` deliberately reaches the credential hops too**, even though putting a
+    password on the wire is a worse claim than putting a body on it. ADR 0153 is silent here, and the
+    alternative — leaving credentials with no expressible declaration — would push an operator whose
+    legacy peer needs Basic auth over a cleartext segment into writing a FALSE ``tls_hop_attested``,
+    which is precisely the defect 0153 exists to remove. The declaration stays per-connection, WARNs at
+    every construction, is audited, and is reported as a loosening, so it is strictly more visible than
+    the blanket escape that used to permit exactly this. (SMTP AUTH over cleartext remains refused
+    OUTRIGHT in ``transports.email`` — that is a hard refusal, not a posture decision, and is
+    untouched.)"""
     if scheme != "http":
         return
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -391,11 +464,19 @@ def refuse_cleartext_credential_hop(
         cell="HTTP cleartext credentials",
         message=f"sends a {credential} over cleartext http to {host!r}",
         attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
 
 
 def refuse_cleartext_credentials(
-    scheme: str, headers: dict[str, str], url: str, *, attested: bool = False
+    scheme: str,
+    headers: dict[str, str],
+    url: str,
+    *,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> None:
     """Refuse to send credentials over a cleartext (``http``) channel (posture-keyed, #200).
 
@@ -405,26 +486,35 @@ def refuse_cleartext_credentials(
     if "Authorization" not in headers:
         return
     refuse_cleartext_credential_hop(
-        scheme, url, credential="credential (Authorization header)", attested=attested
+        scheme,
+        url,
+        credential="credential (Authorization header)",
+        attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
 
 
 def refuse_cleartext_egress(
-    scheme: str, url: str, *, attested: bool = False
+    scheme: str,
+    url: str,
+    *,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> InsecureHopGuard | None:
-    """Refuse a cleartext (``http``) outbound to a **non-loopback** host (ASVS 12.2.1, posture-keyed #200).
+    """Refuse a cleartext (``http``) outbound to a **non-loopback** host (ASVS 12.2.1, #200 / ADR 0153).
 
     A plaintext ``http://`` destination puts the PHI-bearing request body on the wire even with no
-    ``Authorization`` header, so an off-box http egress is decided by the instance posture: a
-    production-PHI hop REFUSES (escape inert — decision 2), a non-prod PHI hop refuses unless the clamped
-    escape downgrades it to a loud WARN (decision 5 floor keeps it strict otherwise), and an on-box
-    loopback / per-hop-attested / synthetic hop is allowed — so the default ``127.0.0.1`` posture stays
-    byte-identical. Complements :func:`refuse_cleartext_credentials`, which fires first (more specific)
+    ``Authorization`` header, so an off-box http egress is decided by the ONE authority: an enforcing hop
+    REFUSES, an on-box loopback / per-hop-attested hop is allowed — so the default ``127.0.0.1`` posture
+    stays byte-identical — and an ADR 0153 ``cleartext_accepted`` declaration crosses it with a loud,
+    audited WARN. Complements :func:`refuse_cleartext_credentials`, which fires first (more specific)
     when the connection also carries credentials.
 
-    Returns an :class:`InsecureHopGuard` when the cleartext hop was PERMITTED (a warned / attested off-box
-    egress) so the caller re-asserts it at send; ``None`` for a secure or loopback hop (no send guard
-    needed — the send stays byte-identical)."""
+    Returns an :class:`InsecureHopGuard` when the cleartext hop was PERMITTED (a warned / attested /
+    accepted off-box egress) so the caller re-asserts it at send; ``None`` for a secure or loopback hop
+    (no send guard needed — the send stays byte-identical)."""
     if scheme != "http":
         return None
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -433,23 +523,36 @@ def refuse_cleartext_egress(
         cell="HTTP cleartext egress",
         message=(f"delivers its payload over cleartext http to a non-loopback host ({host!r})"),
         attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     if is_loopback_hop_host(host):
         return None  # on-box loopback — not a network exposure, so no send-time guard
-    return InsecureHopGuard(posture=posture, attested=attested, cell="HTTP cleartext egress")
+    return InsecureHopGuard(
+        posture=posture,
+        attested=attested,
+        cell="HTTP cleartext egress",
+        cleartext_accepted=cleartext_accepted,
+    )
 
 
 def refuse_verify_off(
-    scheme: str, url: str, *, connector: str, attested: bool = False
+    scheme: str,
+    url: str,
+    *,
+    connector: str,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> InsecureHopGuard | None:
-    """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
+    """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (#200 / ADR 0153).
 
     Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop and is
-    decided exactly like cleartext egress: production-PHI REFUSES (escape inert), a non-prod PHI hop
-    refuses unless the clamped escape downgrades it to a loud WARN, an on-box loopback / attested /
-    synthetic hop is allowed. Only meaningful for ``https`` (an ``http`` url has no TLS to verify and is
-    handled by :func:`refuse_cleartext_egress`); returns ``None`` for a non-https scheme. Returns an
-    :class:`InsecureHopGuard` when the hop was permitted (a warned / attested off-box hop)."""
+    decided exactly like cleartext egress: an enforcing hop REFUSES, an on-box loopback / attested hop is
+    allowed, and a ``cleartext_accepted`` declaration crosses it with a loud, audited WARN. Only
+    meaningful for ``https`` (an ``http`` url has no TLS to verify and is handled by
+    :func:`refuse_cleartext_egress`); returns ``None`` for a non-https scheme. Returns an
+    :class:`InsecureHopGuard` when the hop was permitted (a warned / attested / accepted off-box hop)."""
     if scheme != "https":
         return None
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -459,10 +562,14 @@ def refuse_verify_off(
         cell=cell,
         message=f"disables TLS certificate verification for non-loopback host {host!r}",
         attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     if is_loopback_hop_host(host):
         return None
-    return InsecureHopGuard(posture=posture, attested=attested, cell=cell)
+    return InsecureHopGuard(
+        posture=posture, attested=attested, cell=cell, cleartext_accepted=cleartext_accepted
+    )
 
 
 def refuse_unrevoked_verified_hop(
@@ -636,6 +743,8 @@ def proxy_auth_handler_from_settings(
     proxy_scheme: str,
     dest_scheme: str,
     attested: bool,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
     """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
     recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
@@ -665,8 +774,16 @@ def proxy_auth_handler_from_settings(
         )
     # A proxy credential over a cleartext http proxy hop crosses in the clear on the CONNECT/request —
     # refuse it REGARDLESS of destination scheme, posture-keyed (ADR 0092). Names only the proxy host.
+    # ADR 0153: the proxy hop is a distinct crossing from the destination hop, but it belongs to the
+    # SAME connection, so it is governed by that connection's one declaration. Threaded explicitly (like
+    # `attested` beside it) rather than read off the settings mapping — one declaration, one source.
     refuse_cleartext_credential_hop(
-        proxy_scheme, proxy_url, credential="web-proxy credential", attested=attested
+        proxy_scheme,
+        proxy_url,
+        credential="web-proxy credential",
+        attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     kind = str(auth_type or "basic").strip().lower()
     if kind == "basic":
@@ -693,7 +810,12 @@ def proxy_auth_handler_from_settings(
 
 
 def proxy_config_from_settings(
-    s: Mapping[str, Any], *, dest_scheme: str, attested: bool = False
+    s: Mapping[str, Any],
+    *,
+    dest_scheme: str,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> ProxyConfig | None:
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
@@ -735,6 +857,8 @@ def proxy_config_from_settings(
         proxy_scheme=proxy_scheme,
         dest_scheme=dest_scheme,
         attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
     )
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
@@ -799,7 +923,12 @@ def ech_sidecar_url_from_settings(s: Mapping[str, Any]) -> str | None:
 
 
 def egress_route_from_settings(
-    s: Mapping[str, Any], *, dest_scheme: str, attested: bool = False
+    s: Mapping[str, Any],
+    *,
+    dest_scheme: str,
+    attested: bool = False,
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> ProxyConfig | None:
     """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
     (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is
@@ -813,7 +942,13 @@ def egress_route_from_settings(
             "build; on this connector it would NOT hide the SNI, so it is refused rather than silently "
             "leaking it (ADR 0139)"
         )
-    return proxy_config_from_settings(s, dest_scheme=dest_scheme, attested=attested)
+    return proxy_config_from_settings(
+        s,
+        dest_scheme=dest_scheme,
+        attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
+    )
 
 
 class RestDestination(DestinationConnector):
@@ -846,6 +981,9 @@ class RestDestination(DestinationConnector):
         self.consumes_metadata: bool = bool(s.get("dynamic_headers", False))
         # #200 (ADR 0092): the per-connection insecure-hop attestation, keying the posture-keyed refusal.
         attested = config.tls_hop_attested
+        # ADR 0153 decision 2: the OPPOSITE per-connection declaration — this hop is cleartext, is not
+        # secure, and that is accepted (WARN + audit, never a silent ALLOW).
+        accepted, accept_reason = config.cleartext_accepted, config.cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
         # ADR 0139 (ASVS 12.1.5): opt-in ECH SNI-hiding. When set, this connection re-addresses each
@@ -862,7 +1000,13 @@ class RestDestination(DestinationConnector):
         self._proxy: ProxyConfig | None = (
             None
             if self._ech_sidecar is not None
-            else egress_route_from_settings(s, dest_scheme=scheme, attested=attested)
+            else egress_route_from_settings(
+                s,
+                dest_scheme=scheme,
+                attested=attested,
+                cleartext_accepted=accepted,
+                cleartext_reason=accept_reason,
+            )
         )
         dest_host = urllib.parse.urlsplit(self.url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -873,10 +1017,23 @@ class RestDestination(DestinationConnector):
             # CONNECT tunnel for an https destination, sends it to the proxy for an http one (ADR 0126).
             self._headers.update(proxy_dest.auth_headers())
         enforce_outbound_length_limits(self.url, self._headers)
-        refuse_cleartext_credentials(scheme, self._headers, self.url, attested=attested)
+        refuse_cleartext_credentials(
+            scheme,
+            self._headers,
+            self.url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+        )
         # ASVS 12.2.1: even without an Authorization header the request body is PHI, so a cleartext
         # http egress to a non-loopback host is refused (loopback stays byte-identical). See rest.py.
-        self._hop_guard = refuse_cleartext_egress(scheme, self.url, attested=attested)
+        self._hop_guard = refuse_cleartext_egress(
+            scheme,
+            self.url,
+            attested=attested,
+            cleartext_accepted=accepted,
+            cleartext_reason=accept_reason,
+        )
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound body. None = off (byte-
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
         # dry-run/start), like a bad TLS cert; the per-request signature is minted in _post (off-loop).
@@ -896,7 +1053,12 @@ class RestDestination(DestinationConnector):
             # SMART access token never ships over cleartext http (the detached-JWS signature, by
             # contrast, is public-verifiable and needs no such guard).
             refuse_cleartext_credentials(
-                scheme, {**self._headers, "Authorization": "Bearer"}, self.url, attested=attested
+                scheme,
+                {**self._headers, "Authorization": "Bearer"},
+                self.url,
+                attested=attested,
+                cleartext_accepted=accepted,
+                cleartext_reason=accept_reason,
             )
         if bool(s.get("verify_tls", True)):
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
@@ -928,7 +1090,12 @@ class RestDestination(DestinationConnector):
             # posture (#200): production-PHI REFUSES (escape inert), a non-prod PHI hop refuses unless the
             # clamped escape / a per-hop attestation permits it. Loopback stays byte-identical.
             guard = refuse_verify_off(
-                scheme, self.url, connector="REST destination", attested=attested
+                scheme,
+                self.url,
+                connector="REST destination",
+                attested=attested,
+                cleartext_accepted=accepted,
+                cleartext_reason=accept_reason,
             )
             if guard is not None:
                 self._hop_guard = guard

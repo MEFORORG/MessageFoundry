@@ -246,6 +246,7 @@ from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
     WiringError,
+    accepted_cleartext_hops,
     load_config,
     redacted_settings,
 )
@@ -1481,9 +1482,22 @@ def create_app(
         # notice. security is the resolved SecuritySettings the serve path stashed (defaults on the
         # test/embedding path). No secret material — these are booleans/ints only.
         security = getattr(request.app.state, "security", None) or SecuritySettings()
+        # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
+        # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
+        auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
+        # ADR 0153: the ONE connection-scoped deviation. Read LIVE off the running graph (so a reload is
+        # reflected) — this route is where an operator learns a cleartext hop is being crossed by
+        # declaration, and a stale or absent list would understate the posture. An engine with no
+        # registry runner (an embedding/test) contributes nothing rather than guessing.
+        runner = engine.registry_runner
+        cleartext_hops = (
+            [name for name, _ in accepted_cleartext_hops(runner.registry)]
+            if runner is not None
+            else []
+        )
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
-            for name, risk in security_loosenings(security)
+            for name, risk in security_loosenings(security, store, auth_settings, cleartext_hops)
         ]
         synthetic_relaxation = (
             "strict PHI-only controls (at-rest-encryption refusal, deny-by-default egress, bounded "
@@ -1510,7 +1524,10 @@ def create_app(
                     "backend": backend,
                     "encryption_enabled": info.encrypts,
                     "key_source": store.key_provider,
-                    "loosenings": [name for name, _ in security_loosenings(security)],
+                    # Reuse the list computed above rather than recomputing it: a second call could
+                    # observe a different graph after a concurrent reload, and the audit row must record
+                    # exactly what the response reports.
+                    "loosenings": [entry.switch for entry in loosenings],
                 }
             ),
             client=client_ip(request),
@@ -5483,6 +5500,13 @@ def create_managed_app(
         reconciler: asyncio.Task[None] | None = None
         bootstrap_reminder: asyncio.Task[None] | None = None
         security_notifier = None
+        # Back the COMPLETE loosening list on GET /security/posture: [auth] carries posture switches
+        # (ad_session_recheck_seconds) that security_loosenings() must see. Stashed here, OUTSIDE the
+        # `enabled` guard below, deliberately — a settings object that exists but is disabled is still
+        # the resolved settings, and stashing it only on the enabled path would make the route silently
+        # fall back to AuthSettings() defaults and report a subset. Mirrors store_settings above.
+        if auth_settings is not None:
+            app.state.auth_settings = auth_settings
         if auth_settings is not None and auth_settings.enabled:
             # Out-of-band security-event push (#188, ASVS 6.3.5/6.3.7) — reuses the [alerts] SMTP
             # transport, sent to each affected user's own address. The notifier is wired only when the

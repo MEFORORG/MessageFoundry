@@ -152,6 +152,9 @@ def run_checks(
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
         ),
+        # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
+        # in review rather than discoverable only by reading each connection. Advisory — see the check.
+        _check_cleartext_accepted(config_dir),
     ]
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
@@ -1308,6 +1311,51 @@ def _check_build(
         ok=True,
         required=True,
         detail=f"connectors build against the {env_name or 'default'} posture",
+    )
+
+
+def _check_cleartext_accepted(
+    config_dir: str | Path,
+) -> CheckResult:
+    """Surface **the whole set** of outbound connections that declare ``cleartext_accepted`` (ADR 0153).
+
+    ADR 0153 accepts, and cannot prevent, an operator declaring the acceptance broadly enough to
+    approximate the blanket escape it removed. Its stated mitigations are that the declaration is
+    per-connection, that it warns and audits at every construction, and that **``check`` surfaces the
+    whole accepted set** — this is that surface. Advisory (``required=False``): a declared acceptance is
+    a legitimate, reasoned choice, not a config error, and blocking on it would push operators back
+    toward a false ``tls_hop_attested``. It exists so the set is *visible in review*, next to the hosts.
+
+    SKIPs when the graph will not load — ``validate`` reports that, and a check that silently reported
+    an empty accepted set on an unloadable config would be worse than one that says it could not look."""
+    from messagefoundry.config.wiring import WiringError, accepted_cleartext_hops, load_config
+
+    try:
+        registry = load_config(config_dir)
+    except (WiringError, OSError, ImportError, SyntaxError, ValueError) as exc:
+        return CheckResult(
+            "cleartext-accepted",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"config did not load: {exc}",
+        )
+    accepted = accepted_cleartext_hops(registry)
+    if not accepted:
+        return CheckResult(
+            "cleartext-accepted",
+            ok=True,
+            required=False,
+            detail="no outbound connection declares cleartext_accepted",
+        )
+    listed = "; ".join(f"{name} ({reason})" for name, reason in accepted)
+    return CheckResult(
+        "cleartext-accepted",
+        ok=True,
+        required=False,
+        detail=(
+            f"{len(accepted)} outbound connection(s) cross a cleartext hop by declaration — {listed}"
+        ),
     )
 
 

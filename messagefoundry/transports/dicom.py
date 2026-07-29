@@ -506,6 +506,11 @@ class DicomScuDestination(DestinationConnector):
                 description="plaintext DIMSE C-STORE association",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,
+                # ADR 0153: `cleartext_accepted` crosses this hop with a loud, audited WARN. Unlike
+                # Tcp()/X12() it is TRANSITIONAL here — DICOM() supports tls=true, so the declaration
+                # should end when the peer does.
+                cleartext_accepted=config.cleartext_accepted,
+                cleartext_reason=config.cleartext_reason,
             )
             if self._ssl is None
             else None

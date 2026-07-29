@@ -36,7 +36,6 @@ from hl7.containers import Component, Field, Repetition
 from messagefoundry.config.models import AckMode, ConnectorType, Destination, Source
 from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
-    hop_insecure_escape_downgrades,
     weakened_tls_escape_permitted_here,
 )
 from messagefoundry.config.tls_policy import (
@@ -46,6 +45,7 @@ from messagefoundry.config.tls_policy import (
     RevocationHopGuard,
     TrustAnchorPolicy,
     build_verifying_client_context,
+    cleartext_acceptance_audit_sink,
     current_hop_posture,
     enforce_insecure_hop,
     harden_kex_groups,
@@ -142,6 +142,11 @@ class InsecureHopGuard:
     attested: bool
     attested_reason: str | None
     posture: HopPosture | None
+    # ADR 0153 decision 2: the operator's declaration that THIS hop is cleartext, is not secure, and
+    # that is accepted. Distinct from `attested` above, which claims the opposite (the hop IS secure by
+    # means the engine cannot see) — never fuse the two, the audit trail exists to tell them apart.
+    cleartext_accepted: bool = False
+    cleartext_reason: str | None = None
 
     @classmethod
     def capture(
@@ -153,6 +158,8 @@ class InsecureHopGuard:
         description: str,
         attested: bool,
         attested_reason: str | None,
+        cleartext_accepted: bool = False,
+        cleartext_reason: str | None = None,
     ) -> InsecureHopGuard:
         """Snapshot the decision inputs + the active hop posture for a cleartext outbound hop. ``cell`` is
         a short PHI-free label of the crossing; ``description`` explains the hop (scheme only — never a
@@ -164,18 +171,20 @@ class InsecureHopGuard:
             description=description,
             attested=attested,
             attested_reason=attested_reason,
+            cleartext_accepted=cleartext_accepted,
+            cleartext_reason=cleartext_reason,
             posture=current_hop_posture(),
         )
 
     def _disposition(self, posture: HopPosture) -> HopDisposition:
         return insecure_hop_disposition(
-            is_phi=posture.is_phi,
             enforcing=posture.enforcing,
             is_loopback_hop=is_loopback_hop_host(self.host),
             hop_attested=self.attested,
-            # The global escape is CLAMPED to non-enforcing upstream (settings.hop_insecure_escape_
-            # downgrades), so under ENFORCE this is always False and can never satisfy an enforcing PHI hop.
-            audited_opt_out=hop_insecure_escape_downgrades(enforcing=posture.enforcing),
+            # ADR 0153: the data label is gone, and with it the blunt global MEFOR_ALLOW_INSECURE_TLS
+            # escape — a cleartext hop is now crossed only on-box, on an attestation, on a per-connection
+            # acceptance, or under a non-enforcing dial.
+            cleartext_accepted=self.cleartext_accepted,
         )
 
     def _detail(self) -> str:
@@ -183,19 +192,22 @@ class InsecureHopGuard:
 
     def enforce_construction(self) -> None:
         """The ENFORCED construction gate: raise
-        :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on a production-PHI cleartext hop,
-        loud-log (+ audit the attestation) on a warned hop, allow the rest. No-op when the posture is
-        unstamped (``None``) — the build_check gate is the authority; see the class docstring."""
+        :class:`~messagefoundry.config.tls_policy.InsecureHopRefused` on an unattested, unaccepted
+        enforcing cleartext hop, loud-log (+ audit the attestation / the acceptance) on a warned hop,
+        allow the rest. No-op when the posture is unstamped (``None``) — the build_check gate is the
+        authority; see the class docstring."""
         posture = self.posture
         if posture is None:
             return
         disposition = self._disposition(posture)
-        # Audit an attestation that SUPPRESSED a would-be production-PHI refusal (decision 3): the
-        # disposition is ALLOW only because `tls_hop_attested` fired before the production REFUSE arm.
+        # Audit an attestation that SUPPRESSED a would-be enforcing refusal (ADR 0092 decision 3): the
+        # disposition is ALLOW only because `tls_hop_attested` fired before the REFUSE arm. The
+        # `posture.is_phi` conjunct this branch used to carry went with ADR 0153 — the authority no
+        # longer reads the label, so gating the audit on it would silence the record for exactly the
+        # hops that newly depend on the attestation.
         if (
             disposition is HopDisposition.ALLOW
             and self.attested
-            and posture.is_phi
             and posture.enforcing
             and not is_loopback_hop_host(self.host)
         ):
@@ -205,7 +217,20 @@ class InsecureHopGuard:
                 self._detail(),
                 self.attested_reason or "(none provided)",
             )
-        enforce_insecure_hop(disposition, message=self._detail(), cell=self.cell)
+        enforce_insecure_hop(
+            disposition,
+            message=self._detail(),
+            cell=self.cell,
+            # ADR 0153 decision 2: an ACCEPTED cleartext hop is recorded at EVERY construction, not just
+            # warned — an accepted risk that stops being visible has stopped being accepted. Only wired
+            # when the acceptance is what produced the WARN, so a merely non-enforcing instance does not
+            # manufacture acceptance records for hops nobody declared.
+            audit_sink=(
+                cleartext_acceptance_audit_sink(self.cleartext_reason)
+                if disposition is HopDisposition.WARN and self.cleartext_accepted
+                else None
+            ),
+        )
 
     def assert_send(self) -> None:
         """Zero-I/O send-time backstop: re-assert the captured decision at the byte crossing (defense in
@@ -681,6 +706,10 @@ class MLLPDestination(DestinationConnector):
                 description="cleartext MLLP egress",
                 attested=config.tls_hop_attested,
                 attested_reason=config.tls_hop_attested_reason,
+                # ADR 0153: `cleartext_accepted` crosses this hop with a loud, audited WARN. TRANSITIONAL
+                # here — MLLP() supports tls=true, so the declaration should end when the peer does.
+                cleartext_accepted=config.cleartext_accepted,
+                cleartext_reason=config.cleartext_reason,
             )
             if self._ssl is None
             else None
