@@ -87,25 +87,48 @@ if ($Status) {
     }
     $pushInstalled = (Test-Path $prePush) -and ((Get-Content $prePush -Raw -EA SilentlyContinue) -match [regex]::Escape($pushMarker))
     Write-Host "pre-push   : $(if ($pushInstalled) { 'INSTALLED (push guard)' } elseif (Test-Path $prePush) { 'present, but NOT ours' } else { 'NOT INSTALLED' })"
-    # Report the worktree-aware patch explicitly. Unpatched is not cosmetic: the shim's INSTALL_PYTHON
-    # can point at a worktree that no longer exists (blocking every commit everywhere), and the
-    # `language: system` ruff/bandit hooks only resolve from an activated shell.
-    if ((Test-Path $preCommit) -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match 'MessageFoundry local patch \(worktree-aware toolchain\)')) {
-        Write-Host "  patch    : worktree-aware (resolves .venv + INSTALL_PYTHON from the CURRENT worktree)"
-    } elseif ($pcShim) {
-        Write-Host "  patch    : NOT APPLIED -- run this script to fix" -ForegroundColor Yellow
-        # (?m) so ^ anchors per LINE: Get-Content -Raw yields one string, and piping that to
-        # Select-String with a ^ anchor silently matches nothing -- the diagnostic would just vanish.
-        if ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match "(?m)^INSTALL_PYTHON='(.+)'\s*$") {
-            $pinnedPy = $Matches[1]
-            Write-Host "             INSTALL_PYTHON is hardcoded to $pinnedPy" -ForegroundColor Yellow
-            if (-not (Test-Path $pinnedPy)) {
-                Write-Host "             ^ THAT PATH DOES NOT EXIST -- commits are relying on the PATH fallback." -ForegroundColor Red
-            } else {
-                Write-Host "             If that checkout is ever removed, EVERY commit in EVERY worktree fails." -ForegroundColor Yellow
-            }
+    # Report WHERE the shim's interpreter points. This script does not (and must not) rewrite that file
+    # -- see the "DIAGNOSE, never write" note below -- so this is a diagnostic with a remedy, not a
+    # pending action. It matters because the path is baked in at `pre-commit install` time and can name
+    # a worktree that no longer exists, which fails every commit in every worktree at once.
+    #
+    # (?m) so ^ anchors per LINE: Get-Content -Raw yields ONE string, and piping that to Select-String
+    # with a ^ anchor silently matches nothing -- the diagnostic would just vanish (it did).
+    if ($pcShim -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match "(?m)^INSTALL_PYTHON='(.+)'\s*$")) {
+        $pinnedPy = $Matches[1]
+        # The PRIMARY checkout is the only non-disposable one: it owns the common git dir, so it cannot
+        # be `git worktree remove`d. Anything else -- a sibling clone-style worktree like
+        # MessageFoundry-ledger just as much as one under .claude/worktrees/ -- can vanish. Testing for
+        # a `.claude\worktrees\` path missed exactly that case, so derive the primary from $common
+        # instead of pattern-matching a layout convention.
+        $primaryRoot = (Split-Path -Parent $common)
+        # EXACT match against the primary's own venv, not a path-prefix test. Three traps, all hit while
+        # writing this:
+        #   * `"...\MessageFoundry-ledger\...".StartsWith("...\MessageFoundry")` is TRUE, so a bare
+        #     prefix test reports a SIBLING worktree as the primary.
+        #   * git returns the common dir with FORWARD slashes (C:/Users/...) while INSTALL_PYTHON uses
+        #     backslashes, so an un-normalised compare never matches at all.
+        #   * even a boundary-correct prefix test is wrong here: a worktree under
+        #     `<primary>\.claude\worktrees\<name>` is INSIDE the primary's path and is still removable.
+        #     Only the primary's own `.venv` is non-removable, so compare against exactly that.
+        $normPinned = [System.IO.Path]::GetFullPath($pinnedPy)
+        $primaryVenvPys = @(
+            (Join-Path $primaryRoot ".venv\Scripts\python.exe"),
+            (Join-Path $primaryRoot ".venv/bin/python")
+        ) | ForEach-Object { [System.IO.Path]::GetFullPath($_) }
+        if (-not (Test-Path $pinnedPy)) {
+            Write-Host "  interp   : $pinnedPy" -ForegroundColor Red
+            Write-Host "             ^ DOES NOT EXIST. Commits now depend on ``pre-commit`` being on PATH," -ForegroundColor Red
+            Write-Host "               and on a bare PATH it is not. Fix: run ``pre-commit install`` from" -ForegroundColor Red
+            Write-Host "               $primaryRoot" -ForegroundColor Red
+        } elseif ($primaryVenvPys -notcontains $normPinned) {
+            Write-Host "  interp   : $pinnedPy" -ForegroundColor Yellow
+            Write-Host "             ^ NOT the primary checkout, so that worktree is removable. If it goes," -ForegroundColor Yellow
+            Write-Host "               every commit in all $(@(& git -C $RepoRoot worktree list).Count) worktrees fails at once (it fails closed)." -ForegroundColor Yellow
+            Write-Host "               Re-anchor: run ``pre-commit install`` from $primaryRoot" -ForegroundColor Yellow
+        } else {
+            Write-Host "  interp   : $pinnedPy (primary checkout -- not removable)"
         }
-        Write-Host "             ruff/bandit are `language: system` -- they need the venv on PATH." -ForegroundColor Yellow
     }
     # A worktree whose ruff drifts off constraints.lock lints with a DIFFERENT linter than CI, and its
     # `ruff check --fix` hook rewrites files accordingly. Compare rather than assume.
@@ -224,106 +247,33 @@ exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
 
 [System.IO.File]::WriteAllText($prePush, $pushHook, (New-Object System.Text.UTF8Encoding $false))
 
-# --- make pre-commit's generated shim WORKTREE-AWARE ----------------------------------------------
-# pre-commit generates ONE .git/hooks/pre-commit, and because it lives in the common git dir every
-# worktree runs it. It is generated with two assumptions that a multi-worktree checkout breaks:
+# --- pre-commit's generated shim: DIAGNOSE, never write -------------------------------------------
+# This script deliberately does NOT touch .git/hooks/pre-commit. pre-commit owns that file alone, and
+# tests/test_ledger_check.py::test_the_installer_no_longer_writes_a_pre_commit_hook enforces it,
+# because two tools contending for it once blocked EVERY commit in the repo on Windows (see the
+# header). A patch here would also be futile: `pre-commit install` rewrites the file from its template,
+# so anything spliced in is erased the next time anyone runs it.
 #
-#   1. INSTALL_PYTHON is hardcoded to whichever checkout happened to run `pre-commit install` -- here it
-#      was MessageFoundry-ledger's .venv, a DISPOSABLE worktree. Remove that worktree and the fallback
-#      `command -v pre-commit` finds nothing on a bare PATH, so EVERY commit in EVERY worktree exits 1.
-#      Fails closed rather than open, but it blocks every session at once.
-#   2. The ruff/bandit hooks are `language: system` -- deliberately, so pre-commit can never disagree
-#      with the CI/dev ruff on a version (.pre-commit-config.yaml says so). But `language: system`
-#      resolves the entry from PATH, and PATH holds no venv unless the user activated one. Measured
-#      2026-07-29 from a bare PATH: `ruff` not found, so the ruff hooks fail. The symptom looks like a
-#      broken hook; the cause is an unactivated shell.
+# There are two real problems with the generated shim in a multi-worktree checkout. Both are REPORTED
+# by -Status and both have a supported remedy that needs no patching:
 #
-# Worse than either alone: a worktree whose .venv drifts off constraints.lock silently lints with a
-# DIFFERENT ruff than CI. That happened -- one worktree carried ruff 0.16.0 against pyproject's
-# `<0.16` cap (installed standalone, so nothing capped it), producing ~829 findings CI does not have,
-# and its `ruff check --fix` hook then STRIPPED `# noqa` directives the pinned ruff still wants.
+#   1. INSTALL_PYTHON is hardcoded to whichever checkout last ran `pre-commit install` -- here it was
+#      MessageFoundry-ledger's .venv, a DISPOSABLE worktree. Delete that worktree and the fallback
+#      `command -v pre-commit` finds nothing on a bare PATH, so every commit in every worktree exits 1.
+#      Fails closed, but blocks every session at once.
+#      REMEDY: run `pre-commit install` from the PRIMARY checkout, whose .venv is not disposable. That
+#      is pre-commit's own mechanism for repointing it -- no third-party edit to its file.
 #
-# So resolve both against the worktree being committed in. `language: system` then gets exactly what
-# that worktree's venv holds -- which is what the config always intended.
+#   2. ruff/bandit/ledger-gate/forbidden-content are `language: system` -- deliberately, so pre-commit
+#      cannot disagree with the CI/dev ruff on a version. But `language: system` resolves from PATH, so
+#      the hooks need a venv on PATH. Measured from a bare PATH: `ruff` not found.
+#      REMEDY: commit from a shell with the worktree's .venv activated (the documented workflow).
 #
-# Idempotent and marker-guarded: safe to re-run, and a no-op once applied. `pre-commit install`
-# regenerates the file from scratch and drops this, so re-run this script after doing that.
-$pcPatchMarker = "MessageFoundry local patch (worktree-aware toolchain)"
-$pcPatch = @'
-
-# --- MessageFoundry local patch (worktree-aware toolchain) ----------------------------------------
-# Injected by scripts/coord/install-git-hooks.ps1 -- see that script for the full rationale.
-# `pre-commit install` REGENERATES this file and removes this block; re-run the script afterwards.
-_mf_root="$(git rev-parse --show-toplevel 2>/dev/null)"
-if [ -n "$_mf_root" ]; then
-    # Put THIS worktree's venv first on PATH so `language: system` hooks (ruff, bandit) resolve to the
-    # same versions its tests and CI use, from any shell, activated or not.
-    for _mf_dir in "$_mf_root/.venv/Scripts" "$_mf_root/.venv/bin"; do
-        if [ -d "$_mf_dir" ]; then
-            # POSIX-ify: a bare `C:/...` entry in a colon-separated PATH is ambiguous. cygpath ships
-            # with Git for Windows; if it is somehow missing, skip rather than corrupt PATH.
-            if command -v cygpath >/dev/null 2>&1; then
-                _mf_dir="$(cygpath -u "$_mf_dir")"
-            fi
-            case ":$PATH:" in
-                *":$_mf_dir:"*) ;;
-                *) PATH="$_mf_dir:$PATH"; export PATH ;;
-            esac
-            break
-        fi
-    done
-    # Run pre-commit itself from this worktree's interpreter when it has one, so the framework is never
-    # tied to a worktree that can be deleted. The templated value above stays as the last resort.
-    for _mf_py in "$_mf_root/.venv/Scripts/python.exe" "$_mf_root/.venv/bin/python"; do
-        if [ -x "$_mf_py" ]; then
-            INSTALL_PYTHON="$_mf_py"
-            break
-        fi
-    done
-fi
-# --- end MessageFoundry local patch ---------------------------------------------------------------
-'@ -replace "`r`n", "`n"
-
-$pcIsFramework = (Test-Path $preCommit) -and ((Get-Content $preCommit -Raw -EA SilentlyContinue) -match 'File generated by pre-commit')
-if (-not $pcIsFramework) {
-    # Never fabricate the file: without pre-commit's own shim there is nothing to patch, and the loud
-    # "LEDGER GATE IS NOT ARMED" warning below is the correct signal.
-    Write-Host "pre-commit shim absent -- skipping the worktree-aware patch (nothing to patch)." -ForegroundColor Yellow
-} else {
-    $pcBody = Get-Content $preCommit -Raw
-    if ($pcBody -match [regex]::Escape($pcPatchMarker)) {
-        Write-Host "pre-commit shim already worktree-aware (patch present) -- unchanged." -ForegroundColor DarkGray
-    } elseif ($pcBody -notmatch '# end templated') {
-        # Anchor missing => pre-commit changed its template. Refuse rather than guess at an insertion
-        # point: a patch spliced into the wrong place could break every commit in every worktree.
-        Write-Host "!! pre-commit's shim has no '# end templated' anchor -- NOT patching." -ForegroundColor Red
-        Write-Host "   Its template changed. Re-check scripts/coord/install-git-hooks.ps1 against the" -ForegroundColor Red
-        Write-Host "   generated file before relying on worktree-aware tool resolution." -ForegroundColor Red
-    } else {
-        # Insert immediately after the templated block, so INSTALL_PYTHON is overridden after pre-commit
-        # sets it but before the exec that uses it.
-        #
-        # String.Replace, NOT -replace. In .NET regex replacement `$_` means THE ENTIRE INPUT STRING,
-        # and this patch contains `$_mf_dir` / `$_mf_py` / `$_mf_root` -- so `-replace` spliced the whole
-        # hook file into itself at each one (measured: 681 bytes -> 9556, with `PATH="#!/bin/sh...`
-        # written into the middle of the PATH assignment). A corrupted pre-commit hook breaks commits in
-        # all worktrees at once, so this is a literal replace with no substitution semantics.
-        $anchor = "# end templated"
-        $anchorCount = ([regex]::Matches($pcBody, [regex]::Escape($anchor))).Count
-        if ($anchorCount -ne 1) {
-            Write-Host "!! found $anchorCount '$anchor' anchors (expected 1) -- NOT patching." -ForegroundColor Red
-            return
-        }
-        $patched = $pcBody.Replace($anchor, $anchor + $pcPatch)
-        if ($patched -eq $pcBody) {
-            Write-Host "!! could not splice the worktree-aware patch -- pre-commit shim left UNCHANGED." -ForegroundColor Red
-        } else {
-            Copy-Item -LiteralPath $preCommit -Destination "$preCommit.prepatch" -Force
-            [System.IO.File]::WriteAllText($preCommit, ($patched -replace "`r`n", "`n"), (New-Object System.Text.UTF8Encoding $false))
-            Write-Host "pre-commit shim PATCHED to be worktree-aware (backup: pre-commit.prepatch)." -ForegroundColor Green
-        }
-    }
-}
+# The sharper half of (2) is version drift, not absence, and -Status checks it: a worktree whose ruff
+# disagrees with constraints.lock lints with a DIFFERENT linter than CI *and* its `ruff check --fix`
+# hook rewrites files to match. Measured 2026-07-29: one worktree carried ruff 0.16.0 against
+# pyproject's `<0.16` cap (installed standalone, so nothing capped it), producing ~829 findings CI does
+# not have, and stripping `# noqa` directives the pinned 0.15.22 still wants.
 
 # Git for Windows does not need the exec bit, but a WSL/Linux checkout of the same repo would.
 if ($IsLinux -or $IsMacOS) { & chmod +x $commitMsg; & chmod +x $prePush }
