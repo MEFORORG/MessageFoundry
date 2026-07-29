@@ -102,7 +102,7 @@ deliberate — replace `<version>` with the current release shown at the top of 
 needs (each is opt-in and lazy-imported):
 
 ```bash
-pip install -e packaging/messagefoundry-webconsole   # the browser web console (/ui) — the operator UI; most operators want this (source tree: not on PyPI yet)
+pip install "messagefoundry-webconsole==<version>"   # the browser web console (/ui) — the operator UI; most operators want this
 pip install "messagefoundry[postgres]==<version>"    # PostgreSQL store backend (production server DB)
 pip install "messagefoundry[sqlserver]==<version>"   # SQL Server store backend (+ OS-level ODBC Driver 18)
 pip install "messagefoundry[sftp]==<version>"        # SFTP transport for the REMOTEFILE connector
