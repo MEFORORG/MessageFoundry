@@ -4,9 +4,13 @@
 
 from __future__ import annotations
 
+import re
+import time
+
 import pytest
 
 from messagefoundry.api.multipart import (
+    _DISPOSITION_PARAM,
     MultipartError,
     MultipartTooLargeError,
     parse_boundary,
@@ -78,3 +82,53 @@ def test_no_file_part_rejected() -> None:
         parse_single_file_upload(
             f"multipart/form-data; boundary={_B}", _body([part]), max_file_bytes=1024
         )
+
+
+# --- ReDoS guard on the Content-Disposition parameter regex (CodeQL py/polynomial-redos) ---------
+
+#: The pre-guard pattern. Kept here so the equivalence test proves the ``(?<!\w)`` guard is a pure
+#: performance change; if the production regex ever drifts, this test is what catches the semantic gap.
+_LEGACY_DISPOSITION_PARAM = re.compile(r'(\w+)="([^"]*)"')
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        'Content-Disposition: form-data; name="file"; filename="acme.hl7"',
+        'Content-Disposition:form-data;name="a";filename="b.txt"',
+        'Content-Disposition: form-data; filename="a;b=c.txt"; name="f"',
+        'Content-Disposition: form-data; name=""',
+        'Content-Disposition: form-data; foo*name="x"',
+        'Content-Disposition: form-data; name="x" name="y"',
+        'Content-Disposition: form-data; 9name="d"; _n="e"',
+        'Content-Disposition: form-data; name = "spaced"',
+        'name="a"filename="b"',
+        "Content-Disposition: form-data",
+    ],
+)
+def test_disposition_param_regex_matches_legacy_semantics(line: str) -> None:
+    """The ``(?<!\\w)`` ReDoS guard must not change which parameters are extracted."""
+    assert _DISPOSITION_PARAM.findall(line) == _LEGACY_DISPOSITION_PARAM.findall(line)
+
+
+def test_hostile_disposition_header_parses_in_linear_time() -> None:
+    """A Content-Disposition line of many word chars and no ``="`` must not blow up quadratically.
+
+    The header block is attacker-supplied and bounded only by ``[store].max_upload_bytes`` (25 MiB
+    default), and ``parse_single_file_upload`` runs synchronously on the asyncio event loop — so a
+    quadratic scan here is a whole-engine denial of service, not a slow request. Assert the growth
+    ratio rather than a wall-clock budget so the test is not flaky on a loaded CI runner: quadratic
+    scaling multiplies by ~16 when the input quadruples; linear scaling stays near ~4.
+    """
+
+    def elapsed(n: int) -> float:
+        line = "content-disposition: " + "a" * n
+        start = time.perf_counter()
+        _DISPOSITION_PARAM.findall(line)
+        return time.perf_counter() - start
+
+    base_n = 20_000
+    elapsed(base_n)  # warm the regex cache / JIT-free interpreter paths
+    small = max(elapsed(base_n), 1e-6)
+    large = elapsed(base_n * 4)
+    assert large / small < 8.0, f"scaling looks super-linear: {small=} {large=}"
