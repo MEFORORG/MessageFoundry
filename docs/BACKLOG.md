@@ -374,7 +374,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 The shipping configuration (SQLite/server-DB, single uvicorn worker, **localhost bind + required auth**)
 carries no open network exposure. The gaps below are **by design and tracked** — full context in
 [`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md) (the gates + the *Security posture* subsection),
-[`security/CISO-REVIEW.md`](security/CISO-REVIEW.md) (30-risk register), and the ASVS-L2 assessment.
+`security/CISO-REVIEW.md` (30-risk register), and the ASVS-L2 assessment.
 
 **Known gaps (by design):**
 - **MFA is built but off by default** — native RFC 6238 TOTP for local accounts (WP-14, #336/#338), enabled
@@ -412,8 +412,8 @@ carries no open network exposure. The gaps below are **by design and tracked** �
   built or documented-residual.** 6.3.3 MFA, 8.4.2 admin defense, and 16.4.3 off-box logs closed earlier;
   the last three (4.1.5, 12.1.4, 13.3.3) are **now built controls with documented residuals (4.1.5 #378,
   12.1.4 #376, 13.3.3 #377)** — each a *conditional* Pass, not an unqualified one. Per
-  [`security/ASVS-L3-ASSESSMENT.md`](security/ASVS-L3-ASSESSMENT.md) +
-  [`security/ASVS-L3-REMEDIATION-PLAN.md`](security/ASVS-L3-REMEDIATION-PLAN.md):
+  `security/ASVS-L3-ASSESSMENT.md` +
+  `security/ASVS-L3-REMEDIATION-PLAN.md`:
   - *Off-loopback-conditional* (build at off-loopback exposure, ADR 0002):
     - **8.4.2 — multi-layer administrative-interface defense.** ✅ **BUILT (WP-L3-13, #342):** admin routes
       now layer MFA step-up (WP-14) **+** a new-client-IP contextual-risk signal that forces step-up **+**
@@ -4148,7 +4148,7 @@ policy) — this decides whether the WP-15 reverse-proxy posture works untouched
 CBT-off knob. (b) If enforcement is possible and wanted: an opt-in `tls-server-end-point` binding for
 the **in-process-TLS** termination mode only (behind a TLS-terminating proxy EPA is structurally
 broken — the browser hashed the proxy's certificate — so it must never be silently enforced there;
-see [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md)). Also fold in the other two
+see OFF-LOOPBACK-DEPLOYMENT.md). Also fold in the other two
 recorded SSO open items when a lab DC exists: a domain-joined end-to-end smoke of `GET /ui/sso`
 (mock-seam coverage proves the HTTP state machine, not SSPI/keytab/browser reality) and the
 mutual-auth `out_token` browser-behavior question.
@@ -4329,20 +4329,20 @@ flipped [ADR 0032](adr/0032-console-desktop-launch.md) to RETIRED.
 **Type:** architecture / feature (large) — collapse the two operator UIs to one, keeping the
 browser `/ui` console ([#75](#75-browser--web-operator-monitor)) as the sole operator client.
 
-**What:** retire the PySide6 desktop console ([`console/`](../messagefoundry/console/)) once the
+**What:** retire the PySide6 desktop console (`console/`) once the
 browser ops console reaches operator parity. The earlier "impossible" verdict rested on two
 blockers; the owner has now waived the first (moving harness code is acceptable), leaving three
 concrete moves:
-- Extract the **Qt-free** HTTP API client [`console/client.py`](../messagefoundry/console/client.py)
+- Extract the **Qt-free** HTTP API client `console/client.py`
   (`EngineClient` / `ApiError` — verified zero Qt imports) into a shared home (e.g.
   `messagefoundry/apiclient/`); the harness ([`harness/monitor.py`](../harness/monitor.py),
   `scenarios.py`, `load/…`) and any other consumer import it there.
 - Rehome the shared Qt widgets the harness reuses
-  ([`console/widgets.py`](../messagefoundry/console/widgets.py) `ConfigurableTable` /
-  `MessagesPanel` / `MessageDetailPanel`, [`console/login.py`](../messagefoundry/console/login.py)
+  (`console/widgets.py` `ConfigurableTable` /
+  `MessagesPanel` / `MessageDetailPanel`, `console/login.py`
   `LoginDialog`) into `harness/` (already a PySide6 app).
 - Move the one browser-impossible capability — **local Windows service control**
-  ([`console/service_control.py`](../messagefoundry/console/service_control.py): `sc query` state +
+  (`console/service_control.py`: `sc query` state +
   elevated `net start/stop`/install; a browser can't UAC-elevate and can't stop the very engine
   hosting its own API) — to the CLI (`messagefoundry service install|start|stop|status`, wrapping
   the existing [`scripts/service/`](../scripts/service/) NSSM scripts) or a tiny standalone
@@ -6042,7 +6042,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build (indexed below). **Severity:** n/a (index).
 
-**Scope:** Umbrella item for the 2026-07-09 independent re-score of the engine against **OWASP ASVS 5.0.0 Level 3** ([`security/ASVS-L3-ASSESSMENT-2026-07-09.md`](security/ASVS-L3-ASSESSMENT-2026-07-09.md)). Owns no findings itself; items **#186–#205** below partition all 67 open cells, each exactly once.
+**Scope:** Umbrella item for the 2026-07-09 independent re-score of the engine against **OWASP ASVS 5.0.0 Level 3** (`security/ASVS-L3-ASSESSMENT-2026-07-09.md`). Owns no findings itself; items **#186–#205** below partition all 67 open cells, each exactly once.
 
 **Why:** The prior assessment reported **214 Pass / 0 Partial / 0 Fail / 131 N/A** by introducing a "conditional Pass" — a verdict ASVS does not define — which absorbed every off-by-default, operator-activated and deployment-delegated control, plus one control that does not exist at all (15.2.5, the runtime sandbox). Scored strictly, the shipped default posture is:
 
@@ -6057,7 +6057,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Coverage rule:** every Partial and every Fail in either posture is owned by exactly one of #186–#205. A finding with no owning item is a bug in this index.
 
-**Source:** [`security/ASVS-L3-ASSESSMENT-2026-07-09.md`](security/ASVS-L3-ASSESSMENT-2026-07-09.md) §6 (findings table + the four remediation classes). Supersedes the scoring in [`security/ASVS-L3-ASSESSMENT.md`](security/ASVS-L3-ASSESSMENT.md).
+**Source:** `security/ASVS-L3-ASSESSMENT-2026-07-09.md` §6 (findings table + the four remediation classes). Supersedes the scoring in `security/ASVS-L3-ASSESSMENT.md`.
 
 ---
 
@@ -6145,7 +6145,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 191. SMART/OAuth outbound: exercise the built path, or scope it out
 
-> ✅ **SHIPPED 2026-07-11 (PR #926) — exercised + scoped out.** The SMART/OAuth outbound path is driven end-to-end by `tests/test_smart_backend.py::test_asvs_191_smart_oauth_controls_exercised` (alg-allowlist/no-'None', `aud` binding, no-token-leak, scope-**absence** when unset, `private_key_jwt` with no shared secret) — proving the code is correct. Per the owner decision the five ASVS cells (9.1.2/9.2.4/10.1.1/10.2.3/10.4.10) are recorded **N/A in both assessed postures** (scope-out) rather than folded into the documented deployment; they re-score to Pass the moment a SMART outbound is configured. Scorecard counts reconciled (Posture A 179/46/5/115; B 189/52/10/94); disposition documented in [`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) §1d.
+> ✅ **SHIPPED 2026-07-11 (PR #926) — exercised + scoped out.** The SMART/OAuth outbound path is driven end-to-end by `tests/test_smart_backend.py::test_asvs_191_smart_oauth_controls_exercised` (alg-allowlist/no-'None', `aud` binding, no-token-leak, scope-**absence** when unset, `private_key_jwt` with no shared secret) — proving the code is correct. Per the owner decision the five ASVS cells (9.1.2/9.2.4/10.1.1/10.2.3/10.4.10) are recorded **N/A in both assessed postures** (scope-out) rather than folded into the documented deployment; they re-score to Pass the moment a SMART outbound is configured. Scorecard counts reconciled (Posture A 179/46/5/115; B 189/52/10/94); disposition documented in `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md` §1d.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** owner decision. **Severity:** low.
 
@@ -6259,7 +6259,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 198. In-use memory protection: zeroization, mlock, and the unwrapped-DEK residual
 
-> ✅ **CLOSED 2026-07-13 — code-partial + documented deployment-requirement risk-acceptance (owner partial-accept, NOT a full technical close).** The honest disposition of an item that pure-Python cannot fully close: **(1) code-feasible half BUILT** — best-effort `mlock`/`VirtualLock` + `memset`-zeroize of **every** key/plaintext buffer the cipher owns as a *mutable* `bytearray` (the unwrapped DEK, retired decrypt-only keys, and the `encrypt`/`decrypt` plaintext buffers) landed in `store/crypto.py` (`_install_key`/`_secure_zero`/`_lock_memory`), fail-safe (a lock/wipe failure degrades, never raises or corrupts) and `mfenc:v1` byte-identical; a full-path zeroize-verification test pins every owned secret buffer ends all-zero (`tests/test_store_encryption.py`). **No additional code-owned mutable buffer remains to wipe** — the residual copies are CPython-**immutable** `str`/`bytes` (caller plaintext, the returned ciphertext-only marker, `cryptography`'s `decrypt()` output, the transient `bytes(dek)` constructor copies) + OpenSSL's internal `EVP` key copy, all unreachable to scrub. **(2) 13.3.3 = best-effort partial + accepted residual; 11.7.2 = active on a keyed instance (already true); 11.7.1 (full in-use memory *encryption*) = ACCEPTED as a stated DEPLOYMENT REQUIREMENT** (disabled/encrypted swap, restricted local admin, confidential-compute host where memory forensics is in scope — [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist), [SECURITY.md](SECURITY.md) "In-use memory protection") with a signed risk-acceptance ([ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5). The ASVS scorecard verdicts (13.3.3 Fail / 11.7.1 Fail / 11.7.2 Partial) are **unchanged** — an accepted risk stays an unmet requirement; what changed is that the gap is owned, dated, and scheduled for review. _Re-scored 2026-07-10 → P2 (Value 6 · Difficulty 6, big bet; ASVS 5.0 L3 re-score, PR #854)._
+> ✅ **CLOSED 2026-07-13 — code-partial + documented deployment-requirement risk-acceptance (owner partial-accept, NOT a full technical close).** The honest disposition of an item that pure-Python cannot fully close: **(1) code-feasible half BUILT** — best-effort `mlock`/`VirtualLock` + `memset`-zeroize of **every** key/plaintext buffer the cipher owns as a *mutable* `bytearray` (the unwrapped DEK, retired decrypt-only keys, and the `encrypt`/`decrypt` plaintext buffers) landed in `store/crypto.py` (`_install_key`/`_secure_zero`/`_lock_memory`), fail-safe (a lock/wipe failure degrades, never raises or corrupts) and `mfenc:v1` byte-identical; a full-path zeroize-verification test pins every owned secret buffer ends all-zero (`tests/test_store_encryption.py`). **No additional code-owned mutable buffer remains to wipe** — the residual copies are CPython-**immutable** `str`/`bytes` (caller plaintext, the returned ciphertext-only marker, `cryptography`'s `decrypt()` output, the transient `bytes(dek)` constructor copies) + OpenSSL's internal `EVP` key copy, all unreachable to scrub. **(2) 13.3.3 = best-effort partial + accepted residual; 11.7.2 = active on a keyed instance (already true); 11.7.1 (full in-use memory *encryption*) = ACCEPTED as a stated DEPLOYMENT REQUIREMENT** (disabled/encrypted swap, restricted local admin, confidential-compute host where memory forensics is in scope — [PHI.md §10](PHI.md#10-secure-deployment--operations-checklist), [SECURITY.md](SECURITY.md) "In-use memory protection") with a signed risk-acceptance (ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5). The ASVS scorecard verdicts (13.3.3 Fail / 11.7.1 Fail / 11.7.2 Partial) are **unchanged** — an accepted risk stays an unmet requirement; what changed is that the gap is owned, dated, and scheduled for review. _Re-scored 2026-07-10 → P2 (Value 6 · Difficulty 6, big bet; ASVS 5.0 L3 re-score, PR #854)._
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** owner decision — **partial-accept (code-partial + documented deployment-requirement risk-acceptance)**. **Severity:** medium.
 
@@ -6375,7 +6375,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 205. Documented risk acceptances (ASVS L3 residuals)
 
-> ✅ **SHIPPED 2026-07-11 (PR #924).** The risk-acceptance register is drafted at [`docs/security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md): every residual ASVS L3 Partial/Fail/N-A grouped by theme with reason, compensating controls, and a re-score trigger, plus per-theme sign-off blocks. Acceptance does **not** change scorecard status (residuals stay Partial/Fail); the **owner signature** is the one remaining act (placeholders provided). Companion to the assessment + remediation plan.
+> ✅ **SHIPPED 2026-07-11 (PR #924).** The risk-acceptance register is drafted at `docs/security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`: every residual ASVS L3 Partial/Fail/N-A grouped by theme with reason, compensating controls, and a re-score trigger, plus per-theme sign-off blocks. Acceptance does **not** change scorecard status (residuals stay Partial/Fail); the **owner signature** is the one remaining act (placeholders provided). Companion to the assessment + remediation plan.
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** accept + sign off. **Severity:** low.
 

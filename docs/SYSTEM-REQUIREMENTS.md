@@ -2,13 +2,17 @@
 
 These are the minimum and recommended requirements for running the MessageFoundry (MEFOR)
 engine, its message store, and the administration clients. The engine is a headless
-Python/asyncio service; the console is a separate desktop application.
+Python/asyncio service; the operator console is a browser page served by the engine itself at `/ui`.
 
-> **On the throughput figures.** MEFOR does **not** ship a validated, published per-node
-> throughput baseline. The sizing tiers in [Sizing by message volume](#sizing-by-message-volume)
-> are **engineering estimates** derived from the architecture and from the synthetic load-test
-> profiles in [`harness/load/`](../harness/load/) — they are starting points, not guarantees.
-> Always establish your own baseline on production-like hardware before go-live
+> **On the throughput figures.** MEFOR **does** publish a measured per-node throughput baseline:
+> [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md) is **canonical** for every measured
+> figure, with [THROUGHPUT.md](THROUGHPUT.md) as the plain-language guide to reading it. What it
+> publishes is a reproducible **method** plus numbers stamped "as measured on the reference config" —
+> not a headline capacity number, because the durable-write path makes throughput hardware-dependent.
+> The sizing tiers in [Sizing by message volume](#sizing-by-message-volume) are **engineering
+> estimates** derived from the architecture and from the synthetic load-test profiles in
+> [`harness/load/`](../harness/load/) — they project, they do not measure, and they are not
+> guarantees. Always establish your own baseline on production-like hardware before go-live
 > (see [LOAD-TESTING.md](LOAD-TESTING.md) and [§ Capacity notes](#capacity-notes)).
 
 ---
@@ -53,7 +57,7 @@ only the host can. On a host that does not provide it:
   declaration fatal with `[security].require_memory_encryption_declaration = true` (default `false`).
   Loopback and synthetic instances are unaffected and silent. See
   [CONFIGURATION.md](CONFIGURATION.md) `[security]` and
-  [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md).
+  OFF-LOOPBACK-DEPLOYMENT.md.
 
 **What the engine does and does not tell you.** `GET /security/posture` carries a **report-only**
 platform read-out (`memory_encryption_self_reported_capability` / `..._self_reported_active` /
@@ -88,9 +92,9 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 |---|---|
 | **Windows Server 2022 / 2025** | ✅ Primary supported & serviced platform (Windows-service deployment via NSSM) |
 | Windows Server 2019 | ✅ Supported |
-| Windows 10 / 11 | ✅ Supported (development, pilot, console host) |
+| Windows 10 / 11 | ✅ Supported (development, pilot, test-harness host) |
 | **Linux** (modern x86-64 distributions) | ✅ Engine supported (cross-platform Python); no bundled service installer — run under systemd yourself |
-| macOS | ⚠️ Development / console use only |
+| macOS | ⚠️ Development / test-harness use only |
 
 ## Runtime
 
@@ -118,9 +122,9 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 
 | Client | Requirement |
 |---|---|
-| **Desktop console** | PySide6 (Qt) desktop application — install with the `console` extra. Runs on Windows, Linux, or macOS as a separate process; connects to the engine over the localhost HTTP/WebSocket API. **Not browser-based.** |
+| **Web console** (the operator UI) | A modern browser — **nothing to install on the operator's machine.** The engine serves the console same-origin under `/ui` from its own FastAPI app ([ADR 0065](adr/0065-web-ops-dashboard.md)), **on by default** since [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (`[security].serve_web_console`; set it to `false` for a JSON-API-only deployment). It ships as a separately-versioned wheel, `messagefoundry-webconsole`, mounted in-process. This is the **sole operator console** — the PySide6 desktop console was retired ([ADR 0032](adr/0032-console-desktop-launch.md)). |
 | **VS Code extension** | Visual Studio Code (current stable) — route wizard, validate-on-save, test bench, stage→promote. |
-| Web browser | Not required to operate the engine. A modern browser is needed only for the **opt-in read-only ops dashboard** served under `/ui` (`[api].serve_ui`, off by default — [ADR 0065](adr/0065-web-ops-dashboard.md)); the JSON API otherwise serves tooling. |
+| Test harness — *optional, not needed to run the engine* | The standalone synthetic send/receive/load harness (`python -m harness`) is the **only** PySide6 (Qt) surface left: `pip install messagefoundry[harness]`, Windows / Linux / macOS, a separate process reaching the engine only over the HTTP API. It is a **testing tool** — an engine host that does not run it needs no Qt and no GUI at all. |
 
 ## Network & ports
 
@@ -139,6 +143,12 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 > behavior; they are not committed numbers. Throughput depends heavily on **transform cost per
 > message** (the dominant factor), message size, fan-out, and strict-validation use. **Measure your
 > own feeds** with the load harness before committing (see [Capacity notes](#capacity-notes)).
+>
+> The **measured** figures — and the exact conditions they were measured under — live in
+> [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md) (canonical) and
+> [THROUGHPUT.md](THROUGHPUT.md); the measured anchors are restated under *Reading the tiers* below. The
+> **two upper tiers project above every rate measured so far**, so no tier row may be quoted as a
+> demonstrated capability.
 
 ### How throughput is bounded (read this first)
 
@@ -202,21 +212,36 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 - *Peak sustained* is a **per-second** capacity estimate. Healthcare feeds are bursty; real **average**
   rate (and therefore daily volume) is typically a fraction of peak, so the *indicative daily volume*
   columns assume a realistic duty cycle, not `peak × 86,400`.
-- The **single-stream / single-core ceiling** is roughly the "High single-node" row — a few hundred
-  msg/s with real transforms, approaching ~1000 msg/s only for light/pass-through work. Past that on one
-  feed you are over one core's budget.
-- The **estimated maximum as currently architected** is the **"High single-node, concurrent"** row: one
-  engine process, many connections / lanes draining the shared server DB concurrently via `SKIP LOCKED`,
-  bounded by the database's commit ceiling. There is no fixed published cap — on a well-provisioned box
-  with a tuned server DB this lands in the **low thousands of msg/s**, beyond which you are
-  **database-bound** and scale the DB tier. (A multi-process, sharded-by-inbound scale-out beyond one
-  engine is a **future direction, not built** — the active-active lane-ownership it would have needed was
-  dropped and its code removed, 2026-06-18.) Group-commit and a lazy MSH-only routing peek are identified
-  0.2 levers to raise the per-core ceiling ([THROUGHPUT-IMPROVEMENTS.md](THROUGHPUT-IMPROVEMENTS.md)).
+- The **single-stream / single-core ceiling is the part that has actually been measured**, and it sits far
+  below the upper tiers: **~60 msg/s end-to-end** for one strictly-ordered interface against an
+  *instant-acknowledging* partner, versus **~450 msg/s at intake** (ACK-on-receipt) — i.e. **~16 ms** of
+  engine overhead per message ([THROUGHPUT.md](THROUGHPUT.md) §8). On the published reference config the
+  sustainable single-node rates were **≥ 70 msg/s (SQLite) · ~50 (PostgreSQL) · ~30 (SQL Server)**, all
+  conformance-clean, on a 4-vCPU runner with the database co-located
+  ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Results). The ~1000 msg/s pass-through figure
+  quoted above is a **vendor's** self-benchmark, not a MEFOR measurement.
+- The **maximum as currently architected** is the **"High single-node, concurrent"** row: one engine
+  process, many connections / lanes draining the shared server DB concurrently via `SKIP LOCKED`,
+  bounded by the database's commit ceiling. **No measured run supports that row's "low thousands of
+  msg/s" — it is a projection, and must never be quoted as a demonstrated figure.** Nor do per-interface
+  ceilings **add**: a measured 16-lane run delivered **87/s in aggregate — 5.44/s per lane** — where
+  summing the per-lane ceilings would have predicted ~960/s, an **~11× over-report**
+  ([THROUGHPUT.md](THROUGHPUT.md) §7). Always take `min(measured concurrent aggregate, Σ per-interface)`.
+- To go past one engine, use the **built** multi-process **engine-shard** scale-out (`messagefoundry
+  supervise`, above), whose measured result is **~linear scaling: η ≈ 0.85** — 1 → 2 → 4 shards at ~50 →
+  88.7 → 165.5 msg/s aggregate ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Multi-process
+  sharding scale-out). That run used **per-shard SQLite on a consumer 8-core test box**, so the portable
+  result is the **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate.
+  Group-commit and the wider "reduce committed transactions per event" lever are **closed, not pending** —
+  group-commit was withdrawn ([ADR 0055](adr/0055-group-commit-durable-write.md)) and the pre-registered
+  measurement returned ABANDON at an elasticity of −0.115
+  ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)), so do not size
+  on a future per-core lever.
 
 > **Single-stream server-DB caveat.** Because each staged handoff is a committed round-trip, a single
-> delivery worker against a *remote* server DB drains far slower than in-process SQLite (the SQL Server
-> CI smoke profile observes ~30 deliveries/s for one stream). High volume on a server DB comes from
+> delivery worker against a server DB drains far slower than in-process SQLite (the published baseline
+> measures **~30 msg/s sustainable on SQL Server** vs **≥ 70 on SQLite** for one stream —
+> [TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Results). High volume on a server DB comes from
 > **concurrency** — many connections / lanes / processes draining in parallel — not single-stream speed.
 > Size the DB host for that concurrent commit load.
 
@@ -230,8 +255,11 @@ multi-engine deployments as **active-passive** (one active writer per store) for
   SQL Server when that becomes the bottleneck.
 - Scale **intra-node** on a server DB (one delivery worker per outbound; many connections / lanes
   draining concurrently via `SKIP LOCKED`; keep retry policies finite where head-of-line blocking on a
-  shared FIFO lane would otherwise stall a lane). A multi-process scale-out beyond one engine is a
-  **future direction, not built** (the active-active lane-ownership it would need was dropped + removed,
-  2026-06-18). Engine **HA** is **active-passive failover** (opt-in leader/standby cluster on shared
-  PostgreSQL — see [CLUSTERING.md](CLUSTERING.md)); delegate **DB-tier** HA to the database + a
-  load-balancer VIP.
+  shared FIFO lane would otherwise stall a lane). A multi-process **engine-shard** scale-out beyond one
+  engine **is built** (`messagefoundry supervise` — [ADR 0037](adr/0037-multi-process-sharding-l3.md),
+  [ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md),
+  [ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md)); it needs a server DB so all
+  shards share one unified store, and it is **not yet certified as a production topology** — see
+  [Sizing by message volume](#sizing-by-message-volume). Engine **HA** is **active-passive failover**
+  (opt-in leader/standby cluster on shared PostgreSQL — see [CLUSTERING.md](CLUSTERING.md)); delegate
+  **DB-tier** HA to the database + a load-balancer VIP.

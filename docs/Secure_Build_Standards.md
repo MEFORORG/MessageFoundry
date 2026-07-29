@@ -1,20 +1,20 @@
 # Secure Build Standards — An Evidence-Based Rubric for Judging Whether a Build Is Actually Secure
 
-*Companion to the [Secure Development Standards](Secure_Development_Standards.md) (SDS), the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) (the AI-build companion), and the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the sibling outcome rubric). The SDS says what a secure build must satisfy. The AI companion says how to build it with an AI assistant. Code Quality judges whether the code is good. This document is the fourth leg: it defines how to judge whether a build is actually secure rather than security theater, using signals the evidence supports. Each project records its graded result in a separate scorecard — see the [MessageFoundry Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md) for the reference implementation.*
+*Companion to the Secure Development Standards (SDS), the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) (the AI-build companion), and the [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the sibling outcome rubric). The SDS says what a secure build must satisfy. The AI companion says how to build it with an AI assistant. Code Quality judges whether the code is good. This document is the fourth leg: it defines how to judge whether a build is actually secure rather than security theater, using signals the evidence supports. Each project records its graded result in a separate scorecard — see the [MessageFoundry Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md) for the reference implementation.*
 
-> **Scope boundary — read this first.** This is a measurement rubric, not the security standard itself. The standard is the [SDS](Secure_Development_Standards.md). This rubric does not re-derive any per-requirement finding. It grades on top of a project's existing security evidence base — its ASVS assessment, conformance review, threat model, and risk-acceptance register — which remain the single source of truth. A scorecard built from this rubric cites those; it does not re-adjudicate them or fork a second scorecard. Its value-add is a layer none of them carry: an evidence-graded, anti-scoreboard, composite letter grade. That grade separates a genuinely secure build from a well-instrumented one that only looks secure, the way [Code Quality](Code_Quality_Standards.md) sits on top of the SDS.
+> **Scope boundary — read this first.** This is a measurement rubric, not the security standard itself. The standard is the SDS. This rubric does not re-derive any per-requirement finding. It grades on top of a project's existing security evidence base — its ASVS assessment, conformance review, threat model, and risk-acceptance register — which remain the single source of truth. A scorecard built from this rubric cites those; it does not re-adjudicate them or fork a second scorecard. Its value-add is a layer none of them carry: an evidence-graded, anti-scoreboard, composite letter grade. That grade separates a genuinely secure build from a well-instrumented one that only looks secure, the way [Code Quality](Code_Quality_Standards.md) sits on top of the SDS.
 
 | | |
 |---|---|
 | **Document** | Secure Build Standards — Evidence-Based Rubric |
-| **Applies to** | Any project developed under the [SDS](Secure_Development_Standards.md). Each project records its graded result in its own scorecard; MessageFoundry (MEFOR) is the reference implementation ([Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md)). |
+| **Applies to** | Any project developed under the SDS. Each project records its graded result in its own scorecard; MessageFoundry (MEFOR) is the reference implementation ([Secure Build Scorecard](Secure_Build_Scorecard_MEFOR.md)). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local security owner. |
 | **Status** | Draft for review |
 | **Version** | 0.5 |
 | **Date** | July 14, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the evidence base behind the rubric (new metric studies, a new framework version, a change to the enforcement model). |
-| **Aligns to** | NIST SP 800-218 (SSDF) producer practices · SP 800-115 (technical security testing) · SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Companion to the [SDS](Secure_Development_Standards.md), the [AI-build companion](Secure_AI_Development_Standards.md), and [Code Quality](Code_Quality_Standards.md). Confers no certification — NIST and OWASP issue no certificate, and a self-assessment is not one. |
+| **Aligns to** | NIST SP 800-218 (SSDF) producer practices · SP 800-115 (technical security testing) · SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Companion to the SDS, the [AI-build companion](Secure_AI_Development_Standards.md), and [Code Quality](Code_Quality_Standards.md). Confers no certification — NIST and OWASP issue no certificate, and a self-assessment is not one. |
 
 ---
 
@@ -36,7 +36,7 @@ This standard answers one question: is a build actually secure, or is it securit
 
 It serves three audiences. Maintainers get a standing rubric to re-run each release, so the posture is re-graded rather than assumed to hold. Adopters and auditors get evidence that a build is judged against consensus frameworks and its own conformance record, not a badge. Future projects inherit the rubric and add their own scorecard.
 
-**This is a rubric, not a re-derivation.** It sits on top of the [SDS](Secure_Development_Standards.md) (the requirement spine) and on each project's own security evidence base — its conformance review and its ASVS assessment with a risk-acceptance register. Those documents remain the single source of truth for per-requirement verdicts. A scorecard built from this rubric cites them and does not restate them. Its value-add is the same layer [Code Quality](Code_Quality_Standards.md) adds on the SDS for the quality outcome: an evidence-graded, anti-scoreboard, composite letter grade for the security outcome. The SDS governs the process. The [AI companion](Secure_AI_Development_Standards.md) governs how the build is done with an AI assistant. This rubric governs whether the resulting build is actually defended, and whether the claims about that defense are honest.
+**This is a rubric, not a re-derivation.** It sits on top of the SDS (the requirement spine) and on each project's own security evidence base — its conformance review and its ASVS assessment with a risk-acceptance register. Those documents remain the single source of truth for per-requirement verdicts. A scorecard built from this rubric cites them and does not restate them. Its value-add is the same layer [Code Quality](Code_Quality_Standards.md) adds on the SDS for the quality outcome: an evidence-graded, anti-scoreboard, composite letter grade for the security outcome. The SDS governs the process. The [AI companion](Secure_AI_Development_Standards.md) governs how the build is done with an AI assistant. This rubric governs whether the resulting build is actually defended, and whether the claims about that defense are honest.
 
 **The lens is composite defense over scoreboards.** A single security number invites optimization of the number. A scanner count, an ASVS percent-pass, a green CI run, or a self-issued "L3 verified" each collapses a multi-dimensional posture into one gameable figure. So the verdict is composite and structural. It explicitly forbids grading security on any one row (§4.1). This mirrors the SDS discipline of writing deterministic checks and never asking the model to be secure. Here: grade the composite of enforced controls and verified claims, and never trust a scoreboard.
 
@@ -90,7 +90,7 @@ Each failure mode maps to a numbered signal in [§4](#4-the-rubric--the-12-signa
 
 ## 4. The rubric — the 12 signals that separate a secure build from security theater
 
-Each signal is a risk, a control, and a measure. It is tagged by gate type and by the document that owns it. Gate types: deterministic (machine-checked, red-on-regression), advisory (a human arbitrates the finding), and process (an exercised program, not a file). A scorecard built from this rubric only checks that a control is present and honestly claimed. It cites the [SDS](Secure_Development_Standards.md) and the project's conformance and ASVS evidence for per-requirement verdicts rather than re-deriving them.
+Each signal is a risk, a control, and a measure. It is tagged by gate type and by the document that owns it. Gate types: deterministic (machine-checked, red-on-regression), advisory (a human arbitrates the finding), and process (an exercised program, not a file). A scorecard built from this rubric only checks that a control is present and honestly claimed. It cites the SDS and the project's conformance and ASVS evidence for per-requirement verdicts rather than re-deriving them.
 
 The signals fall into two layers, and the split is the whole point.
 
@@ -142,7 +142,7 @@ The composite letter grade a project records is therefore project-set and direct
 
 ## 5. Placement (local vs CI)
 
-Every signal is owned by the [SDS](Secure_Development_Standards.md), the [AI-build companion](Secure_AI_Development_Standards.md), or a project's ASVS assessment. A scorecard records where each control actually fires across a project's enforcement points. Most projects have three: a **pre-commit hook** (local, fast feedback), a **local + CI check command**, and **CI** (the authoritative gate) — the same three the AI companion and the [Code Quality rubric §5](Code_Quality_Standards.md) name.
+Every signal is owned by the SDS, the [AI-build companion](Secure_AI_Development_Standards.md), or a project's ASVS assessment. A scorecard records where each control actually fires across a project's enforcement points. Most projects have three: a **pre-commit hook** (local, fast feedback), a **local + CI check command**, and **CI** (the authoritative gate) — the same three the AI companion and the [Code Quality rubric §5](Code_Quality_Standards.md) name.
 
 Two distinctions keep a placement table honest.
 
@@ -206,7 +206,7 @@ Two things are new here. Signal 11 is the claims-register and single-verdict-of-
 - OWASP ASVS v5.0.0 (May 2025), Level 3 — the application/API verification standard a project's assessment is scoped to.
 
 **The parent standards this rubric mirrors and extends:**
-- [**Secure Development Standards**](Secure_Development_Standards.md) — the requirement spine (§4 SSDF, §5 spec-driven, §6 testing + ASVS L3, §7 controls/HIPAA + §7.4 interface auth, §9 evidence).
+- **Secure Development Standards** — the requirement spine (§4 SSDF, §5 spec-driven, §6 testing + ASVS L3, §7 controls/HIPAA + §7.4 interface auth, §9 evidence).
 - [**Secure AI-Assisted Development Standards**](Secure_AI_Development_Standards.md) — the AI-build companion (blocking gates §6.4, supply-chain integrity, evidence honesty §8).
 - [**Code Quality & Anti-Slop Standards**](Code_Quality_Standards.md) — the sibling outcome rubric whose structure and voice this document mirrors.
 

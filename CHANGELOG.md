@@ -111,7 +111,7 @@ without being able to fail.
   property that no operator can satisfy on Windows (where the platform read-out is always `null`) — the
   same scoping rule as `[security].allowed_client_networks`' companion refusal (ADR 0151). Loopback and
   synthetic instances are byte-identical. See
-  [OFF-LOOPBACK-DEPLOYMENT.md](docs/security/OFF-LOOPBACK-DEPLOYMENT.md) ladder row 12 and
+  OFF-LOOPBACK-DEPLOYMENT.md ladder row 12 and
   [SYSTEM-REQUIREMENTS.md](docs/SYSTEM-REQUIREMENTS.md).
 - **Report-only platform memory-encryption read-out on `GET /security/posture`** (ADR 0152 rung 1;
   `ENGINE_UI_SEAM` 12 → 13) — `memory_encryption_self_reported_capability` / `..._self_reported_active` /
@@ -961,12 +961,12 @@ cipher becomes crypto-agile — all additive, with the on-disk `mfenc:v1` format
 ### Security
 - **Dependency fast-response program** — a KEV→EPSS→CVSS triage policy with a **≤72h fast lane** for
   actively-exploited dependency CVEs ([`.github/SECURITY.md`](.github/SECURITY.md),
-  [`docs/security/DEP-CVE-RUNBOOK.md`](docs/security/DEP-CVE-RUNBOOK.md)); a **daily** SCA cron;
+  `docs/security/DEP-CVE-RUNBOOK.md`); a **daily** SCA cron;
   Dependabot moved to the native `uv` ecosystem with **automatic hashed-lock re-export**; **scoped
   auto-merge** of safe patches with a **supply-chain cooldown**; weekly **RV.2 metrics**
-  ([`docs/security/DEPENDENCY-METRICS.md`](docs/security/DEPENDENCY-METRICS.md)); and an adopter
+  (`docs/security/DEPENDENCY-METRICS.md`); and an adopter
   remediation SLA + advisory process ([`docs/SUPPORT-POLICY.md`](docs/SUPPORT-POLICY.md),
-  [`docs/security/ADVISORY-PROCESS.md`](docs/security/ADVISORY-PROCESS.md)).
+  `docs/security/ADVISORY-PROCESS.md`).
 - **Adopter "vulnerable pin" tripwire** — `messagefoundry init`'s scaffolded CI gains an `audit-pin` job
   that reds an adopter's build when their pinned engine or its dependencies have a known published
   advisory ([`docs/ADOPTER-CI.md`](docs/ADOPTER-CI.md)).

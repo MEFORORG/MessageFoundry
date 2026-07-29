@@ -31,7 +31,7 @@ is open.
 | The engine vendor (MEFOR) does | The adopter org does |
 |---|---|
 | Fast-response on dependency + own-code CVEs ([`SECURITY.md`](../.github/SECURITY.md) SLA) | Adopt security releases within the SLA above |
-| Publish the fix + an advisory ([`security/ADVISORY-PROCESS.md`](security/ADVISORY-PROCESS.md)) | Watch the advisory channel / keep `audit-pin` green |
+| Publish the fix + an advisory (`security/ADVISORY-PROCESS.md`) | Watch the advisory channel / keep `audit-pin` green |
 | Sign + attest release artifacts (SLSA / PEP 740) | Verify provenance on install (`verify-engine`) |
 | Ship secure **defaults** (127.0.0.1 bind, auth required, deny-by-default egress) | Operate securely: config-dir ACLs, secrets, TLS posture, deployment |
 

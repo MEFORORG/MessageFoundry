@@ -10,6 +10,24 @@ parallelism, method, coordination. Created 2026-06-30; REVISED 2026-06-30 (conne
 connection-scale revision**, which this table implements). This is the **execution layer**: order,
 parallelism, method, coordination.
 
+> ## ⛔ SUPERSEDED IN ONE RESPECT (2026-07-29) — the commit/`txn/event` items here are CLOSED
+>
+> **[ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (2026-07-13) closed
+> Phase 4: transaction reduction is a MEASURED dead end.** A pre-registered falsifier cut committed transactions
+> per message **28.5%** (10.47 → 7.49) and moved sustained throughput **−0.56%** — inside the null band — and its
+> arm E bounded the coupling at an elasticity of **−0.115** (*"No transaction-reduction mechanism — fusion,
+> group-commit, or any other — can close a 5.79× gap"*). **Do not build F2 or F3.** **B1** below is the shipped
+> instance ([ADR 0057](adr/0057-inline-step-a-fast-path.md)): it is **⛔ DO NOT PROMOTE**, stays default-OFF
+> permanently (`inline: bool = False`, [`config/wiring.py:2452`](../messagefoundry/config/wiring.py)), and **no
+> throughput claim may be made for it** — the "aggregate-commit lever" note on its row is retained as the
+> reasoning of the time, not as a measured effect. **B9** (Postgres `commit_delay` / group-commit) is
+> **⛔ DECLINED** ([BACKLOG #217](BACKLOG.md)).
+>
+> The rest of this plan — the connection-scale items, the claim-storm program, and the engine-side per-message CPU
+> frontier — is **unaffected** and is left exactly as written. Measured throughput lives in
+> [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md); 45M/day remains a **target**
+> ([ADR 0052](adr/0052-enterprise-scale-target.md)), never a demonstrated capability.
+
 ## 2026-07-02 (later) — WS-C RESULT: the connection-scale claim storm (a THIRD wall) + the fix program
 
 The 1,500-lane campaign found the wall that binds at CONNECTION scale regardless of volume: the
@@ -158,7 +176,7 @@ re-profile on the production platform before final box sizing; (c) a clean 4-eng
 | **B6** | shared **ingest sub-pool** / writer path | ⬜ TODO | B11/B13 | Give pre-ACK intake its own commit path so ACK-on-receipt latency doesn't queue behind the worker-claim + idle-poll storm. **Shared sub-pool carved from B13's pool — NOT per-listener** (1,500 dedicated conns is infeasible). |
 | **B14** | per-listener accept-cap default | ⬜ TODO | B11 | `DEFAULT_MAX_CONNECTIONS=256` × 1,500 listeners = 384k socket ceiling. Lower the default (most HL7 partners hold 1–4), keep the per-connection override. |
 | **B10** | rename-based FIFO index migration | ✅ **DONE** (ADR 0060, #676) | B3 | renames to `ix_queue_fifo_*_seq` + idempotent on-open DROP-old/CREATE-new on all 3 backends, so B3's cut lands on **upgraded** DBs. |
-| **B9** | Postgres `commit_delay` (group-commit) | ⏸ DEFERRED | B8 | only meaningful once B8 shows durable-write-bound AND the store presents concurrent in-flight txns (see the single-writer-vs-pool open question). |
+| **B9** | Postgres `commit_delay` (group-commit) | ⛔ **DECLINED** (was ⏸ DEFERRED) | — | ~~only meaningful once B8 shows durable-write-bound AND the store presents concurrent in-flight txns~~ — B8/ADR 0069 showed the commit tier is **~9% utilised**, ADR 0099 withdrew ADR 0055, and ADR 0107 measured the whole `txn/event` class flat (elasticity **−0.115**). Dead by measurement three times over ([BACKLOG #217](BACKLOG.md)). Still unbuilt in code — `commit_delay` is described as a planned PG-only increment at `config/settings.py:281-284`. |
 | **T8** | backend-parametric test/measurement | ⬜ TODO | — | run every connection-scale + commit result across SQLite/SQL Server/Postgres. |
 
 ## Execution sequence
@@ -174,7 +192,7 @@ GATE:     the 1500-SHAPE test (see the 2026-07-02 block above) -> the real per-b
           Sizes B5/B6/B14 AND the ownership-scoped-recovery decision.
 THEN:     engine per-message CPU decomposition -> pick the top lever (B5 executor split / ADR 0053
           free-threading / hot-path cuts)  ->  B5  ->  B6 ingest sub-pool  ->  B14 accept-cap
-LATER:    B9 (only if a de-confounded run shows durable-write-bound) ; T8 backend-parametric
+LATER:    B9 -> DECLINED (group-commit measured dead: ADR 0069/0099/0107) ; T8 backend-parametric
 RELIABILITY-AT-SCALE (fold into the above): ownership-scoped reset_stale_inflight (PREREQUISITE for any
           N-active engines on one store; = scoped-reset + the ADR 0063 single-consumer-per-outbound-lane
           primitive — a reliability-core A+B build, NOT a one-file patch; see the "Scope correction" above)

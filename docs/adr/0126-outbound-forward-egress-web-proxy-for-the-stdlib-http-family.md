@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-17
-- **Related:** [ADR 0003](0003-payload-agnostic-ingress.md) (stdlib-only HTTP transport) · [ADR 0024](0024-smart-backend-services-token-provider.md) (SMART token provider) · [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) (posture-keyed insecure-hop refusal) · CLAUDE.md §2 (one-way deps), §9 (PHI) · BACKLOG #112 (address / "Use Default Web Proxy") · #127 (credential types) · #128 (intranet bypass)
+- **Related:** [ADR 0003](0003-non-hl7-transports-database-rest-soap.md) (stdlib-only HTTP transport) · [ADR 0024](0024-smart-backend-services-token-provider.md) (SMART token provider) · [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) (posture-keyed insecure-hop refusal) · CLAUDE.md §2 (one-way deps), §9 (PHI) · BACKLOG #112 (address / "Use Default Web Proxy") · #127 (credential types) · #128 (intranet bypass)
 
 ---
 

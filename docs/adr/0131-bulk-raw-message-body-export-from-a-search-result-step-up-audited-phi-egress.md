@@ -8,9 +8,9 @@
   (`can_access_channel`), and a pre-stream `messages_export` audit counting every selected body. New
   `MESSAGES_EXPORT` permission in [`auth/permissions.py`](../../messagefoundry/auth/permissions.py)
   (OPERATOR + administrator). `app.js` save-selected / save-all with a progress readout + stop control.
-- **Related:** [ADR 0046](0046-message-content-search-scan-and-decrypt.md) (the `/messages/search` +
+- **Related:** [ADR 0046](0046-message-content-search.md) (the `/messages/search` +
   `search_messages` this reuses for selection), [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
-  (the PHI-read hop guard), [ADR 0090](0090-message-resend-edit-resubmit.md) (the `messages:view_raw`
+  (the PHI-read hop guard), [ADR 0090](0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) (the `messages:view_raw`
   PHI gate this rides), the `/audit/export` streaming route it mirrors, BACKLOG #124. Companion:
   [ADR 0130](0130-runtime-ephemeral-log-verbosity-control-and-phi-redacted-log-tail-viewer.md) (S7b #171).
 

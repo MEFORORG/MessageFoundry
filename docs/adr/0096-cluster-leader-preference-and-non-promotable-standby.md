@@ -2,7 +2,7 @@
 
 - **Status:** Accepted  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-12
-- **Related:** [ADR 0048](0048-third-tier-dr-standby-priority-runprofile.md) · [CLAUDE.md §2 "Reliability invariant"] · BACKLOG #101 · builds on the self-fencing leadership lease (Workstream A2, `pipeline/cluster.py` / `pipeline/cluster_sqlserver.py`)
+- **Related:** [ADR 0048](0048-third-tier-disaster-recovery-standby.md) · [CLAUDE.md §2 "Reliability invariant"] · BACKLOG #101 · builds on the self-fencing leadership lease (Workstream A2, `pipeline/cluster.py` / `pipeline/cluster_sqlserver.py`)
 
 ---
 

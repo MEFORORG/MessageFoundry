@@ -5,6 +5,24 @@ store-once (L2b) have **shipped**; the Corepoint-anchored path-to-parity is now 
 + no-rewrite decision recorded in [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md) and tracked
 as [BACKLOG #64](BACKLOG.md).*
 
+> ## ⛔ SUPERSEDED IN ONE RESPECT (2026-07-29) — the group-commit lever this note recommends is CLOSED
+>
+> **[ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (2026-07-13) closed
+> Phase 4: `txn/event` reduction is a MEASURED dead end.** A pre-registered falsifier cut committed transactions
+> per message **28.5%** (10.47 → 7.49) and moved sustained throughput **−0.56%** — inside the null band — and its
+> arm E bounded the coupling at an elasticity of **−0.115**. In the ADR's own words: *"No transaction-reduction
+> mechanism — fusion, group-commit, or any other — can close a 5.79× gap."* The shipped instance,
+> [ADR 0057](adr/0057-inline-step-a-fast-path.md) inline stage-fusion, is **⛔ DO NOT PROMOTE** and stays
+> default-OFF permanently (`inline: bool = False`,
+> [`config/wiring.py:2452`](../messagefoundry/config/wiring.py)).
+>
+> So **§2's "the database lever we *should* pull", §4 step 2 and §5 step 2 are stale as a plan** — group-commit is
+> **⛔ DECLINED** ([BACKLOG #217](BACKLOG.md)), dead across ADR 0069 (the commit tier is ~9% utilised) → ADR 0099
+> (which withdrew ADR 0055) → ADR 0107. Everything else here — the two axes, the core/transform axis, sharding —
+> is unaffected and is left exactly as written: it is the record of the reasoning at the time. Measured throughput
+> lives in [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md); 45M/day remains a **target**
+> ([ADR 0052](adr/0052-enterprise-scale-target.md)), never a demonstrated capability.
+
 How to make MessageFoundry faster, grounded in the current code and in our own
 [throughput research](marketing/throughput-research-2026-06-13.md) (local/private) and
 [load-testing harness](LOAD-TESTING.md). This is an engineering note, not a committed plan — the
@@ -135,8 +153,9 @@ peek. High payoff, but only after confirming parsing is the bottleneck.
 
 1. **Measure** with the load harness (`cheap`/`edit`/`slow`; SQLite vs server DB) to confirm the binding
    axis per representative feed — now anchored to the **Corepoint target** (§5).
-2. **Group-commit** (§2) — the single-node durable-write win; the **#1 unbuilt lever**; stays on existing
-   backends. Lands under its **own ADR** when built (it touches the most invariant-dense code).
+2. ~~**Group-commit** (§2) — the single-node durable-write win; the **#1 unbuilt lever**; stays on existing
+   backends. Lands under its **own ADR** when built (it touches the most invariant-dense code).~~
+   **⛔ CLOSED 2026-07-13 — do not build it** (ADR 0107 / [BACKLOG #217](BACKLOG.md); see the banner).
 3. **Lean-writes / carriage** — VARBINARY ciphertext ([#62](BACKLOG.md)), the `message_events` verbosity
    knob ([#63](BACKLOG.md)), embedded-doc pruning ([#47](BACKLOG.md) / ADR 0042), retention
    ([#34](BACKLOG.md)).
@@ -183,7 +202,8 @@ against Rhapsody *marketing*, not this spec):
    **Windows Server 2025 + SQL Server 2025 box** ([#40](BACKLOG.md)) via the load harness
    ([#28](BACKLOG.md)/[#29](BACKLOG.md)) — against the **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target.
    Pins `E_core` and the binding axis. **Nothing builds before it.**
-2. **Group-commit** (§2) — *iff* durable-write-bound. Its own ADR.
+2. ~~**Group-commit** (§2) — *iff* durable-write-bound. Its own ADR.~~ **⛔ CLOSED (ADR 0107); the
+   measurement it was gated on ran and the lever is a measured dead end.**
 3. **Lean-writes / carriage** — the [#62](BACKLOG.md)/[#63](BACKLOG.md)/[#47](BACKLOG.md)/[#34](BACKLOG.md)
    cluster.
 4. **Multi-DB log split** — shared-server backend only.

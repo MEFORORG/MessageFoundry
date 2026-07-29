@@ -1,6 +1,6 @@
 # MessageFoundry — A Mental Model of the Project
 
-*Open-source healthcare integration engine · Python · v0.1.0 (Early Access) · prepared 2026-06-18*
+*Open-source healthcare integration engine · Python · v0.3.2 · prepared 2026-06-18, revised 2026-07-29*
 
 This document is an orientation map, not a manual. It builds the **mental model** you need to reason about MessageFoundry: what it is, the four building blocks, how a message flows, the invariants you must not break, and where everything lives. Read it top to bottom once; afterwards the codebase and CLAUDE.md will make sense.
 
@@ -169,7 +169,7 @@ The point of splitting routing from transform: a slow or failing transform can *
 
 > **At-least-once, broker-free:** The transactional staged queue (SQLite in WAL mode, or PostgreSQL / SQL Server) gives at-least-once delivery, retries, replay, and dead-lettering WITHOUT a separate message broker. The inbound is ACKed only after the raw message is durably committed to the ingress stage (ACK-on-receipt). Every stage handoff (ingress→routed, routed→outbound) is a single committed transaction: claim → produce next-stage rows → complete this stage. A crash before commit rolls back and re-runs; each handoff is idempotent — meaning safe to repeat: re-running it lands the same result with no extra effect.
 >
-> **Therefore — purity is mandatory:** Because a re-run must re-derive identical output, Routers and Transforms MUST be pure (message in → message out, no external side effects), and outbound connections must be idempotent. The one sanctioned exception (ADR 0010): a Handler may make a live, read-only db_lookup(connection, statement, params) for enrichment/gating — its result may differ per pass, accepted by design. It runs off the event loop, is gated by \[egress\].allowed_db, and is unavailable to a Router or in dry-run.
+> **Therefore — purity is mandatory:** Because a re-run must re-derive identical output, Routers and Transforms MUST be pure (message in → message out, no external side effects), and outbound connections must be idempotent. The sanctioned exception is a Handler making a live, **read-only** lookup for enrichment/gating — either db_lookup(connection, statement, params) against a database (ADR 0010, gated by \[egress\].allowed_db) or fhir_lookup(connection, query) against a FHIR API (ADR 0043, gated by \[egress\].allowed_http, GET-only). Its result may differ per pass, accepted by design. Both run off the event loop and are unavailable to a Router or in dry-run (they raise).
 
 ### “At-least-once” does not mean routine duplicates
 
@@ -266,7 +266,7 @@ The standalone PySide6 **test harness** is the deliberate exception. It’s a se
 
 This engine carries PHI, so security is built, not bolted on:
 
-- **Auth + RBAC** — local + AD (LDAP/Kerberos) users, fixed built-in roles, deny-by-default per-route permissions, opaque sessions, native TOTP MFA for local accounts, full audit (auth/, api/, docs/SECURITY.md).
+- **Auth + RBAC** — local + AD (LDAP/Kerberos) users, built-in roles (plus custom roles, ADR 0045), deny-by-default per-route permissions, opaque sessions, native TOTP MFA **and** browser WebAuthn passkeys (ADR 0068, the \[webauthn\] extra) for local accounts, full audit (auth/, api/, docs/SECURITY.md).
 
 - **Encryption-at-rest** — message bodies are AES-256-GCM encrypted in the store.
 
@@ -308,7 +308,7 @@ This engine carries PHI, so security is built, not bolted on:
 | ide/ | VS Code extension (TypeScript): setup, promote, test bench, AI commands. |
 | samples/ | Example Connection/Router/Handler modules + send_mllp.py sender. |
 | harness/ | Standalone PySide6 send/receive + load-test harness (PHI-free synthetic traffic). |
-| docs/ | ARCHITECTURE.md, ADRs (0001–0021), SECURITY.md, PHI.md, CONNECTIONS.md, and more. |
+| docs/ | ARCHITECTURE.md, ADRs (0001–0153), SECURITY.md, PHI.md, CONNECTIONS.md, and more. |
 
 ## 12. System requirements
 
@@ -340,7 +340,7 @@ Keep the message store on a fast *local* disk, not a network share — the stage
 
 ## 13. Deployment & operations
 
-- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.1.0"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
+- **Install:** the supported production artifact is the signed, version-pinned PyPI wheel (pip install "messagefoundry==0.3.2"); then messagefoundry init scaffolds your own config repo (ADR 0017). Extras are opt-in: \[postgres\], \[sqlserver\], \[harness\] (the PySide6 test harness), \[sftp\], \[fhir\], \[dicom\], \[webauthn\], \[otel\]. The `/ui` web console installs alongside as the separate `messagefoundry-webconsole` distribution, published to PyPI on its own `webconsole-v*` cadence.
 
 - **Run headless:** python -m messagefoundry serve --config samples/config --db ./messagefoundry.db --env dev — API on http://127.0.0.1:8765 (GET /connections, /messages, /stats, WS /ws/stats).
 
@@ -446,7 +446,7 @@ The runtime needs about a dozen packages; everything past the core is an **opt-i
 | **Group** | **Packages** | **What for** |
 |----|----|----|
 | **Core runtime** | hl7apy, python-hl7, pydantic, aiosqlite, fastapi, uvicorn, argon2-cffi, cryptography, ldap3, pyspnego, tomlkit, tzdata | HL7 validate/parse, config models, the SQLite store, the API, password hashing + AES-256-GCM PHI-at-rest, AD/Kerberos auth, TOML writing, tz data. Always installed. |
-| \[harness\] | PySide6, httpx, truststore | The standalone PySide6 test harness GUI + its HTTP client to the engine API. (Was `[console]` before the desktop console was retired — BACKLOG #103.) |
+| \[harness\] | PySide6 | The standalone PySide6 test harness GUI. (Was `[console]` before the desktop console was retired — BACKLOG #103; its HTTP client, httpx + truststore, moved to the core runtime.) |
 | \[postgres\] | asyncpg | PostgreSQL store backend (no OS dependency; ships compiled wheels). |
 | \[sqlserver\] | aioodbc *+ OS ODBC Driver 18* | SQL Server store backend (the ODBC driver installs at the OS level, not via pip). |
 | \[sftp\] | paramiko | SFTP transport for the REMOTEFILE connector (FTP/FTPS use the stdlib). |
@@ -483,12 +483,12 @@ Dependencies are declared in two tiers. pyproject.toml states loose \>= minimums
 | **Stage** | ingress → routed → outbound — the three persisted queue stages. |
 | **Disposition** | A message's status: RECEIVED / ROUTED / UNROUTED / PROCESSED / FILTERED / ERROR. |
 | **Connector** | A pluggable transport implementation in transports/ (MLLP, file, …). |
-| **db_lookup** | The one sanctioned non-pure input: a Handler's live, read-only DB read (ADR 0010). |
+| **db_lookup / fhir_lookup** | The sanctioned non-pure inputs: a Handler's live, read-only DB read (ADR 0010) or FHIR read/search (ADR 0043). |
 | **“channel” / “route”** | Fine as casual prose for a wired path; there is NO built channel/route element. |
 | **Idempotent** | An operation that’s safe to repeat: doing it twice has the same effect as doing it once. A re-delivered message lands the same result, so a retry causes no harm — which is what makes at-least-once safe (§5). |
 
 ## 17. The whole model in one paragraph
 
-> MessageFoundry is a headless asyncio engine that receives messages on inbound Connections, persists each one durably before ACKing (so nothing is ever dropped), then moves it through a three-stage durable queue (SQLite by default, or Postgres/SQL Server) — ingress → routed → outbound — where a per-connection Router (pure Python) decides which Handlers see it and each Handler (pure Python) filters, transforms, and Sends it to outbound Connections. Every stage handoff is one committed transaction, giving at-least-once delivery, retries, replay, and dead-lettering with no separate broker; the price is that routers and transforms must be pure (the lone exception being a read-only db_lookup). A browser web console (served same-origin at `/ui`) drives it all over a localhost HTTP/WebSocket API — never touching the engine or DB directly. There is no “channel” object: the config is a by-name graph of four building blocks — Connection, Router, Handler, message store — authored as code-first Python (with connection transport optionally as TOML data), with auth, RBAC, audit, and encryption-at-rest built in because it carries PHI.
+> MessageFoundry is a headless asyncio engine that receives messages on inbound Connections, persists each one durably before ACKing (so nothing is ever dropped), then moves it through a three-stage durable queue (SQLite by default, or Postgres/SQL Server) — ingress → routed → outbound — where a per-connection Router (pure Python) decides which Handlers see it and each Handler (pure Python) filters, transforms, and Sends it to outbound Connections. Every stage handoff is one committed transaction, giving at-least-once delivery, retries, replay, and dead-lettering with no separate broker; the price is that routers and transforms must be pure (the exceptions being a read-only db_lookup / fhir_lookup). A browser web console (served same-origin at `/ui`) drives it all over a localhost HTTP/WebSocket API — never touching the engine or DB directly. There is no “channel” object: the config is a by-name graph of four building blocks — Connection, Router, Handler, message store — authored as code-first Python (with connection transport optionally as TOML data), with auth, RBAC, audit, and encryption-at-rest built in because it carries PHI.
 
-*Sources: README.md, CLAUDE.md, messagefoundry/\_\_init\_\_.py, samples/config/ (IB_ACME_ADT, IB_RTE_ELIGIBILITY), and ADRs 0001/0004/0007/0010/0012/0013/0016. For depth, read docs/ARCHITECTURE.md and docs/architecture-diagram.md.*
+*Sources: README.md, CLAUDE.md, messagefoundry/\_\_init\_\_.py, samples/config/ (IB_ACME_ADT, IB_RTE_ELIGIBILITY), and ADRs 0001/0004/0007/0010/0012/0013/0016/0043. For depth, read docs/ARCHITECTURE.md and docs/architecture-diagram.md.*

@@ -67,10 +67,10 @@ asks for.
    keyword args + `connections.toml` `sign_*` keys is a small follow-up (the factory **is** the schema for
    those data surfaces) and was kept out of this change's blast radius.
 5. **Scorecards reconcile separately.** The L3 scorecards
-   ([ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md),
-   [ASVS-L3-STATUS.md](../security/ASVS-L3-STATUS.md),
-   [ASVS-L3-REMEDIATION-PLAN.md](../security/ASVS-L3-REMEDIATION-PLAN.md)) and
-   [SDS Appendix A.6](../Secure_Development_Standards.md) still record the **prior accepted-risk Fail /
+   (ASVS-L3-ASSESSMENT.md,
+   ASVS-L3-STATUS.md,
+   ASVS-L3-REMEDIATION-PLAN.md) and
+   SDS Appendix A.6 still record the **prior accepted-risk Fail /
    deferred-by-design** entry. **This ADR is the governing record of the shipped capability;** those docs
    are reconciled to "Pass (conditional, opt-in) with residual" in their next revision — a deliberate
    doc-only follow-up, not silently flipped here.
@@ -116,8 +116,8 @@ controls and the build triggers, and revisit when a trigger fires.
 > compensating controls that still govern the **unsigned default** path (residual item 1).
 
 - ASVS **4.1.5 remains a Fail** on the scorecard — an *accepted* Fail is governed, not re-scored to Pass
-  or N/A. It is recorded as a dated deviation in [SDS Appendix A.6](../Secure_Development_Standards.md)
-  and tracked in [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md).
+  or N/A. It is recorded as a dated deviation in SDS Appendix A.6
+  and tracked in ASVS-FAILS-REMEDIATION-PLAN.md.
 - **Residual risk:** a compromised hop inside MF or on the (trusted) network could alter a message with
   no per-message signature to detect it; mitigated by the on-prem trust boundary, TLS, restricted service
   accounts, and the audit trail. Accepted while the supported model holds.
@@ -125,16 +125,16 @@ controls and the build triggers, and revisit when a trigger fires.
 - **Review:** at each release and on any trigger above. This ADR is superseded by the build decision when
   the signature path is implemented.
 
-**Cross-references:** [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) (4.1.5 verdict) ·
-[ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md) ·
-[Secure_Development_Standards.md](../Secure_Development_Standards.md) §A.6 · [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) · [ADR 0015](0015-ws-soap-outbound-mtls-wssecurity.md).
+**Cross-references:** ASVS-L3-ASSESSMENT.md (4.1.5 verdict) ·
+ASVS-FAILS-REMEDIATION-PLAN.md ·
+Secure_Development_Standards.md §A.6 · [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) · [ADR 0015](0015-ws-soap-outbound-mtls-wssecurity.md).
 
 ## Amendment (2026-07-17) — 4.1.5 instructed at exposure; residual reaffirmed (ADR 0115 / WP #243)
 
 **Status:** Doc-only — no default changed; signing stays **opt-in per connection**. This records the
 ADR 0115 drive-to-Pass treatment of 4.1.5: because a global "sign everything" flip would break
 partners with no verifier, 4.1.5 is **instructed, not flipped**.
-[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Per-message
+`docs/security/OFF-LOOPBACK-DEPLOYMENT.md` §"Per-message
 signing for partner integrity" now instructs enabling detached-JWS signing (code-first
 `with_signing(...)`, a pinned `algorithm`, an `env()` PEM key) on any outbound whose **partner
 contract requires message-level integrity**. (There is no `connections.toml` `sign_*` data surface

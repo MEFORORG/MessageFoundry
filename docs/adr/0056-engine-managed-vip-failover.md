@@ -369,17 +369,17 @@ no engine/store/config import.
 ### Placement and construction
 
 A new **"High Availability"** page joins the console's left nav after Engine Status (registered in
-[`console/shell.py`](../../messagefoundry/console/shell.py) `_NAV` / `_NAV_ICONS` and built in
+`console/shell.py` `_NAV` / `_NAV_ICONS` and built in
 `_build_pages()`, its `error` signal wired to the shell's `_show_error`). It reuses the
 `refresh()`/`reload()`/`stop()` + `AsyncRunner` + in-flight-guard + snapshot/`_apply` **threading
-shape** of `EngineStatusPage` ([`console/status.py`](../../messagefoundry/console/status.py)).
+shape** of `EngineStatusPage` (`console/status.py`).
 
 > **Construction note (do not copy `EngineStatusPage`'s constructor).** `EngineStatusPage` is built with
 > **only** the read-only `poll_client` and does its few writes (service start/stop) via local UAC, *not*
 > the API. The HA page's failover is a genuine **API write** that needs the **main-thread `client`** (the
 > one carrying the step-up/MFA challenge handlers; `poll_client` from `for_polling()` has **none**). So
 > model the **construction** on `ConnectionsPage`
-> ([`console/connections.py`](../../messagefoundry/console/connections.py)):
+> (`console/connections.py`):
 > `HighAvailabilityPage(client, *, poll_client=poll_client)` — reads off-thread via `poll_client`, the
 > failover write on the main thread via `client`.
 

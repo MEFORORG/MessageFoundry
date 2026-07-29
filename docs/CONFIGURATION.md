@@ -1,19 +1,24 @@
 # Service configuration & settings
 
-> **Status: first cut implemented; the rest is the target.** The `ServiceSettings` model + loader
+> **Status: the catalog is built.** The `ServiceSettings` model + loader
 > ([config/settings.py](../messagefoundry/config/settings.py)) and the **CLI > env > file > default**
-> precedence are built and wired into `serve`. Implemented sections: **`[store]`** (`backend`, `path`,
-> `synchronous`), **`[api]`** (`host`, `port`), **`[inbound]`** (`bind_host`), **`[delivery]`**
-> (`retry_*` + `ordering` — the default retry policy and queue ordering an outbound inherits when it
-> declares none), **`[environments]`**
-> (`dir`; active env = `[ai].environment`), **`[logging]`** (`level` + structured-JSON `format` +
-> off-box `forward_*` syslog shipping), **`[auth]`** (authentication +
-> RBAC), and **`[ai]`** (AI-assistance policy) — plus `--service-config`.
-> **`[retention]`** is now enforced (retention/purge + SQLite maintenance), except its `audit_days`
-> key, which is **reserved/keep-forever by design**. Other catalog entries
-> (`[delivery].outbox_workers`/`dead_letter`, some server-DB `[store]` keys)
-> are **accepted-but-ignored** in a config file today so a forward-looking file still loads; build
-> them incrementally.
+> precedence are built and wired into `serve`, along with `--service-config`. Every bracketed `[section]`
+> catalogued below is a real, validated section on the `ServiceSettings` model — **`[store]`** (SQLite
+> **and** the server-DB keys), **`[api]`**, **`[inbound]`**, **`[delivery]`** (the retry policy, queue
+> ordering and alert thresholds an outbound inherits when it declares none), **`[environments]`** (`dir`;
+> active env = `[ai].environment`), **`[logging]`**, **`[auth]`**, **`[ai]`**, **`[retention]`** (enforced
+> by the retention/purge + SQLite-maintenance pass), and the rest — **except `[engine]`**, which has no
+> model at all. Three built sections are not catalogued here yet: **`[tls]`** (client trust anchors,
+> [ADR 0093](adr/0093-pinned-internal-ca-trust-anchor.md)), **`[backup]`**
+> ([ADR 0049](adr/0049-turnkey-dr-backup-restore-verify.md)) and **`[dr]`**
+> ([ADR 0048](adr/0048-third-tier-disaster-recovery-standby.md)).
+>
+> **An unimplemented key is accepted *silently*** — every section model is pydantic `extra="ignore"`, so
+> a forward-looking file still loads rather than failing. The accepted-but-ignored keys, each also
+> flagged where it is documented: the **whole `[engine]` section** (see [`[engine]`](#engine)),
+> `[delivery].outbox_workers`/`dead_letter`, `[logging].file`/`max_bytes`/`backups`,
+> `[retention].audit_days` (**reserved/keep-forever by design**), `[reference].max_staleness_seconds`,
+> `[ai].baa_attested`, and `[update_check].index_url`/`index_allowed_hosts`.
 
 ## Principle — two kinds of configuration
 
@@ -27,7 +32,7 @@ MessageFoundry deliberately separates them:
    document covers. They're set by whoever *operates* the service (ops/admin), not by the interface
    author, and must keep **secrets out of source control**.
 
-## Mechanism (proposed)
+## Mechanism
 
 A single **`messagefoundry.toml`** (TOML — consistent with `pyproject.toml`; **not** YAML, and not
 channel config) with one section per group, plus **environment-variable overrides** for secrets, plus
@@ -40,7 +45,11 @@ CLI flag  >  environment variable  >  messagefoundry.toml  >  built-in default
 - File location: `./messagefoundry.toml` by default, or `--service-config <path>`.
 - **Secrets** (e.g. a DB password) should come from **env** (or a secret reference), never plaintext
   in the file — env wins over the file so a deployment can inject them.
-- Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`).
+- Env naming: `MEFOR_<SECTION>_<KEY>` (e.g. `MEFOR_STORE_PASSWORD`, `MEFOR_API_PORT`). The parser splits
+  the name at the **first** `_` after the prefix and matches that against a known-section list, so five
+  built sections have **no env layer** and a `MEFOR_*` var aimed at one is dropped without a warning:
+  `[sandbox]`, `[service]`, and the underscored `[cert_monitor]`, `[secret_rotation]`, `[update_check]`.
+  Set those in the file.
 - Loaded once at startup into a typed `ServiceSettings` (pydantic) model; the engine + store read from
   it. `serve` keeps its existing flags as the CLI layer.
 
@@ -179,12 +188,14 @@ The one row that *does* vary:
 > **unparseable** entry, or `"*"`, is refused at config load rather than degrading silently. With either
 > posture declared (`exposure_protected`), the `/ui` session cookie ships `Secure` and HSTS is
 > emitted regardless of the per-request scheme. Full runbook + reverse-proxy-mTLS reference
-> configs: [security/OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md).
+> configs: security/OFF-LOOPBACK-DEPLOYMENT.md.
 
 ### `[inbound]` — inbound listener defaults
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `bind_host` | str | `127.0.0.1` | the **default** network interface every inbound MLLP/TCP listener binds to. Authors never set a `host` on an inbound connection (a wiring error if they do) — it's a per-environment operator decision here. Binding `0.0.0.0` exposes unauthenticated MLLP to the network, so it's deliberate (DEV typically loopback, PROD a specific NIC behind a firewall). A non-loopback bind **requires `tls=true`** on each MLLP connection (the §0 exposed-gate refuses a plaintext off-loopback listener at startup) unless `serve --allow-insecure-bind` is passed. A single connection may override this with a per-connection `bind_address` (and restrict peers with `source_ip_allowlist`) — MLLP/TCP only; see [CONNECTIONS.md](CONNECTIONS.md). |
+| `ack_after` | enum | `ingest` | the **default** ACK timing every inbound inherits (staged pipeline, [ADR 0001](adr/0001-staged-pipeline-architecture.md)). `ingest` = ACK-on-receipt, once the raw message is durably committed to the ingress stage and **before** routing/transform/delivery. `delivered` (defer the ACK until delivery succeeds) is **not built** — wiring it raises a `WiringError`, so it fails loud rather than silently ACKing early. A connection's own `ack_after=` overrides this. |
+| `stream_inflight_budget_bytes` | int (bytes) | `0` | aggregate cap on the **total** bytes of over-threshold message bodies concurrently mid-detach across **all** inbounds (#149, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). A detach that would push the running total over it is refused with backpressure (the message is NAK'd/`ERROR`'d, never accepted-and-dropped), so a burst of very large documents can't exhaust memory. `0` (default) = unlimited — a *single* body is still bounded by the per-connection `max_message_bytes`. Only over-threshold streaming detaches count against it. |
 
 ### `[environments]` — per-environment graph values (DEV/PROD)
 The **same** code-first graph runs in every environment; only the values it references via
@@ -408,7 +419,7 @@ Implemented (see [SECURITY.md](SECURITY.md)). Authentication is **required** by 
 password is a **secret** supplied via env (`MEFOR_AUTH_AD_BIND_PASSWORD`), never the file.
 The full inventory of resource-demanding functionality the `*_rate_limit_*` throttles below defend —
 including the surfaces that remain **unbounded** at this release — is
-[security/THREAT-MODEL.md §Resource-demanding functionality (ASVS 15.1.3)](security/THREAT-MODEL.md#resource-demanding-functionality-asvs-1513).
+security/THREAT-MODEL.md §Resource-demanding functionality (ASVS 15.1.3).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
@@ -491,19 +502,23 @@ including the surfaces that remain **unbounded** at this release — is
 ### `[ai]` — AI coding assistance policy
 Implemented (see [AI.md](AI.md)). Controls the IDE AI assistant across the **OFF→PHI-safe** range;
 the policy is centrally governed and **posture-clamped**. `mode`/`data_scope` plus the active
-environment NAME + posture (`environment`/`data_class`/`production`) are the keys that act in the MVP —
-the rest are forward-compat placeholders for the future engine broker (accepted-but-ignored today).
+environment NAME + posture (`environment`/`data_class`/`production`) govern the policy; `provider`,
+`model`, `endpoint`, `api_key` and `allowed_endpoints` are **live** under `mode = managed_endpoint` — the
+engine broker ([ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md)).
+Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored).
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `mode` | enum | `byo` | `off` · `byo` · `managed_claude` · `managed_claude_baa` (the last two are **future** — not serviceable by the current IDE) |
+| `mode` | enum | `byo` | `off` · `byo` · `managed_endpoint` · `managed_claude` · `managed_claude_baa`. **`managed_endpoint` is built** — the engine brokers one `code_only` prompt to a customer-managed / self-hosted LLM over `POST /ai/chat`, audited per use (ADR 0135); it never reaches `phi` scope. `managed_claude`/`managed_claude_baa` are **future** — not serviceable by the current IDE |
 | `data_scope` | enum | `code_only` | `code_only` · `synthetic` · `deidentified` · `phi`, least→most sensitive; capped by `production` posture and by `mode` (only `managed_claude_baa` reaches `phi`) |
 | `environment` | str | — | free-form active-environment **name** (ADR 0017); selects `environments/<name>.toml` + `current_environment()`. **Required** for `serve` (no default) |
 | `data_class` | | | **→ moved to `[security].handles_real_patient_data`** (ADR 0118) — set it there; no longer accepted in `[ai]`. |
 | `production` | | | **→ moved to `[security].production_instance`** (ADR 0118) — set it there; no longer accepted in `[ai]`. |
-| `provider` | str | `claude` | **forward-compat, unused in MVP** (P1 broker) |
-| `model` | str | `claude-opus-4-8` | **forward-compat, unused in MVP** |
-| `baa_attested` | bool | `false` | **forward-compat, unused in MVP** |
-| `endpoint` | str | — | **forward-compat, unused in MVP** |
+| `provider` | str | `claude` | the broker's request shape; **read** under `mode = managed_endpoint` (and recorded in the per-use audit) |
+| `model` | str | `claude-opus-4-8` | the model the broker asks for; **read** under `mode = managed_endpoint` (also echoed on the reply) |
+| `baa_attested` | bool | `false` | **accepted-but-ignored** — an operator attestation carried for the future `managed_claude_baa` path |
+| `endpoint` | str | — | the customer-managed LLM URL. **Required** for `mode = managed_endpoint`; `http`/`https` only, and a cleartext `http` endpoint is **refused** (it would expose `api_key`) |
+| `api_key` | secret | — | the LLM credential — **env only** (`MEFOR_AI_API_KEY`), never the file. **Required** for `mode = managed_endpoint` |
+| `allowed_endpoints` | list | `[]` | fail-closed SSRF allow-list for `endpoint`'s host; each entry is `host` (any port) or `host:port`. **An empty list permits nothing** — deliberately independent of `[egress].allowed_http`, which is permissive when empty and so can't gate this surface |
 
 > Only `code_only` context is ever sent in the MVP (graph names + active editor code) — **never
 > message bodies**. The full resolution/clamping algorithm, the `GET /ai/policy` endpoint, the
@@ -530,7 +545,7 @@ the rest are forward-compat placeholders for the future engine broker (accepted-
 | `ntp_peer` | str | — | NTP/SNTP host to compare the local clock against (**required** when `require_time_sync`) |
 | `time_sync_max_skew_seconds` | float | `2.0` | \|local − peer\| above this is "skewed" (must be > 0) |
 | `time_sync_fail_closed` | bool | `false` | **refuse to start** (instead of warn) on skew or an unreachable peer. Further opt-in; requires `require_time_sync` |
-| `file`, `max_bytes`, `backups` | str/int | — | **planned** rotation (NSSM captures stdout today) |
+| `file`, `max_bytes`, `backups` | str/int | — | **accepted-but-ignored** (planned) rotation — none is a `LoggingSettings` field. The engine logs to stdout and NSSM rotates it; `log_dir` above is how you point the engine at where it lands |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
 > **every** sink, including the off-box forwarder. For an encrypted hop set `forward_protocol = "tls"`
@@ -614,10 +629,10 @@ Because the local diff is cheap and PHI-safe it is **on by default** (zero phone
 | `internal_error` | enum | `continue` | what a delivery worker does on an **internal/code error** (a non-`DeliveryError` exception from `send` — our bug, not the partner's): `continue` (dead-letter the row + advance) or `stop` (halt the connection's worker, preserve the message for replay, raise a `connection_stopped` alert). Per-outbound `internal_error=` overrides. Partner NAKs / transport failures are unaffected. |
 | `buildup_max_depth` | int | _unset_ | raise a `queue_buildup` alert when an outbound lane's pending depth reaches this. Unset = depth dimension off (a healthy ceiling is throughput-specific, so there's no safe default). Per-outbound `buildup=BuildupThreshold(...)` overrides. |
 | `buildup_max_oldest_seconds` | num | 300 | raise `queue_buildup` when the lane's **oldest** pending message has waited this long (a stuck/retry-forever head is the classic cause). On by default — a head stuck >5 min is a problem in any environment. Set to unset/`0`-disable via a per-outbound override. |
-| `stall_max_oldest_seconds` | num | _unset_ | raise a `message_stall` alert (Corepoint "Max Message Stall", [ADR 0014](adr/0014-alert-routing-rules.md)) when an outbound lane's **oldest undelivered message** has waited this long. **Unset (the default) = the stall alert is OFF** — deny-by-default/opt-in, because it overlaps `buildup_max_oldest_seconds`'s age dimension and would double-page if both fired. Set a threshold to turn it on; a per-outbound `stall=StallThreshold(...)` overrides it. The stall event routes through `[[alerts.rules]]` like any other ([ADR 0014](adr/0014-alerting-rules-engine.md)). |
+| `stall_max_oldest_seconds` | num | _unset_ | raise a `message_stall` alert (Corepoint "Max Message Stall", [ADR 0014](adr/0014-alerting-rules-engine.md)) when an outbound lane's **oldest undelivered message** has waited this long. **Unset (the default) = the stall alert is OFF** — deny-by-default/opt-in, because it overlaps `buildup_max_oldest_seconds`'s age dimension and would double-page if both fired. Set a threshold to turn it on; a per-outbound `stall=StallThreshold(...)` overrides it. The stall event routes through `[[alerts.rules]]` like any other ([ADR 0014](adr/0014-alerting-rules-engine.md)). |
 | `saturation_sustain_samples` | int | _unset_ | raise a `saturation` alert (BACKLOG #93, [ADR 0014 amendment](adr/0014-alerting-rules-engine.md)) when an outbound lane's pending backlog is **rising sustained** over this many consecutive samples — the queue **derivative** (ingest > drain), distinct from the absolute depth/age ceilings above. A bursty-but-**draining** lane (spike then fall) never fires; only a lane whose depth climbs monotonically does. **Unset (the default) = OFF** — deny-by-default/opt-in (it overlaps `buildup_max_oldest_seconds`'s age dimension). Floor of 2 (fewer can't tell a burst from sustained growth). Global-only for now; a per-outbound override is a documented follow-up (a `[[alerts.rules]]` `connection` glob with `transports = []` can suppress it for a known-bursty feed in the interim). |
-| `outbox_workers` | int | per-outbound | delivery concurrency (planned) |
-| `dead_letter` | enum | `keep` | `keep`/`drop`-after-N (planned) |
+| `outbox_workers` | int | — | **accepted-but-ignored** (planned): delivery concurrency. Not a `DeliverySettings` field — worker topology is set by `[pipeline].claim_mode` today |
+| `dead_letter` | enum | — | **accepted-but-ignored** (planned): `keep`/`drop`-after-N. Not a `DeliverySettings` field — a finite `retry_max_attempts` is what dead-letters a row today |
 
 ### `[pipeline]`
 | Key | Type | Default | Notes |
@@ -665,6 +680,7 @@ one connection (see [CONNECTIONS.md](CONNECTIONS.md)).
 |---|---|---|---|
 | `connection_events` | bool | `true` | master switch for the **connection/transport event log**: inbound lifecycle (established/closed) + pre-ingress failures (allowlist/capacity/oversize/peer-reset/framing) + outbound lane transitions (connection_lost/restored). Metadata-only, written off the hot path by a drain task. Per-connection `capture_connection_errors` overrides it. |
 | `response_sent` | bool | `true` | master switch for **"Response Sent"** — the ACK/NAK returned to an inbound sender. Always captures the disposition metadata (`ack_code`/`phase`/`outcome`); the AA body is stored only on an encrypted store, and every NAK body is NULL. Per-connection `capture_ack` overrides it. |
+| `message_events` | enum | `all` | verbosity of the per-message **`message_events`** disposition log (#63) — how many rows the store writes to that table. `all` (default) records every event; `errors` drops the routine successes (`received`/`delivered`/`replayed`); `off` keeps only the floor. **A compliance floor is retained at every level, even `off`:** `viewed` (the HIPAA PHI-access trail) plus the terminal `dead`/`error`/`failed`. Not a master switch — it never touches the `messages`/queue disposition rows (count-and-log is separate) or the tamper-evident `audit_log` chain. |
 
 > Retention for the event log has its own short window — `[retention].connection_event_retention_hours`
 > (in **hours**; `0` = inherit `messages_days`).
@@ -1056,13 +1072,29 @@ an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op
 | `fail_closed_on_drift` | bool | `false` | when `true`, drift makes `serve` **refuse to start** (after recording the audit row + alerting). Default `false` = **alert-only**: a legitimate reviewed in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard enforcement on a locked-down instance. |
 
 ### `[engine]`
+**Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in
+`messagefoundry.toml` is parsed and **silently dropped** (`ServiceSettings` is `extra="ignore"`). The rows
+below are the shape a future section would take, not knobs that do anything today. In particular
+`data_dir` does **not** anchor relative paths — reach for `[environments].base_dir` /
+`serve --project-root` for `env()` value files, and `--db` / `[store].path` for the store, instead.
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `shutdown_timeout_seconds` | int | 30 | graceful stop |
-| `data_dir` | str | `.` | base for relative paths |
+| `shutdown_timeout_seconds` | int | — | **accepted-but-ignored** (proposed): graceful stop. The ASGI lifespan's `engine.stop()` is not bounded by a setting today |
+| `data_dir` | str | — | **accepted-but-ignored** (proposed): base for relative paths. Setting it anchors nothing |
 
 ### `[service]` (NSSM / Windows)
-Mostly lives in `scripts/service/` today: service name, auto-restart, stdout/stderr log paths.
+The NSSM **install** knobs — auto-restart, stdout/stderr log paths — live in `scripts/service/`. The
+section here is the engine's **read-only** report of its own Windows-service run state to the console
+(L6a, [ADR 0065](adr/0065-web-ops-dashboard.md)): an unprivileged `sc query <service_name>` off the event
+loop, surfaced at `GET /service/status` and gated by `monitoring:read`. There is deliberately **no
+control** here — no start/stop/restart, the engine can't restart its own host over the API. Off by
+default, and **file-only** (`[service]` has no `MEFOR_*` env layer).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `report_status` | bool | `false` | report the run state; off = no `sc query` ever runs and the route answers `state = "disabled"` |
+| `service_name` | str | `""` | the Windows service to query. Letters, digits, space, `.`, `_`, `-` only (anything else is refused at load); empty = disabled |
 
 ### `[security]`
 The **canonical, plain-language home for the high-value security posture switches**
@@ -1092,7 +1124,7 @@ regardless of any value here — byte-identical to the former production-PHI ref
 | `require_encryption_for_remote` | bool | `true` | any off-machine access must be over TLS (config-file twin of `--allow-insecure-bind`; can't relax production-PHI) |
 | `serve_web_console` | bool | `true` | mount the browser ops console at `/ui` — **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)); set `false` to shrink to a JSON-only surface. Default-on applies to **local loopback** binds; on an exposed instance a default-on console auto-degrades to JSON-only unless explicitly enabled with TLS + `web_console_public_address` |
 | `web_console_public_address` | str | `""` | external origin when the console is exposed off-box (CSRF/CSWSH + WebAuthn RP-id) |
-| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own per-connection `[inbound].source_ip_allowlist`. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md) first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
+| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own per-connection `[inbound].source_ip_allowlist`. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read OFF-LOOPBACK-DEPLOYMENT.md first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
 | `encrypt_stored_data` | bool | `true` | PHI encrypted at rest (key from the environment) |
 | `allow_unencrypted_phi` | bool | `false` | audited escape: start a PHI instance with **no** key |
 | `memory_encryption_operator_declared` | bool | `false` | **`[BUILT]` ([ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) rung 2, ASVS 11.7.1):** the operator's **declaration** that this host provides hardware memory encryption (AMD SEV-SNP / Intel TDX), so PHI is protected in RAM **while it is being processed**. The engine cannot verify it — a local CPU flag is emitted by the OS whose integrity the requirement protects against — so this records **who took responsibility**, the same discipline as `MEFOR_TLS_REVOCATION_ATTESTED`. It is deliberately **not** called "attested": in confidential computing that word means a CPU-signed quote verified against the silicon vendor's root PKI (ADR 0152 rung 3, **not built**). An **exposed** PHI instance without it **warns and starts** — on every environment, at both `enforcement` settings; it refuses only if `require_memory_encryption_declaration` is also set. A **positive platform read-out does not substitute for it** (a read-out must never relax a control). **Loopback and synthetic instances are byte-identical** (never consulted). If the platform read-out positively contradicts this, the contradiction is **warned at start and reported** as `memory_encryption_readout_contradicts_declaration` on `GET /security/posture` — but **never refused** (the read-out is a self-report, not evidence, and has known false negatives: driver not loaded, container without the device node mapped, Azure CVM paravisor). **Setting this does not make the instance ASVS 11.7.1-compliant** — see the read-out note below the table. Env: `MEFOR_SECURITY_MEMORY_ENCRYPTION_OPERATOR_DECLARED` |
@@ -1159,7 +1191,7 @@ configuration is **not** to set this: leave it unset, keep the startup warning, 
 **Partial**. Reaching for `[security].enforcement = warn` is the wrong lever — that is the global
 refuse/warn dial and downgrades every other posture refusal at the same time; nothing about this control
 requires it, because it never refuses unless you opt in via `require_memory_encryption_declaration`. The
-step-by-step is in [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md)
+step-by-step is in OFF-LOOPBACK-DEPLOYMENT.md
 § *In-use data protection*.
 
 ## Example
@@ -1176,6 +1208,7 @@ encrypt = true
 
 [security]
 local_access_only = true                # loopback bind (ADR 0118; the bind host lives here, not [api])
+delete_message_bodies_after_days = 30   # the PHI-body window (ADR 0118; NOT [retention].messages_days)
 
 [api]
 port = 8765
@@ -1193,9 +1226,10 @@ forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for tls unless forward
 # ntp_peer = "ntp.hospital.local"
 
 [retention]
-messages_days = 30      # null inbound bodies after 30 days, keep metadata
+# The inbound-body window is [security].delete_message_bodies_after_days above — setting
+# messages_days here is REJECTED at load (ADR 0118). Only the plumbing keys stay in this section:
 dead_letter_days = 90   # null dead-letter bodies after 90 days
-vacuum_at = "03:30"     # daily off-peak VACUUM to reclaim space
+vacuum_at = "03:30"     # daily off-peak VACUUM to reclaim space (SQLite only)
 ```
 ```bash
 # secret via env (never in the file)
@@ -1207,16 +1241,20 @@ set MEFOR_STORE_PASSWORD=...
 1. ✅ **Done** — `ServiceSettings` model + loader (file + env + CLI precedence); `[api]`/`[logging]`
    and `[store] backend=sqlite|path|synchronous` wired into `serve` (`--service-config` + the
    `--db`/`--host`/`--port`/`--log-level` overrides).
-2. `[delivery]` defaults → feed the default `RetryPolicy`.
-3. `[store]` server-DB keys land **with** the SQL Server backend.
+2. ✅ **Done** — `[delivery]` defaults feed the default `RetryPolicy` (`DeliverySettings.retry_policy()`),
+   alongside the ordering / internal-error / buildup-stall-saturation / priority defaults an outbound
+   inherits when it declares none.
+3. ✅ **Done** — `[store]` server-DB keys landed with the SQL Server **and** Postgres backends (both
+   consume `server`/`database`/`username`/`pool_size`/`command_timeout`/`ssl_root_cert`); they are
+   **implemented**, not accepted-but-ignored.
 4. ✅ **Done** — `[retention]` purge/maintenance job (body-null + WAL/VACUUM, audited; `audit_days`
    reserved). `[logging]` structured-JSON `format` + off-box `forward_*` syslog shipping land
    (sec-offbox-log); PHI redaction is an always-on handler filter (no structlog).
 
 ## Open decisions (to confirm)
 
-- **TOML file + env + CLI** as above — or env-only / all-CLI? (TOML chosen for consistency with
-  `pyproject.toml` and ops-friendliness; secrets via env.)
+- ✅ **Decided and built** — **TOML file + env + CLI** as above, chosen for consistency with
+  `pyproject.toml` and ops-friendliness; secrets via env.
 - Where settings are **edited from** — Console (operational) and/or a read-only view in the IDE.
 - Whether per-connection overrides (e.g. a connection's own retry) stay in code (today) or also move
   into settings. Recommendation: **keep per-connection logic in code**, service settings are defaults.

@@ -6,7 +6,7 @@
   (the native surface, whose §1 enumerates this status-bar item — and records it as one that *"opens
   engine settings"*, a drift this ADR reconciles), and [ADR 0035](0035-ide-extension-workspace-trust-and-scope.md)
   (machine-scoped engine target + the pre-prompt target refusal, whose reach a standalone sign-in command
-  extends). **Bounded by** [ADR 0065](0065-zero-install-same-origin-browser-ops-dashboard.md): the web
+  extends). **Bounded by** [ADR 0065](0065-web-ops-dashboard.md): the web
   console is the **sole operator console**. Relates to BACKLOG #221(c).
 
 ## Context

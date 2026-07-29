@@ -21,12 +21,12 @@
   below **as the historical record of a now-superseded decision** — it no longer describes shipped code.
 - **Built:** the `[project.gui-scripts]` `messagefoundry-console` entry point
   ([pyproject.toml](../../pyproject.toml)); the window/taskbar icon
-  ([messagefoundry/console/__main__.py](../../messagefoundry/console/__main__.py) `_app_icon()` +
+  (`messagefoundry/console/__main__.py` `_app_icon()` +
   `app.setWindowIcon`); the shipped badge
-  ([messagefoundry/console/resources/app.ico](../../messagefoundry/console/resources/app.ico) +
-  `app.svg` source + a stdlib packer [scripts/console/pack_ico.py](../../scripts/console/pack_ico.py));
+  (`messagefoundry/console/resources/app.ico` +
+  `app.svg` source + a stdlib packer `scripts/console/pack_ico.py`);
   and the per-user/`-AllUsers` shortcut scripts
-  ([scripts/console/install-console-shortcut.ps1](../../scripts/console/install-console-shortcut.ps1) +
+  (`scripts/console/install-console-shortcut.ps1` +
   `uninstall-console-shortcut.ps1`).
 - **Builds on (must not redesign):** the consumer deployment model — engine as a pinned, read-only
   installed wheel ([ADR 0017](0017-consumer-deployment-model.md)); the engine as a boot-start Windows
@@ -88,7 +88,7 @@ admin rights — unlike the machine-wide service, whose install is necessarily e
   arguments** in the common case. A non-default engine is `-Url` on the installer (off-loopback requires TLS,
   per the client's plaintext-to-remote guard).
 - The wheel grows by one small `.ico` (~17 KB). The icon is regenerable from `app.svg` via Inkscape + the
-  committed stdlib packer (see [resources/README.md](../../messagefoundry/console/resources/README.md)).
+  committed stdlib packer (see `messagefoundry/console/resources/README.md`).
 - `messagefoundry-console.exe` only appears after a (re)install that picks up the new entry point; the
   shortcut script fails clearly if it is absent.
 - **Deferred (Phase B):** a frozen, signed, zero-Python installer — BACKLOG #39. Related future niceties

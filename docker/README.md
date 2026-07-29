@@ -6,8 +6,14 @@
 The **headless engine** runs cleanly as an OCI container (ADR 0017 "container fast-follow"). This
 directory holds the image, a Topology-A `compose.yaml`, minimal Kubernetes manifests, and a CI smoke.
 
-The PySide6 **console is never in the image** — it is a host-side GUI client that reaches the engine
-over the HTTP API. Only the headless engine (asyncio/uvicorn/SQLite, no GUI dependency) containerizes.
+**Only the headless engine containerizes** (asyncio/uvicorn/SQLite, no GUI dependency). The operator
+console is the browser web console at `/ui`, a **separately-versioned optional wheel**
+(`messagefoundry-webconsole`) that these images do **not** install — a container serve therefore
+soft-degrades to the JSON API only, with a warning (ADR 0143); an **explicit**
+`[security].serve_web_console=true` against an image without that wheel is refused at startup instead of
+degraded, so bake the wheel in before you turn it on. PySide6 is never in the image either: it
+now backs only the standalone test harness, a host-side GUI client that reaches the engine over the
+HTTP API.
 
 Read [`docs/CONTAINER-EXPOSURE-EVALUATION.md`](../docs/CONTAINER-EXPOSURE-EVALUATION.md) first — it
 establishes that the off-loopback security controls are already built; this is packaging + ops wiring.

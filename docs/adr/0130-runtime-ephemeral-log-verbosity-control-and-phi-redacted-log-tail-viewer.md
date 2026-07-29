@@ -10,7 +10,7 @@
   [`auth/permissions.py`](../../messagefoundry/auth/permissions.py). Off-path when no `[logging].log_dir`
   is configured (the viewer degrades to "no file", never raises).
 - **Related:** [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md)
-  (the PHI-read hop guard the viewer inherits), [ADR 0065](0065-web-console-option-b-same-origin-ui.md)
+  (the PHI-read hop guard the viewer inherits), [ADR 0065](0065-web-ops-dashboard.md)
   (the console that renders it), `support/redact.redact_log_text` (#49 — the shared redactor the viewer
   reuses), BACKLOG #171. Companion: [ADR 0131](0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)
   (the S7b bulk-export item).

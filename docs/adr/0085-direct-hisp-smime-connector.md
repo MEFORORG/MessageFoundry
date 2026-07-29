@@ -5,7 +5,7 @@
 - **Status:** Accepted (2026-07-10) — PR1 outbound-only; later phases deferred
 - **Date:** 2026-07-10
 - **Related:** [ADR 0029](0029-email-smtp-destination.md) (SMTP EMAIL destination — the STARTTLS/cleartext
-  posture reused here) · [ADR 0003](0003-non-hl7-transports.md)/[ADR 0004](0004-payload-agnostic-ingress.md)
+  posture reused here) · [ADR 0003](0003-non-hl7-transports-database-rest-soap.md)/[ADR 0004](0004-payload-agnostic-ingress.md)
   (pluggable transports + payload-agnostic bodies) · CLAUDE.md §2 (reliability/purity invariants) · §7
   (no ad-hoc deps) · §9 (PHI rules) · BACKLOG #157
 

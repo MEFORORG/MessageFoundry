@@ -2,7 +2,7 @@
 
 - **Status:** Proposed  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-21
-- **Related:** [ADR 0087](0087-sandbox-subprocess-isolation.md) (the subprocess worker this extends) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-lookup.md) (`db_lookup`/`fhir_lookup` — the sanctioned reads to re-enable) · [ADR 0144](0144-security-lint-gate-over-admin-authored-router-handler-config.md) (the *static* half of the 15.2.5 defense) · [HANDLER-CODE-SHARED-RESPONSIBILITY.md](../security/HANDLER-CODE-SHARED-RESPONSIBILITY.md) · [ASVS risk-acceptance register](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 6 (15.2.5) · BACKLOG #197 · CLAUDE.md §2 · the 2026-07-21 runtime-isolation research pass
+- **Related:** [ADR 0087](0087-sandbox-subprocess-isolation.md) (the subprocess worker this extends) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup` — the sanctioned reads to re-enable) · [ADR 0144](0144-security-lint-gate-over-admin-authored-router-handler-config.md) (the *static* half of the 15.2.5 defense) · HANDLER-CODE-SHARED-RESPONSIBILITY.md · ASVS risk-acceptance register (`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`) theme 6 (15.2.5) · BACKLOG #197 · CLAUDE.md §2 · the 2026-07-21 runtime-isolation research pass
 
 ---
 
@@ -106,7 +106,7 @@ egress/filesystem/imports), per platform.** Proposed (design only — no code in
 
 **Positive** — Closes the heaviest 15.2.5 residual with a **hard, cross-platform** confinement AND re-enables
 the sanctioned live lookups the ADR 0087 sandbox has to forbid — so the
-[shared-responsibility split](../security/HANDLER-CODE-SHARED-RESPONSIBILITY.md) is finally backed by a real
+shared-responsibility split is finally backed by a real
 technical boundary (the property the AWS Lambda / Firecracker precedent pairs with its split).
 
 **Negative / risks** — Confinement is **asymmetric** (Landlock Linux-only, AppContainer Windows-only): two

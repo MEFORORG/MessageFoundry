@@ -73,7 +73,7 @@ proxy_tls_min_version = "1.2"
 
 **The `proxy_tls_min_version` line is not the control — your proxy configuration is.** Copy a
 reference terminator config whole from
-[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs
 (nginx, Caddy, or IIS + ARR — each pins an explicit protocol floor plus forward-secret ciphers and
 key-exchange groups) and keep the fence and this declaration in step: narrow the proxy to TLS 1.3
 only and you must raise `proxy_tls_min_version` to `"1.3"` in the same change. That page also

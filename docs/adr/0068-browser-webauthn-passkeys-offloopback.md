@@ -8,7 +8,7 @@
   `MULTISESSION-PLAN-v0.2.md:437` "WP-14b design amendment authored+Accepted" gate) ·
   [ADR 0065](0065-web-ops-dashboard.md) (web console; its AC-2 cookie boundary and AC-6 off-loopback
   refusal are restated and extended here) · [BACKLOG](../BACKLOG.md) #11 / #75 ·
-  [ASVS-L3-ASSESSMENT §2b](../security/ASVS-L3-ASSESSMENT.md) (both "Deferred (off-loopback / L5)"
+  ASVS-L3-ASSESSMENT §2b (both "Deferred (off-loopback / L5)"
   residuals) · [docs/SECURITY.md](../SECURITY.md)
 
 ---
@@ -419,7 +419,7 @@ re-probe.
 records the ADR 0115 treatment of the phishing-resistant factor: it is **instructed, not made
 mandatory in-engine**.
 
-[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Enrolling a
+`docs/security/OFF-LOOPBACK-DEPLOYMENT.md` §"Enrolling a
 hardware passkey as the exposed-admin factor" now instructs installing the `[webauthn]` extra,
 setting `[api].public_origin`, and enrolling a roaming hardware authenticator as the admin factor for
 an exposed console.

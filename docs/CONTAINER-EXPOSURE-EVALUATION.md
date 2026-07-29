@@ -39,9 +39,9 @@ operational notes.
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) ~540-610 | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` ~1655-1678 | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); `--allow-insecure-bind` downgrades to a warning; loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
 | Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips` in `uvicorn.run` ([`__main__.py`](../messagefoundry/__main__.py) ~531-533) | `tls_terminated_upstream` satisfies the gate **without** in-process TLS, but the model validator **requires** `trusted_proxies` to be set with it. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). |
-| TOTP MFA (WP-14) | ADR 0002 §3; `[auth].require_mfa`; console flow in [`console/client.py`](../messagefoundry/console/client.py) | Native RFC 6238 TOTP for local accounts; step-up boundary; admin reset; recovery codes. Built 2026-06-17. |
+| TOTP MFA (WP-14) | ADR 0002 §3; `[auth].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP for local accounts; step-up boundary; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
-| Console transport guard | [`console/client.py`](../messagefoundry/console/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
+| Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
 | At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; `require_encryption=true` refuses start without a key; rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
 
 **No Dockerfile / compose exists in the repo** (confirmed via glob). ADR 0017 decision 7 lists the
@@ -183,7 +183,7 @@ trusted_proxies = ["127.0.0.1"]               # so XFF from the sidecar gives th
 
 **The floor declared in (b) is worth exactly what the proxy container's config says.** Copy a
 reference terminator whole from
-[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs
 — nginx, Caddy or IIS + ARR, each pinning an explicit protocol floor plus forward-secret ciphers and
 key-exchange groups — and move the fence and `proxy_tls_min_version` together, never one alone. The
 same-pod sidecar block needs no attestation pair: it is a loopback bind, so the exposure ladder's

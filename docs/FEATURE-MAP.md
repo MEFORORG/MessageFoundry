@@ -18,8 +18,8 @@ view (workstreams, gates, sequencing for the next release) is the
 names a **Router** (`@router`), which forwards to one or more **Handlers** (`@handler`, filter →
 transform), which `Send` to outbound Connections. No enclosing "channel" object; the configuration
 *is* the graph, version-controlled as Python. Connection *transport config* may also live in
-`connections.toml` (ADR 0007). Engine = headless asyncio FastAPI service; PySide6 console + VS Code
-IDE are separate surfaces over the localhost API.
+`connections.toml` (ADR 0007). Engine = headless asyncio FastAPI service; the browser web console
+(`/ui`) + VS Code IDE are separate surfaces over the localhost API.
 
 ---
 
@@ -63,13 +63,13 @@ IDE are separate surfaces over the localhost API.
 |---------|:--:|-------|
 | python-hl7 tolerant peek (hot path) | ✅ | Routing/filtering |
 | hl7apy strict validation (opt-in per inbound) | ✅ | `validation.strict`; slow path, off routing |
-| Parse-tree model + viewer | ✅ | Console + IDE render it |
+| Parse-tree model + viewer | ✅ | The web console's message detail + the PySide6 test harness render it |
 | MSH-driven encoding-character awareness | ✅ | No hardcoded separators |
-| FHIR codec (`parsing/fhir`: FhirPeek + FhirResource) | ✅ | ADR 0022 (#20) — `[fhir]` extra; JSON; R4B/R5/STU3; FHIRPath; pure/console-importable |
+| FHIR codec (`parsing/fhir`: FhirPeek + FhirResource) | ✅ | ADR 0022 (#20) — `[fhir]` extra; JSON; R4B/R5/STU3; FHIRPath; pure/client-importable |
 | X12 EDI tolerant codec (`parsing/x12`: X12Peek + X12Message + interchange splitter) | ✅ | ADR 0012 — on-demand against `RawMessage`; never pushed through the pipeline |
 | Hardened `RawMessage.xml()` (defusedxml, XXE-safe) | ✅ | #31 / PR #422 — DOCTYPE / external-entity / billion-laughs **raise**, not parse |
 | base64 binary-carriage codec (`parsing/binary`: `mfb64:v1:` + `RawMessage.from_bytes`/`.raw_bytes`/`.binary()`/`.is_binary`) | ✅ | ADR 0028 (#437) — NUL-safe arbitrary bytes over the str/TEXT ingress+store; HL7 OBX-5 ED embedding helpers; pure stdlib, no new dep |
-| DICOM codec (`parsing/dicom`: DicomPeek + DicomDataset + SR→HL7 helpers) | ✅ | ADR 0025 Phase 1 (#439) — `[dicom]` extra (pydicom); headers + Structured Report only (no pixel data → no numpy); pure/console-importable; on-demand against `RawMessage` |
+| DICOM codec (`parsing/dicom`: DicomPeek + DicomDataset + SR→HL7 helpers) | ✅ | ADR 0025 Phase 1 (#439) — `[dicom]` extra (pydicom); headers + Structured Report only (no pixel data → no numpy); pure/client-importable; on-demand against `RawMessage` |
 
 ## 4. Pipeline & Reliability
 
@@ -127,10 +127,10 @@ IDE are separate surfaces over the localhost API.
 | MLLP-over-TLS | ✅ | Gate #4 (WP-13b) |
 | Reverse-proxy TLS termination support (`trusted_proxies`) | ✅ | Offered alongside native TLS |
 | TOTP MFA (local users) | ✅ | **Built (WP-14, ADR 0002 §3)** — RFC 6238 TOTP + single-use recovery codes for local accounts; `[auth].require_mfa` enforces it for the Administrator role at the step-up boundary. AD/Entra users' MFA stays delegated to the IdP. |
-| WebAuthn/FIDO2 passkeys (local users, browser) | ✅ | **Built (WP-14b, ADR 0068 — web-console L5a)** — phishing-resistant second factor at the same step-up boundary via the optional `[webauthn]` extra (py_webauthn): browser-only ceremonies on `/ui` (enrollment behind the WP-14 password re-proof; the assertion satisfies the MFA leg only — the password leg keeps step-up freshness + the new-IP re-anchor); credential store across all 3 backends with sign-count CAS clone detection; RP identity rides `[api].public_origin` (fail-closed behind a declared proxy). TOTP stays the desktop console's factor; AD users stay directory-delegated. |
-| Browser ops console (`/ui`, zero-install web dashboard) | ✅ | **Built (ADR 0065 + 0068, #75 phases 1–4 + L5a/L5b + L6b)** — same-origin server-rendered ops console on the engine API: live monitoring/queues/connections, message search + raw/parse-tree views (single audited PHI path), replay/dead-letter ops behind the step-up-to-unlock primitive (per-connection + **all-channels** replay), config-deploy, full user/RBAC/AD-map admin, self-service account (password + TOTP + passkeys + **active-session management**), audit views, service-status badge, connection event log (**kind-filtered**), alerts, **per-connection stats reset**, and the **update-available** signal. Cookie confined to `/ui` (JSON API stays bearer-only), token-free CSRF (SameSite=Strict + Sec-Fetch-Site/Origin), strict CSP, off-loopback exposure behind the ADR 0068 startup ladder (TLS-or-refuse + `public_origin` binding + forced Secure/HSTS at declared exposure). Near-full desktop parity (L6b closeout); deliberately desktop-only: Windows service start/stop, multi-engine switching, client-local view prefs. The PySide6 desktop console stays (additive). |
+| WebAuthn/FIDO2 passkeys (local users, browser) | ✅ | **Built (WP-14b, ADR 0068 — web-console L5a)** — phishing-resistant second factor at the same step-up boundary via the optional `[webauthn]` extra (py_webauthn): browser-only ceremonies on `/ui` (enrollment behind the WP-14 password re-proof; the assertion satisfies the MFA leg only — the password leg keeps step-up freshness + the new-IP re-anchor); credential store across all 3 backends with sign-count CAS clone detection; RP identity rides `[api].public_origin` (fail-closed behind a declared proxy). TOTP stays the factor for non-browser clients (the JSON API's `/auth/mfa-verify` + `/me/mfa/*`, used by the PySide6 harness sign-in); AD users stay directory-delegated. |
+| Browser ops console (`/ui`, zero-install web dashboard) | ✅ | **Built (ADR 0065 + 0068, #75 phases 1–4 + L5a/L5b + L6b)** — same-origin server-rendered ops console on the engine API: live monitoring/queues/connections, message search + raw/parse-tree views (single audited PHI path), replay/dead-letter ops behind the step-up-to-unlock primitive (per-connection + **all-channels** replay), config-deploy, full user/RBAC/AD-map admin, self-service account (password + TOTP + passkeys + **active-session management**), audit views, service-status badge, connection event log (**kind-filtered**), alerts, **per-connection stats reset**, and the **update-available** signal. Cookie confined to `/ui` (JSON API stays bearer-only), token-free CSRF (SameSite=Strict + Sec-Fetch-Site/Origin), strict CSP, off-loopback exposure behind the ADR 0068 startup ladder (TLS-or-refuse + `public_origin` binding + forced Secure/HSTS at declared exposure). Closed out at L6b with near-full parity against the desktop console, and it is now the **sole operator console**: the PySide6 desktop console was **retired** and `messagefoundry/console/` deleted (BACKLOG #103, ADR 0032 retired) — PySide6 backs only the standalone test harness. Two things it deliberately does not do: Windows service start/stop (the unprivileged tray service-manager, ADR 0113) and multi-engine switching (CLI/API-side). |
 | Federated SSO — OAuth 2.0 / OIDC / SAML (Entra) | ⏭️ | 0.2 — admin browser SSO + service-to-service OAuth2; a dedicated federated-SSO ADR precedes the build |
-| mTLS client/peer auth (console→API; MLLP partner) | ✅ | **Built (opt-in)** — the API requires a console client cert when `[api].tls_client_ca_file` is set (console presents `--client-cert`/`--client-key`); MLLP partner mTLS via the connection's `tls_ca_file`. Server-identity TLS stays the default; client certs are opt-in per the deploying org's PKI. |
+| mTLS client/peer auth (API client→API; MLLP partner) | ✅ | **Built (opt-in)** — the API requires a client cert when `[api].tls_client_ca_file` is set (an API client presents one through the shared `apiclient`'s `tls_client_cert`/`tls_client_key`); MLLP partner mTLS via the connection's `tls_ca_file`. Server-identity TLS stays the default; client certs are opt-in per the deploying org's PKI. |
 | SMART Backend Services (FHIR **client** OAuth2) | ✅ | **ADR 0024 (Accepted) — #432.** OAuth2 `client_credentials` + signed-JWT `client_assertion` (`RS384`/`ES384`) authenticating the FHIR/REST **outbound** (ADR 0022) against real SMART-secured servers (Epic, Oracle Health). `with_smart_backend()` composer over `FHIR()`/`Rest()` extends the ADR 0018 signer; mints + expiry-caches a short-lived bearer, re-mints on 401, injects per request; token endpoint gated by `[egress].allowed_http`; secrets via `env()`; no new dependency. Client-only (App Launch / authZ-server out of lane → next row) |
 | SMART App Launch / authorization server (FHIR **server** facade) | 🧭 | Out of an engine's lane / deferred — browser authorization-code + PKCE, EHR/standalone launch context, OIDC (`fhirUser`), scope **enforcement**, `.well-known/smart-configuration` publishing. Presupposes a human user (App Launch) or the system-of-record role (authZ/resource server); the latter also needs the unbuilt inbound FHIR facade (ADR 0023) |
 | OWASP ASVS L3 posture | ✅ | **A documented self-assessment against OWASP ASVS 5.0 Level 3 (345 requirements) exists, and every control is built or carries a documented residual.** **No pass/fail count is published here.** The scoring is under reconciliation (BACKLOG #310) and, by the project’s own rule, no figure is quotable until the final re-score lands — so quoting one here would be a claim we cannot stand behind. *(Earlier editions of this row quoted a four-figure count taken from a document that has since been marked **⛔ superseded as unreliable**: it reached zero Fails by introducing a “conditional Pass” — a verdict ASVS does not define — and scored strictly, that same source puts the shipped default posture materially lower. The figure and the link were removed 2026-07-25; the link also pointed into `docs/security/`, which is private and therefore absent from the public mirror.)* **Framing that must not be dropped:** this is a **point-in-time, AI-assisted self-assessment — not a certification, not an audit, and not an independent review**. There has been **no third-party assessment, no penetration test and no dynamic (DAST) testing** to date; that is a signed, dated standing risk acceptance which is **void on any off-loopback or production exposure**. The assessment set is maintained privately under `docs/security/` and can be made available to evaluators under NDA. |
@@ -157,20 +157,26 @@ IDE are separate surfaces over the localhost API.
 | Load-test harness (profiles, governor, report/SLO verdict) | ✅ (PR #201) | Already caught a store concurrency bug (#200) |
 | **Published throughput numbers + tuning baseline** | 🔨 | **Gate #3** — SQLite + PG + SQL Server + failover run |
 | Metrics export (Prometheus/OpenTelemetry) | ✅ | #21 / PR #407 — `/metrics` exporter (`MONITORING_READ`-gated); `[otel]` extra |
-| Alerts management page (console) | ✅ | #22 / PR #420 — read-only view over `GET /alerts/rules` (#22b / PR #415) |
+| Alerts management page (web console) | ✅ | Active instances (ack / resolve / windowed suspend, #143) + the loaded rules over `GET /alerts/rules` (#22b / PR #415) |
 
-## 10. Surfaces — Admin Console (PySide6)
+## 10. Surfaces — Operator console (browser, `/ui`) + the PySide6 harness
+
+The **sole operator console** is the browser web console served same-origin at `/ui` by the engine's
+own FastAPI app (`messagefoundry_webconsole`, ADR 0065) — the row in §7 carries its security posture.
+The PySide6 **desktop console was retired** and `messagefoundry/console/` deleted (BACKLOG #103, ADR
+0032 retired); PySide6 now backs only the standalone test harness (`harness/`, the `[harness]` extra).
 
 | Feature | Status | Notes |
 |---------|:--:|-------|
-| Connection dashboard, message browser, parse-tree viewer | ✅ | |
-| Delivery/audit trail + replay | ✅ | |
-| Dead-letter list + replay (via API/CLI) | ✅ | Console **Dead Letters page** shipped — #22a / PR #413 |
-| Cluster/leader status surface | 🔨 | Consumes `GET /cluster/status` |
-| Off-thread API polling (no UI freeze on a slow node) | ✅ | BACKLOG #2 (DONE) — periodic pollers + per-page refreshes off the main thread (#299/#341); dedicated read-only poll client |
-| Dead Letters page (list + replay) | ✅ | #22a / PR #413 |
-| Alerts page (rules view over `GET /alerts/rules`) | ✅ | #22 / PR #420 |
+| Connection dashboard, message log, parse-tree viewer | ✅ | Raw + parse-tree views are the single audited PHI path |
+| Delivery/audit trail + per-message replay | ✅ | On the audited message-detail page |
+| Dead-letter list + bulk replay | ✅ | Per-connection, per-destination, and all-channels replay — step-up-gated |
+| Alerts page (instances + loaded rules) | ✅ | Ack / resolve / windowed notification suspend (#143) |
+| Cluster/leader status surface | ✅ | Engine-status page renders `GET /cluster/status` (role, clustered, is-leader, node id) |
+| User/RBAC/AD-map admin + self-service account | ✅ | Body-carrying admin forms behind step-up-to-unlock; account = password + TOTP + passkeys + active sessions |
 | Multi-engine switcher | ⏭️ | CLI/API equivalents exist |
+| Windows service start/stop from a desktop surface | ✅ | The tokenless notification-area **tray service-manager** (ADR 0113, `messagefoundry-tray`) — deliberately not a second console: it reads only the SCM state + `GET /health` and deep-links to `/ui` |
+| PySide6 **test harness** (send/receive/load/failover + Monitor tab) | ✅ | `harness/` — a separate process over the `apiclient` HTTP client; background poll off the GUI thread; reuses the view widgets rehomed from the retired console |
 
 ## 11. Surfaces — VS Code IDE
 
@@ -215,6 +221,7 @@ IDE are separate surfaces over the localhost API.
 
 *Maintenance: update marks as features land. (`0.1.0` shipped 2026-06-18; **active-active scale-out was
 dropped and its code removed** — see §6. **v0.2 wave on `main` (2026-06-19/20):** Prometheus `/metrics`
-(#407), FHIR codec + REST destination (#416), console **Dead Letters** (#413) + **Alerts** (#420) pages,
+(#407), FHIR codec + REST destination (#416), desktop-console **Dead Letters** (#413) + **Alerts** (#420)
+pages (that console has since been retired — §10),
 `GET /alerts/rules` (#415), hardened `RawMessage.xml()` (#422), USER-GUIDE (#412); ADR 0021 §7
 connection-error log + ADR 0026 update-check **Accepted**, on-trigger to build. **v0.3 connector wave on `main` (2026-06-20):** SMART Backend Services token provider (#432, ADR 0024), base64 binary-carriage codec (#437, ADR 0028), DICOM codec + C-STORE SCP Phase 1 (#439, ADR 0025), anonymizer / de-identification (#440, ADR 0030) — all four ADRs Accepted + shipped. **DICOM Phase 2 (#478, 2026-06-23):** outbound C-STORE SCU + C-ECHO + DICOMweb STOW-RS, completing ADR 0025.)*

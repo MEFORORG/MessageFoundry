@@ -13,7 +13,7 @@ It is built on stdlib `ctypes` (no PySide6, no Qt) and the Qt-free `messagefound
 The tray reads exactly two credential-free signals — the local **service state** (Windows SCM) and
 the **tokenless** `GET /health` — and deep-links to `/ui` for everything else. It **never** signs in,
 holds a token, or shows a message body, queue depth, connection row, or throughput number. The
-operator console remains the web console (`/ui`, [ADR 0065](adr/0065-zero-install-same-origin-browser-ops-dashboard.md)).
+operator console remains the web console (`/ui`, [ADR 0065](adr/0065-web-ops-dashboard.md)).
 This boundary is frozen by a test (`tests/test_tray_boundary.py`) and by the tokenless-`/health`
 guard (`tests/test_api_health_tokenless.py`) — widening it needs a new ADR.
 

@@ -4,9 +4,11 @@
 #
 # MessageFoundry headless ENGINE image (ADR 0017 "container fast-follow").
 #
-# The PySide6 console is NEVER in this image — it is a host-side GUI client that reaches the engine
-# over the HTTP API (see docs/CONTAINER-EXPOSURE-EVALUATION.md). This image is the headless engine
-# only: a pure asyncio/uvicorn/SQLite service with no GUI dependency.
+# This image is the headless ENGINE only: a pure asyncio/uvicorn/SQLite service with no GUI dependency
+# (see docs/CONTAINER-EXPOSURE-EVALUATION.md). The browser ops console is a separately-versioned optional
+# wheel (messagefoundry-webconsole) that is NOT installed here, so a container serve soft-degrades to the
+# JSON API only with a warning (ADR 0143). PySide6 is never in the image either — it now backs only the
+# standalone test harness, a host-side GUI client that reaches the engine over the HTTP API.
 #
 # Build the slim default (core + SQLite store):
 #     docker build -f docker/Dockerfile -t messagefoundry .
@@ -15,8 +17,8 @@
 #     docker build -f docker/Dockerfile --target runtime-sqlserver -t messagefoundry:sqlserver .
 #
 # Both install from per-profile, hash-locked requirements (docker/locks/*.lock) — NOT the all-extras
-# requirements.lock, which would drag PySide6/dev tools into a runtime image. The locks are kept in
-# sync with uv.lock by the DEP-1 step in .github/workflows/security.yml.
+# requirements.lock, which would drag the harness's PySide6 + dev tools into a runtime image. The locks
+# are kept in sync with uv.lock by the DEP-1 step in .github/workflows/security.yml.
 
 # Pinned to Debian 12 "bookworm": a mature base whose Microsoft ODBC repo (the -sqlserver variant) is
 # well-supported. Debian 13 "trixie" signs its MS repo with a key absent from the legacy microsoft.asc
