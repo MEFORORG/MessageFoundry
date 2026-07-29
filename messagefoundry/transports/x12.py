@@ -125,6 +125,7 @@ class X12Destination(DestinationConnector):
             # PERMANENT, STRUCTURAL declaration here — there is no `tls = true` to migrate to (#311).
             cleartext_accepted=config.cleartext_accepted,
             cleartext_reason=config.cleartext_reason,
+            connection=config.name,
         )
         self._hop_guard.enforce_construction()
 

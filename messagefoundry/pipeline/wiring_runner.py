@@ -5690,12 +5690,15 @@ def _dest_config(
     _apply_egress_proxy_default(settings, egress)
     # ADR 0153: MIRROR the cleartext-acceptance declaration into the resolved settings. The connectors
     # read the typed Destination fields below, but the deep settings-driven seams — the forward-proxy
-    # credential chain, the HTTP Digest / OAuth2 token-endpoint providers — receive only a settings
-    # mapping, exactly as they already do for `tls_hop_attested`. Written ONLY when the flag is set, so
-    # an outbound that declared nothing carries no new keys and is byte-identical.
+    # credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers — receive only a
+    # settings mapping, exactly as they already do for `tls_hop_attested`. The connection NAME rides
+    # with it so the acceptance audit record those seams emit can still name the declaration that
+    # produced it. Written ONLY when the flag is set, so an outbound that declared nothing carries no
+    # new keys and is byte-identical.
     if oc.cleartext_accepted:
         settings["cleartext_accepted"] = True
         settings["cleartext_reason"] = oc.cleartext_reason
+        settings["cleartext_connection"] = oc.name
     return Destination(
         name=oc.name,
         type=oc.spec.type,

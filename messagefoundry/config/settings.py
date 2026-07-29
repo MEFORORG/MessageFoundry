@@ -3919,20 +3919,34 @@ def security_loosenings(
     auth: AuthSettings,
     cleartext_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
-    """Every security-relevant switch currently at its INSECURE value, as ``(switch, plain-language risk)``.
+    """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
+    section, as ``(switch, plain-language risk)``.
+
+    **Scope, stated precisely so the gap is visible rather than implied.** This registry covers *every*
+    ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
+    that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
+    ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
+    ``[auth].ad_session_recheck_seconds``, and the per-connection ``cleartext_accepted``. It is NOT yet
+    an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
+    carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
+    ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
+    ``password_check_breached``) that are gated elsewhere and are not reported here. That list is
+    enumerated in the floor test's exemption set so the gap is a written decision that a new switch
+    cannot silently join.
 
     Every parameter is REQUIRED, not optional, and deliberately so. There is exactly ONE shipped posture
     and an operator may only loosen from it, so a deviation that this registry cannot see is a second
     posture by the back door. An optional parameter is a detector that silently fails to fire; a required
     one makes omission a type error at every call site.
 
-    ``cleartext_hops`` is the list of OUTBOUND CONNECTION NAMES that declare ``cleartext_accepted``
-    (ADR 0153) — the one connection-scoped deviation in this otherwise settings-scoped registry. It
-    arrives as plain names rather than a ``Registry`` so ``config.settings`` never has to know the graph
-    type; the caller resolves them (``checks.accepted_cleartext_hops`` is the shared reader). A caller
-    that genuinely has no graph — ``messagefoundry security show``, which reads a settings file and
-    never loads the connection config — passes an empty sequence and SAYS SO in its output, rather than
-    reporting a subset as if it were everything.
+    ``cleartext_hops`` is the list of CONNECTION NAMES that declare ``cleartext_accepted`` (ADR 0153) —
+    the one connection-scoped deviation in this otherwise settings-scoped registry. It arrives as plain
+    names rather than a ``Registry`` so ``config.settings`` never has to know the graph type; the caller
+    resolves them (``config.wiring.accepted_cleartext_hops`` is the shared reader, which walks both
+    outbound connections and ``FhirLookup`` read connections). A caller that genuinely has no graph —
+    ``messagefoundry security show``, which reads a settings file and never loads the connection config
+    — passes an empty sequence and SAYS SO in its output, rather than reporting a subset as if it were
+    everything.
 
     Shared by the serve-time loosening warning (``__main__``, ADR 0118 AC-4) and the read-only posture
     view (``GET /security/posture``, AC-5), so the two never drift. This is advisory only — it names what
@@ -4079,7 +4093,7 @@ def security_loosenings(
         out.append(
             (
                 "cleartext_accepted",
-                f"{len(cleartext_hops)} outbound connection(s) cross a CLEARTEXT hop by declaration "
+                f"{len(cleartext_hops)} connection(s) cross a CLEARTEXT hop by declaration "
                 f"({named}) — the payload, and any credential the connection carries, ride those hops "
                 "unencrypted and readable by anything on the path",
             )

@@ -147,6 +147,10 @@ class InsecureHopGuard:
     # means the engine cannot see) — never fuse the two, the audit trail exists to tell them apart.
     cleartext_accepted: bool = False
     cleartext_reason: str | None = None
+    # The DECLARING connection's name. It is what makes the acceptance audit record actionable: `cell`
+    # is a static family label, so with two outbounds to the same host an auditor could otherwise not
+    # tell which declaration produced the crossing.
+    connection: str | None = None
 
     @classmethod
     def capture(
@@ -160,6 +164,7 @@ class InsecureHopGuard:
         attested_reason: str | None,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
+        connection: str | None = None,
     ) -> InsecureHopGuard:
         """Snapshot the decision inputs + the active hop posture for a cleartext outbound hop. ``cell`` is
         a short PHI-free label of the crossing; ``description`` explains the hop (scheme only — never a
@@ -173,6 +178,7 @@ class InsecureHopGuard:
             attested_reason=attested_reason,
             cleartext_accepted=cleartext_accepted,
             cleartext_reason=cleartext_reason,
+            connection=connection,
             posture=current_hop_posture(),
         )
 
@@ -226,7 +232,7 @@ class InsecureHopGuard:
             # when the acceptance is what produced the WARN, so a merely non-enforcing instance does not
             # manufacture acceptance records for hops nobody declared.
             audit_sink=(
-                cleartext_acceptance_audit_sink(self.cleartext_reason)
+                cleartext_acceptance_audit_sink(self.cleartext_reason, connection=self.connection)
                 if disposition is HopDisposition.WARN and self.cleartext_accepted
                 else None
             ),
@@ -710,6 +716,7 @@ class MLLPDestination(DestinationConnector):
                 # here — MLLP() supports tls=true, so the declaration should end when the peer does.
                 cleartext_accepted=config.cleartext_accepted,
                 cleartext_reason=config.cleartext_reason,
+                connection=config.name,
             )
             if self._ssl is None
             else None

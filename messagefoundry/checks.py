@@ -1317,7 +1317,7 @@ def _check_build(
 def _check_cleartext_accepted(
     config_dir: str | Path,
 ) -> CheckResult:
-    """Surface **the whole set** of outbound connections that declare ``cleartext_accepted`` (ADR 0153).
+    """Surface **the whole set** of connections that declare ``cleartext_accepted`` (ADR 0153).
 
     ADR 0153 accepts, and cannot prevent, an operator declaring the acceptance broadly enough to
     approximate the blanket escape it removed. Its stated mitigations are that the declaration is
@@ -1325,6 +1325,9 @@ def _check_cleartext_accepted(
     whole accepted set** — this is that surface. Advisory (``required=False``): a declared acceptance is
     a legitimate, reasoned choice, not a config error, and blocking on it would push operators back
     toward a false ``tls_hop_attested``. It exists so the set is *visible in review*, next to the hosts.
+
+    Covers outbound connections AND ``FhirLookup`` read connections — ``accepted_cleartext_hops`` walks
+    both, so the "whole accepted set" claim is true rather than nearly true.
 
     SKIPs when the graph will not load — ``validate`` reports that, and a check that silently reported
     an empty accepted set on an unloadable config would be worse than one that says it could not look."""
@@ -1346,16 +1349,14 @@ def _check_cleartext_accepted(
             "cleartext-accepted",
             ok=True,
             required=False,
-            detail="no outbound connection declares cleartext_accepted",
+            detail="no connection declares cleartext_accepted",
         )
     listed = "; ".join(f"{name} ({reason})" for name, reason in accepted)
     return CheckResult(
         "cleartext-accepted",
         ok=True,
         required=False,
-        detail=(
-            f"{len(accepted)} outbound connection(s) cross a cleartext hop by declaration — {listed}"
-        ),
+        detail=(f"{len(accepted)} connection(s) cross a cleartext hop by declaration — {listed}"),
     )
 
 

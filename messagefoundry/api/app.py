@@ -1468,7 +1468,13 @@ def create_app(
         cipher via the public ``store.cipher_info()`` accessor (never the private ``_cipher``), and
         ``key_source`` is the provider *name*. ``plaintext_columns`` reports any PHI column left
         unencrypted on the active backend — empty on every backend now (the SQL Server residual was
-        retired by H4; SQLite/Postgres/SQL Server all have full at-rest coverage)."""
+        retired by H4; SQLite/Postgres/SQL Server all have full at-rest coverage).
+
+        **Engine-shard scope (ADR 0037).** The connection-scoped part of ``loosenings`` (the ADR 0153
+        ``cleartext_accepted`` declarations) is read off THIS process's registry, which in a sharded
+        deployment is the shard-filtered graph — so each shard reports its own declared set, not the
+        estate's. ``messagefoundry check`` reads the whole config dir and is the estate-wide surface.
+        ``loosenings_scope`` is non-``None`` when this engine has no loaded graph at all."""
         # The live cipher posture (on/off + key fingerprint only). cipher_info() is the public Store
         # accessor — the route never touches engine.store._cipher.
         info = engine.store.cipher_info()
@@ -1488,12 +1494,22 @@ def create_app(
         # ADR 0153: the ONE connection-scoped deviation. Read LIVE off the running graph (so a reload is
         # reflected) — this route is where an operator learns a cleartext hop is being crossed by
         # declaration, and a stale or absent list would understate the posture. An engine with no
-        # registry runner (an embedding/test) contributes nothing rather than guessing.
+        # registry runner (an embedding, or an app queried before start) cannot see them at all, so it
+        # DECLARES that in `loosenings_scope` rather than returning a settings-only subset that reads as
+        # the whole posture — the same discipline `messagefoundry security show` follows.
         runner = engine.registry_runner
         cleartext_hops = (
             [name for name, _ in accepted_cleartext_hops(runner.registry)]
             if runner is not None
             else []
+        )
+        loosenings_scope = (
+            None
+            if runner is not None
+            else (
+                "settings only — no connection graph is loaded on this engine, so per-connection "
+                "cleartext_accepted declarations are NOT included (see `messagefoundry check`)"
+            )
         )
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
@@ -1546,6 +1562,7 @@ def create_app(
             plaintext_columns=_plaintext_columns(backend, encryption_enabled=info.encrypts),
             security=security.model_dump(),
             loosenings=loosenings,
+            loosenings_scope=loosenings_scope,
             synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)

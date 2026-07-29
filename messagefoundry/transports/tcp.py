@@ -152,6 +152,7 @@ class TcpDestination(DestinationConnector):
             # one. There is no `tls = true` for it to migrate to (BACKLOG #311).
             cleartext_accepted=config.cleartext_accepted,
             cleartext_reason=config.cleartext_reason,
+            connection=config.name,
         )
         self._hop_guard.enforce_construction()
 

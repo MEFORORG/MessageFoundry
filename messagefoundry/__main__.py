@@ -4193,12 +4193,20 @@ def _security(args: argparse.Namespace) -> int:
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
     _loosenings_partial = False
-    try:
-        _full = load_settings(config_path=path)
-        _store, _auth = _full.store, _full.auth
-    except Exception:  # noqa: BLE001 - any load failure degrades to a declared-partial report
-        _store, _auth = StoreSettings(), AuthSettings()
-        _loosenings_partial = True
+    _store, _auth = StoreSettings(), AuthSettings()
+    if Path(path).exists():
+        # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
+        # and `security show` is expected to work offline before any config exists. Only a file that
+        # exists and will not resolve is partial.
+        try:
+            _full = load_settings(config_path=path)
+            _store, _auth = _full.store, _full.auth
+        except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
+            # The specific ways a settings file fails to resolve: a schema/cross-field violation,
+            # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
+            # bad env/section. Anything else is a programming error and must surface, not be degraded
+            # into a boolean.
+            _loosenings_partial = True
 
     def _loosenings(sec: SecuritySettings) -> list[dict[str, str]]:
         # This CLI reads a SETTINGS file and never loads the connection graph, so it cannot see the ADR

@@ -41,6 +41,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.config.models import ConnectorType, Destination
+from messagefoundry.config.settings import hop_insecure_escape_downgrades
 from messagefoundry.config.tls_policy import (
     HopDisposition,
     HopPosture,
@@ -299,35 +300,49 @@ def _shipped_strict_disposition(
     host: str,
     attested: bool,
     cleartext_accepted: bool = False,
+    weakened_tls: bool = False,
 ) -> HopDisposition:
     """The floored disposition for an ALREADY-SHIPPED insecure-egress cell (#200, amended by ADR 0153).
 
     Runs the instance ``posture`` through the ONE authority (:func:`insecure_hop_disposition`), then
     applies ADR 0092 decision 5's no-loosen floor: a cell that refused BOTH staging and production PHI
     today must keep REFUSE for a hop that only reaches the gradient's WARN because the instance is not
-    enforcing. Pure — no I/O — so the send-time guard can reuse it verbatim.
+    enforcing. Pure apart from one ``os.environ`` read on the ``weakened_tls`` arm, so the send-time
+    guard can reuse it verbatim.
 
-    **The floor is now keyed on ``cleartext_accepted``, not on the global escape.** Before ADR 0153 it
-    read ``not audited_opt_out``, which is how ``MEFOR_ALLOW_INSECURE_TLS`` relaxed an HTTP-family
-    cleartext hop. 0153 decision 5 says the variable "can no longer influence a cleartext-hop decision",
-    and these cells — REST/SOAP/FHIR/DICOMweb bodies, HTTP credentials, ``verify_tls=false`` — *are*
-    cleartext-hop decisions: the ADR's out-of-scope note about this function means its **floor** is not
-    being reworked, not that the HTTP family keeps a data-label carve-out. Re-keying it (a) keeps 0092
-    §5 exactly (a non-enforcing hop that reaches WARN with no declaration is still floored to REFUSE, as
-    today), and (b) makes decision 2's escape effective on the largest cleartext-egress family in the
-    product — the only one where it is a genuine escape, since Tcp()/X12() never reach this cell.
+    **Two different cells share this function, and ADR 0153 governs only one of them.**
 
-    Side effect, stated plainly: an instance that set ``MEFOR_ALLOW_INSECURE_TLS`` to cross a
-    non-enforcing HTTP cleartext hop no longer can. That is a TIGHTENING, and it is intended — it is
-    also what makes the raw-transport guards and this one agree again, rather than leaving the blunt env
-    var alive on HTTP and dead on raw TCP."""
+    * A **cleartext** hop (``http://`` body or credential egress) is what 0153 decision 2 is about, so
+      it is keyed on ``cleartext_accepted`` and the blunt ``MEFOR_ALLOW_INSECURE_TLS`` escape no longer
+      reaches it (decision 5 — the variable "can no longer influence a cleartext-hop decision"). The
+      floor is re-keyed to match: a WARN reached by the non-enforcing dial alone is still floored to
+      REFUSE, exactly as before, but a declared acceptance survives it. Without that re-key decision 2
+      would be inert for REST/SOAP/FHIR/DICOMweb — the largest cleartext-egress family in the product,
+      and the only one where the declaration is a genuine escape (``Tcp()``/``X12()`` never reach here).
+    * A **``verify_tls=false``** hop is NOT cleartext — it is encrypted but unauthenticated — so it is
+      explicitly OUT of 0153's scope ("the cleartext transport-hop decision only"). It keeps the
+      pre-0153 clamped global escape (``weakened_tls=True``), which is also what the MLLP/FTPS
+      ``tls_verify=false`` cells do via ``weakened_tls_escape_permitted_here()``; ``cleartext_accepted``
+      deliberately does NOT reach it. Threading the acceptance here would have LOOSENED an enforcing hop
+      that refuses today (0092 decision 5 forbids that), attached an operator's "this hop has no TLS"
+      reason to a hop that has TLS, and split the HTTP family from MLLP on the same question.
+
+    The only 0153 change that reaches the verify-off cell is the deleted ``not is_phi`` ALLOW arm, which
+    can only ever tighten it."""
+    # Clamped to non-enforcing upstream, so under ENFORCE this is always False and the blunt escape can
+    # never satisfy an enforcing hop (ADR 0092 decision 2). Read only for the verify-off cell.
+    escape = weakened_tls and hop_insecure_escape_downgrades(enforcing=posture.enforcing)
+    permitted = cleartext_accepted or escape
     disposition = insecure_hop_disposition(
         enforcing=posture.enforcing,
         is_loopback_hop=is_loopback_hop_host(host),
         hop_attested=attested,
-        cleartext_accepted=cleartext_accepted,
+        # Arm 3 of the new precedence occupies exactly the slot the pre-0153 `audited_opt_out` arm did
+        # (WARN, ahead of the enforcing REFUSE), so feeding the clamped escape through it is
+        # byte-identical for the verify-off cell.
+        cleartext_accepted=permitted,
     )
-    if disposition is HopDisposition.WARN and not cleartext_accepted:
+    if disposition is HopDisposition.WARN and not permitted:
         # A WARN reached via the non-enforcing dial alone — this shipped cell REFUSED it; keep it strict.
         return HopDisposition.REFUSE
     return disposition
@@ -351,6 +366,10 @@ class InsecureHopGuard:
     # ADR 0153 decision 2 — captured with the posture so the send-time re-assertion sees exactly the
     # declaration the construction gate decided on.
     cleartext_accepted: bool = False
+    # True only for the verify_tls=false cell, which is OUT of ADR 0153's scope and keeps the clamped
+    # global escape (see _shipped_strict_disposition). Captured rather than inferred so the send-time
+    # re-assertion cannot silently decide a different question than construction did.
+    weakened_tls: bool = False
 
     def assert_send(self, host: str, redacted_url: str) -> None:
         """Re-assert (zero I/O) that ``host`` is still a permitted hop under the captured posture."""
@@ -360,6 +379,7 @@ class InsecureHopGuard:
                 host=host,
                 attested=self.attested,
                 cleartext_accepted=self.cleartext_accepted,
+                weakened_tls=self.weakened_tls,
             )
             is HopDisposition.REFUSE
         ):
@@ -377,6 +397,8 @@ def _enforce_shipped_hop(
     attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
+    weakened_tls: bool = False,
 ) -> tuple[HopDisposition, HopPosture]:
     """Decide + enforce an already-shipped insecure hop at CONSTRUCTION, returning (disposition, posture).
 
@@ -384,10 +406,15 @@ def _enforce_shipped_hop(
     :func:`enforce_insecure_hop` (raise on REFUSE, loud-log on WARN, no-op on ALLOW). When a per-hop
     attestation SUPPRESSES a would-be refusal it is recorded loudly — the audited opt-in that replaced
     the blunt global escape (ADR 0092 decision 3). When an ADR 0153 ``cleartext_accepted`` declaration is
-    what produced the WARN, that is recorded too, at every construction."""
+    what produced the WARN, that is recorded too, at every construction, naming ``connection`` so the
+    record leads back to the declaration that produced it."""
     posture = _current_hop_posture_fail_closed()
     disposition = _shipped_strict_disposition(
-        posture, host=host, attested=attested, cleartext_accepted=cleartext_accepted
+        posture,
+        host=host,
+        attested=attested,
+        cleartext_accepted=cleartext_accepted,
+        weakened_tls=weakened_tls,
     )
     # The `posture.is_phi` conjunct this branch used to carry went with ADR 0153: the authority no longer
     # reads the label, so gating the audit on it would silence the record for exactly the hops that
@@ -408,7 +435,7 @@ def _enforce_shipped_hop(
         message=message,
         cell=cell,
         audit_sink=(
-            cleartext_acceptance_audit_sink(cleartext_reason)
+            cleartext_acceptance_audit_sink(cleartext_reason, connection=connection)
             if disposition is HopDisposition.WARN and cleartext_accepted
             else None
         ),
@@ -416,19 +443,30 @@ def _enforce_shipped_hop(
     return disposition, posture
 
 
-def cleartext_acceptance_from_settings(s: Mapping[str, Any]) -> tuple[bool, str | None]:
-    """``(cleartext_accepted, cleartext_reason)`` read off an ``env()``-resolved settings mapping.
+def cleartext_acceptance_from_settings(
+    s: Mapping[str, Any],
+) -> tuple[bool, str | None, str | None]:
+    """``(cleartext_accepted, cleartext_reason, connection)`` off an ``env()``-resolved settings mapping.
 
     ADR 0153's pair is a **top-level outbound key**, but the deep settings-driven seams — the forward-proxy
-    credential chain, the HTTP Digest / OAuth2 token-endpoint providers, and the ``FhirLookup`` read
-    executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``. The
-    runner's ``_dest_config`` mirrors the declaration into those resolved settings (and only when it is
-    set, so an outbound that declared nothing is byte-identical), and this is the single reader, so the
-    mirror is never re-parsed by hand at four call sites. A ``FhirLookup`` connection, which has no
-    ``Destination``, carries the pair as a spec setting directly — the same surface its
-    ``tls_hop_attested`` already uses."""
+    credential chain, the HTTP Digest / OAuth2 / SMART token-endpoint providers, and the ``FhirLookup``
+    read executor — receive only a settings mapping, exactly as they already do for ``tls_hop_attested``.
+    The runner's ``_dest_config`` mirrors the declaration into those resolved settings (and only when it
+    is set, so an outbound that declared nothing is byte-identical), and this is the single reader, so
+    those resolved keys are never re-parsed by hand at five call sites.
+
+    The connection NAME is mirrored alongside them (``cleartext_connection``) so the acceptance record
+    from one of these deep seams can still name the declaration that produced it — a record an auditor
+    cannot trace back to a connection is not much of a record. A ``FhirLookup`` connection, which has no
+    ``Destination``, carries the pair as a spec setting written by its factory and supplies its own name
+    directly."""
     reason = s.get("cleartext_reason")
-    return bool(s.get("cleartext_accepted", False)), None if reason is None else str(reason)
+    connection = s.get("cleartext_connection")
+    return (
+        bool(s.get("cleartext_accepted", False)),
+        None if reason is None else str(reason),
+        None if connection is None else str(connection),
+    )
 
 
 def refuse_cleartext_credential_hop(
@@ -439,6 +477,7 @@ def refuse_cleartext_credential_hop(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> None:
     """Refuse a named ``credential`` riding a cleartext (``http``) hop (#200, amended by ADR 0153).
 
@@ -466,6 +505,7 @@ def refuse_cleartext_credential_hop(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
 
 
@@ -477,6 +517,7 @@ def refuse_cleartext_credentials(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> None:
     """Refuse to send credentials over a cleartext (``http``) channel (posture-keyed, #200).
 
@@ -492,6 +533,7 @@ def refuse_cleartext_credentials(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
 
 
@@ -502,6 +544,7 @@ def refuse_cleartext_egress(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> InsecureHopGuard | None:
     """Refuse a cleartext (``http``) outbound to a **non-loopback** host (ASVS 12.2.1, #200 / ADR 0153).
 
@@ -525,6 +568,7 @@ def refuse_cleartext_egress(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
     if is_loopback_hop_host(host):
         return None  # on-box loopback — not a network exposure, so no send-time guard
@@ -537,22 +581,24 @@ def refuse_cleartext_egress(
 
 
 def refuse_verify_off(
-    scheme: str,
-    url: str,
-    *,
-    connector: str,
-    attested: bool = False,
-    cleartext_accepted: bool = False,
-    cleartext_reason: str | None = None,
+    scheme: str, url: str, *, connector: str, attested: bool = False
 ) -> InsecureHopGuard | None:
-    """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (#200 / ADR 0153).
+    """Refuse a ``verify_tls=false`` (unverified-TLS) hop to a non-loopback host (posture-keyed, #200).
 
-    Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop and is
-    decided exactly like cleartext egress: an enforcing hop REFUSES, an on-box loopback / attested hop is
-    allowed, and a ``cleartext_accepted`` declaration crosses it with a loud, audited WARN. Only
-    meaningful for ``https`` (an ``http`` url has no TLS to verify and is handled by
+    Disabling certificate verification makes the ``https`` hop MITM-able, so it is an insecure hop:
+    an enforcing hop REFUSES, an on-box loopback / per-hop-attested hop is allowed, and the CLAMPED
+    global escape (``MEFOR_ALLOW_INSECURE_TLS``, inert under ENFORCE) downgrades a non-enforcing one to
+    a loud WARN. Only meaningful for ``https`` (an ``http`` url has no TLS to verify and is handled by
     :func:`refuse_cleartext_egress`); returns ``None`` for a non-https scheme. Returns an
-    :class:`InsecureHopGuard` when the hop was permitted (a warned / attested / accepted off-box hop)."""
+    :class:`InsecureHopGuard` when the hop was permitted (a warned / attested off-box hop).
+
+    **ADR 0153's ``cleartext_accepted`` deliberately does NOT reach this cell.** A verify-off hop is
+    encrypted-but-unauthenticated, not cleartext, and 0153 scopes itself to "the cleartext
+    transport-hop decision only". Threading the acceptance here would LOOSEN an enforcing hop that
+    refuses today (ADR 0092 decision 5 forbids that), attach an operator's "this peer cannot do TLS"
+    reason to a peer that plainly does, and split this cell from the MLLP/FTPS ``tls_verify=false``
+    cells, which decide the same question through ``weakened_tls_escape_permitted_here()``. The one
+    0153 change that does reach here is the deleted ``not is_phi`` ALLOW arm — a tightening."""
     if scheme != "https":
         return None
     host = urllib.parse.urlsplit(url).hostname or ""
@@ -562,14 +608,11 @@ def refuse_verify_off(
         cell=cell,
         message=f"disables TLS certificate verification for non-loopback host {host!r}",
         attested=attested,
-        cleartext_accepted=cleartext_accepted,
-        cleartext_reason=cleartext_reason,
+        weakened_tls=True,
     )
     if is_loopback_hop_host(host):
         return None
-    return InsecureHopGuard(
-        posture=posture, attested=attested, cell=cell, cleartext_accepted=cleartext_accepted
-    )
+    return InsecureHopGuard(posture=posture, attested=attested, cell=cell, weakened_tls=True)
 
 
 def refuse_unrevoked_verified_hop(
@@ -745,6 +788,7 @@ def proxy_auth_handler_from_settings(
     attested: bool,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> tuple[tuple[tuple[str, str], ...], _ProxyDigestRecipe | None]:
     """The #127 proxy-credential-type dispatch: returns ``(pre-emptive auth header, reactive digest
     recipe)`` for an already-``env()``-resolved settings mapping ``s``. (Named per the phase doc; lives
@@ -784,6 +828,7 @@ def proxy_auth_handler_from_settings(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
     kind = str(auth_type or "basic").strip().lower()
     if kind == "basic":
@@ -816,6 +861,7 @@ def proxy_config_from_settings(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> ProxyConfig | None:
     """Build the per-connection :class:`ProxyConfig` from an already-``env()``-resolved settings mapping,
     or ``None`` when no proxy is configured (byte-identical). Reads ``proxy_url`` (#112), ``proxy_no_proxy``
@@ -859,6 +905,7 @@ def proxy_config_from_settings(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
     return ProxyConfig(
         proxies=(("http", proxy_url), ("https", proxy_url)),
@@ -929,6 +976,7 @@ def egress_route_from_settings(
     attested: bool = False,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> ProxyConfig | None:
     """Resolve the per-connection forward/egress **proxy** (ADR 0126) from ``proxy_url``, or ``None``
     (byte-identical). **Fails closed on ``ech_egress``:** the ECH SNI-hiding send-path (ADR 0139) is
@@ -948,6 +996,7 @@ def egress_route_from_settings(
         attested=attested,
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
 
 
@@ -1006,6 +1055,7 @@ class RestDestination(DestinationConnector):
                 attested=attested,
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
+                connection=config.name,
             )
         )
         dest_host = urllib.parse.urlsplit(self.url).hostname or ""
@@ -1024,6 +1074,7 @@ class RestDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         # ASVS 12.2.1: even without an Authorization header the request body is PHI, so a cleartext
         # http egress to a non-loopback host is refused (loopback stays byte-identical). See rest.py.
@@ -1033,6 +1084,7 @@ class RestDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound body. None = off (byte-
         # identical). Built here so a bad key/algorithm fails loud at connector construction (check/
@@ -1059,6 +1111,7 @@ class RestDestination(DestinationConnector):
                 attested=attested,
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
+                connection=config.name,
             )
         if bool(s.get("verify_tls", True)):
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the peer cert but does no
@@ -1087,15 +1140,14 @@ class RestDestination(DestinationConnector):
                 self._opener = _NO_REDIRECT_OPENER
         else:
             # verify_tls=false makes the https hop MITM-able — an insecure hop decided by the instance
-            # posture (#200): production-PHI REFUSES (escape inert), a non-prod PHI hop refuses unless the
-            # clamped escape / a per-hop attestation permits it. Loopback stays byte-identical.
+            # posture (#200): an enforcing hop REFUSES, a non-enforcing one refuses unless the clamped
+            # escape / a per-hop attestation permits it. Loopback stays byte-identical. ADR 0153's
+            # cleartext_accepted does NOT reach here — this hop has TLS (see refuse_verify_off).
             guard = refuse_verify_off(
                 scheme,
                 self.url,
                 connector="REST destination",
                 attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
             )
             if guard is not None:
                 self._hop_guard = guard

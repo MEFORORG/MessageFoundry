@@ -169,6 +169,7 @@ class DicomWebDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.base_url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -187,6 +188,7 @@ class DicomWebDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         # ASVS 12.2.1: the STOW-RS multipart body carries the DICOM object (PHI), so a cleartext http
         # egress to a non-loopback host is refused even without credentials (loopback byte-identical).
@@ -196,6 +198,7 @@ class DicomWebDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         if bool(s.get("verify_tls", True)):
             # #201 (ADR 0078 amendment): the verify-ON https hop validates the DICOMweb-server cert but
@@ -216,12 +219,7 @@ class DicomWebDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme,
-                self.base_url,
-                connector="DICOMweb destination",
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                scheme, self.base_url, connector="DICOMweb destination", attested=attested
             )
             if guard is not None:
                 self._hop_guard = guard

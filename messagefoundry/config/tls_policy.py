@@ -473,7 +473,9 @@ def enforce_insecure_hop(
         audit_sink(detail)
 
 
-def cleartext_acceptance_audit_sink(reason: str | None) -> Callable[[str], None]:
+def cleartext_acceptance_audit_sink(
+    reason: str | None, *, connection: str | None = None
+) -> Callable[[str], None]:
     """The ``audit_sink`` :func:`enforce_insecure_hop` records an accepted cleartext hop through.
 
     ADR 0153 decision 2 requires a ``cleartext_accepted`` hop to be "logged at every construction and
@@ -481,6 +483,12 @@ def cleartext_acceptance_audit_sink(reason: str | None) -> Callable[[str], None]
     DECLARATION and its reason, so an auditor can tell an operator-accepted cleartext hop apart from a
     hop that merely warned because the instance is not enforcing — the two produce the same
     :attr:`~HopDisposition.WARN` and would otherwise be indistinguishable in the log.
+
+    ``connection`` names the declaring connection. It is what makes the record ACTIONABLE: ``cell`` is a
+    static family label and the HTTP-family ``message`` carries a host but no port, so with two
+    destinations to the same host an auditor could otherwise not tell which declaration produced the
+    crossing — and the whole point of the record is to lead back to the line to fix. Every cell that can
+    know the name passes it; ``None`` renders as ``(unnamed)`` rather than a misleading blank.
 
     Built as a plain ``Callable`` so this stays a pure ``config``-level helper that never imports the
     engine's ``AlertSink`` (one-way dependency boundary), and shared by BOTH insecure-hop guards (the
@@ -495,7 +503,9 @@ def cleartext_acceptance_audit_sink(reason: str | None) -> Callable[[str], None]
 
     def _record(detail: str) -> None:
         logger.warning(
-            "cleartext hop crossed on an operator acceptance — %s (cleartext_accepted; reason: %s)",
+            "cleartext hop crossed on an operator acceptance — connection %s: %s "
+            "(cleartext_accepted; reason: %s)",
+            connection or "(unnamed)",
             detail,
             reason or "(none provided)",
         )

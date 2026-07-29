@@ -511,6 +511,7 @@ class DicomScuDestination(DestinationConnector):
                 # should end when the peer does.
                 cleartext_accepted=config.cleartext_accepted,
                 cleartext_reason=config.cleartext_reason,
+                connection=config.name,
             )
             if self._ssl is None
             else None

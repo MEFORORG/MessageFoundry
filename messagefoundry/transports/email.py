@@ -166,6 +166,7 @@ class EmailDestination(DestinationConnector):
                 attested_reason=config.tls_hop_attested_reason,
                 cleartext_accepted=config.cleartext_accepted,
                 cleartext_reason=config.cleartext_reason,
+                connection=config.name,
             )
             self._hop_guard.enforce_construction()
         else:

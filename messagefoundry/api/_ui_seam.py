@@ -69,7 +69,13 @@ from typing import Any
 #: fields satisfies 11.7.1, and the status page renders them worded "self-reported", never "compliant".
 #: (The last three were renamed/retyped from an earlier draft of THIS seam — v13 is unreleased, so the
 #: field set is corrected in place rather than burning v14 on a shape no console ever saw.)
-ENGINE_UI_SEAM: int = 14
+#: seam v15: SecurityPosture gained the additive `loosenings_scope` — `None` when the loosening list is
+#: COMPLETE, else a string naming what it could not see (an engine with no loaded connection graph
+#: cannot read the ADR 0153 per-connection `cleartext_accepted` declarations). Additive with a default,
+#: so an older console simply ignores it; bumped rather than corrected in place because v14 SHIPPED
+#: (v0.3.2). Under "one shipped posture, loosen only" a subset that reads as the whole posture is the
+#: failure this field exists to prevent, so the console must be able to render the caveat.
+ENGINE_UI_SEAM: int = 15
 
 
 @dataclass(frozen=True, slots=True)

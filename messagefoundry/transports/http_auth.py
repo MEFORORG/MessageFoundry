@@ -128,6 +128,7 @@ class OAuth2ClientCredentialsProvider:
         attested: bool = False,
         cleartext_accepted: bool = False,
         cleartext_reason: str | None = None,
+        connection: str | None = None,
         proxy: ProxyConfig | None = None,
     ) -> None:
         if not token_url:
@@ -159,6 +160,7 @@ class OAuth2ClientCredentialsProvider:
                 # refuse_cleartext_credential_hop).
                 cleartext_accepted=cleartext_accepted,
                 cleartext_reason=cleartext_reason,
+                connection=connection,
             )
         except InsecureHopRefused as exc:
             raise HttpAuthError(
@@ -290,6 +292,7 @@ def oauth2_cc_provider_from_settings(
         return None
     if not s.get("oauth2_enabled", True):
         return None
+    _accepted = cleartext_acceptance_from_settings(s)
     return OAuth2ClientCredentialsProvider(
         token_url=str(s.get("oauth2_token_url") or ""),
         client_id=str(s.get("oauth2_client_id") or ""),
@@ -304,9 +307,11 @@ def oauth2_cc_provider_from_settings(
         # decides purely on posture.
         attested=bool(s.get("tls_hop_attested", False)),
         # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings
-        # by the runner's _dest_config for exactly this kind of settings-driven seam.
-        cleartext_accepted=cleartext_acceptance_from_settings(s)[0],
-        cleartext_reason=cleartext_acceptance_from_settings(s)[1],
+        # by the runner's _dest_config for exactly this kind of settings-driven seam (the connection name
+        # rides with it so the acceptance audit record can name the declaration that produced it).
+        cleartext_accepted=_accepted[0],
+        cleartext_reason=_accepted[1],
+        connection=_accepted[2],
         proxy=proxy,  # ADR 0126: forward-proxy the token-endpoint POST
     )
 
@@ -361,7 +366,7 @@ def digest_handler_from_settings(
     attested = bool(s.get("tls_hop_attested", False))
     # ADR 0153: the sibling cleartext-acceptance declaration, mirrored into these resolved settings by
     # the runner's _dest_config for exactly this kind of settings-driven seam.
-    accepted, accept_reason = cleartext_acceptance_from_settings(s)
+    accepted, accept_reason, accept_conn = cleartext_acceptance_from_settings(s)
     try:
         refuse_cleartext_credential_hop(
             scheme,
@@ -370,6 +375,7 @@ def digest_handler_from_settings(
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=accept_conn,
         )
     except InsecureHopRefused as exc:
         raise HttpAuthError(

@@ -208,7 +208,7 @@ def _check_hop_attestation(attested: bool, reason: str | None) -> None:
 def _check_cleartext_acceptance(accepted: bool, reason: str | None) -> None:
     """Load-validate the per-outbound cleartext-acceptance pair (ADR 0153 decision 2).
 
-    The mirror image of :func:`_check_hop_attestation`, with the opposite claim: ``tls_hop_attested``
+    The exact inverse of :func:`_check_hop_attestation`, with the opposite claim: ``tls_hop_attested``
     says *this hop IS secure by means the engine cannot see* (ALLOW, silent); ``cleartext_accepted``
     says *this hop is NOT secure and we accept that* (WARN, logged + audited at every construction).
     They are deliberately separate fields — collapsing them would leave the audit trail unable to

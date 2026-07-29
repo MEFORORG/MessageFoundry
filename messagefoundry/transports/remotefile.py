@@ -512,6 +512,7 @@ def _anon_ftp_guard(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> InsecureHopGuard | None:
     """An :class:`~messagefoundry.transports.mllp.InsecureHopGuard` for an ANONYMOUS plain-``ftp`` hop
     (protocol ``ftp`` with no credentials), or ``None`` for any other protocol / a credentialed ftp.
@@ -539,6 +540,7 @@ def _anon_ftp_guard(
         attested_reason=None if reason is None else str(reason),
         cleartext_accepted=cleartext_accepted,
         cleartext_reason=cleartext_reason,
+        connection=connection,
     )
 
 
@@ -547,6 +549,7 @@ def _validate_common(
     *,
     cleartext_accepted: bool = False,
     cleartext_reason: str | None = None,
+    connection: str | None = None,
 ) -> str:
     """Shared construction-time validation: required ``host``/``remote_dir``, a known ``protocol``, and
     the cleartext-FTP credential guard. Returns the normalized protocol.
@@ -582,7 +585,10 @@ def _validate_common(
     # credentialed case above is the orthogonal credential-on-the-wire guard). No-op for ftps/sftp/
     # credentialed-ftp, and byte-identical off the enforced gate (posture unstamped).
     guard = _anon_ftp_guard(
-        s, cleartext_accepted=cleartext_accepted, cleartext_reason=cleartext_reason
+        s,
+        cleartext_accepted=cleartext_accepted,
+        cleartext_reason=cleartext_reason,
+        connection=connection,
     )
     if guard is not None:
         guard.enforce_construction()
@@ -598,6 +604,7 @@ class RemoteFileDestination(DestinationConnector):
             s,
             cleartext_accepted=config.cleartext_accepted,
             cleartext_reason=config.cleartext_reason,
+            connection=config.name,
         )
         # #200 send-time backstop for an anonymous plain-ftp hop (the enforced refusal already fired in
         # _validate_common at the construction gate). None for ftps/sftp/credentialed-ftp.
@@ -605,6 +612,7 @@ class RemoteFileDestination(DestinationConnector):
             s,
             cleartext_accepted=config.cleartext_accepted,
             cleartext_reason=config.cleartext_reason,
+            connection=config.name,
         )
         # Constructing the SFTP client validates the host-key escape posture fail-fast (build_check).
         # #190 (ADR 0093): pass the instance [tls] internal-CA trust-anchor policy so an FTPS hop that

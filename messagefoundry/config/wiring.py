@@ -498,6 +498,12 @@ def FhirLookup(
     timeout_seconds: float = 30.0,
     verify_tls: bool = True,  # False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
     encoding: str = "utf-8",
+    # ADR 0153 decision 2 — the same per-connection cleartext declaration an outbound carries. It must
+    # be authorable HERE: the read executor honours the pair, so leaving it to a hand-mutated
+    # `spec.settings` would be an escape with no load validation and nothing for the loosening registry
+    # to name — a deviation the registry cannot see is a second posture by the back door.
+    cleartext_accepted: bool = False,
+    cleartext_reason: str | None = None,
 ) -> FhirLookupSpec:
     """Declare a named live-lookup FHIR connection (ADR 0043). A Handler reads it at run time with
     ``fhir_lookup(name, query)`` — a **read-only** read-by-id (``"Patient/123"``) or search
@@ -518,21 +524,38 @@ def FhirLookup(
     the engine only at allowed hosts. Put secrets (``bearer_token`` / ``basic_*`` / SMART keys) in
     :func:`env`. TLS is on by default; weakening it needs ``MEFOR_ALLOW_INSECURE_TLS``. The pure
     ``parsing/fhir/`` codec parses the reply, so a ``FhirLookup``-declaring graph needs the optional
-    ``messagefoundry[fhir]`` extra."""
-    spec = FhirLookupSpec(
-        name,
-        {
-            "url": url,  # stored under "url" (NOT base_url) so the egress gate reads the same key as FHIR()
-            "fhir_version": fhir_version,
-            "headers": headers or {},
-            "bearer_token": bearer_token,
-            "basic_user": basic_user,
-            "basic_password": basic_password,
-            "timeout_seconds": timeout_seconds,
-            "verify_tls": verify_tls,
-            "encoding": encoding,
-        },
-    )
+    ``messagefoundry[fhir]`` extra.
+
+    ``cleartext_accepted`` / ``cleartext_reason`` (ADR 0153) declare that this lookup's read hop is
+    cleartext, is not secure, and the operator accepts that — a mandatory written reason, a loud WARN
+    plus an audit record at every construction, and an entry in ``security_loosenings()`` /
+    ``GET /security/posture`` naming this connection. Same flag/reason coherence rules as an
+    ``outbound()``: the flag without a reason, a blank reason, or a reason without the flag all fail
+    loud at load."""
+    # ADR 0153: coherence-checked at the ONE authoring surface, exactly as build_outbound_connection
+    # does for an outbound, so the declaration cannot reach the read executor unvalidated.
+    try:
+        _check_cleartext_acceptance(cleartext_accepted, cleartext_reason)
+    except ValueError as exc:
+        raise WiringError(f"fhir lookup {name!r}: {exc}") from exc
+    settings: dict[str, Any] = {
+        "url": url,  # stored under "url" (NOT base_url) so the egress gate reads the same key as FHIR()
+        "fhir_version": fhir_version,
+        "headers": headers or {},
+        "bearer_token": bearer_token,
+        "basic_user": basic_user,
+        "basic_password": basic_password,
+        "timeout_seconds": timeout_seconds,
+        "verify_tls": verify_tls,
+        "encoding": encoding,
+    }
+    if cleartext_accepted:
+        # Written only when declared, so an undeclared lookup's settings are byte-identical (and the
+        # redacted settings view, which several surfaces render, gains no empty governance keys).
+        settings["cleartext_accepted"] = True
+        settings["cleartext_reason"] = cleartext_reason
+        settings["cleartext_connection"] = name
+    spec = FhirLookupSpec(name, settings)
     _active_registry().add_fhir_lookup(spec)
     return spec
 
@@ -2899,21 +2922,32 @@ def _active_registry() -> Registry:
 
 
 def accepted_cleartext_hops(registry: Registry) -> list[tuple[str, str]]:
-    """Every outbound connection that DECLARES ``cleartext_accepted``, as ``(name, reason)`` (ADR 0153).
+    """Every connection that DECLARES ``cleartext_accepted``, as ``(name, reason)`` (ADR 0153).
 
     The SINGLE reader of the accepted set, shared by ``messagefoundry check``'s ``cleartext-accepted``
     surface and by the API's ``GET /security/posture`` loosening registry, so the two can never report
     different sets. Sorted by connection name for a stable, diffable list.
 
+    It walks **both** connection tables that can cross a declared cleartext hop: ``outbound`` and
+    ``fhir_lookups``. The lookups are not optional coverage — the read executor honours the declaration
+    for a PHI-bearing read hop, so omitting them here would let a live cleartext hop cross while every
+    visibility surface reported the accepted set as empty. Lookup names are prefixed ``fhir_lookup:``
+    because they live in a separate namespace and could otherwise collide with an outbound's name.
+
     Pure — it reads the loaded graph and touches nothing else. It lives HERE, beside the ``Registry`` it
     reads, rather than in ``checks`` or ``api``, so neither of those has to import the other: the
     acceptance is connection-scoped by construction, which is exactly why the settings-scoped
     ``security_loosenings`` takes the resolved NAMES rather than a graph."""
-    return sorted(
+    out = [
         (oc.name, oc.cleartext_reason or "(none recorded)")
         for oc in registry.outbound.values()
         if oc.cleartext_accepted
-    )
+    ]
+    for spec in registry.fhir_lookups.values():
+        if spec.settings.get("cleartext_accepted"):
+            reason = spec.settings.get("cleartext_reason")
+            out.append((f"fhir_lookup:{spec.name}", str(reason) if reason else "(none recorded)"))
+    return sorted(out)
 
 
 def _call_site() -> tuple[str | None, int | None]:

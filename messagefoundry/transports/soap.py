@@ -336,6 +336,8 @@ class SoapDestination(DestinationConnector):
         # the WS-Security / body-secret credential hops below are decided in helper methods.
         self._cleartext_accepted = config.cleartext_accepted
         self._cleartext_reason = config.cleartext_reason
+        # Held for the same reason: the acceptance audit record names the declaring connection.
+        self._connection_name = config.name
         accepted, accept_reason = self._cleartext_accepted, self._cleartext_reason
         # Captured at construction; re-asserted (zero I/O) at the byte-crossing in _post (decision 4).
         self._hop_guard: InsecureHopGuard | None = None
@@ -348,6 +350,7 @@ class SoapDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         dest_host = urllib.parse.urlsplit(self.url).hostname or ""
         proxy_dest = self._proxy.for_host(dest_host) if self._proxy is not None else None
@@ -365,6 +368,7 @@ class SoapDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         # ASVS 12.2.1: the SOAP envelope body is PHI, so a cleartext http egress to a non-loopback
         # host is refused even without credentials (loopback stays byte-identical). See rest.py.
@@ -374,6 +378,7 @@ class SoapDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=accepted,
             cleartext_reason=accept_reason,
+            connection=config.name,
         )
         # ASVS 4.1.5 (ADR 0018): opt-in detached-JWS signing of the outbound envelope. None = off
         # (byte-identical). Built here so a bad key/algorithm fails loud at connector construction; the
@@ -417,12 +422,7 @@ class SoapDestination(DestinationConnector):
         else:
             # verify_tls=false makes the https hop MITM-able — a posture-keyed insecure hop (#200).
             guard = refuse_verify_off(
-                scheme,
-                self.url,
-                connector="SOAP destination",
-                attested=attested,
-                cleartext_accepted=accepted,
-                cleartext_reason=accept_reason,
+                scheme, self.url, connector="SOAP destination", attested=attested
             )
             if guard is not None:
                 self._hop_guard = guard
@@ -451,6 +451,7 @@ class SoapDestination(DestinationConnector):
                 attested=attested,
                 cleartext_accepted=accepted,
                 cleartext_reason=accept_reason,
+                connection=config.name,
             )
         digest = digest_handler_from_settings(s, url=self.url)
         if digest is not None:
@@ -526,6 +527,7 @@ class SoapDestination(DestinationConnector):
             attested=attested,
             cleartext_accepted=self._cleartext_accepted,
             cleartext_reason=self._cleartext_reason,
+            connection=self._connection_name,
         )
         return tuple(pairs)
 
@@ -600,6 +602,7 @@ class SoapDestination(DestinationConnector):
                 attested=attested,
                 cleartext_accepted=self._cleartext_accepted,
                 cleartext_reason=self._cleartext_reason,
+                connection=self._connection_name,
             )
 
     def _build_headers(self, s: dict[str, Any]) -> dict[str, str]:
