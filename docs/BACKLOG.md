@@ -3438,8 +3438,11 @@ parity analysis.
 ## 81. Alert escalation tiers + day/time thresholds + content (Action-Point) alerting
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **4/10** · _fill-in_. Corepoint alert-parity; clean external-notifier / code-first-Handler workaround; remainder = escalation-state + schedule config across 3 backends. _(was DEMAND-GATE · V3/5 · D3/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — two of the three named sub-capabilities are BUILT; do not rebuild them.** Adversarial verification (2 lenses) refuted a full close, so this stays open — but narrowed. **BUILT and persisted across all three backends:** escalation tiers and schedule-aware thresholds ([ADR 0133](adr/0133-alert-escalation-tiers-schedule-aware-thresholds-and-content-triggered-alerts-the-56-remainder.md)), including the per-key escalation state the notifier drops on resolve (`messagefoundry/api/app.py:2367`, `:2541`) and the occurrence-driven tier count surfaced on the rules API (`:4316`).
+>
+> ⚠️ **The REMAINDER is the third sub-capability — content (Action-Point) alerting — and it is plumbing with no reachable trigger.** `content_match` exists on the concrete notifier (`messagefoundry/pipeline/alert_sinks.py:669`, event shape at `:677`, label routing at `:553`) but is **not on the `AlertSink` Protocol** (`messagefoundry/pipeline/alerts.py:27`), and the engine holds its sink as `self._alert_sink: AlertSink` (`messagefoundry/pipeline/wiring_runner.py:731`) — which is also `LoggingAlertSink` whenever no `[alerts]` transport is configured. A Handler is passed only the payload and no alert emitter is exported, so **nothing outside the tests can ever fire it**. Second, smaller gap: the persisted `escalation_tier` is never surfaced on `AlertInstanceInfo` / `GET /alerts/active`, which does not match ADR 0133 D1's stated outcome. Build **only** those two things.
 
 **Cluster:** Operational/monitoring (alert remainder). **Priority:** P2. **Verdict:** demand-gate.
 
@@ -3930,6 +3933,10 @@ that into the corresponding OBX segment." Reconciled against the in-store siblin
 ## 95. Engine-brokered AI assistance — integrate the IDE coding assistant with a customer's managed AI subscription or in-house LLM instance (P3, on-trigger)
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **6/10** · _money pit_. BYO vscode.lm cleanly covers the mainstream case; the broker adds real but narrow central per-use AI-egress audit and in-house-only-LLM support. _(was DEMAND-GATE · V2/5 · D3/5)_
+
+> **AMENDED 2026-07-28 — the engine broker IS built; the remainder is narrower than this item reads.** Adversarial verification refuted a full close. **BUILT:** the engine-side broker (`messagefoundry/transports/ai_broker.py`), its per-use AI-egress audit, and the IDE flip — [ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md), `code_only` + non-streaming MVP.
+>
+> ⚠️ **The REMAINDER is the generic customer-endpoint mode, and it is half-merged in a way that fails confusingly.** `provider` is **accepted but never read** — stored at `ai_broker.py:143` and used nowhere — and `chat()` unconditionally sends the **Anthropic Messages** wire body with `anthropic-version` / `x-api-key` headers regardless of it (the shape is documented as the MVP provider at `ai_broker.py:62`). So every backend this item names — Azure OpenAI, Bedrock, an internal gateway, vLLM, Ollama — rejects that body as an **opaque 502 rather than a config error**, and no validator refuses a non-`claude` provider. Also `docs/AI.md` still declares *"No model-provider or engine broker integration exists yet"* and omits `api_key`/`allowed_endpoints` — stale, since the broker shipped.
 
 **Type:** feature — AI governance + customer-infrastructure integration. Turns the **reserved-but-unused**
 `[ai]` broker config keys into a real integration: let the **engine broker** the IDE assistant's model calls to a
@@ -4614,8 +4621,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## 114. Directory validation toggle (perform vs suppress startup validation)
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **2/10** · _fill-in_. Corepoint-parity File toggle to fail-fast on an invalid startup directory; clean workaround via the on-demand test probe plus existing run-time deferral. _(was DEMAND-GATE · V2/5 · D2/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — the INBOUND half is fully BUILT; only the outbound half remains.** Adversarial verification refuted a full close. **BUILT:** `validate_directory` on the File source (`messagefoundry/transports/file.py:311`) with its opt-in at-start check (`:389-398`) — a no-mkdir probe that reports the connection `failed` at start rather than deferring to first poll (`:170`).
+>
+> ⚠️ **The REMAINDER is the outbound half, and today it fails SILENTLY.** `DestinationConnector` has **no `validate_startup` hook at all**: `FileDestination` never reads the setting and still `mkdir`s on write, and the runner's outbound start path never validates. Worse, `File(validate_directory=True)` on an **outbound** is accepted and ignored with **no `WiringError`** — an operator can ask for fail-fast validation, get none, and see no error. ADR 0031's amendment scopes the outbound out as *"out of scope here"*, which is a **deferral, not a decline**. Minimum viable fix is the wiring rejection; the hook is the fuller build.
 
 **Cluster:** Connections & Transports. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -4810,8 +4820,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## 124. Batch-export message bodies from a connection log to a file
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **3/10** · _fill-in_. Corepoint-parity bulk export; the search plus per-message audited raw API is a real, scriptable workaround, so useful breadth, not a blocker. _(was DEMAND-GATE · V2/5 · D3/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — the API half is BUILT; the console half is DEAD CODE.** Adversarial verification refuted a full close. **BUILT:** `GET /messages/export` (`messagefoundry/api/app.py:3001`) behind a dedicated `MESSAGES_EXPORT` permission with step-up + audit ([ADR 0131](adr/0131-bulk-raw-message-body-export-from-a-search-result-step-up-audited-phi-egress.md)), with 11 tests. A scripted operator can export today.
+>
+> ⚠️ **The REMAINDER is the console affordance, and it is worse than missing — it is wired to nothing.** The console JS registers a handler on `[data-mf-msg-export]`, but **no page builder emits that attribute** (`pages/messages.py` contains zero `data-mf-*` attributes and no per-row checkboxes), and the URL the JS fetches, `/ui/messages/export`, **has no route** — it would be swallowed by `/ui/messages/{message_id}`. So the progress bar and stop control the Scope names by name are unreachable. ⚠️ **ADR 0131 and its index row at `docs/adr/README.md:157` overstate this** and should be amended when the console half lands.
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -4830,8 +4843,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## 125. Uploaded Logs page - import external message files and browse them offline
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **5/10** · _fill-in_. Corepoint-parity offline file viewer; dryrun and File()->store->browser cover the inspect need cleanly, so it is console breadth not a blocker. _(was DEMAND-GATE · V2/5 · D3/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — nearly all of this is BUILT; one named capability is absent by construction.** Adversarial verification refuted a full close. **BUILT** ([ADR 0134](adr/0134-offline-uploaded-logs-viewer-connection-decoupled-upload-browse-resend-deletion-phi-at-rest-posture-stdlib-multipart.md)): the Uploaded Logs page, opt-in `uploads_dir`, encrypted upload, filter/search browse, per-message **resend**, delete (**#126**, closed), quotas, retention and audit.
+>
+> ⚠️ **The REMAINDER: the Scope and Why both ask to "resend AND SAVE", and there is no save/download route anywhere.** The complete surface is `POST /uploads`, `GET /uploads`, `GET /uploads/{id}/messages`, `POST …/resend`, `DELETE /uploads/{id}` — no read-one and no download. Browse is **metadata-only by construction** (a test asserts `PID` is *not* in the response), so an operator can neither **read** nor **save** an uploaded message body. "Save" appears nowhere in ADR 0134 — not even in its out-of-scope list — so this is an undocumented gap, not a ratified narrowing. Decide it explicitly: build the download, or record the decline.
 
 **Cluster:** Monitoring. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5772,8 +5788,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## 172. Gzip/zip compression codec + file-connector option
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **3/10** · _fill-in_. Corepoint file-feed parity (gzip/zip in/out) with a clean code-first workaround: a Handler already calls stdlib gzip/zipfile against RawMessage. _(was DEMAND-GATE · V2/5 · D2/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — the codec is BUILT; the connector covers gzip only.** Adversarial verification refuted a full close. **BUILT:** the pure three-algorithm compression codec (`messagefoundry/parsing/compression.py`, Handler-callable) and the File connector's gzip/gunzip option ([ADR 0123](adr/0123-compression-codec-gzip-zip-deflate-file-connector-compress-decompress-option.md)).
+>
+> ⚠️ **The REMAINDER is ZIP on the connector, which is foreclosed at three separate layers** — the wiring type (`decompress: Literal['gzip'] | None`), `_SUPPORTED_COMPRESSION = frozenset({"gzip"})` (`messagefoundry/transports/file.py:88`, enforced at `:145`), and a validator that raises on `'zip'`. The item's Scope asks for a connector option to "gunzip/**unzip** inbound archived drops" and its Trigger fires on a partner feed delivering "gzipped/**zipped** archives", so a zip-delivering partner is **not** served — a Handler must call the codec by hand. ADR 0123 records the narrowing deliberately, but it **is** a narrowing. Second gap: the sibling **REMOTEFILE** connector has **zero** compression support.
 
 **Cluster:** Modeling & Codecs. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5862,8 +5881,11 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## 177. Effective-permission inspector for a user
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **5/10** · Difficulty **2/10** · _fill-in_. Corepoint-parity RBAC audit capability; manual /users×/roles cross-ref is a real workaround; reuses Identity.build flattening + a console pane. _(was P3 · V2/5 · D2/5)_
-
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-28 — the API half is BUILT; the console view is the remainder. ⚠️ This item was nearly closed in error.** A first pass read the merged endpoint as the whole item; two independent adversarial lenses **both refuted** that, and they were right. **BUILT:** `GET /users/{user_id}/permissions` (`messagefoundry/api/auth_routes.py:610`, docstring citing BACKLOG #177 at `:615`) resolving the flattened effective set via `AuthService.identity_for_user_id` (`:622`) — the same `Identity.build` path `/auth/me` uses — with tests and `docs/SECURITY.md` coverage.
+>
+> ⚠️ **The REMAINDER: the Scope says "An admin endpoint … PLUS console view", and the re-score explicitly prices in "a console pane".** `user_detail_page` returns only Profile / Roles / Channel-scope / Account-actions cards, `_user_detail` never calls the inspector, the golden `/ui` route surface contains **no** permission-inspector route, and `apiclient/` has **no wrapper** for the endpoint — so the console cannot even reach it. An admin still cross-references `/users` × `/roles` by hand, which is the exact workaround the item exists to remove. Build the pane; do not rebuild the endpoint.
 
 **Cluster:** Security. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -6803,6 +6825,10 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 ## 228. Steps / config search finds handlers, routers, and transforms by name (not just connections)
 
 > 🔢 **Logged 2026-07-11 (unscored).** Preview-driven UX gap; to be value/difficulty-scored at the next backlog pass.
+
+> **AMENDED 2026-07-28 — the index IS built; two clauses of the Proposed line are not.** Adversarial verification refuted a full close. **BUILT:** `ide/src/symbolIndex.ts` scans and surfaces handlers / routers / transforms **by name** in the MEFOR view's Definitions section, unit-tested — which fixes the item's headline complaint (a transform is a Python symbol inside a file named for the *connection*, so neither the sidebar search nor Ctrl+P could find it).
+>
+> ⚠️ **REMAINDER (a): a hit cannot open straight into the Steps view.** The Proposed line asks to reuse the CodeLens / `openSteps` entry point, but Definitions rows carry **no `contextValue`**, so the inline "View as Steps" action — gated on `viewItem == meforElementHandler` — never renders on them, and a click runs plain `openSource`. ⚠️ **REMAINDER (b): "(and the outbound connections a handler sends to)" is outside the index** — `SymbolKind` is `handler|router|transform` only, and the definition regex matches **top-level `def`** only. Both are small; neither is done.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
