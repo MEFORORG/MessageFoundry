@@ -180,7 +180,16 @@ def test_release_load_bearing_canaries_present() -> None:
 def test_release_pypi_publish_is_last_step_and_tag_gated() -> None:
     rel = _release()
     # Isolate the `release` job (up to the next top-level job) so ordering is measured within it.
-    release_job = rel.split("\n  release-harness:", 1)[0]
+    # The boundary is DERIVED rather than the name of whichever job happened to follow: this read
+    # `rel.split("\n  release-harness:")`, so inserting release-webconsole between the two silently
+    # widened the slice to include it and the assertion then measured the WRONG job's last step.
+    _start = rel.index("\n  release:") + 1
+    _next = re.search(r"^  [a-z][\w-]*:$", rel[_start:], re.M | re.I)
+    _after = re.search(
+        r"^  [a-z][\w-]*:$", rel[_start + (_next.end() if _next else 0) :], re.M | re.I
+    )
+    assert _after, "could not find the job after `release` — the workflow shape moved"
+    release_job = rel[_start:][: (_next.end() if _next else 0) + _after.start()]
 
     # Step boundaries are `      - name:` / `      - uses:` at the job's step indent.
     steps = list(re.finditer(r"^      - (?:name|uses): (.+)$", release_job, re.M))
@@ -331,7 +340,89 @@ def test_both_wheel_smokes_compare_versions_not_strings() -> None:
         "a raw string compare of tag vs built version is back; it rejects canonical pre-release "
         "versions (0.3.0rc1 != 0.3.0-rc1) and blocks every rc tag"
     )
-    assert rel.count("from packaging.version import") == 2, (
-        "both the engine and harness wheel smokes must compare PEP 440 versions — fixing only one "
-        "moves the failure rather than removing it"
+    # DERIVED, not hardcoded. This read `== 2` and broke the day a third wheel job (the separately
+    # versioned console) was added — a guard that must be edited whenever the thing it guards grows is
+    # a guard that gets its number bumped without thought. The property worth pinning is "EVERY wheel
+    # smoke normalises", so count the jobs that actually build a wheel and require one comparison each,
+    # plus the engine's own. A new wheel job carrying a string compare now fails HERE.
+    wheel_builds = rel.count("python -m build --wheel")
+    assert wheel_builds >= 2, f"expected the harness + console wheel builds, found {wheel_builds}"
+    assert rel.count("from packaging.version import") == wheel_builds + 1, (
+        f"every wheel smoke must compare PEP 440 versions — {wheel_builds} wheel-building job(s) plus "
+        f"the engine smoke require {wheel_builds + 1} comparisons, found "
+        f"{rel.count('from packaging.version import')}. Fixing only one moves the failure rather than "
+        f"removing it."
     )
+
+
+# --- the separately-versioned web console (ASVS 15.2.4) --------------------------------------------
+
+
+def _jobs() -> dict:
+    import yaml
+
+    return yaml.safe_load(RELEASE_YML.read_text(encoding="utf-8"))["jobs"]
+
+
+def test_the_console_and_engine_tag_namespaces_are_mutually_exclusive() -> None:
+    """The console is SEPARATELY VERSIONED (its own ``__version__`` root, changelog and PyPI cadence —
+    docs/WEBCONSOLE-PACKAGE.md), so it fires on ``webconsole-v*`` while the engine fires on ``v*``.
+
+    If the two guards ever overlap the damage is silent and asymmetric: an engine tag would publish the
+    console at a version nobody chose, and a console tag would publish the ENGINE at the console's
+    version. Both are wrong in a way the version-check steps cannot catch, because each checks its own
+    wheel against the same tag.
+
+    Mutation: drop either ``startsWith(github.ref_name, 'webconsole-')`` clause. Red here.
+    """
+    jobs = _jobs()
+    engine, console = jobs["release"]["if"], jobs["release-webconsole"]["if"]
+    assert "!startsWith(github.ref_name, 'webconsole-')" in engine, (
+        "the engine release job would fire on a console tag and ship the engine at the console's version"
+    )
+    assert (
+        "startsWith(github.ref_name, 'webconsole-')" in console and "!startsWith" not in console
+    ), "the console release job is not gated to its own tag namespace"
+
+
+def test_the_console_release_does_not_depend_on_the_engine_release() -> None:
+    """``release-harness`` is deliberately lockstep and so carries ``needs: release``. The console is
+    deliberately NOT: an engine release must not drag it along, and a console release must not wait on
+    one. A ``needs`` here would silently couple two cadences the design separates."""
+    assert "needs" not in _jobs()["release-webconsole"], (
+        "release-webconsole must not depend on the engine release — the console has its own cadence"
+    )
+
+
+def test_the_console_version_check_reads_the_console_tag_not_the_engine_tag() -> None:
+    """The strip must be ``webconsole-v``, not ``v``. With the wrong prefix ``want`` keeps the
+    ``webconsole-`` text, no PEP 440 parse succeeds, and the job fails on EVERY console tag by
+    construction — the exact shape of the bug the harness job carried until it was fixed."""
+    body = RELEASE_YML.read_text(encoding="utf-8")
+    console = body[body.index("release-webconsole:") : body.index("release-harness:")]
+    assert '"${GITHUB_REF_NAME#webconsole-v}"' in console, (
+        "the console version check must strip the console tag prefix, not the engine's"
+    )
+    assert "messagefoundry_webconsole-" in console, "it must read the CONSOLE wheel's version"
+
+
+def test_the_console_publish_uses_trusted_publishing_and_is_tag_gated() -> None:
+    """Same bar as the engine and harness: OIDC, never an API token, and never on a branch push.
+
+    The ``PUBLISH_WEBCONSOLE`` variable gate is deliberate — the build and version-check run on every
+    console tag so the path is exercised before it is armed. Flipping the variable is what actually
+    creates the PyPI project and CLAIMS the name (ASVS 15.2.4): a registered *pending* publisher grants
+    permission to publish but reserves nothing.
+    """
+    body = RELEASE_YML.read_text(encoding="utf-8")
+    console = body[body.index("release-webconsole:") : body.index("release-harness:")]
+    assert "pypa/gh-action-pypi-publish@" in console, (
+        "the console must publish via the pinned action"
+    )
+    assert "id-token: write" in console, "Trusted Publishing needs the OIDC identity"
+    assert not re.search(r"password:|PYPI_.*TOKEN|api-token", console), (
+        "the console publish must not use an API token — Trusted Publishing only"
+    )
+    assert (
+        "startsWith(github.ref, 'refs/tags/')" in console and "vars.PUBLISH_WEBCONSOLE" in console
+    ), "the console publish must be tag-gated AND variable-gated"
