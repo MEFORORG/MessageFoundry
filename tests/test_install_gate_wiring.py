@@ -34,13 +34,39 @@ def tools_the_gate_handles() -> set[str]:
     return tools
 
 
-def tools_the_installer_registers() -> set[str]:
-    """Every tool name reachable through the installer's PreToolUse matchers."""
+def matcher_block() -> str:
     text = INSTALLER.read_text(encoding="utf-8")
-    block = text.split("$matchers = @(", 1)[1].split("$entries", 1)[0]
+    return text.split("$matchers = @(", 1)[1].split("$entries", 1)[0]
+
+
+def tools_the_installer_registers() -> set[str]:
+    """Every tool name the installer CAN register -- including the ones behind an opt-in switch.
+
+    This is deliberately the permissive reading. It answers "did someone add a rule and forget the
+    matcher entirely", which is the drift this file exists for. It does NOT answer "does the default
+    install wire it" (see below) and it cannot answer "is it wired on this machine" at all -- that needs
+    the live settings.json, which is tests/test_gate_installed_parity.py.
+    """
     tools: set[str] = set()
-    for matcher in QUOTED.findall(block):
+    for matcher in QUOTED.findall(matcher_block()):
         tools.update(matcher.split("|"))
+    return tools
+
+
+def tools_registered_by_default() -> set[str]:
+    """What a bare `install-gate.ps1` writes: the unconditional array, plus blocks guarded by a NEGATED
+    switch (`-not $NoDispatchGate` is on unless you opt out). A block guarded by a plain `if ($Switch)`
+    is opt-IN and contributes nothing by default."""
+    block = matcher_block()
+    tools: set[str] = set()
+    unconditional, _, rest = block.partition("if (")
+    for matcher in QUOTED.findall(unconditional):
+        tools.update(matcher.split("|"))
+    for chunk in ("if (" + rest).split("if (")[1:]:
+        guard, _, body = chunk.partition(")")
+        if "-not" in guard:  # opt-OUT: on unless suppressed
+            for matcher in QUOTED.findall(body):
+                tools.update(matcher.split("|"))
     return tools
 
 
@@ -77,4 +103,35 @@ def test_the_installer_does_not_register_tools_the_gate_ignores() -> None:
     stray = tools_the_installer_registers() - tools_the_gate_handles()
     assert not stray, (
         f"install-gate.ps1 matches {sorted(stray)}, which worktree_gate.ps1 never inspects."
+    )
+
+
+def test_the_default_install_wires_rules_1_2_and_3_and_nothing_else() -> None:
+    """Pin what a bare `install-gate.ps1` actually turns on.
+
+    The permissive test above is satisfied by a matcher sitting behind an opt-in switch, which is exactly
+    how a rule can be "registered by the installer" and still never fire. Rule 4 (EnterWorktree) is
+    deliberately opt-in -- it compounds with rule 2 to leave a primary-resident session no in-session path
+    to isolation, so activating it as a side effect of installing an unrelated fix would be a trap. That
+    decision belongs in this assertion, where changing it is visible, rather than in a switch nobody reads.
+    """
+    assert tools_registered_by_default() == {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "NotebookEdit",
+        "Bash",
+        "PowerShell",
+        "Task",
+        "Agent",
+        "Workflow",
+    }
+
+
+def test_every_opt_in_tool_is_guarded_by_a_plain_switch() -> None:
+    """The opt-in must be real: a tool named outside a guard is on by default whatever the docs say."""
+    opt_in = tools_the_installer_registers() - tools_registered_by_default()
+    assert opt_in == {"EnterWorktree"}, f"unexpected opt-in set: {sorted(opt_in)}"
+    assert re.search(r"if \(\$EnterWorktreeGate\)", matcher_block()), (
+        "EnterWorktree must be added inside an `if ($EnterWorktreeGate)` block"
     )

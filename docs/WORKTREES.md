@@ -126,6 +126,8 @@ they're committed to `main` (and fetched). `.claude/settings.json` is tracked (s
 ## The worktree gate (enforcement, not a reminder)
 
 > Full write-up, with the measurements and the backout procedure: [WORKTREE-GATE.md](WORKTREE-GATE.md).
+> The whole estate as one system — every control's LIVE/INERT status, an audit of the gaps, and the
+> ultracode question: [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md).
 
 The `SessionStart` banner above **asks** you to work in a worktree. Measurement says asking doesn't work:
 across 30 days, 166 sessions ran with their cwd in the shared primary, and **44% of all their file writes

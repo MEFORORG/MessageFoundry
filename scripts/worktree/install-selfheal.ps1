@@ -21,9 +21,31 @@
 #>
 param(
     [Parameter(Mandatory)][string]$ConfigDir,
-    [string]$HookPath = (Join-Path $env:USERPROFILE '.claude-hooks\worktree-selfheal.ps1')
+    # NO DEFAULT HERE, deliberately. Parameter defaults are evaluated during BINDING, before the first
+    # line of the body -- so a default that throws preempts the CLAUDECODE guard below and the script
+    # dies with an unrelated error instead of refusing. That is exactly what happened: the default was
+    # `Join-Path $env:USERPROFILE ...`, and off Windows $env:USERPROFILE is NULL, so on Linux CI the
+    # installer crashed with "Cannot bind argument to parameter 'Path' because it is null" and the
+    # refusal never ran. A guard is only a guard if nothing can run ahead of it.
+    [string]$HookPath
 )
 $ErrorActionPreference = 'Stop'
+
+# Its sibling install-gate.ps1 has refused to run inside Claude Code since it shipped; this installer
+# never did, and it is the MORE privileged of the two. It wires a user-scope SessionStart hook that runs
+# `git checkout` on the shared primary unattended, and its canonical source is $PSScriptRoot -- the copy
+# in the calling session's own worktree, which that session may freely edit. The higher-privilege
+# component was the less protected one.
+if ($env:CLAUDECODE -eq '1') {
+    throw "Refusing to run inside Claude Code. This installs a user-scope hook that repairs the shared primary unattended, from a script the calling session can edit. Run it from a plain pwsh terminal."
+}
+
+# Home directory, null-safely. $env:USERPROFILE is Windows-only and is NULL elsewhere; honour it when set
+# (tests and account swaps rely on overriding it) and fall back to the .NET accessor, which resolves $HOME
+# on Unix. Every script in this family uses the same idiom -- see worktree-selfheal.ps1 and install-gate.ps1.
+$homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+if (-not $HookPath) { $HookPath = Join-Path $homeDir '.claude-hooks/worktree-selfheal.ps1' }
+
 if (-not (Test-Path -LiteralPath $ConfigDir)) { throw "Config dir not found: $ConfigDir" }
 $settingsPath = Join-Path $ConfigDir 'settings.json'
 
@@ -37,7 +59,7 @@ elseif (-not (Test-Path -LiteralPath $HookPath)) { throw "worktree-selfheal.ps1 
 $reposFile = Join-Path $sharedDir 'worktree-gate.repos.txt'
 if (-not (Test-Path -LiteralPath $reposFile)) {
     # Seed from the worktree gate's existing allowlist if present; else a commented template.
-    $gateRepos = Join-Path $env:USERPROFILE '.claude\hooks\worktree-gate.repos.txt'
+    $gateRepos = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
     if (Test-Path -LiteralPath $gateRepos) { Copy-Item -LiteralPath $gateRepos -Destination $reposFile -Force }
     else { Set-Content -LiteralPath $reposFile -Encoding utf8 -Value '# Primaries guarded by the SessionStart backstop. One absolute path per line. Delete to disable.' }
 }

@@ -50,21 +50,34 @@ param(
     [switch]$Status,
     # Do not gate Task/Agent/Workflow dispatch from the primary (writes are still gated).
     [switch]$NoDispatchGate,
+    # Gate the EnterWorktree tool (rule 4), which relocates a LIVE session into a worktree.
+    #
+    # OPT-IN, and deliberately OFF by default. Rule 4 has never been installed, and turning it on as a
+    # SIDE EFFECT of installing an unrelated fix would be a trap: with rules 2 and 4 both live, a session
+    # started in the primary has no in-session path to isolation at all -- it can neither dispatch a
+    # subagent nor relocate itself, so it must be restarted elsewhere by a human. That is a hard stop on
+    # workflow-by-default from the directory sessions naturally open in, and it is a decision the owner
+    # makes on purpose (docs/WORKTREES.md), not one that rides along with a regex fix.
+    #
+    # It also duplicates a guard the vendor now ships: since v2.1.206 EnterWorktree into a path OUTSIDE
+    # .claude/worktrees/ raises a confirmation prompt that no permission rule can suppress, and since
+    # v2.1.198 the transcript follows the session's cwd BOTH ways, so relocation re-files a chat rather
+    # than losing it. See docs/SESSION-DRIFT-CONTROLS.md.
+    [switch]$EnterWorktreeGate,
     # Config dirs to wire the hook into. Default: ~/.claude plus every existing ~/.claude-account-*.
     [string[]]$ConfigDir
 )
 
 $ErrorActionPreference = "Stop"
 
-if ($env:CLAUDECODE -eq "1") {
-    throw "Refusing to run inside Claude Code. A session that can install this gate can also remove it. Run from a plain pwsh terminal."
-}
-
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 
 # The gate SCRIPT + its allowlist live ONCE, shared, under ~/.claude\hooks -- referenced by absolute path
 # from every config dir's settings.json, so a single copy (and a single kill switch) governs all accounts.
-$HooksDir  = Join-Path $env:USERPROFILE ".claude\hooks"
+# Null-safely: $env:USERPROFILE is Windows-only and NULL elsewhere, where Join-Path throws a
+# parameter-binding error instead of returning a path. Same idiom as its sibling scripts.
+$HomeDir   = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+$HooksDir  = Join-Path $HomeDir ".claude/hooks"
 $GateDst   = Join-Path $HooksDir "worktree_gate.ps1"
 $ReposFile = Join-Path $HooksDir "worktree-gate.repos.txt"
 
@@ -73,9 +86,9 @@ $Marker = "worktree_gate.ps1"
 
 # Config dirs to wire. Default: ~/.claude + every existing ~/.claude-account-* (the VS Code launchers).
 if (-not $ConfigDir -or $ConfigDir.Count -eq 0) {
-    $cands = @( (Join-Path $env:USERPROFILE ".claude") )
+    $cands = @( (Join-Path $HomeDir ".claude") )
     $cands += @(
-        Get-ChildItem -LiteralPath $env:USERPROFILE -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
+        Get-ChildItem -LiteralPath $HomeDir -Directory -Filter ".claude-account-*" -ErrorAction SilentlyContinue |
             ForEach-Object { $_.FullName }
     )
     $ConfigDir = @($cands | Where-Object { Test-Path -LiteralPath $_ -PathType Container })
@@ -115,10 +128,52 @@ function Remove-GateHooks($Data) {
     return $Data
 }
 
+function Get-GateVersion([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    $m = [regex]::Match((Get-Content -LiteralPath $Path -Raw), '\$GateVersion\s*=\s*"([^"]+)"')
+    if ($m.Success) { $m.Groups[1].Value } else { "(unstamped)" }
+}
+
+function Get-GateHash([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return $null }
+    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+}
+
+# Every tool a gate script branches on. -Status calls this on the INSTALLED copy, deliberately: the
+# question it answers is "which rules does the gate that is RUNNING have, and are they all wired", and the
+# source's rule set is not evidence for either. That is the whole point of the audit -- rule 4 was in the
+# source, declared by this installer, and covered by tests, while the running gate had never heard of it.
+function Get-HandledTools([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return @() }
+    $text = Get-Content -LiteralPath $Path -Raw
+    $tools = [System.Collections.Generic.HashSet[string]]::new()
+    foreach ($m in [regex]::Matches($text, '\$tool\s+-(?:not)?in\s+@\(([^)]*)\)')) {
+        foreach ($q in [regex]::Matches($m.Groups[1].Value, '"([^"]+)"')) { $null = $tools.Add($q.Groups[1].Value) }
+    }
+    @($tools)
+}
+
 # ------------------------------------------------------------------------------------------ status
+# NB this branch runs BEFORE the CLAUDECODE refusal below, deliberately. Auditing is not installing, and
+# a session that cannot see whether the gate is current has no way to notice the exact failure that let
+# rule 4 sit unshipped for five days while every test reported it present. Installing stays a human act.
 if ($Status) {
-    $installed = Test-Path -LiteralPath $GateDst
-    Write-Host "gate script : $(if ($installed) { "installed -> $GateDst" } else { 'NOT installed' })"
+    $srcGate = Join-Path $RepoRoot "scripts\hooks\worktree_gate.ps1"
+    $iVer = Get-GateVersion $GateDst ; $sVer = Get-GateVersion $srcGate
+    $iSha = Get-GateHash    $GateDst ; $sSha = Get-GateHash    $srcGate
+
+    Write-Host "installed   : $(if ($iSha) { "$GateDst  v$iVer" } else { 'NOT installed' })"
+    Write-Host "source      : $(if ($sSha) { "$srcGate  v$sVer" } else { 'NOT FOUND' })"
+    if ($iSha -and $sSha) {
+        if ($iSha -eq $sSha) {
+            Write-Host "parity      : IN SYNC" -ForegroundColor Green
+        } else {
+            Write-Host "parity      : *** STALE *** the running gate is NOT this checkout's script." -ForegroundColor Red
+            Write-Host "              Re-run this installer to update it. Until you do, rules added or"
+            Write-Host "              removed in source have no effect, and the tests still pass."
+        }
+    }
+
     if (Test-Path -LiteralPath $ReposFile) {
         Write-Host "governing   :"
         Get-Content -LiteralPath $ReposFile | Where-Object { $_ -and -not $_.StartsWith('#') } |
@@ -126,13 +181,46 @@ if ($Status) {
     } else {
         Write-Host "governing   : nothing (no allowlist -> gate is OFF)"
     }
+
+    # Compare the wired matchers against the rules the INSTALLED script actually implements -- an
+    # expectation, not a count. A count of "3" is not information unless you know whether 3 is right.
+    $handled = @(Get-HandledTools $GateDst)
     foreach ($cd in $ConfigDir) {
         $sp = Join-Path $cd "settings.json"
         $s = Read-Settings $sp
-        $n = @($s.hooks.PreToolUse | Where-Object { @($_.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" } }).Count
-        Write-Host "hook entries: $n in $sp"
+        $wired = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($e in @($s.hooks.PreToolUse)) {
+            if (@($e.hooks) | Where-Object { "$($_.command)" -like "*$Marker*" }) {
+                foreach ($t in "$($e.matcher)".Split("|")) { if ($t) { $null = $wired.Add($t) } }
+            }
+        }
+        # Rules that are deliberately unwired are reported as such, never as UNWIRED. A status line that
+        # cries wolf about a known-and-intended state is one a reader learns to skip, which is how a real
+        # UNWIRED would go unnoticed -- the exact failure this whole block exists to surface.
+        $optIn   = @("EnterWorktree")
+        $absent  = @($handled | Where-Object { -not $wired.Contains($_) })
+        $missing = @($absent  | Where-Object { $optIn -notcontains $_ } | Sort-Object)
+        $offByChoice = @($absent | Where-Object { $optIn -contains $_ } | Sort-Object)
+        $stray   = @($wired   | Where-Object { $handled -notcontains $_ } | Sort-Object)
+        Write-Host "wiring      : $sp"
+        Write-Host "              matched  : $(@($wired | Sort-Object) -join ', ')"
+        if ($offByChoice) {
+            Write-Host "              opt-in   : $($offByChoice -join ', ')  <- off by default, add -EnterWorktreeGate to enable"
+        }
+        if ($missing) {
+            Write-Host "              UNWIRED  : $($missing -join ', ')  <- implemented but NEVER FIRES" -ForegroundColor Yellow
+        }
+        if ($stray) {
+            Write-Host "              stray    : $($stray -join ', ')  <- matched but the script ignores it" -ForegroundColor Yellow
+        }
     }
+    Write-Host ""
+    Write-Host "scanned $($ConfigDir.Count) config dir(s) against $(@($handled).Count) implemented rule(s)."
     return
+}
+
+if ($env:CLAUDECODE -eq "1") {
+    throw "Refusing to run inside Claude Code. A session that can install this gate can also remove it. Run from a plain pwsh terminal. (-Status is allowed from a session: auditing is not installing.)"
 }
 
 # --------------------------------------------------------------------------------------- uninstall
@@ -185,10 +273,12 @@ $command = "pwsh -NoProfile -File `"$GateDst`""
 $matchers = @(
     "Write|Edit|MultiEdit|NotebookEdit"   # rule 1 -- writes INTO the primary's tree
     "Bash|PowerShell"                     # rules 3 + 3b -- git verbs that swap the primary / hijack a worktree
-    "EnterWorktree"                       # rule 4 -- relocating a live session (loses its transcript)
 )
 if (-not $NoDispatchGate) {
     $matchers += "Task|Agent|Workflow"    # rule 2 -- subagent dispatch FROM the primary
+}
+if ($EnterWorktreeGate) {
+    $matchers += "EnterWorktree"          # rule 4 -- OPT-IN, see the parameter's note for why
 }
 
 $entries = foreach ($m in $matchers) {

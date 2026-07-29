@@ -29,10 +29,30 @@
 #>
 param(
     # Shared allowlist of primary checkouts to guard (one absolute path per line, '#' comments).
-    # Absent or empty => the backstop is OFF. Kept OUTSIDE any per-account config dir so it is
-    # account-agnostic and survives an account swap.
-    [string]$ReposFile = (Join-Path $env:USERPROFILE '.claude-hooks\worktree-gate.repos.txt')
+    # Absent or empty => the backstop is OFF.
+    #
+    # ONE allowlist, shared with the PreToolUse gate. There used to be two -- the gate read
+    # ~/.claude/hooks/worktree-gate.repos.txt and this backstop read ~/.claude-hooks/worktree-gate.repos.txt
+    # -- with one installer rewriting its own unconditionally and the other seeding the second only if
+    # absent. Nothing kept them in sync: adding a governed repo through the gate installer never reached
+    # the backstop, and `install-gate.ps1 -Uninstall` left this hook armed and still willing to run
+    # `git checkout` on the primary long after the gate was gone. They agreed only by luck.
+    #
+    # The legacy path is still read as a FALLBACK, because this script is installed as a copy: an older
+    # installed copy paired with a newer allowlist (or the reverse) must not silently turn the backstop
+    # off. Whichever file exists wins, gate location first.
+    [string]$ReposFile
 )
+
+if (-not $ReposFile) {
+    # Null-safely: $env:USERPROFILE is Windows-only and is NULL elsewhere, where Join-Path then throws a
+    # parameter-binding error rather than returning a path. Honour the env var when set (tests and account
+    # swaps override it) and fall back to the .NET accessor, which resolves $HOME on Unix.
+    $homeDir = if ($env:USERPROFILE) { $env:USERPROFILE } else { [Environment]::GetFolderPath('UserProfile') }
+    $shared = Join-Path $homeDir '.claude/hooks/worktree-gate.repos.txt'
+    $legacy = Join-Path $homeDir '.claude-hooks/worktree-gate.repos.txt'
+    $ReposFile = if (Test-Path -LiteralPath $shared) { $shared } else { $legacy }
+}
 
 $ErrorActionPreference = 'SilentlyContinue'
 
