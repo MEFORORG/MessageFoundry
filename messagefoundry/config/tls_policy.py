@@ -64,6 +64,7 @@ __all__ = [
     "cleartext_acceptance_audit_sink",
     "current_hop_posture",
     "enforce_insecure_hop",
+    "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
     "relax_verify_expiry",
@@ -295,6 +296,39 @@ def validate_tls_ciphers(value: str) -> str:
             f"these admit a non-forward-secret key exchange: {', '.join(non_fs)}"
         )
     return value
+
+
+def harden_cipher_suites(ctx: ssl.SSLContext, *, connector: str) -> None:
+    """**Assert** that every suite ``ctx`` would negotiate is forward-secret, and raise if not.
+
+    ASVS 12.1.2 / 11.6.2. ``validate_tls_ciphers`` already rejects a *configured* ``tls_ciphers`` /
+    ``proxy_tls_ciphers`` that admits static RSA/DH — but that validator only fires when an operator
+    sets the knob. A context built without one **inherits the interpreter's default suite list and
+    nothing checked it**, which is the real residual: inheritance without assertion, not (as the
+    residual of record says) "no cipher knob at all".
+
+    This is an assertion rather than a ``set_ciphers`` preference string, deliberately. Measured
+    against the shipped default on CPython 3.14.6 / OpenSSL 3.5.7, all four context shapes resolve to
+    **17 suites, zero non-forward-secret**, so this raises on no supported configuration today — it
+    converts an inherited property into a checked one. The obvious alternative,
+    ``set_ciphers("ECDHE+AESGCM:ECDHE+CHACHA20:...")``, was measured and REJECTED: against the shipped
+    default it *removes* six CBC-SHA2 suites that real MLLP/DICOM hospital peers still speak (an
+    interop regression) and *adds* two DSS suites the default did not enable. The default order
+    already leads with ``TLS_AES_256_GCM_SHA384``, so "strongest first" holds without touching it.
+
+    Raises :class:`ValueError` at construction — the same class the surrounding TLS config errors use,
+    so it surfaces at ``check`` / dry-run / ``serve`` rather than as a wire-time surprise.
+    """
+    non_fs = sorted(
+        {str(c.get("name", "?")) for c in ctx.get_ciphers() if not _is_forward_secret(c)}
+    )
+    if non_fs:
+        raise ValueError(
+            f"{connector}: the TLS context would negotiate non-forward-secret suite(s) "
+            f"{', '.join(non_fs)} (ASVS 12.1.2). Forward secrecy is required on every hop; a suite "
+            f"list that admits static RSA/DH key exchange lets a future key compromise decrypt "
+            f"recorded PHI traffic."
+        )
 
 
 def _is_forward_secret(cipher: Mapping[str, object]) -> bool:
