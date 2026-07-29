@@ -32,6 +32,12 @@ on:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
       - "v[0-9]+.[0-9]+.[0-9]+-*"  # pre-releases: v0.1.0-rc1, …
+      # The web console is SEPARATELY VERSIONED (its own __version__, changelog and PyPI cadence —
+      # docs/WEBCONSOLE-PACKAGE.md), so it gets its own tag namespace rather than riding an engine tag.
+      # It lives in THIS workflow rather than its own file because the PyPI Trusted Publisher for
+      # messagefoundry-webconsole is registered against `release.yml`; a separate file would not match it.
+      - "webconsole-v[0-9]+.[0-9]+.[0-9]+"
+      - "webconsole-v[0-9]+.[0-9]+.[0-9]+-*"
   workflow_dispatch:
 
 # Deny-all at the workflow level; each job below requests only the scopes it uses (least privilege).
@@ -55,7 +61,9 @@ jobs:
     # was already flipped to `==` at the cutover; release.yml was missed.
     #
     # `==` is also the safe form now: a fork, or the retired private vault, still cannot release.
-    if: github.repository == 'MEFORORG/MessageFoundry'
+    # NOT on a console tag: the console has its own job below and its own version root, so an
+    # engine release built from `webconsole-v*` would ship the engine at the console's version.
+    if: github.repository == 'MEFORORG/MessageFoundry' && !startsWith(github.ref_name, 'webconsole-')
     runs-on: ubuntu-latest
     permissions:
       contents: write       # create the release + upload its assets
@@ -339,6 +347,121 @@ jobs:
         uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
         with:
           packages-dir: dist-pub/
+          skip-existing: true
+          attestations: true
+
+  release-webconsole:
+    # Build + publish the SEPARATE `messagefoundry-webconsole` distribution (the browser ops console,
+    # packaging/messagefoundry-webconsole/). Unlike release-harness this is NOT lockstep with the engine:
+    # the console has its own __version__ root, changelog and PyPI cadence (docs/WEBCONSOLE-PACKAGE.md),
+    # so it fires on its OWN `webconsole-v*` tag and has NO `needs: release` — an engine release must not
+    # drag the console along, and a console release must not wait on one.
+    #
+    # ASVS 15.2.4 (dependency confusion). `messagefoundry-webconsole` is registered on PyPI as a PENDING
+    # Trusted Publisher against this workflow, which grants permission to publish but does NOT reserve the
+    # name: until a distribution is actually uploaded the name is claimable by anyone, and our own docs
+    # reference it. The FIRST successful run of this job creates the project and closes that exposure.
+    # Until then docs must point at the source-tree install (pinned by tests/test_install_instruction_provenance.py).
+    if: github.repository == 'MEFORORG/MessageFoundry' && startsWith(github.ref_name, 'webconsole-')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # gh release upload (attach the console wheel)
+      id-token: write   # PyPI Trusted Publishing (OIDC) — no API token anywhere
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Build the console wheel (wheel-only — the package tree is force-included from the repo root)
+        run: |
+          python -m pip install --upgrade pip build
+          # Wheel-only for the same reason as the harness: messagefoundry_webconsole/ lives OUTSIDE this
+          # project dir and is pulled in via force-include, so an sdist would not be self-contained.
+          python -m build --wheel ./packaging/messagefoundry-webconsole --outdir webconsole-dist
+          ls -l webconsole-dist/
+
+      - name: Smoke-check the console wheel (version == the console's OWN __version__ == tag)
+        run: |
+          built=$(python -c "import glob,re; print(re.search(r'messagefoundry_webconsole-([^-]+)-', glob.glob('webconsole-dist/*.whl')[0]).group(1))")
+          echo "console wheel version: $built"
+          # Compared against the CONSOLE's version root, never the engine's — that is the whole point of
+          # the separate tag namespace. PEP 440 comparison because hatchling normalises the filename
+          # (tag webconsole-v0.3.0-rc1 -> 0.3.0rc1), so a string compare could never match a pre-release.
+          if [ "${GITHUB_REF_TYPE:-}" = "tag" ]; then
+            want="${GITHUB_REF_NAME#webconsole-v}"
+            python -m pip install --quiet packaging
+            python - "$built" "$want" <<'PYVER'
+          import sys
+          from packaging.version import InvalidVersion, Version
+
+          built, want = sys.argv[1], sys.argv[2]
+          try:
+              b, w = Version(built), Version(want)
+          except InvalidVersion as exc:
+              raise SystemExit(f"::error::unparseable version ({exc}) — built={built!r} tag={want!r}")
+          if b != w:
+              raise SystemExit(
+                  f"::error::console wheel version {built} != tag {want} (normalised {b} != {w})"
+              )
+          print(f"console version matches tag: {b}")
+          PYVER
+          fi
+
+      # CREATE-OR-UPDATE, and it must CREATE — unlike release-harness, this job has no `needs: release`,
+      # so on a `webconsole-v*` tag NO engine job has run and NO GitHub release exists. A bare
+      # `gh release upload` (what the harness can safely use, because `needs: release` guarantees the
+      # release) would fail with "release not found" on every console tag, killing the job BEFORE the
+      # publish step below — i.e. the one job whose purpose is to claim the PyPI name could never claim it.
+      #
+      # The update arm is equally load-bearing: v0.3.1 showed a bare `gh release create` turns a single
+      # PyPI failure into a permanent retry deadlock (every re-run dies here and SKIPS the publish, so a
+      # re-run cannot even test the fix it exists to verify). Step ORDER is deliberate and matches the
+      # engine: the reversible action (a GitHub release, deletable) precedes the irreversible one (a PyPI
+      # upload burns that version forever).
+      - name: Create or update the console GitHub release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          ver="${tag#webconsole-v}"
+          # Notes come from the CONSOLE's own changelog, not the engine's — separate cadence, separate
+          # version root, separate release notes.
+          awk -v v="$ver" 'BEGIN{f=0} /^## \[/{ if(f) exit; if(index($0,"["v"]")) f=1 } f{print}'             packaging/messagefoundry-webconsole/CHANGELOG.md > notes.md || true
+          [ -s notes.md ] || echo "MessageFoundry web console $tag" > notes.md
+          case "$ver" in
+            *-*) pre_create="--prerelease"; pre_edit="--prerelease=true"  ;;
+            *)   pre_create="";             pre_edit="--prerelease=false" ;;
+          esac
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release $tag already exists — updating in place (this is a re-run)."
+            gh release edit "$tag" --title "$tag" --notes-file notes.md "$pre_edit"
+            gh release upload "$tag" webconsole-dist/*.whl --clobber
+          else
+            gh release create "$tag" webconsole-dist/*.whl --title "$tag" --notes-file notes.md $pre_create
+          fi
+
+      - name: Upload console artifact (dry-run / always)
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: webconsole-artifacts
+          path: webconsole-dist/
+          if-no-files-found: ignore
+
+      # GATED like the harness: no-op until the owner sets repo variable PUBLISH_WEBCONSOLE=true. The
+      # build + version-check above still run on every console tag, so the publish path is exercised
+      # before it is armed. Flipping the variable is what actually claims the PyPI name.
+      - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
+        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        with:
+          packages-dir: webconsole-dist/
           skip-existing: true
           attestations: true
 

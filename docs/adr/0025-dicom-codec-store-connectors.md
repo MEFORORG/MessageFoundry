@@ -292,7 +292,8 @@ right; built behind the Phase-1 slice:
   [transports/rest.py](../../messagefoundry/transports/rest.py) — **exactly as the SOAP and FHIR destinations do**.
   `SoapDestination`/`FhirDestination` are *not* wrappers of `RestDestination`; each is a sibling `DestinationConnector`
   that imports rest.py's `_NO_REDIRECT_OPENER`/`_NoRedirectHandler`, `_insecure_opener`, `_redact_url`,
-  `enforce_outbound_length_limits`, `refuse_cleartext_credentials`, the `_RETRYABLE_4XX` retry idiom, plus
+  `enforce_outbound_length_limits` (ASVS 4.2.5 -- applied to the DERIVED `_target_url`, not just `base_url`),
+  `refuse_cleartext_credentials`, the `_RETRYABLE_4XX` retry idiom, plus
   `signer_from_destination` — and follows rest.py's status→retry idiom. `DicomWebDestination` does the **same**: it
   **does not compose or instantiate `RestDestination`**, and it does **not** re-implement HTTP. It implements the
   `DestinationConnector` contract: one `async def send(self, payload: str) -> DeliveryResponse | None`, optional

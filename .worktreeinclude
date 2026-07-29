@@ -1,0 +1,17 @@
+# Gitignored files that Claude Code copies into every worktree it creates with git --
+# `claude --worktree`, desktop parallel sessions, and `isolation: worktree` subagents.
+# .gitignore syntax; only files that match AND are gitignored are copied, so nothing here
+# can be committed by accident.
+#
+# WHY THIS FILE EXISTS. `git worktree add` delivers tracked files only. The leak gate's token
+# list is deliberately gitignored, and the pre-commit hook passes --require-tokens and FAILS
+# CLOSED without it -- so a fresh worktree could not commit AT ALL, with an error message that
+# never mentions worktrees. scripts/worktree/new.ps1 hand-copies it for the worktrees IT makes,
+# but that covers none of the first-party creation paths above, which is where every nested
+# .claude/worktrees/ session lands. This closes that gap for all of them.
+#
+# Deliberately NOT here: .env and anything under secrets/. Those are refused by policy
+# (CLAUDE.md section 5), and a worktree that needs them should get them from the environment.
+# Also not .venv -- it is per-worktree ON PURPOSE (docs/WORKTREES.md), because a shared
+# `pip install -e .` binds to one source path and would silently test the wrong checkout.
+scripts/security/scan-tokens.local.txt

@@ -85,3 +85,42 @@ def test_decode_helpers_map_bad_body_to_apierror() -> None:
         _decode(httpx.Response(200, json={"unexpected": "shape"}), EngineInfo)
     with pytest.raises(ApiError):
         _decode_list(httpx.Response(200, json={"not": "a list"}), ChannelInfo)
+
+
+# --- ASVS 4.2.5: the client's own outbound length bound --------------------------------------------
+
+
+def test_apiclient_length_bounds_match_the_transport_constants() -> None:
+    """The constants are DUPLICATED in apiclient rather than imported, because ADR 0088 keeps this
+    package engine-free — a GUI/harness process must not pull `transports/` in just to make an HTTP
+    call. This test is where the duplication is kept honest: it imports both sides in a TEST process,
+    where the coupling is harmless, and reds if either drifts.
+
+    Mutation: change either constant on either side. Red: the assertion names both values."""
+    from messagefoundry.apiclient.client import (
+        MAX_REQUEST_HEADER_VALUE_LEN,
+        MAX_REQUEST_URL_LEN,
+    )
+    from messagefoundry.transports.rest import (
+        MAX_OUTBOUND_HEADER_VALUE_LEN,
+        MAX_OUTBOUND_URL_LEN,
+    )
+
+    assert MAX_REQUEST_URL_LEN == MAX_OUTBOUND_URL_LEN, (
+        f"apiclient bounds the URL at {MAX_REQUEST_URL_LEN} but the transports bound it at "
+        f"{MAX_OUTBOUND_URL_LEN}; the duplication has drifted"
+    )
+    assert MAX_REQUEST_HEADER_VALUE_LEN == MAX_OUTBOUND_HEADER_VALUE_LEN, (
+        f"apiclient bounds a header value at {MAX_REQUEST_HEADER_VALUE_LEN} but the transports "
+        f"bound it at {MAX_OUTBOUND_HEADER_VALUE_LEN}; the duplication has drifted"
+    )
+
+
+def test_apiclient_refuses_an_over_length_request_path() -> None:
+    """`_request` builds `base_url + path`; nothing measured it before. Mutation: delete the URL
+    check in `_request`. Red: DID NOT RAISE (the request reaches httpx instead)."""
+    from messagefoundry.apiclient.client import ApiError, EngineClient
+
+    client = EngineClient("http://127.0.0.1:8765")
+    with pytest.raises(ApiError, match="over the 8192-char limit"):
+        client._request("GET", "/messages?q=" + "a" * 9000)

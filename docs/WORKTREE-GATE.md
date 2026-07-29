@@ -7,6 +7,10 @@ worktree completely untouched.
 It is opt-in, installed by hand, governs only the checkouts you list, and comes back out cleanly
 (`settings.json` is restored byte-for-byte). See [Backing it out](#backing-it-out).
 
+> This page is the gate's own design rationale. For the gate **in context** — the whole drift-control
+> estate, which parts are actually installed and enforcing, and an audit of what they miss — see
+> [SESSION-DRIFT-CONTROLS.md](SESSION-DRIFT-CONTROLS.md).
+
 ---
 
 ## Why it exists

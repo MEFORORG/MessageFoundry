@@ -143,10 +143,24 @@ Server-side `state` is a CSRF/mix-up defence, **not** a browser binding — whoe
 - **AC-2** — WHEN a federated login completes, THE SYSTEM SHALL resolve roles from on-prem AD via
   `resolve_principal`, never from a token claim.
   → `tests/test_auth_oidc_service.py`
-- **AC-3** — IF the `id_token` fails any verification rung (signature, `iss`, `aud`/`azp`, `exp`/`iat`
-  skew, `nonce`, `kid` unknown/ambiguous, key below the floor), THEN THE SYSTEM SHALL refuse the login,
-  mint no session, and audit a closed-set reason slug.
+- **AC-3** — IF the `id_token` fails any verification rung (declared token class via `typ`/`events`,
+  signature, `iss`, `aud`/`azp`, `exp`/`iat` skew, required `sub`, `nonce`, `kid` unknown/ambiguous,
+  key below the floor), THEN THE SYSTEM SHALL refuse the login, mint no session, and audit a
+  closed-set reason slug.
   → `tests/test_auth_oidc.py`
+
+  *Amended 2026-07-28 (ASVS 9.2.2).* The class rungs were added because an access token
+  (`typ: at+jwt`), a back-channel logout token (`logout+jwt`) and an RFC 8417 security event token
+  are minted by the **same issuer under the same key** as the `id_token`: every signature and key
+  rung passes on them, so without an explicit class assertion the only thing between an access token
+  and an accepted login is nonce equality. An **absent** `typ` is still accepted — RFC 7519 §5.1
+  makes the header advisory and refusing it would lock out conforming IdPs.
+
+  > **Forward note for cell 10.5.5 (back-channel logout receiver).** A logout token legitimately
+  > carries `events` and no `nonce`, so `validate_id_token` will refuse it — correctly. Build that
+  > receiver its **own** logout-token ladder (OIDC Back-Channel Logout §2.4: require `events`, forbid
+  > `nonce`, require `sid`/`sub`). Do **not** relax `unexpected_events_claim` to reuse this function:
+  > that silently reopens ASVS 9.2.2 and no test outside this ADR note would catch it.
 - **AC-4** — IF the protected header declares `alg` outside the configured allow-list, THEN THE SYSTEM
   SHALL raise before any signature computation (`none` and `HS*` are unrepresentable in
   `SignatureAlgorithm`).

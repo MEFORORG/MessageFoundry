@@ -374,7 +374,7 @@ same-origin at `/ui` (not part of the service runtime — a separate, version-ma
 mounts in-process):
 
 ```powershell
-pip install "messagefoundry-webconsole"          # into the engine venv
+pip install -e packaging/messagefoundry-webconsole   # into the engine venv (not on PyPI yet)
 # set [api].serve_ui = true in the service settings, then (re)start the service
 ```
 

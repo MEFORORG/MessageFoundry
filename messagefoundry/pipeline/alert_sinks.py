@@ -298,6 +298,13 @@ class WebhookTransport:
                 "(cleartext, MITM-able — trusted-network/dev use only)",
                 INSECURE_TLS_ESCAPE_ENV,
             )
+        # ASVS 4.2.5: bound the webhook URL. Construction-only is sufficient here and not a shortcut:
+        # the URL is operator config and the sole header is a fixed ``Content-Type``, so nothing is
+        # added between here and the wire. Imported lazily to keep the module's import cost unchanged
+        # for the far commoner non-webhook sinks.
+        from messagefoundry.transports.rest import enforce_outbound_length_limits
+
+        enforce_outbound_length_limits(url, {"Content-Type": "application/json"})
         self.url = url
         self.timeout = timeout
         # Optional egress allowlist (lower-cased); empty = any host. SSRF defense-in-depth (1.3.6).

@@ -183,8 +183,10 @@ in → `fhir.resources` resource out, hand-authored (no pure-Python v2↔FHIR co
 that **reuses the shared module-level helpers** in [transports/rest.py](../../messagefoundry/transports/rest.py) —
 **exactly as the SOAP destination does**. `SoapDestination` ([transports/soap.py](../../messagefoundry/transports/soap.py))
 is *not* a wrapper of `RestDestination`; it is a sibling `DestinationConnector` that imports rest.py's
-`_NO_REDIRECT_OPENER`/`_NoRedirectHandler`, `_insecure_opener`, `_redact_url`, `enforce_outbound_length_limits`,
-`refuse_cleartext_credentials`, plus `signer_from_destination` — and follows rest.py's status→retry idiom.
+`_NO_REDIRECT_OPENER`/`_NoRedirectHandler`, `_insecure_opener`, `_redact_url`, `enforce_outbound_length_limits`
++ `enforce_send_time_length_limits` + `enforce_signature_header_limits` (ASVS 4.2.5 -- the construction gate
+sees only static config; the send-time gate bounds the per-call URL, the per-message headers and the minted
+bearer), `refuse_cleartext_credentials`, plus `signer_from_destination` — and follows rest.py's status→retry idiom.
 `FhirDestination` does the **same**: it **does not compose or instantiate `RestDestination`**, and it does
 **not** re-implement HTTP. It implements the `DestinationConnector` contract: one `async def send(self, payload:
 str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides, and it raises **only**
@@ -195,7 +197,9 @@ str) -> DeliveryResponse | None`, optional `aclose`/`test_connection` overrides,
 - The TLS posture: the no-redirect, TLS-verifying opener (`_NO_REDIRECT_OPENER`/`_NoRedirectHandler` — a 3xx is
   raised, never followed: the PHI-redirect defense, ASVS 15.3.2) and the `verify_tls=False` escape gated by
   `MEFOR_ALLOW_INSECURE_TLS` (`insecure_tls_allowed()`), plus the cleartext-credential refusal.
-- `enforce_outbound_length_limits`, `refuse_cleartext_credentials`, `_redact_url`, and the optional JWS signer
+- `enforce_outbound_length_limits` / `enforce_send_time_length_limits` / `enforce_signature_header_limits`
+  (ASVS 4.2.5; the FHIR per-call URL is message-derived, so the send-time arm is load-bearing here in a way it
+  is not for REST), `refuse_cleartext_credentials`, `_redact_url`, and the optional JWS signer
   hook (`signer_from_destination`, ADR 0018) for signed bodies.
 - The retry classification **idiom** from rest.py's `_post`: **2xx → delivered**; status in `_RETRYABLE_4XX =
   {408, 429}` **or** `5xx` → `DeliveryError` (transient → pipeline retries with backoff); **any other 4xx** (and a

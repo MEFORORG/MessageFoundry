@@ -564,3 +564,29 @@ def test_no_lookup_declared_is_unchanged() -> None:  # AC-7
     assert reg.fhir_lookups == {}
     with pytest.raises(FhirLookupError):
         fhir_lookup("epic", "Patient/123")
+
+
+# --- ASVS 4.2.5: the read URL is the most message-derived URL in the engine ------------------------
+
+
+async def test_fhir_lookup_over_length_read_url_is_refused() -> None:
+    """This executor never called the construction length gate at ALL — fhir.py's only call site was
+    the DESTINATION's __init__ — so both the configured base and the per-call read URL were unbounded.
+    The query is Handler-supplied and reaches `{base}/{query}` verbatim.
+
+    Mutation: replace the `find_outbound_length_violation` call in `_get` with `violation = None`.
+    Red: the `match=` below. **That clause is mandatory, not decorative** — with the guard gone the
+    oversize GET reaches the fake opener and `_parse` raises `FhirLookupError` anyway, so a bare
+    `pytest.raises(FhirLookupError)` would pass either way and prove nothing."""
+    ex, opener = _executor()
+    with pytest.raises(FhirLookupError, match="over the 8192-char limit"):
+        await ex.read("epic", "Patient?name=" + "a" * 9000)
+    assert opener.requests == [], "the over-length request must never reach the opener"
+
+
+async def test_fhir_lookup_ordinary_read_still_reaches_the_opener() -> None:
+    """Byte-identity control for the gate above: a normal read is untouched. Mutation: drop
+    MAX_OUTBOUND_URL_LEN to 8 → this reds, proving the gate sits on the ordinary path."""
+    ex, opener = _executor(body=b'{"resourceType": "Patient", "id": "123"}')
+    await ex.read("epic", "Patient/123")
+    assert len(opener.requests) == 1

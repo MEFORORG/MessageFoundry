@@ -37,6 +37,9 @@ REASONS: frozenset[str] = frozenset(
         "malformed_token",
         "malformed_payload",
         "claim_not_numeric",
+        "claim_sub_missing",
+        "wrong_token_type",
+        "unexpected_events_claim",
         "unknown_kid",
         "ambiguous_kid",
         "key_rejected",
@@ -100,6 +103,37 @@ class FederatedPrincipal:
     expires_at: float
 
 
+#: The ``typ`` values an ``id_token`` may declare, after normalisation. RFC 7519 §5.1 makes the header
+#: advisory and OIDC Core does not mandate it, so an ABSENT ``typ`` is accepted — refusing it would
+#: lock out conforming IdPs that omit it.
+_ID_TOKEN_TYPS: frozenset[str] = frozenset({"jwt"})
+
+
+def _assert_id_token_typ(header: Mapping[str, object]) -> None:
+    """Refuse a JWS whose header DECLARES a class other than ``id_token`` (ASVS 9.2.2).
+
+    The tokens this excludes — an access token (``at+jwt``, RFC 9068), a back-channel logout token
+    (``logout+jwt``), a security event token (``secevent+jwt``) — are minted by the **same issuer
+    under the same key**, so every check downstream of key selection passes on them. Without this the
+    only thing between an access token and an accepted federated login is nonce equality.
+
+    Normalisation is ``.strip().lower().removeprefix("application/")``, lower-casing **before** the
+    prefix strip: RFC 7515 §4.1.9 lets the ``application/`` prefix be omitted and media types are
+    case-insensitive, so ``Application/JWT`` is a legal spelling of ``jwt``. Stripping first would
+    leave ``Application/JWT`` un-normalised and refuse a conforming token.
+
+    Called at the TOP of key selection, before the kid guard and the alg pin, so a wrong-class token
+    is audited as ``wrong_token_type`` rather than as whichever unrelated rung it happens to trip.
+    """
+    typ = header.get("typ")
+    if typ is None:
+        return
+    if not isinstance(typ, str):
+        raise ClaimsError("wrong_token_type", "id_token header typ is not a string")
+    if typ.strip().lower().removeprefix("application/") not in _ID_TOKEN_TYPS:
+        raise ClaimsError("wrong_token_type", f"id_token header declares typ {typ!r}")
+
+
 def _select_key_and_alg(
     id_token: str, policy: OidcClaimPolicy, jwks: JwksCache
 ) -> tuple[object, SignatureAlgorithm]:
@@ -107,6 +141,7 @@ def _select_key_and_alg(
         header = unverified_jws_header(id_token)
     except SigningError as exc:
         raise ClaimsError("malformed_token", str(exc)) from exc
+    _assert_id_token_typ(header)
     kid = header.get("kid")
     if not isinstance(kid, str) or kid == "":
         raise ClaimsError("unknown_kid", "id_token header carries no kid")
@@ -146,13 +181,26 @@ def _verify_signature(id_token: str, key: object, policy: OidcClaimPolicy) -> Ma
         raise ClaimsError("malformed_payload", str(exc)) from exc
 
 
-def _check_core_claims(claims: Mapping[str, object], policy: OidcClaimPolicy, now: float) -> float:
-    """Walk the core OIDC claim checks and **return the verified ``exp``** (ADR 0142 AC-6).
+def _check_core_claims(
+    claims: Mapping[str, object], policy: OidcClaimPolicy, now: float
+) -> tuple[float, str]:
+    """Walk the core OIDC claim checks and **return the verified ``(exp, sub)``** (ADR 0142 AC-6).
 
-    The `exp` is returned rather than discarded so the session cap has a second operand that came
-    from the *signature-verified* claims. A caller must never re-parse the token to recover it — that
-    is the second-read bug class ``verify_compact_jws`` exists to foreclose.
+    Both are returned rather than discarded so the session cap and the audit subject have operands
+    that came from the *signature-verified* claims. A caller must never re-parse the token to recover
+    either — that is the second-read bug class ``verify_compact_jws`` exists to foreclose.
     """
+    # ASVS 9.2.2, ahead of every other claim check. A claim set carrying ``events`` is a Security
+    # Event Token (RFC 8417) — a back-channel logout token or similar — not an ``id_token``, and the
+    # two must not be interchangeable. This runs FIRST because a logout token carries no ``nonce``:
+    # checked in ladder order it would be refused as ``nonce_mismatch``, which indicts the browser
+    # binding and tells the operator the wrong thing about why the login failed.
+    if "events" in claims:
+        raise ClaimsError(
+            "unexpected_events_claim",
+            "claim set carries an events claim (RFC 8417 SET, not an id_token)",
+        )
+
     if claims.get("iss") != policy.issuer:
         raise ClaimsError("claim_iss", "iss does not match the pinned issuer")
 
@@ -168,10 +216,13 @@ def _check_core_claims(claims: Mapping[str, object], policy: OidcClaimPolicy, no
     exp = _require_number(claims, "exp", "expired")
     if now > exp + skew:
         raise ClaimsError("expired", "id_token exp is in the past")
-    if "iat" in claims:
-        iat = _require_number(claims, "iat", "issued_in_future")
-        if iat > now + skew:
-            raise ClaimsError("issued_in_future", "id_token iat is in the future")
+    # ``iat`` is REQUIRED of an id_token by OIDC Core 2, so it is read unconditionally rather than
+    # behind an `if "iat" in claims` guard. A token omitting it is not an id_token; the omission
+    # surfaces as ``claim_not_numeric`` at this rung, the same slug a non-numeric ``iat`` already
+    # raised, so no new reason enters the closed set.
+    iat = _require_number(claims, "iat", "issued_in_future")
+    if iat > now + skew:
+        raise ClaimsError("issued_in_future", "id_token iat is in the future")
     if "nbf" in claims:
         nbf = _require_number(claims, "nbf", "not_yet_valid")
         if now + skew < nbf:
@@ -181,7 +232,15 @@ def _check_core_claims(claims: Mapping[str, object], policy: OidcClaimPolicy, no
     if not isinstance(token_nonce, str) or not hmac.compare_digest(token_nonce, policy.nonce):
         raise ClaimsError("nonce_mismatch", "id_token nonce does not match the flow nonce")
 
-    return exp
+    # ``sub`` is REQUIRED of an id_token by OIDC Core 2 and is the only stable identifier the
+    # assertion carries. It was previously read with an `else ""` fallback at construction, so a
+    # token without one minted a principal whose subject was the empty string — and that empty
+    # subject was written into the ``auth.login_success`` audit as if it were evidence.
+    subject = claims.get("sub")
+    if not isinstance(subject, str) or subject == "":
+        raise ClaimsError("claim_sub_missing", "id_token carries no usable sub claim")
+
+    return exp, subject
 
 
 def _require_number(claims: Mapping[str, object], field_name: str, _reason: str) -> float:
@@ -272,14 +331,13 @@ def validate_id_token(
     """
     key, _alg = _select_key_and_alg(id_token, policy, jwks)
     claims = _verify_signature(id_token, key, policy)
-    expires_at = _check_core_claims(claims, policy, clock())
+    expires_at, subject = _check_core_claims(claims, policy, clock())
     amr, acr = _check_mfa_gate(claims, policy)
     username = _resolve_username(claims, policy)
 
-    subject = claims.get("sub")
     return FederatedPrincipal(
         username=username,
-        subject=subject if isinstance(subject, str) else "",
+        subject=subject,
         amr=amr,
         acr=acr,
         expires_at=expires_at,

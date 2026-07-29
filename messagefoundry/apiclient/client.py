@@ -72,6 +72,15 @@ __all__ = ["EngineClient", "ApiError"]
 _log = logging.getLogger(__name__)
 _LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
+# ASVS 4.2.5, the client half. Deliberately DUPLICATED from transports/rest.py's
+# MAX_OUTBOUND_URL_LEN / MAX_OUTBOUND_HEADER_VALUE_LEN rather than imported: ADR 0088 makes this
+# package Qt-free AND engine-free, so a GUI or harness process can depend on it without dragging in
+# transports/. Importing the constants would reintroduce exactly that coupling. The values are pinned
+# equal by test_apiclient_length_bounds_match_the_transport_constants, which imports both sides in a
+# TEST process (where the coupling is harmless) and fails if either drifts.
+MAX_REQUEST_URL_LEN = 8192
+MAX_REQUEST_HEADER_VALUE_LEN = 8192
+
 
 class ApiError(RuntimeError):
     """An API call failed (transport error, a non-2xx response, or an undecodable 2xx body)."""
@@ -273,6 +282,22 @@ class EngineClient:
         **kw: object,
     ) -> httpx.Response:
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else None
+        # ASVS 4.2.5: bound the request line and the bearer this client emits. The limits are
+        # DUPLICATED from transports/rest.py rather than imported: ADR 0088 makes this package
+        # engine-free (a GUI/harness process must not pull transports/ in), so the import that would
+        # share them is exactly the coupling this package exists to avoid. Kept in step by
+        # ``test_apiclient_length_bounds_match_the_transport_constants``.
+        if len(self.base_url) + len(path) > MAX_REQUEST_URL_LEN:
+            raise ApiError(
+                f"request URL is {len(self.base_url) + len(path)} chars, over the "
+                f"{MAX_REQUEST_URL_LEN}-char limit"
+            )
+        if headers is not None and len(headers["Authorization"]) > MAX_REQUEST_HEADER_VALUE_LEN:
+            # Never echo the value: it is a live session bearer.
+            raise ApiError(
+                f"the session Authorization header is {len(headers['Authorization'])} chars, over "
+                f"the {MAX_REQUEST_HEADER_VALUE_LEN}-char limit"
+            )
         try:
             response = self._http.request(method, path, headers=headers, **kw)  # type: ignore[arg-type]
         except httpx.HTTPError as exc:
