@@ -110,6 +110,8 @@ reading the emitted decision — not by reading source alone.
 | Control | Scope | Status |
 |---|---|---|
 | Rule 1 — write into primary | user | **LIVE** (probe-verified DENY) |
+| Rule 1a — write to the gate's own script or allowlist | user | **NEW** — the kill switch sat outside every governed root, so rule 1 allowed an `Edit` to it |
+| Rule 3c — `git config` that disarms the shared repo | user | **NEW** — `core.hooksPath` / `core.worktree` / `alias.*` / `include.path`; asks git for the common dir, so a *linked worktree* is covered too |
 | Rule 2 — dispatch from primary | user | **LIVE** (probe-verified DENY) |
 | Rule 3 — git verbs vs primary | user | **LIVE, partial** — the `-c` and relative-`cd` holes are fixed in source (G2/G3); enumerated-verb gaps remain (G9) |
 | Rule 3b — worktree hijack | user | **LIVE but narrow** — 2 of 11 verbs, existing-local-branch destinations only |
@@ -227,7 +229,7 @@ Note also a naming collision worth cleaning up: `mefor.homeBranch` (a git config
 `restore-primary.ps1` and selfheal) and `mefor-home-branch` (an untracked file written by `new.ps1`) are
 two different mechanisms one letter apart.
 
-### G5 — The gate's own enforcement surface is writable by every governed session
+### G5 — The gate's own enforcement surface is writable by every governed session — **FIXED**
 
 The live gate is `~/.claude/hooks/worktree_gate.ps1`; the kill switch is
 `~/.claude/hooks/worktree-gate.repos.txt`; the matchers are in five `settings.json` files. **None of those
@@ -239,7 +241,7 @@ The gate's header says the kill switch is "deliberately NOT named in the deny me
 `bypassPermissions` would use it." That is security by obscurity over a file one `ls` away. By contrast
 `<primary>/.git/hooks` **is** governed by rule 1 already, and a test asserts it.
 
-### G6 — The shared `.git` is unprotected against config-level disarm
+### G6 — The shared `.git` is unprotected against config-level disarm — **FIXED**
 
 `config` is not in rule 3's verb list, so `git config core.hooksPath …` and `git -c core.hooksPath=… commit`
 pass (probe-verified ALLOW) — disabling the ledger/claim/leak commit gates for **all eight worktrees at
@@ -440,10 +442,11 @@ analysis must be redone.
 | B1 | **Mostly done** | Parity check, `-Status` audit, `-EnterWorktreeGate` opt-in. **Not** done: it emits no liveness receipt through `scripts/quality/liveness.py`, so on CI it is three honest skips rather than a tracked result. |
 | B3 | **Mostly done** | Shared resolver, case-sensitive `-C`, `cd`/`pushd` from the prefix only, `--work-tree` / `GIT_WORK_TREE` / `--git-dir` as additional candidates. **Not** done: `GIT_DIR=` is unhandled. Rule 3b's early return is now moot — both rules resolve through the same function — rather than literally inverted. |
 | B4 | **Mostly done** | Per-line scanning, continuation folding, interpreter-argument recursion, quoted spans blanked. **Not** done: the split helper is still not shared with `block-blanket-git-stage.ps1`, so the two hooks can still disagree about what a command is. |
+| B5, B8 | **Done** | Rules 1a and 3c: the gate's own script and allowlist are governed, and the `git config` keys that disarm the shared repo are denied from any worktree. **Not** done: `~/.claude/settings.json` is deliberately left writable — the `update-config` skill exists to edit it, and blocking it would break a supported workflow to close a hole needing a far more deliberate act. |
 | B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
-| B5, B6, B8, B10, B11 | **Not started** | B6 (worktree-first entry point) has the largest durable effect and no code in it. |
+| B6, B10, B11 | **Not started** | B6 (worktree-first entry point) has the largest durable effect and no code in it. |
 
-Remaining order: B6, then B8 (cross-worktree blast radius), then B5, B10, B11, then the B1/B3/B4 remainders.
+Remaining order: B6, then B10, B11, then the B1/B3/B4 remainders.
 
 Each shipped fix was proved to catch its own regression by mutation — five mutations applied to the shipped
 script one at a time, all five went red — and an adversarial review of the first attempt found three

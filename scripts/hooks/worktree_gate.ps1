@@ -419,6 +419,62 @@ if ($tool -in @("Bash", "PowerShell")) {
     $cmd = [string]$hook.tool_input.command
     if (-not $cmd) { exit 0 }
 
+    # -----------------------------------------------------------------------------------------------
+    # Rule 3c -- a git CONFIG write that disarms the SHARED repository. `config` changes no tree, so the
+    # verb list never saw it, and its blast radius is worse than a tree swap: all eight worktrees share
+    # one `.git`, so `git config core.hooksPath /dev/null` run in ANY of them disables the ledger, claim
+    # and leak commit gates for EVERY one at once. `-c core.hooksPath=` does it for a single command,
+    # which is enough to slip one commit past them. `core.worktree`, `alias.*` and `include.path` are the
+    # same class: they redirect what a later git command actually does.
+    #
+    # Deliberately narrow. Reads (`--get`, `--list`, ...) and every other key stay untouched -- this must
+    # not become a general ban on configuring a repo, and `git config user.email` is ordinary setup.
+    #
+    # Unlike rules 1-3 this does NOT use Test-Governed, because its `.claude/worktrees/` exemption is
+    # exactly wrong here: a linked worktree is not the primary, but its config write lands in the SHARED
+    # config and harms every sibling. Ask git for the common dir instead, which catches nested worktrees,
+    # sibling worktrees and the primary alike. Any git failure falls through to ALLOW.
+    # -----------------------------------------------------------------------------------------------
+    $dangerKeys = 'core\.hookspath|core\.worktree|alias\.[\w.-]+|include\.path|includeif\.'
+    foreach ($seg in (Get-ScannableSegments $cmd)) {
+        if ($seg.Scan -cnotmatch '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)') { continue }
+        if ($seg.Scan -notmatch "(?:\bconfig\b[^|;&]*?\s|-c\s+)(?<key>$dangerKeys)") { continue }
+        $badKey = $Matches['key']
+        # A read is not a write.
+        if ($seg.Scan -match '(?:^|\s)--(get|get-all|get-regexp|list|show-origin)(\s|$)') { continue }
+
+        $at = [regex]::Match($seg.Raw, '(^|[\s;&|(''"\\/])git(\.exe)?["'']?(\s|$)')
+        $pfx = $(if ($at.Success) { $seg.Raw.Substring(0, $at.Index) } else { "" })
+        $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
+        if ($where.Count -eq 0) { continue }
+
+        $common = "$(& git -C $where[0] rev-parse --git-common-dir 2>$null)".Trim()
+        if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
+        $commonCmp = Get-ComparablePath $common $where[0]
+        $govCfg = $null
+        foreach ($r in $roots) {
+            if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
+        }
+        if (-not $govCfg) { continue }
+
+        Write-Deny -Rule "3c" -Detail "git config $badKey" -Reason @"
+BLOCKED: setting '$badKey' would change the SHARED git configuration of $($govCfg.Display).
+
+Every worktree of this repository shares one .git directory, so this is not a local change: it takes
+effect for all of them at once. Repointing core.hooksPath (or aliasing a command, or redirecting
+core.worktree) disables the commit-time ledger, claim and secret-leak gates for every session on this
+machine, and nothing would report that they had stopped running.
+
+What to do instead:
+  * If a commit hook is failing, FIX THE CAUSE -- the hook output names it. Never route around a gate;
+    that converts a caught problem into an uncaught one.
+  * If you need a different hook set for a genuine reason, that is a repository decision. STOP and tell
+    the user: "I need to change core.hooksPath on the shared repo and the worktree gate blocked it."
+  * Ordinary per-user config (user.email, user.name, and anything that is not on the disarm list) is
+    untouched and needs no workaround.
+"@
+    }
+
     # The verb must be a whole SUBCOMMAND. `\bmerge\b` is not enough: a hyphen counts as a word boundary,
     # so it also matches the `merge` inside `merge-base` and `merge-tree` -- both of which are READ-ONLY
     # and are exactly what a session should be using instead of a checkout. Require the verb to end at
@@ -555,6 +611,49 @@ if (-not $target) { exit 0 }   # unrecognized tool shape -> fail open
 if (-not [System.IO.Path]::IsPathRooted($target)) {
     if (-not $hook.cwd) { exit 0 }
     $target = Join-Path ([string]$hook.cwd) $target
+}
+
+# ---------------------------------------------------------------------------------------------------
+# Rule 1a -- the gate's OWN enforcement surface. The installed script and its allowlist live OUTSIDE
+# every governed root, so Test-Governed returned $null for them and rule 1 allowed an Edit to either: one
+# line written to the allowlist disarms the gate for every session on this machine, permanently and
+# silently. The docstring's answer was that the kill switch is "deliberately NOT named in the deny
+# message" -- obscurity over a file one `ls` away, and not a control.
+#
+# Scoped to ~/.claude/hooks/ ONLY, deliberately. settings.json is NOT covered: editing it is sanctioned
+# work (the update-config skill exists to do exactly that), and blocking it would break a supported
+# workflow to close a hole that requires a far more deliberate act than deleting a stray-looking text
+# file. This closes the accident and the cheap route-around, which is all a guardrail is for.
+#
+# The installer is unaffected: it writes from a plain terminal via Set-Content/Copy-Item, which is a
+# SHELL call and not an Edit, so no tool-argument rule sees it. That asymmetry is the point -- the human
+# installs and removes the gate; a session may not.
+# ---------------------------------------------------------------------------------------------------
+# Match the two exact FILES, never their parent directory. Keying on the parent looked tidier and was
+# wrong twice over: $ReposFile is a parameter that can point anywhere (under test it sits in a temp dir,
+# where it swallowed every unrelated path), and ~/.claude/hooks/ also holds things this rule has no
+# business governing. The surface worth protecting is precisely the kill switch and the script it arms.
+$gateFiles = @(
+    (Get-ComparablePath $ReposFile)
+    (Get-ComparablePath (Join-Path (Split-Path -Parent $ReposFile) "worktree_gate.ps1"))
+) | Where-Object { $_ }
+if ((Get-ComparablePath $target) -in $gateFiles) {
+    Write-Deny -Rule "1a" -Detail $target -Reason @"
+BLOCKED: this writes to the worktree gate's own enforcement surface ($target).
+
+That directory holds the installed hook and its allowlist. The allowlist is the gate's kill switch -- a
+single edit there turns it off for every session on this machine, so a session may not write here at all.
+This is not a file to fix in passing.
+
+If the gate is genuinely wrong -- a false positive, a rule that needs changing -- fix it at the SOURCE and
+re-install, which is a human act from a plain terminal:
+
+    scripts\hooks\worktree_gate.ps1        the rule you want to change
+    scripts\worktree\install-gate.ps1      installs it (refuses to run inside Claude Code)
+
+If you need it OFF right now, say so and let the user decide, in these words: "I want the worktree gate
+turned off and I need you to do it." Do not disable it yourself.
+"@
 }
 
 $root = Test-Governed (Get-ComparablePath $target)
