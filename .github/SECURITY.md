@@ -15,7 +15,11 @@ verify a report against current `main` before filing.
 - **Preferred (always available, fully private):** open a [GitHub private security advisory](https://github.com/MEFORORG/MessageFoundry/security/advisories/new)
   ("Report a vulnerability") — GitHub keeps it private to the maintainers until coordinated disclosure.
   This is the recommended channel.
-- Alternatively, email the maintainer at the address on the GitHub profile.
+- **No GitHub account?** Email **<security@messagefoundry.org>** — it reaches the maintainers
+  directly. Ordinary email is not end-to-end encrypted, so the advisory above is still preferred for a
+  detailed report; if you only have email, send a short notice and we will open a private channel.
+  Please do **not** use the website contact form for vulnerability details — it is routed through a
+  third-party form service.
 
 If you cannot reach a maintainer privately within a few business days, you may request a contact via a
 **non-detail** public issue (title only, e.g. "requesting a private security contact") — **never** put
@@ -56,11 +60,11 @@ is *not* a contradiction of the ≤7-day own-code window above):
   else's library, so the SLA measures how fast we adopt the fix once it exists.
 - **Exploitation pressure sets priority, not CVSS alone.** We triage **KEV-first** (on CISA's
   Known-Exploited-Vulnerabilities list → patch now), then **EPSS** (≥ 0.7 = imminent), with **CVSS only
-  as a tiebreaker**, and we weigh **reachability** (is the package installed in a shipped profile, wired
-  into a running graph, and egress-reachable? — see `docs/security/SOUP-DEPENDENCY-HANDLING.md`, a
-  maintainer-internal document; see
-  [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md) for why it is not published here
-  and what you can request).
+  as a tiebreaker**, and we weigh **reachability** — is the package installed in a shipped profile,
+  wired into a running graph, and egress-reachable? The procedure behind that judgement is
+  `docs/security/SOUP-DEPENDENCY-HANDLING.md`, a maintainer-internal document;
+  [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md) explains why it is not published
+  here and what you can request.
 
 | Class | Trigger | Target (from upstream-fix availability) |
 |---|---|---|
@@ -74,7 +78,8 @@ is *not* a contradiction of the ≤7-day own-code window above):
 leave the affected extra uninstalled, or tighten the egress allow-list — and track to the fix. Detection
 feeds this lane automatically: blocking `pip-audit`/`npm-audit` against the hash-locked tree, a **daily**
 `security.yml` cron (a CVE against an unchanged pin is caught in ~24h), and grouped Dependabot security
-PRs. The step-by-step response is `docs/security/DEP-CVE-RUNBOOK.md` (also maintainer-internal).
+PRs. The step-by-step response is `docs/security/DEP-CVE-RUNBOOK.md`, also maintainer-internal —
+see [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md).
 
 ## Scope notes
 
