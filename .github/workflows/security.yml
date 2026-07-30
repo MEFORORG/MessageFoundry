@@ -78,7 +78,12 @@ jobs:
           # same lock, so a fresh `uv pip install -e ".[extras]"` cannot drift to a newer upstream
           # release. Re-export it here so it can never fall out of step with uv.lock.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
-          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock
+          # The CI TOOLCHAIN locks (ADR 0034 §3): PEP 735 `[dependency-groups]`, so the scanners and the
+          # quality tools flow through uv.lock and are consumed HASH-PINNED. Non-default groups, so they
+          # stay out of the four exports above (and out of the SBOM / image locks / audited runtime).
+          uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
+          uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
+          git diff --exit-code -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock
       - name: Install from the hashed lockfile (DEP-1)
         run: |
           # --require-hashes enforces a hash for every requirement (the lockfile carries them): a
@@ -89,13 +94,19 @@ jobs:
           /tmp/lockcheck/bin/pip install --require-hashes -r requirements.lock
       - name: Audit the locked dependencies (DEP-1)
         run: |
-          # PINNED. This job exists to prove nothing unpinned enters the tree, and it was installing
-          # its own auditor with a bare `pip install pip-audit` — dependency intake that none of the
-          # lockfiles it checks actually covers. `==` also makes the audit reproducible: an unpinned
-          # auditor can change its advisory database handling between two runs of the same commit.
-          python -m pip install --upgrade pip "pip-audit==2.10.1"
+          # HASH-PINNED from the lock, not merely `==`-pinned: a version pin does not satisfy Scorecard
+          # PinnedDependenciesID, and the transitive closure floated regardless. Rationale for each pin
+          # lives in pyproject.toml's [dependency-groups]. The `--upgrade pip` bootstrap is GONE rather
+          # than pinned — this lock hash-pins `pip` itself (a pip-audit → pip-api dependency).
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           pip-audit -r requirements.lock --desc
+          # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
+          # without this a CVE in a pinned scanner is invisible to every gate — the "pinned, stale,
+          # unpatched is worse than floating" failure ADR 0034 §3 names. `--ignore-vuln <ID>` is the
+          # escape hatch for a triaged advisory, exactly as for the lockfile audit above.
+          pip-audit -r ci/locks/ci-scanners.lock --desc
+          pip-audit -r ci/locks/ci-quality.lock --desc
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
       # blocks today with no branch-protection change, the same reasoning as the ledger-gate backstop
       # in ci.yml. (A hard-failing job that is NOT a required context does not stop auto-merge — it
@@ -300,9 +311,10 @@ jobs:
           python-version: "3.14"
       - name: Scan source for insecure patterns
         run: |
-          # Pin bandit: an unpinned upgrade once silently changed `# nosec` parsing (1.9.x requires
-          # space-separated test IDs) and broke a green branch. Bump deliberately, not implicitly.
-          python -m pip install --upgrade pip "bandit==1.9.4"
+          # HASH-PINNED from the lock (ADR 0034 §3); bandit's version is the findings baseline of a
+          # blocking gate — the `# nosec`-parsing incident behind that pin is recorded beside the pin
+          # itself, in pyproject.toml's [dependency-groups].ci-scanners. Bump there, then re-export.
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
           # Skips are reviewed-safe project idioms. The subprocess sites (B603/B607) are annotated
           # per-line with `# nosec` at the call instead of a wholesale skip, so a NEW unreviewed
           # subprocess call is still flagged (review low-27):
