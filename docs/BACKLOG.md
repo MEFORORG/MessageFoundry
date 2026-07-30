@@ -6904,6 +6904,8 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 ## 232. Steps view for routers
 
+> 🔢 **Filed 2026-07-30 — not started.** ADR-first: a `route` row kind widens the ADR 0076 §3 grammar, so the amendment lands before any build.
+
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
 
 **What:** `lens parse` emits rows per `@handler` only — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) §3 states routers are "**out of v1 scope**" — so a `@router` function gets **no Steps view at all**: no "Reopen in Steps view" CodeLens on the def, no rows. An analyst who can read a Handler as steps drops back to raw Python the moment *routing* is the question, which is exactly where destination selection and fan-out are decided.
@@ -6928,6 +6930,8 @@ def route_demo_oru(msg):
 
 ## 233. Steps view move-drop logic implemented twice (model + webview)
 
+> 🔢 **Filed 2026-07-30 — not started.** Prerequisite for #237; option (c), a differential test across both implementations, can land first on its own.
+
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (de-duplicate). **Severity:** medium — a silent-divergence class, not a visible bug.
 
 **What:** the row move/drop semantics exist in **two independent implementations** that must agree and are not mechanically kept in agreement:
@@ -6950,6 +6954,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 ## 234. Steps view projection refreshes on save only
 
+> 🔢 **Filed 2026-07-30 — not started.** The framing itself (revisit vs. fix) is unsettled — read the Verdict line and #225 before treating this as either.
+
 **Cluster:** IDE & Authoring. **Priority:** P3. **Verdict:** **revisit — ADR amendment required, do not treat as a bug.** **Severity:** low (UX latency).
 
 **What:** the Steps view re-projects the handler on **save**, not on edit. Type in the split text editor and the rows do not follow until the buffer is written. Live values go further and are **skipped entirely while `document.isDirty`**.
@@ -6965,6 +6971,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 **Source:** Windmill/Kestra evaluation (2026-07-30); owner asked for it to be filed the same day.
 
 ## 235. Generate Steps view parameter forms from Python type hints
+
+> 🔢 **Filed 2026-07-30 — not started.** Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
 
@@ -6982,6 +6990,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 ## 236. Test-this-step and test-up-to-step with pinned upstream values
 
+> 🔢 **Filed 2026-07-30 — not started.** Largely a stop condition + state dump on ADR 0072's traced dry-run; lookup rows must mock by default, not as an afterthought.
+
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
 
 **What:** the Steps view's Test control delegates to the Test Bench — it runs the **whole** handler. Windmill's OSS editor offers *test this step*, *test up to this step*, and **step mocking** (pin an upstream step's output and run from there). The analog: run a handler **up to row N** against a chosen synthetic sample and show the message state at that point; optionally pin an upstream row's result so a lower row can be exercised without re-running an expensive lookup.
@@ -6995,6 +7005,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 **Source:** Windmill/Kestra evaluation (2026-07-30); owner approved testing it as a separate lane from #235.
 
 ## 237. Per-argument input modes (static templated dynamic) in the Steps view
+
+> 🔢 **Filed 2026-07-30 — not started.** Gated on #233: the duplicated move/drop logic is a prerequisite for touching this form surface.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
@@ -7012,6 +7024,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 ## 238. OpenFlow step-attribute completeness pass over the engine vocabulary
 
+> 🔢 **Filed 2026-07-30 — not started.** A review whose output is findings, not a feature; OpenFlow is explicitly **not** a compatibility target.
+
 **Cluster:** IDE & Authoring / Engine. **Priority:** P3. **Verdict:** build (a review, not a feature). **Severity:** none — this is a gap-analysis task whose output is findings.
 
 **What:** read Windmill's **OpenFlow** step-attribute vocabulary as a **completeness checklist** against MessageFoundry's own step/connector semantics, and record what is missing, what is deliberately absent, and what is already covered under a different name. The attributes to walk: `retry`, `timeout`, `stop_after_if`, `skip_if`, `continue_on_error`, `mock`, `cache_ttl`.
@@ -7025,6 +7039,8 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 **Source:** Windmill/Kestra evaluation (2026-07-30); owner approved the checklist framing explicitly ("don't target compatibility").
 
 ## 239. Re-measure Steps view estate coverage (opaque vs editable rows) after the palette
+
+> 🚧 **PARTIAL — measured 2026-07-30, tooling not yet merged.** The scan ran against the de-identified estate (388 files · 145 handlers · 1,423 rows · 0 parse refusals; editable share **42.0%**, fully-typed handlers **14.5%**) and the full result is recorded on PR #81. The re-runnable `scripts/quality/lens_coverage.py` is still unmerged, so the number is **not yet reproducible from `main`**.
 
 **Cluster:** IDE & Authoring. **Priority:** P1 — this number decides how much further Steps-view investment is justified. **Verdict:** build (cheap, reproducible). **Severity:** none (measurement).
 
