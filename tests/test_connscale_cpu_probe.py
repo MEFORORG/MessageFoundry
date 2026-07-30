@@ -26,9 +26,17 @@ import time
 
 import pytest
 
-from harness.load.connscale.probe import FdSampler, ProcSample
+from harness.load.connscale.probe import _PROBE_TIMEOUT_S, FdSampler, ProcSample
 from harness.load.connscale.runner import _PROC_BY_SAMPLE, _drain_proc
 from harness.load.enginepoll import EngineSample
+
+#: How long to keep re-walking before declaring the subtree re-resolution broken.
+#:
+#: DERIVED from the probe's own per-walk timeout rather than hardcoded, so raising that timeout cannot
+#: silently leave this deadline too short to fit even one attempt. Six walks' worth: enough that a
+#: couple of enumerations can time out entirely and the test still reaches a verdict, which is exactly
+#: the transient-failure tolerance `_resolve_pids` is written to provide.
+_RESOLUTION_DEADLINE_S = max(30.0, 6 * _PROBE_TIMEOUT_S)
 
 
 def _sample(elapsed: float) -> EngineSample:
@@ -223,15 +231,54 @@ def test_subtree_re_resolution_picks_up_a_late_spawned_child() -> None:
 
     child = subprocess.Popen([sys.executable, "-c", _BURN])  # noqa: S603 - fixed argv, no shell
     try:
-        time.sleep(1.0)
-        sampler.sample_proc()  # walk 2 — must now see the child
-        resolved_after = list(sampler._pids or [])
+        # POLL, don't sleep-and-hope. This used to be `time.sleep(1.0)` then ONE `sample_proc()`, which
+        # contradicted the contract under test: `_resolve_pids` treats an ERRORED enumeration as
+        # transient — it returns root-only for that tick, leaves `_pids` uncached, and expects the NEXT
+        # tick to retry. Giving it a single tick asserts a stricter property than production requires.
+        #
+        # On Windows the walk shells out to `Get-CimInstance Win32_Process` with a 5 s timeout; on a
+        # loaded runner that times out, `_descendants_windows` returns None, `_pids` stays None, and the
+        # old assertion read `assert <pid> in []` — which names neither the cause nor the failing
+        # property. Measured on windows-2025 (2026-07-30): failed twice in one job, while windows-2022
+        # and ubuntu passed the identical commit.
+        deadline = time.monotonic() + _RESOLUTION_DEADLINE_S
+        walks = 0
+        walked_ok = (
+            False  # did ANY enumeration succeed? separates "cannot measure" from "wrong answer"
+        )
+        resolved_after: list[int] = []
+        while True:
+            sampler.sample_proc()
+            walks += 1
+            if sampler._pids is not None:
+                walked_ok = True
+                resolved_after = list(sampler._pids)
+                if child.pid in resolved_after:
+                    break
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(0.25)
     finally:
         child.kill()
         child.wait(timeout=10)
 
     assert child.pid not in resolved_before
-    assert child.pid in resolved_after
+
+    # Two distinct failures, reported distinctly. Collapsing them is what made the original message
+    # useless: "the probe could not enumerate at all" is an environment/probe problem, while "it
+    # enumerated and missed a live child" is the re-resolution regression this test exists to catch.
+    assert walked_ok, (
+        f"the process-table walk never succeeded in {_RESOLUTION_DEADLINE_S:.0f}s ({walks} attempts) — "
+        f"every one returned None (enumeration errored or timed out; the Windows path allows "
+        f"{_PROBE_TIMEOUT_S:.0f}s per walk). The probe could not measure at all, so this test could not "
+        f"assess re-resolution. Not the same as missing the child."
+    )
+    assert child.pid in resolved_after, (
+        f"the walk SUCCEEDED but did not include the late-spawned child {child.pid} after {walks} "
+        f"attempts over {_RESOLUTION_DEADLINE_S:.0f}s; last resolution was {resolved_after}. This is "
+        f"the A3 regression: a subtree resolved once pins the sampler to an idle parent, so a sharded "
+        f"engine's `serve --shard` workers are never counted."
+    )
 
 
 def test_resolve_every_serves_from_cache_between_walks(monkeypatch: pytest.MonkeyPatch) -> None:
