@@ -2007,45 +2007,97 @@ def _serve(args: argparse.Namespace) -> int:
         # default threads through to the RetentionRunner (no forbidden-file edit).
         # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
         # dead_letter_days stays [retention] plumbing — label each window at its real home.
-        _RETENTION_WINDOW_LABEL = {
-            "messages_days": "[security].delete_message_bodies_after_days",
-            "dead_letter_days": "[retention].dead_letter_days",
-        }
-        if not enforcing and not settings.retention.allow_unbounded_phi:
-            auto_bounded = [
-                field
-                for field in ("messages_days", "dead_letter_days")
-                if field not in settings.retention.model_fields_set
+        # ASVS 14.2.7: the tier list is GENERATED from the classification in
+        # config/retention_classification.py, which a drift test holds equal — in both directions — to
+        # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
+        # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
+        # binding to the classification is the same defect with more characters.
+        from messagefoundry.config.retention_classification import (
+            MIN_PHI_RETENTION_WINDOWS,
+            PHI_RETENTION_WINDOWS,
+            auto_bounded_windows,
+        )
+        from messagefoundry.config.retention_classification import (
+            unbounded_windows as _unbounded_windows,
+        )
+
+        # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
+        # tuple, so a bad merge dropping most entries would leave this gate checking one window while
+        # reporting success — the precise shape of failure this whole change set exists to remove.
+        if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+            print(
+                f"error: the PHI retention classification has shrunk to "
+                f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
+                "to start rather than gate on a partial classification. This is a build defect, not a "
+                "configuration one — see messagefoundry/config/retention_classification.py.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
+        # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+        # `enforce` posture an unset window took the refusal below instead of a default.
+        #
+        # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
+        # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
+        # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
+        # still refused unless the audited opt-out is set. So "unbounded by accident" is still
+        # prevented; "unbounded by inattention" becomes "30 days by inattention".
+        #
+        # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
+        # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
+        # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+        if not settings.retention.allow_unbounded_phi:
+            defaulted = [
+                w
+                for w in auto_bounded_windows()
+                if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
             ]
-            for field in auto_bounded:
-                setattr(settings.retention, field, 30)
-            if auto_bounded:
-                auto_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in auto_bounded)
+            for window in defaulted:
+                setattr(
+                    getattr(settings, window.reads_from.strip("[]")),
+                    window.field,
+                    window.auto_bound_days,
+                )
+            if defaulted:
                 print(
-                    f"info: {auto_desc} defaulted ON (30 days) for a PHI instance ({env_name!r}) — "
-                    "PHI message bodies are now bounded at rest (secure-by-default, ASVS 14.2.7). Set an "
-                    "explicit [retention] window to override, or [security].allow_keeping_phi_indefinitely=true to "
-                    "retain indefinitely.",
+                    f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
+                    f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
+                    "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
+                    "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
                     file=sys.stderr,
                 )
-        unbounded_windows = [
-            field
-            for field, days in (
-                ("messages_days", settings.retention.messages_days),
-                ("dead_letter_days", settings.retention.dead_letter_days),
+
+        # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
+        # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
+        # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
+        # [logging].log_dir there is nothing for the app-log sweep to sweep.
+        still_unbounded = _unbounded_windows(settings)
+        refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
+        warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
+
+        if warn_only:
+            # Classified and warned, never refused. Naming the tier AND its protection level is the
+            # point: an operator who sees "PL-1" knows a full body is involved.
+            print(
+                "warning: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and will accumulate without bound: "
+                + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
+                + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
+                "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
+                file=sys.stderr,
             )
-            if days <= 0
-        ]
-        if unbounded_windows:
-            windows_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in unbounded_windows)
+
+        if refusable:
+            windows_desc = ", ".join(w.setting for w in refusable)
             if not settings.retention.allow_unbounded_phi:
                 if enforcing:
                     print(
-                        f"error: no data-retention window is configured for {windows_desc} on a "
-                        f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
-                        "start — PHI message bodies would be retained indefinitely (unbounded PHI at "
-                        "rest, ASVS 14.2.4). Set the window(s) to a positive number of days (e.g. 30) to "
-                        "bound PHI at rest; or, to deliberately retain forever, set "
+                        f"error: a data-retention window is explicitly disabled for {windows_desc} on "
+                        f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
+                        "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
+                        "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
+                        "(e.g. 30); or, to deliberately retain forever, set "
                         "[security].allow_keeping_phi_indefinitely=true (audited).",
                         file=sys.stderr,
                     )
