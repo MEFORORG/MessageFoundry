@@ -6901,3 +6901,143 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 **Related:** [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the authoring palette this defers from), [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) / [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) (the lens), #222 (Steps view), #26 (the declined visual-authoring line + its structured-Steps-view carve-out).
 
 **Source:** ADR 0106 palette design (2026-07-12); owner deferred Block pending an idiomatic fit.
+
+## 232. Steps view for routers
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
+
+**What:** `lens parse` emits rows per `@handler` only — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) §3 states routers are "**out of v1 scope**" — so a `@router` function gets **no Steps view at all**: no "Reopen in Steps view" CodeLens on the def, no rows. An analyst who can read a Handler as steps drops back to raw Python the moment *routing* is the question, which is exactly where destination selection and fan-out are decided.
+
+**Why this is not simply "point the lens at routers":** a router does not mutate `msg` — it **selects destinations**. The shipped shape is a guard-and-return of handler names:
+
+```python
+@router("demo_oru_router")
+def route_demo_oru(msg):
+    if msg["MSH-9.1"] != "ORU":
+        return []
+    return ["demo_oru_relay"]
+```
+
+(`samples/config/IB_DEMO_ORU_router.py:22-27`). The §3 row contract has no kind that fits: `send` rows model `Send(...)` to an **outbound**, a router returns **handler** names, and a bare `return []` already means *filter* inside a Handler. So the build needs (a) a `route` row kind (or an explicit widening of `send`), (b) `return []` disambiguated by the enclosing decorator, (c) a router-specific Add-palette group, and (d) the same coverage-partition + byte-stable splice guarantees the handler path holds.
+
+**Gate:** widening the row *grammar* requires **amending ADR 0076** (§2: "widening the roster is an ordinary addition, widening the *grammar* requires amending this ADR"). ADR-first, not a straight build.
+
+**Related:** #222 (the Steps view), ADR 0076 §3 (routers out of v1), [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) (recognition-first), [ADR 0108](adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md) (send fan-out), #228 (sidebar search already finds routers by name).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30) — surfaced while comparing the Steps view's coverage against general-purpose flow editors; owner filed the same day.
+
+## 233. Steps view move-drop logic implemented twice (model + webview)
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (de-duplicate). **Severity:** medium — a silent-divergence class, not a visible bug.
+
+**What:** the row move/drop semantics exist in **two independent implementations** that must agree and are not mechanically kept in agreement:
+
+| Function | Tested TS model | CSP-isolated webview |
+|---|---|---|
+| `blockExtent` | `ide/src/stepsModel.ts:1767` | `ide/media/stepsWebview.js:68` |
+| `walkMove` | `ide/src/stepsModel.ts:1861` | `ide/media/stepsWebview.js:126` |
+| `resolveDrop` | `ide/src/stepsModel.ts:1531` | `ide/media/stepsWebview.js:404` |
+
+The webview cannot import from `src/` (it is loaded as a plain script into a `default-src 'none'` webview, `stepsView.ts:917`), so the drag/drop *preview* the user sees is computed by the webview copy while the *committed* splice is computed by the model copy. They can drift, and the fixture tests only cover the model side — so a divergence shows up as "the drop landed somewhere other than where the indicator said", with green tests.
+
+**Why it matters beyond tidiness:** these functions decide the line ranges handed to `lens rewrite`. ADR 0076 §5's byte-stability guarantee is only as good as the extent computation that feeds it, and ADR 0089 §6 already records that "each native form is a new corruption-risk class — the ADR 0076 review history shows this is where bugs hide".
+
+**Options (pick at build time):** (a) build the shared pure functions into a small bundled module the webview loads as a local resource (esbuild already runs — `ide/esbuild.js`); (b) move the preview computation into the extension host and post results to the webview; (c) keep both but add a differential test that runs the same fixture corpus through **both** implementations and asserts identical output. (c) is the cheapest guard and could land first regardless of which structural fix is chosen.
+
+**Related:** #222, [ADR 0103](adr/0103-steps-view-row-context-menu.md) (row context menu — move/paste entry points), ADR 0076 §5 (byte-stable splice).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); duplication verified by direct read of both files.
+
+## 234. Steps view projection refreshes on save only
+
+**Cluster:** IDE & Authoring. **Priority:** P3. **Verdict:** **revisit — ADR amendment required, do not treat as a bug.** **Severity:** low (UX latency).
+
+**What:** the Steps view re-projects the handler on **save**, not on edit. Type in the split text editor and the rows do not follow until the buffer is written. Live values go further and are **skipped entirely while `document.isDirty`**.
+
+**Read this before building:** sync-on-save is a **deliberate guardrail**, not an oversight. ADR 0076 §5 adopts the verified InterSystems/VS Code set *wholesale*: "**Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available**". And the live-value skip is a **correctness** fix, not laziness (#225): the trace reads the module **from disk** while rows are projected from the **live buffer**, so after an unsaved structural edit the disk trace's line numbers describe the pre-edit file and mapping them by line containment would attach a value marker to the **wrong row**.
+
+**So the item is:** decide whether a *bounded* relaxation is safe — e.g. debounced re-projection of **rows only** (already partly present: `RERENDER_DEBOUNCE_MS = 250`, `stepsView.ts:89`) while keeping live values save-gated; and whether the update-loop guard (`EditLoopGuard`) still holds if projection races an in-flight `lens rewrite`. Any change here **amends ADR 0076 §5** and must re-argue the guardrail it removes.
+
+**Non-goal:** removing the save gate on live values. #225's dirty-buffer misalignment is a real correctness hazard and its fix (re-attach on save) should stand unless the trace itself learns to read the buffer.
+
+**Related:** #222, #225 (live values + the dirty-buffer skip), ADR 0076 §5.
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner asked for it to be filed the same day.
+
+## 235. Generate Steps view parameter forms from Python type hints
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
+
+**What:** today a recognized row exposes **enabled inputs only for literal params**; anything else renders visibly disabled (`stepsView.ts:11-13`). Windmill's pattern is to derive a **JSON Schema from the script's Python type hints** and render the step's parameter form from that schema. Applied here: `lens parse` (or a sibling `lens schema`) emits, per recognized action, a small parameter schema derived from the vocabulary helper's own **type hints** — which ADR 0076 §2 already requires to be "fully type-hinted, mypy-strict".
+
+**Why it is attractive:** it widens what is *editable* without widening the **recognition grammar** — the expensive, ADR-amendment-gated axis. The row set stays exactly as recognized today; only the input widgets get richer (enum → dropdown, `Literal["upper","lower","title"]` → radio, int → number field with validation, code-set name → the existing `codesetList` picker).
+
+**Build sketch:** engine side, derive the schema from `messagefoundry/actions.py` signatures (stdlib `inspect`/`typing`, no new runtime dep — ADR 0076 §6.5 forbids one in phases 1–2); IDE side, replace the hand-rolled per-op input rendering in `stepsModel.ts` (`ADD_MENU_CATALOG`, `TOOLBAR_INSERT_DEFAULTS`) with a schema-driven renderer. Keep `code`/`control` rows read-only.
+
+**Open question:** whether the schema is emitted by the engine (one source of truth beside the vocabulary, matching the ADR 0072 L5/L6 split the lens already follows) or hard-coded in the IDE. Engine-side is the consistent choice and is the recommendation to test first.
+
+**Related:** #222, ADR 0076 §2 (typed, mypy-strict vocabulary), [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the 27-item palette this would re-render), #237 (per-argument input modes — same form surface, land them together or in a deliberate order).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30) — "borrow the idea, not the product"; owner approved testing it as a separate lane.
+
+## 236. Test-this-step and test-up-to-step with pinned upstream values
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
+
+**What:** the Steps view's Test control delegates to the Test Bench — it runs the **whole** handler. Windmill's OSS editor offers *test this step*, *test up to this step*, and **step mocking** (pin an upstream step's output and run from there). The analog: run a handler **up to row N** against a chosen synthetic sample and show the message state at that point; optionally pin an upstream row's result so a lower row can be exercised without re-running an expensive lookup.
+
+**Why it fits the existing machinery:** the pieces are already shipped. ADR 0072's traced dry-run (`dryrun --trace json`) already produces per-line values and the lens already folds them onto rows by line containment (`mergeLiveValues`, `traceRowValues`), and the sample picker already exists (Test Bench pattern, defaulting to `messageSetsDir`). "Up to row N" is largely a **stop condition + a state dump** on a path that already runs.
+
+**Hard parts:** (a) `db_lookup`/`fhir_lookup` rows do real I/O — "pin/mock upstream" is what makes partial runs safe and must be the default for lookup rows, not an afterthought; (b) the dirty-buffer misalignment of #225 applies identically (the trace reads disk); (c) **PHI**: any state dump reuses ADR 0072's `--show-phi` redaction gate unchanged, adds no second gate, and persists nothing — the lens's trace argv must remain incapable of emitting `--show-phi` (`buildLensTraceArgs`).
+
+**Related:** #222, #225 (live values), [ADR 0072](adr/0072-traced-dryrun-mode.md) (traced dry-run + the redaction gate), Test Bench (`ide/src/testBench.ts`).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved testing it as a separate lane from #235.
+
+## 237. Per-argument input modes (static templated dynamic) in the Steps view
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** today a parameter slot is effectively **literal-or-refused** — a literal is editable, anything else (a `msg[...]` read, a concat, a conditional) collapses the row's editability. Windmill's flow editor instead gives every argument an explicit **mode**: *static* (a literal), *templated* (an interpolation over upstream values), or *dynamic* (an expression), with a picker over what is available upstream. Adopting the mode concept turns "this row is not editable" into "this argument is in dynamic mode", which is both more honest and more useful.
+
+**Why it matters here specifically:** ADR 0089's estate scan found the editable/opaque split is driven by **value-expression shape** — it classifies every `msg.set` value as literal / field-copy / conditional / lookup / concat / replace / split / substring / trim / case. Those classes map almost one-to-one onto modes, so this is a presentation of a distinction the lens **already computes**, not new recognition.
+
+**Build sketch:** surface the value-expression class in the `lens parse` row contract; render a mode selector per argument; static mode keeps today's plain input; templated mode offers the HL7 path picker (`hl7Picker.ts`) over the segment scope already built by `hl7scope.ts`; dynamic mode stays read-only in v1 (shows the verbatim source) so no new rewrite class is introduced.
+
+**Sequencing:** shares the parameter-form surface with **#235**. Deciding the schema shape first (#235) and layering modes on top (#237) avoids reworking the renderer twice — but they are separately valuable and can be evaluated independently.
+
+**Related:** #222, #235 (schema-driven forms), ADR 0089 §5 (the value-expression classifier this reuses), ADR 0104 §2.3 / `hl7Picker.ts` (the path picker).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved.
+
+## 238. OpenFlow step-attribute completeness pass over the engine vocabulary
+
+**Cluster:** IDE & Authoring / Engine. **Priority:** P3. **Verdict:** build (a review, not a feature). **Severity:** none — this is a gap-analysis task whose output is findings.
+
+**What:** read Windmill's **OpenFlow** step-attribute vocabulary as a **completeness checklist** against MessageFoundry's own step/connector semantics, and record what is missing, what is deliberately absent, and what is already covered under a different name. The attributes to walk: `retry`, `timeout`, `stop_after_if`, `skip_if`, `continue_on_error`, `mock`, `cache_ttl`.
+
+**Explicitly NOT the goal — do not target OpenFlow compatibility.** OpenFlow is an open standard (Apache-2.0, so safe to read and cite) but its `info.version` tracks Windmill's own release tag, i.e. one vendor's weekly train. Emitting or consuming OpenFlow is a **separate** question and is not authorized by this item. Adopting a *declarative artifact* remains declined by ADR 0076 §7 and #26.
+
+**Expected output:** a short findings note (a research doc or an amendment to this item) listing, per attribute: covered / not covered / deliberately declined, with the MessageFoundry construct that covers it. Some will already be covered engine-side rather than in the Steps view (retry/timeout live in connector + delivery semantics, not in a handler row), and saying so precisely is most of the value.
+
+**Related:** #222, ADR 0076 §7 (declarative artifact declined), #26 (the visual/declarative-authoring line).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved the checklist framing explicitly ("don't target compatibility").
+
+## 239. Re-measure Steps view estate coverage (opaque vs editable rows) after the palette
+
+**Cluster:** IDE & Authoring. **Priority:** P1 — this number decides how much further Steps-view investment is justified. **Verdict:** build (cheap, reproducible). **Severity:** none (measurement).
+
+**What:** re-run [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) §5's AST coverage scan against the current production estate and publish the delta. **The measurement already exists and must not be re-invented:** ADR 0089 §1 scanned **87 files / 486 `msg`-manipulating functions / 3,852 statements** and found **~66% of projected rows opaque** (`code` / `UNRECOGNIZED control`) with **100% of handlers rendering zero editable action rows**; the index row records **~42% editable after Phase A**. §5 states the scan is explicitly "a **repeatable** coverage check — re-running it after each phase measures the coverage lift and surfaces the shrinking residual".
+
+**What is genuinely unknown:** the number *today*, after Phase A **plus** ADR 0106's 27-item palette, ADR 0108's send fan-out, and ADR 0104's picker landed. ADR 0089 §4 projects Phases A–D reaching **~80–90%** of transform statements against ~13% at baseline; nobody has confirmed where the current build actually sits, so the decision to build Phases B–E (or to stop) is being taken without the number that was designed to inform it.
+
+**Estate note (owner, 2026-07-30):** the production corpus this scan runs against has been **renamed** since ADR 0089 was written — confirm the current path with the owner before scanning rather than assuming the ADR's. (Estate identifiers are customer tokens and stay out of the repo; the forbidden-content gate enforces this.) Note also that the ADR 0104 estate scan cites **152 handlers**, a different slice than ADR 0089's **486** `msg`-manipulating functions — state which population any new number describes.
+
+**PHI:** the scan "reads only code (no PHI) and runs on any estate" (ADR 0089 §5) — keep that property; publish counts and shapes, never message content.
+
+**Why P1:** if the residual opaque fraction is still high, the palette is decorating a surface most production handlers fall out of, and Phases B–E (or a different bet entirely) matter more than any new row type. If it is low, #232/#235/#236/#237 are the right next investments. Either way this is a scan re-run, not a build.
+
+**Related:** ADR 0089 (the scan, the phases, and the erratum that phase work is tracked per-item at filing time — **not** by the stale #226–#230 range), #222, #235, #236, #237.
+
+**Source:** Windmill/Kestra evaluation (2026-07-30). ⚠️ That evaluation initially asserted "nobody has measured" this — **incorrect**; the owner corrected it the same day and ADR 0089 carries the prior numbers. Filed as a **re-measure**, not a first measurement.
