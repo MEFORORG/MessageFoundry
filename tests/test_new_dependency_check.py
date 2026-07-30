@@ -90,6 +90,73 @@ def test_declared_distributions_covers_extras_not_just_core() -> None:
     assert set(found) == {"fastapi", "hl7", "pynetdicom", "pydicom", "hvac"}
 
 
+def test_declared_distributions_covers_pep735_dependency_groups() -> None:
+    """The CI toolchain (ADR 0034 §3) is declared in `[dependency-groups]`, not in an extra.
+
+    Those names are resolved into `uv.lock` and installed into the runner that executes the BLOCKING
+    security gates, so a squatted scanner name lands with the job's token in hand. A gate that cannot
+    see the table cannot vet it, and would report a clean sweep while ignoring it entirely.
+    """
+    found = declared_distributions(
+        """
+        [project]
+        dependencies = ["fastapi>=0.100"]
+
+        [dependency-groups]
+        ci-scanners = ["bandit==1.9.4", "zizmor==1.5.2"]
+        ci-quality = ["mutmut==3.6.0", "pytest-cov>=7.0"]
+        """
+    )
+    assert set(found) == {"fastapi", "bandit", "zizmor", "mutmut", "pytest-cov"}
+
+
+def test_an_include_group_table_is_skipped_not_crashed_on() -> None:
+    """PEP 735 lets a group entry be `{include-group = "other"}` instead of a requirement string.
+
+    That table names another GROUP, not a distribution, so there is nothing to vet — and handing the
+    dict to `requirement_name()` would raise, taking the whole gate down with it. The included group's
+    own members are still swept, because every group is iterated regardless of who includes it.
+    """
+    found = declared_distributions(
+        """
+        [project]
+        dependencies = []
+
+        [dependency-groups]
+        base = ["bandit==1.9.4"]
+        everything = [{ include-group = "base" }, "zizmor==1.5.2"]
+        """
+    )
+    assert set(found) == {"bandit", "zizmor"}
+
+
+def test_a_bogus_name_declared_in_a_dependency_group_is_rejected() -> None:
+    """End-to-end: a hallucinated name in a GROUP must fail vetting exactly like one in an extra.
+
+    Drives the real `declared_distributions` -> `vet` path rather than asserting the parser alone, so
+    "the table is parsed" and "the table is enforced" are two different claims and both are proven.
+    """
+    declared = declared_distributions(
+        """
+        [project]
+        dependencies = ["fastapi>=0.100"]
+
+        [dependency-groups]
+        ci-scanners = ["bandit==1.9.4", "hl7-sast-scanner==2.0"]
+        """
+    )
+    assert "hl7-sast-scanner" in declared, "the group name never reached the vetting stage"
+    findings, examined = vet(
+        declared,
+        lambda name: None if name == "hl7-sast-scanner" else _fetch_all_good(name),
+        now=_NOW,
+    )
+    assert examined == 3
+    assert [(f.distribution, f.problem) for f in findings] == [
+        ("hl7-sast-scanner", "does not exist on PyPI")
+    ]
+
+
 # --- the vetting rules: each failure mode proven, not assumed ----------------------------------
 
 
@@ -305,6 +372,39 @@ def test_the_real_pyproject_declares_a_plausible_number_of_distributions() -> No
     # Spot-check one core dep and one extra, so a table being dropped entirely is caught by name.
     assert "fastapi" in declared
     assert "pynetdicom" in declared, "the [dicom] extra is not being read"
+    assert "bandit" in declared, "the [dependency-groups] CI toolchain is not being read"
+
+
+def test_the_ci_toolchain_groups_actually_raise_the_examined_count() -> None:
+    """The count must MOVE, not merely be plausible — a parser that silently reads nothing new passes
+    every floor above.
+
+    Measured: 41 distributions before `[dependency-groups]` was swept, 47 after. The six added names
+    are the CI toolchain (`bandit`, `pip-audit`, `zizmor`, `diff-cover`, `mutmut`, `pytest-cov`);
+    `pytest-timeout` is declared in BOTH the `dev` extra and `ci-quality` and so adds nothing, which is
+    itself deliberate — the identical spec in both places is what stops uv resolving two versions.
+
+    Asserted as a SET DELTA rather than a magic total, so adding an ordinary dependency tomorrow does
+    not red this, but the group table falling out of the parser does.
+    """
+    from scripts.security.new_dependency_check import declared_distributions as parse
+
+    text = (_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    with_groups = set(parse(text))
+
+    # The same file with [dependency-groups] renamed to an inert table = the pre-change behaviour.
+    without = set(parse(text.replace("\n[dependency-groups]\n", "\n[inert-not-a-real-table]\n", 1)))
+
+    added = with_groups - without
+    print(f"examined: {len(without)} -> {len(with_groups)} (+{len(added)}): {sorted(added)}")
+    assert added == {"bandit", "pip-audit", "zizmor", "diff-cover", "mutmut", "pytest-cov"}, (
+        f"the [dependency-groups] sweep added {sorted(added)}; expected the six CI toolchain names. "
+        "If a tool was deliberately added or removed, re-point this set in the same commit."
+    )
+    assert "pytest-timeout" in without, (
+        "pytest-timeout must remain declared in the [dev] extra too — the ci-quality group deliberately "
+        "repeats its exact spec so uv cannot resolve two different versions"
+    )
 
 
 def test_every_finding_message_names_the_remedy() -> None:

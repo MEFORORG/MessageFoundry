@@ -19,6 +19,12 @@ the "highest-priority deferred gate" and records that verify-before-add "is toda
 human remembering". CLAUDE.md section 5 states the rule in prose, and prose is what a session
 rationalizes past at 2am.
 
+WHAT IT SWEEPS: ``[project].dependencies``, every ``[project.optional-dependencies]`` extra, and every
+PEP 735 ``[dependency-groups]`` group. The last was added 2026-07-29 with the hash-pinned CI toolchain
+(ADR 0034 section 3): those names are not shipped in the wheel, but they are resolved into ``uv.lock``
+and installed into the runner that executes the BLOCKING security gates, which makes a squatted scanner
+name a sharper target than a runtime dependency rather than a softer one.
+
 WHAT IT CHECKS, per declared distribution:
   * EXISTS         -- PyPI serves a project page for the name at all.
   * HAS RELEASES   -- at least one release with files. A registered-but-empty placeholder is the shape
@@ -114,14 +120,28 @@ def requirement_name(spec: str) -> str | None:
 def declared_distributions(pyproject_text: str) -> dict[str, str]:
     """Every distribution this project declares -> the spec it was declared with.
 
-    Covers ``[project].dependencies`` AND every ``[project.optional-dependencies]`` extra, because an
-    extra is exactly where a niche, plausible-sounding, hallucination-prone name lands.
+    Covers THREE tables, because a name this gate does not read is a name that enters the tree unvetted:
+
+    * ``[project].dependencies`` -- the runtime closure.
+    * every ``[project.optional-dependencies]`` extra -- exactly where a niche, plausible-sounding,
+      hallucination-prone name lands.
+    * every PEP 735 ``[dependency-groups]`` group -- the CI toolchain (ADR 0034 section 3). These are
+      not published wheel metadata, but they ARE resolved into ``uv.lock``, hash-exported to
+      ``ci/locks/*.lock``, and installed into the runner that executes the blocking security gates. A
+      slopsquatted scanner name is if anything a SHARPER target than a runtime dependency: it runs with
+      the job's token before any of these controls report.
     """
     data = tomllib.loads(pyproject_text)
     project = data.get("project") or {}
     specs: list[str] = list(project.get("dependencies") or [])
     for extra_specs in (project.get("optional-dependencies") or {}).values():
         specs.extend(extra_specs or [])
+    for group_specs in (data.get("dependency-groups") or {}).values():
+        # A PEP 735 entry is EITHER a requirement string OR a `{include-group = "other"}` table. The
+        # table names another group in this same file, not a distribution, so it has nothing to vet --
+        # and passing the dict to requirement_name() would raise. Include-groups are covered anyway:
+        # every group is iterated here regardless of who includes it.
+        specs.extend(spec for spec in (group_specs or []) if isinstance(spec, str))
 
     found: dict[str, str] = {}
     for spec in specs:
