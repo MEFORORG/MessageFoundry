@@ -24,13 +24,12 @@ it directly is the only way the number stays honest as the grammar moves.
 
 PHI. `lens parse` is a static `ast` parse that never imports or executes a config module, and no
 message ever enters this path. The scan reads only code and emits only counts and file names, so it
-is safe to run against a production estate. Pass `--hash-names` when sending results anywhere.
+is safe to run against a production estate. Pass `--anonymize` when sending results anywhere.
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import statistics
 import subprocess
@@ -109,11 +108,21 @@ def classify_code_row(first_stmt: str) -> str:
     return "other"
 
 
-def _label(py: Path, root: Path, hash_names: bool) -> str:
+def _label(py: Path, root: Path, anonymize: bool, seen: dict[str, str]) -> str:
+    """Estate-relative path, or a stable opaque index when anonymizing.
+
+    Deliberately NOT a hash. A hash of a file name is reversible by dictionary attack -- estate
+    modules follow a rigid naming convention (`IB_<id>_<system>_<type>_handler.py`), so a candidate
+    list is cheap to generate and digest. A per-run counter carries no preimage at all. It also
+    keeps `hashlib` out of a dev script, which the ASVS 11.1.3 crypto-inventory gate tracks as a
+    deployed-system crypto import.
+    """
     rel = py.relative_to(root).as_posix()
-    if not hash_names:
+    if not anonymize:
         return rel
-    return f"<{hashlib.sha256(rel.encode()).hexdigest()[:12]}>.py"
+    if rel not in seen:
+        seen[rel] = f"<module-{len(seen) + 1:04d}>.py"
+    return seen[rel]
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -126,7 +135,9 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="count only UNRECOGNIZED control rows as opaque (recognized control is not opaque)",
     )
-    ap.add_argument("--hash-names", action="store_true", help="hash file names in the output")
+    ap.add_argument(
+        "--anonymize", action="store_true", help="replace file names with stable opaque indices"
+    )
     ap.add_argument("--json", dest="as_json", action="store_true", help="emit JSON")
     args = ap.parse_args(argv)
 
@@ -140,12 +151,15 @@ def main(argv: list[str] | None = None) -> int:
     code_per_handler: list[int] = []
     opaque_per_handler: list[int] = []
     refusals: list[dict[str, str]] = []
+    labels: dict[str, str] = {}
 
     for py in config_modules(args.config_dir):
         files += 1
         out, err = parse_module(py, args.python, args.cwd)
         if out is None:
-            refusals.append({"file": _label(py, args.config_dir, args.hash_names), "reason": err})
+            refusals.append(
+                {"file": _label(py, args.config_dir, args.anonymize, labels), "reason": err}
+            )
             continue
         try:
             src = py.read_text(encoding="utf-8", errors="replace").splitlines()
