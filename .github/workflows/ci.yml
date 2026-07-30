@@ -262,8 +262,11 @@ jobs:
   # deployment target.
   ide:
     name: ide build (${{ matrix.os }})
-    # `ide` is NOT a required check and ci-gate does NOT `needs: ide`, so skipping it — or varying its
-    # matrix per repo (below) — can't wedge any required context. It runs when it can be affected:
+    # ci-gate DOES `needs: ide` — a red extension build or a broken Steps contract now blocks the merge,
+    # which it previously could not (the leg could fail and `ci-gate` stayed green). Skipping it — or
+    # varying its matrix per repo (below) — still cannot wedge the gate: ci-gate runs `if: always()` and
+    # fails only on a leg result of 'failure' or 'cancelled', so a 'skipped' ide passes it. It runs when
+    # it can be affected:
     # push-to-main + workflow_dispatch (full coverage), and PRs that touch ide/** or this workflow (the
     # `changes.ide` path-gate) — a pure-Python PR can't change the isolated npm project's result, so it's
     # skipped there. Not on the nightly cron: the engine heavy legs need that safety net, an isolated npm
@@ -443,9 +446,15 @@ jobs:
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
           fi
-          # The ide job (VS Code extension build+test) only depends on ide/** (its own npm project)
-          # and this workflow; a pure-Python PR can't change its result, so don't run it there.
-          if echo "$changed" | grep -qE '^(ide/|\.github/workflows/ci\.yml)'; then
+          # The ide job (VS Code extension build+test) depends on ide/** (its own npm project), this
+          # workflow, AND the engine-side surfaces its suites encode as a contract. The Steps editor
+          # (ADR 0076/0089/0103/0104/0106/0108) is a projection of a Handler .py produced by
+          # `messagefoundry lens`, and ide/src/test/suite/steps*.test.ts asserts against committed
+          # fixtures of that JSON; the live-debug suite does the same for the diagnostics shape, and
+          # docs/STEPS-PALETTE.md is the action vocabulary those rows are drawn from. A change to any of
+          # them can break the leg, so "a pure-Python PR can't change its result" was only ever true of
+          # the npm build half — it was never true of the contract half.
+          if echo "$changed" | grep -qE '^(ide/|messagefoundry/(lens|actions|diagnostics)\.py|docs/STEPS-PALETTE\.md|\.github/workflows/ci\.yml)'; then
             echo "ide=true" >> "$GITHUB_OUTPUT"
           else
             echo "ide=false" >> "$GITHUB_OUTPUT"
@@ -1485,6 +1494,7 @@ jobs:
     if: always()
     needs:
       - changes
+      - ide
       - sqlserver-store
       - postgres-store
       - load-test
