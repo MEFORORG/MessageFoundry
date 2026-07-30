@@ -1,8 +1,9 @@
 # Dual-Licensing Plan (open-core posture)
 
 > **⚠️ Planning document — pending legal review.** This records the *intended* dual-licensing posture
-> and the open legal questions it depends on. It is **not** legal advice and **not** a published
-> commitment. The specific commercial terms are not finalized; see
+> and the open legal questions it depends on. It ships in the public repository so adopters can see
+> where the licensing posture stands, but it is **not** legal advice and publishing it is **not** a
+> commitment to the terms below. The specific commercial terms are not finalized; see
 > [../COMMERCIAL-LICENSE.md](../COMMERCIAL-LICENSE.md) for the consumer-facing (also pending) summary.
 > Referenced by [ADR 0017](adr/0017-consumer-deployment-model.md) decision #6 and backlog item #13.
 

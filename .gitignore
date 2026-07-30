@@ -150,7 +150,9 @@ scripts/security/scan-tokens.local.txt
 #   docs/CI-TOPOLOGY.md — STALE: it documents the retired private-repo/public-mirror split and
 #                         scripts/publish/, which the cutover deleted. Publishing it would actively
 #                         mislead. Rewrite for the post-cutover topology or delete it.
-#   docs/Secure_Development_Standards.md — scans clean, but it was deliberately pulled from the public
-#                         PyPI sdist (#1020); reversing that is an owner call, not a side effect.
+#   (docs/Secure_Development_Standards.md was here. PUBLISHED 2026-07-29 on the owner's call: the
+#    document licenses itself as publishable and adopter-facing, messagefoundry.org already served
+#    it, and 44 citations across the repo — including adr/TEMPLATE.md — pointed at a file that did
+#    not exist. Published from the newest copy, de-branded back to the generic lineage its own
+#    revision history names.)
 /docs/CI-TOPOLOGY.md
-/docs/Secure_Development_Standards.md

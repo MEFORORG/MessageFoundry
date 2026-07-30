@@ -20,8 +20,8 @@
 - **Requirement:** OWASP ASVS 5.0 **13.3.3** (V13 Configuration, **Level 3**) — *"Verify that all
   cryptographic operations are performed using an isolated security module such as a vault or HSM to
   manage and protect key material from exposure outside of the security module."* Scored a hard **Fail**
-  at L3 ([ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) §V13), classified
-  **DEFERRED-BY-DESIGN** (not off-loopback-gated) in [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md).
+  at L3 (ASVS-L3-ASSESSMENT.md §V13), classified
+  **DEFERRED-BY-DESIGN** (not off-loopback-gated) in ASVS-FAILS-REMEDIATION-PLAN.md.
 - **Built (this amendment, WP-BL3-04 step 1):** the **core seam** —
   [store/keyprovider.py](../../messagefoundry/store/keyprovider.py) (the `KeyProvider` protocol, the
   `auto`/`env`/`dpapi` built-ins, and the lazy external-provider hooks), the `[store].key_provider` setting
@@ -39,10 +39,10 @@
   [secrets_dpapi.py](../../messagefoundry/secrets_dpapi.py)), and the `gen-key` / `protect-key` /
   `rotate-key` CLI ([__main__.py](../../messagefoundry/__main__.py)).
 - **Supersedes (on acceptance, for the 13.3.3 dimension):** the **WP-L3-14** "HSM/vault key material"
-  deferral one-liner in [ASVS-L3-REMEDIATION-PLAN.md](../security/ASVS-L3-REMEDIATION-PLAN.md) — this
+  deferral one-liner in ASVS-L3-REMEDIATION-PLAN.md — this
   ADR formalizes the seam that discharges it.
-- **Related:** [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md) (13.3.3
-  detail + the accepted on-prem residual), [BEYOND-ASVS-L3-REMEDIATION-PLAN.md](../security/BEYOND-ASVS-L3-REMEDIATION-PLAN.md)
+- **Related:** ASVS-FAILS-REMEDIATION-PLAN.md (13.3.3
+  detail + the accepted on-prem residual), BEYOND-ASVS-L3-REMEDIATION-PLAN.md
   (WP-BL3-04 the implementing WP, WP-BL3-05 posture-gated encryption, **WP-BL3-28** the future
   `mfenc:v2` PQ envelope), [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (the related
   off-loopback transport-security trigger), [ADR 0017](0017-consumer-deployment-model.md) (the per-instance
@@ -76,14 +76,14 @@ outside any security module**: DPAPI protects the key only **at rest on disk** (
 matches; this amendment adds that integration point — see *Built* above). The requirement **genuinely
 applies** (the app performs cryptographic operations on PHI). At the time of this amendment 13.3.3 is one
 of the **3 remaining combined L3 Fails** — current scorecard **189 / 20 / 3 / 133**
-([ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md)); the `178 / 20 / 6 / 141` this ADR originally
+(ASVS-L3-ASSESSMENT.md); the `178 / 20 / 6 / 141` this ADR originally
 cited was a stale intermediate tally (it predated WP-L3-13 admin defense closing **8.4.2** and the
 sec-offbox-log forwarder closing **16.4.3**). The 3 are all **L3-only**: **4.1.5, 12.1.4, 13.3.3** (8.4.2
 is no longer a Fail). This amendment's built seam + an operator-activated external module flip 13.3.3 (see
 *ASVS 13.3.3 mapping* below).
 
 **Governance — the original deferred-by-design posture (superseded for the verdict by this amendment).**
-The design-time posture, per [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md)
+The design-time posture, per ASVS-FAILS-REMEDIATION-PLAN.md
 and [PHI.md](../PHI.md) §11, classified 13.3.3 **DEFERRED-BY-DESIGN** — to be closed via an explicit
 accepted-risk decision, *not* purely off-loopback-conditional — with the **build trigger** that requires an
 external provider (verbatim): *"Off-prem / PHI-critical / off-loopback deployment, or a BAA / customer
@@ -395,14 +395,14 @@ this ADR records 13.3.3's verdict-flip intent only — it edits **no** score doc
 
 ## Relationship to other work packages
 
-- **WP-BL3-04** ([BEYOND-ASVS-L3-REMEDIATION-PLAN.md](../security/BEYOND-ASVS-L3-REMEDIATION-PLAN.md)) —
+- **WP-BL3-04** (BEYOND-ASVS-L3-REMEDIATION-PLAN.md) —
   the implementing work package this ADR formalizes: refactor the `resolve_active_key` chokepoint to
   dispatch on `[store].key_provider`, env + DPAPI as built-ins, cloud/Vault/HSM as lazy optional extras.
   This ADR's enum extends the WP one-liner's `env|dpapi|aws_kms|azure_kv|vault` with `auto`, `gcp_kms`,
   and `pkcs11` (recorded in §2). Trigger **now** as DESIGN. *(Note: that plan's `store/base.py` line
   anchors predate the current tree; the line/symbol references in this ADR are the accurate point-in-time
   ones.)*
-- **WP-L3-14** ([ASVS-L3-REMEDIATION-PLAN.md](../security/ASVS-L3-REMEDIATION-PLAN.md)) — the prior
+- **WP-L3-14** (ASVS-L3-REMEDIATION-PLAN.md) — the prior
   HSM/vault deferral. WP-BL3-04's design **discharges** it; this ADR supersedes that deferral one-liner
   for the 13.3.3 dimension (reusing the WP-11d DPAPI groundwork + the `crypto.py` `Cipher` seam).
 - **WP-BL3-05** (posture ⇒ `require_encryption`) — a **future, not-yet-built** `[instance].data_class = phi`
@@ -518,7 +518,7 @@ Design + build:
 - **The Pass(B) needle-mover is still at-rest encryption ON** — `[ai].data_class = "phi"` + a configured
   `[store].encryption_key` (WP #243). With no key (`IdentityCipher`) there is no AEAD tag to bind, so
   `aad_bind` is a no-op; it is the **hardened (Posture-B) setting** layered on top of encryption-on (see
-  [docs/security/OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md)).
+  docs/security/OFF-LOOPBACK-DEPLOYMENT.md).
 
 **Status: 11.3.3 → Pass(B) — cell-bound AAD BUILT and tested, opt-in via `[store].aad_bind` (off by
 default; A stays Partial because encryption is off by default).** This ADR owns the `mfenc` crypto-seam
@@ -666,7 +666,7 @@ optional `pyproject` extra, and re-locked — DEP-1). ASVS 13.3.3 flips **Fail �
 on the built isolation seam + an operator-activated external module (residuals: the operator-activation step,
 and the in-process bulk-crypto DEK-in-heap deferred to 11.7.1 / WP-BL3-28). The cross-document scorecard flip
 (to **192 / 20 / 0 / 133** once 4.1.5 / 12.1.4 / 13.3.3 all flip) and the
-[ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) / [ASVS-FAILS-REMEDIATION-PLAN.md](../security/ASVS-FAILS-REMEDIATION-PLAN.md)
+ASVS-L3-ASSESSMENT.md / ASVS-FAILS-REMEDIATION-PLAN.md
 / [PHI.md](../PHI.md) §4/§11 / [CONFIGURATION.md](../CONFIGURATION.md) / [SECURITY.md](../SECURITY.md) row
 updates are the **Coordinator's** single-writer task — this ADR edits no score doc.*
 

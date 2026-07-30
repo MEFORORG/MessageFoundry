@@ -1,7 +1,8 @@
 # MessageFoundry — Delta Security-Fixes Multisession Plan (2026-07-01)
 
 **Scope.** Remediate the **seven verified findings** from the delta security audit
-([`docs/reviews/DELTA-REVIEW-2026-07-01.md`](../reviews/DELTA-REVIEW-2026-07-01.md)) — the code surface
+(`docs/reviews/DELTA-REVIEW-2026-07-01.md`, maintainer-internal — see
+[`SECURITY-DOCS-POLICY.md`](../SECURITY-DOCS-POLICY.md)) — the code surface
 that landed since the 2026-06-10 full review (v0.2.0 → v0.2.13). No new features, **no ADRs** (these are
 bug fixes, not decision records). The six candidates the audit *refuted* are out of scope.
 

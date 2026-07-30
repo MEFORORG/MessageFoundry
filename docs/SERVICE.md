@@ -6,8 +6,12 @@ MessageFoundry runs as a long-lived background service via
 and captures its output to rotating log files. Stopping the service sends Ctrl+C so the
 engine drains its connections cleanly (the ASGI lifespan calls `engine.stop()`).
 
-This is the localhost, single-machine setup. Networked deployment (binding beyond
-`127.0.0.1`, auth/TLS) is a later step — see [ARCHITECTURE.md](ARCHITECTURE.md).
+This is the localhost, single-machine setup: the service binds `127.0.0.1` and authentication is
+already required (it is on by default). Networked deployment is **built but deliberate** — bind
+off-loopback with `[security].local_access_only = false` + `[security].listen_address`, and an
+off-loopback API bind is *refused at startup* unless TLS is configured (`[api].tls_cert_file`, or a
+trusted upstream terminator). See [DEPLOYMENT.md](DEPLOYMENT.md) for the exposure checklist and
+[REMOTE-CONSOLE.md](REMOTE-CONSOLE.md) for operating this service from another PC.
 
 Before going live, hand your endpoint-security and firewall admins the
 [Antivirus Exclusions & Firewall Permissions guide](ANTIVIRUS-FIREWALL.md): it spells out the
@@ -33,8 +37,9 @@ venv interpreter) and the per-connection firewall openings the service needs.
    `-NssmPath`), `install-service.ps1` downloads the pinned, SHA‑256‑verified release into
    `<DataDir>\bin\nssm.exe` and uses it. No manual install needed. (You can still pre-install it
    — `choco install nssm` or a download from <https://nssm.cc> — and it'll be used if found.)
-3. **An elevated PowerShell** (Run as Administrator) — required to register a service. The
-   console's Engine Status page can do this for you via **Install service…** (UAC prompt).
+3. **An elevated PowerShell** (Run as Administrator) — required to register a service.
+   `messagefoundry service install --env <name>` elevates for you (a UAC prompt) and runs the
+   install script below in a visible window so you can read its output.
 
 ## Install
 
@@ -45,8 +50,15 @@ venv interpreter) and the per-connection firewall openings the service needs.
 
 `-Environment` is **required** (ADR 0017): it selects which `environments/<name>.toml` value file the
 engine resolves and the instance's PHI posture. `serve` refuses to start without it (no silent
-default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name. The
-console's **Install service…** button prompts for it.
+default), so the install script refuses too — pass `dev`, `staging`, `prod`, or a custom name.
+**A custom name must also declare its posture** — `[security].handles_real_patient_data` and
+`[security].production_instance` in the service config (`messagefoundry.toml`) — because a free-form
+environment name carries no PHI posture to derive one from (only `dev`/`staging`/`prod` do). Without
+both, `serve` exits 2 with *"environment '\<name\>' has no built-in security posture"*, so the service
+registers fine and then dies on every start. (The pre-ADR-0118 spellings `[ai].data_class` /
+`[ai].production` are **rejected at config load** — see
+[ADR 0118](adr/0118-secure-by-default-security-configuration-section.md).)
+`messagefoundry service install` requires the same name via `--env` and passes it straight through.
 
 Defaults:
 
@@ -244,11 +256,12 @@ trust boundary: anyone who can write a `.py` file there can run code as the serv
   ```powershell
   icacls "D:\hl7\config" /inheritance:r /grant "Administrators:(OI)(CI)F" "NT SERVICE\MessageFoundry:(OI)(CI)R"
   ```
-  The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`
-  (with `-ServiceAccount`): it strips inherited ACEs and locks the dir to SYSTEM + Administrators
-  (full) and the service account (read+execute). It is **opt-in** because the config dir often lives
-  inside a developer's repo where stripping inheritance is surprising — for production, point
-  `-Config` at a dedicated admin-owned directory and pass `-LockConfigDir`.
+  The supported one-step way to do this at install time is `install-service.ps1 -LockConfigDir`:
+  it strips inherited ACEs and locks the dir to SYSTEM + Administrators (full) and the run-as
+  account (read+execute) — no companion flag needed, since the run-as account defaults to the
+  virtual account. It is **opt-in** because the config dir often lives inside a developer's repo
+  where stripping inheritance is surprising — for production, point `-Config` at a dedicated
+  admin-owned directory and pass `-LockConfigDir`.
 - **Fix an existing tree that inherits a broad write grant** without a full ACL reset. A config dir
   placed under a shared root (e.g. `C:\srv\…`) often inherits `Authenticated Users` (`S-1-5-11`)
   write, which trips the guard below. The lighter-touch alternative to `/inheritance:r` is to break
@@ -371,12 +384,17 @@ icacls "C:\ProgramData\MessageFoundry\logs" /inheritance:r `
 
 This service is **headless**. Operators watch and run it from the **browser web console** served
 same-origin at `/ui` (not part of the service runtime — a separate, version-matched wheel the engine
-mounts in-process):
+mounts in-process). The wheel is **not published to an index yet**, so install it by path:
 
 ```powershell
-pip install "messagefoundry-webconsole"          # into the engine venv
-# set [api].serve_ui = true in the service settings, then (re)start the service
+pip install -e packaging/messagefoundry-webconsole   # into the engine venv
 ```
+
+No switch is needed: the console is **on by default** for a loopback bind
+([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)),
+and `[security].serve_web_console = false` turns it off. (`[api].serve_ui` was the old spelling and
+is now **refused at config load** — [ADR 0118](adr/0118-secure-by-default-security-configuration-section.md)
+moved the console/bind/origin switches into `[security]`.)
 
 Browse to this service's `/ui` (`http://127.0.0.1:8765/ui`) and sign in. See
 [INSTALL-GUIDE.md](INSTALL-GUIDE.md) → "Launching the admin console". (The former PySide6 desktop

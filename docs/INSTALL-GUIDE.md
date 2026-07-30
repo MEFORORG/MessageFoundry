@@ -245,19 +245,26 @@ messagefoundry serve --config config --env test --project-root C:\srv\mefor\my-c
 ### Launching the admin console (in a browser)
 
 Operators monitor and run an instance from the **browser web console** served same-origin at `/ui`.
-It ships as a separate, version-matched wheel (`messagefoundry-webconsole`) that the engine mounts
-in-process; install it alongside the engine and turn on `[api].serve_ui`:
+It ships as a separate wheel (`messagefoundry-webconsole`) on its **own version line** — deliberately
+*not* lockstep with the engine — that the engine mounts in-process. The pair is checked at startup
+against the engine's UI-seam version and a mismatched pair is **refused**, so install the console
+release built for the engine version you pinned. The console is **on by default**, so on a local
+instance installing it is all you need:
 
 ```powershell
 pip install "messagefoundry-webconsole==0.2.15"   # the /ui web console, into the same venv
-# then set [api].serve_ui = true in your service settings and (re)start the engine
+# then (re)start the engine — there is no switch to turn on. To turn the console OFF, set
+# [security].serve_web_console = false (the old [api].serve_ui spelling is refused at config load)
 ```
 
 Browse to the engine's `/ui` (`http://127.0.0.1:8765/ui` by default — typically the boot-start
-[service](SERVICE.md)) and sign in; nothing else is needed for the local case. Off-loopback exposure
-requires TLS (see [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md)). The former PySide6 desktop console was
-retired in favour of this browser console (BACKLOG #103); PySide6 now backs only the standalone test
-harness (`pip install "messagefoundry[harness]"`).
+[service](SERVICE.md)) and sign in; nothing else is needed for the local case. Off-loopback the console
+is **opt-in**: an exposed instance serves `/ui` only when `[security].serve_web_console = true` is set
+explicitly — a default-on console on an exposed bind quietly degrades to the JSON API with a warning —
+and it additionally requires TLS, plus `[security].web_console_public_address` behind a declared
+TLS-terminating proxy (see [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md)). The former PySide6 desktop console
+was retired in favour of this browser console (BACKLOG #103); PySide6 now backs only the standalone
+test harness (`pip install "messagefoundry[harness]"`).
 
 ---
 

@@ -88,7 +88,7 @@ And **+13.2% is a ceiling that over-states F2 twice over:**
    would serialize *eight* transforms onto the ingress lane instead of one**, so that give-back gets **worse** with H,
    while the benefit is capped at +13.2%.
 
-**Net:** F2's best conceivable number is a **B5-sized result** — and **[ADR 0071](../../../docs/adr/0071-cut-executor-round-trips-b5.md)
+**Net:** F2's best conceivable number is a **B5-sized result** — and **[ADR 0071](../../../adr/0071-cut-executor-round-trips-b5.md)
 B5 measured +6.5 / +9.3 / +10.0% and was a NO-GO to promote.** The realistic number, net of an overlap cost that grows
 with H, sits **inside or below** that already-rejected band.
 
@@ -151,7 +151,7 @@ and building two independent instruments was the right instinct.
 **The store-side search and the txn/event lever are both measured dead ends. There is no identified lever left, and the
 wall remains UNNAMED.** That is an uncomfortable but honest position, and it is far better than having built F2.
 
-**The one large unexplored area is the ENGINE side.** [ADR 0098](../../../docs/adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md)
+**The one large unexplored area is the ENGINE side.** [ADR 0098](../../../adr/0098-store-side-scaling-levers-are-exhausted-transaction-amortization-is-the-only-path-to-45m-day.md)
 §Out-of-scope already flagged it: *"the per-PID CPU collector still reads 0.00; nothing in this programme has attributed
 engine-side cost."* Every falsifier so far has been aimed at the **store**. Meanwhile the engine box sat at ~38–60%
 `max_core` while the store saturated — and the prior WS-B work put the per-box wall at *"76% plumbing."* **Engine-side

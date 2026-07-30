@@ -190,7 +190,7 @@ without touching the single-operator loopback default.
 Per ADR 0115, 2.3.5 is a control whose secure setting is deployment-specific: a single-operator
 loopback install has no second operator to be the checker, so a global flip would break it. The
 deliverable is therefore the **instruction**, now in
-[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Dual-control
+`docs/security/OFF-LOOPBACK-DEPLOYMENT.md` §"Dual-control
 approvals at exposure": set `[approvals].enabled = true` (optionally tune `operations` /
 `expiry_hours`) on any multi-operator, network-exposed console.
 
@@ -208,7 +208,7 @@ install. All three shipped defaults are unchanged and byte-identical.
 
 - **16.2.2 — startup time-sync gate.** Built and tested (ADR 0080: `serve` runs a bounded SNTP probe
   before intake; `tests/test_logging.py`). The runbook
-  ([`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Time
+  (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md` §"Time
   synchronization") instructs `[logging].require_time_sync = true` + `ntp_peer = <mgmt-NTP>` (and
   `time_sync_fail_closed = true` where a wrong clock is worse than a missed start). `require_time_sync`
   stays `false` by default — a `true` default requires `ntp_peer` at config load and would refuse to

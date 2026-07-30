@@ -38,7 +38,7 @@ has *resolved*, and no way to ask "what is wrong right now". The notifier's only
 This shows directly in the API: `ConnectionRow.alerts_active` ([`api/models.py:250`](../../messagefoundry/api/models.py))
 is documented as `# stubbed 0 until the alerts feature exists` and the dashboard sets it to a literal `0` at
 every fill site ([`api/app.py`](../../messagefoundry/api/app.py) — three `alerts_active=0` rows). The console
-renders that stub ([`console/connections.py`](../../messagefoundry/console/connections.py) `_fmt_count(row.alerts_active)`),
+renders that stub (`console/connections.py` `_fmt_count(row.alerts_active)`),
 so an operator's connections dashboard always shows zero active alerts no matter how many lanes are stopped.
 
 The Mirth/Corepoint operator model is an **alert dashboard**: an alert is an *instance* with a lifecycle
@@ -143,7 +143,7 @@ instance count for that connection — a single grouped `COUNT(*) WHERE status='
 read on the lockfree read path, joined to the row by connection name. The model field's comment
 ([`api/models.py:250`](../../messagefoundry/api/models.py)) updates from "stubbed 0 until the alerts feature
 exists" to its real meaning. The console dashboard (`_fmt_count(row.alerts_active)`,
-[`console/connections.py`](../../messagefoundry/console/connections.py)) then renders a true count with **no
+`console/connections.py`) then renders a true count with **no
 console change**. Acknowledged instances are **excluded** from `alerts_active` (an operator working an alert
 clears the red badge) but remain visible on the Alerts page — the standard ack semantics.
 
