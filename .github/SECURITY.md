@@ -15,7 +15,11 @@ verify a report against current `main` before filing.
 - **Preferred (always available, fully private):** open a [GitHub private security advisory](https://github.com/MEFORORG/MessageFoundry/security/advisories/new)
   ("Report a vulnerability") — GitHub keeps it private to the maintainers until coordinated disclosure.
   This is the recommended channel.
-- Alternatively, email the maintainer at the address on the GitHub profile.
+- **No GitHub account?** Email **<security@messagefoundry.org>** — it reaches the maintainers
+  directly. Ordinary email is not end-to-end encrypted, so the advisory above is still preferred for a
+  detailed report; if you only have email, send a short notice and we will open a private channel.
+  Please do **not** use the website contact form for vulnerability details — it is routed through a
+  third-party form service.
 
 If you cannot reach a maintainer privately within a few business days, you may request a contact via a
 **non-detail** public issue (title only, e.g. "requesting a private security contact") — **never** put
