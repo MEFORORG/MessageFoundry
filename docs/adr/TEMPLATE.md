@@ -19,7 +19,7 @@ constraints bound the choice (reliability/purity, count-and-log, no-grouping-uni
 
 > Behavioural acceptance criteria in **EARS** (Easy Approach to Requirements Syntax) — testable,
 > unambiguous, each linked (`→`) to the test or fixture that verifies it. Recommended (SHOULD) per
-> [Secure Development Standards §5](../Secure_Development_Standards.md). Forms: ubiquitous
+> the [Secure Development Standards §5.](../Secure_Development_Standards.md) Forms: ubiquitous
 > `THE SYSTEM SHALL …` · event-driven `WHEN <trigger> THE SYSTEM SHALL <response>` · state-driven
 > `WHILE <state> …` · unwanted-behaviour `IF <condition> THEN THE SYSTEM SHALL …` · optional
 > `WHERE <feature> …`. `messagefoundry adr-analyze` checks each `→` link resolves to a real file.

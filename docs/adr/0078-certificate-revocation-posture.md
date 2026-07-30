@@ -8,7 +8,7 @@
 - **Related:** **refines the revocation residual in
   [ADR 0002 §"Certificate revocation (12.1.4)"](0002-phase2-transport-security-and-strong-auth.md)**
   (that ADR *documented* the delegation; this ADR makes it an **enforced** start-time control) ·
-  flips the ASVS 12.1.4 row in [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) from
+  flips the ASVS 12.1.4 row in ASVS-L3-ASSESSMENT.md from
   *documented-residual delegation* to *enforced delegation* · builds on the in-process API TLS
   (WP-13a) + reverse-proxy termination (WP-15) of ADR 0002 · the exposed-bind refusal ladder in
   [`__main__.py`](../../messagefoundry/__main__.py) `_serve` · the TLS hardening helpers in

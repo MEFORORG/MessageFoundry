@@ -80,6 +80,10 @@ that cannot come back "no" is not an experiment; it is a search for confirmation
 - **Distinguish RAW capability from PUBLISHABLE** (the Phase-5 **D4** rule: publish at ≤50 % of the measured ceiling).
 - **Report a co-constraint carve-out honestly.** If the *rig* (engine box, load-gen) is the saturated resource rather
   than the system under test, the verdict is a **lower bound, DEFERRED** — not a design verdict.
+- **State the estimand — or quote the figure in deliveries/s.** A reported throughput figure MUST say **what is being
+  counted** (intake acceptance vs delivery); intake and delivery are separate walls, and a number that names neither is
+  not a result. The retracted **"engine sustains 26"** was ingress *acceptance* read against a **~16 msg/s** delivery
+  plateau, and **193/s is intake-only** — never a general ceiling.
 
 **Where it lives:** the handoff/handback pair is the unit. A **HANDOFF** carries the pre-registered rule *before* the
 run; a **HANDBACK** reports against it; an independent **REVIEW** adversarially audits the handback. All three are
@@ -127,3 +131,27 @@ code.
       is the discipline-in-ADR enough with artifacts kept on the operator's drive? **Owner's call.** The
       argument for committing: the C5–C7 handbacks are the only record of *how* the numbers were obtained, and
       `docs/benchmarks/` already carries the conclusions without the method.
+
+---
+
+## Amendment (2026-07-30) — the estimand rule is written down (it was already being cited)
+
+**Nothing above is reversed.** One rule that was already in force — and already cited *to this ADR* — was never
+actually written here. It is added as the last bullet of *Instrument rules that are equally binding*: **a reported
+throughput figure MUST state its estimand (intake acceptance vs delivery) or be quoted in deliveries/s.**
+
+**It was being cited against a gap.** [ADR 0074](0074-adopter-capacity-estimator.md):146 reads *"Per ADR 0101, the
+reported figure MUST state its estimand or be quoted in **deliveries/s**"* — but this ADR contained neither word. The
+citation was right about the rule and wrong only about where it lived, which is the same defect §Context describes:
+the discipline existed outside version control.
+
+**It earns its place by the same standard as the other bullets — it cost a real retraction.** ADR 0074:205 records
+Arm 0's retraction of **"engine sustains 26"** as exactly this conflation: 26/s was *ingress acceptance*, measured
+against a delivery plateau of **~16 msg/s ≈ 128 outbound-deliveries/s**
+([`benchmarks/STEP4-bracket-and-littles-law.md`](../benchmarks/STEP4-bracket-and-littles-law.md):307, run
+`s4-climbA`). It is also a **standing** correction rather than a closed one: the `N=1 = 193/s` figure is
+**intake-only, fan-out 1** (ADR 0074:63), yet is carried in a Grounding row labelled *"(server backend)"* that
+ADR 0074:164 flags as mislabelled — the same conflation, still live.
+
+**Number, title, slug and status are unchanged** — this adds an instrument rule to an existing list, not a new
+decision, and the index row in [README.md](README.md) is unaffected.

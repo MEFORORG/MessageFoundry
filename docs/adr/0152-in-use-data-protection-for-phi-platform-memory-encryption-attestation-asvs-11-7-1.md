@@ -4,7 +4,7 @@ Date: 2026-07-22
 
 ## Status
 
-**Accepted (2026-07-22)** — plan in [`docs/security/ASVS-11-7-1-IN-USE-DATA-PLAN.md`](../security/ASVS-11-7-1-IN-USE-DATA-PLAN.md).
+**Accepted (2026-07-22)** — plan in `docs/security/ASVS-11-7-1-IN-USE-DATA-PLAN.md`.
 
 Build state at acceptance:
 
@@ -14,7 +14,7 @@ Build state at acceptance:
 | **Rung 2** — operator declaration | **Built.** `[security].memory_encryption_operator_declared` (default `false`); an **exposed PHI** instance without it **warns at every start**, and refuses only when the estate opts in via `[security].require_memory_encryption_declaration` (default `false`) under `enforcement = enforce`. A contradiction is warned + reported as the tri-state `memory_encryption_readout_contradicts_declaration`, never refused. See the *2026-07-22 amendment* below for why the refusal is opt-in and why the field is not called "attested". |
 | **Rung 3** — cryptographic attestation | **Not built.** No quote acquisition, no signature verification, no vendor-chain handling. |
 | **Windows rung 3** | **Recorded infeasible in practice** — see *Windows rung 3 — spike conclusion* below. It is **platform-blocked, not API-blocked**. |
-| Deployment requirements + runbook | **Written** — [`docs/SYSTEM-REQUIREMENTS.md`](../SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment), [`OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) § *In-use data protection* (ladder row 12), [`CONFIGURATION.md`](../CONFIGURATION.md). |
+| Deployment requirements + runbook | **Written** — [`docs/SYSTEM-REQUIREMENTS.md`](../SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment), `OFF-LOOPBACK-DEPLOYMENT.md` § *In-use data protection* (ladder row 12), [`CONFIGURATION.md`](../CONFIGURATION.md). |
 
 **Accepting this ADR does not re-score 11.7.1.** The evidence for `Fail → Partial` now exists (a gate, an
 attestation of record, and a reported platform measurement) but the verdict is an owner decision on the
@@ -23,7 +23,7 @@ assessment of record, deliberately not a side effect of shipping the build.
 ## Context
 
 MessageFoundry targets **ASVS Level 3** because it carries PHI. On the 2026-07-22 single-posture
-re-score ([`ASVS-L3-ASSESSMENT-2026-07-22.md`](../security/ASVS-L3-ASSESSMENT-2026-07-22.md)) exactly
+re-score (`ASVS-L3-ASSESSMENT-2026-07-22.md`) exactly
 one requirement scores **Fail**, and this is it:
 
 > **11.7.1** — *Verify that full memory encryption is in use that protects sensitive data while it is

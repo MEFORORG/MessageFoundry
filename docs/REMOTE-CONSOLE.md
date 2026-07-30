@@ -73,12 +73,13 @@ proxy_tls_min_version = "1.2"
 
 **The `proxy_tls_min_version` line is not the control — your proxy configuration is.** Copy a
 reference terminator config whole from
-[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs
 (nginx, Caddy, or IIS + ARR — each pins an explicit protocol floor plus forward-secret ciphers and
 key-exchange groups) and keep the fence and this declaration in step: narrow the proxy to TLS 1.3
 only and you must raise `proxy_tls_min_version` to `"1.3"` in the same change. That page also
 carries the recommended hardening for an exposed console (client-certificate device posture,
-`web_console_public_address`, the full startup ladder).
+`web_console_public_address`, the full startup ladder). It is maintainer-internal —
+[SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 ### Authentication at exposure
 
@@ -93,7 +94,55 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
 
 ---
 
-## 2. Console side — point it at the engine
+## 2. What the console can change
+
+The web console is **not** a read-only viewer. It carries the operator write surface, and each `/ui`
+write calls the same JSON handler, RBAC permission and audit path the API uses
+([`api/app.py`](../messagefoundry/api/app.py)) — so exposing the console exposes these operations to
+whoever holds the permission. Plan an exposure against this list, not against the dashboard's
+read-only-looking front page.
+
+Every row is a `POST`. **Step-up** means the operator is re-verified (password, plus MFA where
+enrolled) before the action runs — a stale window is redirected to `/ui/reauth` rather than refused.
+**Dual control** applies only where `[approvals]` is enabled: the action is then held for a second,
+*distinct* approver holding `approvals:approve` instead of executing inline.
+
+| Operation | Route | Permission | Extra gate |
+|---|---|---|---|
+| Start / stop / restart a connection, singly or over a selection | `/ui/connections/{name}/start`, `/stop`, `/restart`, `/ui/connections/bulk-control` | `connections:control` | — |
+| Toggle a connection's flag annotation — the one console write that persists to `connections.toml` | `/ui/connections/{name}/flag` | `config:deploy` | — |
+| Reload the graph from the engine's own startup config dir (executes your config Python) | `/ui/config/reload` | `config:deploy` | step-up + dual control |
+| Replay one message | `/ui/messages/{message_id}/replay` | `messages:replay` | step-up |
+| Replay dead deliveries — for one channel, for one (channel, destination), or all of them | `/ui/dead-letters/{channel_id}/replay`, `/ui/dead-letters/{channel_id}/{destination_name}/replay`, `/ui/dead-letters/replay-all` | `messages:replay` | step-up + dual control |
+| Edit a message body and resend it (re-route, or direct to a chosen outbound) | `/ui/messages/{message_id}/edit-resend` | `messages:edit` | step-up |
+| Purge an outbound's queued deliveries, for one connection or a selection | `/ui/connections/{name}/purge/{scope}`, `/ui/connections/purge-bulk` | `messages:purge` | step-up + dual control |
+| Acknowledge / resolve / suspend / resume an alert | `/ui/alerts/{alert_id}/ack`, `/resolve`, `/suspend`, `/resume` | `monitoring:diagnose` | — |
+| Reset cumulative statistics — all of them, one connection, or a selection | `/ui/statistics/reset`, `/reset-one`, `/reset-many` | `monitoring:diagnose` | — |
+| Run an on-demand store integrity check (`PRAGMA quick_check` — reads, changes nothing) | `/ui/status/integrity-check` | `monitoring:diagnose` | — |
+| Activate / release a DR standby | `/ui/dr/activate`, `/ui/dr/release` | `dr:operate` | — |
+| Upload a message file into the engine — **writes real PHI at rest** | `/ui/uploaded-logs/upload` | `files:upload` | — |
+| Re-inject a message out of an uploaded file | `/ui/uploaded-logs/file/{file_id}/resend` | `files:browse` | — |
+| Delete an uploaded file | `/ui/uploaded-logs/file/{file_id}/delete` | `files:delete` | step-up |
+| Save / delete a message-search preset | `/ui/messages/search/presets`, `/presets/{preset_id}/delete` | `messages:read` | step-up on save |
+| Create / update / delete a user; set roles or channel scope; reset password or MFA; revoke their sessions | `/ui/users`, `/ui/users/{user_id}/update`, `/roles`, `/channel-scope`, `/reset-password`, `/reset-mfa`, `/revoke-sessions`, `/delete` | `users:manage` | step-up |
+| Create / update / delete a custom role | `/ui/roles/custom`, `/ui/roles/custom/{role_id}/update`, `/delete` | `users:manage` | step-up |
+| Map AD groups to roles, and to channel scopes | `/ui/ad-groups/map`, `/ui/ad-groups/scope-map` | `users:manage` | step-up |
+| The operator's **own** account: change password, enrol / confirm / disable TOTP, add or remove a passkey, revoke own sessions | `/ui/account/password`, `/ui/account/mfa/*`, `/ui/account/webauthn/*`, `/ui/account/sessions/*` | none — self-scoped, authorized by session ownership | password re-proof; full step-up to disable MFA or remove a passkey |
+| Sign in, sign out, re-authenticate, verify a second factor | `/ui/login`, `/ui/logout`, `/ui/reauth`, `/ui/reauth/webauthn`, `/ui/mfa` | none | — |
+
+Two things the console deliberately **cannot** do. It has no editor for Connection/Router/Handler
+Python — the reload above always runs the engine's own startup config dir, never a browser-supplied
+path — and it cannot write service settings: `[security]` and the rest of `messagefoundry.toml` are
+read-only to it (`GET /security/posture`), so changing posture is a file/IDE operation. The
+connection-flag row is the single exception to "no config writes".
+
+The exhaustive per-route table — reads as well as writes, the exact gate on each, and the places a
+`/ui` route is deliberately weaker than its JSON counterpart — lives in
+[`SECURITY.md`](SECURITY.md).
+
+---
+
+## 3. Console side — point it at the engine
 
 ```
 python -m messagefoundry.console --url https://engine-host:8765

@@ -81,7 +81,7 @@ Destinations compose with everything already built (retry policy, `NegativeAckEr
   engine's at-least-once invariant already requires idempotent destinations — `MERGE`/upsert or a
   natural key).
 - **SOAP destination**: a thin layer over the REST/HTTP client — build the envelope (+ optional
-  WS-Security per the Secure Development Standards), POST it, map SOAP `Fault` → permanent vs the
+  WS-Security per the [Secure Development Standards](../Secure_Development_Standards.md)), POST it, map SOAP `Fault` → permanent vs the
   transport error → retry.
 
 ### 3. Sources second — gated on the payload-agnostic decision (§5)

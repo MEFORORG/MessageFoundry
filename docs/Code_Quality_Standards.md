@@ -61,19 +61,19 @@ The full standard follows: the evidence review, the AI failure-mode map, the com
 
 *A companion standard to [Secure Development Standards](Secure_Development_Standards.md) (SDS) and [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) (the AI-build companion). The SDS says **what a secure build must satisfy**; the AI-build companion says **how to build it with an AI assistant** (process, tiers, provenance). This document is the third leg: **how to judge whether the resulting code is actually good — not "AI slop" — using signals the evidence supports, not scoreboards it refutes.** It governs the **outcome**, where the SDS governs the process and the AI companion governs the tooling.*
 
-> **Scope boundary — read this first.** This is a **code-quality measurement rubric**, not a security standard (that is the [SDS](Secure_Development_Standards.md)) and not the AI-build process standard (that is the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md)). Where a signal here is *already owned* by a companion — dependency-existence verification, human review, SAST — this doc **points to it and does not restate it.** Its own additions are the *quality-measurement* gates neither companion carries: test-signal proof (mutation), duplication/reuse detection, coverage *visibility*, complexity *triage*, lint breadth, and **published-artifact / supply-chain-*out* integrity** (signal 6).
+> **Scope boundary — read this first.** This is a **code-quality measurement rubric**, not a security standard (that is the SDS) and not the AI-build process standard (that is the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md)). Where a signal here is *already owned* by a companion — dependency-existence verification, human review, SAST — this doc **points to it and does not restate it.** Its own additions are the *quality-measurement* gates neither companion carries: test-signal proof (mutation), duplication/reuse detection, coverage *visibility*, complexity *triage*, lint breadth, and **published-artifact / supply-chain-*out* integrity** (signal 6).
 
 |  |  |
 |----|----|
 | **Document** | Code Quality & Anti-Slop Standards |
-| **Applies to** | Any project developed under the [SDS](Secure_Development_Standards.md). **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
+| **Applies to** | Any project developed under the SDS. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A); future projects add Appendix B, C, … |
 | **Maintained by** | Project maintainers (open-source). Each deploying/adopting organization assigns its own local owner. |
 | **Status** | Draft for review |
 | **Version** | 0.11 |
 | **Date** | July 27, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material change to the metric evidence base or the AI toolchain. |
-| **Aligns to** | **ISO/IEC 25010:2023** (product-quality model — Maintainability = modularity / reusability / analyzability / modifiability / testability) · companion to [SDS](Secure_Development_Standards.md) **PW.7 / PW.8** and the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) §3 failure-modes / §9 deferred-gates. Evidence base is **peer-reviewed metric-validity studies + DORA 2024 + GitClear + the METR RCT + Stanford CCS'23**, each carried with its honesty caveat (§7). **Confers no certification.** |
+| **Aligns to** | **ISO/IEC 25010:2023** (product-quality model — Maintainability = modularity / reusability / analyzability / modifiability / testability) · companion to SDS **PW.7 / PW.8** and the [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) §3 failure-modes / §9 deferred-gates. Evidence base is **peer-reviewed metric-validity studies + DORA 2024 + GitClear + the METR RCT + Stanford CCS'23**, each carried with its honesty caveat (§7). **Confers no certification.** |
 
 ------------------------------------------------------------------------
 
@@ -121,7 +121,7 @@ The [Secure AI-Assisted Development Standards §3](Secure_AI_Development_Standar
 
 | AI slop failure mode | Evidence | The control (owner) |
 |----|----|----|
-| **Insecure code + overconfidence** | Stanford CCS'23: AI-assisted users wrote less-secure code, *more* confident it was secure. [\[R6\]](#r6) | Mandatory human review + blocking SAST that cannot be waived — **owned by [SDS PW.7](Secure_Development_Standards.md) + [AI companion §6.5/§6.6](Secure_AI_Development_Standards.md)**. This rubric only *checks it is present*. |
+| **Insecure code + overconfidence** | Stanford CCS'23: AI-assisted users wrote less-secure code, *more* confident it was secure. [\[R6\]](#r6) | Mandatory human review + blocking SAST that cannot be waived — **owned by SDS PW.7 + [AI companion §6.5/§6.6](Secure_AI_Development_Standards.md)**. This rubric only *checks it is present*. |
 | **Hallucinated / typosquatted dependencies** ("slopsquatting") | ~14.4% of *distinct* Python modules in real ChatGPT output did not exist. [\[R7\]](#r7) | Verify-before-add + hash-locked lockfile + new-import audit — **owned by [AI companion §6.4/§9](Secure_AI_Development_Standards.md)**. This rubric *checks it is present*. |
 | **Silent duplication over reuse** (copy-instead-of-abstract) | GitClear: 2024 was the first year copy/pasted lines (12.3%) exceeded "moved"/refactored lines (9.5%). [\[R9\]](#r9) *(Correlational — §7.)* | **Clone-detection on the diff** + a "moved vs copied" review lens. **New gate — this document (§5).** |
 | **Shallow tests that assert little** | Coverage % hides assertion-free tests; mutation testing exposes them. [\[R5\]](#r5) | **Mutation testing on changed code, as guidance.** **New gate — this document (§5).** |
@@ -260,7 +260,7 @@ The five gates this document adds (rubric rows 7–11) are *quality-measurement*
 - **DORA 2024** — AI adoption vs. delivery stability/throughput — [dora.dev/research/2024](https://dora.dev/research/2024/dora-report/).
 - **GitClear** — copy/paste vs. moved lines, churn — [GitClear AI Copilot Code Quality 2025](https://gitclear-public.s3.us-west-2.amazonaws.com/GitClear-AI-Copilot-Code-Quality-2025.pdf).
 - **METR RCT (experienced devs 19% slower)** — cited via the [AI companion §3/§11](Secure_AI_Development_Standards.md).
-- **Cross-links:** [Secure Development Standards](Secure_Development_Standards.md) · [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) · [`../CLAUDE.md`](../CLAUDE.md).
+- **Cross-links:** Secure Development Standards · [Secure AI-Assisted Development Standards](Secure_AI_Development_Standards.md) · [`../CLAUDE.md`](../CLAUDE.md).
 
 ------------------------------------------------------------------------
 
@@ -315,7 +315,7 @@ Ordered by anti-slop leverage, not effort (build placement per §5). **✅ = shi
 
 ### A.4 Documented caveat — solo-maintainer review
 
-Row 5's "human review" is **self-review** (the [SDS §A.6](Secure_Development_Standards.md#a6-documented-deviations) / [AI companion Appendix A.6](Secure_AI_Development_Standards.md#a6-documented-deviations) single-maintainer deviation). The Stanford overconfidence finding (§3) bites hardest exactly when the author reviews their own AI-authored code — which is the strongest argument for the mutation gate (Built this cycle — \#1040), since it is the one control that *adversarially* checks whether the tests assert anything, independent of the author's confidence.
+Row 5's "human review" is **self-review** (the SDS §A.6 / [AI companion Appendix A.6](Secure_AI_Development_Standards.md#a6-documented-deviations) single-maintainer deviation). The Stanford overconfidence finding (§3) bites hardest exactly when the author reviews their own AI-authored code — which is the strongest argument for the mutation gate (Built this cycle — \#1040), since it is the one control that *adversarially* checks whether the tests assert anything, independent of the author's confidence.
 
 ------------------------------------------------------------------------
 

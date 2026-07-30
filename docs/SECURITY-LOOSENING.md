@@ -109,7 +109,7 @@ trail.
 - **When acceptable:** a real remote-operations need, on a trusted/segmented network, with TLS.
 - **Compensating controls:** keep `require_encryption_for_remote = true` (TLS required); front with a
   revocation-checking reverse proxy (`[api].tls_terminated_upstream` + `trusted_proxies`); a managed admin
-  host / mTLS ([OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md)).
+  host / mTLS (OFF-LOOPBACK-DEPLOYMENT.md).
 - **Still refused:** an off-box bind without TLS (unless `require_encryption_for_remote = false`, below).
 
 ### `allowed_client_networks = []` (empty) **while the console is exposed** — no source-network allow-list
@@ -127,7 +127,7 @@ trail.
 - **Compensating controls:** the host-firewall `-RemoteAddress` rule
   ([ANTIVIRUS-FIREWALL.md](ANTIVIRUS-FIREWALL.md)); nginx/Caddy `allow`/`deny`; network segmentation.
 - **Before setting it:** read the section in
-  [OFF-LOOPBACK-DEPLOYMENT.md](security/OFF-LOOPBACK-DEPLOYMENT.md) — it is **inert behind an undeclared
+  OFF-LOOPBACK-DEPLOYMENT.md — it is **inert behind an undeclared
   proxy or NAT**, it tightens `[api].trusted_proxies` to single hosts, and a lockout costs a service
   restart ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)).
 - **Still refused:** nothing — this is advisory only. An exposed bind with an empty list starts normally.

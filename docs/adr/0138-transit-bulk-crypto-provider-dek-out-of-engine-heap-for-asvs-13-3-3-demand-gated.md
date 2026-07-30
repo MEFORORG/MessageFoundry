@@ -5,7 +5,7 @@
 
 - **Status:** Accepted (2026-07-20) — **Increment 1 built + verified** (see *Implementation status*); the deferred legs stay demand-gated
 - **Date:** 2026-07-20
-- **Related:** [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (the KeyProvider seam this extends) · [ADR 0109](0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md) (Rejected — undeclared-PHI fail-closed) · [ASVS-L3-ASSESSMENT-2026-07-20.md](../security/ASVS-L3-ASSESSMENT-2026-07-20.md) §3 (13.3.3 Fail) · [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5 · [solutions research](../security/ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md) · BACKLOG **#271** · CLAUDE.md §2 (reliability/at-rest), §9 (PHI/HIPAA)
+- **Related:** [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (the KeyProvider seam this extends) · [ADR 0109](0109-at-rest-encryption-fail-closed-on-an-undeclared-phi-posture.md) (Rejected — undeclared-PHI fail-closed) · ASVS-L3-ASSESSMENT-2026-07-20.md §3 (13.3.3 Fail) · ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5 · solutions research (`ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md`) · BACKLOG **#271** · CLAUDE.md §2 (reliability/at-rest), §9 (PHI/HIPAA)
 
 ---
 
@@ -38,7 +38,7 @@ with the plaintext key resident in the engine's heap; the shipped Vault provider
 ([`store/keyprovider_vault.py`](../../messagefoundry/store/keyprovider_vault.py)) only **KEK-unwraps** the
 DEK, so the unwrapped key still lands in process memory for the bulk work.
 
-Two verified facts (from the [solutions research](../security/ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md),
+Two verified facts (from the solutions research,
 3-vote adversarially verified) reframe the fix:
 
 1. **The requirement's own text names "a vault"** — disjunctively from "hardware security module" — as a

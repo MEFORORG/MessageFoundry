@@ -29,7 +29,7 @@
 - **Related:** ADR 0037 (L3 multi-process sharding — **built**, the multi-core path) · ADR 0039 (L5
   DBSHARD — design-approved, **shelved**) · ADR 0040 (L6 free-threading — declined-for-now) · ADR 0001
   (staged pipeline / ACK-on-receipt) · ADR 0019 (store DEK / KeyProvider) · ADR 0028 (base64 binary
-  carriage) · [docs/THROUGHPUT-IMPROVEMENTS.md](../THROUGHPUT-IMPROVEMENTS.md) §5 (the engineering note) ·
+  carriage) · [docs/archive/throughput/THROUGHPUT-IMPROVEMENTS.md](../archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5 (the engineering note) ·
   BACKLOG #64 (the tracked roadmap) · #28/#29 (load/throughput tests) · #40 (Win2025 + SQL2025 box CI) ·
   #34/#47/#62/#63 (the lean-writes/storage cluster) · #52 (capability-parity sibling) ·
   [CLAUDE.md](../../CLAUDE.md) §2 (reliability + count-and-log invariants).

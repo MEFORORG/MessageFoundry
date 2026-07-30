@@ -29,8 +29,8 @@
   ([config/settings.py](../../messagefoundry/config/settings.py), used by LDAPS + SQL Server).
 - **Supersedes:** the `tls_*` "future" placeholder row in [CONFIGURATION.md](../CONFIGURATION.md) `[api]`
   and the one-line stub bullets under **Phase 2** in
-  [ASVS-L2-REMEDIATION-PLAN.md](../security/ASVS-L2-REMEDIATION-PLAN.md) (expanded here).
-- **Related:** [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) (the five
+  ASVS-L2-REMEDIATION-PLAN.md (expanded here).
+- **Related:** ASVS-L3-ASSESSMENT.md (the five
   deferred-until-off-loopback Fails: HSTS 3.4.1, WSS 4.4.1, MFA 6.3.3, transport TLS 12.3.1, off-box
   logs 16.4.3 — this ADR addresses the first four), [PHI.md](../PHI.md) §4 (data in transit) + §11
   (roadmap P1-4 / P2-1 / P2-2 / P2-3), [SECURITY.md](../SECURITY.md) "Not yet built", and
@@ -91,7 +91,7 @@ require_mfa PHI-prod ladder (refuse prod PHI / warn non-prod PHI / quiet synthet
 `MEFOR_TLS_REVOCATION_ATTESTED` (ADR 0078). `--allow-insecure-bind` **cannot** bypass it (that override
 lives only in the no-TLS arm of the mutually-exclusive exposed-gate, which a Posture-B bind never
 reaches). This is an **extension, never a weakening** — loopback and synthetic instances start
-byte-identically. See [OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md) row 1b.
+byte-identically. See OFF-LOOPBACK-DEPLOYMENT.md row 1b.
 
 ### 1. WP-13a — Engine API + WebSocket TLS (primary termination path)
 
@@ -115,7 +115,7 @@ Falls out for free:
   ([api/security.py](../../messagefoundry/api/security.py) `authorize_ws`) is transport-agnostic and
   needs **no** change. (4.4.1)
 - **Console** — `EngineClient` already refuses plaintext `http` to a non-loopback host unless
-  `--insecure` ([console/client.py](../../messagefoundry/console/client.py) `_assert_safe_transport`);
+  `--insecure` (`console/client.py` `_assert_safe_transport`);
   point it at `https://`/`wss://` for remote engines. For **mutual TLS** (12.3.5) it can now present a
   client certificate via `--client-cert` / `--client-key` (threaded into `httpx.Client(cert=…)`), so
   when the API sets `tls_client_ca_file` (→ `CERT_REQUIRED`) the console authenticates by certificate,
@@ -316,6 +316,6 @@ residuals tracked in ADR 0078.
 one WP per branch/PR with the standard quartet gate. **WP-14 (MFA) was subsequently pulled forward and
 BUILT 2026-06-17** (native RFC 6238 TOTP for local accounts) rather than waiting for 0.2, since the
 engine must carry its own MFA for local-account deployments.
-Flip the relevant [ASVS-L3-ASSESSMENT.md](../security/ASVS-L3-ASSESSMENT.md) rows and update
+Flip the relevant ASVS-L3-ASSESSMENT.md rows and update
 [PHI.md](../PHI.md) §4/§11 + [CONFIGURATION.md](../CONFIGURATION.md) + [SECURITY.md](../SECURITY.md) as
 each lands. Update CLAUDE.md / ARCHITECTURE.md only when code ships, not now.*

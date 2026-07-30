@@ -47,7 +47,7 @@ After we acknowledge a report, we triage it by severity and target these remedia
 **Coordinated disclosure.** We practice coordinated disclosure: we ask that you give us a reasonable
 window to ship a fix before any public detail, and we publish details (and credit, if wanted) **once
 a fix is available**. We'll keep you updated on progress and agree the disclosure timing with you.
-These windows trace to the project's Secure Development Standards (§4.4 RV.2, Appendix A.5).
+These windows trace to the project's [Secure Development Standards](../docs/Secure_Development_Standards.md) (§4.4 RV.2, Appendix A.5).
 
 ## Dependency (third-party) vulnerabilities
 
@@ -61,7 +61,10 @@ is *not* a contradiction of the ≤7-day own-code window above):
 - **Exploitation pressure sets priority, not CVSS alone.** We triage **KEV-first** (on CISA's
   Known-Exploited-Vulnerabilities list → patch now), then **EPSS** (≥ 0.7 = imminent), with **CVSS only
   as a tiebreaker**, and we weigh **reachability** — is the package installed in a shipped profile,
-  wired into a running graph, and egress-reachable?
+  wired into a running graph, and egress-reachable? The procedure behind that judgement is
+  `docs/security/SOUP-DEPENDENCY-HANDLING.md`, a maintainer-internal document;
+  [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md) explains why it is not published
+  here and what you can request.
 
 | Class | Trigger | Target (from upstream-fix availability) |
 |---|---|---|
@@ -75,7 +78,8 @@ is *not* a contradiction of the ≤7-day own-code window above):
 leave the affected extra uninstalled, or tighten the egress allow-list — and track to the fix. Detection
 feeds this lane automatically: blocking `pip-audit`/`npm-audit` against the hash-locked tree, a **daily**
 `security.yml` cron (a CVE against an unchanged pin is caught in ~24h), and grouped Dependabot security
-PRs.
+PRs. The step-by-step response is `docs/security/DEP-CVE-RUNBOOK.md`, also maintainer-internal —
+see [`docs/SECURITY-DOCS-POLICY.md`](../docs/SECURITY-DOCS-POLICY.md).
 
 ## Scope notes
 
