@@ -1,0 +1,106 @@
+name: Nightly failure notice
+
+# A scheduled run's failure reports NOWHERE. That is the gap this closes.
+#
+# THE DEFECT THIS EXISTS FOR. Measured 2026-07-30: the `load test (smoke, sqlserver)` legs had been red
+# for FOUR consecutive nights (2026-07-27 through 07-30) and nothing surfaced it. Across the last 14
+# nightly CI runs, 5 failed. A nightly is not a PR context, so nobody sees it unless they go looking --
+# and the one thing that could have carried it onto a merge path, the `CI gate` roll-up, treats a
+# SKIPPED leg as a pass (correctly: those legs do not run on PRs at all).
+#
+# So the repo had a whole class of test -- the server-DB store, load/throughput and service-smoke legs,
+# i.e. exactly what the three required `test` legs SKIP -- whose failures were invisible by
+# construction. This is the same shape as the gate-liveness work (`scripts/quality/liveness.py`): a
+# signal that reports into the void is not a signal.
+#
+# WHY `workflow_run` AND NOT A JOB INSIDE ci.yml. A job would have to `needs:` every nightly leg and
+# would silently stop covering any leg added later. `workflow_run` fires on the WHOLE run's conclusion,
+# so a new leg is covered the day it is added, with nothing to keep in step.
+#
+# SCOPE: schedule-only, deliberately. A push/PR failure is already visible on the PR itself; alerting
+# there would be pure noise, and `workflow_run` fires for every CI completion regardless of trigger.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+
+# Read-only by default; the one job that writes escalates to `issues: write` and nothing else.
+permissions:
+  contents: read
+
+jobs:
+  notice:
+    name: nightly failure notice
+    # ONLY scheduled runs. `github.event.workflow_run.event` is the trigger of the run that COMPLETED,
+    # not of this one -- this workflow is always itself a `workflow_run`.
+    if: github.event.workflow_run.event == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Open, update, or close the nightly-failure issue
+        env:
+          # Hoisted, never interpolated into the script body (zizmor: template injection). A run title
+          # is attacker-influenceable in the general case -- a branch name reaches it -- so none of
+          # these are pasted into shell.
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          RUN_URL: ${{ github.event.workflow_run.html_url }}
+          RUN_STARTED: ${{ github.event.workflow_run.run_started_at }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        run: |
+          set -euo pipefail
+
+          TITLE="Nightly CI is failing"
+          LABEL="bug"
+
+          # Find an OPEN issue with this exact title. `--search` is deliberately anchored on the title
+          # so a human renaming the issue starts a fresh one rather than silently detaching this
+          # workflow from it -- a stale reference that opens duplicates forever is worse than a new
+          # issue.
+          existing="$(gh issue list --state open --label "$LABEL" --limit 50 \
+                        --json number,title \
+                        --jq "[.[] | select(.title == \"$TITLE\")][0].number // empty")"
+
+          if [ "$CONCLUSION" = "success" ]; then
+            # Recovered. Close it so the issue tracks CURRENT state rather than becoming a permanent
+            # nag nobody reads -- an alert that is always on is the same as no alert.
+            if [ -n "$existing" ]; then
+              gh issue comment "$existing" --body \
+                "Nightly CI is green again as of [this run]($RUN_URL) (\`$HEAD_SHA\`). Closing."
+              gh issue close "$existing"
+              echo "closed #$existing — nightly recovered"
+            else
+              echo "nightly green, no open issue — nothing to do"
+            fi
+            exit 0
+          fi
+
+          # `cancelled` and `skipped` are not failures: a cancelled nightly is usually a superseded or
+          # manually-stopped run, and reporting it as a break would train the reader to ignore this.
+          if [ "$CONCLUSION" != "failure" ]; then
+            echo "nightly concluded '$CONCLUSION' — not a failure, nothing to do"
+            exit 0
+          fi
+
+          BODY="Nightly (scheduled) CI failed.
+
+          - run: $RUN_URL
+          - commit: \`$HEAD_SHA\`
+          - started: $RUN_STARTED
+
+          A scheduled run is not a PR context, so this failure appears nowhere else. The nightly-only
+          legs are the server-DB store, load/throughput and service-smoke suites — exactly the ones the
+          three required \`test\` legs skip — so a break here is invisible until someone looks.
+
+          This issue is opened once and commented on each subsequent failure; it closes itself when a
+          nightly goes green again."
+
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$BODY"
+            echo "commented on #$existing"
+          else
+            gh issue create --title "$TITLE" --label "$LABEL" --body "$BODY"
+            echo "opened a new issue"
+          fi
