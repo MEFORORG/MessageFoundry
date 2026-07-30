@@ -55,9 +55,18 @@
          NOTHING to this tool's decisions: of the writes landing in a `<primary>-<slug>` sibling on
          this repo, 88.9% came from a session whose recorded cwd was a different checkout, and signal 1
          placed a session inside 0 of the 4 siblings that existed when it was measured. Measured after
-         (2026-07-30, real repo, 5 candidates): signal 1 = 1 of 5, signal 3 = 4 of 5, and the three it
-         adds include two worktrees a session that is LIVE RIGHT NOW had written 144 times between them
-         from a cwd of the primary. Like signal 1 it can only veto, and -Name cannot override it.
+         (2026-07-30, real repo, 7 candidates): signal 1 = 1 of 7, signal 3 = 6 of 7, and the five it
+         adds include three worktrees a session that is LIVE RIGHT NOW had written 257 times between
+         them from a cwd of the PRIMARY, plus one being written into from a checkout of an entirely
+         different repository. Like signal 1 it can only veto, and -Name cannot override it.
+         WHAT THAT NUMBER IS AND IS NOT, because it is a placement count and reads like a protection
+         delta: at the DEFAULT windows, every candidate signal 3 covered had also had its git metadata
+         touched more recently than its last tool-call write, so signal 3's veto set was a strict
+         SUBSET of signal 2's and the unattended default-flag run behaved identically without it. That
+         is an empirical fact about one afternoon, not a structural one -- a session editing files
+         without running a git command is seen by signal 3 and not by signal 2 -- but the measured
+         value of signal 3 today is concentrated where signal 2 is off or narrowed: -Name, a reduced
+         -IdleHours, and the per-candidate re-check during -Apply.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
@@ -82,9 +91,11 @@
     cleared from any candidate -- and a file caught half-written is precisely what a session that
     launched a second ago looks like), and no transcript fault behind signal 3 (an unreadable
     transcript, a torn line, or its canary reporting that the format has moved). When it is unavailable
-    every candidate becomes SKIP and the run exits non-zero rather than silently pruning unfenced, and
-    the fence is re-read immediately before each removal so a fence that DIES mid-run stops the rest.
-    There is deliberately no override flag.
+    every candidate becomes SKIP and the run exits non-zero rather than silently pruning unfenced. The
+    fence is re-read IN FULL before EACH removal -- every source, per candidate, not once for the loop
+    -- so a session that arrives during an earlier removal still stops the later ones; it used to be
+    read once, which left the only signal with measured coverage stale for candidates 2..N while the
+    36 h metadata guess was the fresh one. There is deliberately no override flag.
 
     A SIGNAL THAT SAW NOTHING SAYS SO, RATHER THAN REPORTING A BARE ZERO. "0 candidates vetoed" reads
     as "nobody is anywhere" and sends an operator to -Name; "3 of 5 candidates have no footprint, so
@@ -213,6 +224,12 @@ function Set-Exit([int]$Code) { if ($Code -gt $script:exit) { $script:exit = $Co
 # The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
 # occupied, so a window under this one releases trees that measurement says are in use.
 $IDLE_FLOOR_HOURS = 12
+# The same floor under -FootprintHours, and it exists for the same measured reason: `-IdleHours 0.5`,
+# typed for "half an hour", released every worktree on this repo and printed no warning at all -- and
+# the new knob shipped with exactly that hole. Measured on the real repo: `-FootprintHours 0.5` took
+# signal 3 from 5 vetoes to 2 with an EMPTY reducedAssurance, while the -Name banner in the same run
+# asserted "signals 1 and 3 still apply". Only the literal 0 and a negative value were ever declared.
+$FOOTPRINT_FLOOR_HOURS = 12
 
 function Write-Note([string]$Text, [string]$Colour = 'DarkGray') {
     if (-not $Json) { Write-Host $Text -ForegroundColor $Colour }
@@ -286,6 +303,23 @@ elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
 if ($ConfigRoot) {
     $reducedAssurance += "liveness fence scoped to an explicit -ConfigRoot ($($ConfigRoot -join ', ')): the machine's real session registry was NOT consulted"
 }
+# Signal 3's window, declared on exactly the same terms as signal 2's. A footprint that cannot be
+# fenced against a live pid vetoes until it ages out of THIS window, so narrowing it releases
+# worktrees whose last writer cannot be proven gone.
+$footprintVetoOn = ($FootprintHours -gt 0)
+if (-not $footprintVetoOn) {
+    $reducedAssurance += 'write footprint DISABLED (-FootprintHours 0): signal 3 is OFF, so a session writing into a worktree by absolute path from another checkout is invisible to this run'
+}
+elseif ($FootprintHours -lt $FOOTPRINT_FLOOR_HOURS) {
+    $reducedAssurance += "footprint window NARROWED to $FootprintHours h (floor $FOOTPRINT_FLOOR_HOURS h): signal 3 will release a worktree whose last tool-call write is older than that, and it is the only signal with measured coverage of a cross-checkout writer"
+}
+# How signal 3 must be DESCRIBED elsewhere in this run. The -Name banner below used to assert
+# "signals 1 and 3 still apply" unconditionally, which is false the moment another flag has narrowed
+# or disabled signal 3 -- and the only warning an operator saw was that false one.
+$sig3State =
+if (-not $footprintVetoOn) { 'signal 3 is OFF (-FootprintHours 0)' }
+elseif ($FootprintHours -lt $FOOTPRINT_FLOOR_HOURS) { "signal 3 is NARROWED to $FootprintHours h" }
+else { 'signal 3 still applies' }
 
 # --- Refresh refs (see -Fetch) -------------------------------------------------------------------
 $fetched = $false
@@ -694,11 +728,17 @@ $prunable = @($decisions | Where-Object { $_.Decision -eq 'PRUNE' })
 # line, while the flag it is equivalent to got a red banner.
 $confirmedActually = @($decisions | Where-Object { $_.Confirmed } | ForEach-Object { $_.Leaf })
 if ($confirmedActually.Count -gt 0) {
-    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those (signals 1 and 3 still apply, and -Name cannot reach either)"
+    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those (signal 1 applies and $sig3State; -Name cannot reach either)"
 }
-# A source that could not see anything is reduced assurance, not a clean bill of health.
+# A source that could not see anything is reduced assurance, not a clean bill of health. BOTH extra
+# sources: signal 4's note ("no pin has ever been taken in this repo") used to render only in yellow
+# one indent down, while signal 3's was promoted -- so the signal measuring 0 BY CONSTRUCTION was the
+# quieter of the two.
 if ($fp -and $fp.Available -and $fp.Note) {
     $reducedAssurance += "write-footprint source contributed nothing: $($fp.Note)"
+}
+if ($pinSet -and $pinSet.Available -and $pinSet.Note) {
+    $reducedAssurance += "operator-pin source contributed nothing: $($pinSet.Note)"
 }
 
 # The gh receipt, written from what the probes ANSWERED (see Test-Merged).
@@ -737,7 +777,11 @@ $blindSpots = @(
     'a write by anything that is not a Claude tool call (an editor, an autosave, a plain terminal, a process still running after its tool call returned)',
     'a file written BY a shell command -- the transcript records the command string, not a resolved path list',
     'a session that never registered AND never wrote through a tool call',
-    'a session whose writes are outside -FootprintHours while its git metadata is outside -IdleHours'
+    'a session whose writes are outside -FootprintHours while its git metadata is outside -IdleHours',
+    # The two residuals the fixed canaries still cannot reach. Named here rather than left in a script
+    # header, because this list is what an operator actually reads before deciding to trust the fence.
+    'a transcript torn mid-write on its FIRST write into a brand-new worktree, in a file that has never named this repo family -- counted (linesUnparseableElsewhere), not refused; that worktree is covered by signal 4 and by fresh git metadata instead',
+    'a vendor release that renames the write tools AND moves the path keys at the same time -- canary 1 catches the second, canary 4 the first, and neither catches both together; what is left is the footprint note saying no write placed'
 )
 
 if (-not $Json) {
@@ -754,6 +798,17 @@ if (-not $Json) {
                 $fp.TranscriptsFound, $fp.RootsWithCorpus, $fp.TranscriptsInWindow, $fp.WindowHours,
                 $fp.TranscriptsWithNeedle, $fp.LinesParsed, $fp.WritesExamined, $fp.WritesPlaced,
                 $fp.WritesUnplaced, $fp.CrossTreeWrites) -ForegroundColor DarkGray
+            # The allow-list, and what was actually observed against it. Canary 4 fires only when the
+            # intersection is EMPTY; a PARTIAL rename (one tool renamed, the rest intact) leaves it
+            # green, so the vocabulary has to be legible rather than merely asserted.
+            Write-Host ("    write tools recognised: {0} of {1}; {2} distinct tool name(s) seen over {3:n0} path-tool block(s). Placement: {4} by path, {5} through .git ({6} director(ies) probed)." -f
+                (@($fp.WriteToolNamesSeen) -join '/'), (@($fp.WriteToolsAllowList) -join '/'),
+                @($fp.ToolNamesSeen).Count, $fp.PathToolBlocks,
+                $fp.PlacedByPrefix, $fp.PlacedByGitdir, $fp.GitdirProbes) -ForegroundColor DarkGray
+            if ($fp.LinesUnparseableElsewhere -gt 0) {
+                Write-Host ("    {0} unparseable line(s) in transcripts with no connection to this repo family -- counted, not refused (a machine-wide scan cannot fault on every session that is mid-append)." -f
+                    $fp.LinesUnparseableElsewhere) -ForegroundColor DarkGray
+            }
             if ($fp.Note) { Write-Host "    $($fp.Note)" -ForegroundColor Yellow }
             # NEVER a bare zero. "0 vetoed" reads as "nobody is anywhere" and sends an operator to
             # -Name; this is the same number with the honest meaning attached.
@@ -896,13 +951,22 @@ function Remove-BranchSafely {
 
 $occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
-    # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
-    # candidate, and a session can arrive inside that window.
-    $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
-        -IncludeFootprints -FootprintHours $FootprintHours -IncludePins
     Write-Note ""
     foreach ($d in $prunable) {
         if (-not $Json) { Write-Host "Removing $($d.Leaf) [$($d.Branch)]..." -ForegroundColor Cyan }
+
+        # PER CANDIDATE, NOT ONCE FOR THE LOOP. This read used to sit ABOVE the foreach, so signals 1,
+        # 3 and 4 were frozen at the moment the first removal began and only signal 2 -- the crude 36 h
+        # metadata guess -- was re-read per candidate. The branch's own arithmetic inverts that: signal
+        # 3 is the one with measured coverage, and it was the stale one for candidates 2..N. Measured:
+        # a LIVE session's write into the SECOND candidate, landing during the FIRST removal, was
+        # invisible (vetoedByFootprint 0, fence.available true) and the directory was destroyed; the
+        # identical footprint present before the run started produced a SKIP. Signal 2 cannot cover it
+        # -- a transcript write touches no git metadata, which is the entire gap signal 3 exists for.
+        # It costs a corpus scan per candidate (~7 s on this repo). That is the correct trade for a
+        # tool whose failure mode is destroying another session's work.
+        $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
+            -IncludeFootprints -FootprintHours $FootprintHours -IncludePins
 
         # Re-check the things that can change under us in seconds.
         if (-not $occ2.Available) {
@@ -1134,6 +1198,7 @@ if ($Json) {
                     examined    = $pinSet.PinsExamined
                     unreadable  = $pinSet.PinsUnreadable
                     expired     = $pinSet.PinsExpired
+                    gone        = $pinSet.PinsGone
                     unplaceable = $pinSet.PinsUnplaceable
                     faults      = @($pinSet.Faults)
                 }
@@ -1152,11 +1217,17 @@ if ($Json) {
                     rootsWithCorpus      = $fp.RootsWithCorpus
                     transcriptsFound     = $fp.TranscriptsFound
                     transcriptsInWindow  = $fp.TranscriptsInWindow
+                    transcriptsVanished  = $fp.TranscriptsVanished
                     transcriptsWithNeedle = $fp.TranscriptsWithNeedle
                     bytesScanned         = $fp.BytesScanned
                     linesScanned         = $fp.LinesScanned
                     linesParsed          = $fp.LinesParsed
+                    linesUnparseableElsewhere = $fp.LinesUnparseableElsewhere
+                    pathToolBlocks       = $fp.PathToolBlocks
                     pathBlocksExamined   = $fp.PathBlocksExamined
+                    toolNamesSeen        = @($fp.ToolNamesSeen)
+                    writeToolsAllowList  = @($fp.WriteToolsAllowList)
+                    writeToolNamesSeen   = @($fp.WriteToolNamesSeen)
                     writesExamined       = $fp.WritesExamined
                     writesOutsideWindow  = $fp.WritesOutsideWindow
                     writesUndated        = $fp.WritesUndated
@@ -1167,6 +1238,7 @@ if ($Json) {
                     gitdirProbes         = $fp.GitdirProbes
                     sidechainFiles       = $fp.SidechainFiles
                     sidechainLines       = $fp.SidechainLines
+                    sidechainPathToolBlocks = $fp.SidechainPathToolBlocks
                     sidechainPathBlocks  = $fp.SidechainPathBlocks
                     crossTreeWrites      = $fp.CrossTreeWrites
                     faults               = @($fp.Faults)
