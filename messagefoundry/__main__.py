@@ -1132,10 +1132,13 @@ def _serve(args: argparse.Namespace) -> int:
     )
 
     # Delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when the operator declares
-    # [store].require_managed_identity, refuse (production) / warn (non-production) if the store
-    # authenticates with a static credential rather than a managed/delegated identity (Windows
-    # Integrated / Entra). Off by default → byte-identical. Admin device posture and AD/SMTP managed
-    # identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked here.
+    # [store].require_managed_identity, refuse to start if the store authenticates with a static
+    # credential rather than a managed/delegated identity (Windows Integrated / Entra). The refuse/warn
+    # split is [security].enforcement, NOT the deployment tier — the branch below reads `enforcing`, and
+    # `enforce` is the shipped default on dev and staging as much as on prod, so a staging box that
+    # turns this on and leaves a static credential is REFUSED, not warned. It downgrades to a warning
+    # only under enforcement = warn. Off by default → byte-identical. Admin device posture and AD/SMTP
+    # managed identity stay deployment-delegated (documented in docs/SECURITY.md), not engine-checked.
     mi_reason = settings.store.managed_identity_precondition()
     if mi_reason is not None:
         if enforcing:
@@ -1235,13 +1238,23 @@ def _serve(args: argparse.Namespace) -> int:
     #
     # Open-egress posture (Q5b): on a PHI-carrying instance, outbound egress that is fully
     # unrestricted — no [egress] allowlist AND deny_by_default off — lets a transform send PHI to any
-    # destination. On a PRODUCTION instance this fails closed (refuse to start, the prod analogue of
-    # the keyless-store refusal above); on a non-production PHI instance (e.g. staging) it is an
-    # advisory warning. A synthetic instance stays quiet. Lock it down with [security].block_unlisted_outbound
-    # or per-transport [egress].allowed_* lists.
+    # destination. The refuse/warn split is [security].enforcement, NOT the deployment tier: the branch
+    # below reads `enforcing`, and `enforce` is the shipped default on dev and staging as much as on
+    # prod, so all three REFUSE on stock defaults. It downgrades to an advisory warning only under
+    # enforcement = warn. A synthetic instance carries no PHI and stays quiet. Lock it down with
+    # [security].block_unlisted_outbound or per-transport [egress].allowed_* lists.
+    #
+    # [egress] declares EIGHT allowed_* lists and every one is enforced downstream by _allowlist_for
+    # (pipeline/wiring_runner.py). Counting only six here meant a mail-only or Direct-only instance
+    # could enumerate every destination it actually uses and still be refused as "UNRESTRICTED", with
+    # nothing in the refusal naming the two lists that did not count. allowed_smtp/allowed_direct are
+    # counted only when [security].block_unlisted_outbound was NOT set explicitly — precisely the state
+    # the flip below turns deny-by-default ON for, so such an instance still starts fail-closed. An
+    # instance that explicitly opted OUT of deny-by-default is deliberately unchanged: it cannot
+    # satisfy this gate on smtp/direct alone, because there the other six transports stay allow-any.
     if data_class is DataClass.PHI:
         eg = settings.egress
-        egress_open = not eg.deny_by_default and not (
+        listed = (
             eg.allowed_mllp
             or eg.allowed_tcp
             or eg.allowed_http
@@ -1249,14 +1262,29 @@ def _serve(args: argparse.Namespace) -> int:
             or eg.allowed_remote
             or eg.allowed_file_dirs
         )
+        if "deny_by_default" not in eg.model_fields_set:
+            listed = listed or eg.allowed_smtp or eg.allowed_direct
+        egress_open = not eg.deny_by_default and not listed
         if egress_open:
+            # Reaching here WITH allowed_smtp/allowed_direct declared is only possible when
+            # [security].block_unlisted_outbound was set explicitly (otherwise those two count above), so
+            # name that override rather than leaving the operator to wonder why a declared allowlist did
+            # not satisfy the gate.
+            mail_only_note = (
+                " You have declared [egress].allowed_smtp/allowed_direct, but those satisfy this gate "
+                "only when [security].block_unlisted_outbound is left unset — setting it false opts out "
+                "of the deny-by-default flip, which would leave every OTHER transport allow-any. Remove "
+                "that override (or set it true) and a mail-only/Direct-only allowlist is accepted."
+                if (eg.allowed_smtp or eg.allowed_direct)
+                else ""
+            )
             if enforcing:
                 print(
                     f"error: outbound egress is UNRESTRICTED on a "
                     f"{'production ' if production else ''}PHI instance "
                     f"({env_name!r}); refusing to start — a transform could send PHI to any "
                     "destination. Set [security].block_unlisted_outbound=true, or declare the permitted "
-                    "destinations with per-transport [egress].allowed_* allowlists.",
+                    f"destinations with per-transport [egress].allowed_* allowlists.{mail_only_note}",
                     file=sys.stderr,
                 )
                 return 2
@@ -2078,9 +2106,12 @@ def _serve(args: argparse.Namespace) -> int:
     # The per-user security-event push (lockout, password/email/roles change, new-IP admin action)
     # rides the [alerts] SMTP transport AND the [auth].notify_security_events kill-switch — api/app.py
     # builds the notifier only when BOTH are on, so with either off it is silently absent (which the
-    # defaults and the off-loopback runbook never set). Mirror the retention posture: a PRODUCTION PHI
-    # instance with no effective channel REFUSES to start; a non-production PHI instance WARNS;
-    # synthetic/dev is byte-identical. The explicit, audited opt-out is
+    # defaults and the off-loopback runbook never set). A PHI instance with no effective channel REFUSES
+    # to start; synthetic/dev is byte-identical. The refuse/warn split is [security].enforcement, NOT the
+    # deployment tier — the branch below reads `enforcing`, and `enforce` is the shipped default on dev
+    # and staging as much as on prod, so `serve --env staging` on stock defaults with no [alerts] SMTP is
+    # REFUSED, not warned. It downgrades to a warning only under enforcement = warn. This gate is why
+    # [alerts] is not optional on a stock instance. The explicit, audited opt-out is
     # [alerts].security_notifications_required=false (accept the pull-only /me/security-events feed in
     # writing). "Effective channel" == notify_security_events on + SMTP host + sender (parity with the
     # app.py notifier wiring). Skipped when auth is disabled (no accounts to notify — a non-loopback
@@ -2100,7 +2131,9 @@ def _serve(args: argparse.Namespace) -> int:
                         "start — account-security events (lockout, password/roles change, new-IP admin "
                         "action) would have no push channel, only the pull-only /me/security-events feed "
                         "(ASVS 6.3.5/6.3.7). Configure the [alerts] SMTP transport (email_smtp_host + "
-                        "email_from) and keep [auth].notify_security_events on; or, to rely on the "
+                        'email_from; add email_to as well if any [[alerts.rules]] routes to "email" — '
+                        "the alert email transport requires all three) and keep "
+                        "[auth].notify_security_events on; or, to rely on the "
                         "pull-only feed, set [alerts].security_notifications_required=false (audited).",
                         file=sys.stderr,
                     )
@@ -4194,6 +4227,7 @@ def _alert(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import alerts_edit
     from messagefoundry.config.settings import AlertRule, load_settings
+    from messagefoundry.pipeline.alert_sinks import configured_alert_transport_names
 
     path = args.service_config
 
@@ -4215,9 +4249,38 @@ def _alert(args: argparse.Namespace) -> int:
             raw = args.data if args.data is not None else sys.stdin.read()
             obj = json.loads(raw)
             try:
-                AlertRule.model_validate(obj)  # precise per-field error before we touch the file
+                new_rule = AlertRule.model_validate(obj)
             except ValidationError as exc:
                 return _emit_error(f"invalid alert rule: {exc}", as_json=args.json)
+            # Routing cross-check at AUTHORING time. notifier_from_settings refuses a rule that routes to
+            # an unconfigured transport, but that fires at the next START — so without this the editor
+            # happily writes a rule that bricks the following boot with no diagnostic here. Scoped to the
+            # rule being ADDED (not every rule in the file) so a file that already contains a bad rule can
+            # still be repaired with `alert remove` instead of being wedged shut.
+            routed = set(new_rule.transports or [])
+            for step in new_rule.escalate:
+                routed |= set(step.transports or [])
+            if routed:
+                # Only a rule that NAMES a transport can be refused, so only that case needs the settings
+                # file — which keeps `alert add` working against a file that does not exist yet (the
+                # from-scratch create path, where a rule routing nowhere is still perfectly valid).
+                try:
+                    configured = configured_alert_transport_names(
+                        load_settings(config_path=path).alerts
+                    )
+                except (OSError, ValueError):
+                    configured = (
+                        set()
+                    )  # unreadable/absent settings file → nothing is configured yet
+                unknown = sorted(routed - configured)
+                if unknown:
+                    return _emit_error(
+                        f"alert rule routes to unconfigured transport(s) {unknown}; this instance "
+                        f"configures {sorted(configured) or 'none'}. Configure [alerts].webhook_url, or "
+                        "email_smtp_host + email_from + email_to (all three), before adding the rule — "
+                        "otherwise the engine refuses to start.",
+                        as_json=args.json,
+                    )
             result = alerts_edit.add_rule(path, obj, validate=validate)
         else:  # remove
             if args.index is None:

@@ -3496,7 +3496,8 @@ class SecuritySettings(_Section):
     # host address ("10.20.4.7" -> /32); IPv4 and IPv6, mixed freely. Same syntax as an inbound
     # connection's source_ip_allowlist, and the same matcher (messagefoundry.netaddr).
     # SCOPE: the OPERATOR surface only. It does NOT restrict the MLLP/TCP/X12/DICOM/HTTP ingest
-    # listeners — those have their own per-connection [inbound].source_ip_allowlist.
+    # listeners — those have their own per-connection source_ip_allowlist (an inbound(...) keyword,
+    # NOT an [inbound] service key: that spelling is accepted and silently discarded).
     # LOOPBACK IS ALWAYS ALLOWED, unconditionally and with no knob: the credential-less on-box clients
     # (the tray's tokenless /health poll (ADR 0113), a browser opening /ui on the engine host,
     # `messagefoundry check`, the harness/apiclient, a container HEALTHCHECK) cannot be allow-listed, so

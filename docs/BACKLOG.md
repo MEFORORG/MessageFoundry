@@ -7057,3 +7057,28 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 **Related:** ADR 0089 (the scan, the phases, and the erratum that phase work is tracked per-item at filing time — **not** by the stale #226–#230 range), #222, #235, #236, #237.
 
 **Source:** Windmill/Kestra evaluation (2026-07-30). ⚠️ That evaluation initially asserted "nobody has measured" this — **incorrect**; the owner corrected it the same day and ADR 0089 carries the prior numbers. Filed as a **re-measure**, not a first measurement.
+
+## 252. DICOM SCP peer-control gate counts a spoofable AE-title list as sufficient
+
+> 🔢 **Filed 2026-07-30.** P2. Surfaced while fixing the refusal message that named a non-existent settings key (that half is fixed; this half is a contract change and was deliberately not ridden in on it).
+
+**Type:** security hardening — authentication strength of a fail-closed gate.
+
+**What:** `transports/dicom.py` refuses a non-loopback C-STORE SCP that has *no* peer control, but the check **counts controls rather than weighing them**:
+
+```python
+mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
+if self._host not in _LOOPBACK_HOSTS and not (
+    self._calling_ae_allowlist or self._source_ip_allowlist or mtls_on
+):
+```
+
+So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to fail closed. A DICOM Calling AE Title is a **caller-asserted string with no cryptographic binding** — any peer that guesses or learns one AE Title is admitted. Empirically confirmed: an SCP on `0.0.0.0` with only `calling_ae_allowlist=["MOD1"]` constructs without error.
+
+**Why it is filed rather than fixed:** the three-control set is a documented contract — [ADR 0025](adr/0025-dicom-codec-store-connectors.md) §9 and the `docs/SECURITY.md` decision-table row both enumerate `calling_ae_allowlist` / `source_ip_allowlist` / mTLS as co-equal satisfiers. Demoting one is an ADR amendment and a breaking change for any site relying on it, so it needs its own decision rather than being a rider on a message correction.
+
+**Options:** (a) keep three satisfiers but require AE-title to be paired with an IP allowlist or mTLS off-loopback; (b) demote AE-title to *not* satisfying the gate alone, with an explicit audited opt-out mirroring the other loosenings; (c) accept as-is and document the weakness at the gate (the refusal message now warns about it in-band).
+
+**Related:** ADR 0025 §9, `docs/SECURITY.md` DICOM peer-control row, `tests/test_dicom_scp_security.py::test_nonloopback_scp_with_calling_ae_allowlist_ok` (pins the current behaviour, so it changes with the decision).
+
+**Source:** adversarial documentation security review (2026-07-30); the message/doc half shipped alongside this filing.

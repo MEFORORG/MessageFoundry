@@ -1040,9 +1040,13 @@ access decision — every one consumed at this release, on the control plane **a
 **Scope frame.** There are **two independent source-address allow-lists** with the same syntax and the
 same matcher, but deliberately different carve-outs. `[security].allowed_client_networks` restricts the
 **operator surface** (JSON API + `/ui` + `/ws/stats`) and **never** restricts an ingest listener;
-loopback is always allowed there. Per-connection `[inbound].source_ip_allowlist` restricts **one ingest
+loopback is always allowed there. The per-connection `source_ip_allowlist` restricts **one ingest
 listener** and deliberately does **not** inherit the loopback carve-out — an allow-list naming a partner
-must not also admit anything running on the local box.
+must not also admit anything running on the local box. ⚠️ That one is an **`inbound(...)` keyword** (or
+the top-level key in a `connections.toml` `[[inbound]]` table); there is **no**
+`[inbound].source_ip_allowlist` service setting. `[inbound]` carries only `bind_host`, `ack_after` and
+`stream_inflight_budget_bytes`, and every section model ignores unknown keys — so that spelling in
+`messagefoundry.toml` is accepted and **silently discarded**, leaving the listener ungated.
 
 **Action vocabulary (closed set).** Every row below **opens its Action cell** with exactly one of:
 **ALLOW** (pass through), **DENY** (403 / 401 / 400 / 409 / refused connection / DIMSE status /
@@ -1093,7 +1097,7 @@ one-to-one — that is why the bind/exposure posture occupies two rows and the A
 
 #### Table B — data plane (ingest listeners)
 
-`[inbound].source_ip_allowlist` is enforced on **five** listener types — at **accept** on the four
+The per-connection `source_ip_allowlist` is enforced on **five** listener types — at **accept** on the four
 stream listeners (MLLP, TCP, X12, HTTP), and for **DICOM inside the C-STORE handler**, i.e. after the
 association has been negotiated and accepted and after the object has been received, but before any
 durable commit. A non-allowlisted DICOM peer can therefore still establish an association, consume a
@@ -1114,7 +1118,7 @@ listen source. The refusal action differs materially per listener, so each has i
 | **MLLP / HTTP / DICOM** — peer client certificate | the TLS peer certificate presented at handshake | `tls = true` **and** `tls_ca_file` set → `ssl.CERT_REQUIRED` plus strict RFC 5280 verify flags; no client certificate, or one not issued by that CA | **DENY** — the TLS handshake fails and the connection **never reaches the accept path**, so there is **no** connection event and no allow-list evaluation. `tls_ca_file` unset → server-only TLS and no peer-certificate decision. TCP and X12 have no inbound TLS at this release |
 | **DICOM** — calling AE | the requesting AE's Calling AE Title, at **association negotiation** | `calling_ae_allowlist` set and the title is not in it | **DENY** — the association is rejected by pynetdicom before any C-STORE callback runs (`ae.require_calling_aet`). `None` = any AE the peer-IP allow-list admits |
 | **DICOM** — called AE | the AE Title the peer addressed the association to | not this engine's own `ae_title` | **DENY** at negotiation (`ae.require_called_aet`); **default `require_called_ae_title = true`** |
-| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of any peer control | non-loopback bind with **none** of `calling_ae_allowlist`, `[inbound].source_ip_allowlist`, or mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`) | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
+| **DICOM** — peer-control construction gate | the SCP's bind host × the presence of any peer control | non-loopback bind with **none** of `calling_ae_allowlist`, `source_ip_allowlist` (an `inbound(...)` keyword — for a DICOM SCP the ONLY surface, since `DICOM()` is not authorable in `connections.toml`), or mTLS (`tls` + `tls_ca_file` → `CERT_REQUIRED`) | **DENY at construction** (ValueError). The connection degrades per ADR 0031 startup fault isolation and the fault surfaces under `messagefoundry check` / dry-run. Loopback hosts are exempt |
 
 > **Telemetry honesty.** The `peer_not_allowlisted` connection event is durable when the connection's
 > `capture_connection_errors` is `true`, **or is unset (`None`, the default) and the
