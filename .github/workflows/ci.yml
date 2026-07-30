@@ -344,6 +344,10 @@ jobs:
       # `ide`: run the ide build job only when a PR touches ide/** or this workflow (true on
       # push/dispatch for full coverage; false on the nightly cron). Not a required check.
       ide: ${{ steps.f.outputs.ide }}
+      # Path-gate for windows-service-smoke on PRs (NSSM install scripts / service modules / tray).
+      service: ${{ steps.f.outputs.service }}
+      # Per-event matrix for windows-service-smoke: both Server SKUs nightly, one on a PR.
+      service_matrix: ${{ steps.f.outputs.service_matrix }}
       # `matrix`: the `test` job's include list, per-repo — full ubuntu+windows matrix HERE (this repo is
       # public, so hosted runners are free; the self-hosted Windows runners are retired), ubuntu-only on
       # a fork. Consumed as `matrix: ${{ fromJSON(needs.changes.outputs.matrix) }}` in `test`.
@@ -392,12 +396,22 @@ jobs:
           else
             echo 'ide_matrix={"os":["ubuntu-latest"]}' >> "$GITHUB_OUTPUT"
           fi
+          # windows-service-smoke matrix, per-event: the nightly/dispatch run covers BOTH Server SKUs,
+          # but a path-gated PR runs windows-2025 only — one 2x-billed runner instead of two, which is
+          # what makes a per-PR service gate affordable. The install path is identical on both SKUs; the
+          # second SKU is regression breadth, and the nightly still provides it.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            echo 'service_matrix={"include":[{"os":"windows-2025","python-version":"3.14"}]}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'service_matrix={"include":[{"os":"windows-2022","python-version":"3.14"},{"os":"windows-2025","python-version":"3.14"}]}' >> "$GITHUB_OUTPUT"
+          fi
           # Manual dispatch = full coverage: force every gate true so the whole workflow runs.
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
             echo "docker=true" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            echo "service=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Push-to-main: the FUNCTIONAL gate (code) stays true — the required test legs re-run on
@@ -411,6 +425,7 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "ide=true" >> "$GITHUB_OUTPUT"
+            echo "service=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if [ "$EVENT_NAME" = "schedule" ]; then
@@ -420,6 +435,9 @@ jobs:
             echo "docker=false" >> "$GITHUB_OUTPUT"
             echo "code=false" >> "$GITHUB_OUTPUT"
             echo "ide=false" >> "$GITHUB_OUTPUT"
+            # The nightly fires windows-service-smoke via its own `schedule` if-arm; keep the PR
+            # path-gate arm false so it cannot ALSO match and double-run the leg.
+            echo "service=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Remaining case: pull_request. Compute the path-based filters from the PR diff.
@@ -445,6 +463,16 @@ jobs:
             echo "docker=true" >> "$GITHUB_OUTPUT"
           else
             echo "docker=false" >> "$GITHUB_OUTPUT"
+          fi
+          # windows-service-smoke: the NSSM install -> serve -> MLLP path. Until now this ran on the
+          # nightly and on dispatch only, so a PR editing install-service.ps1 or the service entrypoint
+          # merged with ZERO service coverage and the break surfaced hours later on the cron, attributed
+          # to nobody. Path-gate it onto PRs that touch the install scripts, the service/status modules,
+          # or the tray app that drives the same service control surface (ADR 0113).
+          if echo "$changed" | grep -qE '^(scripts/service/|messagefoundry/service.*\.py|messagefoundry/tray/|\.github/workflows/ci\.yml)'; then
+            echo "service=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "service=false" >> "$GITHUB_OUTPUT"
           fi
           # The ide job (VS Code extension build+test) depends on ide/** (its own npm project), this
           # workflow, AND the engine-side surfaces its suites encode as a contract. The Steps editor
@@ -1189,21 +1217,26 @@ jobs:
   # re-validates a specific merge on demand.
   windows-service-smoke:
     name: windows service smoke (${{ matrix.os }}, py${{ matrix.python-version }})
-    # This repo only: it spins up 2x-billed hosted Windows runners on BOTH Server SKUs, which is free
-    # here (public) and billed to the owner of a fork. Nightly schedule + manual dispatch only. ci-gate
-    # `needs` this job, but a `skipped` leg counts as a pass there, so gating it off a fork cannot wedge
-    # the gate.
-    if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && github.repository == 'MEFORORG/MessageFoundry'
+    needs: changes
+    # Three arms. The nightly + dispatch arms stay this-repo-only: they spin up 2x-billed hosted Windows
+    # runners on BOTH Server SKUs unconditionally, which is free here (public) and would be billed to the
+    # owner of a fork. The PR arm is path-gated and carries NO repository guard — a PR that edits the
+    # install scripts, the service modules or the tray must get real service coverage wherever it is
+    # raised, including on a fork, because merging that change blind is the failure this closes. The PR
+    # arm runs a single SKU (see `service_matrix`), so a fork pays for one runner on a PR it chose to
+    # make to those paths. ci-gate `needs` this job, but a `skipped` leg counts as a pass there, so
+    # neither the fork guard nor the path gate can wedge the gate.
+    if: >-
+      ((github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+        && github.repository == 'MEFORORG/MessageFoundry')
+      || (github.event_name == 'pull_request' && needs.changes.outputs.service == 'true')
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
-        # install->serve->MLLP path is validated on the version we ship, on each Server SKU. This job
-        # is push/dispatch-only, so the Windows minutes cost no PR time.
-        include:
-          - { os: windows-2022, python-version: "3.14" }
-          - { os: windows-2025, python-version: "3.14" }
+      # Windows Server 2022 + 2025 on the supported deploy Python (3.14), so the real NSSM
+      # install->serve->MLLP path is validated on the version we ship, on each Server SKU. On a PR the
+      # matrix narrows to windows-2025 alone to halve the 2x-billed minutes; the nightly keeps both.
+      matrix: ${{ fromJSON(needs.changes.outputs.service_matrix) }}
     defaults:
       run:
         shell: pwsh
