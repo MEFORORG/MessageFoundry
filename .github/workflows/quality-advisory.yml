@@ -303,10 +303,16 @@ jobs:
           # re-exports this lock by design -- superseding the note that used to sit here claiming they
           # were deliberately kept out of pyproject to avoid tripping that gate.
           #
-          # `python -m pip`, not `uv pip install --system`, for two reasons: `--require-hashes` is pip's
-          # contract (and every other hashed install in this repo uses pip), and Scorecard's
-          # pinned-dependency parser keys on pip/pip3/`python -m pip` -- so `uv pip` would be invisible
-          # to the very check this change exists to satisfy. Same setup-python interpreter either way.
+          # `python -m pip`, not `uv pip install --system`, for ONE honest reason: every other hashed
+          # install in this repo is a pip install, and keeping one spelling means one thing for the
+          # guards in tests/test_ci_venv_pinning.py to match. Same setup-python interpreter either way.
+          #
+          # NOT because uv cannot: `uv pip install --require-hashes` exists (env UV_REQUIRE_HASHES), and
+          # setup-uv is already in this job -- the earlier claim that "--require-hashes is pip's
+          # contract" was simply wrong. NOR for Scorecard's benefit: its parser keys on
+          # pip/pip3/`python -m pip`, so a `uv pip` line generates NO finding at all, and converting one
+          # can only ADD parseable surface -- it cannot close an alert. This line is posture-neutral to
+          # Scorecard and is here for uniformity.
           #
           # Safe against the editable install above: the group lock and constraints.lock agree on all 10
           # shared packages (pytest and pytest-timeout among them), so this cannot re-point what the
@@ -443,7 +449,9 @@ jobs:
           # 30248096425; and pytest-timeout is REQUIRED because mutmut 3 always passes `--timeout`/
           # `--timeout-method` to pytest, so without the plugin every invocation dies with an
           # unrecognised-argument error surfacing only as BadTestExecutionCommandsException.
-          # `python -m pip` because --require-hashes is pip's contract and Scorecard only parses pip.
+          # `python -m pip` for UNIFORMITY with every other hashed install in this repo, not because uv
+          # cannot do it (`uv pip install --require-hashes` exists) and not for Scorecard (a `uv pip`
+          # line generates no finding at all) -- see the coverage job's install step for the full note.
           python -m pip install --require-hashes -r ci/locks/ci-quality.lock
       - name: Mutation-test a bounded scope (advisory - never fails)
         continue-on-error: true

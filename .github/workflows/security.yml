@@ -96,15 +96,29 @@ jobs:
         run: |
           # HASH-PINNED from the lock, not merely `==`-pinned: a version pin does not satisfy Scorecard
           # PinnedDependenciesID, and the transitive closure floated regardless. Rationale for each pin
-          # lives in pyproject.toml's [dependency-groups]. The `--upgrade pip` bootstrap is GONE rather
-          # than pinned — this lock hash-pins `pip` itself (a pip-audit → pip-api dependency).
+          # lives in pyproject.toml's [dependency-groups]. THIS step's `--upgrade pip` bootstrap is gone
+          # rather than pinned — the lock hash-pins `pip` itself (a pip-audit → pip-api dependency).
+          # Scoped deliberately, because the unqualified claim was FALSE for this job: the DEP-1 step
+          # above still runs `pip install --upgrade pip "uv=="` in this same interpreter two steps
+          # earlier, and that unverified pip does the load-bearing work (the six exports + the diff
+          # gate); the line below then DOWNGRADES pip to the locked version after the fact. So this
+          # job's posture improves for the AUDITOR, not for the exporter. The `uv` bootstrap is circular
+          # by construction (ADR 0034 section 3's residuals) and is why `pip` stays registered in
+          # SECURITY_YML_ACCEPTED_UNPINNED. The claim holds unqualified in the bandit job and zizmor.yml.
           python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
           # Audit the committed, pinned set — reproducible (vs auditing a fresh latest-resolve).
           pip-audit -r requirements.lock --desc
           # Audit the TOOLCHAIN locks too. NOT bookkeeping: hash-pinning makes the toolchain STICKY, so
           # without this a CVE in a pinned scanner is invisible to every gate — the "pinned, stale,
-          # unpatched is worse than floating" failure ADR 0034 §3 names. `--ignore-vuln <ID>` is the
-          # escape hatch for a triaged advisory, exactly as for the lockfile audit above.
+          # unpatched is worse than floating" failure ADR 0034 section 3 names. `--ignore-vuln <ID>` is
+          # the escape hatch for a triaged advisory, exactly as for the lockfile audit above.
+          #
+          # CONSEQUENCE, stated rather than discovered later: this is a REQUIRED context, so a CVE in
+          # mutmut's or diff-cover's closure reds the merge gate over an ADVISORY tool. That is not a new
+          # posture — requirements.lock is exported `--all-extras`, so ruff, mypy and pytest already do
+          # exactly this — but it does add 40 distributions to the blocking set (23 from ci-scanners, 17
+          # from ci-quality; measured). Zero advisories at the time of writing. If the owner would rather
+          # the advisory half not block, move the ci-quality line alone to its own step.
           pip-audit -r ci/locks/ci-scanners.lock --desc
           pip-audit -r ci/locks/ci-quality.lock --desc
       # ANTI-SLOPSQUAT. Deliberately a STEP in this already-REQUIRED job rather than a new context: it
