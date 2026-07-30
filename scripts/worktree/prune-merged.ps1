@@ -38,43 +38,58 @@
 
     OCCUPANCY IS NOT IMPLIED BY CLEAN+MERGED. A session can sit in a worktree with nothing
     uncommitted -- a brand-new worktree has zero commits, so it is "an ancestor of origin/main" and
-    perfectly clean from the second it is created, which is exactly the state that got destroyed. Two
-    independent occupancy signals are therefore required, and either one vetoes:
+    perfectly clean from the second it is created, which is exactly the state that got destroyed. THREE
+    independent occupancy signals are therefore required, and any one of them vetoes:
 
       1. THE LIVENESS FENCE (scripts/coord/occupancy.ps1, shared with presence.ps1). Reads
          <config-root>/sessions/<pid>.json, maps each session's recorded cwd onto a worktree, and
          fences it on pid + process start time. Only LIVE / UNVERIFIED / UNREADABLE veto, for the
          veto-only reason above. A session in a NESTED worktree vetoes its ancestor too.
       2. RECENT ACTIVITY (-IdleHours, default 36). Newest mtime of the worktree's PRIVATE git metadata
-         (index, HEAD, logs/HEAD, ...). This is the signal that does NOT depend on a recorded cwd, and
-         it is what covers the fence's biggest blind spot -- so it is not a nicety, it is the load-
-         bearing one for the class of worktree this tool actually prunes. If it cannot be read, that is
-         a veto too. Confirm a specific worktree past this veto with -Name <slug>; -Name never
-         overrides signal 1, a nested worktree, or a lock.
+         (index, HEAD, logs/HEAD, ...). Does not depend on a recorded cwd. If it cannot be read, that
+         is a veto too. Confirm a specific worktree past this veto with -Name <slug>; -Name never
+         overrides signals 1 or 3, a nested worktree, or a lock.
+      3. THE WRITE FOOTPRINT (scripts/coord/footprint.ps1, -FootprintHours, default 36). Reads Claude
+         Code's own transcripts and places a session by where it actually WROTE, which is the question
+         signal 1 was never able to answer. It exists because signal 1 was measured contributing
+         NOTHING to this tool's decisions: of the writes landing in a `<primary>-<slug>` sibling on
+         this repo, 88.9% came from a session whose recorded cwd was a different checkout, and signal 1
+         placed a session inside 0 of the 4 siblings that existed when it was measured. Measured after
+         (2026-07-30, real repo, 5 candidates): signal 1 = 1 of 5, signal 3 = 4 of 5, and the three it
+         adds include two worktrees a session that is LIVE RIGHT NOW had written 144 times between them
+         from a cwd of the primary. Like signal 1 it can only veto, and -Name cannot override it.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
-      * a session that writes into this worktree BY ABSOLUTE PATH from somewhere else -- measured on
-        this repo, 29% of writes come from a session sitting in the primary and land in a sibling.
-        Measured again 2026-07-30: 5 live sessions, 9 worktrees, and signal 1 vetoed NONE of the four
-        `<primary>-<slug>` siblings, including one a session was demonstrably building in. Signal 2 is
-        what stood between that session and this script;
-      * a cwd recorded as a UNC (\\host\C$\...) or 8.3 short path -- the match is a normalised string
-        compare, and neither spelling normalises to the worktree's own path;
-      * a session that never registered;
-      * a session that only Writes/Edits files and runs no git command: it touches none of the seven
-        metadata files, so signal 2 goes quiet on it as well.
+      * a write by anything that is not a Claude tool call -- a human editing in an editor, an
+        autosave, a plain terminal, a process spawned by a tool call and still running after it
+        returned. Those appear in no transcript, so signal 3 is blind to them and signal 2 sees them
+        only if they touch git metadata;
+      * a file written BY a shell command: the transcript records the command string, not a resolved
+        path list, and this deliberately does not try to parse one out of it;
+      * a session that never registered AND never wrote through a tool call;
+      * a session whose writes fall outside -FootprintHours while its git metadata is outside
+        -IdleHours: both windows have to be open for either to see it.
+    A cwd recorded as a UNC (\\host\C$\...) or 8.3 short path still defeats signal 1's string compare,
+    but signal 3 resolves a written path through .git and does not share that blind spot.
     It DOES see VS Code sessions: the file registry carries every surface, and the match is purely
     path-based (the Desktop app's own session tooling only lists what it spawned).
 
     FENCE UNAVAILABLE => NOTHING IS PRUNED, LOUDLY (exit 2). "The fence found nobody" and "the fence
-    could not look" are the same empty answer, so availability is checked explicitly: at least one
-    config root with a session registry, at least one readable record, and NO record that failed to
-    parse (an unparseable record's cwd is unknowable, so it cannot be cleared from any candidate -- and
-    a file caught half-written is precisely what a session that launched a second ago looks like). When
-    it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
-    pruning unfenced, and the fence is re-read immediately before each removal so a fence that DIES
-    mid-run stops the rest. There is deliberately no override flag.
+    could not look" are the same empty answer, so availability is checked explicitly and ANDed across
+    both record-based sources: at least one config root with a session registry, at least one readable
+    record, NO record that failed to parse (an unparseable record's cwd is unknowable, so it cannot be
+    cleared from any candidate -- and a file caught half-written is precisely what a session that
+    launched a second ago looks like), and no transcript fault behind signal 3 (an unreadable
+    transcript, a torn line, or its canary reporting that the format has moved). When it is unavailable
+    every candidate becomes SKIP and the run exits non-zero rather than silently pruning unfenced, and
+    the fence is re-read immediately before each removal so a fence that DIES mid-run stops the rest.
+    There is deliberately no override flag.
+
+    A SIGNAL THAT SAW NOTHING SAYS SO, RATHER THAN REPORTING A BARE ZERO. "0 candidates vetoed" reads
+    as "nobody is anywhere" and sends an operator to -Name; "3 of 5 candidates have no footprint, so
+    for those this signal contributed nothing" is the same number and the opposite instruction. Both
+    per-signal veto counts and the count of candidates no signal covered are on every run.
 
     EVERYTHING THAT NARROWS THE FENCE IS DECLARED IN RED, on the run and in the JSON receipt --
     -IdleHours 0, an -IdleHours below the 12h floor (an occupied worktree has been measured at 10.4h,
@@ -163,6 +178,12 @@ param(
     # floor, because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
     # released every worktree on this repo and printed no warning at all.
     [double]$IdleHours = 36,
+    # How far back the write-footprint source (signal 3) reads the transcript corpus. Separate from
+    # -IdleHours on purpose: -IdleHours 0 is a declared way to turn the crude metadata heuristic off,
+    # and it must not take the signal with actual measured coverage down with it. A footprint that
+    # cannot be fenced against a live pid vetoes until it ages out of THIS window, so shortening it
+    # releases worktrees whose last writer cannot be proven gone.
+    [double]$FootprintHours = 36,
     # Liveness fence tolerance, passed through to the shared fence.
     [int]$StartSkewMinutes = 15,
     # The ref a branch must be merged into.
@@ -210,7 +231,14 @@ if ($IdleHours -lt 0) {
     exit $EXIT_REFUSED
 }
 
-$occ = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+if ($FootprintHours -lt 0) {
+    if ($Json) { @{ error = 'FootprintHours must be >= 0'; footprintHours = $FootprintHours; exitCode = $EXIT_REFUSED } | ConvertTo-Json -Depth 4 | Write-Output }
+    else { Write-Host "REFUSED: -FootprintHours $FootprintHours is negative, which would put the window in the future and disarm signal 3 while appearing to set it." -ForegroundColor Red }
+    exit $EXIT_REFUSED
+}
+
+$occ = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
+    -IncludeFootprints -FootprintHours $FootprintHours
 
 if (-not $occ.RepoFound) {
     if ($Json) { @{ error = 'not a git repository'; repoRoot = $RepoRoot; exitCode = $EXIT_REFUSED } | ConvertTo-Json -Depth 4 | Write-Output }
@@ -238,13 +266,16 @@ if ((ConvertTo-Norm $RepoRoot) -ne (ConvertTo-Norm $occ.PrimaryPath)) {
 
 $RepoRootFwd = ($RepoRoot -replace '\\', '/')
 $RepoLeaf = Split-Path $RepoRoot -Leaf
+# The write-footprint source's own receipt. Read here, before the reduced-assurance notices are
+# assembled: it was assigned further down and every notice about it evaluated against $null.
+$fp = $occ.Footprint
 
 # Anything that narrows what the two occupancy signals can see. Named on the run and in the JSON, so a
 # reduced fence is never mistaken for a full one.
 $activityVeto = ($IdleHours -gt 0)
 $reducedAssurance = @()
 if (-not $activityVeto) {
-    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): signal 2 is OFF, so a session writing in by absolute path is invisible to this run'
+    $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): signal 2 is OFF, so a session that touched git metadata but wrote nothing through a tool call is invisible to this run'
 }
 elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
     # Only the literal 0 used to be declared. Everything between 0 and the floor disarmed signal 2 just
@@ -507,7 +538,13 @@ function Test-WorktreeClean {
 # actually stopped, so the run that signal 1 saved reported signal 1 as having contributed nothing.
 function ConvertTo-OccupantRows([object[]]$Rows) {
     return @($Rows | ForEach-Object {
-            [pscustomobject]@{ Short = $_.Short; State = $_.State; Surface = $_.Entrypoint; Cwd = $_.Cwd; Worktree = $_.Worktree }
+            [pscustomobject]@{
+                Short = $_.Short; State = $_.State; Surface = $_.Entrypoint; Cwd = $_.Cwd; Worktree = $_.Worktree
+                # WHICH SIGNAL saw it, and (for a footprint) how much it saw. A merged occupant list
+                # cannot show that one of the two sources has gone to zero, which is the whole reason
+                # the second one was built.
+                Source = $_.Source; Writes = $_.Writes; LastWriteAt = $_.LastWriteAt; CrossTree = $_.CrossTree
+            }
         })
 }
 
@@ -530,15 +567,27 @@ function Get-Decision {
     # Occupancy 1: the liveness fence. Unavailable is a REFUSAL, never an empty answer. -IncludeNested
     # because removing a parent takes the nested checkout with it, so a session in the nested tree must
     # veto the ancestor as well.
+    # Signals 1 AND 3 both arrive here: Get-WorktreeOccupants returns the veto-worthy rows of both
+    # sources, each tagged with the one that produced it. They are reported separately -- a single
+    # "occupied by N" cannot show that one source contributed nothing.
     $occupants = @()
     if ($occ.Available) {
         $occupants = @(Get-WorktreeOccupants -Occupancy $occ -Path $Wt.Path -IncludeNested)
         if ($occupants.Count -gt 0) {
             $who = ($occupants | ForEach-Object {
                     $where = if ((ConvertTo-Norm $_.WorktreePath) -eq (ConvertTo-Norm $Wt.Path)) { '' } else { " in nested $($_.Worktree)" }
-                    "$($_.Short) [$($_.State)]$where"
+                    if ($_.Source -eq 'footprint') {
+                        $from = if ($_.CrossTree) { " writing in from $($_.Cwd)" } else { '' }
+                        "$($_.Short) [$($_.State)] $($_.Writes) write(s)$from$where"
+                    }
+                    else { "$($_.Short) [$($_.State)]$where" }
                 }) -join ', '
-            $reasons += "occupied by $($occupants.Count) session(s): $who"
+            $bySignal = @()
+            $n1 = @($occupants | Where-Object { $_.Source -eq 'cwd' }).Count
+            $n3 = @($occupants | Where-Object { $_.Source -eq 'footprint' }).Count
+            if ($n1) { $bySignal += "$n1 by recorded cwd" }
+            if ($n3) { $bySignal += "$n3 by write footprint" }
+            $reasons += "occupied by $($occupants.Count) session(s) ($($bySignal -join ', ')): $who"
         }
     }
 
@@ -641,7 +690,11 @@ $prunable = @($decisions | Where-Object { $_.Decision -eq 'PRUNE' })
 # line, while the flag it is equivalent to got a red banner.
 $confirmedActually = @($decisions | Where-Object { $_.Confirmed } | ForEach-Object { $_.Leaf })
 if ($confirmedActually.Count -gt 0) {
-    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those, and signal 1 has been measured vetoing 0 of 4 real siblings"
+    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those (signals 1 and 3 still apply, and -Name cannot reach either)"
+}
+# A source that could not see anything is reduced assurance, not a clean bill of health.
+if ($fp -and $fp.Available -and $fp.Note) {
+    $reducedAssurance += "write-footprint source contributed nothing: $($fp.Note)"
 }
 
 # The gh receipt, written from what the probes ANSWERED (see Test-Merged).
@@ -657,17 +710,29 @@ if ($ghFailures -gt 0) {
 }
 
 # --- The fence receipt: count what was EXAMINED, not what was found ------------------------------
-$liveInRepo = @($occ.Sessions | Where-Object { Test-OccupancyVeto $_.State }).Count
-# What signal 1 actually CONTRIBUTED here, which is not the same as how many sessions it saw. On this
-# repo the honest number has been 0 of 4 while three of those worktrees were occupied in fact.
-# Recomputed AFTER the apply loop, because a re-check veto is a signal-1 contribution too.
+# Sessions, not ROWS: signal 3 emits one row per (session, worktree) pair, so a session writing into
+# three worktrees would otherwise be counted as three live sessions.
+$liveInRepo = @($occ.Sessions | Where-Object { Test-OccupancyVeto $_.State } |
+        ForEach-Object { $_.SessionId } | Select-Object -Unique).Count
+# What each source actually CONTRIBUTED here, which is not the same as how many sessions it saw, and
+# never merged into one number: signal 1's honest figure on this repo has been 0 of 4 while three of
+# those worktrees were occupied in fact, and a combined count would have hidden exactly that.
+# Recomputed AFTER the apply loop, because a re-check veto is a contribution too.
+function Measure-SignalVetoes([object[]]$Decisions, [string]$Source) {
+    return @($Decisions | Where-Object { @($_.Occupants | Where-Object { $_.Source -eq $Source }).Count -gt 0 }).Count
+}
 $fenceVetoedAtDecision = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
 $fenceVetoed = $fenceVetoedAtDecision
+$cwdVetoed = Measure-SignalVetoes $decisions 'cwd'
+$footprintVetoed = Measure-SignalVetoes $decisions 'footprint'
+# The number an operator must see instead of a bare zero: candidates this signal had nothing to say
+# about, which is not the same claim as "nobody was there".
+$withoutFootprint = @($decisions | Where-Object { @($_.Occupants | Where-Object { $_.Source -eq 'footprint' }).Count -eq 0 }).Count
 $blindSpots = @(
-    'a session writing into a worktree by absolute path from elsewhere (29% of writes on this repo)',
-    'a cwd recorded as a UNC or 8.3 short path',
-    'a session that never registered',
-    'a session that only edits files and runs no git command (invisible to signal 2 as well)'
+    'a write by anything that is not a Claude tool call (an editor, an autosave, a plain terminal, a process still running after its tool call returned)',
+    'a file written BY a shell command -- the transcript records the command string, not a resolved path list',
+    'a session that never registered AND never wrote through a tool call',
+    'a session whose writes are outside -FootprintHours while its git metadata is outside -IdleHours'
 )
 
 if (-not $Json) {
@@ -675,8 +740,23 @@ if (-not $Json) {
     if ($occ.Available) {
         Write-Host ("Occupancy fence: {0} config root(s), {1} record(s) examined, {2} live session(s) in this repo family." -f
             $occ.RootsExamined, $occ.RecordsExamined, $liveInRepo) -ForegroundColor DarkCyan
-        Write-Host ("  Sessions it placed INSIDE a candidate: {0} of {1} candidate(s) vetoed by signal 1 (at decision time)." -f
-            $fenceVetoedAtDecision, $decisions.Count) -ForegroundColor DarkCyan
+        Write-Host ("  Signal 1 (recorded cwd)     placed a session inside {0} of {1} candidate(s)." -f
+            $cwdVetoed, $decisions.Count) -ForegroundColor DarkCyan
+        if ($fp) {
+            Write-Host ("  Signal 3 (write footprint) placed a session inside {0} of {1} candidate(s)." -f
+                $footprintVetoed, $decisions.Count) -ForegroundColor DarkCyan
+            Write-Host ("    scanned {0} transcript(s) across {1} corpus root(s); {2} in the last {3} h, {4} mentioning this repo; {5:n0} line(s) parsed, {6} write(s) examined, {7} placed in a worktree here, {8} elsewhere ({9} of the placed came from a session sitting in another checkout)." -f
+                $fp.TranscriptsFound, $fp.RootsWithCorpus, $fp.TranscriptsInWindow, $fp.WindowHours,
+                $fp.TranscriptsWithNeedle, $fp.LinesParsed, $fp.WritesExamined, $fp.WritesPlaced,
+                $fp.WritesUnplaced, $fp.CrossTreeWrites) -ForegroundColor DarkGray
+            if ($fp.Note) { Write-Host "    $($fp.Note)" -ForegroundColor Yellow }
+            # NEVER a bare zero. "0 vetoed" reads as "nobody is anywhere" and sends an operator to
+            # -Name; this is the same number with the honest meaning attached.
+            if ($withoutFootprint -gt 0 -and $decisions.Count -gt 0) {
+                Write-Host ("    {0} of {1} candidate(s) have NO footprint at all -- for those this signal contributed nothing, which is not the same as nobody being there." -f
+                    $withoutFootprint, $decisions.Count) -ForegroundColor Yellow
+            }
+        }
     }
     else {
         Write-Host "Occupancy fence UNAVAILABLE -- $($occ.Detail)." -ForegroundColor Red
@@ -807,7 +887,8 @@ $occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
-    $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+    $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
+        -IncludeFootprints -FootprintHours $FootprintHours
     Write-Note ""
     foreach ($d in $prunable) {
         if (-not $Json) { Write-Host "Removing $($d.Leaf) [$($d.Branch)]..." -ForegroundColor Cyan }
@@ -975,11 +1056,15 @@ elseif ($Apply) {
 }
 
 $skipped = @($decisions | Where-Object { $_.Decision -eq 'SKIP' -or $_.Outcome -eq 'skipped' }).Count
-# Now that the apply loop has run, count what signal 1 ACTUALLY stopped -- including the re-check saves.
+# Now that the apply loop has run, count what the fence ACTUALLY stopped -- including the re-check
+# saves, and still split by source so neither can be read as coverage the other provided.
 $fenceVetoed = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
+$cwdVetoed = Measure-SignalVetoes $decisions 'cwd'
+$footprintVetoed = Measure-SignalVetoes $decisions 'footprint'
+$withoutFootprint = @($decisions | Where-Object { @($_.Occupants | Where-Object { $_.Source -eq 'footprint' }).Count -eq 0 }).Count
 if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
-    Write-Host ("  Signal 1 vetoed {0} further candidate(s) during the removal pass (total {1} of {2})." -f
-        ($fenceVetoed - $fenceVetoedAtDecision), $fenceVetoed, $decisions.Count) -ForegroundColor DarkCyan
+    Write-Host ("  The fence vetoed {0} further candidate(s) during the removal pass (total {1} of {2}: {3} by recorded cwd, {4} by write footprint)." -f
+        ($fenceVetoed - $fenceVetoedAtDecision), $fenceVetoed, $decisions.Count, $cwdVetoed, $footprintVetoed) -ForegroundColor DarkCyan
 }
 
 # -Name asked for something that does not exist, so the operator's instruction was NOT carried out. It
@@ -1022,9 +1107,45 @@ if ($Json) {
             liveInRepo         = $liveInRepo
             vetoedCandidates   = $fenceVetoed
             vetoedCandidatesAtDecision = $fenceVetoedAtDecision
+            # PER SOURCE, never only the total: the total cannot show that one signal has gone to zero,
+            # and one of them measurably had.
+            vetoedByCwd        = $cwdVetoed
+            vetoedByFootprint  = $footprintVetoed
+            candidatesWithoutFootprint = $withoutFootprint
             blindSpots         = $blindSpots
             idleHours          = $IdleHours
+            footprintHours     = $FootprintHours
             activityVeto       = $activityVeto
+            footprint          = if ($null -eq $fp) { $null } else {
+                [pscustomobject]@{
+                    available            = [bool]$fp.Available
+                    detail               = [string]$fp.Detail
+                    note                 = [string]$fp.Note
+                    windowHours          = $fp.WindowHours
+                    rootsExamined        = $fp.RootsExamined
+                    rootsWithCorpus      = $fp.RootsWithCorpus
+                    transcriptsFound     = $fp.TranscriptsFound
+                    transcriptsInWindow  = $fp.TranscriptsInWindow
+                    transcriptsWithNeedle = $fp.TranscriptsWithNeedle
+                    bytesScanned         = $fp.BytesScanned
+                    linesScanned         = $fp.LinesScanned
+                    linesParsed          = $fp.LinesParsed
+                    pathBlocksExamined   = $fp.PathBlocksExamined
+                    writesExamined       = $fp.WritesExamined
+                    writesOutsideWindow  = $fp.WritesOutsideWindow
+                    writesUndated        = $fp.WritesUndated
+                    writesPlaced         = $fp.WritesPlaced
+                    writesUnplaced       = $fp.WritesUnplaced
+                    placedByPrefix       = $fp.PlacedByPrefix
+                    placedByGitdir       = $fp.PlacedByGitdir
+                    gitdirProbes         = $fp.GitdirProbes
+                    sidechainFiles       = $fp.SidechainFiles
+                    sidechainLines       = $fp.SidechainLines
+                    sidechainPathBlocks  = $fp.SidechainPathBlocks
+                    crossTreeWrites      = $fp.CrossTreeWrites
+                    faults               = @($fp.Faults)
+                }
+            }
             reducedAssurance   = @($reducedAssurance)
         }
         refs     = $fetchDetail
