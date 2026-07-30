@@ -2,8 +2,8 @@
 
 Since the MEFORORG cutover this repository IS the published artifact — a push to ``main`` is
 publication, immediately, with no publish step left to catch anything. Server-side branch protection
-requires a PR and 12 status checks, and since 2026-07-28 ``enforce_admins`` is TRUE, so the owner no
-longer bypasses it either. This hook is now defence-in-depth: it fails FAST and LOCALLY with an
+requires a PR and 12 status checks. ``enforce_admins`` was ON from 2026-07-28 but is OFF again as of
+2026-07-29 (the documented escape hatch in the hook's own HISTORY note), so the owner CAN bypass. This hook is now defence-in-depth: it fails FAST and LOCALLY with an
 explanation rather than after a round-trip, and it covers ``cla-signatures``, which branch protection
 does not. (It was written while ``enforce_admins`` was false and the hook WAS the only guard.) The
 realistic trigger is unchanged: one click on VS Code's Sync button while the current branch happens to
