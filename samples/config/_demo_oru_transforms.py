@@ -46,5 +46,13 @@ def _tag_mrn_identifier(msg: Message) -> None:
 
 def _carry_then_clear_visit(msg: Message, orig_patient_class: str) -> None:
     # Preserve the ORIGINAL Patient Class into PV1-18 (Patient Type), then blank PV1-19 (Visit Number).
+    #
+    # PV1 is optional in ORU^R01 and absent from plenty of real traffic (an unsolicited result with no
+    # visit context). Reads of an absent segment return empty, but a WRITE raises "cannot set absent
+    # segment", so this has to guard: without one, the whole message dead-letters over a field that was
+    # never there. There is nothing to carry and no visit to blank when the source has no PV1, and
+    # synthesizing one would fabricate visit context the sender did not send — so skip instead.
+    if "PV1" not in msg.segments():
+        return
     msg["PV1-18"] = orig_patient_class
     msg["PV1-19"] = ""

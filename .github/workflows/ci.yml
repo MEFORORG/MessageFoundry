@@ -1522,12 +1522,55 @@ jobs:
   # that does run on a PR (e.g. `sqlserver-store` on a server-DB PR) thus still blocks the merge.
   # NB: `docker-smoke` is intentionally NOT gated here (out of the named set) — add it to `needs`
   # below to make a container-smoke failure block merge too.
+  # `messagefoundry check` is the project's OWN commit/CI gate — validate + dryrun over a config bundle,
+  # plus advisory lint. It shipped, it is documented as the gate, and it was invoked by no workflow and
+  # no CI script: .pre-commit-config.yaml owns the pre-commit hook, so .mefor-hooks/pre-commit never
+  # runs either. Nothing checked that the config surface the samples demonstrate still loads and still
+  # transforms. It does not now: wiring it caught a Handler in samples/config that dead-lettered every
+  # message without a PV1 segment (fixed in the same series).
+  #
+  # Cheap and Linux-only: no service container, no matrix, ~1x minutes. Advisory sub-checks (ruff/mypy
+  # over the sample config, dead-config, accepts-candidate) report but do not set the exit code, so this
+  # leg reds only on a REQUIRED sub-check — validate or dryrun.
+  config-gate:
+    name: config gate (messagefoundry check)
+    needs: changes
+    if: >-
+      github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+      || github.event_name == 'push' || needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          cache-dependency-glob: |
+            pyproject.toml
+            requirements.lock
+
+      - name: Install project (dev extras)
+        run: uv pip install --system --constraint constraints.lock -e ".[dev]"
+
+      - name: Run the check gate over samples/config
+        # The bundled samples are the worked example the docs point new adopters at, so a break here is
+        # a break in the first thing an adopter runs. --messages drives the dryrun across the sample
+        # corpus (260 runs over 20 messages today), which is what actually executes every Router and
+        # Handler in the bundle.
+        run: python -m messagefoundry check --config samples/config --messages samples/messages
+
   ci-gate:
     name: CI gate
     if: always()
     needs:
       - changes
       - ide
+      - config-gate
       - sqlserver-store
       - postgres-store
       - load-test
