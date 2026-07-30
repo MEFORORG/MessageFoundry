@@ -137,6 +137,15 @@ async def test_live_differential_proc_vs_batch(proc_store: SqlServerStore) -> No
 async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) -> None:
     # Hand-edit one proc body out-of-band, then re-open: the gate must degrade loudly (the
     # OBJECT_DEFINITION hash mismatch), and the tampered store must still claim on the batch.
+    #
+    # POSITIVE CONTROL FIRST — this is not optional. Until the head-form fix landed, the gate
+    # rejected EVERY body on every server, so this test's degrade assertions were satisfied by a
+    # gate that had never matched anything: it passed while proving nothing. Pinning "the gate is
+    # green on the untampered proc" in the same test is what makes the degrade below evidence.
+    assert proc_store.claim_proc_effective is True, (
+        "positive control: the gate must ACCEPT the correctly deployed proc, else the tamper"
+        " assertions below are vacuous"
+    )
     await proc_store._execute(
         f"ALTER PROCEDURE dbo.{ss._CLAIM_PROC_CID} @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32), @lanes NVARCHAR(MAX),"
@@ -148,7 +157,7 @@ async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) 
         try:
             assert tampered.claim_proc_effective is False
             assert tampered.claim_proc_degraded_reason is not None
-            assert "does not match the shipped definition" in tampered.claim_proc_degraded_reason
+            assert "matches no form this build deploys" in tampered.claim_proc_degraded_reason
             # Still claims (batch path — never a lane outage).
             result = await tampered.claim_fifo_heads(Stage.INGRESS.value, ["IB_NONE"])
             assert result.by_lane == {}
