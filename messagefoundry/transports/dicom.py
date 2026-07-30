@@ -27,7 +27,8 @@ already-scheduled commit may still land, so a re-ingest **must be idempotent** (
 DIMSE failure (the sender was already told Success).
 
 **Security (§9):** the calling-AE allowlist (``require_calling_aet``, association-level) + a peer-IP
-allowlist (the ``[inbound].source_ip_allowlist``, checked before any commit) + ``require_called_aet`` +
+allowlist (the per-connection ``source_ip_allowlist`` passed to ``inbound(...)`` — there is no
+``[inbound].source_ip_allowlist`` service key — checked before any commit) + ``require_called_aet`` +
 a ``max_object_bytes`` cap (over-cap → DIMSE failure **before** commit) + DICOM-over-TLS. A non-loopback
 cleartext SCP is refused at startup by the generalized bind-guard (see
 :func:`messagefoundry.pipeline.wiring_runner.check_dimse_tls_exposure`). All log lines carry only
@@ -179,7 +180,8 @@ class DicomScpSource(SourceConnector):
         # Fail-closed peer controls (SEC-012, deny-by-default per ADR 0025 §9): a non-loopback SCP with
         # NO peer authentication is refused at construction. DIMSE has no transport auth on its own, so
         # a remotely-reachable SCP must gate peers by at least one of: the calling-AE allowlist, the
-        # [inbound].source_ip_allowlist, or mTLS (tls + tls_ca_file → CERT_REQUIRED in
+        # per-connection source_ip_allowlist (an inbound(...) keyword — NOT an [inbound] service-settings
+        # key, which does not exist and is discarded silently), or mTLS (tls + tls_ca_file → CERT_REQUIRED in
         # _server_ssl_context). This is the AUTHENTICATION analog of check_dimse_tls_exposure's cleartext
         # bind guard (which is the orthogonal CONFIDENTIALITY guard). Raising here integrates with
         # ADR-0031 startup fault isolation (the connection degrades, not the engine) and surfaces under
@@ -190,9 +192,15 @@ class DicomScpSource(SourceConnector):
         ):
             raise ValueError(
                 f"DICOM C-STORE SCP bound non-loopback host {self._host!r} with no peer controls: "
-                "set at least one of calling_ae_allowlist, [inbound].source_ip_allowlist, or mTLS "
-                "(tls_ca_file) to fail closed (egress deny-by-default ethos, ADR 0025 §9), or bind "
-                "127.0.0.1."
+                "set at least one of mTLS (tls + tls_ca_file), source_ip_allowlist, or "
+                "calling_ae_allowlist to fail closed (egress deny-by-default ethos, ADR 0025 §9), or "
+                "bind 127.0.0.1. Authoring surface: pass them to inbound(...), e.g. "
+                'inbound("pacs_in", DICOM(...), source_ip_allowlist=["10.0.0.0/8"]). That is the ONLY '
+                "surface for a DICOM SCP — the [inbound] section of messagefoundry.toml has no "
+                "source_ip_allowlist key and discards it silently, and while connections.toml "
+                "[[inbound]] tables do accept the key, none of their transports is DICOM. Note "
+                "calling_ae_allowlist alone gates on a caller-asserted AE Title with no cryptographic "
+                "binding; prefer mTLS or the IP allowlist where the peer is not trusted."
             )
         self._handler: InboundHandler | None = None
         self._loop: asyncio.AbstractEventLoop | None = None

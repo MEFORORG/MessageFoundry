@@ -1565,7 +1565,7 @@ def DICOM(
     # common image storage classes + Verification); transfer syntaxes default to the standard set
     calling_ae_allowlist: list[str]
     | None = None,  # SCP: only these calling AE Titles may associate
-    # (None → any AE the peer-IP allowlist admits — the [inbound].source_ip_allowlist is the IP gate)
+    # (None → any AE the peer-IP allowlist admits — this call's source_ip_allowlist is the IP gate)
     require_called_ae_title: bool = True,  # SCP: a peer must address THIS engine's ae_title as called AE
     tls: bool = False,  # DICOM-over-TLS off-loopback (§9); a non-loopback cleartext SCP is refused
     # fail-closed unless `serve --allow-insecure-bind` (the generalized bind-guard)
@@ -1591,7 +1591,8 @@ def DICOM(
     Like ``X12``, the inbound takes **no** ``host`` (the bind interface is ``[inbound].bind_host``); it
     runs a ``pynetdicom`` AE C-STORE SCP **off the event loop**, commits each object durably to the
     ingress stage **before** returning C-STORE Success (commit-before-SUCCESS), accepts only the
-    ``calling_ae_allowlist`` AE Titles (when set) from the ``[inbound].source_ip_allowlist`` peers, and
+    ``calling_ae_allowlist`` AE Titles (when set) from the peers allowed by the ``inbound(...)``
+    ``source_ip_allowlist`` keyword (there is no ``[inbound].source_ip_allowlist`` service key), and
     rejects an object over ``max_object_bytes`` with a DIMSE failure before the commit. A non-loopback
     cleartext SCP (no ``tls``) is refused at startup unless ``serve --allow-insecure-bind`` (PHI on the
     wire, §9).

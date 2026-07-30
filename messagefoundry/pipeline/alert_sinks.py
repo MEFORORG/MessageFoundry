@@ -1095,11 +1095,34 @@ class NotifierAlertSink(_BackgroundDispatcher[dict[str, Any]]):
                 )
 
 
+def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
+    """The transport names :func:`notifier_from_settings` would configure, without building any.
+
+    Exported for the AUTHORING surfaces (``messagefoundry alert add``). The startup cross-check below
+    is fail-loud, but startup is the wrong place to first learn that a rule cannot route: the rule
+    editor is the trap's front door, and a rule written there would otherwise refuse only at the next
+    start. Deliberately builds nothing — no secret resolution, no SMTP object — so it is safe to call
+    from an edit path. The two names mirror the ``self.name`` values at ``WebhookTransport`` (``webhook``)
+    and ``EmailTransport`` (``email``); the email transport needs all THREE of host/from/to, which is
+    the asymmetry that makes a half-configured [alerts] block look configured."""
+    names: set[str] = set()
+    if alerts.webhook_url:
+        names.add("webhook")
+    if alerts.email_smtp_host and alerts.email_from and alerts.email_to:
+        names.add("email")
+    return names
+
+
 def notifier_from_settings(
     alerts: AlertsSettings, *, secret_provider: SecretProvider | None = None
 ) -> NotifierAlertSink | None:
     """Build a :class:`NotifierAlertSink` from ``[alerts]`` settings, or ``None`` when no transport is
     configured (the caller then leaves the engine on its default logging sink).
+
+    Rules are cross-validated against the configured transports BEFORE the zero-transport return, so a
+    ``[[alerts.rules]]`` block that routes to a transport this instance does not configure raises here
+    even when NO transport is configured at all. That case used to be accepted and then silently never
+    applied. Rules that name no transport still build a ``None`` sink, with a warning when any exist.
 
     ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
@@ -1137,10 +1160,16 @@ def notifier_from_settings(
                 html_template=alerts.email_html_template,
             )
         )
-    if not transports:
-        return None
     # Fail loud at config time if a rule routes to a transport that isn't configured (a typo or a
     # missing webhook_url/email block) — caught at startup/reload, not silently swallowed at send.
+    #
+    # This runs BEFORE the zero-transport early return, deliberately. It used to sit after it, so a
+    # [[alerts.rules]] block on an instance with NO configured transport was accepted and then silently
+    # never applied, while the IDENTICAL rule alongside one transport was a hard ValueError — the
+    # fail-loud guarantee held everywhere except the state an operator is most likely in while first
+    # setting alerts up. With zero transports `configured` is empty, so a rule naming ANY transport now
+    # refuses at startup and names the keys to add. A rule that names NO transport is unaffected and
+    # still starts, which is what keeps the ordinary "rules but no [alerts] block yet" path working.
     configured = {t.name for t in transports}
     for i, rule in enumerate(alerts.rules):
         unknown = [t for t in (rule.transports or []) if t not in configured]
@@ -1157,4 +1186,15 @@ def notifier_from_settings(
                     f"[alerts].rules[{i}].escalate[{j}] routes to unconfigured transport(s) "
                     f"{unknown_tier}; configured: {sorted(configured)}"
                 )
+    if not transports:
+        if alerts.rules:
+            # Every rule here names no transport (one that did would have raised above), so this is not
+            # a refusal — but the rules cannot page anyone, and that used to be entirely silent.
+            log.warning(
+                "[alerts] declares %d routing rule(s) but no transport is configured, so alerts fall "
+                "through to the logging sink and none of these rules can notify anyone. Configure "
+                "webhook_url, or email_smtp_host + email_from + email_to.",
+                len(alerts.rules),
+            )
+        return None
     return NotifierAlertSink(transports, realert_seconds=alerts.realert_seconds, rules=alerts.rules)
