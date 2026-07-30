@@ -7040,7 +7040,9 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 ## 239. Re-measure Steps view estate coverage (opaque vs editable rows) after the palette
 
-> 🚧 **PARTIAL — measured 2026-07-30, tooling not yet merged.** The scan ran against the de-identified estate (388 files · 145 handlers · 1,423 rows · 0 parse refusals; editable share **42.0%**, fully-typed handlers **14.5%**) and the full result is recorded on PR #81. The re-runnable `scripts/quality/lens_coverage.py` is still unmerged, so the number is **not yet reproducible from `main`**.
+> ✅ **SHIPPED (2026-07-30, PR #81).** `scripts/quality/lens_coverage.py` drives the shipped `lens parse --json` — not a second `ast` walk — so the number cannot drift from what the Steps view actually renders. Measured against the de-identified estate: 388 files · 145 handlers · 1,423 rows · **0 parse refusals**; editable share **42.0%**, fully-typed handlers **14.5%** (21/145), median opaque rows/handler **3**. Full result and the pre-registered decision rule are recorded on PR #81.
+>
+> ⚠️ **The pre-registered rule fired 🔴 RED, and the RED prescription was *not* adopted** — both triggers landed exactly on their boundaries (B = 14.5% missed the 15% floor by 0.5pp; median opaque = 3 hit `≥ 3` exactly), while A = 42.0% sat mid-AMBER. The AMBER prescription (breadth before depth) was taken instead, on the argument that the opacity is *mechanical* — comment-only rows (28%) plus helper delegation (41.8%) are ~70% of the opaque mass and both are addressable within the projection model. **This override was a delegated judgment call, never explicitly ratified by the owner**; treat it as open if the next measurement does not move. See #240 (comment-only rows) and ADR 0089 Phase D (helper descent).
 
 **Cluster:** IDE & Authoring. **Priority:** P1 — this number decides how much further Steps-view investment is justified. **Verdict:** build (cheap, reproducible). **Severity:** none (measurement).
 
