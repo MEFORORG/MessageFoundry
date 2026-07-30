@@ -6,9 +6,14 @@ updates:
   # pyproject.toml + uv.lock and REGENERATES uv.lock IN its PRs (version updates GA 2025-03,
   # security updates GA 2025-12) — the old "pip" ecosystem updated requirements/pyproject but NOT
   # uv.lock. It still does not re-derive the EXPORTED locks (requirements.lock + docker/locks/* +
-  # constraints.lock), which the DEP-1 gate in security.yml byte-diffs;
+  # constraints.lock + ci/locks/* — SIX artifacts), which the DEP-1 gate in security.yml byte-diffs;
   # .github/workflows/dependabot-lock-resync.yml re-exports those on the Dependabot branch so the
   # gate stays green.
+  #
+  # UNVERIFIED, and it cannot be verified before the next weekly run: whether this ecosystem enumerates
+  # PEP 735 `[dependency-groups]` (the hash-pinned CI toolchain, ADR 0034 §3) at all. If it does not,
+  # those pins go stale silently — which is why security.yml's pip-audit step audits ci/locks/*.lock
+  # directly, turning "silently stale" into a red gate within ~24h via the daily cron.
   - package-ecosystem: "uv"
     directory: "/"
     schedule:

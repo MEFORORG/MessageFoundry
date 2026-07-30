@@ -298,12 +298,26 @@ jobs:
       - name: Install project + coverage tools
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          # NEITHER package is in constraints.lock, so the --constraint above is a no-op for them and both
-          # previously floated to whatever PyPI served that day. diff-cover is now pinned exactly: the
-          # inline-annotation surface depends on `--format github-annotations:<level>` and on adjacent-line
-          # coalescing in GitHubAnnotationsReportGenerator. Deliberately NOT in pyproject.toml -- these are
-          # CI-only tools, and adding them would trip the DEP-1 lock-sync gate and force four re-exports.
-          uv pip install --system --constraint constraints.lock pytest-cov "diff-cover==10.4.1"
+          # HASH-PINNED from the CI toolchain lock (ADR 0034 §3). These tools now DO live in
+          # pyproject.toml ([dependency-groups].ci-quality, where each pin's rationale sits) and DEP-1
+          # re-exports this lock by design -- superseding the note that used to sit here claiming they
+          # were deliberately kept out of pyproject to avoid tripping that gate.
+          #
+          # `python -m pip`, not `uv pip install --system`, for ONE honest reason: every other hashed
+          # install in this repo is a pip install, and keeping one spelling means one thing for the
+          # guards in tests/test_ci_venv_pinning.py to match. Same setup-python interpreter either way.
+          #
+          # NOT because uv cannot: `uv pip install --require-hashes` exists (env UV_REQUIRE_HASHES), and
+          # setup-uv is already in this job -- the earlier claim that "--require-hashes is pip's
+          # contract" was simply wrong. NOR for Scorecard's benefit: its parser keys on
+          # pip/pip3/`python -m pip`, so a `uv pip` line generates NO finding at all, and converting one
+          # can only ADD parseable surface -- it cannot close an alert. This line is posture-neutral to
+          # Scorecard and is here for uniformity.
+          #
+          # Safe against the editable install above: the group lock and constraints.lock agree on all 10
+          # shared packages (pytest and pytest-timeout among them), so this cannot re-point what the
+          # coverage run executes under.
+          python -m pip install --require-hashes -r ci/locks/ci-quality.lock
       - name: Tests under coverage (advisory - never fails)
         continue-on-error: true
         env:
@@ -428,13 +442,17 @@ jobs:
       - name: Install project + mutmut
         run: |
           uv pip install --system --constraint constraints.lock -e ".[dev,harness,fhir,dicom,x12,xml,webauthn]" -e packaging/messagefoundry-webconsole
-          # mutmut 3, pinned. `mutmut<3` resolved to 2.5.1, which CRASHES on Python 3.14 in its pony-ORM
-          # cache (`cannot pickle 'itertools.count'`) before generating a single mutant -- verified from
-          # run 30248096425. pytest-timeout is REQUIRED: mutmut 3 always passes `--timeout`/
-          # `--timeout-method` to pytest, and without the plugin every test invocation dies with an
-          # unrecognised-argument error that surfaces only as BadTestExecutionCommandsException.
-          # Neither package is in constraints.lock, so the --constraint above does not pin them.
-          uv pip install --system "mutmut==3.6.0" pytest-timeout
+          # mutmut 3 + pytest-timeout, HASH-PINNED from the CI toolchain lock (ADR 0034 §3). Both live in
+          # pyproject.toml's [dependency-groups].ci-quality, which records why each is load-bearing:
+          # `mutmut<3` resolved to 2.5.1, which CRASHES on Python 3.14 in its pony-ORM cache
+          # (`cannot pickle 'itertools.count'`) before generating a single mutant -- verified from run
+          # 30248096425; and pytest-timeout is REQUIRED because mutmut 3 always passes `--timeout`/
+          # `--timeout-method` to pytest, so without the plugin every invocation dies with an
+          # unrecognised-argument error surfacing only as BadTestExecutionCommandsException.
+          # `python -m pip` for UNIFORMITY with every other hashed install in this repo, not because uv
+          # cannot do it (`uv pip install --require-hashes` exists) and not for Scorecard (a `uv pip`
+          # line generates no finding at all) -- see the coverage job's install step for the full note.
+          python -m pip install --require-hashes -r ci/locks/ci-quality.lock
       - name: Mutation-test a bounded scope (advisory - never fails)
         continue-on-error: true
         env:

@@ -1,16 +1,21 @@
 name: Dependabot lock resync
 
-# Re-exports the FOUR committed "uv export" artifacts (requirements.lock +
+# Re-exports the SIX committed "uv export" artifacts (requirements.lock +
 # docker/locks/requirements-core.lock + docker/locks/requirements-sqlserver.lock + the HASHLESS
-# constraints.lock) on a Dependabot PR that touched uv.lock / pyproject.toml, and commits them back
-# to the PR branch so the DEP-1 drift gate (security.yml -> pip-audit job, step "Check the lockfile
-# is in sync with pyproject (DEP-1)") goes green WITHOUT a human re-export.
+# constraints.lock + the two PEP 735 CI-toolchain locks ci/locks/ci-scanners.lock and
+# ci/locks/ci-quality.lock) on a Dependabot PR that touched uv.lock / pyproject.toml, and commits them
+# back to the PR branch so the DEP-1 drift gate (security.yml -> pip-audit job, step "Check the
+# lockfile is in sync with pyproject (DEP-1)") goes green WITHOUT a human re-export.
 #
 # WHY: the native "uv" Dependabot ecosystem regenerates uv.lock + pyproject.toml in its PR, but NOT
-# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + the four "uv export"s and
+# the exported lock artifacts. The DEP-1 gate re-runs "uv lock --check" + all six "uv export"s and
 # "git diff --exit-code"s the result, so a Dependabot uv PR would otherwise leave the exports stale
 # and red the gate. This workflow runs the IDENTICAL commands and pushes the refreshed exports onto
 # the Dependabot branch.
+#
+# The two ci/locks/*.lock artifacts are what makes the CI toolchain hash-pinned rather than merely
+# version-pinned (ADR 0034 §3). They are ALSO what keeps it fresh: a hash-pinned toolchain outside this
+# resync machinery would rot into a pinned, stale, unpatched toolchain — worse posture than floating.
 #
 # KEEP THIS LIST IN LOCKSTEP WITH security.yml's DEP-1 step. A file the gate diffs but this job does
 # not re-export is un-fixable by the bot: the resync pushes an incomplete set, DEP-1 re-exports the
@@ -128,6 +133,10 @@ jobs:
           # The hashless constraint export every CI install pins against (`--constraint constraints.lock`,
           # ci.yml). Same lock, --no-hashes; omitted here it would stay stale and red DEP-1 forever.
           uv export --all-extras --no-emit-project --no-hashes --format requirements.txt -o constraints.lock
+          # The CI TOOLCHAIN locks (PEP 735 dependency groups, ADR 0034 §3). Same lockstep rule as the
+          # four above: the gate diffs them, so the bot must re-export them or the PR has no path green.
+          uv export --only-group ci-scanners --format requirements.txt -o ci/locks/ci-scanners.lock
+          uv export --only-group ci-quality --format requirements.txt -o ci/locks/ci-quality.lock
 
       - name: Commit and push the resynced locks
         if: steps.creds.outputs.present == 'true'
@@ -139,11 +148,11 @@ jobs:
           set -euo pipefail
           git config user.name 'dependabot[bot]'
           git config user.email '49699333+dependabot[bot]@users.noreply.github.com'
-          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock; then
+          if git diff --quiet -- requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock; then
             echo 'Exported lock files already in sync; nothing to push.'
             exit 0
           fi
-          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock
+          git add requirements.lock docker/locks/requirements-core.lock docker/locks/requirements-sqlserver.lock constraints.lock ci/locks/ci-scanners.lock ci/locks/ci-quality.lock
           git commit -m 'chore(deps): resync exported lock files (DEP-1)'
           # Push with the persisted App-token credential (NOT GITHUB_TOKEN). An App-token push emits a
           # synchronize event so the required checks (DEP-1, ci.yml) re-run on the new commit; a
