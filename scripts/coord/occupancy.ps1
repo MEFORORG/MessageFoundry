@@ -40,16 +40,24 @@
     host, so nothing here can prove a session is GONE. Occupancy may therefore only ever VETO an
     action; a DEAD/STALE/absent verdict must never by itself authorise one.
 
-    WHAT IT CANNOT SEE -- state this wherever it is consumed:
+    TWO SOURCES, COMPOSED. -IncludeFootprints adds a SECOND source with its own receipt and its own
+    rows: footprint.ps1, which reads where each session has actually WRITTEN rather than where it was
+    launched. Availability is ANDed (either source failing to look refuses the whole run) and vetoes are
+    ORed (either source seeing somebody stops the removal); reasons only ever append. Each source keeps
+    its OWN examined/found counters, so nobody can read coverage from one as coverage from the other --
+    the specific way a two-signal fence quietly collapses into one.
+
+    WHAT THE CWD SOURCE CANNOT SEE -- state this wherever it is consumed:
       * A session that writes into a worktree BY ABSOLUTE PATH from somewhere else. Records carry the
-        cwd a session was launched in, and measurement on this repo says 29% of writes come from a
-        session sitting in the primary and land in a sibling worktree. Those are invisible here, so a
-        cwd-keyed fence alone is not sufficient protection for a destructive action. Measured
-        2026-07-30 on this repo: 5 live sessions, 9 worktrees, and ZERO of the four `<primary>-<slug>`
-        siblings drew a veto -- including the one a session was demonstrably building in. A caller that
-        destroys things needs a second, non-cwd signal; this one alone is not enough.
+        cwd a session was launched in and nothing ever rewrites it, so a workflow that fans subagents
+        into N sibling worktrees is represented by ONE record carrying ONE cwd. Measured 2026-07-30 on
+        this repo: of the writes landing in a `<primary>-<slug>` sibling, 88.9% came from a session
+        whose recorded cwd was a different checkout, and this source placed a session inside ZERO of the
+        four siblings that then existed -- including the one a live session was demonstrably building
+        in. That is what -IncludeFootprints exists for; this source alone is not enough.
       * A cwd recorded as a UNC path (\\host\C$\...) or an 8.3 short path: the match is a string
-        compare on the normalised path, and neither spelling normalises to the worktree's own.
+        compare on the normalised path, and neither spelling normalises to the worktree's own. (The
+        footprint source resolves through .git instead and does not share this blind spot.)
       * A session that never registered at all.
     It DOES see VS Code sessions -- <config-root>/sessions/<pid>.json is the only registry carrying
     every surface (the Desktop app's own session tooling lists just what it spawned). The match is
@@ -63,12 +71,18 @@
     for that reason, and Get-NestedWorktrees lists them so a caller can refuse outright.
 #>
 
-# The liveness fence, shared with presence.ps1 and sessions.ps1.
+# The liveness fence, shared with presence.ps1 and sessions.ps1. (footprint.ps1 dot-sources it too;
+# PowerShell re-sourcing is idempotent, and the shared ConvertTo-Norm comes from it.)
 . "$PSScriptRoot\session-registry.ps1"
+# The write-footprint source, used only under -IncludeFootprints.
+. "$PSScriptRoot\footprint.ps1"
 
 # States that must VETO a destructive action: the session is live, or we could not tell that it isn't.
 # DEAD/STALE are deliberately absent -- they are not a veto, and they are not permission either.
-$script:OccupancyVetoStates = @('LIVE', 'UNVERIFIED', 'UNREADABLE')
+# UNREGISTERED is only ever produced by the footprint source (a session that wrote here and has no
+# registry record); it vetoes for the same reason UNREADABLE does -- the fence could not be evaluated,
+# and an unevaluated fence is not a passed fence.
+$script:OccupancyVetoStates = @('LIVE', 'UNVERIFIED', 'UNREADABLE', 'UNREGISTERED')
 
 function Test-OccupancyVeto {
     [CmdletBinding()]
@@ -76,10 +90,9 @@ function Test-OccupancyVeto {
     return ($script:OccupancyVetoStates -contains $State)
 }
 
-function ConvertTo-Norm([string]$p) {
-    if (-not $p) { return "" }
-    return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
-}
+# ConvertTo-Norm now lives in session-registry.ps1, dot-sourced above: footprint.ps1 has to answer "is
+# this path inside that worktree" exactly as this file does, and the only way to guarantee that is one
+# copy at the bottom of the stack.
 
 # Every worktree sharing one .git. Keyed on the worktree SET rather than a single path, because the
 # whole point is seeing siblings, not just yourself.
@@ -125,7 +138,7 @@ Map every session record onto the worktree it was launched in, fenced for livene
 
 Returns a pscustomobject:
     RepoFound        [bool]   the -Repo hint resolved to a git repo at all
-    Available        [bool]   the fence had something to examine (see the header)
+    Available        [bool]   BOTH sources had something to examine (see the header)
     Detail           [string] why it is unavailable, '' when it is available
     RootsExamined     [int]    config roots holding a sessions registry
     RecordsExamined   [int]    records that PARSED across those roots
@@ -133,14 +146,24 @@ Returns a pscustomobject:
     UnplaceableFiles  [array]  each one's path and why, so the operator can go and look
     Worktrees         [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...)
     PrimaryPath       [string] the trunk checkout (git reports it first)
-    Sessions          [array]  one row per record whose cwd falls inside one of those worktrees
+    Sessions          [array]  veto-worthy rows from BOTH sources, each tagged with its Source
+                               ('cwd' or 'footprint'). The cwd rows are one per record placed by its
+                               recorded cwd; the footprint rows are one per (session, worktree) pair
+                               with a write inside the window.
+    FootprintsIncluded[bool]   whether the second source ran at all
+    Footprint         [object] its full receipt (see footprint.ps1), or $null
 #>
 function Get-WorktreeOccupancy {
     [CmdletBinding()]
     param(
         [string]$Repo,
         [string[]]$ConfigRoot,
-        [int]$StartSkewMinutes = 15
+        [int]$StartSkewMinutes = 15,
+        # Add the write-footprint source. Off by default: the read-only roster callers want "where is
+        # each session sitting", and one of them runs in a SessionStart hook where a corpus scan is
+        # both the wrong question and the wrong cost. Anything DESTRUCTIVE must pass it.
+        [switch]$IncludeFootprints,
+        [double]$FootprintHours = 36
     )
 
     $worktrees = @(Get-RepoWorktrees $Repo)
@@ -150,6 +173,7 @@ function Get-WorktreeOccupancy {
             Detail = 'not inside a git repository -- nothing to scope occupancy to'
             RootsExamined = 0; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = @(); PrimaryPath = ''; Sessions = @()
+            FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $null
         }
     }
 
@@ -174,6 +198,7 @@ function Get-WorktreeOccupancy {
             Detail = "session registry unreadable: $($_.Exception.Message)"
             RootsExamined = $roots.Count; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @()
+            FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $null
         }
     }
     $records = @($all | Where-Object { -not $_.Unreadable })
@@ -236,6 +261,9 @@ function Get-WorktreeOccupancy {
         $recPid = 0
         try { $recPid = [int]$rec.pid } catch { $recPid = 0 }
         $sessions += [pscustomobject]@{
+            # Which SOURCE placed this row. The two are never merged into one number anywhere: a fence
+            # that reports a single "vetoed N" cannot show that one of its signals has gone to zero.
+            Source       = 'cwd'
             State        = $live.State
             Detail       = $live.Detail
             SessionId    = $sid
@@ -250,6 +278,43 @@ function Get-WorktreeOccupancy {
             Worktree     = if ($matchNorm -eq $primaryNorm) { "primary" } else { Split-Path $match.Path -Leaf }
             IsPrimary    = ($matchNorm -eq $primaryNorm)
             Branch       = $match.Branch
+            # Footprint-only columns, present on every row so the two shapes are interchangeable.
+            Writes       = 0
+            LastWriteAt  = ''
+            CrossTree    = $false
+            PlacedBy     = 'cwd'
+        }
+    }
+
+    # --- Source 2: where sessions have actually WRITTEN ------------------------------------------
+    # ANDed on availability, ORed on vetoes, reasons appended. A source that could not look refuses the
+    # whole run; a source that looked and saw nobody adds nothing and says so in its own receipt.
+    $fp = $null
+    if ($IncludeFootprints) {
+        try {
+            $fp = Get-WorktreeFootprints -Worktrees $worktrees -ConfigRoot $ConfigRoot `
+                -WindowHours $FootprintHours -StartSkewMinutes $StartSkewMinutes
+        }
+        catch {
+            # An exception in the scanner is "could not look", never "nobody is here".
+            $fp = [pscustomobject]@{
+                Available = $false
+                Detail = "the write-footprint scan threw: $($_.Exception.GetType().Name)"
+                Note = ''; WindowHours = $FootprintHours
+                RootsExamined = 0; RootsWithCorpus = 0
+                TranscriptsFound = 0; TranscriptsInWindow = 0; TranscriptsWithNeedle = 0
+                BytesScanned = [long]0; LinesScanned = 0; LinesParsed = 0; PathBlocksExamined = 0
+                WritesExamined = 0; WritesOutsideWindow = 0; WritesUndated = 0
+                WritesPlaced = 0; WritesUnplaced = 0
+                PlacedByPrefix = 0; PlacedByGitdir = 0; GitdirProbes = 0; GitdirUnresolvable = 0
+                SidechainFiles = 0; SidechainLines = 0; SidechainPathBlocks = 0
+                CrossTreeWrites = 0; Faults = @(); Footprints = @()
+            }
+        }
+        $sessions += @($fp.Footprints)
+        if (-not $fp.Available) {
+            $available = $false
+            $detail = if ($detail) { "$detail; write-footprint source: $($fp.Detail)" } else { "write-footprint source: $($fp.Detail)" }
         }
     }
 
@@ -259,6 +324,7 @@ function Get-WorktreeOccupancy {
         RecordsUnplaceable = $faults.Count
         UnplaceableFiles = @($faults | ForEach-Object { "$($_.File) -- $($_.Why)" })
         Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @($sessions)
+        FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $fp
     }
 }
 

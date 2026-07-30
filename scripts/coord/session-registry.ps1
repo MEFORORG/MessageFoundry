@@ -40,6 +40,15 @@
     combine it with an independent signal and let either one veto.
 #>
 
+# ONE path normaliser, at the bottom of the stack ON PURPOSE. The cwd matcher (occupancy.ps1) and the
+# write-footprint scanner (footprint.ps1) must decide "is this path inside that worktree" identically:
+# two copies of a safety comparison drift, and the copy that drifts is the one nobody is testing. It
+# lives here because it is the only file both of them already depend on.
+function ConvertTo-Norm([string]$p) {
+    if (-not $p) { return "" }
+    return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
+}
+
 # Every config root that actually holds a session registry.
 function Get-ClaudeConfigRoots {
     [CmdletBinding()]
