@@ -60,9 +60,8 @@ is *not* a contradiction of the ≤7-day own-code window above):
   else's library, so the SLA measures how fast we adopt the fix once it exists.
 - **Exploitation pressure sets priority, not CVSS alone.** We triage **KEV-first** (on CISA's
   Known-Exploited-Vulnerabilities list → patch now), then **EPSS** (≥ 0.7 = imminent), with **CVSS only
-  as a tiebreaker**, and we weigh **reachability** (is the package installed in a shipped profile, wired
-  into a running graph, and egress-reachable? — see
-  [`docs/security/SOUP-DEPENDENCY-HANDLING.md`](../docs/security/SOUP-DEPENDENCY-HANDLING.md)).
+  as a tiebreaker**, and we weigh **reachability** — is the package installed in a shipped profile,
+  wired into a running graph, and egress-reachable?
 
 | Class | Trigger | Target (from upstream-fix availability) |
 |---|---|---|
@@ -76,7 +75,7 @@ is *not* a contradiction of the ≤7-day own-code window above):
 leave the affected extra uninstalled, or tighten the egress allow-list — and track to the fix. Detection
 feeds this lane automatically: blocking `pip-audit`/`npm-audit` against the hash-locked tree, a **daily**
 `security.yml` cron (a CVE against an unchanged pin is caught in ~24h), and grouped Dependabot security
-PRs. The step-by-step response is [`docs/security/DEP-CVE-RUNBOOK.md`](../docs/security/DEP-CVE-RUNBOOK.md).
+PRs.
 
 ## Scope notes
 
