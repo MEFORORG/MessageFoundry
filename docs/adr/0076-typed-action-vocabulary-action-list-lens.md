@@ -1,6 +1,6 @@
 # ADR 0076 — Typed action vocabulary + structured action-list lens over Python Handlers
 
-**Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Two amendments are PROPOSED and awaiting owner ratification (2026-07-30):** Amendment A — a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L) (BACKLOG #248); Amendment B — ADR 0089 Phase D "helper descent", **not buildable** until its three preconditions clear. Neither is in force; §3/§4/§5 read as originally accepted until the owner rules.
+**Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — still PROPOSED and NOT ratified:** ADR 0089 Phase D "helper descent" is specified and priced but **not buildable**; its yield is unmeasured and may be negative, and its three §B.4 preconditions are unmet. Do not read A's ratification as covering B.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings ([`docs/research/ide-low-code-options.md`](../research/ide-low-code-options.md) — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
 Plan: [`docs/releases/MULTISESSION-PLAN-8.md`](../releases/MULTISESSION-PLAN-8.md) (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
@@ -133,9 +133,17 @@ Phase 2b shipped the lens with the live-value slot **stubbed** (each row rendere
 
 ## Amendment A (2026-07-30) — a `note` row kind: comment-only rows stop projecting as opaque `code` (BACKLOG #248)
 
-> **Status of this amendment: PROPOSED (2026-07-30) — owner ratification required.** It supersedes an
-> owner-ratified decision (ADR 0106 §5 (L), ratified 2026-07-13), so it cannot be adopted by the session
-> that drafted it. The evidence in §A.3 is verified against `main`; the decision is not taken.
+> **Status of this amendment: ACCEPTED — ratified by the owner 2026-07-30.** It supersedes an
+> owner-ratified decision (ADR 0106 §5 (L), ratified 2026-07-13); that supersession is now in force, and
+> ADR 0106 §5 (L)'s "honest degrade" projection of an inserted Comment as a `code` row no longer holds.
+> The evidence in §A.3 was verified against `main` before ratification.
+>
+> **In force means the grammar changed, not that the build is done.** §3's row enum now includes `note`
+> and `diagnostic`; §4's ladder gains `note` as a sibling of the typed rows. BACKLOG #248 is the build
+> and is now unblocked. The invariants in §A.4 are **build gates, not caveats** — in particular the
+> pragma allowlist, the `_merge_code_rows` docstring exclusion, and the rule that a note edit takes its
+> indentation and `#` prefix form from the existing line rather than the insert normalizer. §A.6's two
+> known-wrong behaviours are **not** fixed by this amendment and must not be reported as fixed.
 
 §3's row enum ends at `{ "kind": "code", … } // verbatim, unrecognized`, and §4's ladder sends
 "everything else" there. A standalone comment is therefore projected as an opaque `Code` step. This
