@@ -678,6 +678,13 @@ jobs:
         # suites above never picked them up and they ran only on SQLite. Run them here against the real
         # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
         #
+        # NOT only throughput levers: this step is the catch-all for ANY MEFOR_TEST_SQLSERVER-gated file
+        # the named suites above do not collect. CI runs an explicit file LIST here, not the whole suite,
+        # so a new gated file that nobody appends never runs in CI at all — it just reports as skipped on
+        # the plain legs, which reads identical to passing. `tests/test_sqlserver_legacy_outbox_migration.py`
+        # (ASVS 14.2.7) is here for exactly that reason: it verifies a one-way schema migration that can
+        # only be observed against a real server.
+        #
         # RETRY WRAPPER: pyodbc 5.3.0 intermittently segfaults in its C parameter-binding path under
         # py3.14 against the SQL Server 2025 container (upstream mkleehammer/pyodbc#1459, unfixed; 5.3.0
         # is the newest pyodbc and the first with py3.14 wheels, so there is nothing to bump to). The
@@ -698,6 +705,7 @@ jobs:
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
+          tests/test_sqlserver_legacy_outbox_migration.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:

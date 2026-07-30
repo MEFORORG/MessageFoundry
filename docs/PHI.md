@@ -95,7 +95,6 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 | `attachment_chunk.ciphertext` (ADR 0105 / #149) | all three | **Yes** — one slice of a detached very-large document (e.g. a base64 PDF from OBX-5.5) | **Yes, when a key is set** — store cipher, **sealed per chunk on write**; AAD `("attachment_chunk","ciphertext",attachment_id,seq)`; store DEK | **PL-1** | The document is detached at ingress, content-addressed (`sha256` of the verbatim plaintext) and chunked; the message keeps only an `mfdoc:v1:ref:` handle. Read back via `GET /messages/{id}/attachments/{id}` (§3) | ``rides `[security].delete_message_bodies_after_days` `` |
 | `attachment` header row (`content_type`, `total_bytes`, `refcount`, `created_at`) + `message_attachment` linkage | all three | **No** — size/type/linkage only | No (metadata, deliberately not ciphered) | **PL-4** | The linkage row is the security crux of the download route: it scopes a content address to a message the caller may already read | ``rides `[security].delete_message_bodies_after_days` `` |
 | `response.body` (ADR 0013 captured replies; ADR 0021 `kind='ack_sent'`) | all three | **Yes** — the partner's reply body, or the ACK/NAK the engine returned | **Yes, when a key is set** — store cipher; AAD `("response","body",message_id,destination_name,response_seq)`; store DEK | **PL-1** | Composite PK, so it rides its own migration/rotation pass. An **ACK body is stored only when the store cipher is active** — on a keyless store it is `NULL` rather than plaintext (fail-safe), and a NAK never stores a body at all | ``rides `[security].delete_message_bodies_after_days` `` |
-| `outbox.payload` (**legacy**, pre-staged-pipeline schema) | **SQL Server only** | **Yes** — a full outbound body on a store upgraded from the flat-`outbox` schema | **Yes, when a key is set** — store cipher (on-open migration only); AAD `("outbox","payload",id)`; store DEK | **PL-1** | SQL Server's schema pass re-runs a **create-if-absent** `IF OBJECT_ID('outbox','U') IS NULL CREATE TABLE outbox` on every open, so the table always exists and an existing one is never re-created or emptied — and it is never migrated away or dropped (SQLite migrates its rows into `queue` then `DROP`s it; Postgres has no such table). Empty on a greenfield install. **Three honest gaps:** it is absent from `reencrypt_to_active`, so a key rotation followed by dropping the retired key leaves those bodies undecryptable; `outbox.last_error` is in neither the migration nor the rotation pass; and **no purge path on any backend touches it** ([§8](#8-retention--purge)) | `UNBOUNDED — honest gap` |
 | `[store].uploads_dir/*.blob` + `*.meta` — the cipher cells `uploaded_file.body` / `uploaded_file.meta` (offline uploaded logs, ADR 0134) | all (filesystem, not the DB) | **Yes** — an operator-uploaded diagnostic message file, held for offline browsing decoupled from any connection | **Yes, when a key is set** — the **same store cipher** (`build_store_cipher`); AAD `("uploaded_file","body")` / `("uploaded_file","meta")` + `file_id`; store DEK. **identity/plaintext-on-disk otherwise** (the File-connector-spill tier below) | **PL-1** | A PHI-at-rest location **outside** the message store, opt-in (unset ⇒ the subsystem is disabled — no surface). On-disk identity is a random 32-hex `file_id` (path-traversal guard); the operator filename is display-only. Every access is `files:*`-gated, browse is step-up + PHI-hop-guarded, all audited (metadata only). **Not** re-encrypted by `rotate-key` (outside the store) — stays readable via the decrypt keyring. The dir is created `0o700` and the sidecar written `0o600` **best-effort, and both are no-ops on Windows** — the engine applies no ACL here (it does not call the `icacls` enforcer). **Retention + quotas (ASVS 5.2.4):** uploaded files auto-prune after `[store].uploads_retention_days` (default **30**) — swept opportunistically at save time and by a periodic task; every prune is audited (`upload.prune`, file_id + uploader only, never content). Per-uploader caps `[store].max_upload_files_per_user` (default **100**) / `[store].max_upload_total_bytes_per_user` (default **250 MiB**) bound the at-rest volume; a would-be over-quota upload is refused **HTTP 409** with an `upload.reject_quota` audit before anything is written (defaults-ON, `ge=1` floors; quota is per-process per-`uploads_dir`). Harden the dir + volume encryption ([§10](#10-secure-deployment--operations-checklist)) | `` `[store].uploads_retention_days` `` |
 | `[backup].destination/mefor-backup-*.mfbak` (ADR 0049 DR backup) | **SQLite only** carries bodies | **SQLite: Yes** — a consistent store snapshot (full inbound + outbound bodies) + the config bundle. **SQL Server / Postgres: No** — config bundle only | **Yes** — `.mfbak` chunked-AEAD codec under the **store DEK** (`resolve_active_key`); an identity-cipher (no-key) box is **refused** unless `[backup].allow_unencrypted` writes a `.mfbak.plain` | **PL-1** (SQLite) / **PL-4** (server backends) | On a **server-DB store `snapshot_to` raises `DbaDelegatedError`**, so the BackupRunner writes a **config-only** archive — or skips entirely when `[backup].config_only_on_server_db = false`. There is therefore **no `.mfbak` containing message bodies on SQL Server or Postgres**; the DB-tier backup there is `BACKUP DATABASE` / Always On / `pg_dump` / PITR, infra-owned. Where bodies *are* present it is a second at-rest PHI copy, bounded by keep-N retention; like `uploads_dir` it is **not** re-encrypted by `rotate-key`. The share's own ACLs are infra-owned | ``keep-N `[backup].retention_keep` `` |
 | `mefor-backup-*` / `mefor-tar-*` / `mefor-verify-*` staging dirs (OS temp dir, ADR 0049) | SQLite carries bodies; server backends config-only | **Yes** — a full store snapshot, and on verify a **decrypted** archive | **No** — the snapshot keeps the store's own column cipher, but the staging tar and the verify extraction are **plaintext on disk**; no engine ACL (`_secure_file` is never called on these paths) | **PL-1** | `run_backup` snapshots the store to `<tmp>/store.db` and tars it **plaintext** before sealing it into the `.mfbak` (`pipeline/dr_backup.py`), and `[backup].verify_after_backup` (**default `true`**) decrypts the archive straight back out to a second temp dir on **every** run — independent of `full_restore_verify`. Transient (the `TemporaryDirectory` unlinks on exit) but **not** on a crash or `SIGKILL`. Lives under `%TEMP%` / `TMPDIR`, **not** the ACL'd data dir: cover the temp volume with FDE and point `TMP`/`TMPDIR` at an owner-only path ([§10](#10-secure-deployment--operations-checklist)) | `UNBOUNDED — honest gap` |
@@ -149,14 +148,26 @@ destruction) are documented in [§3](#3-encryption-at-rest) under the matching h
 > contain no backticked setting at all.
 
 **Per-backend cipher coverage, stated exactly.** The store cipher covers **18** `(table, column)`
-pairs on SQLite. **SQL Server** covers 18 = the SQLite set **minus** `shared_body.body` (never written
-there) **plus** the legacy `outbox.payload`. **Postgres** covers 17 = the SQLite set **minus**
-`shared_body.body`. Two further asymmetries are real and worth knowing. **(1)** Neither SQL Server nor
-Postgres sweeps `attachment_chunk` in its *on-open* plaintext→cipher migration (only in `rotate-key`),
-which is harmless today because `put_attachment` always seals on write, but means a legacy
-no-key→key transition would not sweep chunks the way SQLite's does. **(2)** SQL Server's legacy
-`outbox.payload` is swept by the on-open migration but is **absent from `reencrypt_to_active`**, so a
-rotation that retires the old key leaves those bodies undecryptable (the row above says the same).
+pairs on SQLite. **SQL Server** covers 17 = the SQLite set **minus** `shared_body.body` (never written
+there). **Postgres** covers 17 = the SQLite set **minus** `shared_body.body`. SQL Server's count was
+18 until the legacy `outbox.payload` was retired (below); the two server backends now carry the same
+set. One asymmetry remains and is worth knowing: neither SQL Server nor Postgres sweeps
+`attachment_chunk` in its *on-open* plaintext→cipher migration (only in `rotate-key`), which is
+harmless today because `put_attachment` always seals on write, but means a legacy no-key→key
+transition would not sweep chunks the way SQLite's does.
+
+**The legacy SQL Server `outbox` table is gone (ASVS 14.2.7), and that closed two real gaps.** It was
+recreated by the schema pass on every open and read by nothing, so a store upgraded from the
+pre-staged-pipeline layout kept full outbound PHI bodies there that no purge on any backend reached —
+while `messages.raw` blanked on its own window, so the message read as purged. It also sat outside
+`reencrypt_to_active`, so a key rotation that retired the old key left those bodies undecryptable.
+Both close the same way: a guarded statement in the SQL Server schema batch folds surviving rows into
+`queue` as `stage='outbound'` — payload carried over verbatim, so encryption at rest is preserved —
+and then `DROP`s the table. Migrated rows are ordinary outbound queue rows, bounded by
+`[security].delete_message_bodies_after_days` / `[retention].dead_letter_days`, swept by the on-open
+cipher migration and rotated by `reencrypt_to_active`, so the tier no longer needs its own row here.
+SQLite already performed the equivalent migration (`_migrate_outbox_to_queue`); Postgres never had the
+table.
 
 **The body cipher `[BUILT]`.** Each backend routes the columns above through the store's `_cipher`
 ([store/crypto.py](../messagefoundry/store/crypto.py)) on write/read — **AES-256-GCM when a store key
@@ -246,7 +257,7 @@ for defense-in-depth without swapping the `aiosqlite` connector.
 1. **Application-level AES-256-GCM `[BUILT]`.** The store's `_cipher`
    ([store/crypto.py](../messagefoundry/store/crypto.py)) encrypts the cipher-covered columns.
    **[§2](#2-where-phi-lives--data-at-rest-inventory) is the normative list** — 18 `(table, column)`
-   pairs on SQLite, 18 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells. The
+   pairs on SQLite, 17 on SQL Server, 17 on Postgres, plus the two `uploaded_file` sidecar cells. The
    per-level blocks below group that same set; they do not redefine it, and CI pins the counts **and**
    the membership of both sections to the store's cipher registry, so they cannot diverge. Stored format
    `mfenc:v1 ‖ key_id ‖ base64(nonce ‖ ciphertext ‖ GCM tag)` — the GCM tag
@@ -378,7 +389,7 @@ a statement about *what is built today*; where a control does not exist, it says
 #### PL-1 · PHI body
 
 **Applies to:** `messages.raw` · `queue.payload` · `shared_body.body` · `attachment_chunk.ciphertext` ·
-`response.body` · `outbox.payload` (SQL Server legacy) · `[store].uploads_dir` blobs
+`response.body` · `[store].uploads_dir` blobs
 (`uploaded_file.body` / `uploaded_file.meta`) · `.mfbak` archives (SQLite) · `mefor-backup-*` /
 `mefor-tar-*` / `mefor-verify-*` staging dirs (OS temp dir) · File-connector spill dirs ·
 application log files (`[logging].log_dir`).
@@ -426,7 +437,9 @@ application log files (`[logging].log_dir`).
   by `purge_dead_letters`; `response.body` is set to `NULL` in place by the same pass;
   `shared_body.body` is refcount-decremented and GC'd at 0 when its **last** referrer is purged;
   streaming attachments are decref'd + GC'd at 0 (plus a startup `sweep_orphan_attachments`).
-  **`outbox.payload` is purged by nothing on any backend**, while `[store].uploads_dir` blobs auto-prune
+  The legacy SQL Server `outbox.payload` no longer exists to be purged — its rows were folded into
+  `queue` and the table DROPped ([§2](#2-where-phi-lives--data-at-rest-inventory)), so they now ride the
+  same window as any other outbound row. `[store].uploads_dir` blobs auto-prune
   after `[store].uploads_retention_days` (default **30**) via an age-based sweep — a periodic
   `UploadRetentionRunner` plus an opportunistic pass at save time, each pruned pair audited `upload.prune`
   (ASVS 5.2.4, #291); an operator `DELETE` is an additional removal path. **`.mfbak` archives** are bounded
@@ -1076,7 +1089,6 @@ window purely so a replay can be richer — is precisely the defect ASVS 14.2.7 
 | Tier | Status |
 |---|---|
 | `reference.value` (a **declared** set) | **orphan-only** coverage. `purge_reference_snapshots` bounds a set config has DROPPED; a set still declared is never purged whatever its age, because its snapshot is live data. The wired-set case remains unbounded — the honest gap |
-| `outbox.payload` (SQL Server legacy) | recreated on every open, **touched by no purge on any backend** — legacy PHI there is retained forever |
 | `queue.payload` (stage=`ingress`/`routed`, **DEAD**) | **no purge reaches it** — added 2026-07-30 by the ASVS 14.2.7 classification sweep, which is the only reason it was found. The happy path consumes these rows at `route_handoff`/`transform_handoff`, so they are documented as transient — but a router or handler content fault calls `dead_letter_now` (`pipeline/wiring_runner.py:4415`, `:4449`), which sets status/`last_error` and **never touches `payload`**, while both purges are scoped `Stage.OUTBOUND` (`store/store.py:8384`, `:8659`). So `messages.raw` blanks on its window and the message reads as purged while a **full raw PHI body survives here indefinitely**. Filed as its own defect; the likely fix is to let a DEAD ingress/routed row ride `[retention].dead_letter_days` exactly as a dead outbound row does |
 | `mefor-backup-*` / `mefor-tar-*` / `mefor-verify-*` staging dirs | no window — a `TemporaryDirectory` unlinks on exit, but **not** on a crash or `SIGKILL`, and `verify_after_backup` (default `true`) decrypts a full archive back out to a second temp dir on **every** run. The engine applies **no ACL** on these paths (`_secure_file` is never called on them, and on a server-DB store — the deployed posture — it applies no file ACL at all), so the cover is the operator's: FDE on the temp volume plus `TMP`/`TMPDIR` pointed at a directory the OS restricts to the service account ([§10](#10-secure-deployment--operations-checklist)) |
 | `users.totp_secret` | no window by design — it lives and dies with the user row |

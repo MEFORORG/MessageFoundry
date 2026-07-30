@@ -24,6 +24,12 @@ The **guarded** form is fine and stays::
 
 — it is a no-op once the table is gone. That distinction is structural, not stylistic, which is why this
 scanner reads the loop body rather than grepping for the word ``outbox``.
+
+**The two source-level retirement guards at the bottom live here for the same reason.** They assert
+things about `_SCHEMA` and about the engine package that need no database, and the live migration
+suite (`tests/test_sqlserver_legacy_outbox_migration.py`) carries a MODULE-level
+``skipif(not MEFOR_TEST_SQLSERVER)``. Leaving them there would have gated a pure source check behind a
+running SQL Server — the same "runs on a leg that may not exist" trap this module was built to avoid.
 """
 
 from __future__ import annotations
@@ -32,6 +38,8 @@ import ast
 import pathlib
 
 import pytest
+
+from messagefoundry.store import Stage
 
 _TESTS = pathlib.Path(__file__).resolve().parent
 
@@ -95,17 +103,6 @@ def _scanned_files() -> list[pathlib.Path]:
     return sorted(p for p in _TESTS.glob("test_*.py") if p.name not in _NOT_RESET_LISTS)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "EXPECTED RED until the legacy SQL Server `outbox` table is retired. 21 unguarded reset sites "
-        "across 18 files still name it, and they are CORRECT today — the table exists. This guard "
-        "lands FIRST, before the retirement, so the retirement cannot ship half-done; its failure list "
-        "is the work list. strict=True makes this self-clearing: the moment the last reset list is "
-        "fixed the test XPASSes, which strict turns into a FAILURE, forcing this marker to be removed "
-        "in the same commit. A non-strict xfail would let the guard rot silently green forever."
-    ),
-)
 def test_no_fixture_issues_an_unguarded_outbox_delete() -> None:
     """After the legacy table is retired, an unguarded reset is a module-wide failure.
 
@@ -113,8 +110,10 @@ def test_no_fixture_issues_an_unguarded_outbox_delete() -> None:
     leg naming the file and line, which is the only place it can be caught for the nine files that run
     on no SQL Server CI step.
 
-    NOTE this test is expected to FAIL until Commit 6 updates the reset lists. That is deliberate and is
-    the point of landing the guard first: the failure list below IS the work list.
+    This test shipped one commit ahead of the retirement carrying `xfail(strict=True)`, with the 21
+    offending sites as its failure list. `strict` is what made that self-clearing: fixing the last reset
+    list turned the xfail into an XPASS, which strict reports as a FAILURE, so the marker could not be
+    left behind to rot silently green — removing it here was forced, not remembered.
     """
     scanned = _scanned_files()
     # Liveness receipt: report what was EXAMINED, not just what was found. A glob that silently matched
@@ -178,3 +177,101 @@ def test_every_exemption_still_exists_and_still_needs_exempting(exempt: str) -> 
         f"{exempt} no longer mentions 'outbox' — the exemption is stale and should be removed, "
         f"otherwise a genuine reset list landing in this file later would be silently skipped"
     )
+
+
+def test_the_migration_ships_in_the_schema_batch_not_open_path_code() -> None:
+    """No database needed. `_schema_hash()` alone decides whether the DDL batch runs at all, so a
+    migration outside `_SCHEMA` is invisible to that decision and would never fire on an upgrade.
+
+    Mutation: move the statement into an open-path method — reds here, on the plain leg, rather than
+    silently never running against a real customer upgrade.
+    """
+    from messagefoundry.store.sqlserver import _SCHEMA
+
+    migrations = [s for s in _SCHEMA if "DROP TABLE outbox" in s]
+    assert len(migrations) == 1, (
+        f"expected exactly one outbox migrate-and-drop statement in _SCHEMA, found {len(migrations)}"
+    )
+    stmt = migrations[0]
+    assert "IF OBJECT_ID('outbox','U') IS NOT NULL" in stmt, (
+        "the migration is not existence-guarded"
+    )
+    assert "INSERT INTO queue" in stmt, "the statement drops the table without migrating its rows"
+    assert f"'{Stage.OUTBOUND.value}'" in stmt, "migrated rows must land at the outbound stage"
+    assert "EXISTS (SELECT 1 FROM messages" in stmt, "the FK orphan filter is gone"
+    assert "NOT EXISTS (SELECT 1 FROM queue" in stmt, "the PK anti-join is gone"
+
+    # Placement matters as much as presence: SQL Server defers name resolution, so a statement placed
+    # before `queue` exists would parse and then fail at RUN time on a legacy DB.
+    queue_ddl = [i for i, s in enumerate(_SCHEMA) if "CREATE TABLE queue" in s]
+    assert len(queue_ddl) == 1, "could not locate the queue DDL to check migration ordering"
+    assert _SCHEMA.index(stmt) > queue_ddl[0], (
+        "the migration runs BEFORE `queue` is created; on a legacy DB old enough to lack `queue` that "
+        "is a failed open inside the batch's single transaction — a startup crash-loop"
+    )
+
+
+#: The ONLY engine modules allowed to name the retired table, and how many SQL references each may
+#: carry. A migration must obviously still address the table it is migrating away, so a flat ban would
+#: be unsatisfiable — but "some references are fine" is how a stray read hides forever. Pinning the
+#: COUNT is what keeps the carve-out honest: a new `FROM outbox` anywhere in these files moves the
+#: number and reds, even though the file is exempt from the ban itself.
+_MIGRATION_MODULES = {
+    # POSIX keys, matched against a POSIX-normalised path below. Native separators would key on
+    # backslashes and MISS on the ubuntu leg, reporting both migrations as stray — a guard that is red
+    # on one OS and green on another, which is worse than no guard.
+    "store/store.py": (2, "_migrate_outbox_to_queue — the SQLite fold-into-queue + DROP"),
+    "store/sqlserver.py": (1, "the _SCHEMA migrate-and-drop statement (ASVS 14.2.7)"),
+}
+
+
+def test_only_the_two_migrations_still_reference_the_retired_table() -> None:
+    """No database needed. Anywhere else, a surviving read/write is *Invalid object name* at runtime.
+
+    The keyed encrypt pass is covered separately and structurally by
+    `tests/test_sqlserver_encrypt_pass_tables.py`; this is the broad sweep for everything else.
+
+    Mutation: add a `SELECT ... FROM outbox` to any engine module — reds naming the file and line. Add
+    one to a MIGRATION module — still reds, on the pinned count, which is the case a plain
+    file-exemption list would have missed.
+    """
+    import pathlib
+    import re
+
+    root = pathlib.Path(__file__).resolve().parents[1] / "messagefoundry"
+    files = sorted(root.rglob("*.py"))
+    # Liveness receipt: report what was EXAMINED. A glob matching nothing would pass vacuously.
+    assert len(files) > 40, (
+        f"liveness: only {len(files)} engine modules scanned — the glob is broken"
+    )
+
+    # Statements that would actually touch the table. `outbox_id`, `outbox_for`, `outbox_by_status`
+    # and friends are API/method names, not the table, so the pattern is anchored on SQL keywords.
+    sql = re.compile(r"\b(FROM|INTO|UPDATE|TABLE|JOIN)\s+outbox\b", re.I)
+    stray: list[str] = []
+    counts: dict[str, int] = {}
+    for path in files:
+        rel = path.relative_to(root).as_posix()
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if not sql.search(line) or "DROP TABLE outbox" in line:
+                continue
+            if rel in _MIGRATION_MODULES:
+                counts[rel] = counts.get(rel, 0) + 1
+                continue
+            stray.append(f"  {rel}:{lineno}: {line.strip()[:100]}")
+
+    assert not stray, (
+        f"scanned {len(files)} engine modules; these still address the retired `outbox` table "
+        f"outside a migration:\n" + "\n".join(stray)
+    )
+    for rel, (expected, reason) in _MIGRATION_MODULES.items():
+        got = counts.get(rel, 0)
+        assert got == expected, (
+            f"{rel} carries {got} SQL references to `outbox`, expected {expected} ({reason}). "
+            f"More means a new one crept into a module exempt from the ban; fewer means the migration "
+            f"itself was removed or rewritten — in which case a legacy store never gets folded in and "
+            f"its PHI bodies stay unpurgeable, which is the whole point of the retirement."
+        )
+        assert "DROP TABLE outbox" in (root / rel).read_text(encoding="utf-8"), (
+            f"{rel} is exempted as a MIGRATION but no longer DROPs the table — the exemption is stale"
+        )

@@ -1180,7 +1180,6 @@ async def _reset_store(env: Mapping[str, str]) -> None:
             cur = await conn.cursor()
             for table in (
                 "queue",
-                "outbox",
                 "response",
                 "delivered_keys",
                 "state",
