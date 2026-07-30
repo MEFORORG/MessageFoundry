@@ -23,6 +23,7 @@ module — that would make the suite depend on the network and on a mutable serv
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -154,6 +155,36 @@ def test_it_reuses_the_shared_resolver_rather_than_a_second_copy() -> None:
     assert "from tests._workflow_contexts import" in src, (
         "the reachability check no longer imports the shared resolver — it has grown a second "
         "context->workflow mapping, which will drift from tests/_workflow_contexts.py"
+    )
+
+
+def test_the_script_imports_without_pytest_installed() -> None:
+    """The CI job installs the SCANNER lock, not the test toolchain — so pytest is absent there.
+
+    This is the regression that broke PR #76's first run. ``tests/_workflow_contexts`` did
+    ``import pytest`` at module scope (only to reach ``importorskip("yaml")``), so the script died on
+    ``ModuleNotFoundError: No module named 'pytest'`` in CI while passing locally, where a dev venv has
+    pytest. A pure environment difference — exactly the class this repo keeps getting bitten by.
+
+    Asserted by importing in a SUBPROCESS and checking ``pytest`` never entered ``sys.modules``. Testing
+    it in-process would be meaningless: pytest is, by definition, already imported when this runs.
+    """
+    probe = (
+        "import sys; "
+        "sys.path.insert(0, r'" + str(_ROOT) + "'); "
+        "import tests._workflow_contexts as m; "
+        "assert m.required_contexts(), 'resolver returned no contexts'; "
+        "print('PYTEST_IMPORTED' if 'pytest' in sys.modules else 'CLEAN')"
+    )
+    out = subprocess.run(  # noqa: S603 - fixed argv, no shell
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=120
+    )
+    assert out.returncode == 0, f"importing the resolver failed:\n{out.stderr}"
+    assert "CLEAN" in out.stdout, (
+        "importing tests/_workflow_contexts pulled in pytest. The CI job for "
+        "scripts/ci/check_required_workflow_state.py installs only ci/locks/ci-scanners.lock, so a "
+        "pytest import there is a hard failure. Import yaml directly and fall back to importorskip "
+        f"only when it is absent.\nstdout: {out.stdout}\nstderr: {out.stderr}"
     )
 
 
