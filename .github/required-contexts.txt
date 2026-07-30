@@ -44,12 +44,27 @@
 # it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
 
 # --- ci.yml ---------------------------------------------------------------------------------------
-# NOTE: `CI gate` is NOT in this list. It was removed from branch protection on 2026-07-29 and the
-# reason is not recorded here -- this file states what the server enforces, not why. It matters,
-# because that roll-up is what gated ci.yml's CONDITIONAL/matrix legs (ci.yml, job `ci-gate`,
-# `if: always()` over its `needs:`). The three `test` legs below are required in their own right and
-# are unaffected; what no longer gates a merge is everything the roll-up covered beyond them. If the
-# removal was incidental, restoring it is one POST to the contexts endpoint plus a line here.
+# `CI gate` (ci.yml, job `ci-gate`) is a ROLL-UP, not a test. It is `if: always()` over six legs that
+# are PATH-GATED or nightly -- sqlserver-store, postgres-store, load-test, load-test-sqlserver,
+# windows-service-smoke, changes -- and fails if any of them failed or was cancelled.
+#
+# Requiring the roll-up is the only way to gate those six. They cannot be required directly: a
+# path-gated job does not report on a PR that touches none of its paths, which is the
+# required-but-absent trap and would wedge every such PR forever. The roll-up always reports, so it is
+# safe to require -- verified on a run where all six legs SKIPPED and `CI gate` still returned success.
+#
+# It matters because those six cover exactly what the three `test` legs SKIP: the store suites skip
+# unless a leg supplies the database. Without the roll-up required, a PR touching the SQL Server or
+# Postgres store, the load path, or the Windows service could merge with those legs red and nothing on
+# the merge path would notice.
+#
+# Removed from protection 2026-07-29 (reason unrecorded) and RESTORED 2026-07-30 after checking its
+# record: 18 success / 2 failure over 20 runs, and neither failure would have blocked a PR --
+#   * one was a `schedule` (nightly) run whose sqlserver load-test legs failed: not a PR context;
+#   * one was a superseded re-push where every job was CANCELLED. `CI gate` fails on `cancelled` by
+#     design, but branch protection gates on the LATEST head SHA, so a cancelled old run does not
+#     block the current head (see ci.yml's concurrency note).
+CI gate
 test (ubuntu-latest, py3.14)
 test (windows-2022, py3.14)
 test (windows-2025, py3.14)
