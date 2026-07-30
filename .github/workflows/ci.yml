@@ -426,7 +426,7 @@ jobs:
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
           # and run ONLY on the server-DB legs, so a file not matched here edits with NO real SS/PG
           # coverage (it merely skips the gated leg). Keep this in sync with those steps
-          # (docs/throughput-build-plan.md).
+          # (docs/archive/throughput/throughput-build-plan.md).
           # The transports/ + config/wiring arms are the CAPTURE SURFACE: capture_response / reingress_to
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
@@ -676,7 +676,7 @@ jobs:
         # reliability-core invariant tests — crash-replay, poison-bound, and the per-lane-FIFO locked-head-
         # BLOCKS (#285) gate — that are MEFOR_TEST_SQLSERVER-gated but live in their OWN files, so the named
         # suites above never picked them up and they ran only on SQLite. Run them here against the real
-        # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
+        # backend. APPEND each new lever's test file per docs/archive/throughput/throughput-build-plan.md.
         #
         # NOT only throughput levers: this step is the catch-all for ANY MEFOR_TEST_SQLSERVER-gated file
         # the named suites above do not collect. CI runs an explicit file LIST here, not the whole suite,
@@ -823,7 +823,7 @@ jobs:
           MEFOR_ALLOW_INSECURE_TLS: "1"
         # The throughput levers' MEFOR_TEST_POSTGRES-gated invariants (esp. the FOR-UPDATE no-SKIP-LOCKED
         # locked-head-BLOCKS twin of #285, and the batch FIFO/crash tests) live in their own files. APPEND
-        # each new lever's test file per docs/throughput-build-plan.md.
+        # each new lever's test file per docs/archive/throughput/throughput-build-plan.md.
         run: >-
           pytest -v
           tests/test_inline_fast_path.py
