@@ -66,7 +66,29 @@ if ($root) {
             $peers = @()
             # A SessionStart hook must never fail loudly: whatever this prints IS the chat's starting
             # context, so a throw here would replace the coordination banner with a stack trace.
-            try { $peers = @(& $presence -Json | ConvertFrom-Json) } catch { $peers = @() }
+            # BUT IT MUST NOT FAIL SILENTLY EITHER. A failed roster and an empty roster used to render
+            # IDENTICALLY -- the block simply disappeared -- so a session read "nobody else is here"
+            # off a broken dependency. That is the same absence-of-evidence-as-evidence-of-absence
+            # this repo keeps being bitten by, on the one banner that exists to prevent collisions.
+            # NOT just a try/catch: a script that writes nothing and exits non-zero throws NOTHING
+            # through `&`, so the catch alone would still leave the roster silently empty. The output
+            # is checked for having happened at all, which is the only shape that covers both.
+            $rosterError = ''
+            $raw = ''
+            try { $raw = ((& $presence -Json) | Out-String).Trim() }
+            catch { $rosterError = $_.Exception.Message }
+            if (-not $rosterError) {
+                if (-not $raw) { $rosterError = 'presence.ps1 produced no output' }
+                else {
+                    try { $peers = @($raw | ConvertFrom-Json) }
+                    catch { $peers = @(); $rosterError = 'presence.ps1 output could not be parsed' }
+                }
+            }
+            if ($rosterError) {
+                $lines += ""
+                $lines += "PEER ROSTER UNAVAILABLE -- who else is in this repo could NOT be determined ($rosterError)."
+                $lines += "  Do not read this as 'nobody else is here'. Check by hand: pwsh -NoProfile -File scripts\coord\presence.ps1"
+            }
 
             $others = @($peers | Where-Object { -not $_.IsSelf })
             if ($others.Count -gt 0) {

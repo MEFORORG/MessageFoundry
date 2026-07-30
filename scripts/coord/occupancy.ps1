@@ -77,10 +77,17 @@
 # The liveness fence, shared with presence.ps1 and sessions.ps1. (footprint.ps1 dot-sources it too;
 # PowerShell re-sourcing is idempotent, and the shared ConvertTo-Norm comes from it.)
 . "$PSScriptRoot\session-registry.ps1"
-# The write-footprint source, used only under -IncludeFootprints.
-. "$PSScriptRoot\footprint.ps1"
-# Declared occupancy (a human said so), used only under -IncludePins.
-. "$PSScriptRoot\pin.ps1"
+#
+# footprint.ps1 AND pin.ps1 ARE LOADED LAZILY, INSIDE THE OPT-IN BRANCHES BELOW, AND THAT IS A SAFETY
+# PROPERTY RATHER THAN A COST ONE. This file is dot-sourced by presence.ps1, which runs in the
+# SessionStart hook -- so sourcing them here put both on the hook path unconditionally. Measured: with
+# a parse error in footprint.ps1, presence.ps1 exited 1 with no JSON, session-context.ps1 caught it
+# into an empty peer list, and the SessionStart banner rendered IDENTICALLY minus the roster. A
+# session read "nobody else is here" from a dependency it does not use -- the same absence-of-evidence
+# failure this whole line of work exists to remove, relocated onto the coordination banner. Loading
+# them where they are used means a scanner that will not even parse takes down only the source that
+# needed it, which becomes an unavailable fence, which refuses. Scripts that call INTO them directly
+# (worktree-pin.ps1, new.ps1) dot-source them themselves.
 
 # States that must VETO a destructive action: the session is live, or we could not tell that it isn't.
 # DEAD/STALE are deliberately absent -- they are not a veto, and they are not permission either.
@@ -303,22 +310,28 @@ function Get-WorktreeOccupancy {
     $fp = $null
     if ($IncludeFootprints) {
         try {
+            # Loaded here, not at file scope -- see the note at the top. A dot-source inside a function
+            # defines into the function's scope, which is exactly the reach this call needs.
+            . "$PSScriptRoot\footprint.ps1"
             $fp = Get-WorktreeFootprints -Worktrees $worktrees -ConfigRoot $ConfigRoot `
                 -WindowHours $FootprintHours -StartSkewMinutes $StartSkewMinutes
         }
         catch {
-            # An exception in the scanner is "could not look", never "nobody is here".
+            # An exception in the scanner -- including one thrown while LOADING it -- is "could not
+            # look", never "nobody is here".
             $fp = [pscustomobject]@{
                 Available = $false
                 Detail = "the write-footprint scan threw: $($_.Exception.GetType().Name)"
                 Note = ''; WindowHours = $FootprintHours
                 RootsExamined = 0; RootsWithCorpus = 0
-                TranscriptsFound = 0; TranscriptsInWindow = 0; TranscriptsWithNeedle = 0
-                BytesScanned = [long]0; LinesScanned = 0; LinesParsed = 0; PathBlocksExamined = 0
+                TranscriptsFound = 0; TranscriptsInWindow = 0; TranscriptsVanished = 0; TranscriptsWithNeedle = 0
+                BytesScanned = [long]0; LinesScanned = 0; LinesParsed = 0; LinesUnparseableElsewhere = 0
+                PathToolBlocks = 0; PathBlocksExamined = 0; ToolNamesSeen = @()
+                WriteToolsAllowList = @(); WriteToolNamesSeen = @()
                 WritesExamined = 0; WritesOutsideWindow = 0; WritesUndated = 0
                 WritesPlaced = 0; WritesUnplaced = 0
                 PlacedByPrefix = 0; PlacedByGitdir = 0; GitdirProbes = 0; GitdirUnresolvable = 0
-                SidechainFiles = 0; SidechainLines = 0; SidechainPathBlocks = 0
+                SidechainFiles = 0; SidechainLines = 0; SidechainPathToolBlocks = 0; SidechainPathBlocks = 0
                 CrossTreeWrites = 0; Faults = @(); Footprints = @()
             }
         }
@@ -333,13 +346,16 @@ function Get-WorktreeOccupancy {
     # The only source that can see a writer who is not a Claude tool call at all.
     $pins = $null
     if ($IncludePins) {
-        try { $pins = Get-WorktreePins -Worktrees $worktrees -Repo $Repo }
+        try {
+            . "$PSScriptRoot\pin.ps1"
+            $pins = Get-WorktreePins -Worktrees $worktrees -Repo $Repo
+        }
         catch {
             $pins = [pscustomobject]@{
                 Available = $false
                 Detail = "the pin store read threw: $($_.Exception.GetType().Name)"
                 Note = ''; Dir = ''
-                PinsExamined = 0; PinsUnreadable = 0; PinsExpired = 0; PinsUnplaceable = 0
+                PinsExamined = 0; PinsUnreadable = 0; PinsExpired = 0; PinsGone = 0; PinsUnplaceable = 0
                 Faults = @(); Pins = @()
             }
         }
