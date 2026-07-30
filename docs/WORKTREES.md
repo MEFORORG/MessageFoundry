@@ -97,15 +97,29 @@ Occupancy is checked by four independent signals, and **any one of them vetoes**
    Every pin **expires** — a pin with no expiry turns the first forgotten one into a permanent
    refusal, and `-Name` cannot override it either.
 
-All four are re-read **immediately before each removal**, not just when the table was built — a gh
-round trip per candidate plus every prior removal is a real window, and it is the window the incident
-description blames.
+All four are re-read in full **before each removal**, per candidate — not once for the loop. That
+distinction was itself a defect: the re-read sat above the removal loop, so signals 1, 3 and 4 were
+frozen at the moment the first removal began and only signal 2, the crude 36 h metadata guess, was
+refreshed per candidate. A live session's write landing in the *second* candidate during the removal
+of the first was invisible, and the directory was destroyed. It costs a corpus scan per candidate
+(~9 s on this repo); that is the right trade for a tool whose failure mode is destroying somebody
+else's work.
 
 ```
 scripts\worktree\worktree-pin.ps1 -Take -Reason "hand-editing in VS Code"   # this worktree, 12h
 scripts\worktree\worktree-pin.ps1 -List
 scripts\worktree\worktree-pin.ps1 -Release <file>
+scripts\worktree\worktree-pin.ps1 -Release -Worktree ..\repo-pins   # when you never saw the file name
 ```
+
+`remove.ps1` **releases** a worktree's pins when it removes it, and the reader ignores an unexpired pin
+whose path is no longer on disk. Both halves are needed: nothing released the birth pin, so a
+`new.ps1` / 20 minutes of work / `remove.ps1` cycle left a live pin naming a directory that no longer
+existed — which made the **entire** fence unavailable for the rest of the 6 h, for every session, with
+no override flag and a message naming a path the operator could not find. A directory that is not
+there cannot be occupied under any spelling, so ignoring it cannot hide a veto; a path that **does**
+exist and places nowhere is still a fault, because it could be this repo spelled a way the matcher
+does not recognise.
 
 `new.ps1` takes a **6h birth pin** on every worktree it creates. That window is the most exposed one
 there is: a worktree created a second ago has zero commits, so it is "an ancestor of `origin/main`"
@@ -145,10 +159,23 @@ signal 1 placed a session inside **0 of the 4** siblings that existed. Signal 2,
 touched `.git` in the last 36h", was the only thing standing between a live session and this script,
 and `-Name` can turn it off.
 
-Measured again after signal 3 landed, same repo, 5 candidates: **signal 1 = 1 of 5, signal 3 = 4 of 5**.
-The three it adds include two worktrees that a session which was **live at that moment** had written
-144 times between them from a cwd of the primary — one of them merged, clean, and 22 hours from being
-pruned unattended.
+Measured again after signal 3 landed, same repo, 7 candidates: **signal 1 = 1 of 7, signal 3 = 6 of 7**.
+The five it adds include three worktrees that a session which was **live at that moment** had written
+257 times between them from a cwd of the primary, and one being written into from a checkout of an
+entirely different repository.
+
+**What that number is, and what it is not.** It is a *placement* count and it reads like a protection
+delta, so state the difference. At the default windows, every candidate signal 3 covered had also had
+its git metadata touched more recently than its last tool-call write — so signal 3's veto set was a
+strict **subset** of signal 2's, and an unattended default-flag run behaved identically before and
+after. That is a fact about one afternoon, not a structural one (a session that edits files without
+running a git command is seen by signal 3 and not by signal 2), but the measured value of signal 3
+today is concentrated where signal 2 is **off or narrowed**: `-Name`, a reduced `-IdleHours`, and the
+per-candidate re-check during `-Apply`. Two further honesty notes on the same measurement: three of
+the six vetoes came from the session that built this, so the figure is not independent of the
+measurer; and `master-test-plan`, the one candidate signal 3 cannot see, is not untouched — 121
+transcripts mention it and 263 `Read` calls target paths inside it. What is true is that **no write
+tool call has ever targeted it**, which is the honest and stronger claim.
 
 Two bugs found doing that measurement are worth recording, because both were guards that could not
 fire while every counter looked healthy. `git worktree list` reports paths with **forward slashes**

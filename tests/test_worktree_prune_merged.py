@@ -351,11 +351,15 @@ def _argv(
     return args + list(extra)
 
 
-def _env_with(path_prepend: Path | None) -> dict[str, str] | None:
-    if path_prepend is None:
+def _env_with(
+    path_prepend: Path | None, env_extra: dict[str, str] | None = None
+) -> dict[str, str] | None:
+    if path_prepend is None and not env_extra:
         return None
     env = dict(os.environ)
-    env["PATH"] = f"{path_prepend}{os.pathsep}{env.get('PATH', '')}"
+    if path_prepend is not None:
+        env["PATH"] = f"{path_prepend}{os.pathsep}{env.get('PATH', '')}"
+    env.update(env_extra or {})
     return env
 
 
@@ -367,12 +371,15 @@ def run(
     skip_fetch: bool = True,
     path_prepend: Path | None = None,
     script: Path | None = None,
+    env_extra: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Invoke the real script with -Json and parse its receipt.
 
     ``config_root=""`` means the fixture's own root; ``None`` omits the flag entirely.
     ``path_prepend`` puts a shim directory ahead of the real tools, for the gh/git probes.
     ``script`` points at a MUTATED copy of the script tree, for the anti-vacuity suite.
+    ``env_extra`` redirects the environment -- USERPROFILE, for the tests that must exercise config
+    root DISCOVERY rather than an explicit ``-ConfigRoot`` (which bypasses it entirely).
     """
     proc = subprocess.run(
         _argv(
@@ -388,7 +395,7 @@ def run(
         text=True,
         timeout=300,
         check=False,
-        env=_env_with(path_prepend),
+        env=_env_with(path_prepend, env_extra),
     )
     assert proc.stdout.strip(), f"no JSON on stdout (exit {proc.returncode}): {proc.stderr}"
     out: dict[str, Any] = json.loads(proc.stdout)
@@ -1934,12 +1941,7 @@ def test_a_negative_footprint_window_is_refused(fx: Fixture, sleeper: int) -> No
 # --- Placement: git's spelling, not ours ---------------------------------------------------------
 
 
-def test_a_write_through_a_junction_is_placed_by_gitdir(fx: Fixture, sleeper: int) -> None:
-    """The literal prefix match is a string compare, so an equivalent spelling places nowhere.
-
-    A junction is the cheap reproduction of the UNC / 8.3 / ``subst`` family. Walking up to ``.git``
-    and reading where it points answers in git's own spelling instead of ours.
-    """
+def _junction(fx: Fixture) -> Path:
     link = fx.root / "linked"
     made = subprocess.run(
         ["cmd", "/c", "mklink", "/J", str(link), str(fx.primary.parent)],
@@ -1949,22 +1951,87 @@ def test_a_write_through_a_junction_is_placed_by_gitdir(fx: Fixture, sleeper: in
     )
     if made.returncode != 0 or not link.exists():  # pragma: no cover - policy dependent
         pytest.skip(f"could not create a junction here: {made.stdout}{made.stderr}")
+    return link
+
+
+def test_a_write_through_a_junction_is_placed_by_gitdir(fx: Fixture, sleeper: int) -> None:
+    """The literal prefix match is a string compare, so an equivalent spelling places nowhere.
+
+    A junction is the cheap reproduction of the UNC / 8.3 / ``subst`` family. Walking up to ``.git``
+    and reading where it points answers in git's own spelling instead of ours.
+
+    THE ``cwd`` HERE IS LOAD-BEARING AND USED TO BE WRONG. It was the primary, and ``write_transcript``
+    stamps the cwd onto every line -- so the line carried a worktree path of this repo as a literal
+    substring for a reason that had nothing to do with the junction, and survived the needle funnel
+    that used to run BEFORE placement. With the cwd moved outside the family the line contains no
+    needle at all, which is the configuration the .git fallback exists for: re-running the old test
+    with this one-word change failed on its own assertion (``placedByGitdir == 1`` -> ``0 == 1``).
+    ``transcriptsWithNeedle == 0`` is asserted below so it can never silently drift back.
+    """
+    link = _junction(fx)
+    outside = fx.root / "outside"
+    outside.mkdir(exist_ok=True)
 
     _quiesce(fx, "clean", "gone")
-    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_session(pid=sleeper, cwd=outside, session_id=SID_WRITER)
     fx.write_transcript(
         session_id=SID_WRITER,
-        cwd=fx.primary,
+        cwd=outside,  # <- NOT the primary: the line must carry no path of this repo family
         writes=[link / fx.sibling("clean").name / "x.py"],
     )
     res = run(fx, "-Apply")
     fp = res["fence"]["footprint"]
+    assert fp["transcriptsWithNeedle"] == 0, (
+        "the transcript must mention no worktree of this repo, or the junction is not what placed it"
+    )
     assert fp["placedByPrefix"] == 0, "the string compare must genuinely have failed"
     assert fp["placedByGitdir"] == 1
     assert fp["gitdirProbes"] > 0
     d = by_leaf(res, "clean")
     assert d["Outcome"] != "removed"
     assert "write footprint" in d["Reason"]
+    assert by_leaf(res, "gone")["Outcome"] == "removed", "positive control"
+
+
+def test_mutant_restoring_the_needle_funnel_hides_the_junction_write(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """The funnel that made the .git fallback unreachable, put back, on the same fixture.
+
+    The pre-filter tested every LINE for a worktree path as a literal substring before anything was
+    placed -- so the only spellings the fallback exists for were dropped before it could run. Measured
+    on the real script: a registered LIVE session writing into a candidate through a junction gave
+    ``Available=true``, zero faults, ``writesExamined=0`` AND ``writesUnplaced=0`` (invisible to every
+    counter), and ``-Apply`` destroyed the directory.
+    """
+    link = _junction(fx)
+    outside = fx.root / "outside"
+    outside.mkdir(exist_ok=True)
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=outside, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=outside, writes=[link / fx.sibling("clean").name / "x.py"]
+    )
+    assert run(fx)["fence"]["vetoedByFootprint"] == 1, "control: the shipped scanner sees it"
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            '        $all = $txt.Split("`n")',
+            '        if (-not $family) { continue }\n        $all = $txt.Split("`n")',
+        ),
+    )
+    bad = run(fx, "-Apply", script=mutated)
+    fp = bad["fence"]["footprint"]
+    assert fp["available"] is True and not fp["faults"], (
+        "the funnel is SILENT -- that is the defect"
+    )
+    assert fp["writesExamined"] == 0 and fp["writesUnplaced"] == 0, "invisible to every counter"
+    assert bad["fence"]["vetoedByFootprint"] == 0
+    assert by_leaf(bad, "clean")["Outcome"] == "removed", (
+        "with the funnel back, a live session's worktree is destroyed -- the mutant must KILL"
+    )
 
 
 def test_the_gitdir_fallback_is_actually_reached(fx: Fixture, sleeper: int) -> None:
@@ -2322,18 +2389,28 @@ def test_a_pin_with_no_expiry_is_a_fault_not_an_eternal_veto(fx: Fixture, sleepe
 def test_a_stale_pin_for_a_removed_worktree_heals_instead_of_bricking(
     fx: Fixture, sleeper: int
 ) -> None:
-    """An unexpired pin naming no worktree is a fault -- it could be this repo, spelled differently.
+    """An unexpired pin naming a path that EXISTS and is no worktree is a fault -- it could be this
+    repo, spelled a way the matcher does not recognise.
 
     An EXPIRED one is not, or a pin outliving the worktree it named would refuse every run for ever
     and the only fix would be for somebody to find and delete a file they have never heard of.
+
+    THE FIXTURE USED TO NAME A DIRECTORY THAT DID NOT EXIST for the fault half, and that conflated the
+    two cases: an unexpired pin on a path that is not on disk at all is what a BIRTH PIN becomes the
+    second its worktree is removed, and treating it as a fault took the whole fence down for hours
+    (see ``test_a_pin_whose_worktree_is_GONE_does_not_brick_the_fence``). Nothing can occupy a
+    directory that is not there, under any spelling, so only an existing path can hide a veto -- which
+    is what this now pins down, both halves in one run.
     """
     _quiesce(fx, "clean", "gone")
     fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
     import datetime
 
     d = _pin_dir(fx)
+    exists_but_not_a_worktree = fx.root / "long-gone-worktree"
+    exists_but_not_a_worktree.mkdir(exist_ok=True)
     stale = {
-        "path": str(fx.root / "long-gone-worktree"),
+        "path": str(exists_but_not_a_worktree),
         "reason": "x",
         "expiresAt": (
             datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
@@ -2342,6 +2419,7 @@ def test_a_stale_pin_for_a_removed_worktree_heals_instead_of_bricking(
     (d / "stale.json").write_text(json.dumps(stale), encoding="utf-8")
     ok = run(fx)
     assert ok["fence"]["pins"]["available"] is True
+    assert ok["fence"]["pins"]["expired"] == 1
     assert ok["fence"]["pins"]["unplaceable"] == 0
 
     live = dict(stale)
@@ -2352,6 +2430,9 @@ def test_a_stale_pin_for_a_removed_worktree_heals_instead_of_bricking(
     bad = run(fx, "-Apply")
     assert bad["_exit"] == 2
     assert bad["fence"]["pins"]["unplaceable"] == 1
+    assert bad["fence"]["pins"]["gone"] == 0, (
+        "the path exists, so this is not the self-healing case"
+    )
     assert bad["counts"]["removed"] == 0
 
 
@@ -2488,3 +2569,611 @@ def test_a_footprint_source_that_throws_refuses_instead_of_crashing(
     assert "threw" in res["fence"]["footprint"]["detail"]
     assert res["counts"]["removed"] == 0
     assert fx.sibling("clean").exists()
+
+
+# --------------------------------------------------------------------------------------------------
+# The adversarial round: four independent reviews drove the scanner and the pruner against the real
+# corpus and found holes that every green test above walked straight past. Each test here reproduces
+# one, and each carries either a positive control or a mutation that puts the hole back.
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_occupancy_fence_is_re_read_for_EVERY_removal_not_once_for_the_loop(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """A session that arrives DURING the first removal must still stop the second one.
+
+    The re-read used to sit above the ``foreach``, so signals 1, 3 and 4 were frozen at the moment the
+    first removal began and only signal 2 -- the crude 36 h metadata heuristic -- was refreshed per
+    candidate. That inverts the branch's own arithmetic: signal 3 is the one with measured coverage,
+    and it was the stale one for candidates 2..N. Signal 2 cannot cover this, because writing a
+    transcript touches no git metadata.
+
+    The git shim fires on the FIRST ``worktree remove`` and plants the footprint, so the arrival lands
+    strictly between ``repo-clean``'s removal and ``repo-gone``'s. The positive control is the same
+    footprint present BEFORE the run starts, in a separate invocation.
+    """
+    late = "cafe0001-1111-2222-3333-444444444444"
+
+    # --- control: the identical footprint, already on disk ---
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=late)
+    fx.write_transcript(session_id=late, cwd=fx.primary, writes=[fx.sibling("gone") / "late.py"])
+    control = run(fx, "-Apply")
+    assert by_leaf(control, "gone")["Outcome"] != "removed", "control: it vetoes when it is there"
+    assert control["fence"]["vetoedByFootprint"] == 1
+
+    # --- the race: the same footprint, written mid-run by the removal of the FIRST candidate ---
+    fx2 = _build(tmp_path / "race")
+    _backdate(fx2.primary, fx2.sibling("clean"), 500)
+    _backdate(fx2.primary, fx2.sibling("gone"), 500)
+    fx2.write_session(pid=sleeper, cwd=fx2.primary, session_id=late)
+
+    planter = tmp_path / "plant.py"
+    planter.write_text(
+        "import json, os, pathlib, time\n"
+        f"base = pathlib.Path(r{str(fx2.cfg)!r}) / 'projects' / 'proj' / {late!r} / 'subagents'\n"
+        "base.mkdir(parents=True, exist_ok=True)\n"
+        "f = base / 'agent-late.jsonl'\n"
+        "when = time.time() - 60\n"
+        "stamp = time.strftime('%Y-%m-%dT%H:%M:%S', time.gmtime(when)) + '.000Z'\n"
+        f"target = str(pathlib.Path(r{str(fx2.sibling('gone'))!r}) / 'late.py')\n"
+        "rec = {'type': 'assistant', 'isSidechain': True, 'sessionId': " + repr(late) + ",\n"
+        f"       'cwd': r{str(fx2.primary)!r}, 'timestamp': stamp,\n"
+        "       'message': {'role': 'assistant', 'content': [\n"
+        "           {'type': 'tool_use', 'id': 't1', 'name': 'Write',\n"
+        "            'input': {'file_path': target}}]}}\n"
+        "f.write_text(json.dumps(rec) + '\\n', encoding='utf-8')\n"
+        "os.utime(f, (when, when))\n",
+        encoding="utf-8",
+    )
+
+    d = _shim_dir(tmp_path)
+    real = shutil.which("git")
+    assert real, "git must be on PATH"
+    mark = d / "fired"
+    (d / "git.ps1").write_text(
+        f"$mark = '{mark}'\n"
+        "if (($args -contains 'worktree') -and ($args -contains 'remove') -and "
+        "-not (Test-Path -LiteralPath $mark)) {\n"
+        "  Set-Content -LiteralPath $mark -Value '1'\n"
+        f"  & '{sys.executable}' '{planter}' | Out-Null\n"
+        "}\n"
+        f"& '{real}' @args\n"
+        "exit $LASTEXITCODE\n",
+        encoding="utf-8",
+    )
+
+    res = run(fx2, "-Apply", path_prepend=d)
+    assert mark.exists(), "the shim never fired -- this test would prove nothing"
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "the first removal must happen"
+    assert by_leaf(res, "gone")["Outcome"] != "removed", (
+        "a live session's write landed in repo-gone during removal #1 and it was destroyed anyway"
+    )
+    assert "footprint" in json.dumps(by_leaf(res, "gone")["Occupants"])
+    assert fx2.sibling("gone").exists()
+
+
+def test_a_write_tool_RENAME_is_a_fault_not_a_silent_zero(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """Canary 4, and the hole every other canary is structurally unable to see.
+
+    Canaries 1-3 are denominated on PATH-BEARING blocks, which stay perfectly healthy through a rename
+    of the write TOOL NAMES. Measured on the real repo with ``Write``/``Edit`` renamed in the
+    allow-list: ``vetoedByFootprint`` 5 -> 0, ``available`` still true, ``faults`` empty, ``note``
+    empty, ``pathBlocksExamined`` UP by three -- and ``MessageFoundry-pins``, with a LIVE session that
+    had written into it 61 times from another checkout, went from SKIP to PRUNE.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    good = run(fx, "-Apply")
+    assert good["fence"]["vetoedByFootprint"] == 1, "control"
+    assert good["fence"]["footprint"]["writeToolNamesSeen"] == ["Edit"]
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            "$script:FootprintWriteTools = @('Write', 'Edit', 'MultiEdit', 'NotebookEdit')",
+            "$script:FootprintWriteTools = @('WriteFile', 'EditFile')",
+        ),
+    )
+    bad = run(fx, "-Apply", script=mutated)
+    fp = bad["fence"]["footprint"]
+    assert fp["writesExamined"] == 0, "the rename really did take extraction to zero"
+    assert fp["pathBlocksExamined"] > 0, "...while the other canaries' denominator stayed healthy"
+    assert fp["available"] is False, "canary 4 did not fire on a vocabulary that no longer matches"
+    assert any("tool vocabulary has moved" in x for x in fp["faults"])
+    assert bad["_exit"] == 2
+    assert bad["counts"]["removed"] == 0
+    assert fx.sibling("clean").exists()
+
+
+def test_a_shell_only_window_does_not_brick_the_pruner(fx: Fixture, sleeper: int) -> None:
+    """Canary 1 must fire on a MOVED KEY, never on a window that simply ran no path tools.
+
+    Its denominator used to be "transcripts mentioning this repo", so a 36 h window whose only in-repo
+    tool calls were shell or search commands -- a monitoring loop, a CI babysit, a git-only session --
+    refused every prune, for up to 36 h, with no override flag, and told the operator to go looking for
+    a vendor schema change that had not happened. Denominating on tools that carry a path BY
+    DEFINITION is the same detection without the false positive.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    # A Bash block naming the repo: it carries `command`, never a path key.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        tool="Bash",
+        path_key="command",
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["transcriptsWithNeedle"] >= 1, "the repo IS named, or this proves nothing"
+    assert fp["pathToolBlocks"] == 0, "no tool that must carry a path was called"
+    assert fp["pathBlocksExamined"] == 0
+    assert fp["available"] is True, "a shell-only window is not a schema change"
+    assert fp["faults"] == []
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+
+def test_an_unrelated_project_subagent_does_not_brick_the_pruner(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """Canary 2's numerator was repo-scoped and its denominator machine-wide.
+
+    ``SidechainFiles`` counted every in-window subagent transcript on the host; ``SidechainLines``
+    counted only lines that survived the repo needle funnel. So one subagent run in ANY other project,
+    with no MessageFoundry subagent write in the same window, refused every prune for up to 36 h and
+    blamed a vendor schema change. Measured on this host: 122 of 475 in-window subagent transcripts
+    already belong to other projects.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    outside = fx.root / "another-repo"
+    outside.mkdir(exist_ok=True)
+    # A subagent in a DIFFERENT project, writing somewhere else entirely.
+    fx.write_transcript(
+        session_id="deadbeef-0000",
+        cwd=outside,
+        writes=[outside / "z.py"],
+        project="some-other-project",
+        sidechain=True,
+    )
+    # ...and an ordinary parent-session touch of THIS repo in the same window, which is what makes the
+    # old numerator/denominator mismatch bite: work another project with subagents, touch this one from
+    # the main session only. ``repo-gone`` absorbs it so ``repo-clean`` stays the positive control.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        sidechain=False,
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["sidechainFiles"] >= 1
+    assert fp["sidechainLines"] >= 1, (
+        "its lines must be parsed, or the two sides are not comparable"
+    )
+    assert fp["available"] is True and fp["faults"] == []
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+    # And the funnel, put back: the same corpus now refuses, blaming a marker that never moved.
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            '        $all = $txt.Split("`n")',
+            '        if (-not $family) { continue }\n        $all = $txt.Split("`n")',
+        ),
+    )
+    bad = run(fx, "-Apply", script=mutated)
+    assert bad["fence"]["footprint"]["available"] is False
+    assert any("subagent marker has moved" in x for x in bad["fence"]["footprint"]["faults"])
+
+
+def test_a_tail_torn_BEFORE_the_path_still_refuses(fx: Fixture, sleeper: int) -> None:
+    """A torn tail was a fault only if the tear landed AFTER the path bytes.
+
+    The path sits deep inside the line, so a tear before it is the MORE likely one -- and it produced
+    ``available=true, faults=0`` plus a Note positively asserting that nothing in the window mentioned
+    this repo. Relevance is now decided per FILE, not per tail.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        # Cut before "tool_use" AND before any path: neither the old marker gate nor the old needle
+        # gate would have looked at this line.
+        raw_tail='{"type":"assistant","message":{"content":[{"ty',
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["available"] is False, "a half-written final line is a session writing RIGHT NOW"
+    assert any("half-written" in x for x in fp["faults"])
+    assert res["_exit"] == 2
+    assert res["counts"]["removed"] == 0
+
+
+def test_a_torn_tail_in_an_UNRELATED_transcript_is_counted_not_refused(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The other half of the same rule, and the reason it is scoped rather than absolute.
+
+    The scan is machine-wide, so faulting on any unparseable line anywhere would refuse every run for
+    as long as ANY session on the host is mid-append. A fence nobody can use is a fence that gets
+    bypassed. ``repo-clean`` coming back removed is the positive control.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    outside = fx.root / "another-repo"
+    outside.mkdir(exist_ok=True)
+    fx.write_transcript(
+        session_id="deadbeef-0000",
+        cwd=outside,
+        writes=[outside / "z.py"],
+        project="some-other-project",
+        raw_tail='{"type":"assistant","message":{"content":[{"ty',
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["linesUnparseableElsewhere"] >= 1, "it must be COUNTED, not silently dropped"
+    assert fp["available"] is True and fp["faults"] == []
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "positive control"
+
+
+def test_a_corpus_root_without_a_session_registry_is_still_scanned(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """The corpus was discovered by a predicate about a directory it does not read.
+
+    ``Get-ClaudeConfigRoots`` admitted a root only if it held ``sessions``; footprint.ps1 reads
+    ``projects``. A root with a full corpus and no session registry -- an account swap mid-flight, and
+    this machine carries a ``.claude-swap-backup`` -- was dropped BEFORE ``RootsExamined`` counted it,
+    so the receipt reported a healthy scan over a corpus that had vanished.
+    """
+    home = tmp_path / "home"
+    (home / ".claude" / "sessions").mkdir(parents=True)
+    (home / ".claude" / "sessions" / f"{sleeper}.json").write_text(
+        json.dumps(
+            {
+                "pid": sleeper,
+                "sessionId": SID_WRITER,
+                "cwd": str(fx.primary),
+                "startedAt": int(time.time() * 1000),
+                "entrypoint": "claude-desktop",
+                "kind": "interactive",
+            }
+        ),
+        encoding="utf-8",
+    )
+    # The corpus lives in a SECOND root that has no sessions/ at all.
+    corpus = Fixture(fx.root)
+    corpus.cfg = home / ".claude-corpus"
+    (corpus.cfg / "projects").mkdir(parents=True)
+    _quiesce(fx, "clean", "gone")
+    corpus.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"] * 2
+    )
+
+    env = {"USERPROFILE": str(home)}
+    res = run(fx, "-Apply", config_root=None, env_extra=env)
+    fp = res["fence"]["footprint"]
+    assert fp["rootsExamined"] == 2, "the sessions-less root must be COUNTED, not silently dropped"
+    assert fp["rootsWithCorpus"] == 1
+    assert fp["transcriptsFound"] == 1
+    assert res["fence"]["vetoedByFootprint"] == 1
+    assert by_leaf(res, "clean")["Outcome"] != "removed"
+    assert by_leaf(res, "gone")["Outcome"] == "removed", "positive control"
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            "-MustContain @('sessions', 'projects')",
+            "-MustContain @('sessions')",
+        ),
+    )
+    bad = run(fx, "-Apply", config_root=None, env_extra=env, script=mutated)
+    bfp = bad["fence"]["footprint"]
+    assert bfp["rootsExamined"] == 1 and bfp["transcriptsFound"] == 0
+    assert bfp["available"] is True and bfp["faults"] == [], (
+        "the loss is SILENT -- that is the defect"
+    )
+    assert by_leaf(bad, "clean")["Outcome"] == "removed", "the mutant must KILL"
+
+
+def test_a_pin_whose_worktree_is_GONE_does_not_brick_the_fence(fx: Fixture, sleeper: int) -> None:
+    """new.ps1 takes a 6 h birth pin and nothing released it.
+
+    So ``new.ps1 -Name x`` / 20 minutes of work / ``remove.ps1 -Name x`` left an UNEXPIRED pin naming
+    a directory that no longer existed, which made the ENTIRE fence unavailable for the rest of the
+    6 h, for every session, with no override flag and a message naming a path the operator could not
+    find. A directory that is not there cannot be occupied under any spelling, so ignoring it cannot
+    hide a veto. The positive control is the next test: a path that DOES exist still faults.
+    """
+    import datetime
+
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    ghost = _pin_dir(fx) / "repo-born.999.deadbeef.json"
+    ghost.write_text(
+        json.dumps(
+            {
+                "path": str(fx.sibling("never-existed")),
+                "reason": "created by new.ps1",
+                "by": "new.ps1",
+                "pid": 999,
+                "at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "expiresAt": (
+                    datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=6)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = run(fx, "-Apply")
+    ps = res["fence"]["pins"]
+    assert ps["gone"] == 1, "it must be counted, not merely tolerated"
+    assert ps["unplaceable"] == 0
+    assert ps["available"] is True and res["fence"]["available"] is True
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+
+def test_a_pin_on_a_path_that_EXISTS_and_is_no_worktree_still_refuses(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The positive control for the test above, and the case that must stay fail-closed.
+
+    A directory that exists but places nowhere could be this repo's worktree under a spelling the
+    matcher does not recognise -- and that is a missed veto, not a stale pin.
+    """
+    import datetime
+
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    real_dir = fx.root / "a-real-directory"
+    real_dir.mkdir(exist_ok=True)
+    (_pin_dir(fx) / "odd.998.beefdead.json").write_text(
+        json.dumps(
+            {
+                "path": str(real_dir),
+                "reason": "hand-editing",
+                "by": "someone",
+                "pid": 998,
+                "at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "expiresAt": (
+                    datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=6)
+                ).isoformat(),
+            }
+        ),
+        encoding="utf-8",
+    )
+    res = run(fx, "-Apply")
+    assert res["fence"]["pins"]["unplaceable"] == 1
+    assert res["fence"]["pins"]["gone"] == 0
+    assert res["fence"]["available"] is False
+    assert res["_exit"] == 2
+    assert res["counts"]["removed"] == 0
+
+
+def test_removing_a_worktree_releases_its_pins(fx: Fixture) -> None:
+    """The other half of the birth-pin fix: the store must not only ever grow.
+
+    ``Remove-WorktreePins`` is driven for real here; ``remove.ps1`` resolves its repo from
+    ``$PSScriptRoot`` and cannot be pointed at a fixture, so its wiring is asserted at source level --
+    with the best-effort contract asserted too, since a pin that will not delete must never fail a
+    removal that already happened.
+    """
+    kept = _write_pin(fx, "gone")
+    doomed = _write_pin(fx, "clean")
+    out = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{SCRIPT.parent.parent / 'coord' / 'pin.ps1'}'; "
+            f"Remove-WorktreePins -Path '{fx.sibling('clean')}' -PinDir '{_pin_dir(fx)}'",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.strip() == "1"
+    assert not doomed.exists()
+    assert kept.exists(), "only the named worktree's pins may go"
+
+    text = (SCRIPT.parent / "remove.ps1").read_text(encoding="utf-8")
+    assert "Remove-WorktreePins" in text
+    assert "pin.ps1" in text
+    block = text.split("Remove-WorktreePins", 1)[1]
+    assert "catch" in block, "releasing a pin must never fail a removal that already happened"
+
+
+def test_a_narrowed_footprint_window_is_declared(fx: Fixture, sleeper: int) -> None:
+    """``-FootprintHours`` shipped with the exact hole ``-IdleHours`` was already burned by.
+
+    ``-IdleHours 0.5``, typed for "half an hour", released every worktree on this repo and printed no
+    warning at all; that is why a 12 h floor and a red banner exist for it. The new knob had neither,
+    and the ``-Name`` banner in the same run asserted "signals 1 and 3 still apply" while signal 3 had
+    been disarmed by the same command line.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    res = run(fx, "-FootprintHours", "0.5", "-Name", "clean")
+    ra = " | ".join(res["fence"]["reducedAssurance"])
+    assert "footprint window NARROWED to 0.5 h" in ra
+    assert "signal 3 is NARROWED to 0.5 h" in ra, "the -Name banner must not claim signal 3 applies"
+    assert "signals 1 and 3 still apply" not in ra
+
+    off = run(fx, "-FootprintHours", "0")
+    assert any("signal 3 is OFF" in x for x in off["fence"]["reducedAssurance"])
+
+
+def test_the_SessionStart_roster_does_not_depend_on_the_corpus_scanner() -> None:
+    """The old guard scanned three files for the dot-source and missed the only one that had it.
+
+    ``presence.ps1`` dot-sources ``occupancy.ps1``, which dot-sourced ``footprint.ps1`` and ``pin.ps1``
+    UNCONDITIONALLY -- so both sat on the SessionStart hook path. Measured with a parse error planted
+    in ``footprint.ps1``: presence.ps1 exited 1 with no JSON, ``session-context.ps1`` caught it into an
+    empty peer list, and the banner rendered identically minus the roster. Asserted at RUNTIME, because
+    the source-level version of this test passed while the property was false.
+    """
+    coord = SCRIPT.parent.parent / "coord"
+    probe = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            f". '{coord / 'presence.ps1'}' -Json 2>&1 | Out-Null; "
+            "[pscustomobject]@{ "
+            "  fp = [bool](Get-Command Get-WorktreeFootprints -EA SilentlyContinue); "
+            "  pin = [bool](Get-Command New-WorktreePin -EA SilentlyContinue); "
+            "  occ = [bool](Get-Command Get-WorktreeOccupancy -EA SilentlyContinue) "
+            "} | ConvertTo-Json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    got = json.loads(probe.stdout)
+    assert got["occ"] is True, "still the same matcher, or this proves nothing"
+    assert got["fp"] is False, "the corpus scanner reached the SessionStart hook path"
+    assert got["pin"] is False, "the pin store reached the SessionStart hook path"
+
+    # And the file-level rule the runtime check enforces, including the file the old guard skipped.
+    for name in ("overlap.ps1", "session-registry.ps1", "presence.ps1", "occupancy.ps1"):
+        text = (coord / name).read_text(encoding="utf-8")
+        for dep in ('footprint.ps1"', 'pin.ps1"'):
+            # A dot-source at column 0 is file scope; one inside a function is not.
+            top_level = [ln for ln in text.splitlines() if ln.startswith(". ") and dep in ln]
+            assert not top_level, f"{name} loads {dep} at file scope, which is a hook path"
+
+
+def test_a_broken_roster_does_not_silently_empty_the_coordination_banner(tmp_path: Path) -> None:
+    """A failed roster and an empty roster used to render IDENTICALLY: the block just disappeared.
+
+    So a session read "nobody else is here" off a dependency it does not use -- absence of evidence as
+    evidence of absence, on the one banner that exists to prevent collisions. Driven for real against
+    a copied tree whose ``presence.ps1`` fails, in both shapes: a THROW and a silent non-zero exit.
+    The second is the one a try/catch alone does not cover, because nothing propagates through ``&``.
+    """
+    for label, stub in (
+        ("throw", "throw 'synthetic roster failure'\n"),
+        ("silent exit", "exit 1\n"),
+    ):
+        dst = tmp_path / f"tree-{label.replace(' ', '-')}"
+        shutil.copytree(SCRIPT.parent.parent, dst / "scripts")
+        (dst / "scripts" / "coord" / "presence.ps1").write_text(stub, encoding="utf-8")
+        out = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(dst / "scripts" / "worktree" / "session-context.ps1"),
+            ],
+            capture_output=True,
+            text=True,
+            cwd=str(SCRIPT.parent.parent.parent),
+            check=False,
+        )
+        assert "PEER ROSTER UNAVAILABLE" in out.stdout, (
+            f"a {label} in presence.ps1 emptied the roster silently: {out.stdout[-600:]}"
+        )
+        assert "Do not read this as 'nobody else is here'" in out.stdout
+        assert "This chat's worktree" in out.stdout, "the rest of the banner must still render"
+
+    # And the control: the real presence.ps1 renders no such marker.
+    ok = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(SCRIPT.parent / "session-context.ps1"),
+        ],
+        capture_output=True,
+        text=True,
+        cwd=str(SCRIPT.parent.parent.parent),
+        check=False,
+    )
+    assert "PEER ROSTER UNAVAILABLE" not in ok.stdout
+
+
+def test_a_transcript_that_cannot_be_stat_ed_would_be_silently_dropped(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The one guard here I could NOT kill, recorded as such rather than claimed as covered.
+
+    ``File.GetLastWriteTime`` does not throw on a missing file -- it returns the 1601 epoch, which is
+    older than any cut, so a transcript that moved or was deleted between the (lazy) enumeration and
+    the stat was ``continue``d out of the window with ``Available`` still true and no fault.
+    ``sessions.ps1 -Rehome`` MOVES transcripts as normal operation, so the window is real.
+
+    What is asserted here is (a) the primitive that makes the guard REACHABLE on this runtime and
+    (b) that the counter is on the receipt, so an operator would see it if it ever fired. What is NOT
+    asserted is the guard firing end to end: three constructions were tried and none reproduces it --
+    an extended-length name that non-extended APIs cannot resolve (.NET resolves it), a dangling
+    symlink (``File.Exists`` returns true and the link's own mtime comes back), and deleting a file
+    mid-enumeration (not deterministic at 13,700 files scanned in ~9 s). A guard that cannot be killed
+    is a guard that is not really tested, and saying so is the point of this test existing.
+    """
+    probe = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            "$p = 'C:\\definitely\\no\\such\\file.jsonl'; "
+            "[pscustomobject]@{ year = [System.IO.File]::GetLastWriteTime($p).Year; "
+            "exists = [System.IO.File]::Exists($p) } | ConvertTo-Json",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    got = json.loads(probe.stdout)
+    assert got["year"] < 1800, "the sentinel this guard keys on is gone; re-derive the condition"
+    assert got["exists"] is False
+
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    fp = run(fx)["fence"]["footprint"]
+    assert fp["transcriptsVanished"] == 0
+    assert fp["transcriptsFound"] == 1, "and it counted the one that IS there"
+
+
+def test_the_receipt_names_the_write_vocabulary_it_was_looking_for(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Canary 4 fires only when the intersection is EMPTY, so a PARTIAL rename leaves it green.
+
+    That residual is real and cannot be closed by inference, so the vocabulary is made legible instead:
+    the allow-list, what was actually seen against it, and every distinct tool name observed.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"], tool="Write"
+    )
+    res = run(fx)
+    fp = res["fence"]["footprint"]
+    assert fp["writeToolsAllowList"] == ["Write", "Edit", "MultiEdit", "NotebookEdit"]
+    assert fp["writeToolNamesSeen"] == ["Write"], "seen != allowed, and the gap must be visible"
+    assert "Write" in fp["toolNamesSeen"]
+    text = run_text(fx).stdout
+    assert "write tools recognised: Write of Write/Edit/MultiEdit/NotebookEdit" in text
