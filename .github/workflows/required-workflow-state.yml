@@ -1,0 +1,58 @@
+name: Required workflow state
+
+# Every REQUIRED status check must belong to a workflow GitHub will actually run.
+#
+# THE DEFECT THIS EXISTS FOR — measured on the sibling vault repo (wshallwshall/MessageFoundry),
+# 2026-07-30: 10 required contexts whose workflows were ALL `disabled_manually`. A disabled workflow
+# never dispatches, so those contexts never reported — NO pull request could merge, and every merge
+# there had silently been riding admin bypass. Nobody noticed, because the symptom presents as "CI is
+# stuck", not as "branch protection is misconfigured".
+#
+# `tests/test_required_contexts.py` cannot see this: a disabled workflow keeps its file and job name on
+# disk, so resolving a context against YAML passes in the healthy AND the broken case. Workflow `state`
+# is server-side, so this has to be an API check.
+#
+# SCHEDULED, not per-PR, deliberately. A workflow disabled AFTER the last pull request is invisible to
+# any per-PR check — there is no PR to run it on. The failure arrives while the repo is idle, which is
+# exactly when nobody is looking.
+#
+# It checks REACHABILITY (can the context ever report?), not outcome. Whether a check passes is CI's
+# job; whether it is capable of running at all is this one's.
+on:
+  schedule:
+    # 07:00 UTC — an hour after the nightly CI cron, so a workflow disabled overnight is reported the
+    # same morning rather than a day later.
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+  # Also on a PR that edits the required set or the workflows it points at: this is the one moment a
+  # human is actively changing the mapping, and a typo'd context is cheapest to catch right then.
+  pull_request:
+    paths:
+      - ".github/required-contexts.txt"
+      - ".github/workflows/**"
+
+permissions:
+  contents: read
+
+jobs:
+  reachable:
+    name: required contexts belong to active workflows
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      actions: read # read workflow `state`; NOT the admin scope branch protection would need
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Install PyYAML (the resolver parses the workflow files)
+        run: |
+          # Hash-pinned from the CI toolchain lock, like every other scanner install (ADR 0034 §3).
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+      - name: Reconcile required contexts against workflow state
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/check_required_workflow_state.py --repo "$GITHUB_REPOSITORY"

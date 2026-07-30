@@ -22,13 +22,25 @@ import re
 from pathlib import Path
 from typing import Any
 
-import pytest
+# PyYAML stays OPTIONAL (as tests/test_lint_scope_parity.py treats it), and the skip lives HERE rather
+# than in each importing test module: done there it would sit before the
+# `from tests._workflow_contexts import ...` line and every caller would need an E402 dance.
+#
+# Import yaml DIRECTLY first, and only fall back to pytest's importorskip when it is genuinely absent.
+# This module is no longer test-only — scripts/ci/check_required_workflow_state.py imports the same
+# resolver so there is ONE context->workflow mapping rather than two that drift. An unconditional
+# `import pytest` at module scope made that impossible: the CI job installs the scanner lock, not the
+# test toolchain, so the script died on `ModuleNotFoundError: No module named 'pytest'` while passing
+# locally, where a dev venv has pytest. Measured on PR #76.
+#
+# Behaviour under pytest is unchanged: with PyYAML present the try succeeds (pytest is never imported
+# here); with it absent the importorskip still turns the whole importing module into a SKIP.
+try:
+    import yaml
+except ModuleNotFoundError:  # pragma: no cover - exercised only on a venv without PyYAML
+    import pytest
 
-# The importorskip lives HERE rather than in each importing test module. Done there, it would be a
-# statement before the `from tests._workflow_contexts import ...` line and every caller would need an
-# E402 dance; done here, both suites keep ordinary top-of-file imports and PyYAML stays optional
-# exactly as tests/test_lint_scope_parity.py treats it.
-yaml = pytest.importorskip("yaml")
+    yaml = pytest.importorskip("yaml")
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOWS = ROOT / ".github" / "workflows"
