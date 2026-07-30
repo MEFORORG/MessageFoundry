@@ -40,12 +40,15 @@
     host, so nothing here can prove a session is GONE. Occupancy may therefore only ever VETO an
     action; a DEAD/STALE/absent verdict must never by itself authorise one.
 
-    TWO SOURCES, COMPOSED. -IncludeFootprints adds a SECOND source with its own receipt and its own
-    rows: footprint.ps1, which reads where each session has actually WRITTEN rather than where it was
-    launched. Availability is ANDed (either source failing to look refuses the whole run) and vetoes are
-    ORed (either source seeing somebody stops the removal); reasons only ever append. Each source keeps
-    its OWN examined/found counters, so nobody can read coverage from one as coverage from the other --
-    the specific way a two-signal fence quietly collapses into one.
+    THREE SOURCES, COMPOSED. Each is opt-in, has its own receipt, and tags its own rows:
+      * the recorded cwd (this file) -- where a session was LAUNCHED;
+      * -IncludeFootprints (footprint.ps1) -- where a session has actually WRITTEN;
+      * -IncludePins (pin.ps1) -- where a HUMAN has declared they are working, which is the only one
+        that can see a writer who is not a Claude tool call at all.
+    Availability is ANDed (any source failing to look refuses the whole run) and vetoes are ORed (any
+    source seeing somebody stops the removal); reasons only ever append. Each source keeps its OWN
+    examined/found counters, so nobody can read coverage from one as coverage from another -- the
+    specific way a multi-signal fence quietly collapses into one.
 
     WHAT THE CWD SOURCE CANNOT SEE -- state this wherever it is consumed:
       * A session that writes into a worktree BY ABSOLUTE PATH from somewhere else. Records carry the
@@ -76,13 +79,17 @@
 . "$PSScriptRoot\session-registry.ps1"
 # The write-footprint source, used only under -IncludeFootprints.
 . "$PSScriptRoot\footprint.ps1"
+# Declared occupancy (a human said so), used only under -IncludePins.
+. "$PSScriptRoot\pin.ps1"
 
 # States that must VETO a destructive action: the session is live, or we could not tell that it isn't.
 # DEAD/STALE are deliberately absent -- they are not a veto, and they are not permission either.
 # UNREGISTERED is only ever produced by the footprint source (a session that wrote here and has no
 # registry record); it vetoes for the same reason UNREADABLE does -- the fence could not be evaluated,
-# and an unevaluated fence is not a passed fence.
-$script:OccupancyVetoStates = @('LIVE', 'UNVERIFIED', 'UNREADABLE', 'UNREGISTERED')
+# and an unevaluated fence is not a passed fence. PINNED comes from the pin source and is a
+# DECLARATION rather than a liveness verdict -- kept as its own state so a reader cannot mistake a
+# human saying "I am working here" for a process that was fenced.
+$script:OccupancyVetoStates = @('LIVE', 'UNVERIFIED', 'UNREADABLE', 'UNREGISTERED', 'PINNED')
 
 function Test-OccupancyVeto {
     [CmdletBinding()]
@@ -163,7 +170,9 @@ function Get-WorktreeOccupancy {
         # each session sitting", and one of them runs in a SessionStart hook where a corpus scan is
         # both the wrong question and the wrong cost. Anything DESTRUCTIVE must pass it.
         [switch]$IncludeFootprints,
-        [double]$FootprintHours = 36
+        [double]$FootprintHours = 36,
+        # Add declared occupancy (pin.ps1). Off by default for the same reason as above.
+        [switch]$IncludePins
     )
 
     $worktrees = @(Get-RepoWorktrees $Repo)
@@ -174,6 +183,7 @@ function Get-WorktreeOccupancy {
             RootsExamined = 0; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = @(); PrimaryPath = ''; Sessions = @()
             FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $null
+            PinsIncluded = [bool]$IncludePins; PinSet = $null
         }
     }
 
@@ -199,6 +209,7 @@ function Get-WorktreeOccupancy {
             RootsExamined = $roots.Count; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @()
             FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $null
+            PinsIncluded = [bool]$IncludePins; PinSet = $null
         }
     }
     $records = @($all | Where-Object { -not $_.Unreadable })
@@ -318,6 +329,27 @@ function Get-WorktreeOccupancy {
         }
     }
 
+    # --- Source 3: declared occupancy -------------------------------------------------------------
+    # The only source that can see a writer who is not a Claude tool call at all.
+    $pins = $null
+    if ($IncludePins) {
+        try { $pins = Get-WorktreePins -Worktrees $worktrees -Repo $Repo }
+        catch {
+            $pins = [pscustomobject]@{
+                Available = $false
+                Detail = "the pin store read threw: $($_.Exception.GetType().Name)"
+                Note = ''; Dir = ''
+                PinsExamined = 0; PinsUnreadable = 0; PinsExpired = 0; PinsUnplaceable = 0
+                Faults = @(); Pins = @()
+            }
+        }
+        $sessions += @($pins.Pins)
+        if (-not $pins.Available) {
+            $available = $false
+            $detail = if ($detail) { "$detail; pin source: $($pins.Detail)" } else { "pin source: $($pins.Detail)" }
+        }
+    }
+
     return [pscustomobject]@{
         RepoFound = $true; Available = $available; Detail = $detail
         RootsExamined = $roots.Count; RecordsExamined = $records.Count
@@ -325,6 +357,7 @@ function Get-WorktreeOccupancy {
         UnplaceableFiles = @($faults | ForEach-Object { "$($_.File) -- $($_.Why)" })
         Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @($sessions)
         FootprintsIncluded = [bool]$IncludeFootprints; Footprint = $fp
+        PinsIncluded = [bool]$IncludePins; PinSet = $pins
     }
 }
 

@@ -77,7 +77,7 @@ the directory, leaving a folder git no longer recognised, so every subsequent gi
 session failed. The bias is therefore fixed: **a false SKIP is a minor annoyance, a false PRUNE
 destroys a session.** Anything the script cannot answer confidently, it SKIPs.
 
-Occupancy is checked by three independent signals, and **any one of them vetoes**:
+Occupancy is checked by four independent signals, and **any one of them vetoes**:
 
 1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
@@ -89,10 +89,30 @@ Occupancy is checked by three independent signals, and **any one of them vetoes*
    [`scripts/coord/footprint.ps1`](../scripts/coord/footprint.ps1). It reads Claude Code's own
    transcripts and places a session by where it actually **wrote**, which is the question signal 1 was
    never able to answer. Like signal 1 it can only veto, and `-Name` cannot override it.
+4. **An operator pin** — [`scripts/coord/pin.ps1`](../scripts/coord/pin.ps1), taken with
+   [`scripts/worktree/worktree-pin.ps1`](../scripts/worktree/worktree-pin.ps1). The only signal that
+   sees a writer who is **not a Claude tool call at all**: a human in an editor, an autosave, a plain
+   terminal, a build still writing after the command that started it returned. None of those leave a
+   registry record or a transcript, ever, so the only way to fence them is for somebody to say so.
+   Every pin **expires** — a pin with no expiry turns the first forgotten one into a permanent
+   refusal, and `-Name` cannot override it either.
 
-All three are re-read **immediately before each removal**, not just when the table was built — a gh
+All four are re-read **immediately before each removal**, not just when the table was built — a gh
 round trip per candidate plus every prior removal is a real window, and it is the window the incident
 description blames.
+
+```
+scripts\worktree\worktree-pin.ps1 -Take -Reason "hand-editing in VS Code"   # this worktree, 12h
+scripts\worktree\worktree-pin.ps1 -List
+scripts\worktree\worktree-pin.ps1 -Release <file>
+```
+
+`new.ps1` takes a **6h birth pin** on every worktree it creates. That window is the most exposed one
+there is: a worktree created a second ago has zero commits, so it is "an ancestor of `origin/main`"
+and perfectly clean — the exact state that got one destroyed — and it has no transcript history and
+no session registered in it yet, so signals 1 and 3 are both empty and signal 2 is the only cover
+left, which `-Name` turns off. The pin is best-effort: a failure taking it never blocks worktree
+creation.
 
 **Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
 can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
@@ -138,10 +158,11 @@ backslashes in git's output was a no-op and the only spelling that matters had n
 threw on every call and, with the throw swallowed, reported zero probes while looking like it ran.
 Both now have a self-check that turns the regression into a refusal.
 
-What no signal sees, printed on every run: a write by anything that is not a Claude tool call (an
-editor, an autosave, a plain terminal, a process still running after its tool call returned); a file
-written **by** a shell command (the transcript records the command string, not a resolved path list);
-a session that never registered *and* never wrote through a tool call. A cwd recorded as a UNC or 8.3
+What no signal sees **automatically**, printed on every run: a write by anything that is not a Claude
+tool call (an editor, an autosave, a plain terminal, a process still running after its tool call
+returned) — signal 4 exists precisely for that case, but somebody has to take the pin; a file written
+**by** a shell command (the transcript records the command string, not a resolved path list); a
+session that never registered *and* never wrote through a tool call. A cwd recorded as a UNC or 8.3
 short path still defeats signal 1's string compare, but signal 3 resolves through `.git` and does not
 share that blind spot.
 

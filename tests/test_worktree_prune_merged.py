@@ -2210,6 +2210,264 @@ def test_nothing_on_the_hook_path_touches_the_footprint_scan() -> None:
             assert "footprint" not in f.read_text(encoding="utf-8").lower()
 
 
+# --------------------------------------------------------------------------------------------------
+# Signal 4: the operator pin -- the only cover for a writer that is not a Claude tool call
+# --------------------------------------------------------------------------------------------------
+
+PIN_CLI = SCRIPT.parent / "worktree-pin.ps1"
+
+
+def _pin_dir(fx: Fixture) -> Path:
+    common = subprocess.run(
+        ["git", "-C", str(fx.primary), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    d = Path(common) / "worktree-pins"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def _write_pin(fx: Fixture, slug: str, *, hours: float = 12, reason: str = "hand-editing") -> Path:
+    """Write a pin directly, so the reader is under test rather than the CLI."""
+    import datetime
+
+    exp = datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=hours)
+    f = _pin_dir(fx) / f"{slug}.{os.getpid()}.{abs(hash((slug, hours))) % 10**8:08x}.json"
+    f.write_text(
+        json.dumps(
+            {
+                "path": str(fx.sibling(slug)),
+                "reason": reason,
+                "by": "an-operator",
+                "pid": os.getpid(),
+                "at": datetime.datetime.now(datetime.UTC).isoformat(),
+                "expiresAt": exp.isoformat().replace("+00:00", "Z"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    return f
+
+
+def test_a_pin_vetoes_a_worktree_no_other_signal_can_see(fx: Fixture, sleeper: int) -> None:
+    """A human editing in an editor leaves no registry record and no transcript. This is the cover.
+
+    ``repo-gone`` is the positive control in the same invocation.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    _write_pin(fx, "clean", reason="hand-editing in VS Code")
+
+    res = run(fx, "-Apply")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP"
+    assert d["Outcome"] != "removed"
+    assert "operator pin" in d["Reason"]
+    assert res["fence"]["vetoedByPin"] == 1
+    assert res["fence"]["vetoedByCwd"] == 0
+    assert res["fence"]["vetoedByFootprint"] == 0
+    assert res["fence"]["pins"]["examined"] == 1
+    assert by_leaf(res, "gone")["Outcome"] == "removed", "positive control"
+
+
+def test_name_cannot_override_a_pin(fx: Fixture, sleeper: int) -> None:
+    """Same rule as signals 1 and 3: the flag reached for when the tool refuses cannot reach it."""
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    _write_pin(fx, "clean")
+    res = run(fx, "-Apply", "-Name", "clean")
+    assert by_leaf(res, "clean")["Outcome"] != "removed"
+    assert fx.sibling("clean").exists()
+
+
+def test_an_expired_pin_does_not_veto(fx: Fixture, sleeper: int) -> None:
+    """Every pin expires, or the first forgotten one becomes a permanent refusal."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    _write_pin(fx, "clean", hours=-1)
+    res = run(fx, "-Apply")
+    assert res["fence"]["pins"]["expired"] == 1
+    assert res["fence"]["vetoedByPin"] == 0
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
+def test_an_unparseable_pin_makes_the_fence_unavailable(fx: Fixture, sleeper: int) -> None:
+    """A half-written pin is what somebody taking one right now looks like; its path is unknowable."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    (_pin_dir(fx) / "half.json").write_text('{"path": "C:\\\\so', encoding="utf-8")
+    res = run(fx, "-Apply")
+    assert res["_exit"] == 2
+    assert res["fence"]["available"] is False
+    assert res["fence"]["pins"]["available"] is False
+    assert res["fence"]["pins"]["unreadable"] == 1
+    assert res["counts"]["removed"] == 0
+    assert fx.sibling("clean").exists()
+
+
+def test_a_pin_with_no_expiry_is_a_fault_not_an_eternal_veto(fx: Fixture, sleeper: int) -> None:
+    """It cannot be aged out, so honouring it would refuse for ever and dropping it would lose a veto."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    (_pin_dir(fx) / "forever.json").write_text(
+        json.dumps({"path": str(fx.sibling("clean")), "reason": "no expiry"}), encoding="utf-8"
+    )
+    res = run(fx, "-Apply")
+    assert res["_exit"] == 2
+    assert any("never age out" in f for f in res["fence"]["pins"]["faults"])
+    assert res["counts"]["removed"] == 0
+
+
+def test_a_stale_pin_for_a_removed_worktree_heals_instead_of_bricking(
+    fx: Fixture, sleeper: int
+) -> None:
+    """An unexpired pin naming no worktree is a fault -- it could be this repo, spelled differently.
+
+    An EXPIRED one is not, or a pin outliving the worktree it named would refuse every run for ever
+    and the only fix would be for somebody to find and delete a file they have never heard of.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    import datetime
+
+    d = _pin_dir(fx)
+    stale = {
+        "path": str(fx.root / "long-gone-worktree"),
+        "reason": "x",
+        "expiresAt": (
+            datetime.datetime.now(datetime.UTC) - datetime.timedelta(hours=1)
+        ).isoformat(),
+    }
+    (d / "stale.json").write_text(json.dumps(stale), encoding="utf-8")
+    ok = run(fx)
+    assert ok["fence"]["pins"]["available"] is True
+    assert ok["fence"]["pins"]["unplaceable"] == 0
+
+    live = dict(stale)
+    live["expiresAt"] = (
+        datetime.datetime.now(datetime.UTC) + datetime.timedelta(hours=1)
+    ).isoformat()
+    (d / "live.json").write_text(json.dumps(live), encoding="utf-8")
+    bad = run(fx, "-Apply")
+    assert bad["_exit"] == 2
+    assert bad["fence"]["pins"]["unplaceable"] == 1
+    assert bad["counts"]["removed"] == 0
+
+
+def test_the_pin_cli_takes_lists_and_releases(fx: Fixture) -> None:
+    """Drive the real CLI: an operator's only way in, and a separate surface from the reader."""
+
+    def cli(*args: str) -> dict[str, Any]:
+        proc = subprocess.run(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(PIN_CLI),
+                "-Repo",
+                str(fx.primary),
+                *args,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert proc.stdout.strip(), f"exit {proc.returncode}: {proc.stderr}"
+        out: dict[str, Any] = json.loads(proc.stdout)
+        out["_exit"] = proc.returncode
+        return out
+
+    took = cli(
+        "-Take", "-Path", str(fx.sibling("clean")), "-Reason", "by hand", "-Hours", "3", "-Json"
+    )
+    assert Path(took["pin"]).exists()
+    listed = cli("-List", "-Json")
+    assert listed["available"] is True
+    assert [p["worktree"] for p in listed["pins"]] == ["repo-clean"]
+    assert listed["pins"][0]["reason"] == "by hand"
+    cli("-Release", took["pin"], "-Json")
+    assert cli("-List", "-Json")["pins"] == []
+
+
+def test_the_pin_cli_refuses_to_create_a_live_landmine(fx: Fixture) -> None:
+    """A pin on a non-worktree path is a FAULT to the reader: it would refuse every run until it expired."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(PIN_CLI),
+            "-Repo",
+            str(fx.primary),
+            "-Take",
+            "-Path",
+            str(fx.root),
+            "-Reason",
+            "oops",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+        check=False,
+    )
+    assert proc.returncode != 0
+    assert "not a registered worktree" in proc.stderr + proc.stdout
+
+
+def test_concurrent_pins_do_not_lose_each_other(fx: Fixture) -> None:
+    """One file per pin, never a read-modify-write over a shared list.
+
+    The measured failure of the naive shape was six concurrent writers leaving ONE surviving write
+    and six stray temp files -- and subagents share a process, so a pid alone is not a unique key.
+    """
+    procs = [
+        subprocess.Popen(
+            [
+                "pwsh",
+                "-NoProfile",
+                "-NonInteractive",
+                "-File",
+                str(PIN_CLI),
+                "-Repo",
+                str(fx.primary),
+                "-Take",
+                "-Path",
+                str(fx.sibling("clean")),
+                "-Reason",
+                f"writer {i}",
+                "-Json",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        for i in range(6)
+    ]
+    for p in procs:
+        assert p.wait(timeout=180) == 0
+    d = _pin_dir(fx)
+    assert len(list(d.glob("*.json"))) == 6, "a concurrent writer was lost"
+    assert list(d.glob("*.tmp")) == [], "temp files were left behind"
+
+
+def test_new_ps1_takes_a_birth_pin(fx: Fixture) -> None:
+    """A brand-new worktree is merged, clean and history-free from the second it exists.
+
+    That is exactly the state that got one destroyed, and no other signal covers it. Asserted at
+    source level: driving new.ps1 end to end would provision a venv.
+    """
+    text = (SCRIPT.parent / "new.ps1").read_text(encoding="utf-8")
+    assert "New-WorktreePin" in text
+    assert "pin.ps1" in text
+    # Best-effort, or worktree creation starts failing for a fence's benefit.
+    block = text.split("New-WorktreePin", 1)[0].rsplit("try {", 1)[1]
+    assert "catch" not in block
+    assert "could not take a birth pin" in text
+
+
 def test_a_footprint_source_that_throws_refuses_instead_of_crashing(
     fx: Fixture, sleeper: int, tmp_path: Path
 ) -> None:

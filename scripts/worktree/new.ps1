@@ -97,6 +97,21 @@ try {
     if ($gitDir) { Set-Content -LiteralPath (Join-Path $gitDir 'mefor-home-branch') -Value $Name -Encoding utf8 }
 } catch { }
 
+# A BIRTH PIN, because a worktree created a second ago is the most exposed one there is: it has zero
+# commits, so it is "an ancestor of origin/main" and perfectly clean -- the exact state prune-merged.ps1
+# once destroyed -- and it has no transcript history and no registered session in it yet either, so
+# every occupancy signal except the crude activity heuristic is empty for it, and `-Name` turns that
+# one off. Short by design: it covers the window before the tree has any history of its own, not the
+# work. Best-effort -- a failure here never blocks worktree creation.
+try {
+    . "$PSScriptRoot\..\coord\pin.ps1"
+    $bp = New-WorktreePin -Path $WorktreePath -Hours 6 -Repo $RepoRoot `
+        -Reason "created by new.ps1; covers the window before this worktree has any history of its own"
+    Write-Host "Pinned against the pruner for 6h ($(Split-Path $bp -Leaf))." -ForegroundColor DarkGray
+} catch {
+    Write-Host "NOTE: could not take a birth pin ($($_.Exception.Message)); the new worktree is fenced only by its fresh git metadata." -ForegroundColor Yellow
+}
+
 # The forbidden-content gate's token list is git-ignored, so `git worktree add` cannot deliver it and a
 # fresh worktree starts unable to commit AT ALL -- the pre-commit hook passes --require-tokens and fails
 # closed. Carry the source checkout's copy across if it has one; otherwise say so here, because the

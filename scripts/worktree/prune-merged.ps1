@@ -238,7 +238,7 @@ if ($FootprintHours -lt 0) {
 }
 
 $occ = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
-    -IncludeFootprints -FootprintHours $FootprintHours
+    -IncludeFootprints -FootprintHours $FootprintHours -IncludePins
 
 if (-not $occ.RepoFound) {
     if ($Json) { @{ error = 'not a git repository'; repoRoot = $RepoRoot; exitCode = $EXIT_REFUSED } | ConvertTo-Json -Depth 4 | Write-Output }
@@ -266,9 +266,10 @@ if ((ConvertTo-Norm $RepoRoot) -ne (ConvertTo-Norm $occ.PrimaryPath)) {
 
 $RepoRootFwd = ($RepoRoot -replace '\\', '/')
 $RepoLeaf = Split-Path $RepoRoot -Leaf
-# The write-footprint source's own receipt. Read here, before the reduced-assurance notices are
-# assembled: it was assigned further down and every notice about it evaluated against $null.
+# The extra sources' own receipts. Read here, before the reduced-assurance notices are assembled:
+# they were assigned further down and every notice about them evaluated against $null.
 $fp = $occ.Footprint
+$pinSet = $occ.PinSet
 
 # Anything that narrows what the two occupancy signals can see. Named on the run and in the JSON, so a
 # reduced fence is never mistaken for a full one.
@@ -580,13 +581,16 @@ function Get-Decision {
                         $from = if ($_.CrossTree) { " writing in from $($_.Cwd)" } else { '' }
                         "$($_.Short) [$($_.State)] $($_.Writes) write(s)$from$where"
                     }
+                    elseif ($_.Source -eq 'pin') { "$($_.Short) [PINNED] $($_.Reason)$where" }
                     else { "$($_.Short) [$($_.State)]$where" }
                 }) -join ', '
             $bySignal = @()
             $n1 = @($occupants | Where-Object { $_.Source -eq 'cwd' }).Count
             $n3 = @($occupants | Where-Object { $_.Source -eq 'footprint' }).Count
+            $n4 = @($occupants | Where-Object { $_.Source -eq 'pin' }).Count
             if ($n1) { $bySignal += "$n1 by recorded cwd" }
             if ($n3) { $bySignal += "$n3 by write footprint" }
+            if ($n4) { $bySignal += "$n4 by an operator pin" }
             $reasons += "occupied by $($occupants.Count) session(s) ($($bySignal -join ', ')): $who"
         }
     }
@@ -725,6 +729,7 @@ $fenceVetoedAtDecision = @($decisions | Where-Object { $_.Occupants.Count -gt 0 
 $fenceVetoed = $fenceVetoedAtDecision
 $cwdVetoed = Measure-SignalVetoes $decisions 'cwd'
 $footprintVetoed = Measure-SignalVetoes $decisions 'footprint'
+$pinVetoed = Measure-SignalVetoes $decisions 'pin'
 # The number an operator must see instead of a bare zero: candidates this signal had nothing to say
 # about, which is not the same claim as "nobody was there".
 $withoutFootprint = @($decisions | Where-Object { @($_.Occupants | Where-Object { $_.Source -eq 'footprint' }).Count -eq 0 }).Count
@@ -756,6 +761,12 @@ if (-not $Json) {
                 Write-Host ("    {0} of {1} candidate(s) have NO footprint at all -- for those this signal contributed nothing, which is not the same as nobody being there." -f
                     $withoutFootprint, $decisions.Count) -ForegroundColor Yellow
             }
+        }
+        if ($pinSet) {
+            Write-Host ("  Signal 4 (operator pin)    placed a declaration on {0} of {1} candidate(s); {2} pin(s) examined, {3} expired." -f
+                $pinVetoed, $decisions.Count, $pinSet.PinsExamined, $pinSet.PinsExpired) -ForegroundColor DarkCyan
+            Write-Host "    It is the only signal that sees a writer who is not a Claude tool call -- an editor, an autosave, a plain terminal." -ForegroundColor DarkGray
+            if ($pinSet.Note) { Write-Host "    $($pinSet.Note)" -ForegroundColor Yellow }
         }
     }
     else {
@@ -888,7 +899,7 @@ if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
     $occ2 = Get-WorktreeOccupancy -Repo $RepoRoot -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes `
-        -IncludeFootprints -FootprintHours $FootprintHours
+        -IncludeFootprints -FootprintHours $FootprintHours -IncludePins
     Write-Note ""
     foreach ($d in $prunable) {
         if (-not $Json) { Write-Host "Removing $($d.Leaf) [$($d.Branch)]..." -ForegroundColor Cyan }
@@ -1061,6 +1072,7 @@ $skipped = @($decisions | Where-Object { $_.Decision -eq 'SKIP' -or $_.Outcome -
 $fenceVetoed = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
 $cwdVetoed = Measure-SignalVetoes $decisions 'cwd'
 $footprintVetoed = Measure-SignalVetoes $decisions 'footprint'
+$pinVetoed = Measure-SignalVetoes $decisions 'pin'
 $withoutFootprint = @($decisions | Where-Object { @($_.Occupants | Where-Object { $_.Source -eq 'footprint' }).Count -eq 0 }).Count
 if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
     Write-Host ("  The fence vetoed {0} further candidate(s) during the removal pass (total {1} of {2}: {3} by recorded cwd, {4} by write footprint)." -f
@@ -1111,7 +1123,21 @@ if ($Json) {
             # and one of them measurably had.
             vetoedByCwd        = $cwdVetoed
             vetoedByFootprint  = $footprintVetoed
+            vetoedByPin        = $pinVetoed
             candidatesWithoutFootprint = $withoutFootprint
+            pins               = if ($null -eq $pinSet) { $null } else {
+                [pscustomobject]@{
+                    available   = [bool]$pinSet.Available
+                    detail      = [string]$pinSet.Detail
+                    note        = [string]$pinSet.Note
+                    dir         = [string]$pinSet.Dir
+                    examined    = $pinSet.PinsExamined
+                    unreadable  = $pinSet.PinsUnreadable
+                    expired     = $pinSet.PinsExpired
+                    unplaceable = $pinSet.PinsUnplaceable
+                    faults      = @($pinSet.Faults)
+                }
+            }
             blindSpots         = $blindSpots
             idleHours          = $IdleHours
             footprintHours     = $FootprintHours
