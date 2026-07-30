@@ -19,10 +19,22 @@
     ---------------------------------------------------------
     "The fence ran and nobody is here" and "the fence could not look" produce the SAME empty row set,
     so an empty list must never be read as a green light. This returns a RECEIPT alongside the rows --
-    RootsExamined / RecordsExamined -- and sets Available only when there was something to examine:
-    at least one config root holding a session registry, and at least one readable record in it. A
-    caller about to destroy something must gate on Available, print the receipt, and refuse when it is
-    false. Count what you EXAMINED, not what you found.
+    RootsExamined / RecordsExamined / RecordsUnplaceable -- and sets Available only when there was
+    something to examine: at least one config root holding a session registry, at least one readable
+    record in it, AND no record that could not be PLACED. A caller about to destroy something must gate
+    on Available, print the receipt, and refuse when it is false. Count what you EXAMINED, not what you
+    found.
+
+    AN UNPLACEABLE RECORD MAKES THE WHOLE FENCE UNAVAILABLE. Two shapes qualify -- a file that will not
+    parse, and a record that parses but carries no cwd -- and BOTH used to be dropped on the floor by a
+    silent `continue`, so they appeared in no count at all. Neither can be attributed to, or cleared
+    from, any particular worktree: it could be a session sitting in the very tree the caller is about to
+    delete. A file caught HALF-WRITTEN is exactly this shape, which makes it the signature of a session
+    that launched seconds ago. Refusing the whole run is the only answer that cannot destroy one; the
+    remedy is to look at the named file and re-run.
+
+    RecordsExamined and RecordsUnplaceable deliberately OVERLAP: the first counts what parsed, the
+    second counts what cannot be placed, and a cwd-less record is both.
 
     ONLY A POSITIVE ANSWER IS TRUSTWORTHY (see session-registry.ps1). There is no heartbeat on this
     host, so nothing here can prove a session is GONE. Occupancy may therefore only ever VETO an
@@ -112,14 +124,16 @@ function Get-RepoWorktrees([string]$RepoHint) {
 Map every session record onto the worktree it was launched in, fenced for liveness, with a receipt.
 
 Returns a pscustomobject:
-    RepoFound       [bool]   the -Repo hint resolved to a git repo at all
-    Available       [bool]   the fence had something to examine (see the header)
-    Detail          [string] why it is unavailable, '' when it is available
-    RootsExamined   [int]    config roots holding a sessions registry
-    RecordsExamined [int]    readable records across those roots
-    Worktrees       [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...)
-    PrimaryPath     [string] the trunk checkout (git reports it first)
-    Sessions        [array]  one row per record whose cwd falls inside one of those worktrees
+    RepoFound        [bool]   the -Repo hint resolved to a git repo at all
+    Available        [bool]   the fence had something to examine (see the header)
+    Detail           [string] why it is unavailable, '' when it is available
+    RootsExamined     [int]    config roots holding a sessions registry
+    RecordsExamined   [int]    records that PARSED across those roots
+    RecordsUnplaceable[int]    records that will not parse or carry no cwd -- any at all => Available false
+    UnplaceableFiles  [array]  each one's path and why, so the operator can go and look
+    Worktrees         [array]  every worktree of this .git (Path/Branch/Locked/LockReason/...)
+    PrimaryPath       [string] the trunk checkout (git reports it first)
+    Sessions          [array]  one row per record whose cwd falls inside one of those worktrees
 #>
 function Get-WorktreeOccupancy {
     [CmdletBinding()]
@@ -134,7 +148,7 @@ function Get-WorktreeOccupancy {
         return [pscustomobject]@{
             RepoFound = $false; Available = $false
             Detail = 'not inside a git repository -- nothing to scope occupancy to'
-            RootsExamined = 0; RecordsExamined = 0
+            RootsExamined = 0; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = @(); PrimaryPath = ''; Sessions = @()
         }
     }
@@ -146,19 +160,35 @@ function Get-WorktreeOccupancy {
     $primaryNorm = ConvertTo-Norm $primaryPath
 
     $roots = @()
-    $records = @()
+    $all = @()
     try {
         $roots = @(Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)
-        $records = @(Get-SessionRecords -ConfigRoot $ConfigRoot)
+        # ONE enumeration, faults included: reading the directory twice would let a record appear
+        # between the passes and be counted in neither.
+        $all = @(Get-SessionRecords -ConfigRoot $ConfigRoot -IncludeUnreadable)
     }
     catch {
         # An unreadable registry is an unavailable fence, never an empty one.
         return [pscustomobject]@{
             RepoFound = $true; Available = $false
             Detail = "session registry unreadable: $($_.Exception.Message)"
-            RootsExamined = $roots.Count; RecordsExamined = 0
+            RootsExamined = $roots.Count; RecordsExamined = 0; RecordsUnplaceable = 0; UnplaceableFiles = @()
             Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @()
         }
+    }
+    $records = @($all | Where-Object { -not $_.Unreadable })
+    # UNPLACEABLE, which is a superset of unparseable: a record that parses but carries no cwd cannot be
+    # attributed to -- or ruled out of -- any worktree either, and it used to be dropped by a bare
+    # `continue`. The two counters deliberately overlap: RecordsExamined counts what PARSED,
+    # RecordsUnplaceable counts what cannot be PLACED, and a cwd-less record is both.
+    $faults = @($all | Where-Object { $_.Unreadable } |
+            ForEach-Object { [pscustomobject]@{ File = $_.File; Why = "unparseable: $($_.Error)" } })
+    $placeable = @()
+    foreach ($e in $records) {
+        if (-not $e.Record.cwd) {
+            $faults += [pscustomobject]@{ File = $e.File; Why = 'no cwd in the record, so it cannot be placed in any worktree' }
+        }
+        else { $placeable += $e }
     }
 
     $available = $false
@@ -166,15 +196,19 @@ function Get-WorktreeOccupancy {
     if ($roots.Count -eq 0) {
         $detail = 'no Claude config root with a session registry was found (looked for <userprofile>\.claude*\sessions)'
     }
+    elseif ($faults.Count -gt 0) {
+        # See the header: an unplaceable record could name ANY worktree, so it clears none of them, and
+        # a half-written file is what a session that just launched looks like.
+        $detail = "$($faults.Count) session record(s) could not be placed, so the roster is incomplete and no worktree can be cleared: $(($faults | ForEach-Object { "$($_.File) ($($_.Why))" }) -join '; ')"
+    }
     elseif ($records.Count -eq 0) {
         $detail = "$($roots.Count) config root(s) examined, but not one readable session record in them"
     }
     else { $available = $true }
 
     $sessions = @()
-    foreach ($entry in $records) {
+    foreach ($entry in $placeable) {
         $rec = $entry.Record
-        if (-not $rec.cwd) { continue }
 
         # Scope: cwd inside one of this repo's worktrees. Exact match on the worktree root, or a
         # descendant of it -- a session cd'd into a subdirectory is still that worktree's session.
@@ -222,6 +256,8 @@ function Get-WorktreeOccupancy {
     return [pscustomobject]@{
         RepoFound = $true; Available = $available; Detail = $detail
         RootsExamined = $roots.Count; RecordsExamined = $records.Count
+        RecordsUnplaceable = $faults.Count
+        UnplaceableFiles = @($faults | ForEach-Object { "$($_.File) -- $($_.Why)" })
         Worktrees = $worktrees; PrimaryPath = $primaryPath; Sessions = @($sessions)
     }
 }
@@ -261,5 +297,23 @@ function Get-NestedWorktrees {
     return @($Occupancy.Worktrees | Where-Object {
             $p = ConvertTo-Norm $_.Path
             $p -ne $norm -and $p.StartsWith("$norm/")
+        })
+}
+
+# The inverse: registered worktrees that CONTAIN $Path. A caller enumerating candidates by name prefix
+# needs this, because `<primary>-pins/.claude/worktrees/x` also starts with `<primary>-` and so passed a
+# prefix test as a candidate in its own right -- the nested tree being, by construction, where a live
+# session was just relocated to. Nesting under the PRIMARY was excluded only by the accident that
+# `<primary>/` is not `<primary>-`.
+function Get-ContainingWorktrees {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][object]$Occupancy,
+        [Parameter(Mandatory)][string]$Path
+    )
+    $norm = ConvertTo-Norm $Path
+    return @($Occupancy.Worktrees | Where-Object {
+            $p = ConvertTo-Norm $_.Path
+            $p -ne $norm -and $norm.StartsWith("$p/")
         })
 }
