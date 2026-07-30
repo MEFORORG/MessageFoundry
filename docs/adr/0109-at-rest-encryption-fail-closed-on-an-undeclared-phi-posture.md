@@ -2,7 +2,7 @@
 
 - **Status:** Rejected (2026-07-14)  <!-- premise refuted on close code review — see the Rejection note below -->
 - **Date:** 2026-07-14
-- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (fail-closed escape pattern) · [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (KeyProvider) · [ADR 0036](0036-windows-config-source-trust.md) (the `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` audited-escape precedent) · Secure Development Standards **PW.9** (secure defaults) · [Secure Build Scorecard](../Secure_Build_Scorecard_MEFOR.md) gap #4 · [CLAUDE.md](../../CLAUDE.md) §9 (PHI). **Tier: S2×P2 ⇒ T3.**
+- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (fail-closed escape pattern) · [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (KeyProvider) · [ADR 0036](0036-windows-config-source-trust.md) (the `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` audited-escape precedent) · [Secure Development Standards](../Secure_Development_Standards.md) **PW.9** (secure defaults) · [Secure Build Scorecard](../Secure_Build_Scorecard_MEFOR.md) gap #4 · [CLAUDE.md](../../CLAUDE.md) §9 (PHI). **Tier: S2×P2 ⇒ T3.**
 
 > ## ⛔ REJECTED (2026-07-14) — the premise does not hold
 >

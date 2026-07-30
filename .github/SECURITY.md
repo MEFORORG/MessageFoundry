@@ -43,7 +43,7 @@ After we acknowledge a report, we triage it by severity and target these remedia
 **Coordinated disclosure.** We practice coordinated disclosure: we ask that you give us a reasonable
 window to ship a fix before any public detail, and we publish details (and credit, if wanted) **once
 a fix is available**. We'll keep you updated on progress and agree the disclosure timing with you.
-These windows trace to the project's Secure Development Standards (§4.4 RV.2, Appendix A.5).
+These windows trace to the project's [Secure Development Standards](../docs/Secure_Development_Standards.md) (§4.4 RV.2, Appendix A.5).
 
 ## Dependency (third-party) vulnerabilities
 

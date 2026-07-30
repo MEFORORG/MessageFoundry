@@ -62,7 +62,7 @@ It serves three audiences:
 
 **The solo-maintainer altitude.** This standard is written for the reality it most often runs in: **one maintainer + an AI assistant**, no human second reviewer on hand. In that mode the **automated gates ARE the compensating "second reviewer"** (the SDS §A.6 deviation this doc owns). The matrix and dials make that honest and bounded, and define the **build trigger** at which a control escalates back to a human.
 
-> **Shared responsibility — no compliance conferred.** This standard governs how the software is **built**; it produces **build-provenance evidence** a deploying organization can rely on for **its own** HIPAA / compliance program. It does **not** confer HIPAA compliance — or any certification — on the product, the maintainer, or the adopter, and is not a substitute for the adopter's own risk assessment (cf. the Secure Development Standards §2 shared-responsibility split). The attestation posture is §11.
+> **Shared responsibility — no compliance conferred.** This standard governs how the software is **built**; it produces **build-provenance evidence** a deploying organization can rely on for **its own** HIPAA / compliance program. It does **not** confer HIPAA compliance — or any certification — on the product, the maintainer, or the adopter, and is not a substitute for the adopter's own risk assessment (cf. the [Secure Development Standards §2](Secure_Development_Standards.md) shared-responsibility split). The attestation posture is §11.
 
 ---
 
