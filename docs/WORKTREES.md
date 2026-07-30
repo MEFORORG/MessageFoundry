@@ -77,7 +77,7 @@ the directory, leaving a folder git no longer recognised, so every subsequent gi
 session failed. The bias is therefore fixed: **a false SKIP is a minor annoyance, a false PRUNE
 destroys a session.** Anything the script cannot answer confidently, it SKIPs.
 
-Occupancy is checked by two independent signals, and **either one vetoes**:
+Occupancy is checked by three independent signals, and **any one of them vetoes**:
 
 1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
    matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
@@ -85,9 +85,13 @@ Occupancy is checked by two independent signals, and **either one vetoes**:
 2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
    git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
    **not** depend on a recorded cwd.
+3. **The write footprint** (`-FootprintHours`, default **36**) —
+   [`scripts/coord/footprint.ps1`](../scripts/coord/footprint.ps1). It reads Claude Code's own
+   transcripts and places a session by where it actually **wrote**, which is the question signal 1 was
+   never able to answer. Like signal 1 it can only veto, and `-Name` cannot override it.
 
-Both are re-read **immediately before each removal**, not just when the table was built — a gh round
-trip per candidate plus every prior removal is a real window, and it is the window the incident
+All three are re-read **immediately before each removal**, not just when the table was built — a gh
+round trip per candidate plus every prior removal is a real window, and it is the window the incident
 description blames.
 
 **Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
@@ -110,29 +114,62 @@ accident that `<primary>/` is not `<primary>-`, so the case that was tested was 
 Anything living inside another registered worktree, and anything with a `.claude/worktrees/` path
 segment, is now excluded outright and listed as a non-candidate; `-Name` cannot reach them either.
 
-### Why signal 2 is not a nicety
+### Why signal 3 exists: signal 1 was measured contributing nothing
 
-Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of writes come from a
-session sitting in the primary and landing in a sibling by absolute path — and on 2026-07-30, with 5
-live sessions across 9 worktrees, signal 1 vetoed **none** of the four `<primary>-<slug>` siblings,
-including one a session was demonstrably building in. Signal 2 was the only thing standing between
-that session and this script. The run therefore prints how many candidates signal 1 actually vetoed,
-rather than letting "the fence ran" imply "the fence covered it".
+Signal 1 only ever sees where a session was **launched**, and nothing rewrites that field for the life
+of the session. The mechanism is not drift — a workflow fans subagents into N sibling worktrees while
+the registry holds **one** record carrying **one** cwd for the parent, so N−1 of them are structurally
+invisible. Measured on this repo 2026-07-30: of the writes landing in a `<primary>-<slug>` sibling —
+the only class this tool destroys — **88.9%** came from a session sitting in a different checkout, and
+signal 1 placed a session inside **0 of the 4** siblings that existed. Signal 2, a crude "somebody
+touched `.git` in the last 36h", was the only thing standing between a live session and this script,
+and `-Name` can turn it off.
 
-What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
-that never registered; and a session that only edits files and runs no git command (invisible to
-signal 2 as well, since it touches none of the metadata files).
+Measured again after signal 3 landed, same repo, 5 candidates: **signal 1 = 1 of 5, signal 3 = 4 of 5**.
+The three it adds include two worktrees that a session which was **live at that moment** had written
+144 times between them from a cwd of the primary — one of them merged, clean, and 22 hours from being
+pruned unattended.
 
-Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
+Two bugs found doing that measurement are worth recording, because both were guards that could not
+fire while every counter looked healthy. `git worktree list` reports paths with **forward slashes**
+while transcripts record them with backslashes, so deriving the escaped needle by replacing
+backslashes in git's output was a no-op and the only spelling that matters had no needle at all. And
+`Split-Path -LiteralPath … -Parent` is an invalid **parameter set**, so the `.git`-resolution fallback
+threw on every call and, with the throw swallowed, reported zero probes while looking like it ran.
+Both now have a self-check that turns the regression into a refusal.
+
+What no signal sees, printed on every run: a write by anything that is not a Claude tool call (an
+editor, an autosave, a plain terminal, a process still running after its tool call returned); a file
+written **by** a shell command (the transcript records the command string, not a resolved path list);
+a session that never registered *and* never wrote through a tool call. A cwd recorded as a UNC or 8.3
+short path still defeats signal 1's string compare, but signal 3 resolves through `.git` and does not
+share that blind spot.
+
+The run prints **per-signal** veto counts, never one merged number — a single total cannot show that
+one signal has gone to zero, and one measurably had. It also prints how many candidates have **no
+footprint at all**, in those words: a bare `0` reads as "nobody is anywhere" and sends an operator to
+`-Name`, which is how a fence dies.
+
+Everything that **narrows** any signal is named in red on the run and in the JSON receipt, because
 an operator who believes they are fenced when they are not is worse off than one who knows they
 aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
 measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
-explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
-that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
-`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
-`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
-`-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
-while appearing to set it.
+explicit `-ConfigRoot`; a corpus that contributed nothing; a **failed fetch** (merge decisions then
+rest on stale refs); a **gh PR probe that errored**; and every **`-Name`-confirmed worktree**. `-Name`
+is `-IdleHours 0` scoped to one tree — it stops at signal 2 and cannot reach signals 1 or 3, which is
+deliberate: it is the flag reached for when the tool refuses, so a signal it *could* turn off would
+stop protecting anything the moment it started working. A negative `-IdleHours` or `-FootprintHours`
+is refused outright, because it would put the cut-off in the future and disarm the veto while
+appearing to set it.
+
+Signal 3 fails **closed**: an in-window transcript that will not open, a needle-bearing line that will
+not parse (a half-written final line is exactly this shape), or its canary reporting that the format
+has moved, all make the whole fence unavailable and the run exits 2. A machine with **no** transcript
+corpus is a legitimate state and does *not* brick the tool — it stays available, contributes nothing,
+and says so in those words, because a fail-closed rule that reliably produces a false refusal is a
+fence with a short life. The canary specifically asserts that a **sidechain** write is still
+extractable, not merely a parent one: every cross-worktree write measured here came from a sidechain
+line, so a parent-only canary would stay green while the entire signal went to zero.
 
 ### Outcomes, not intentions
 

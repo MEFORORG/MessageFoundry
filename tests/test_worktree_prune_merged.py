@@ -41,7 +41,7 @@ import subprocess
 import sys
 import textwrap
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +132,82 @@ class Fixture:
             "entrypoint": entrypoint,
         }
         (self.cfg / "sessions" / f"{pid}.json").write_text(json.dumps(rec), encoding="utf-8")
+
+    def write_transcript(
+        self,
+        *,
+        session_id: str,
+        cwd: Path | str,
+        writes: Sequence[Path | str] = (),
+        tool: str = "Edit",
+        sidechain: bool = True,
+        hours_ago: float = 0.5,
+        project: str = "proj",
+        path_key: str = "file_path",
+        block_type: str = "tool_use",
+        extra_input: dict[str, Any] | None = None,
+        raw_tail: str = "",
+        stem: str = "agent-a1",
+    ) -> Path:
+        """Write a Claude Code transcript the way the real corpus records one.
+
+        ``json.dumps`` is load-bearing: it escapes every backslash, which is the ONLY spelling a real
+        transcript uses for a Windows path. A fixture that hand-wrote forward slashes would pass
+        against a scanner whose backslash needle does not exist -- which is precisely the bug the
+        needle self-check now catches, and it was found on the real corpus rather than here.
+
+        ``sidechain`` puts the file where subagent transcripts actually live. It defaults to True
+        because 100% of the cross-worktree writes measured on this repo came from a sidechain line, so
+        a suite that only exercised the parent shape would prove nothing about the case that matters.
+        """
+        base = self.cfg / "projects" / project
+        if sidechain:
+            f = base / session_id / "subagents" / "workflows" / "wf_test" / f"{stem}.jsonl"
+        else:
+            f = base / f"{session_id}.jsonl"
+        f.parent.mkdir(parents=True, exist_ok=True)
+
+        when = time.time() - hours_ago * 3600
+        stamp = (
+            time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(when))
+            + f".{int((when % 1) * 1000):03d}Z"
+        )
+        lines: list[str] = []
+        for target in writes:
+            payload: dict[str, Any] = {path_key: str(target)}
+            payload.update(extra_input or {})
+            lines.append(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "isSidechain": sidechain,
+                        "sessionId": session_id,
+                        "cwd": str(cwd),
+                        "timestamp": stamp,
+                        "gitBranch": "whatever",
+                        "message": {
+                            "role": "assistant",
+                            "content": [
+                                {
+                                    "type": block_type,
+                                    "id": "toolu_test",
+                                    "name": tool,
+                                    "input": payload,
+                                }
+                            ],
+                        },
+                    }
+                )
+            )
+        body = "\n".join(lines)
+        if lines:
+            body += "\n"
+        body += raw_tail
+        f.write_text(body, encoding="utf-8")
+        # The mtime funnel is stage 1 of the scan, so a backdated line needs a backdated file or the
+        # transcript is never opened at all.
+        os.utime(f, (when, when))
+        return f
 
 
 def _build(root: Path) -> Fixture:
@@ -252,6 +328,7 @@ def _argv(
     skip_gh: bool,
     skip_fetch: bool,
     as_json: bool,
+    script: Path | None = None,
 ) -> list[str]:
     root = fx.cfg if config_root == "" else config_root
     args = [
@@ -259,7 +336,7 @@ def _argv(
         "-NoProfile",
         "-NonInteractive",
         "-File",
-        str(SCRIPT),
+        str(script or SCRIPT),
         "-RepoRoot",
         str(fx.primary),
     ]
@@ -289,15 +366,23 @@ def run(
     skip_gh: bool = True,
     skip_fetch: bool = True,
     path_prepend: Path | None = None,
+    script: Path | None = None,
 ) -> dict[str, Any]:
     """Invoke the real script with -Json and parse its receipt.
 
     ``config_root=""`` means the fixture's own root; ``None`` omits the flag entirely.
     ``path_prepend`` puts a shim directory ahead of the real tools, for the gh/git probes.
+    ``script`` points at a MUTATED copy of the script tree, for the anti-vacuity suite.
     """
     proc = subprocess.run(
         _argv(
-            fx, extra, config_root=config_root, skip_gh=skip_gh, skip_fetch=skip_fetch, as_json=True
+            fx,
+            extra,
+            config_root=config_root,
+            skip_gh=skip_gh,
+            skip_fetch=skip_fetch,
+            as_json=True,
+            script=script,
         ),
         capture_output=True,
         text=True,
@@ -775,14 +860,22 @@ def test_explicit_config_root_is_declared_as_fixture_scope(fx: Fixture, sleeper:
 
 
 def test_fence_contribution_is_reported_not_implied(fx: Fixture, sleeper: int) -> None:
-    """The number that matters is how many candidates signal 1 vetoed -- measured 0 of 4 in the wild."""
+    """The number that matters is how many candidates each source vetoed -- signal 1 measured 0 of 4.
+
+    PER SOURCE, never one merged total: a combined "the fence vetoed N" cannot show that one of its
+    signals has gone to zero, and one of them measurably had.
+    """
     live_record(fx, sleeper, fx.primary)  # in the primary: vetoes no candidate
     res = run(fx, "-IdleHours", "0")
     assert res["fence"]["liveInRepo"] == 1
     assert res["fence"]["vetoedCandidates"] == 0
+    assert res["fence"]["vetoedByCwd"] == 0
+    assert res["fence"]["vetoedByFootprint"] == 0
+    assert res["fence"]["candidatesWithoutFootprint"] == 7
 
     text = run_text(fx, "-IdleHours", "0").stdout
-    assert "0 of 7 candidate(s) vetoed by signal 1" in text
+    assert "Signal 1 (recorded cwd)     placed a session inside 0 of 7 candidate(s)" in text
+    assert "Signal 3 (write footprint) placed a session inside 0 of 7 candidate(s)" in text
 
 
 # --------------------------------------------------------------------------------------------------
@@ -1504,3 +1597,636 @@ def _find_free_pid() -> int:
     proc.wait(timeout=30)
     time.sleep(0.3)
     return proc.pid
+
+
+# --------------------------------------------------------------------------------------------------
+# Signal 3: the write footprint
+#
+# The defect these exist for: a session's recorded cwd is where it was LAUNCHED, and nothing ever
+# rewrites it, so a workflow that fans subagents into N sibling worktrees is one record carrying one
+# cwd. Measured on the real repo 2026-07-30: of the writes landing in a `<primary>-<slug>` sibling --
+# the only class this tool destroys -- 88.9% came from a session sitting in a different checkout, and
+# signal 1 placed a session inside 0 of the 4 siblings that existed. `test_a_session_writing_in_from_
+# another_checkout_is_placed_there` is that case, and it is the one that fails without this signal.
+# --------------------------------------------------------------------------------------------------
+
+SID_WRITER = "beefbeef-1111-2222-3333-444444444444"
+
+
+def _quiesce(fx: Fixture, *slugs: str) -> None:
+    """Age signal 2 out of the way so an assertion is about signals 1 and 3, not about mtimes."""
+    for s in slugs:
+        _backdate(fx.primary, fx.sibling(s), 500)
+
+
+def test_a_session_writing_in_from_another_checkout_is_placed_there(
+    fx: Fixture, sleeper: int
+) -> None:
+    """THE case. cwd in the PRIMARY, writes into ``repo-clean``; signal 1 can only see the primary.
+
+    Run with ``-Apply`` and with signal 2 aged out of both siblings, so nothing but the footprint
+    stands between ``repo-clean`` and ``git worktree remove --force``. ``repo-gone`` is the positive
+    control in the SAME invocation: it proves the run was capable of removing something, so the SKIP
+    on ``repo-clean`` is a veto and not a refusal for some unrelated reason.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,  # <- the divergence: sitting in the primary
+        writes=[fx.sibling("clean") / "scripts" / "thing.py"] * 3,
+    )
+
+    res = run(fx, "-Apply")
+    d = by_leaf(res, "clean")
+    assert d["Decision"] == "SKIP"
+    assert d["Outcome"] != "removed"
+    assert fx.sibling("clean").exists()
+    # The REASON, not just survival: a survival-only assertion passes on a script that lost the signal
+    # and was saved by a later layer.
+    assert "write footprint" in d["Reason"], d["Reasons"]
+    occ = [o for o in d["Occupants"] if o["Source"] == "footprint"]
+    assert len(occ) == 1
+    assert occ[0]["State"] == "LIVE"
+    assert occ[0]["Writes"] == 3
+    assert occ[0]["CrossTree"] is True, "the whole point is that its cwd is somewhere else"
+
+    # Per-source receipt: signal 1 saw nothing here and must SAY so rather than being folded into a
+    # single count that looks like coverage.
+    assert res["fence"]["vetoedByCwd"] == 0
+    assert res["fence"]["vetoedByFootprint"] == 1
+    assert res["fence"]["footprint"]["crossTreeWrites"] == 3
+
+    assert by_leaf(res, "gone")["Outcome"] == "removed", "positive control"
+
+
+def test_signal_1_still_sees_nothing_here_which_is_why_signal_3_exists(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The control for the test above: the SAME fixture with the footprint source blind.
+
+    If the transcript is written for a DIFFERENT repo's path, signal 3 has nothing to say and
+    ``repo-clean`` is destroyed -- which is exactly what the tool did before this signal existed, and
+    the reason a green suite over the old code proved nothing.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.root / "somewhere-else" / "thing.py"],
+    )
+    res = run(fx, "-Apply")
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+    assert res["fence"]["vetoedByFootprint"] == 0
+    assert res["fence"]["footprint"]["writesUnplaced"] == 1, (
+        "a write that placed nowhere must be COUNTED -- 'another repo' and 'this repo, spelled "
+        "differently' are indistinguishable here"
+    )
+
+
+def test_a_footprint_from_a_dead_session_does_not_veto(fx: Fixture, sleeper: int) -> None:
+    """Only a POSITIVELY proven-gone verdict releases a footprint, and this is that verdict.
+
+    Carries its own positive control: the identical footprint with a LIVE record DOES veto, so this
+    cannot pass because the footprint was never seen.
+    """
+    _quiesce(fx, "clean", "gone")
+    dead = _find_free_pid()
+    fx.write_session(pid=dead, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id="0000aaaa-9999")  # fence available
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+
+    res = run(fx, "-Apply")
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "a dead writer must not veto forever"
+    assert res["fence"]["vetoedByFootprint"] == 0
+
+    # Same corpus, live record: the veto comes back. Without this the assertion above would also pass
+    # on a build that simply never read the transcript.
+    fx2 = _build(fx.root / "again")
+    _quiesce(fx2, "clean", "gone")
+    fx2.write_session(pid=sleeper, cwd=fx2.primary, session_id=SID_WRITER)
+    fx2.write_transcript(
+        session_id=SID_WRITER, cwd=fx2.primary, writes=[fx2.sibling("clean") / "x.py"]
+    )
+    assert run(fx2)["fence"]["vetoedByFootprint"] == 1
+
+
+def test_a_footprint_older_than_the_window_does_not_veto(fx: Fixture, sleeper: int) -> None:
+    """The second bound on 'forever': an unfenceable writer vetoes until it ages out, not for ever.
+
+    The writer here has NO registry record at all, which is the state that vetoes indefinitely if the
+    window is not applied -- a clean exit and a session that never registered look identical.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id="0000aaaa-9999")
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        hours_ago=200,
+    )
+    res = run(fx, "-Apply")
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+    assert res["fence"]["vetoedByFootprint"] == 0
+
+    # Positive control on the SAME corpus: widen the window and the veto reappears, so this did not
+    # pass because the transcript was unreadable, mis-shaped, or never enumerated.
+    fx2 = _build(fx.root / "wide")
+    _quiesce(fx2, "clean", "gone")
+    fx2.write_session(pid=sleeper, cwd=fx2.primary, session_id="0000aaaa-9999")
+    fx2.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx2.primary,
+        writes=[fx2.sibling("clean") / "x.py"],
+        hours_ago=200,
+    )
+    wide = run(fx2, "-FootprintHours", "400")
+    assert wide["fence"]["vetoedByFootprint"] == 1
+    assert by_leaf(wide, "clean")["Occupants"][0]["State"] == "UNREGISTERED"
+
+
+def test_an_unregistered_writer_vetoes_inside_the_window(fx: Fixture, sleeper: int) -> None:
+    """Absence of a record is not evidence of absence, so it vetoes until the window closes."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id="0000aaaa-9999")
+    fx.write_transcript(
+        session_id="c0ffee00-dead-beef-0000-000000000000",
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+    )
+    res = run(fx, "-Apply")
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] != "removed"
+    assert d["Occupants"][0]["State"] == "UNREGISTERED"
+    assert fx.sibling("clean").exists()
+
+
+def test_name_cannot_override_the_write_footprint(fx: Fixture, sleeper: int) -> None:
+    """-Name is the loudest thing an operator can do to the fence, and it stops at signal 2.
+
+    It is the flag reached for when the tool refuses, so a signal it CAN turn off is a signal that
+    stops protecting anything the moment it starts working.
+    """
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    res = run(fx, "-Apply", "-Name", "clean")
+    d = by_leaf(res, "clean")
+    assert d["Confirmed"] is True, "the override was accepted for signal 2"
+    assert d["Outcome"] != "removed"
+    assert "write footprint" in d["Reason"]
+    assert fx.sibling("clean").exists()
+
+
+# --- Fail-closed: a corpus that cannot be read is not a corpus that is empty ---------------------
+
+
+def test_a_torn_transcript_line_makes_the_fence_unavailable(fx: Fixture, sleeper: int) -> None:
+    """A half-written final line is what a session writing RIGHT NOW looks like.
+
+    Its target is unknowable, so it clears no candidate; the whole run refuses. The fixture writes a
+    GOOD line first, so this is 'incomplete', not 'empty'.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    torn = json.dumps({"type": "assistant", "message": {"content": [{"type": "tool_use"}]}})
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        raw_tail='{"type":"assistant","x":"'
+        + str(fx.sibling("clean")).replace("\\", "\\\\")
+        + "\\",
+    )
+    assert torn  # documents the shape; the tail above is the same thing, truncated
+
+    res = run(fx, "-Apply")
+    assert res["_exit"] == 2
+    assert res["fence"]["available"] is False
+    assert res["fence"]["footprint"]["available"] is False
+    assert any("will not parse" in f for f in res["fence"]["footprint"]["faults"])
+    assert res["counts"]["removed"] == 0
+    assert all(any("fence unavailable" in r for r in c["Reasons"]) for c in res["candidates"])
+    assert fx.sibling("clean").exists() and fx.sibling("gone").exists()
+
+
+def test_an_unreadable_transcript_makes_the_fence_unavailable(fx: Fixture, sleeper: int) -> None:
+    """In the window and unopenable: it could name the very worktree about to be destroyed."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    f = fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    import msvcrt
+
+    fh = os.open(str(f), os.O_RDWR | os.O_BINARY)
+    try:
+        try:
+            msvcrt.locking(fh, msvcrt.LK_NBLCK, os.path.getsize(str(f)))
+        except OSError:  # pragma: no cover - filesystem dependent
+            pytest.skip("this filesystem does not enforce a mandatory byte-range lock")
+        res = run(fx, "-Apply")
+    finally:
+        os.close(fh)
+    assert res["_exit"] == 2
+    assert res["fence"]["footprint"]["available"] is False
+    assert any("could not be read" in x for x in res["fence"]["footprint"]["faults"])
+    assert res["counts"]["removed"] == 0
+    assert fx.sibling("clean").exists()
+
+
+def test_a_moved_input_schema_makes_the_fence_unavailable(fx: Fixture, sleeper: int) -> None:
+    """Stale schema: transcripts mention this repo, and not one tool call carries a known path key.
+
+    Inference over a format nobody promised us goes QUIETLY to zero, which is the same 'confident
+    green over nothing' this repo keeps being bitten by. The canary turns it into a refusal.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        path_key="target_path",  # the vendor renamed it
+    )
+    res = run(fx, "-Apply")
+    assert res["_exit"] == 2
+    assert res["fence"]["footprint"]["available"] is False
+    assert res["fence"]["footprint"]["transcriptsWithNeedle"] >= 1
+    assert res["fence"]["footprint"]["pathBlocksExamined"] == 0
+    assert any("format has moved" in x for x in res["fence"]["footprint"]["faults"])
+    assert res["counts"]["removed"] == 0
+
+
+def test_the_canary_fails_when_only_SUBAGENT_extraction_goes_to_zero(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The canary that actually matters, and the one a parent-only canary would miss.
+
+    Every cross-worktree write measured on this repo came from a sidechain line. A canary that only
+    proved a PARENT write is extractable stays green while the entire signal disappears -- so here the
+    parent transcript extracts perfectly and only the subagent shape has moved.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    # Parent: healthy. A canary keyed on "did we extract anything at all" is satisfied by this line.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        sidechain=False,
+    )
+    # Subagent: the input key moved. Nothing extractable, and it is where the signal lives.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        sidechain=True,
+        path_key="target_path",
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["pathBlocksExamined"] >= 1, "the parent line still extracted -- that is the point"
+    assert fp["sidechainLines"] >= 1
+    assert fp["sidechainPathBlocks"] == 0
+    assert fp["available"] is False
+    assert any("SUBAGENT extraction" in x for x in fp["faults"])
+    assert res["_exit"] == 2
+    assert res["counts"]["removed"] == 0
+
+
+def test_no_corpus_is_declared_rather_than_read_as_nobody_is_here(
+    fx: Fixture, sleeper: int
+) -> None:
+    """A machine with no transcripts is legitimate, and a fence that bricks on it gets bypassed.
+
+    So this stays AVAILABLE and contributes nothing -- and has to say so in those words. A bare
+    ``vetoedByFootprint: 0`` reads as 'nobody is anywhere' and sends an operator to ``-Name``.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["available"] is True
+    assert fp["rootsWithCorpus"] == 0
+    assert "contributed nothing" in fp["note"]
+    assert any("contributed nothing" in r for r in res["fence"]["reducedAssurance"])
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+    text = run_text(fx, "-IdleHours", "0").stdout
+    assert "candidate(s) have NO footprint at all" in text
+    assert "not the same as nobody being there" in text
+
+
+def test_a_negative_footprint_window_is_refused(fx: Fixture, sleeper: int) -> None:
+    """A negative window puts the cut-off in the future: signal 3 disarmed while appearing set."""
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    res = run(fx, "-Apply", "-FootprintHours", "-1")
+    assert res["_exit"] == 2
+    assert "FootprintHours" in res["error"]
+    assert fx.sibling("clean").exists()
+
+
+# --- Placement: git's spelling, not ours ---------------------------------------------------------
+
+
+def test_a_write_through_a_junction_is_placed_by_gitdir(fx: Fixture, sleeper: int) -> None:
+    """The literal prefix match is a string compare, so an equivalent spelling places nowhere.
+
+    A junction is the cheap reproduction of the UNC / 8.3 / ``subst`` family. Walking up to ``.git``
+    and reading where it points answers in git's own spelling instead of ours.
+    """
+    link = fx.root / "linked"
+    made = subprocess.run(
+        ["cmd", "/c", "mklink", "/J", str(link), str(fx.primary.parent)],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if made.returncode != 0 or not link.exists():  # pragma: no cover - policy dependent
+        pytest.skip(f"could not create a junction here: {made.stdout}{made.stderr}")
+
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[link / fx.sibling("clean").name / "x.py"],
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["placedByPrefix"] == 0, "the string compare must genuinely have failed"
+    assert fp["placedByGitdir"] == 1
+    assert fp["gitdirProbes"] > 0
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] != "removed"
+    assert "write footprint" in d["Reason"]
+
+
+def test_the_gitdir_fallback_is_actually_reached(fx: Fixture, sleeper: int) -> None:
+    """``Split-Path -LiteralPath ... -Parent`` is an invalid PARAMETER SET, so it throws every time.
+
+    With the throw swallowed, the whole fallback was dead code reporting zero probes while looking
+    like it ran -- measured on the real corpus as 2090 unplaced writes and not one probe attempted.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.root / "elsewhere" / "x.py"]
+    )
+    fp = run(fx)["fence"]["footprint"]
+    assert fp["writesUnplaced"] == 1
+    assert fp["gitdirProbes"] > 0, "an unplaced write must at least have been probed"
+
+
+# --- Hygiene, disjointness, and the anti-vacuity suite -------------------------------------------
+
+
+def test_no_transcript_content_reaches_the_receipt(fx: Fixture, sleeper: int) -> None:
+    """A transcript carries the full text a Write was given and the full command a Bash call ran.
+
+    Extraction is an allow-list over two keys; everything else must be discarded UNREAD. This asserts
+    it over both surfaces, because the human summary can leak on its own.
+    """
+    secret = "PXQZ-CANARY-PAYLOAD-9931"
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        extra_input={
+            "old_string": secret,
+            "new_string": secret,
+            "content": secret,
+            "command": f"echo {secret}",
+        },
+    )
+    res = run(fx)
+    assert res["fence"]["vetoedByFootprint"] == 1, "the line WAS read, so this is not vacuous"
+    assert secret not in json.dumps(res)
+    assert secret not in run_text(fx).stdout
+
+
+def test_signal_3_reads_nothing_signal_2_reads(fx: Fixture, sleeper: int) -> None:
+    """Two signals that share an input are one signal wearing a disguise.
+
+    Signal 2 is the newest mtime of seven git metadata files; signal 3 reads ``*.jsonl`` under a
+    config root's ``projects``. Asserted at source level so the two can never quietly converge.
+    """
+    footprint = (SCRIPT.parent.parent / "coord" / "footprint.ps1").read_text(encoding="utf-8")
+    for name in (*_GITDIR_FILES, "logs/HEAD"):
+        assert f"'{name}'" not in footprint, f"signal 3 must not read signal 2's {name}"
+    assert "*.jsonl" in footprint
+    prune = SCRIPT.read_text(encoding="utf-8")
+    activity = prune.split("function Get-WorktreeActivity", 1)[1].split("\n}", 1)[0]
+    assert "jsonl" not in activity
+    assert "projects" not in activity
+
+
+def _mutant(tmp_path: Path, *subs: tuple[str, str, str]) -> Path:
+    """A copy of the script tree with one guard removed, for proving a guard can FAIL.
+
+    Every substitution is asserted to have matched: a mutant that silently did not apply is a test
+    that passes for the same reason the guard it is checking would.
+    """
+    dst = tmp_path / f"mutant{len(list(tmp_path.glob('mutant*')))}"
+    shutil.copytree(SCRIPT.parent.parent, dst / "scripts")
+    for rel, old, new in subs:
+        f = dst / "scripts" / rel
+        text = f.read_text(encoding="utf-8")
+        assert old in text, f"mutation target vanished from {rel}: {old!r}"
+        f.write_text(text.replace(old, new, 1), encoding="utf-8")
+    return dst / "scripts" / "worktree" / "prune-merged.ps1"
+
+
+def test_mutant_dropping_the_footprint_join_loses_the_veto(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """Strip the source out of the fence and the case this whole signal exists for comes back."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    assert run(fx)["fence"]["vetoedByFootprint"] == 1
+
+    mutated = _mutant(
+        tmp_path, ("coord/occupancy.ps1", "$sessions += @($fp.Footprints)", "# removed")
+    )
+    assert run(fx, script=mutated)["fence"]["vetoedByFootprint"] == 0, (
+        "the veto survived a build with no footprint source, so it was never the thing producing it"
+    )
+
+
+def test_mutant_swallowing_a_parse_fault_stops_failing_closed(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """The 'veto, not vanish' regression, one layer up: drop the fault and a torn line goes quiet."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        raw_tail='{"type":"assistant","x":"'
+        + str(fx.sibling("clean")).replace("\\", "\\\\")
+        + "\\",
+    )
+    assert run(fx)["fence"]["available"] is False
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            """                try { $null = $tail | ConvertFrom-Json -EA Stop }
+                catch {""",
+            """                try { $null = $tail | ConvertFrom-Json -EA Stop }
+                catch { }
+                if ($false) {""",
+        ),
+    )
+    assert run(fx, script=mutated)["fence"]["available"] is True, (
+        "the refusal survived deleting the fault, so it was not the fault producing it"
+    )
+
+
+def test_a_corrupt_line_in_the_MIDDLE_of_a_transcript_also_refuses(
+    fx: Fixture, sleeper: int
+) -> None:
+    """The other unparseable shape, and it is a different code path from the torn tail.
+
+    The tail check exists because a truncated line may be cut before the ``tool_use`` marker the cheap
+    pre-filter looks for; this one has the marker and still will not parse, which is what a corrupted
+    or format-changed line looks like mid-file.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    esc = str(fx.sibling("clean") / "x.py").replace("\\", "\\\\")
+    good = json.dumps({"type": "user", "note": "well formed"})
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("gone") / "ok.py"],
+        raw_tail=f'{{"kind":"tool_use","p":"{esc}"\n{good}\n',
+    )
+    res = run(fx, "-Apply")
+    assert res["_exit"] == 2
+    assert res["fence"]["footprint"]["available"] is False
+    assert any("will not parse" in x for x in res["fence"]["footprint"]["faults"])
+    assert res["counts"]["removed"] == 0
+
+
+def test_mutant_ORing_availability_stops_refusing(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """Availability is ANDed across sources. Make it an OR and a blind source stops mattering."""
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        path_key="target_path",
+    )
+    assert run(fx)["_exit"] == 2
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/occupancy.ps1",
+            "if (-not $fp.Available) {\n            $available = $false",
+            "if ($false) {\n            $available = $false",
+        ),
+    )
+    assert run(fx, script=mutated)["_exit"] != 2, (
+        "the refusal survived disconnecting the footprint source from availability"
+    )
+
+
+def test_mutant_deriving_the_needle_from_gits_spelling_is_caught(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """The needle self-check, proven by reintroducing the bug it was written for.
+
+    ``git worktree list`` reports FORWARD slashes; transcripts record backslashes. Deriving the
+    escaped needle by replacing backslashes in git's output is a no-op, so the only spelling that
+    matters has no needle. On the real corpus that silently halved the writes examined and left two
+    worktrees a live session had written 79 times between them reading as untouched.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER, cwd=fx.primary, writes=[fx.sibling("clean") / "x.py"]
+    )
+    good = run(fx)
+    assert good["fence"]["vetoedByFootprint"] == 1
+    assert good["fence"]["footprint"]["available"] is True
+
+    mutated = _mutant(
+        tmp_path,
+        (
+            "coord/footprint.ps1",
+            "return @(($back.Replace('\\', '\\\\') + '\\\\'), ($fwd + '/'))",
+            "return @(($b.Replace('\\', '\\\\') + '\\\\'), ($fwd + '/'))",
+        ),
+    )
+    bad = run(fx, script=mutated)
+    assert bad["fence"]["footprint"]["available"] is False, (
+        "the needle self-check did not fire on a needle set with no backslash spelling"
+    )
+    assert any("backslash-spelled needle" in x for x in bad["fence"]["footprint"]["faults"])
+    assert bad["_exit"] == 2
+
+
+# --- The recorder that does not exist -------------------------------------------------------------
+
+
+def test_nothing_on_the_hook_path_touches_the_footprint_scan() -> None:
+    """This design records nothing, which is how 'a recorder failure must not break a tool call' is met.
+
+    There is no hook, no settings.json entry and no store, so there is no write-side failure to have.
+    The property that has to be defended is that it STAYS that way: the corpus scan must never end up
+    behind a PreToolUse/SessionStart hook, where a slow or throwing scan would sit in front of every
+    tool call. presence.ps1 is the SessionStart consumer of the same matcher and must not opt in.
+    """
+    coord = SCRIPT.parent.parent / "coord"
+    presence = (coord / "presence.ps1").read_text(encoding="utf-8")
+    assert "Get-WorktreeOccupancy" in presence, "still the same matcher, or this proves nothing"
+    assert "-IncludeFootprints" not in presence
+    for name in ("overlap.ps1", "session-registry.ps1", "presence.ps1"):
+        # The dot-source, not a mention: session-registry.ps1 explains in prose WHY the shared
+        # normaliser lives there rather than in the scanner, and that is not a dependency.
+        assert 'footprint.ps1"' not in (coord / name).read_text(encoding="utf-8"), (
+            f"{name} is on a hook path and must not pull the corpus scan in"
+        )
+    hooks = SCRIPT.parent.parent / "hooks"
+    if hooks.is_dir():
+        for f in hooks.glob("*.ps1"):
+            assert "footprint" not in f.read_text(encoding="utf-8").lower()
+
+
+def test_a_footprint_source_that_throws_refuses_instead_of_crashing(
+    fx: Fixture, sleeper: int, tmp_path: Path
+) -> None:
+    """However it fails, it must fail as a REFUSAL with a receipt -- never as a stack trace.
+
+    A destructive tool that dies mid-decision leaves the operator with no table and no exit code they
+    can act on, and the next thing they reach for is the override.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    mutated = _mutant(
+        tmp_path,
+        ("coord/footprint.ps1", "$now = Get-Date", "throw 'synthetic scanner failure'"),
+    )
+    res = run(fx, "-Apply", script=mutated)
+    assert res["_exit"] == 2
+    assert res["fence"]["available"] is False
+    assert "threw" in res["fence"]["footprint"]["detail"]
+    assert res["counts"]["removed"] == 0
+    assert fx.sibling("clean").exists()
