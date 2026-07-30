@@ -133,12 +133,33 @@ function Build-Map {
         if ($norm -eq $myRootNorm) { continue }   # not a collision with yourself
         if (-not (Test-Path -LiteralPath $w.Path)) { continue }
 
-        # Committed work on this branch, plus whatever is uncommitted in its tree. Three dots: what the
-        # BRANCH added, not what main added underneath it -- otherwise every worktree looks like it is
-        # changing every file that main has moved since it branched.
+        # Committed work on this branch, plus whatever is uncommitted in its tree.
+        #
+        # NEITHER diff form is correct alone, and each is wrong in the opposite direction:
+        #   three-dot (origin/main...HEAD) = what the BRANCH AUTHORED. Required, because two-dot alone
+        #     blames a merely-behind branch for every file main has moved underneath it.
+        #   two-dot   (origin/main..HEAD)  = what still DIFFERS from main. Required, because the repo
+        #     SQUASH-merges ("title (#NN)"): the squashed commit never becomes an ancestor of the
+        #     branch, so the merge-base never advances and three-dot keeps crediting a landed branch
+        #     with its files FOREVER. Its session then blocks that file set until someone prunes the
+        #     worktree.
+        # The INTERSECTION is what the branch authored AND has not yet landed. It self-clears on
+        # squash, rebase and merge-commit alike. Measured 2026-07-30: two landed branches claimed 8
+        # and 4 files under three-dot and 0 under the intersection, while every branch with real
+        # outstanding work was unchanged (101/101, 21/21, 11/11).
         $files = @()
-        $committed = @(& git -C $w.Path diff --name-only origin/main...HEAD 2>$null)
-        if ($LASTEXITCODE -eq 0) { $files += $committed }
+        $authored = @(& git -C $w.Path diff --name-only origin/main...HEAD 2>$null)
+        if ($LASTEXITCODE -eq 0) {
+            $outstanding = @(& git -C $w.Path diff --name-only origin/main..HEAD 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                # Fall back to the authored set if the two-dot diff fails, so a git hiccup
+                # over-blocks (safe) rather than under-blocks (silent collisions).
+                $still = [System.Collections.Generic.HashSet[string]]::new(
+                    [string[]]$outstanding, [System.StringComparer]::Ordinal)
+                $files += @($authored | Where-Object { $still.Contains($_) })
+            }
+            else { $files += $authored }
+        }
         $dirty = @(& git -C $w.Path status --porcelain 2>$null |
             Where-Object { $_.Length -gt 3 } | ForEach-Object { $_.Substring(3).Trim('"') })
         $files += $dirty
