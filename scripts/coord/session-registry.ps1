@@ -49,14 +49,26 @@ function ConvertTo-Norm([string]$p) {
     return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
-# Every config root that actually holds a session registry.
+# Every config root that holds something a caller can read.
+#
+# -MustContain IS PART OF THE SAFETY, NOT A CONVENIENCE. This used to admit a root only if it held a
+# `sessions` directory, and footprint.ps1 -- which reads `projects`, not `sessions` -- reused it to
+# find the transcript corpus. A root holding a full corpus and no session registry (an account swap
+# mid-flight; this machine carries a .claude-swap-backup) was therefore dropped BEFORE anything
+# counted it, so the scan reported RootsExamined = 1 with zero faults while an entire corpus root, and
+# every write recorded in it, was invisible. The predicate must name the directory the CALLER actually
+# reads. A root matching ANY of the named subdirectories is admitted -- over-admitting costs an empty
+# enumeration, under-admitting loses a corpus silently.
 function Get-ClaudeConfigRoots {
     [CmdletBinding()]
-    param([string[]]$ConfigRoot)
+    param([string[]]$ConfigRoot, [string[]]$MustContain = @('sessions'))
     if ($ConfigRoot) { return @($ConfigRoot | Where-Object { Test-Path $_ }) }
     return @(
         Get-ChildItem -Path $env:USERPROFILE -Directory -Filter ".claude*" -Force -EA SilentlyContinue |
-            Where-Object { Test-Path (Join-Path $_.FullName "sessions") } |
+            Where-Object {
+                $root = $_.FullName
+                @($MustContain | Where-Object { Test-Path (Join-Path $root $_) }).Count -gt 0
+            } |
             ForEach-Object { $_.FullName }
     )
 }
