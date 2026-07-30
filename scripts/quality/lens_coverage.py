@@ -40,6 +40,23 @@ from pathlib import Path
 
 EDITABLE = frozenset({"action", "lookup", "send"})
 
+# A real estate keeps its own .venv beside the config modules, so a naive rglob walks thousands of
+# site-packages files, spawns a CLI call for each, and buries the estate's own numbers. Any path
+# component matching these is skipped, as is any dot-directory.
+SKIP_DIRS = frozenset({"__pycache__", "site-packages", "node_modules", "build", "dist"})
+
+
+def config_modules(root: Path) -> list[Path]:
+    """Every `.py` under ``root`` that is plausibly a config module."""
+    return sorted(
+        py
+        for py in root.rglob("*.py")
+        if not any(
+            part in SKIP_DIRS or (part.startswith(".") and part not in {".", ".."})
+            for part in py.relative_to(root).parts
+        )
+    )
+
 
 def parse_module(py: Path, python: str, cwd: Path) -> tuple[dict | None, str]:
     """Return (parsed JSON, error). `encoding=` is REQUIRED, not cosmetic.
@@ -63,6 +80,33 @@ def parse_module(py: Path, python: str, cwd: Path) -> tuple[dict | None, str]:
         return json.loads(proc.stdout), ""
     except json.JSONDecodeError as exc:
         return None, f"non-JSON output ({exc})"
+
+
+def classify_code_row(first_stmt: str) -> str:
+    """Bucket an opaque `code` row by the shape of its first statement.
+
+    A HEURISTIC on source text, not a parse -- it exists to answer one question the row contract
+    cannot: how much of the opaque mass is a delegating call into a helper module, i.e. how much
+    ADR 0089's Phase D (helper descent) would convert without widening the grammar at all. Buckets
+    are shapes; no source is ever emitted, only counts.
+    """
+    line = first_stmt.strip()
+    if not line or line.startswith("#"):
+        return "comment/blank"
+    if line.startswith(("import ", "from ")):
+        return "import"
+    if line.startswith("return"):
+        return "return"
+    if line.startswith(("try", "except", "finally", "with", "raise", "while", "assert", "yield")):
+        return "exception/other construct"
+    if line.startswith("msg."):
+        return "unrecognized msg API"
+    head, sep, rest = line.partition("=")
+    if sep and not head.rstrip().endswith(("=", "!", "<", ">")) and head.strip().isidentifier():
+        return "assignment from call" if "(" in rest else "assignment (literal/expr)"
+    if "(" in line and line.split("(", 1)[0].replace(".", "_").isidentifier():
+        return "bare helper call"
+    return "other"
 
 
 def _label(py: Path, root: Path, hash_names: bool) -> str:
@@ -91,21 +135,37 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     kinds: Counter[str] = Counter()
+    causes: Counter[str] = Counter()
     files = handlers = zero_editable = fully_typed = 0
     code_per_handler: list[int] = []
+    opaque_per_handler: list[int] = []
     refusals: list[dict[str, str]] = []
 
-    for py in sorted(args.config_dir.rglob("*.py")):
+    for py in config_modules(args.config_dir):
         files += 1
         out, err = parse_module(py, args.python, args.cwd)
         if out is None:
             refusals.append({"file": _label(py, args.config_dir, args.hash_names), "reason": err})
             continue
+        try:
+            src = py.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            src = []
         for handler in out.get("handlers", []):
             handlers += 1
             rows = handler.get("rows", [])
             n_edit = n_opaque = n_code = 0
             for row in rows:
+                if row.get("kind") == "code":
+                    start = row.get("line_start")
+                    end = row.get("line_end", start)
+                    stmt = ""
+                    if isinstance(start, int) and src:
+                        for raw in src[start - 1 : (end if isinstance(end, int) else start)]:
+                            if raw.strip() and not raw.strip().startswith("#"):
+                                stmt = raw
+                                break
+                    causes[classify_code_row(stmt)] += 1
                 kind = row.get("kind", "?")
                 if kind == "control" and not row.get("recognized", True):
                     kind = "control (unrecognized)"
@@ -123,6 +183,7 @@ def main(argv: list[str] | None = None) -> int:
             if rows and n_opaque == 0:
                 fully_typed += 1
             code_per_handler.append(n_code)
+            opaque_per_handler.append(n_opaque)
 
     total = sum(kinds.values())
     opaque = kinds["code"] + kinds["control (unrecognized)"]
@@ -176,6 +237,18 @@ def main(argv: list[str] | None = None) -> int:
     if code_per_handler:
         print(f"median `code` rows per handler   : {statistics.median(code_per_handler)}")
         print(f"max `code` rows in one handler   : {max(code_per_handler)}")
+    if opaque_per_handler:
+        print(f"median OPAQUE rows per handler   : {statistics.median(opaque_per_handler)}")
+        print(f"max OPAQUE rows in one handler   : {max(opaque_per_handler)}")
+    if causes:
+        total_code = sum(causes.values())
+        print("\nwhy `code` rows are opaque (first-statement shape, heuristic):")
+        for cause, count in causes.most_common():
+            print(f"  {cause:<30} {count:>5}  {pct(count, total_code)}")
+        descent = causes["bare helper call"] + causes["assignment from call"]
+        print(
+            f"  -> helper-descent candidates    : {descent:>5}  {pct(descent, total_code)} of code rows"
+        )
     if refusals:
         print("\nparse refusals (whole-file: the lens steps aside to the text editor):")
         for refusal in refusals:
