@@ -42,8 +42,6 @@ pytestmark = pytest.mark.skipif(
     reason="prune-merged.ps1 needs pwsh on Windows (Process.StartTime liveness fence)",
 )
 
-NOW_MS = int(time.time() * 1000)
-
 # Metadata files the activity signal reads. Backdating these is how a fixture gets past the veto
 # without turning it off.
 _GITDIR_FILES = ("index", "HEAD", "ORIG_HEAD", "FETCH_HEAD", "COMMIT_EDITMSG", "MERGE_MSG")
@@ -112,7 +110,11 @@ class Fixture:
             "pid": pid,
             "sessionId": session_id,
             "cwd": str(cwd),
-            "startedAt": NOW_MS if started_at is None else started_at,
+            # NOW, not import time. The fence compares the pid's real start time against this, so a
+            # module-level constant makes every record look like a recycled pid once the suite has been
+            # running for a minute -- and the veto tests then pass for the wrong reason (STALE is not a
+            # veto). Measured: five of them failed in a 14-minute full run and passed in isolation.
+            "startedAt": int(time.time() * 1000) if started_at is None else started_at,
             "version": "2.1.220",
             "kind": "interactive",
             "entrypoint": entrypoint,
@@ -189,13 +191,19 @@ def _build(root: Path) -> Fixture:
     return fx
 
 
-@pytest.fixture(scope="session")
+@pytest.fixture
 def sleeper() -> Iterator[int]:
     """A pid that is unambiguously LIVE for the fence.
 
     NOT ``os.getpid()``: the fence calls a record STALE when its process started more than
     ``StartSkewMinutes`` (15) before the recorded ``startedAt``, so a pytest process older than 15
     minutes silently flips to STALE and the veto tests would pass for the wrong reason.
+
+    FUNCTION-scoped, deliberately. A session-scoped sleeper drifts the other way: it starts once, and
+    by the time a late test writes a record with ``startedAt=now`` the process looks like it began
+    long before its session, which the fence reads as a recycled pid -- also STALE, also silently
+    turning a veto test green for the wrong reason. Spawning per test keeps the two timestamps within
+    a second of each other, which is the only configuration that is LIVE for the right reason.
     """
     proc = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(900)"],
@@ -370,6 +378,9 @@ def test_vscode_session_vetoes_exactly_like_a_desktop_one(fx: Fixture, sleeper: 
     d = by_leaf(res, "gone")
     assert d["Decision"] == "SKIP"
     assert d["Occupants"][0]["Surface"] == "claude-vscode"
+    # LIVE explicitly: a STALE record would also produce SKIP under some other reason, and this test
+    # would then be green while proving nothing about the surface.
+    assert d["Occupants"][0]["State"] == "LIVE"
 
 
 def test_session_in_a_nested_worktree_vetoes_its_ancestor(fx: Fixture, sleeper: int) -> None:
@@ -429,7 +440,7 @@ def test_unreadable_record_vetoes_while_the_fence_stays_available(
                 "pid": "not-a-number",
                 "sessionId": "ffffffff-6666",
                 "cwd": str(fx.sibling("clean")),
-                "startedAt": NOW_MS,
+                "startedAt": int(time.time() * 1000),
             }
         ),
         encoding="utf-8",
