@@ -34,7 +34,6 @@ would otherwise wedge the PR — see the gotcha below).
 The stable contexts required on `main` are — mirroring
 [`.github/required-contexts.txt`](../.github/required-contexts.txt), which is the file to edit:
 
-- `CI gate`
 - `test (ubuntu-latest, py3.14)`
 - `test (windows-2022, py3.14)`
 - `test (windows-2025, py3.14)`

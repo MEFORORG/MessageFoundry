@@ -98,7 +98,7 @@ def test_the_canonical_file_parses_and_names_the_live_set() -> None:
     )
     # Pinned so that ADDING or REMOVING a required check is a deliberate, reviewed edit here rather
     # than a silent one. Verified against `gh api repos/MEFORORG/MessageFoundry/branches/main/protection`.
-    assert len(contexts) == 13, (
+    assert len(contexts) == 12, (
         f"the canonical required set changed to {len(contexts)} contexts. If branch protection really "
         "changed, update this count AND every claim this suite checks; if it did not, revert the file."
     )

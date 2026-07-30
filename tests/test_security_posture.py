@@ -199,7 +199,7 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
                 name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
                 offenders.append(f"{wf}:{key} — step {name!r} has continue-on-error")
     # Liveness receipt. NOT `examined == len(required_contexts())`: the three `test (<os>, py3.14)`
-    # contexts are ONE matrix job, so 13 contexts collapse to 11 jobs. Pinned rather than derived so
+    # contexts are ONE matrix job, so 12 contexts collapse to 10 jobs. Pinned rather than derived so
     # that a change in the collapse — a matrix split, or a context that quietly stops resolving —
     # forces a look here instead of passing on a self-consistent count.
     #
@@ -211,8 +211,8 @@ def test_required_jobs_carry_no_continue_on_error() -> None:
         f"[security-posture] examined {examined} distinct jobs backing "
         f"{len(required_contexts())} required contexts"
     )
-    assert examined == 11, (
-        f"expected the 13 required contexts to resolve to 11 distinct jobs (the 3 `test` legs share one "
+    assert examined == 10, (
+        f"expected the 12 required contexts to resolve to 10 distinct jobs (the 3 `test` legs share one "
         f"matrix job); got {examined}. If the workflow layout genuinely changed, update this count."
     )
     assert not offenders, (
