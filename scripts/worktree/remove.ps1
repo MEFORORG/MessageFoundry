@@ -44,6 +44,21 @@ if ($tracked -and -not $Force) {
 if ($LASTEXITCODE -ne 0) { throw "git worktree remove failed (exit $LASTEXITCODE)" }
 & git -C $RepoRoot worktree prune
 
+# RELEASE THE BIRTH PIN. new.ps1 takes a 6h pin on every worktree it creates, and nothing used to
+# release it -- so a create/work/remove cycle inside that window left an UNEXPIRED pin naming a
+# directory that no longer existed, which made prune-merged.ps1's whole occupancy fence unavailable
+# for the rest of the 6h, for every session, with no override flag. (The reader now also ignores a pin
+# whose path is gone; that is the safety net. This is the tidy-up, so the store does not only grow.)
+# Best-effort by contract: a pin that will not delete must never fail a removal that already happened.
+try {
+    . "$PSScriptRoot\..\coord\pin.ps1"
+    $released = Remove-WorktreePins -Path $WorktreePath -Repo $RepoRoot
+    if ($released -gt 0) { Write-Host "Released $released pruner pin(s) on this worktree." -ForegroundColor DarkGray }
+}
+catch {
+    Write-Host "NOTE: could not release the pruner pin(s) for '$WorktreePath' ($($_.Exception.Message)); they name a path that is gone, which the reader ignores." -ForegroundColor Yellow
+}
+
 if ($DeleteBranch) {
     & git -C $RepoRoot branch -D $Name
     if ($LASTEXITCODE -ne 0) { Write-Warning "could not delete branch '$Name' (unmerged?). Delete manually if intended." }

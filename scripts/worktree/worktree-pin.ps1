@@ -20,6 +20,7 @@
     scripts\worktree\worktree-pin.ps1 -Take -Path ..\repo-pins -Hours 4 -Reason "..."
     scripts\worktree\worktree-pin.ps1 -List
     scripts\worktree\worktree-pin.ps1 -Release <file>
+    scripts\worktree\worktree-pin.ps1 -Release -Worktree ..\repo-pins
     scripts\worktree\worktree-pin.ps1 -Release -All
 #>
 [CmdletBinding(DefaultParameterSetName = 'List')]
@@ -33,6 +34,9 @@ param(
     [Parameter(ParameterSetName = 'Take')][double]$Hours = 12,
     # Which pin to release: the file the -Take reported, or its bare name.
     [Parameter(ParameterSetName = 'Release', Position = 0)][string]$Pin,
+    # ...or every pin on a WORKTREE. The file name is a leaf, a pid and a random suffix, so an operator
+    # who scrolled past the -Take output (or whose pin was taken by new.ps1) has no way to name it.
+    [Parameter(ParameterSetName = 'Release')][string]$Worktree,
     [Parameter(ParameterSetName = 'Release')][switch]$All,
     [string]$Repo,
     [switch]$Json
@@ -42,6 +46,10 @@ $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $false
 
 . "$PSScriptRoot\..\coord\occupancy.ps1"
+# pin.ps1 explicitly: occupancy.ps1 loads it LAZILY, inside its own opt-in branch, so that a scanner
+# that will not parse cannot take down the SessionStart roster. This script is the pin CLI and calls
+# into it at top level, so it must ask for it itself.
+. "$PSScriptRoot\..\coord\pin.ps1"
 
 if (-not $Repo) { $Repo = (Get-Location).Path }
 $dir = Get-WorktreePinDir -Repo $Repo
@@ -68,7 +76,14 @@ if ($Take) {
 }
 
 if ($Release) {
-    if (-not $All -and -not $Pin) { throw "-Release needs a pin file, or -All." }
+    if (-not $All -and -not $Pin -and -not $Worktree) { throw "-Release needs a pin file, a -Worktree, or -All." }
+    if ($Worktree) {
+        $wp = if (Test-Path -LiteralPath $Worktree) { (Resolve-Path -LiteralPath $Worktree).Path } else { $Worktree }
+        $n = Remove-WorktreePins -Path $wp -PinDir $dir
+        if ($Json) { @{ released = $n; worktree = $wp } | ConvertTo-Json | Write-Output }
+        else { Write-Host "Released $n pin(s) on '$wp'." -ForegroundColor Green }
+        exit 0
+    }
     $targets = @()
     if ($All) { $targets = @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -EA SilentlyContinue) }
     else {
@@ -87,7 +102,7 @@ if ($Json) {
     [pscustomobject]@{
         available = [bool]$set.Available; detail = $set.Detail; note = $set.Note; dir = $set.Dir
         examined = $set.PinsExamined; unreadable = $set.PinsUnreadable
-        expired = $set.PinsExpired; unplaceable = $set.PinsUnplaceable
+        expired = $set.PinsExpired; gone = $set.PinsGone; unplaceable = $set.PinsUnplaceable
         faults = @($set.Faults)
         pins = @($set.Pins | ForEach-Object {
                 [pscustomobject]@{ worktree = $_.Worktree; by = $_.Short; reason = $_.Reason; expiresAt = $_.ExpiresAt; file = $_.Root }
@@ -98,7 +113,7 @@ if ($Json) {
 
 Write-Host ""
 Write-Host "Pin store: $($set.Dir)" -ForegroundColor DarkCyan
-Write-Host ("  $($set.PinsExamined) examined, $($set.PinsExpired) expired, $($set.PinsUnreadable) unreadable, $($set.PinsUnplaceable) unplaceable.") -ForegroundColor DarkGray
+Write-Host ("  $($set.PinsExamined) examined, $($set.PinsExpired) expired, $($set.PinsGone) naming a path that is gone, $($set.PinsUnreadable) unreadable, $($set.PinsUnplaceable) unplaceable.") -ForegroundColor DarkGray
 if (-not $set.Available) { Write-Host "  UNAVAILABLE -- $($set.Detail)" -ForegroundColor Red }
 if ($set.Note) { Write-Host "  $($set.Note)" -ForegroundColor Yellow }
 foreach ($p in $set.Pins) {

@@ -26,13 +26,21 @@
     a permanent refusal and the tool into something people work around. `expiresAt` is mandatory and
     an expired pin is reported, not honoured.
 
-    FAIL-CLOSED, with one deliberate exception. A pin file that will not parse is a FAULT and makes
+    FAIL-CLOSED, with two deliberate exceptions. A pin file that will not parse is a FAULT and makes
     the source unavailable, which makes the whole fence unavailable: a half-written pin is what
     somebody taking one right now looks like, and its path is unknowable so it clears no candidate.
     An UNEXPIRED pin naming a path that is no longer any worktree of this repo is a fault too -- it
-    could be this repo's worktree under a spelling the matcher does not recognise. The exception is
-    that an EXPIRED unplaceable pin is simply ignored, so a stale pin for a worktree that was properly
-    removed heals itself instead of bricking the fence.
+    could be this repo's worktree under a spelling the matcher does not recognise. The exceptions are:
+      * an EXPIRED unplaceable pin is ignored, so a stale pin for a worktree that was properly removed
+        heals itself instead of bricking the fence;
+      * an unexpired pin whose PATH DOES NOT EXIST ON DISK is ignored (counted as PinsGone). A
+        directory that is not there cannot be occupied under any spelling, so this cannot hide a
+        veto -- and without it the birth pin below was a loaded gun. new.ps1 takes a 6 h pin at birth
+        and nothing released it, so `new.ps1 -Name x` / 20 minutes of work / `remove.ps1 -Name x`
+        left an unexpired pin naming a directory that no longer existed, which made the ENTIRE fence
+        unavailable for the remaining ~5 h 40 m, for every session, with no override flag and a
+        message naming a path the operator could not find. Reproduced end to end. remove.ps1 now
+        releases pins as well (Remove-WorktreePins), so the two fixes close it from both sides.
 
     CONCURRENCY. One file per pin, named for the worktree, the taker's pid and a random suffix, and
     written temp-then-rename. Never a read-modify-write over a shared list: measured on this repo, six
@@ -65,7 +73,9 @@ Returns a pscustomobject:
     PinsExamined     [int]    files that PARSED
     PinsUnreadable   [int]    files that did not -- any at all => Available false
     PinsExpired      [int]    parsed, and past their expiry
-    PinsUnplaceable  [int]    unexpired and naming no worktree of this repo => Available false
+    PinsGone         [int]    unexpired, and naming a path that does not exist -- ignored, see header
+    PinsUnplaceable  [int]    unexpired, on a path that EXISTS, and naming no worktree of this repo
+                              => Available false
     Faults           [array]  {File, Why}
     Pins             [array]  one veto-worthy row per live pin
 #>
@@ -79,7 +89,7 @@ function Get-WorktreePins {
     $now = Get-Date
     $r = [ordered]@{
         Available = $true; Detail = ''; Note = ''
-        Dir = ''; PinsExamined = 0; PinsUnreadable = 0; PinsExpired = 0; PinsUnplaceable = 0
+        Dir = ''; PinsExamined = 0; PinsUnreadable = 0; PinsExpired = 0; PinsGone = 0; PinsUnplaceable = 0
         Faults = @(); Pins = @()
     }
     $faults = @()
@@ -153,8 +163,14 @@ function Get-WorktreePins {
             # or the store never heals. Unexpired and unplaceable could be this repo's worktree spelled
             # a way the matcher does not recognise, and that is a missed veto.
             if (-not $expired) {
+                # ...unless the path is not on disk at all. Nothing can be occupying a directory that
+                # does not exist, under any spelling, so ignoring this cannot hide a veto -- and it is
+                # what a birth pin becomes the moment its worktree is removed. See the header: without
+                # it, one new.ps1/remove.ps1 cycle took the whole fence down for hours.
+                $pinPath = [string]$rec.path
+                if ($pinPath -and -not (Test-Path -LiteralPath $pinPath)) { $r.PinsGone++; continue }
                 $r.PinsUnplaceable++
-                $faults += [pscustomobject]@{ File = $f.FullName; Why = "a live pin names '$([string]$rec.path)', which is not a worktree of this repo -- it cannot be placed, so it clears none of them" }
+                $faults += [pscustomobject]@{ File = $f.FullName; Why = "a live pin names '$pinPath', which exists but is not a worktree of this repo -- it cannot be placed, so it clears none of them (release it: scripts\worktree\worktree-pin.ps1 -Release '$($f.FullName)')" }
             }
             continue
         }
@@ -248,18 +264,33 @@ function New-WorktreePin {
     return $final
 }
 
-# The rows that must VETO an action against $Path. Same nesting rule as the other sources: removing a
-# parent takes a nested checkout with it, so a pin on the nested tree vetoes the ancestor too.
-function Get-WorktreePinOccupants {
+# Release every pin naming $Path. A worktree being REMOVED must not leave a live pin behind: the
+# reader now ignores a pin whose path is gone, but that is the safety net, not the tidy-up -- a pin
+# store that only ever grows is one an operator eventually has to clean by hand.
+#
+# BEST-EFFORT BY CONTRACT. Callers are removal paths; a pin that will not delete (locked, permissions)
+# must never turn a successful worktree removal into a failure. Returns the number released.
+#
+# Which states VETO is not decided here either -- every caller filters pin rows through
+# Test-OccupancyVeto in occupancy.ps1, the one copy of that rule. A Get-WorktreePinOccupants lived
+# here and was never called; a second copy of a safety filter is exactly the thing that drifts.
+function Remove-WorktreePins {
     [CmdletBinding()]
     param(
-        [Parameter(Mandatory)][object]$PinSet,
         [Parameter(Mandatory)][string]$Path,
-        [switch]$IncludeNested
+        [string]$Repo,
+        [string]$PinDir
     )
+    $dir = if ($PinDir) { $PinDir } else { Get-WorktreePinDir -Repo $Repo }
+    if (-not $dir -or -not (Test-Path -LiteralPath $dir -PathType Container)) { return 0 }
     $norm = ConvertTo-Norm $Path
-    return @($PinSet.Pins | Where-Object {
-            $wt = ConvertTo-Norm $_.WorktreePath
-            $wt -eq $norm -or ($IncludeNested -and $wt.StartsWith("$norm/"))
-        })
+    $n = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.json -File -EA SilentlyContinue)) {
+        $rec = $null
+        try { $rec = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
+        if (-not $rec) { continue }
+        if ((ConvertTo-Norm ([string]$rec.path)) -ne $norm) { continue }
+        try { Remove-Item -LiteralPath $f.FullName -Force -EA Stop; $n++ } catch { }
+    }
+    return $n
 }
