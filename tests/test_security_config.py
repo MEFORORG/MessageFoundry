@@ -409,3 +409,47 @@ def test_known_security_keys_warn_about_nothing(
             'security.allowed_client_networks = ["10.20.4.0/24"]\n',
         )
     assert "unrecognized key" not in caplog.text
+
+
+def test_open_egress_gate_counts_smtp_and_direct_when_deny_by_default_is_unset(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """[egress] declares EIGHT allowed_* lists; the gate used to count six.
+
+    A mail-only or Direct-only PHI instance could enumerate every destination it actually uses and
+    still be refused as "UNRESTRICTED", with nothing in the refusal naming the two lists that did not
+    count — while both ARE enforced downstream by `_allowlist_for`. They are counted only when
+    [security].block_unlisted_outbound is left UNSET, which is precisely the state the deny-by-default
+    flip turns ON, so such an instance still starts fail-closed.
+    """
+    # Assert on THIS gate, not on the whole startup ladder: a bare prod instance also trips later,
+    # unrelated gates (retention, security-notification), so rc == 0 would be testing something else.
+    _serve(tmp_path, monkeypatch, 'egress.allowed_smtp = ["smtp.partner.example"]\n', env="prod")
+    err = capsys.readouterr().err
+    assert "egress is UNRESTRICTED" not in err, "a declared SMTP allowlist must satisfy the gate"
+    assert "block_unlisted_outbound defaulted ON" in err, "...and it must still start fail-closed"
+
+    _serve(tmp_path, monkeypatch, 'egress.allowed_direct = ["hisp.example"]\n', env="prod")
+    err = capsys.readouterr().err
+    assert "egress is UNRESTRICTED" not in err, "a declared Direct allowlist must satisfy the gate"
+    assert "block_unlisted_outbound defaulted ON" in err
+
+
+def test_open_egress_gate_still_refuses_smtp_only_when_deny_by_default_is_opted_out(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The one case that must NOT loosen.
+
+    With [security].block_unlisted_outbound explicitly false the deny-by-default flip is opted out, so
+    an SMTP/Direct-only allowlist would leave every OTHER transport allow-any. That combination is
+    still a refusal, and the message names the override so the operator knows which knob caused it.
+    """
+    toml = (
+        'security.block_unlisted_outbound = false\negress.allowed_smtp = ["smtp.partner.example"]\n'
+    )
+    rc = _serve(tmp_path, monkeypatch, toml, env="prod")
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "egress is UNRESTRICTED on a production PHI instance" in err
+    assert "block_unlisted_outbound" in err
+    assert "allowed_smtp" in err
