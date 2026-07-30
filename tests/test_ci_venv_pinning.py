@@ -75,6 +75,19 @@ lines. In particular `test_lock_installed_toolchain_locks_are_in_the_dep1_set` i
 ADR 0034 §3's stated failure mode — a hand-maintained lock outside the DEP-1 export/resync machinery
 rotting into a pinned, stale, *unpatched* toolchain, which is worse posture than floating.
 
+**What moving those two rows out of `RELEASE_PINNED_TOOLS` cost, and what pays it back.** That table was
+the only check that rejected a *floor* (`_PIN_OPS` deliberately excludes `>=`), so its removal left the
+`==` requirement on `bandit`/`pip-audit`/`zizmor` enforced by nothing: asserting the name is declared
+does not see a floor, and asserting the *exported lock* is `==`-pinned cannot see one either, because
+`uv export` writes `bandit==1.9.4` from `bandit>=1.9.4` just as readily. `EXACT_GROUP_PINS` /
+`FLOOR_BY_DESIGN` restore it at the declaration, where the decision now lives. Three further holes the
+2026-07-29 adversarial pass found and this module now closes, each verified by injecting the regression:
+the install-site COUNT (five sites collapsed onto three table rows, so four were individually
+deletable), the export SELECTOR (`--group` for `--only-group` pulls the whole project runtime into a
+blocking scanner's install closure while staying pinned, hashed and byte-identical under DEP-1), and
+group names LEAKING into the four runtime exports (`--no-dev` only filters the group literally named
+`dev`, so it is not the protection it looks like).
+
 `semgrep` is deliberately NOT in a group and stays a version-pinned inline install: it hard-conflicts
 with the project's own `[otel]` extra, and the only resolution (`[tool.uv] conflicts`) would declare a
 shipped product extra and a CI scanner permanently mutually exclusive. Recorded as a reasoned residual
@@ -219,21 +232,40 @@ RELEASE_PINNED_TOOLS = (
 #: them here — that this file's jobs are schedule/dispatch-only — was factually wrong (it triggers on
 #: `pull_request` and `pip-audit` is a required context). See the module docstring.
 #:
-#: Only ONE `--upgrade pip` bootstrap is left in the file (the `uv` install in the DEP-1 step). The
+#: TWO `--upgrade pip` bootstraps are left in the file, not one — counted, because an inventory that
+#: undercounts is how a residual becomes invisible: the `uv` install in the DEP-1 step, and the
+#: `semgrep` install (`python -m pip install --upgrade pip "semgrep==1.172.0"`, whose *semgrep* pin is
+#: registered above in `RELEASE_PINNED_TOOLS` while its unpinned `pip` half is registered HERE). The
 #: other two went away with their steps rather than being pinned: the `bandit` and `pip-audit` installs
 #: are now `pip install --require-hashes -r ci/locks/ci-scanners.lock`, and that lock hash-pins `pip`
 #: itself — so a hash-verified pip arrives in the same command that used to fetch an unverified one.
 SECURITY_YML_ACCEPTED_UNPINNED = frozenset({"pip"})
 
-#: ``(workflow, lock)`` pairs where a CI toolchain is installed from a hash-pinned `uv export`.
+#: How many `--upgrade pip` bootstraps `security.yml` is KNOWN to still carry. An exact count, not a
+#: floor: `SECURITY_YML_ACCEPTED_UNPINNED` registers the *name* `pip`, so it cannot distinguish two
+#: accepted bootstraps from twenty. Both survivors are named in the docstring above and in ADR 0034 §3's
+#: residuals table; a third must be a decision, and lowering this number is the receipt for removing one.
+SECURITY_YML_PIP_BOOTSTRAPS = 2
+
+#: ``(workflow, lock, install sites)`` triples where a CI toolchain is installed from a hash-pinned
+#: `uv export`.
 #:
 #: These lines are INVISIBLE to every scan in the first half of this module: `_install_targets` skips
 #: `-r` and its argument, so `pip install --require-hashes -r <lock>` names zero packages and passes by
-#: not being looked at. The five tests below are the ones that look.
+#: not being looked at. The tests below are the ones that look.
+#:
+#: THE COUNT IS LOAD-BEARING, not decoration. Five install sites collapse onto three (workflow, lock)
+#: pairs — `security.yml` installs `ci-scanners.lock` twice (the pip-audit step and the bandit step) and
+#: `quality-advisory.yml` installs `ci-quality.lock` twice (the coverage job and the mutation job). An
+#: `assert lines` non-vacuity check is satisfied by ONE surviving line, so deleting either of a pair
+#: leaves its job installing nothing while every check here stays green. Measured: with only "≥1", four
+#: of the five sites were individually deletable at zero test cost — and the coverage job's failure mode
+#: is silent (`pytest -q --cov` dies on `unrecognized arguments`, `|| true` swallows it, and the
+#: diff-coverage step reports "skipped" and exits 0).
 LOCK_INSTALLED_TOOLCHAINS = (
-    ("security.yml", "ci/locks/ci-scanners.lock"),
-    ("zizmor.yml", "ci/locks/ci-scanners.lock"),
-    ("quality-advisory.yml", "ci/locks/ci-quality.lock"),
+    ("security.yml", "ci/locks/ci-scanners.lock", 2),
+    ("zizmor.yml", "ci/locks/ci-scanners.lock", 1),
+    ("quality-advisory.yml", "ci/locks/ci-quality.lock", 2),
 )
 
 #: Tools that MOVED from an inline `pip install <tool>==<version>` into a PEP 735 dependency group. Two
@@ -241,6 +273,28 @@ LOCK_INSTALLED_TOOLCHAINS = (
 #: disappearing from `pyproject.toml` while the lock still carries the name as somebody else's
 #: transitive, and a future edit re-adding an inline `pip install bandit` beside the lock install.
 MOVED_TO_A_GROUP = ("bandit", "pip-audit", "zizmor", "mutmut", "diff-cover", "pytest-cov")
+
+#: Moved tools whose `[dependency-groups]` spec must be an EXACT `==` pin, and why the exactness is the
+#: contract rather than a preference. This exists because moving `bandit` and `pip-audit` out of
+#: `RELEASE_PINNED_TOOLS` deleted the ONLY check that rejected a floor: `test_moved_tools_are_declared_*`
+#: asserts the NAME is declared, and `test_lock_installed_toolchain_lock_is_pinned_and_hashed` inspects
+#: the EXPORTED lock — which `uv export` writes fully `==`-pinned from a `>=` spec just as readily, so it
+#: is structurally blind to the difference. Verified: rewriting all three scanner specs to `>=` re-locked,
+#: re-exported byte-identically, and passed every guard in this repo.
+#:
+#: The failure that buys: a floor means Dependabot's weekly `uv` PR moves a blocking gate's version
+#: inside `uv.lock` with NO `pyproject.toml` diff to review, `dependabot-lock-resync.yml` re-exports and
+#: stages the new lock automatically, and a required gate's findings baseline changes GREEN.
+EXACT_GROUP_PINS = ("bandit", "pip-audit", "zizmor", "diff-cover", "mutmut")
+
+#: The counterpart: moved tools deliberately declared as a FLOOR. Enumerated so "floor by design" and
+#: "floor nobody noticed" cannot look the same.
+#:
+#: `pytest-cov` — nothing parses its output; it only has to emit a `coverage.xml` that `diff-cover`
+#: reads, so it is floored at the current major and left free for Dependabot to move.
+#: `pytest-timeout` — deliberately the IDENTICAL spec to `[project.optional-dependencies].dev`, so the
+#: hashed toolchain install cannot re-point the plugin the coverage run already executes under.
+FLOOR_BY_DESIGN = ("pytest-cov", "pytest-timeout")
 
 
 def _install_targets(line: str) -> list[str]:
@@ -254,9 +308,16 @@ def _install_targets(line: str) -> list[str]:
     match = _PIP_INSTALL.search(line)
     if match is None:  # pragma: no cover - callers filter on the same regex
         return []
+    return _tokens_after(line[match.end() :])
+
+
+def _tokens_after(rest: str) -> list[str]:
+    """The install targets in the tail of an install command — flags, and the arguments of flags that
+    take one, removed. Shared by the ``pip`` and ``pipx`` scans so the two cannot disagree about what
+    counts as a target."""
     targets: list[str] = []
     skip_next = False
-    for tok in line[match.end() :].split():
+    for tok in rest.split():
         if skip_next:
             skip_next = False
             continue
@@ -380,6 +441,53 @@ def _dist_name(spec: str) -> str:
     return match.group(0) if match else ""
 
 
+def _dependency_groups() -> dict[str, list[str]]:
+    """``[dependency-groups]`` -> group name -> its requirement STRINGS.
+
+    PEP 735 lets an entry be a ``{include-group = "other"}`` table rather than a requirement string;
+    those are dropped here (the included group is iterated on its own anyway).
+    """
+    groups = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8")).get(
+        "dependency-groups"
+    )
+    assert groups, (
+        "pyproject.toml declares no [dependency-groups] — the CI toolchain lost its source"
+    )
+    return {
+        name: [spec for spec in (specs or []) if isinstance(spec, str)]
+        for name, specs in groups.items()
+    }
+
+
+def _group_spec(package: str) -> str:
+    """The PEP 508 spec ``package`` is declared with in ``[dependency-groups]``.
+
+    Raises rather than returning a default: "the declaration is gone" and "the declaration is unpinned"
+    must not produce the same result.
+    """
+    for specs in _dependency_groups().values():
+        for spec in specs:
+            if _dist_name(spec) == package:
+                return spec.strip()
+    raise AssertionError(f"{package!r} is not declared in any [dependency-groups] entry")
+
+
+def _project_declared_names() -> set[str]:
+    """Every distribution declared in ``[project]`` — runtime deps plus every extra.
+
+    A name declared BOTH in `[project]` and in a dependency group (today: `pytest-timeout`, held
+    deliberately identical to the `dev` extra) legitimately appears in the runtime exports, so the leak
+    check below must not treat it as a leak.
+    """
+    project = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8")).get(
+        "project", {}
+    )
+    specs: list[str] = list(project.get("dependencies") or [])
+    for extra_specs in (project.get("optional-dependencies") or {}).values():
+        specs.extend(extra_specs or [])
+    return {_dist_name(spec) for spec in specs if _dist_name(spec)}
+
+
 def _names_target(line: str, package: str) -> bool:
     """Does this `pip install` line name ``package`` as a target (bare, or with a version spec)?"""
     return any(
@@ -398,6 +506,11 @@ def _locked_requirements(lock: Path) -> list[tuple[str, int]]:
 
     `uv export` emits `name==version \\` followed by indented `--hash=` continuations, then an optional
     `# via ...` comment.
+
+    Any OTHER leading-dash directive is a hard failure rather than a skip. `-e .`, `--index-url`,
+    `--extra-index-url` and `--find-links` all change what pip actually resolves, and a directive that is
+    neither counted as a requirement nor rejected is invisible to the very guard whose point is not being
+    fooled by a lock's shape.
     """
     out: list[tuple[str, int]] = []
     for raw in lock.read_text(encoding="utf-8").splitlines():
@@ -408,26 +521,56 @@ def _locked_requirements(lock: Path) -> list[tuple[str, int]]:
             if out:  # a hash before any requirement would be malformed; ignore rather than crash
                 name, count = out[-1]
                 out[-1] = (name, count + 1)
-        elif not line.startswith("-"):
+        elif line.startswith("-"):
+            raise AssertionError(
+                f"{lock.name} carries the directive {line!r}, which is neither a requirement nor a "
+                f"`--hash=` line. An index redirect or an editable/project line changes what pip "
+                f"resolves and would otherwise pass through this parser uncounted — decide about it "
+                f"here rather than letting it be silently ignored."
+            )
+        else:
             out.append((line.removesuffix("\\").strip(), 0))
     return out
 
 
-@pytest.mark.parametrize(("workflow", "lock"), LOCK_INSTALLED_TOOLCHAINS)
-def test_lock_installed_toolchain_install_is_hash_verified(workflow: str, lock: str) -> None:
+def _exported_names(export: Path) -> list[str]:
+    """The `name==version` requirement lines of ANY `uv export`, hashed or not.
+
+    Deliberately separate from `_locked_requirements`: that one is strict about directives because it
+    guards a `--require-hashes` install, whereas `constraints.lock` is legitimately `--no-hashes` and is
+    only read here for WHICH names it contains.
+    """
+    return [
+        line.removesuffix("\\").strip()
+        for raw in export.read_text(encoding="utf-8").splitlines()
+        if (line := raw.strip()) and not line.startswith(("#", "-"))
+    ]
+
+
+@pytest.mark.parametrize(("workflow", "lock", "sites"), LOCK_INSTALLED_TOOLCHAINS)
+def test_lock_installed_toolchain_install_is_hash_verified(
+    workflow: str, lock: str, sites: int
+) -> None:
     """Installing FROM a hashed lock buys nothing unless `--require-hashes` is actually passed.
 
     Without the flag pip treats the file as an ordinary requirements list, ignores every `--hash=`
     line, and is free to resolve a different artifact — a silently unpinned install that still reads
     like a pinned one at a glance.
+
+    The site COUNT is asserted exactly, not as "at least one": see LOCK_INSTALLED_TOOLCHAINS. A `>= 1`
+    check is satisfied by one survivor of a pair, so it cannot see a job losing its only install.
     """
     lines = [
         ln for ln in _code_lines(_WORKFLOWS / workflow) if _PIP_INSTALL.search(ln) and lock in ln
     ]
-    # Non-vacuity: a renamed lock or a restructured step must fail loudly, not pass by matching nothing.
-    assert lines, (
-        f"{workflow} no longer installs from {lock} — if the toolchain moved, re-point "
-        f"LOCK_INSTALLED_TOOLCHAINS in the same commit rather than letting this pass vacuously"
+    print(f"[ci-venv-pinning] {workflow}: {len(lines)} install site(s) for {lock}")
+    # Non-vacuity AND completeness: a renamed lock, a restructured step, or a DELETED sibling install
+    # must fail loudly rather than pass by matching only what is left.
+    assert len(lines) == sites, (
+        f"{workflow} installs {lock} at {len(lines)} site(s), expected {sites}. If a job legitimately "
+        f"gained or lost its toolchain install, update the count in LOCK_INSTALLED_TOOLCHAINS in the "
+        f"same commit — a job silently left with no install still passes every other check here, and "
+        f"in the coverage job it fails INVISIBLY (`|| true` swallows the missing --cov plugin)."
     )
     for ln in lines:
         assert "--require-hashes" in ln, (
@@ -436,8 +579,10 @@ def test_lock_installed_toolchain_install_is_hash_verified(workflow: str, lock: 
         )
 
 
-@pytest.mark.parametrize(("workflow", "lock"), LOCK_INSTALLED_TOOLCHAINS)
-def test_lock_installed_toolchain_lock_is_pinned_and_hashed(workflow: str, lock: str) -> None:
+@pytest.mark.parametrize(("workflow", "lock", "sites"), LOCK_INSTALLED_TOOLCHAINS)
+def test_lock_installed_toolchain_lock_is_pinned_and_hashed(
+    workflow: str, lock: str, sites: int
+) -> None:
     """The lock itself must be fully `==`-pinned AND carry hashes.
 
     Blocks substituting a `--no-hashes` export (the shape `constraints.lock` legitimately has, because
@@ -449,7 +594,10 @@ def test_lock_installed_toolchain_lock_is_pinned_and_hashed(workflow: str, lock:
     assert path.is_file(), f"{workflow} installs {lock}, which is not committed"
     reqs = _locked_requirements(path)
     total_hashes = sum(n for _, n in reqs)
-    print(f"[ci-venv-pinning] {lock}: {len(reqs)} requirements, {total_hashes} hashes")
+    print(
+        f"[ci-venv-pinning] {lock}: {len(reqs)} requirements, {total_hashes} hashes "
+        f"({sites} install site(s) in {workflow})"
+    )
     assert reqs, (
         f"{lock} declares no requirements — an empty lock installs nothing and proves nothing"
     )
@@ -465,7 +613,7 @@ def test_lock_installed_toolchain_lock_is_pinned_and_hashed(workflow: str, lock:
     )
 
 
-@pytest.mark.parametrize("lock", sorted({lock for _, lock in LOCK_INSTALLED_TOOLCHAINS}))
+@pytest.mark.parametrize("lock", sorted({lock for _, lock, _ in LOCK_INSTALLED_TOOLCHAINS}))
 def test_lock_installed_toolchain_locks_are_in_the_dep1_set(lock: str) -> None:
     """Each toolchain lock must be REGENERATED and diff-gated by DEP-1, not hand-maintained.
 
@@ -475,11 +623,154 @@ def test_lock_installed_toolchain_locks_are_in_the_dep1_set(lock: str) -> None:
 
     Only the gate half is asserted here; `tests/test_dep1_lock_resync_lockstep.py` then forces the
     Dependabot resync to export, short-circuit on, and stage the identical set.
+
+    THE SELECTOR IS PART OF THE CONTRACT, not just the `-o` path. A `.*` between `uv export` and `-o`
+    accepts `--group` in place of `--only-group`, and `--group` is additive: it emits the PROJECT's whole
+    closure plus the group. Measured — `uv export --group ci-scanners -o ci/locks/ci-scanners.lock` grows
+    the lock from 33 to 69 requirements, pulling `fastapi`, `uvicorn`, `hl7`, `httpx` and `aiosqlite`
+    into what the BLOCKING bandit and zizmor jobs install — and it is fully `==`-pinned and fully hashed,
+    so it passed every other guard here, passed the resync lockstep, and re-exported byte-identically
+    under DEP-1. Nothing went red. The group name is also required to MATCH the lock's stem: without it,
+    `--only-group ci-quality -o ci/locks/ci-scanners.lock` is equally green.
     """
+    group = Path(lock).stem
     body = (_WORKFLOWS / "security.yml").read_text(encoding="utf-8")
-    assert re.search(rf"^\s*uv export\s+.*-o {re.escape(lock)}\s*$", body, re.MULTILINE), (
-        f"security.yml's DEP-1 step does not `uv export` {lock}, so nothing regenerates it and the "
-        f"drift gate never compares it. A stale hash-pinned toolchain is worse than a floating one."
+    pattern = rf"^\s*uv export --only-group {re.escape(group)} --format requirements\.txt -o {re.escape(lock)}\s*$"
+    assert re.search(pattern, body, re.MULTILINE), (
+        f"security.yml's DEP-1 step does not export {lock} with exactly "
+        f"`uv export --only-group {group} --format requirements.txt -o {lock}`. Either nothing "
+        f"regenerates it (so the drift gate never compares it, and a stale hash-pinned toolchain is "
+        f"worse than a floating one), or the SELECTOR changed: `--group` is additive and would pull the "
+        f"whole project runtime into a scanner's install closure while staying pinned, hashed and "
+        f"byte-identical under DEP-1."
+    )
+
+
+@pytest.mark.parametrize("lock", sorted({lock for _, lock, _ in LOCK_INSTALLED_TOOLCHAINS}))
+def test_each_group_pin_reaches_its_own_lock(lock: str) -> None:
+    """Every spec declared in group `<stem>` must appear `==`-pinned in `ci/locks/<stem>.lock`.
+
+    The second half of the selector guard, from the other direction: this is what catches a lock exported
+    from the WRONG group (the filename says `ci-scanners`, the export said `--only-group ci-quality`) and
+    a pin bumped in `pyproject.toml` without a re-export — which would leave the declared version and the
+    installed version disagreeing, with `pyproject.toml` reading as the source of truth it no longer is.
+    """
+    group = Path(lock).stem
+    specs = _dependency_groups().get(group)
+    assert specs, f"[dependency-groups] has no `{group}` entry, but {lock} is exported from it"
+    locked = {name.split("==", 1)[0] for name, _ in _locked_requirements(_REPO / lock)}
+    text = (_REPO / lock).read_text(encoding="utf-8")
+    print(f"[ci-venv-pinning] {group}: {len(specs)} declared spec(s) checked against {lock}")
+    for spec in specs:
+        name = _dist_name(spec)
+        assert name in locked, (
+            f"{lock} does not contain {name!r}, which `[dependency-groups].{group}` declares. The lock "
+            f"was exported from a different group, or is stale — re-run the DEP-1 exports."
+        )
+        if "==" in spec:
+            version = spec.split("==", 1)[1].strip().strip("\"'")
+            assert re.search(rf"^{re.escape(name)}=={re.escape(version)}\b", text, re.MULTILINE), (
+                f"`[dependency-groups].{group}` declares {spec!r} but {lock} pins a different version. "
+                f"A pin bumped without a re-export means pyproject.toml no longer describes what CI "
+                f"installs — re-run the DEP-1 exports in the same commit."
+            )
+
+
+@pytest.mark.parametrize("package", EXACT_GROUP_PINS)
+def test_moved_tool_pins_are_exact_not_floors(package: str) -> None:
+    """A moved tool's `[dependency-groups]` spec must be `==`, not a floor.
+
+    NOTHING ELSE CHECKS THIS. Moving `bandit`/`pip-audit` out of `RELEASE_PINNED_TOOLS` removed the only
+    guard that rejected a floor (`_PIN_OPS` excludes `>=` by design), and the two replacements are blind
+    to it: one asserts the NAME is declared, the other inspects the EXPORTED lock — and `uv export`
+    writes `bandit==1.9.4` from `bandit>=1.9.4` just as readily. Verified end to end: rewriting all three
+    scanner specs to `>=` re-locked, re-exported the two toolchain locks BYTE-IDENTICALLY, and passed
+    every guard in this repo.
+
+    Why exactness rather than freshness: each of these versions is the CONTRACT of a gate that can red a
+    PR — bandit's `# nosec` parsing is a blocking gate's findings baseline, zizmor's gate asserts a clean
+    baseline so a new rule reds an unrelated PR, and the mutation job SHELL-PARSES mutmut's human-readable
+    output. A floor lets Dependabot's weekly `uv` PR move any of them with no `pyproject.toml` diff to
+    review, since the resync re-exports the lock automatically.
+    """
+    spec = _group_spec(package)
+    assert re.fullmatch(rf"{re.escape(package)}==\d+(\.\d+)*", spec), (
+        f"`[dependency-groups]` declares {spec!r}; {package} must be an EXACT `==` pin. `>=` is a FLOOR: "
+        f"it re-resolves inside uv.lock on any re-lock, and the exported lock looks identically pinned "
+        f"either way. If a floor is genuinely wanted, move {package!r} to FLOOR_BY_DESIGN with the "
+        f"reason — do not relax this pattern."
+    )
+
+
+@pytest.mark.parametrize("package", FLOOR_BY_DESIGN)
+def test_floored_group_pins_stay_declared(package: str) -> None:
+    """The counterpart to EXACT_GROUP_PINS: a floor is a decision, so it must be an enumerated one.
+
+    Asserts only that the entry still EXISTS and is not accidentally exact-pinned without the reason
+    moving with it. The point is that reading these two tables together tells you every group spec's
+    intended shape — so "floor by design" can never be mistaken for "floor nobody noticed".
+    """
+    spec = _group_spec(package)
+    print(f"[ci-venv-pinning] floor by design: {spec}")
+    assert re.fullmatch(rf"{re.escape(package)}(>=|~=)\d+(\.\d+)*", spec), (
+        f"`{package}` is listed in FLOOR_BY_DESIGN but declared as {spec!r}. If it was deliberately "
+        f"tightened to an exact pin, move it to EXACT_GROUP_PINS with its reason in the same commit."
+    )
+
+
+def test_dependency_groups_do_not_leak_into_the_runtime_exports() -> None:
+    """No CI-toolchain name may appear in the four PRE-EXISTING DEP-1 artifacts.
+
+    This is the load-bearing invariant `pyproject.toml` asserts in prose and nothing enforced: the groups
+    must stay NON-DEFAULT, because a default group lands in `requirements.lock`, in the container image
+    locks that feed BOTH SBOM builds, and in what `pip-audit` audits AS RUNTIME.
+
+    `--no-dev` is NOT the protection it looks like. `uv export --help`: it disables "the development
+    dependency group" — the group literally named `dev` — so it does not filter any other default group.
+    Measured: adding `default-groups = ["ci-scanners"]` puts `bandit`, `pip-audit` and `zizmor` into
+    `requirements.lock` (98 -> 121 requirements) AND into `docker/locks/requirements-core.lock`
+    (41 -> 69), the SBOM input, past its `--no-dev`. The two `--all-extras` exports pass neither
+    `--no-dev` nor `--no-default-groups`, so they are unguarded by construction — including against the
+    most natural mistake available, a group named `dev` mirroring the existing `dev` EXTRA, which is uv's
+    implicit default group. In every one of those cases the whole suite still passes and DEP-1 merely
+    demands a re-export, then blesses the leak.
+
+    A name declared in BOTH `[project]` and a group is exempt: `pytest-timeout` is deliberately held to
+    the identical spec as the `dev` extra, so its presence in the runtime exports is correct.
+    """
+    runtime_exports = (
+        "requirements.lock",
+        "constraints.lock",
+        "docker/locks/requirements-core.lock",
+        "docker/locks/requirements-sqlserver.lock",
+    )
+    groups = _dependency_groups()
+    project_names = _project_declared_names()
+    toolchain = {
+        _dist_name(spec)
+        for specs in groups.values()
+        for spec in specs
+        if _dist_name(spec) and _dist_name(spec) not in project_names
+    }
+    assert toolchain, "no CI-toolchain-only names to check — this guard would pass vacuously"
+    print(
+        f"[ci-venv-pinning] checked {len(runtime_exports)} runtime exports for "
+        f"{len(toolchain)} toolchain-only name(s): {sorted(toolchain)}"
+    )
+
+    leaks: list[str] = []
+    for export in runtime_exports:
+        path = _REPO / export
+        assert path.is_file(), f"{export} is missing — the DEP-1 artifact set changed"
+        names = {name.split("==", 1)[0] for name in _exported_names(path)}
+        print(f"[ci-venv-pinning]   {export}: {len(names)} requirements")
+        leaks += [f"{export}: {name}" for name in sorted(toolchain & names)]
+    assert not leaks, (
+        "a [dependency-groups] name reached a RUNTIME export:\n  "
+        + "\n  ".join(leaks)
+        + "\nThe CI toolchain must stay in NON-DEFAULT groups. Check for a `[tool.uv] default-groups` "
+        "entry, or a group named `dev` (uv's implicit default group). A leaked name is in the release "
+        "SBOM, the container image locks, and what pip-audit reports as this project's runtime."
     )
 
 
@@ -512,27 +803,78 @@ def test_moved_tools_are_declared_in_a_dependency_group(package: str) -> None:
     )
 
 
+#: `pipx install <tool>` — the OTHER installer in this repo's workflows, and one `_PIP_INSTALL` cannot
+#: see (it anchors on `pip`/`pip3`, so `pipx` never matches). Not hypothetical: `quality-advisory.yml`
+#: already installs `ruff` with `pipx` twice, so it is in-repo idiom rather than a shape nobody would
+#: reach for. `pipx` has no `--require-hashes`, so a moved tool arriving this way is unpinnable.
+_PIPX_INSTALL = re.compile(r"\bpipx\s+(?:-\S+\s+)*install\b")
+
+
+def _pipx_targets(line: str) -> list[str]:
+    """The package tokens a ``pipx install`` line names — same token walk as `_install_targets`."""
+    match = _PIPX_INSTALL.search(line)
+    if match is None:
+        return []
+    return _tokens_after(line[match.end() :])
+
+
 def test_no_moved_tool_is_reinstalled_inline() -> None:
-    """No moved tool may ALSO be installed by an inline `pip install <tool>`.
+    """No moved tool may ALSO be installed by an inline `pip install <tool>` or `pipx install <tool>`.
 
     The regression: someone adds `pip install bandit` beside the lock install (to debug, or because a
     lock refresh was inconvenient). Both run, the last one wins, and the version that actually executes
     is the unpinned one — while every hash-pinning check above still passes, because they only ever
     look at the lock line.
+
+    TWO blind spots were closed here rather than left implied. (1) The scan covered only the three
+    workflows in `LOCK_INSTALLED_TOOLCHAINS`, so `pip install bandit` added to `ci.yml` or `codeql.yml`
+    was invisible — it now sweeps EVERY workflow. (2) `_PIP_INSTALL` does not match `pipx install`, which
+    this repo already uses, so that spelling defeated the guard entirely.
     """
+    workflows = sorted(_WORKFLOWS.glob("*.yml"))
+    assert workflows, f"no workflows found under {_WORKFLOWS} — this guard would pass vacuously"
+    print(
+        f"[ci-venv-pinning] swept {len(workflows)} workflow(s) for inline installs of "
+        f"{len(MOVED_TO_A_GROUP)} moved tool(s)"
+    )
     offenders = [
-        f"{workflow}: {package} named inline in {ln!r}"
-        for workflow in sorted({wf for wf, _ in LOCK_INSTALLED_TOOLCHAINS})
-        for ln in _code_lines(_WORKFLOWS / workflow)
-        if _PIP_INSTALL.search(ln)
+        f"{wf.name}: {package} named inline in {ln!r}"
+        for wf in workflows
+        for ln in _code_lines(wf)
+        if _PIP_INSTALL.search(ln) or _PIPX_INSTALL.search(ln)
         for package in MOVED_TO_A_GROUP
         if _names_target(ln, package)
+        or any(
+            target == package or target.startswith(tuple(f"{package}{op}" for op in _SPEC_OPS))
+            for target in _pipx_targets(ln)
+        )
     ]
     assert not offenders, (
         "a tool routed through a hash-pinned dependency group is ALSO installed inline:\n  "
         + "\n  ".join(offenders)
         + "\nRemove the inline install; bump the pin in pyproject.toml's [dependency-groups] and "
-        "re-export instead."
+        "re-export instead. (`pipx` has no --require-hashes at all, so that spelling cannot be pinned.)"
+    )
+
+
+def test_security_yml_pip_bootstrap_count_is_exact() -> None:
+    """`security.yml` carries exactly `SECURITY_YML_PIP_BOOTSTRAPS` unpinned `--upgrade pip` fetches.
+
+    `SECURITY_YML_ACCEPTED_UNPINNED` registers the NAME `pip`, so it cannot tell two accepted bootstraps
+    from twenty — and the inventory in this module claimed ONE while the file carried TWO (the `uv` install
+    in the DEP-1 step and the `semgrep` install). ADR 0034 §3 is the register a future session reads before
+    re-dismissing a Scorecard alert, so an inventory that undercounts is how a real finding becomes
+    invisible. Counted here so the number cannot drift out of the prose again.
+    """
+    lines = [ln for ln in _code_lines(_WORKFLOWS / "security.yml") if "--upgrade pip" in ln]
+    print(f"[ci-venv-pinning] security.yml --upgrade pip bootstraps: {len(lines)}")
+    for ln in lines:
+        print(f"[ci-venv-pinning]   {ln}")
+    assert len(lines) == SECURITY_YML_PIP_BOOTSTRAPS, (
+        f"security.yml has {len(lines)} `--upgrade pip` bootstrap(s), expected "
+        f"{SECURITY_YML_PIP_BOOTSTRAPS}: {lines}. Each surviving one is a Scorecard "
+        f"PinnedDependenciesID finding that ADR 0034 §3 must name as a residual. Removing one is good "
+        f"news — lower the constant. ADDING one needs a reason in that residuals table."
     )
 
 
