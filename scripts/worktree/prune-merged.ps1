@@ -21,6 +21,14 @@
                         git metadata has not been touched within -IdleHours, and it does not contain
                         another registered worktree.
 
+    "SIBLING" IS NOT A PREFIX MATCH. The candidate set used to be every registered worktree whose path
+    starts with `<primary>-`, which silently includes `<primary>-pins/.claude/worktrees/x` -- a
+    CLAUDE-MANAGED nested worktree, the exact place EnterWorktree relocates a live session to, and the
+    one population this header promised never to touch. Nested trees under the PRIMARY escaped only by
+    the accident that `<primary>/` is not `<primary>-`. Now anything living inside another registered
+    worktree, and anything with a `.claude/worktrees/` path segment, is excluded outright and listed as
+    a non-candidate. -Name cannot reach them either.
+
     THIS TOOL DESTROYS OTHER SESSIONS' WORK IF IT IS WRONG. It removed an occupied worktree once:
     `git worktree remove --force` deleted the .git pointer, deregistered the tree, then failed to
     delete the directory, leaving a folder git no longer recognised -- the session working there had
@@ -61,12 +69,22 @@
 
     FENCE UNAVAILABLE => NOTHING IS PRUNED, LOUDLY (exit 2). "The fence found nobody" and "the fence
     could not look" are the same empty answer, so availability is checked explicitly: at least one
-    config root with a session registry, and at least one readable record. When it is unavailable
-    every candidate becomes SKIP and the run exits non-zero rather than silently pruning unfenced.
-    There is deliberately no override flag. -IdleHours 0 and an explicit -ConfigRoot each REDUCE
-    assurance rather than bypassing it silently: both are named in red on the run and in the JSON
-    receipt, because an operator who believes they are fenced when they are not is worse off than one
-    who knows they aren't.
+    config root with a session registry, at least one readable record, and NO record that failed to
+    parse (an unparseable record's cwd is unknowable, so it cannot be cleared from any candidate -- and
+    a file caught half-written is precisely what a session that launched a second ago looks like). When
+    it is unavailable every candidate becomes SKIP and the run exits non-zero rather than silently
+    pruning unfenced, and the fence is re-read immediately before each removal so a fence that DIES
+    mid-run stops the rest. There is deliberately no override flag.
+
+    EVERYTHING THAT NARROWS THE FENCE IS DECLARED IN RED, on the run and in the JSON receipt --
+    -IdleHours 0, an -IdleHours below the 12h floor (an occupied worktree has been measured at 10.4h,
+    so anything under that releases trees that measurement says are in use), an explicit -ConfigRoot,
+    a FAILED fetch (merge decisions then rest on stale refs), a gh PR probe that errored, and every
+    -Name-confirmed worktree. -Name is the one worth spelling out: it is -IdleHours 0 scoped to one
+    tree, and since signal 1 has been measured vetoing 0 of 4 real siblings, `-Apply -Name <slug>` can
+    leave a candidate with no working occupancy signal at all. It stays available because there are
+    legitimate uses, but it is never silent -- an operator who believes they are fenced when they are
+    not is worse off than one who knows they aren't.
 
     OUTCOMES, NOT INTENTIONS. The summary counts what actually happened -- removed / failed / skipped,
     branches deleted / kept -- because a destructive tool that over-reports what it destroyed is
@@ -77,6 +95,20 @@
     recovery recipe for the orphaned case. `git worktree prune` is never run -- it deregisters ANY
     worktree whose directory is momentarily missing, including the .claude/worktrees ones this script
     must never touch, and it would finish the destruction a failed removal left half done.
+
+    AN ORPHAN OUTLIVES THE RUN THAT MADE IT, SO IT IS REMEMBERED. Once git has deregistered a worktree
+    it is no longer in `git worktree list`, so it drops out of the candidate set and the NEXT run
+    reported a green all-clear over a directory this script had broken -- the recovery recipe existed
+    only in the first run's scrollback. Every orphan is now recorded in <git-common-dir>/
+    prune-merged-orphans.json and re-reported, with the recipe, on every subsequent run until the
+    directory is gone or re-registered. A directory that still carries a .git FILE pointing into this
+    repo's worktree admin area while git no longer lists it is reported the same way, ledger or not.
+
+    EXIT CODES, highest severity wins: 0 nothing wrong; 1 something was attempted and failed without
+    destroying anything; 2 REFUSED -- nothing was attempted because safety could not be established
+    (bad cwd, unavailable fence, a -Name that matched nothing); 3 ORPHANED -- a directory is broken on
+    disk right now and needs the recovery recipe. 3 outranks 2 because damage on disk outranks a
+    refusal to act.
 
     A BRANCH IS NEVER FORCE-DELETED ON A STALE VERDICT. `git branch -d` refuses a branch merged only
     into origin/main when the local main lags, so `-D` used to be the ROUTINE path and git's last
@@ -127,7 +159,9 @@ param(
     # A worktree whose git metadata was touched more recently than this is treated as occupied. Default
     # 36h: longer than any plausible working day, because this is the only signal that sees a session
     # writing in by absolute path, and it was once measured within 1.6h of expiring on two OCCUPIED
-    # worktrees. 0 turns signal 2 OFF and the run says so in red.
+    # worktrees. 0 turns signal 2 OFF and the run says so in red -- and so does anything under the 12h
+    # floor, because only the literal 0 used to be declared: `-IdleHours 0.5`, typed for "half an hour",
+    # released every worktree on this repo and printed no warning at all.
     [double]$IdleHours = 36,
     # Liveness fence tolerance, passed through to the shared fence.
     [int]$StartSkewMinutes = 15,
@@ -147,6 +181,17 @@ $PSNativeCommandUseErrorActionPreference = $false
 $EXIT_OK = 0
 $EXIT_FAILED = 1   # something was attempted and did not fully succeed
 $EXIT_REFUSED = 2  # nothing was attempted, because safety could not be established
+$EXIT_ORPHANED = 3 # a directory is broken on disk right now (this run, or one before it)
+
+# The MOST SEVERE outcome decides the code, and severity is the numeric order above. A run that
+# refuses AND leaves an orphan must report the orphan: a refusal costs the operator a re-run, a broken
+# directory costs a session every git command it tries.
+$exit = $EXIT_OK
+function Set-Exit([int]$Code) { if ($Code -gt $script:exit) { $script:exit = $Code } }
+
+# The floor under -IdleHours. Signal 2 has been measured at 10.4h on a worktree that was demonstrably
+# occupied, so a window under this one releases trees that measurement says are in use.
+$IDLE_FLOOR_HOURS = 12
 
 function Write-Note([string]$Text, [string]$Colour = 'DarkGray') {
     if (-not $Json) { Write-Host $Text -ForegroundColor $Colour }
@@ -201,6 +246,11 @@ $reducedAssurance = @()
 if (-not $activityVeto) {
     $reducedAssurance += 'activity veto DISABLED (-IdleHours 0): signal 2 is OFF, so a session writing in by absolute path is invisible to this run'
 }
+elseif ($IdleHours -lt $IDLE_FLOOR_HOURS) {
+    # Only the literal 0 used to be declared. Everything between 0 and the floor disarmed signal 2 just
+    # as effectively and printed nothing.
+    $reducedAssurance += "activity window NARROWED to $IdleHours h (floor $IDLE_FLOOR_HOURS h): an OCCUPIED worktree has been measured at 10.4 h idle, so signal 2 will release trees somebody is in"
+}
 if ($ConfigRoot) {
     $reducedAssurance += "liveness fence scoped to an explicit -ConfigRoot ($($ConfigRoot -join ', ')): the machine's real session registry was NOT consulted"
 }
@@ -214,7 +264,12 @@ else {
     Write-Note "Fetching origin (--prune)..."
     & git -C $RepoRoot fetch origin --prune --quiet 2>$null
     if ($LASTEXITCODE -eq 0) { $fetched = $true; $fetchDetail = 'origin fetched (--prune)' }
-    else { $fetchDetail = "FETCH FAILED (exit $LASTEXITCODE): merge decisions are being made against stale refs" }
+    else {
+        $fetchDetail = "FETCH FAILED (exit $LASTEXITCODE): merge decisions are being made against stale refs"
+        # Its own text says the merge decisions rest on stale refs, which IS reduced assurance. It used
+        # to render in the same dark grey as "-SkipGh", below the notice an operator actually reads.
+        $reducedAssurance += $fetchDetail
+    }
 }
 
 # --- Merge signal --------------------------------------------------------------------------------
@@ -229,11 +284,13 @@ function Get-GitHubSlug([string]$Repo) {
 
 $ghSlug = if ($SkipGh) { $null } else { Get-GitHubSlug $RepoRoot }
 $hasGh = (-not $SkipGh) -and $ghSlug -and [bool](Get-Command gh -ErrorAction SilentlyContinue)
-$ghDetail =
-if ($SkipGh) { 'PR probe skipped (-SkipGh)' }
-elseif (-not $ghSlug) { 'PR probe skipped: origin is not a GitHub remote' }
-elseif (-not $hasGh) { 'PR probe skipped: gh is not installed' }
-else { "PR probe scoped to $ghSlug" }
+# The receipt is written AFTER the probes, from what they actually answered. It used to be decided up
+# front from "gh is installed and origin is GitHub", so an unauthenticated, rate-limited, offline or
+# unauthorised gh produced "PR probe scoped to <slug>" on a run where every probe errored -- the same
+# defect class (a receipt asserting a check that never ran) this script was rewritten to remove.
+$ghAttempts = 0
+$ghFailures = 0
+$ghFirstError = ''
 
 # Is `origin/main..<branch>` empty right now? Used twice: once as the cheap merge signal, and again
 # immediately before a branch delete, so a verdict formed seconds earlier can never authorise -D.
@@ -289,10 +346,20 @@ function Test-Merged {
     #    three, gh rejects the third, and this whole block silently never ran (it didn't, for a while)
     #    while the receipt still claimed a PR probe was scoped. Keep the comma tight.
     if ($hasGh) {
-        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid --limit 20 2>$null
-        if ($LASTEXITCODE -eq 0 -and $raw) {
+        $script:ghAttempts++
+        $raw = & gh pr list --repo $ghSlug --head $Branch --state merged --json number,headRefOid --limit 20 2>&1
+        $ghExit = $LASTEXITCODE
+        # 2>&1 folds stderr in as ErrorRecords; keep them out of the JSON but keep them as the reason.
+        $ghText = (@($raw | Where-Object { $_ -isnot [System.Management.Automation.ErrorRecord] }) -join "`n").Trim()
+        if ($ghExit -ne 0) {
+            $script:ghFailures++
+            $why = (@($raw) -join ' ').Trim()
+            if (-not $script:ghFirstError) { $script:ghFirstError = if ($why) { $why } else { "gh exited $ghExit" } }
+            $notes += "the merged-PR probe FAILED for this branch (gh exited $ghExit), so only the local merge signals were available"
+        }
+        if ($ghExit -eq 0 -and $ghText) {
             $prs = $null
-            try { $prs = @($raw | ConvertFrom-Json) } catch { $prs = @() }
+            try { $prs = @($ghText | ConvertFrom-Json) } catch { $prs = @() }
             $exact = @($prs | Where-Object { $_.headRefOid -eq $tip })
             if ($exact.Count -gt 0) {
                 return @{ Merged = $true; Reason = "PR #$($exact[0].number) merged at this exact tip"; Unique = $uniq; Notes = $notes; NeverUsed = $false }
@@ -358,17 +425,33 @@ function Get-WorktreeActivity {
 # Literal prefix, NOT -like: `-like` treats [ ] in a path as a character class, so a repo living under
 # a bracketed directory silently matches nothing (and every "was not pruned" assertion would pass
 # vacuously).
-$siblings = @($occ.Worktrees | Where-Object {
-        ($_.Path -replace '\\', '/').StartsWith("$RepoRootFwd-", [StringComparison]::OrdinalIgnoreCase) -and
-        $_.Branch -and -not $_.Bare -and -not $_.Detached
+$prefixed = @($occ.Worktrees | Where-Object {
+        ($_.Path -replace '\\', '/').StartsWith("$RepoRootFwd-", [StringComparison]::OrdinalIgnoreCase)
     })
 
-# Detached and bare siblings are never candidates, but say so rather than leaving the operator to
-# wonder whether they were considered at all.
-$excluded = @($occ.Worktrees | Where-Object {
-        ($_.Path -replace '\\', '/').StartsWith("$RepoRootFwd-", [StringComparison]::OrdinalIgnoreCase) -and
-        ($_.Detached -or $_.Bare -or -not $_.Branch)
-    })
+# Everything the prefix caught but that must never be a candidate -- said out loud rather than leaving
+# the operator to wonder whether it was considered at all.
+$siblings = @()
+$excluded = @()
+foreach ($w in $prefixed) {
+    $fwd = ($w.Path -replace '\\', '/')
+    # A worktree INSIDE another registered worktree is not a sibling of anything. `<primary>-pins/
+    # .claude/worktrees/x` passes the prefix test, and removing it destroys the Claude-managed checkout
+    # a live session was relocated into -- while the parent, protected by Get-NestedWorktrees, watches.
+    $containers = @(Get-ContainingWorktrees -Occupancy $occ -Path $w.Path)
+    if ($containers.Count -gt 0) {
+        $excluded += [pscustomobject]@{ Wt = $w; Why = "nested inside $(Split-Path $containers[-1].Path -Leaf)" }
+    }
+    # Belt and braces, and it survives the containing worktree being deregistered: this path shape is
+    # Claude-managed by construction, whoever currently owns it.
+    elseif ($fwd -match '(?i)/\.claude/worktrees/') {
+        $excluded += [pscustomobject]@{ Wt = $w; Why = 'Claude-managed (.claude/worktrees)' }
+    }
+    elseif ($w.Detached -or $w.Bare -or -not $w.Branch) {
+        $excluded += [pscustomobject]@{ Wt = $w; Why = 'detached/bare' }
+    }
+    else { $siblings += $w }
+}
 
 $namedMisses = @()
 if ($Name) {
@@ -387,6 +470,46 @@ if ($Name) {
 
 # --- One decision pass; two renderers ------------------------------------------------------------
 $idleCut = (Get-Date).AddHours(-1 * $IdleHours)
+
+# ONE cleanliness routine, called by the decision pass AND by the re-check immediately before removal.
+# The re-check used to collapse "the directory vanished", "git status exited 128", "an untracked file
+# appeared" and "somebody edited a tracked file" into the single string "no longer clean" -- discarding
+# the distinction at the exact moment an operator most needs it, because something changed underneath a
+# destructive run.
+# FAILS CLOSED: an unreadable status (a moved-away or half-deleted worktree exits 128 with no output)
+# used to be indistinguishable from "no changes" and pointed straight at destruction.
+function Test-WorktreeClean {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return @{ Clean = $false; Reasons = @('directory is missing (already half-removed? investigate before pruning)') }
+    }
+    $status = @(& git -C $Path --no-optional-locks status --porcelain 2>$null)
+    $statusExit = $LASTEXITCODE
+    if ($statusExit -ne 0) {
+        return @{ Clean = $false; Reasons = @("git status failed (exit $statusExit) -- cannot establish it is clean") }
+    }
+    $trackedChanges = @($status | Where-Object { $_ -notmatch '^\?\?' })
+    $untracked = @($status | Where-Object { $_ -match '^\?\?' })
+    $r = @()
+    if ($trackedChanges.Count -gt 0) { $r += "dirty: $($trackedChanges.Count) uncommitted tracked change(s)" }
+    # Untracked files are the one loss class with no recovery THROUGH GIT: not in the index, not in a
+    # stash, not in the reflog. (--force also deletes IGNORED files -- .venv, a dev DB, a generated
+    # corpus -- which git status never shows here; those are unrecoverable too, merely regenerable.)
+    # `--force` suppresses git's own refusal on them, so this must not wave them through.
+    if ($untracked.Count -gt 0) {
+        $r += "$($untracked.Count) untracked file(s) present -- --force would delete them unrecoverably"
+    }
+    return @{ Clean = ($r.Count -eq 0); Reasons = $r }
+}
+
+# The reported shape of an occupant. Shared with the -Apply re-check, which must WRITE BACK the
+# occupants it finds: a re-check veto used to leave `Occupants: []` on the one candidate the fence
+# actually stopped, so the run that signal 1 saved reported signal 1 as having contributed nothing.
+function ConvertTo-OccupantRows([object[]]$Rows) {
+    return @($Rows | ForEach-Object {
+            [pscustomobject]@{ Short = $_.Short; State = $_.State; Surface = $_.Entrypoint; Cwd = $_.Cwd; Worktree = $_.Worktree }
+        })
+}
 
 function Get-Decision {
     param([object]$Wt, [bool]$Confirmed)
@@ -432,33 +555,9 @@ function Get-Decision {
         $reasons += "liveness fence unavailable -- $($occ.Detail)"
     }
 
-    # Clean. FAILS CLOSED: an unreadable status (a moved-away or half-deleted worktree exits 128 with
-    # no output) used to be indistinguishable from "no changes" and pointed straight at destruction.
-    $clean = $false
-    if (-not (Test-Path -LiteralPath $Wt.Path)) {
-        $reasons += 'directory is missing (already half-removed? investigate before pruning)'
-    }
-    else {
-        $status = @(& git -C $Wt.Path --no-optional-locks status --porcelain 2>$null)
-        $statusExit = $LASTEXITCODE
-        if ($statusExit -ne 0) {
-            $reasons += "git status failed (exit $statusExit) -- cannot establish it is clean"
-        }
-        else {
-            $trackedChanges = @($status | Where-Object { $_ -notmatch '^\?\?' })
-            $untracked = @($status | Where-Object { $_ -match '^\?\?' })
-            if ($trackedChanges.Count -gt 0) {
-                $reasons += "dirty: $($trackedChanges.Count) uncommitted tracked change(s)"
-            }
-            # Untracked (NOT ignored -- .venv/node_modules never appear here) files are the one loss
-            # class with no recovery: not in the index, not in a stash, not in the reflog. `--force`
-            # suppresses git's own refusal on them, so this must not wave them through.
-            if ($untracked.Count -gt 0) {
-                $reasons += "$($untracked.Count) untracked file(s) present -- --force would delete them unrecoverably"
-            }
-            $clean = ($trackedChanges.Count -eq 0 -and $untracked.Count -eq 0)
-        }
-    }
+    $c = Test-WorktreeClean -Path $Wt.Path
+    $clean = [bool]$c.Clean
+    $reasons += @($c.Reasons)
 
     # Occupancy 2: recent activity. The signal that does not need a recorded cwd, and the only one that
     # saw the sessions signal 1 missed.
@@ -515,12 +614,14 @@ function Get-Decision {
         UniqueCommits = $unique
         Locked       = [bool]$Wt.Locked
         NestedWorktrees = @($nested | ForEach-Object { Split-Path $_.Path -Leaf })
-        Occupants    = @($occupants | ForEach-Object { [pscustomobject]@{ Short = $_.Short; State = $_.State; Surface = $_.Entrypoint; Cwd = $_.Cwd; Worktree = $_.Worktree } })
+        Occupants    = @(ConvertTo-OccupantRows $occupants)
         ActivityAgeHours = $activityAge
         Confirmed    = [bool]$Confirmed
         Outcome      = 'not attempted'
         OutcomeDetail = ''
-        BranchOutcome = 'kept'
+        # NOT 'kept': every skipped candidate then claimed a decision nobody made, and the JSON said 7
+        # branches were kept on a run whose summary said 0. 'kept' is now only ever set by a keep.
+        BranchOutcome = 'not attempted'
         BranchDetail  = ''
     }
 }
@@ -535,11 +636,33 @@ foreach ($s in $siblings) {
 }
 $prunable = @($decisions | Where-Object { $_.Decision -eq 'PRUNE' })
 
+# -Name is the loudest thing an operator can do to the fence: it is -IdleHours 0 scoped to one tree,
+# and signal 1 has been measured vetoing 0 of 4 real siblings. It used to produce only a grey `note:`
+# line, while the flag it is equivalent to got a red banner.
+$confirmedActually = @($decisions | Where-Object { $_.Confirmed } | ForEach-Object { $_.Leaf })
+if ($confirmedActually.Count -gt 0) {
+    $reducedAssurance += "activity veto OVERRIDDEN by -Name for: $($confirmedActually -join ', ') -- signal 2 is off for those, and signal 1 has been measured vetoing 0 of 4 real siblings"
+}
+
+# The gh receipt, written from what the probes ANSWERED (see Test-Merged).
+$ghDetail =
+if ($SkipGh) { 'PR probe skipped (-SkipGh)' }
+elseif (-not $ghSlug) { 'PR probe skipped: origin is not a GitHub remote' }
+elseif (-not $hasGh) { 'PR probe skipped: gh is not installed' }
+elseif ($ghAttempts -eq 0) { "PR probe available ($ghSlug) but no candidate reached the merge test" }
+elseif ($ghFailures -eq 0) { "PR probe scoped to ${ghSlug}: $ghAttempts candidate(s) probed" }
+else { "PR probe scoped to $ghSlug FAILED on $ghFailures of $ghAttempts candidate(s): $ghFirstError" }
+if ($ghFailures -gt 0) {
+    $reducedAssurance += "the merged-PR probe FAILED on $ghFailures of $ghAttempts candidate(s): the exact-tip merge signal was unavailable for them ($ghFirstError)"
+}
+
 # --- The fence receipt: count what was EXAMINED, not what was found ------------------------------
 $liveInRepo = @($occ.Sessions | Where-Object { Test-OccupancyVeto $_.State }).Count
 # What signal 1 actually CONTRIBUTED here, which is not the same as how many sessions it saw. On this
 # repo the honest number has been 0 of 4 while three of those worktrees were occupied in fact.
-$fenceVetoed = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
+# Recomputed AFTER the apply loop, because a re-check veto is a signal-1 contribution too.
+$fenceVetoedAtDecision = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
+$fenceVetoed = $fenceVetoedAtDecision
 $blindSpots = @(
     'a session writing into a worktree by absolute path from elsewhere (29% of writes on this repo)',
     'a cwd recorded as a UNC or 8.3 short path',
@@ -552,8 +675,8 @@ if (-not $Json) {
     if ($occ.Available) {
         Write-Host ("Occupancy fence: {0} config root(s), {1} record(s) examined, {2} live session(s) in this repo family." -f
             $occ.RootsExamined, $occ.RecordsExamined, $liveInRepo) -ForegroundColor DarkCyan
-        Write-Host ("  Sessions it placed INSIDE a candidate: {0} of {1} candidate(s) vetoed by signal 1." -f
-            $fenceVetoed, $decisions.Count) -ForegroundColor DarkCyan
+        Write-Host ("  Sessions it placed INSIDE a candidate: {0} of {1} candidate(s) vetoed by signal 1 (at decision time)." -f
+            $fenceVetoedAtDecision, $decisions.Count) -ForegroundColor DarkCyan
     }
     else {
         Write-Host "Occupancy fence UNAVAILABLE -- $($occ.Detail)." -ForegroundColor Red
@@ -582,17 +705,76 @@ if (-not $Json) {
         Write-Host "  (no candidates)" -ForegroundColor DarkGray
     }
     foreach ($e in $excluded) {
-        Write-Host ("{0,-42} {1,-30} not a candidate (detached/bare)" -f (Split-Path $e.Path -Leaf), $e.Branch) -ForegroundColor DarkGray
+        Write-Host ("{0,-42} {1,-30} not a candidate ({2})" -f (Split-Path $e.Wt.Path -Leaf), $e.Wt.Branch, $e.Why) -ForegroundColor DarkGray
     }
     foreach ($n in $namedMisses) {
-        Write-Host "  -Name '$n' matched no sibling worktree." -ForegroundColor Yellow
+        Write-Host "  -Name '$n' matched no PRUNABLE sibling worktree (it may be nested, detached, or not exist)." -ForegroundColor Yellow
     }
 }
 
+# --- Orphans this script left behind on an EARLIER run -------------------------------------------
+# Once git deregisters a worktree it leaves `git worktree list` and therefore the candidate set, so the
+# next run printed a green all-clear over a directory this script had broken and the recovery recipe
+# survived only in the first run's scrollback. Two independent detectors, because either can be true
+# alone: a ledger written at the moment of the failure, and a directory still carrying a .git FILE that
+# points into this repo's worktree admin area while git no longer lists it.
+$gitCommonDir = ''
+$cd = & git -C $RepoRoot rev-parse --path-format=absolute --git-common-dir 2>$null
+if ($LASTEXITCODE -eq 0 -and $cd) { $gitCommonDir = ([string]$cd).Trim() }
+$ledgerPath = if ($gitCommonDir) { Join-Path $gitCommonDir 'prune-merged-orphans.json' } else { '' }
+
+function Read-OrphanLedger {
+    if (-not $ledgerPath -or -not (Test-Path -LiteralPath $ledgerPath)) { return @() }
+    try { return @(Get-Content -LiteralPath $ledgerPath -Raw -EA Stop | ConvertFrom-Json -EA Stop) }
+    catch { return @() }
+}
+
+# Still broken RIGHT NOW: on disk, and not registered. An entry that was repaired (re-added) or fully
+# deleted clears itself, so the ledger cannot nag about a state that no longer exists.
+function Get-LiveOrphans([object[]]$Ledger) {
+    $registered = @{}
+    foreach ($w in @(Get-RepoWorktrees $RepoRoot)) { $registered[(ConvertTo-Norm $w.Path)] = $true }
+    $seen = @{}
+    $out = @()
+    foreach ($e in $Ledger) {
+        $p = [string]$e.path
+        if (-not $p) { continue }
+        $n = ConvertTo-Norm $p
+        if ($registered.ContainsKey($n) -or -not (Test-Path -LiteralPath $p)) { continue }
+        if ($seen.ContainsKey($n)) { continue }
+        $seen[$n] = $true
+        $out += [pscustomobject]@{ Path = $p; Leaf = (Split-Path $p -Leaf); Branch = [string]$e.branch; At = [string]$e.at; Why = 'a previous run of this script failed to finish removing it' }
+    }
+    # The ledger-free detector: an unregistered sibling directory whose .git pointer still names this
+    # repo. Deliberately NOT "any unregistered <repo>-* directory" -- an unrelated folder sharing the
+    # prefix is not an orphan, and a destructive tool that cries wolf gets ignored.
+    $parent = Split-Path $RepoRoot -Parent
+    foreach ($dir in @(Get-ChildItem -LiteralPath $parent -Directory -Force -EA SilentlyContinue |
+            Where-Object { $_.Name.StartsWith("$RepoLeaf-", [StringComparison]::OrdinalIgnoreCase) })) {
+        $n = ConvertTo-Norm $dir.FullName
+        if ($registered.ContainsKey($n) -or $seen.ContainsKey($n)) { continue }
+        $dotgit = Join-Path $dir.FullName '.git'
+        if (-not (Test-Path -LiteralPath $dotgit -PathType Leaf)) { continue }
+        $txt = ''
+        try { $txt = Get-Content -LiteralPath $dotgit -Raw -EA Stop } catch { continue }
+        if ($txt -notmatch 'gitdir:\s*(.+)') { continue }
+        $target = ConvertTo-Norm ($Matches[1].Trim())
+        if (-not $gitCommonDir -or -not $target.StartsWith((ConvertTo-Norm $gitCommonDir) + '/')) { continue }
+        $seen[$n] = $true
+        $out += [pscustomobject]@{ Path = $dir.FullName; Leaf = $dir.Name; Branch = ''; At = ''; Why = 'it still points into this repo''s worktree admin directory, but git no longer lists it' }
+    }
+    return $out
+}
+
+$ledger = @(Read-OrphanLedger)
+# Scanned BEFORE the apply loop, so this run's own orphans are reported as this run's, not as history.
+$priorOrphans = @(Get-LiveOrphans $ledger)
+
 # --- Apply ---------------------------------------------------------------------------------------
 $removed = 0; $failed = 0; $branchesDeleted = 0; $branchesKept = 0; $orphaned = 0
-$exit = $EXIT_OK
-if (-not $occ.Available) { $exit = $EXIT_REFUSED }
+$newOrphans = @()
+if (-not $occ.Available) { Set-Exit $EXIT_REFUSED }
+if ($priorOrphans.Count -gt 0) { Set-Exit $EXIT_ORPHANED }
 
 # Delete the branch only when the delete is provably lossless AT THIS MOMENT. `-d` refuses a branch
 # merged only into origin/main whenever the local main lags (it usually does), so `-D` was the routine
@@ -621,6 +803,7 @@ function Remove-BranchSafely {
     return @{ Outcome = 'kept'; Detail = ($out -join ' ').Trim() }
 }
 
+$occ2 = $null
 if ($Apply -and $prunable.Count -gt 0) {
     # Re-read occupancy immediately before acting: the decision pass above costs a gh round trip per
     # candidate, and a session can arrive inside that window.
@@ -633,7 +816,7 @@ if ($Apply -and $prunable.Count -gt 0) {
         if (-not $occ2.Available) {
             $d.Outcome = 'skipped'
             $d.OutcomeDetail = "re-check: fence became unavailable ($($occ2.Detail))"
-            $exit = $EXIT_REFUSED
+            Set-Exit $EXIT_REFUSED
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
@@ -641,6 +824,10 @@ if ($Apply -and $prunable.Count -gt 0) {
         if ($now.Count -gt 0) {
             $d.Outcome = 'skipped'
             $d.OutcomeDetail = "re-check: a session arrived ($(($now | ForEach-Object { $_.Short }) -join ', '))"
+            # WRITE IT BACK. Without this the candidate the fence just saved still reports `Occupants:
+            # []`, and the receipt's "vetoed by signal 1" figure -- the number that exists precisely so
+            # "the fence ran" cannot imply "the fence covered it" -- under-reports the save to zero.
+            $d.Occupants = @(ConvertTo-OccupantRows $now)
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
@@ -651,10 +838,32 @@ if ($Apply -and $prunable.Count -gt 0) {
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
-        $recheck = @(& git -C $d.Path --no-optional-locks status --porcelain 2>$null)
-        if ($LASTEXITCODE -ne 0 -or $recheck.Count -gt 0) {
+        # Signal 2, re-read. It was the ONE signal missing from this block, and it is the only one with
+        # measured coverage of the class of worktree this tool prunes (signal 1 vetoed 0 of 4 real
+        # siblings). The window is a gh round trip per candidate -- measured at 0.56s -- plus every
+        # removal before this one, which is exactly the interval the re-check exists to close.
+        if ($activityVeto -and -not $d.Confirmed) {
+            $a2 = Get-WorktreeActivity -Path $d.Path
+            $cut2 = (Get-Date).AddHours(-1 * $IdleHours)
+            if ($null -eq $a2) {
+                $d.Outcome = 'skipped'
+                $d.OutcomeDetail = 're-check: activity became unreadable -- cannot establish nobody is in it'
+                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+                continue
+            }
+            if ($a2 -gt $cut2) {
+                $d.Outcome = 'skipped'
+                $d.OutcomeDetail = "re-check: git metadata was touched $([math]::Round(((Get-Date) - $a2).TotalHours, 2)) h ago, inside the $IdleHours h window"
+                Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
+                continue
+            }
+        }
+        # Same routine the decision pass used, so the reason survives: this used to flatten a vanished
+        # directory, an exit-128 status, an untracked file and a real edit into "no longer clean".
+        $c2 = Test-WorktreeClean -Path $d.Path
+        if (-not $c2.Clean) {
             $d.Outcome = 'skipped'
-            $d.OutcomeDetail = 're-check: no longer clean'
+            $d.OutcomeDetail = "re-check: $($c2.Reasons -join '; ')"
             Write-Note "  SKIPPED: $($d.OutcomeDetail)" 'Yellow'
             continue
         }
@@ -691,8 +900,13 @@ if ($Apply -and $prunable.Count -gt 0) {
         elseif ($removeExit -eq 0) {
             # git said it worked and it did not. Do NOT touch the branch on an unverified removal.
             $failed++
-            $exit = $EXIT_FAILED
+            Set-Exit $EXIT_FAILED
             $d.Outcome = 'failed'
+            # A DELIBERATE keep, so it is counted as one. The failure paths used to leave the branch
+            # alone and say so in prose while the summary reported "0 kept".
+            $d.BranchOutcome = 'kept'
+            $d.BranchDetail = 'the removal could not be verified, so the branch was left alone'
+            $branchesKept++
             $d.OutcomeDetail = "git reported success but the directory $(if ($dirExists) { 'still exists' } else { 'is gone' }) and it is $(if ($stillRegistered) { 'STILL REGISTERED' } else { 'deregistered' }); branch '$($d.Branch)' was left alone"
             Write-Note "  FAILED: $($d.OutcomeDetail)" 'Red'
         }
@@ -701,7 +915,10 @@ if ($Apply -and $prunable.Count -gt 0) {
             # deregisters the worktree before it walks the tree, and it deregisters even when that walk
             # fails ("no going back from here"). Diagnose what actually survived.
             $failed++
-            $exit = $EXIT_FAILED
+            Set-Exit $EXIT_FAILED
+            $d.BranchOutcome = 'kept'
+            $d.BranchDetail = 'the removal failed, so the branch was left alone'
+            $branchesKept++
             $fileCount = 0
             if ($dirExists) {
                 $probe = @(Get-ChildItem -LiteralPath $d.Path -Recurse -File -Force -EA SilentlyContinue | Select-Object -First 501)
@@ -717,7 +934,11 @@ if ($Apply -and $prunable.Count -gt 0) {
             }
             elseif (-not $ptrExists -or -not $stillRegistered) {
                 $orphaned++
+                Set-Exit $EXIT_ORPHANED
                 $d.Outcome = 'orphaned'
+                # Remembered on disk: git has deregistered it, so it will not be in the candidate set of
+                # any future run and nothing else would ever mention it again.
+                $newOrphans += [pscustomobject]@{ path = $d.Path; branch = $d.Branch; at = (Get-Date).ToString('o'); detail = $err }
                 $ptrText = if ($ptrExists) { 'intact' } else { 'DELETED' }
                 $d.OutcomeDetail = "ORPHANED: .git pointer $ptrText, $fileText file(s) left, registered=$stillRegistered ($err)"
                 Write-Note "  FAILED (exit $removeExit): $err" 'Red'
@@ -754,6 +975,31 @@ elseif ($Apply) {
 }
 
 $skipped = @($decisions | Where-Object { $_.Decision -eq 'SKIP' -or $_.Outcome -eq 'skipped' }).Count
+# Now that the apply loop has run, count what signal 1 ACTUALLY stopped -- including the re-check saves.
+$fenceVetoed = @($decisions | Where-Object { $_.Occupants.Count -gt 0 }).Count
+if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
+    Write-Host ("  Signal 1 vetoed {0} further candidate(s) during the removal pass (total {1} of {2})." -f
+        ($fenceVetoed - $fenceVetoedAtDecision), $fenceVetoed, $decisions.Count) -ForegroundColor DarkCyan
+}
+
+# -Name asked for something that does not exist, so the operator's instruction was NOT carried out. It
+# used to print one yellow line and exit 0 with a green summary -- the same "green no-op" shape as the
+# wrong-cwd case this script now refuses outright.
+if ($namedMisses.Count -gt 0) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
+
+# Persist the orphan ledger: what is still broken, plus anything this run broke. Written only under
+# -Apply -- a dry run reports the same state without touching anything.
+$ledgerOut = @()
+foreach ($o in $priorOrphans) { $ledgerOut += [pscustomobject]@{ path = $o.Path; branch = $o.Branch; at = $o.At; detail = $o.Why } }
+$ledgerOut += $newOrphans
+$ledgerNote = ''
+if ($Apply -and $ledgerPath) {
+    try {
+        if ($ledgerOut.Count -gt 0) { ($ledgerOut | ConvertTo-Json -Depth 4 -AsArray) | Set-Content -LiteralPath $ledgerPath -Encoding utf8 }
+        elseif (Test-Path -LiteralPath $ledgerPath) { Remove-Item -LiteralPath $ledgerPath -Force }
+    }
+    catch { $ledgerNote = "could not write the orphan ledger at ${ledgerPath}: $($_.Exception.Message)" }
+}
 
 # --- Report --------------------------------------------------------------------------------------
 if ($Json) {
@@ -761,12 +1007,21 @@ if ($Json) {
         repoRoot = $RepoRoot
         apply    = [bool]$Apply
         fence    = [pscustomobject]@{
-            available          = [bool]$occ.Available
+            # FAIL-CLOSED HEADLINE: false if the fence was unavailable at EITHER read. It used to report
+            # the decision-pass verdict only, so a fence that died mid-run produced `available: true`
+            # next to `exitCode: 2` with no field to reconcile them.
+            available          = ([bool]$occ.Available -and ($null -eq $occ2 -or [bool]$occ2.Available))
+            availableAtDecision = [bool]$occ.Available
+            availableAtApply   = if ($null -eq $occ2) { $null } else { [bool]$occ2.Available }
             detail             = $occ.Detail
+            detailAtApply      = if ($null -eq $occ2) { '' } else { [string]$occ2.Detail }
             rootsExamined      = $occ.RootsExamined
             recordsExamined    = $occ.RecordsExamined
+            recordsUnplaceable = $occ.RecordsUnplaceable
+            unplaceableFiles   = @($occ.UnplaceableFiles)
             liveInRepo         = $liveInRepo
             vetoedCandidates   = $fenceVetoed
+            vetoedCandidatesAtDecision = $fenceVetoedAtDecision
             blindSpots         = $blindSpots
             idleHours          = $IdleHours
             activityVeto       = $activityVeto
@@ -775,15 +1030,23 @@ if ($Json) {
         refs     = $fetchDetail
         fetched  = $fetched
         gh       = $ghDetail
+        ghProbes = [pscustomobject]@{ attempted = $ghAttempts; failed = $ghFailures; firstError = $ghFirstError }
         candidates = @($decisions)
-        excluded = @($excluded | ForEach-Object { [pscustomobject]@{ leaf = (Split-Path $_.Path -Leaf); reason = 'detached/bare' } })
+        excluded = @($excluded | ForEach-Object { [pscustomobject]@{ leaf = (Split-Path $_.Wt.Path -Leaf); reason = $_.Why } })
         namedMisses = @($namedMisses)
+        orphansFromEarlierRuns = @($priorOrphans | ForEach-Object { [pscustomobject]@{ leaf = $_.Leaf; path = $_.Path; branch = $_.Branch; why = $_.Why } })
+        ledger   = [pscustomobject]@{ path = $ledgerPath; persisted = ($Apply -and -not $ledgerNote); note = $ledgerNote }
         counts   = [pscustomobject]@{
             candidates      = $decisions.Count
             prunable        = $prunable.Count
             removed         = $removed
+            # `orphaned` is a SUBSET of `failed`, not a sibling of it: removed+failed+skipped covers
+            # every candidate exactly once. failedNonOrphan is spelled out so a consumer cannot reach
+            # the wrong total by adding all four.
             failed          = $failed
+            failedNonOrphan = ($failed - $orphaned)
             orphaned        = $orphaned
+            orphansFromEarlierRuns = $priorOrphans.Count
             skipped         = $skipped
             branchesDeleted = $branchesDeleted
             branchesKept    = $branchesKept
@@ -804,13 +1067,42 @@ if (-not $Apply) {
     }
 }
 else {
-    # Outcomes, not intentions.
-    $orphanText = if ($orphaned) { " ($orphaned ORPHANED)" } else { "" }
-    Write-Host "Done. removed $removed, failed $failed$orphanText, skipped $skipped of $($decisions.Count) candidate(s)." -ForegroundColor $(if ($failed) { 'Red' } else { 'Green' })
+    # Outcomes, not intentions. Coloured by the EXIT CODE, not by $failed: a run where the fence died
+    # and every removal was refused has failed 0 and used to print that line in green next to exit 2.
+    $orphanText = if ($orphaned) { " ($orphaned ORPHANED, counted inside failed)" } else { "" }
+    Write-Host "Done. removed $removed, failed $failed$orphanText, skipped $skipped of $($decisions.Count) candidate(s)." -ForegroundColor $(if ($exit -eq $EXIT_OK) { 'Green' } else { 'Red' })
     Write-Host "  branches: $branchesDeleted deleted, $branchesKept kept." -ForegroundColor DarkGray
 }
+
+# Orphans from an EARLIER run. Git no longer lists them, so nothing else in this report would.
+if ($priorOrphans.Count -gt 0) {
+    Write-Host ""
+    Write-Host "$($priorOrphans.Count) ORPHANED director(ies) from an earlier run are still broken on disk:" -ForegroundColor Red
+    foreach ($o in $priorOrphans) {
+        Write-Host "  $($o.Leaf)  --  $($o.Why)" -ForegroundColor Red
+        Write-Host "    Any session working there sees 'fatal: not a git repository'. Recover it:" -ForegroundColor Red
+        Write-Host "      1. close anything holding files open in it (an editor, a shell sitting in it)" -ForegroundColor Red
+        Write-Host "      2. Move-Item '$($o.Path)' '$($o.Path).salvage'" -ForegroundColor Red
+        Write-Host "      3. git -C '$RepoRoot' worktree add '$($o.Path)'$(if ($o.Branch) { " '$($o.Branch)'" })" -ForegroundColor Red
+        Write-Host "      4. copy anything you need out of '$($o.Path).salvage'" -ForegroundColor Red
+    }
+    if (-not $Apply) { Write-Host "  (this list is re-derived every run; it clears itself once the directory is gone or re-registered)" -ForegroundColor DarkGray }
+}
+if ($ledgerNote) { Write-Host "  NOTE: $ledgerNote" -ForegroundColor Yellow }
+
 foreach ($r in $reducedAssurance) { Write-Host "  REDUCED ASSURANCE: $r" -ForegroundColor Red }
-if (-not $occ.Available) {
-    Write-Host "  Exit 2: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
+if ($exit -eq $EXIT_REFUSED) {
+    if (-not $occ.Available -or ($null -ne $occ2 -and -not $occ2.Available)) {
+        Write-Host "  Exit 2: the occupancy fence was unavailable, so nothing was eligible. Fix the fence, don't bypass it." -ForegroundColor Red
+        if ($null -ne $occ2 -and -not $occ2.Available) {
+            Write-Host "    It was available when the table was built and gone by the time of the removal: $($occ2.Detail)" -ForegroundColor Red
+        }
+    }
+    if ($namedMisses.Count -gt 0) {
+        Write-Host "  Exit 2: -Name named $($namedMisses -join ', '), which matched no prunable sibling, so what you asked for did not happen." -ForegroundColor Red
+    }
+}
+elseif ($exit -eq $EXIT_ORPHANED) {
+    Write-Host "  Exit 3: a directory is broken on disk RIGHT NOW. It is not a failed no-op -- follow the recipe above." -ForegroundColor Red
 }
 exit $exit

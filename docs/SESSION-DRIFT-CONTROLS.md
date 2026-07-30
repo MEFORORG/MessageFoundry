@@ -313,6 +313,16 @@ and `prune-merged.ps1` are sibling-only, so the nested population — where ever
 > perfectly clean and `--force` used to delete both, leaving the nested one registered with no
 > directory. A session in a nested tree now vetoes its ancestor too. Still true: the candidate set is
 > sibling-only, so the nested population has no scripted teardown.
+>
+> **Correction, same day.** "The candidate set is sibling-only" was *stated* but not *true*. The set was
+> a bare `<primary>-` **prefix match**, and `<primary>-pins/.claude/worktrees/x` starts with
+> `<primary>-` — so a Claude-managed nested worktree under a **sibling** was a candidate in its own
+> right and was removed, with its branch, while the containment veto above protected only its parent.
+> Nested trees under the **primary** were excluded by the accident that `<primary>/` is not
+> `<primary>-`, which is the only case anyone had tested. Fixed: anything nested inside another
+> registered worktree, or carrying a `.claude/worktrees/` path segment, is excluded from the candidate
+> set and unreachable by `-Name`. The teardown gap itself is unchanged — nested worktrees still have no
+> scripted removal, they are now merely safe from this script.
 
 ### G12 — The gate has never produced a receipt — **FIXED**
 
