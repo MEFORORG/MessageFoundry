@@ -12,7 +12,8 @@
   **operator/infra responsibility** — MEFOR "designs for the VIP and exposes the health-check/role
   endpoints, but **does not ship a load balancer** — you stand it up (keepalived, HAProxy, F5, a cloud
   NLB, …)" ([DEPLOYMENT.md](../DEPLOYMENT.md) §"High availability"; [CLUSTERING.md](../CLUSTERING.md)
-  §"Client reconnect"; `docs/marketing/ha-failover-research-2026-06-14.md`, a local research note).
+  §"Client reconnect"; `docs/marketing/ha-failover-research-2026-06-14.md`, a local research note that
+  is not published here — see [SECURITY-DOCS-POLICY.md](../SECURITY-DOCS-POLICY.md)).
   This ADR adds an **opt-in** path where the **engine itself** owns the VIP, tied to the leadership
   lease. It does **not** retract the external path — that stays the default and the recommended posture
   for the strictest split-brain guarantee.

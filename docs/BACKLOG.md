@@ -4,7 +4,9 @@ The **Next up** item is the active priority (the next major effort). The numbere
 intentionally deferred — not blocking, and not an open security exposure on the shipping
 configuration (SQLite store, single uvicorn worker, localhost + auth). Each numbered item names the
 originating review finding(s) so the full context (file:line + proposed fix) can be looked up in the
-cited report.
+cited report. Several of those reports — the `docs/reviews/` and `docs/security/` sets — are
+maintainer-internal and will not resolve here; [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)
+states the rule that decides what is withheld and what you can request.
 
 ---
 
@@ -393,7 +395,7 @@ carries no open network exposure. The gaps below are **by design and tracked** �
   on/near the ingress hot path. Both are pure-Python (DoS-class worst case, contained by the pre-parse
   size/segment caps + parse-fail→dead-letter routing), but no vendored-patch / migration plan exists if a
   parsing CVE is disclosed while upstream stays dormant. *(Source:
-  [`reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md`](reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md).)*
+  `reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md`.)*
 
 **Recommended next steps (sequenced in the plan):**
 - *Before any network exposure:* **enable `[auth].require_mfa`** (MFA is built — WP-14 native TOTP; the
@@ -406,7 +408,7 @@ carries no open network exposure. The gaps below are **by design and tracked** �
   throttling — DoS protection for the pre-auth HTTP/TLS parsers (uvicorn/httptools, OpenSSL) and the argon2
   path, which off-loopback become remotely reachable before auth — is unconfirmed. Provide it at the WP-15
   reverse proxy or in-engine. *(Source:
-  [`reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md`](reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md),
+  `reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md`,
   off-loopback delta.)*
 - ✅ **DONE — close (or formally accept) the remaining ASVS L3 Fails:** **0 open Fails — all controls
   built or documented-residual.** 6.3.3 MFA, 8.4.2 admin defense, and 16.4.3 off-box logs closed earlier;
@@ -713,7 +715,7 @@ independent order-group (e.g. per-MRN), ordered inside each group — there is n
 scale-out track for it to complement. A single strictly-
 ordered stream is capped at one core in **every** engine (Mirth serial-per-channel by default, etc.);
 order-group sharding is how you exceed that without sacrificing order. **Long-term, low-priority** —
-revisit only if a real single-feed workload demands it. (See [THROUGHPUT-IMPROVEMENTS.md](THROUGHPUT-IMPROVEMENTS.md)
+revisit only if a real single-feed workload demands it. (See [THROUGHPUT-IMPROVEMENTS.md](archive/throughput/THROUGHPUT-IMPROVEMENTS.md)
 for the complementary per-inbound / multi-process scaling axes.)
 
 **Source:** `docs/hl7-message-ordering-reference.md` (engine survey + design implications); owner
@@ -2655,7 +2657,7 @@ no-op/advisory off an editable dev install so it never bricks development. **Sou
 
 > ✅ **Synthesized into numbered candidates (2026-06-28).** The NEW (untracked) gaps below were promoted to **#65–#85** (1 do-next · 14 demand-gate · 3 declined-by-design · #77 tombstoned as already-built), each adversarially reviewed against the code-first/on-prem identity. #52 stays the cross-reference index; the per-item entries are the source of truth.
 
-> 🔎 **Extended by a help-export coverage sweep (2026-07-09) → items #107–#142.** The analysis above was built from the product's capability surface; a five-pass sweep of the **v8.1.0 HTML help export** (1,569 pages) then found **36 further capabilities** absent from both this analysis and the backlog — **8 moderate · 28 minor, and no new MAJOR gap**. Narrative + a post-mortem of one void (prompt-biased) pass: [`marketing/corepoint-gap-analysis-addendum.md`](marketing/corepoint-gap-analysis-addendum.md).
+> 🔎 **Extended by a help-export coverage sweep (2026-07-09) → items #107–#142.** The analysis above was built from the product's capability surface; a five-pass sweep of the **v8.1.0 HTML help export** (1,569 pages) then found **36 further capabilities** absent from both this analysis and the backlog — **8 moderate · 28 minor, and no new MAJOR gap**. Narrative + a post-mortem of one void (prompt-biased) pass: `marketing/corepoint-gap-analysis-addendum.md`.
 
 > 🧭 **Coverage audit (2026-07-09) → items #143–#184. Every gap in this analysis now has a disposition.** All **246** capabilities were triaged against **current `origin/main`**: **55 already shipped · 77 already tracked · 50 declined-by-design · 7 not-a-gap · 55 open+untracked (→ 42 distinct, filed as #143–#184)**.
 >
@@ -2667,7 +2669,7 @@ no-op/advisory off an editable dev install so it never bricks development. **Sou
 **Corepoint Integration Engine v8.1.0** vs MessageFoundry: **393 distinct capabilities**, each classified
 **HAS / PARTIAL / GAP / EXCEEDS / DECLINED** and **grep-verified against the codebase**.
 Tally: **HAS 133 · PARTIAL 147 · GAP 65 · EXCEEDS 27 · DECLINED 21**. Full report (local-only, gitignored):
-[`marketing/corepoint-gap-analysis.md`](marketing/corepoint-gap-analysis.md).
+`marketing/corepoint-gap-analysis.md`.
 
 This item is the **tracking anchor + cross-reference index**; promote individual rows below to their own
 numbered items as they're scheduled. Each line notes whether it maps to an **existing** backlog item/ADR or
@@ -3082,7 +3084,7 @@ cluster** with **#34** / **#47** / **#62**. Surfaced by the 2026-06-28 DB write-
 Audit + PerfStats) under **AlwaysOn AG**, ~**11 KB/msg** — and Corepoint names **DB durable-write I/O as the
 leading performance driver**. The strategy + the **no-rewrite / no-broker** decision are
 [**ADR 0051**](adr/0051-corepoint-throughput-parity-strategy.md); the engineering note is
-[`THROUGHPUT-IMPROVEMENTS.md`](THROUGHPUT-IMPROVEMENTS.md) §5.
+[`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5.
 
 **Honest verdict (2026-06-28).** NOT at demonstrated parity at 45M/day (the earlier "at parity" claim was vs
 Rhapsody *marketing*, not this spec): **compute** unvalidated (only `E_core ≈ 42 msg/s` measured on an
@@ -3096,7 +3098,7 @@ encrypt-by-default, **not** inefficiency (the "~2× vs Corepoint" was estimate-v
    **Windows Server 2025 + SQL Server 2025 box (#40)** via the load harness (#28 / #29) — against the
    **9,200-IOPS / ~11 KB-msg / 20 + 16-core** target. Pins `E_core` (42 vs 84 vs 400) + the binding axis.
    **Nothing builds before it.**
-2. **Group-commit** — the #1 unbuilt durable-write lever ([`THROUGHPUT-IMPROVEMENTS.md`](THROUGHPUT-IMPROVEMENTS.md)
+2. **Group-commit** — the #1 unbuilt durable-write lever ([`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md)
    §2); its **own ADR** when built — *iff* the run shows durable-write-bound.
 3. **Lean-writes / carriage cluster** — **#62** (VARBINARY carriage) / **#63** (`message_events` knob) /
    **#47** (embedded-doc pruning) / **#34** (retention).
@@ -3107,7 +3109,7 @@ encrypt-by-default, **not** inefficiency (the "~2× vs Corepoint" was estimate-v
 **Priority / gating.** P2, **owner / measure-gated** — the roadmap exists; the build of each lever waits on the
 validation run. Sibling to **#52** (Corepoint *capability* parity). Decision:
 [ADR 0051](adr/0051-corepoint-throughput-parity-strategy.md). Plan doc:
-[`THROUGHPUT-IMPROVEMENTS.md`](THROUGHPUT-IMPROVEMENTS.md) §5. Surfaced by the 2026-06-28 Corepoint 45M/day spec
+[`THROUGHPUT-IMPROVEMENTS.md`](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) §5. Surfaced by the 2026-06-28 Corepoint 45M/day spec
 parity analysis.
 
 ---
@@ -3649,7 +3651,7 @@ built-ins parser took **python-hl7** off the tolerant hot path.
 
 **Context:** the security posture flags python-hl7 + hl7apy as two **single-maintainer, dormant-upstream**
 parsers on the untrusted-input path with **no vendored-patch contingency**
-([DEPENDENCY-INFOSEC-POSTURE-2026-06-23](reviews/DEPENDENCY-INFOSEC-POSTURE-2026-06-23.md)). ADR 0054
+(`DEPENDENCY-INFOSEC-POSTURE-2026-06-23`). ADR 0054
 removed python-hl7 from the tolerant **hot path** (we own that parser now); python-hl7's residual uses
 (`transports/mllp.py`, `anon/hl7.py`, the Peek/Message fallback, the `ParseException` import) retire in
 its Phase-2 removal. **hl7apy remains** for the **opt-in** `validation.strict` tier (+ the synthetic
@@ -4171,7 +4173,7 @@ that first domain-joined box — run this spike alongside it.
 > * **(b)** was closed separately via **#224**. **(c)** remains a documented stdlib scope-out (OpenSSL, not SChannel) — a decision, not a task.
 > * **(e) — the live domain-lab gMSA/SSO/reverse-proxy smoke — is the ONLY residual**, and it needs a real DC + AD CS + gMSA. That is **rig/provisioning the project does not own** (same gate as [#98](#98-kerberos-sso-channel-binding-epa-opt-in--acceptor-enforcement-spike-p3-on-trigger)); it is gated behind **#275**. No engineering capacity closes it.
 >
-> ⚠️ **Two cross-references above resolve to paths that no longer exist from this baseline** (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`): `docs/security/` is **gitignored post-cutover**. The deployment content is intact for operators with the working tree; the links simply do not resolve in the public repo.
+> ⚠️ **Two cross-references above resolve to paths that no longer exist from this baseline** (`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`): `docs/security/` is **gitignored post-cutover**. The deployment content is intact for operators with the working tree; the links simply do not resolve in the public repo. See [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md).
 
 **Type:** deployment hardening — close the last-mile gaps between "the identity primitives exist" and a
 turnkey, documented, validated enterprise Windows/AD install.
@@ -4460,7 +4462,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 ## Corepoint help-export coverage sweep — items #107–#142 (2026-07-09)
 
 > ✅ **Delta only — not the total Corepoint gap surface.** These 36 items are the features found in the
-> **Corepoint v8.1.0 HTML help export** that were *absent* from both [`marketing/corepoint-gap-analysis.md`](marketing/corepoint-gap-analysis.md)
+> **Corepoint v8.1.0 HTML help export** that were *absent* from both `marketing/corepoint-gap-analysis.md`
 > (local-only, gitignored) and this backlog. The analysis's own **65 GAP / 147 PARTIAL** rows remain the primary
 > record of Corepoint parity — including all **three MAJOR** gaps, which are already tracked: the inbound
 > REST/SOAP/FHIR listener (**#7**), operator alert *state* (**#56**), and turnkey disaster recovery (**#60**/**#61**).
@@ -4468,7 +4470,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 > **The sweep found no new MAJOR gap.** Tally: **8 moderate · 28 minor**. Method: 5 passes (broad sweep →
 > transformation deep-read → critic resolution → `resources/` field-level → transport re-audit), each gated by an
 > automated completeness critic; every survivor adversarially verified, then re-checked against `origin/main`
-> before filing. Full narrative + the void-run post-mortem: [`marketing/corepoint-gap-analysis-addendum.md`](marketing/corepoint-gap-analysis-addendum.md).
+> before filing. Full narrative + the void-run post-mortem: `marketing/corepoint-gap-analysis-addendum.md`.
 >
 > Three items are **not clean wins** and say so in place: **#138** (PHI review required), **#139**
 > (decline-by-default anti-feature), **#140** (structurally N/A). **#127**/**#128** are meaningless without **#112**.
@@ -5219,7 +5221,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 ## Corepoint gap-analysis coverage audit — items #143–#184 (2026-07-09)
 
-> ✅ **Closes the loop: every gap in the analysis now has a disposition.** [`marketing/corepoint-gap-analysis.md`](marketing/corepoint-gap-analysis.md) (2026-06-27) was triaged capability-by-capability against **current `origin/main`** and this backlog. Of **246** capabilities:
+> ✅ **Closes the loop: every gap in the analysis now has a disposition.** `marketing/corepoint-gap-analysis.md` (2026-06-27) was triaged capability-by-capability against **current `origin/main`** and this backlog. Of **246** capabilities:
 >
 > | Disposition | Count |
 > |---|---:|
@@ -6038,7 +6040,7 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 > ✅ **CLOSED 2026-07-28 — SUPERSEDED by the [ADR 0115](adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md) re-partition into #242–#246.** This is an **index-only umbrella that owns no findings and ships nothing runnable** (its own score was Value 1 / Difficulty 1) — a tracking wrapper, not work. ADR 0115 (**Accepted 2026-07-16**, owner-directed scope decision) re-partitioned the ASVS L3 programme into phased builds across **BACKLOG #242–#246**, which is where the findings now live and are tracked. An index whose contents have been re-partitioned elsewhere has nothing left to index, so it closes as superseded rather than as delivered.
 >
-> ⚠️ **This is NOT a claim that "ASVS is done".** It is a statement about *this index*, nothing more. The programme **continued past this published baseline** — the file you are reading ends at #231, while #242–#246 and their successors do not appear in it at all — so the state of ASVS L3 cannot be read off this item in either direction. The assessment, remediation and risk-acceptance documents ADR 0115 references live under `docs/security/`, which is **gitignored post-cutover** and therefore not readable from the public repo; their absence here is a publishing boundary, not evidence of completion. _(was 🔢 P3 · Value 1/10 · Difficulty 1/10 · _fill-in_. Filed by the independent ASVS 5.0 L3 re-score, PR #854.)_
+> ⚠️ **This is NOT a claim that "ASVS is done".** It is a statement about *this index*, nothing more. The programme **continued past this published baseline** — the file you are reading ends at #231, while #242–#246 and their successors do not appear in it at all — so the state of ASVS L3 cannot be read off this item in either direction. The assessment, remediation and risk-acceptance documents ADR 0115 references live under `docs/security/`, which is **gitignored post-cutover** and therefore not readable from the public repo; their absence here is a publishing boundary, not evidence of completion (see [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)). _(was 🔢 P3 · Value 1/10 · Difficulty 1/10 · _fill-in_. Filed by the independent ASVS 5.0 L3 re-score, PR #854.)_
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build (indexed below). **Severity:** n/a (index).
 

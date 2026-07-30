@@ -13,21 +13,21 @@ is NOT the wall; see the B8 result below.**
 
 > ## ⛔ SUPERSEDED IN ONE RESPECT (2026-07-29) — the `txn/event` levers this roadmap sequences are CLOSED
 >
-> **[ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (2026-07-13) closed
+> **[ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (2026-07-13) closed
 > Phase 4: transaction reduction is a MEASURED dead end.** A pre-registered falsifier cut committed transactions
 > per message **28.5%** (10.47 → 7.49) and moved sustained throughput **−0.56%** — inside the null band — and its
 > arm E bounded the coupling at an elasticity of **−0.115** (*"No transaction-reduction mechanism — fusion,
 > group-commit, or any other — can close a 5.79× gap"*). **Do not build F2 or F3.** Lever 1 below ("collapse the
-> commit depth", the B1 fast-path) shipped as [ADR 0057](adr/0057-inline-step-a-fast-path.md), which is now
+> commit depth", the B1 fast-path) shipped as [ADR 0057](../../adr/0057-inline-step-a-fast-path.md), which is now
 > **⛔ DO NOT PROMOTE** and stays default-OFF permanently (`inline: bool = False`,
-> [`config/wiring.py:2452`](../messagefoundry/config/wiring.py)).
+> [`config/wiring.py:2452`](../../../messagefoundry/config/wiring.py)).
 >
 > So **"cut the chain first, then multiply lanes" and the ranked-lever table are stale as a plan**: lever 1 was
 > built and buys nothing; lever 2 (`fifo_claim_batch`) is owner-closed **default-OFF**, priced at ≤ +4.7% against
-> a +8% bar ([BACKLOG #212](BACKLOG.md)); `commit_delay` / group-commit is **⛔ DECLINED**
-> ([BACKLOG #217](BACKLOG.md)). **Everything below is retained as the record of the diagnosis and of why the work
+> a +8% bar ([BACKLOG #212](../../BACKLOG.md)); `commit_delay` / group-commit is **⛔ DECLINED**
+> ([BACKLOG #217](../../BACKLOG.md)). **Everything below is retained as the record of the diagnosis and of why the work
 > was sequenced this way — it is not the live plan.** Measured throughput lives in
-> [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md); the frontier is **engine-side attribution**
+> [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md); the frontier is **engine-side attribution**
 > (ADR 0107 §"Out of scope"), and there is no identified throughput lever today.
 
 ---
@@ -41,16 +41,16 @@ Two levers on this roadmap moved, and they are **complementary, not competing** 
 > ⛔ **SUPERSEDED 2026-07-13 — "the sequencing below stands" is now FALSE for its first half.** P0 measured
 > cut-the-chain directly: a **28.5%** cut in committed transactions per message moved throughput **−0.56%**, and
 > arm E bounded the coupling at an elasticity of **−0.115**. **Cut-the-chain is a measured dead end
-> ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)); ADR 0057 is
+> ([ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)); ADR 0057 is
 > ⛔ DO-NOT-PROMOTE.** Engine sharding (TIER 2) is unaffected and remains built.
 
 - **Multiply lanes (TIER 2) — sharding is BUILT.**
-  [ADR 0073](adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) (ownership-scoped recovery + one
+  [ADR 0073](../../adr/0073-ownership-scoped-recovery-single-consumer-lanes.md) (ownership-scoped recovery + one
   delivery consumer per outbound lane) **merged (#803)**, so N `serve --shard` engines on ONE unified store
   is now a built runtime — gated only on the clean **4-engine no-loss bench** before SYSTEM-REQUIREMENTS
   calls it a supported topology.
 - **Cut the chain (TIER 1) — statement batching quantified + ratified.**
-  [ADR 0075](adr/0075-per-hop-sql-statement-batching.md) (`batch_handoff_statements`, default-ON (emergency
+  [ADR 0075](../../adr/0075-per-hop-sql-statement-batching.md) (`batch_handoff_statements`, default-ON (emergency
   off-switch), SS-only)
   is Accepted. A microbench off the real handoffs (adversarially re-reviewed, counts verified honest)
   measured a per-hop **round-trip drop of 27–50%** — but the **≥40% figure is conditional on the
@@ -63,8 +63,8 @@ Two levers on this roadmap moved, and they are **complementary, not competing** 
   `docs/benchmarks/results/2026-07-08-adr0075-batch-ab/`). The one unconditional result: per-hop batching is
   **not** invariant-blocked (commits/msg stays 2.000; only *cross-lane* batching hits the ADR 0069 fence).
 - **Settled dead-ends (do not re-rank as live levers):** B5 thread-hop fusion **NO-GO** 2026-07-06 (below
-  the ≥10% bar; [ADR 0071](adr/0071-cut-executor-round-trips-b5.md), stays default-OFF); free-threading
-  **~+6–7% paper NO-GO** ([ADR 0053](adr/0053-free-threaded-multicore-engine.md) re-scope, #789) — revives
+  the ≥10% bar; [ADR 0071](../../adr/0071-cut-executor-round-trips-b5.md), stays default-OFF); free-threading
+  **~+6–7% paper NO-GO** ([ADR 0053](../../adr/0053-free-threaded-multicore-engine.md) re-scope, #789) — revives
   only if a *real* feed measures transform-CPU share >~23%.
 
 *(Reconciliation note from the throughput-planning session. The older `origin/throughput-docs` @ 3843abe
@@ -254,7 +254,7 @@ sharding only *multiplies* the per-lane rate, sub-linearly; it is worth far more
 | **5** | **Executor sizing / split** (give aioodbc its own pool, or raise the default) | Small secondary **above 4 lanes** (measured ~100→140); SQL-Server-only (asyncpg has no executor) | **build-with-guardrail** | Preserve the EF-6 no-MARS single-active-statement + cursor-close-before-release. |
 | **6** | **Dedicated ingest lane** (reserved server conn / SQLite priority-gate) | Robustness/no-drop, not throughput — eliminates silent intake socket-shed | **build-with-guardrail** | SQLite = bounded-fair priority-gate on `:799`, never a 2nd writer; `[inbound].max_ingress_depth` TCP-backpressure. |
 | **7** | **SQLite `synchronous=NORMAL` baseline** (measurement + `db_status()` observability) | Sizes the honest shipped-default SQLite number; not a throughput win | **build-with-guardrail** | Report a band; surface `synchronous`; document the durability relaxation. |
-| — | **PG `commit_delay`** | ~1.00× at sustained sharded rates (commits rarely bunch) | ⛔ **DECLINED** (was "defer, gated, off, last") — ADR 0107 / [BACKLOG #217](BACKLOG.md) | PG-only GUC; re-test only if batch-claim re-bunches commits. |
+| — | **PG `commit_delay`** | ~1.00× at sustained sharded rates (commits rarely bunch) | ⛔ **DECLINED** (was "defer, gated, off, last") — ADR 0107 / [BACKLOG #217](../../BACKLOG.md) | PG-only GUC; re-test only if batch-claim re-bunches commits. |
 | — | `DELAYED_DURABILITY` · extend the SQLite committer to servers · READPAST in the FIFO claim · `shard_key`-as-index-lead · pool tuning | — | **REJECT / N/A** | durability / by-design / per-lane FIFO (#285) / page-latch refuted / pool ran 40. |
 
 ### Improvement model (honest)

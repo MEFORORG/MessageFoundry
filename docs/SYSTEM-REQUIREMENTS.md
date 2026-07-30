@@ -9,11 +9,12 @@ Python/asyncio service; the operator console is a browser page served by the eng
 > figure, with [THROUGHPUT.md](THROUGHPUT.md) as the plain-language guide to reading it. What it
 > publishes is a reproducible **method** plus numbers stamped "as measured on the reference config" —
 > not a headline capacity number, because the durable-write path makes throughput hardware-dependent.
-> The sizing tiers in [Sizing by message volume](#sizing-by-message-volume) are **engineering
-> estimates** derived from the architecture and from the synthetic load-test profiles in
-> [`harness/load/`](../harness/load/) — they project, they do not measure, and they are not
-> guarantees. Always establish your own baseline on production-like hardware before go-live
-> (see [LOAD-TESTING.md](LOAD-TESTING.md) and [§ Capacity notes](#capacity-notes)).
+> The sizing tiers in [Sizing by message volume](#sizing-by-message-volume) are **derived from those
+> published measurements**: every tier's peak rate traces to a named measured run, and its daily figure is
+> that rate through a **stated duty cycle**, not `× 86,400`. They are still not guarantees — each one
+> inherits its source run's hardware, **fan-out** and transform cost. Always establish your own baseline on
+> production-like hardware before go-live (see [LOAD-TESTING.md](LOAD-TESTING.md), the synthetic load-test
+> profiles in [`harness/load/`](../harness/load/), and [§ Capacity notes](#capacity-notes)).
 
 ---
 
@@ -130,8 +131,8 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 
 | Purpose | Default | Notes |
 |---|---|---|
-| **Engine API** (HTTP + WebSocket) | `127.0.0.1:8765` | **Loopback by default**, authentication-required. No native transport TLS — to reach the API from another host, front it with a **TLS-terminating reverse proxy** or tunnel. |
-| **Inbound MLLP / TCP listeners** | operator-defined (samples use e.g. `2575`, `2600`) | Open to sending systems via firewall. Keep MLLP on a **trusted network segment** (no MLLP-over-TLS). |
+| **Engine API** (HTTP + WebSocket) | `127.0.0.1:8765` | **Loopback by default**, authentication-required. **In-process TLS is built and opt-in** (WP-13a, [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md)): set `[api].tls_cert_file` (plus `tls_key_file` when the key is a separate PEM) and the engine terminates TLS in uvicorn, so the API **and** the `/ws/stats` WebSocket serve `https`/`wss`. TLS **1.2 floor** (`tls_min_version` — `1.2` or `1.3`), optional `tls_ciphers`, and **opt-in mTLS** via `tls_client_ca_file` (a client certificate is then required and verified). A **TLS-terminating reverse proxy** remains the supported alternative (`tls_terminated_upstream` + `trusted_proxies`). An off-loopback bind needs one of the two — in-process TLS needs no override flag, and the browser console refuses an unprotected off-loopback bind outright. |
+| **Inbound MLLP / TCP listeners** | operator-defined (samples use e.g. `2575`, `2600`) | Open to sending systems via firewall. **MLLP-over-TLS is built and opt-in per connection** (WP-13b, `tls = true`, TLS 1.2+ — see [CONNECTIONS.md](CONNECTIONS.md)): an inbound presents `tls_cert_file`/`tls_key_file` as its server identity and opts into **mTLS** with `tls_ca_file`; an outbound **verifies the partner's certificate by default** (`tls_verify`, `tls_check_hostname`, both `true`). Plaintext is still the **default**, so a non-loopback MLLP listener should set `tls = true` — and a cleartext MLLP **egress** off loopback is **refused at startup** on a production-PHI instance unless the hop is attested. |
 | **Outbound** | as configured | Reachability to downstream partners and, for server DBs, to the database host. |
 | Installer egress | HTTPS | Outbound access for the service installer to fetch the pinned NSSM binary (or pre-stage it). |
 
@@ -139,16 +140,17 @@ SEV-SNP needs EPYC 7003+ and TDX needs 5th Gen Xeon Scalable+, which is newer th
 
 ## Sizing by message volume
 
-> **Engineering estimate — not a validated benchmark.** These tiers project the architecture's
-> behavior; they are not committed numbers. Throughput depends heavily on **transform cost per
-> message** (the dominant factor), message size, fan-out, and strict-validation use. **Measure your
-> own feeds** with the load harness before committing (see [Capacity notes](#capacity-notes)).
+> **Derived from measurement — still not a committed number.** Each tier's peak rate below is a rate we
+> have actually measured, named and sourced under *Reading the tiers*, and **no tier projects above a
+> measured rate**. They are still not guarantees: every one carries its source run's hardware, **fan-out**
+> and transform cost, and throughput depends heavily on **transform cost per message** (the dominant
+> factor), message size, fan-out, and strict-validation use. **Measure your own feeds** with the load
+> harness before committing (see [Capacity notes](#capacity-notes)).
 >
-> The **measured** figures — and the exact conditions they were measured under — live in
+> The measured figures — and the exact conditions they were measured under — live in
 > [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md) (canonical) and
-> [THROUGHPUT.md](THROUGHPUT.md); the measured anchors are restated under *Reading the tiers* below. The
-> **two upper tiers project above every rate measured so far**, so no tier row may be quoted as a
-> demonstrated capability.
+> [THROUGHPUT.md](THROUGHPUT.md); the anchors are restated with their arithmetic under *Reading the tiers*
+> below. A tier row is a **sizing starting point**, never a demonstrated capability claim.
 
 ### How throughput is bounded (read this first)
 
@@ -157,9 +159,9 @@ on **one CPU core** (one asyncio event loop; the GIL prevents pure-Python parall
 So per-process throughput is governed, in order, by:
 
 1. **Transform cost per message** — usually the binding constraint. The project's own
-   [throughput research](THROUGHPUT-IMPROVEMENTS.md) cites a comparable vendor benchmark where real
-   transformation cut pass-through throughput by ~60% (≈1000 msg/s → ≈400 msg/s). A light/pass-through
-   feed sits near the top of a tier; a heavy transform sits near the bottom.
+   [throughput research](archive/throughput/THROUGHPUT-IMPROVEMENTS.md) cites a comparable vendor
+   benchmark where real transformation cut pass-through throughput by ~60% (≈1000 msg/s → ≈400 msg/s).
+   A light/pass-through feed sits near the top of a tier; a heavy transform sits near the bottom.
 2. **Durable-write cost** — every stage handoff (ingress → routed → outbound → delivered) is a
    committed transaction. In-process **SQLite is fastest per write**; a **server DB is slower per
    single write** (network + MVCC) but is the concurrency substrate (next point).
@@ -200,43 +202,70 @@ multi-engine deployments as **active-passive** (one active writer per store) for
 
 ### Tiers
 
-| Tier | Peak sustained (est.) | Indicative daily volume | Deployment shape | Store | Suggested hardware (engine host) |
+| Tier | Peak sustained ingress | Indicative daily volume | Deployment shape | Store | Suggested hardware (engine host) |
 |---|---|---|---|---|---|
-| **Pilot / light** | up to ~50 msg/s | up to ~1–4 M/day | 1 process, single node | SQLite | 2 cores / 4 GB |
-| **Standard single-node** | ~50–200 msg/s | ~4–15 M/day | 1 process, single node | SQLite, or PostgreSQL / SQL Server | 4 cores / 8 GB |
-| **High single-node** | ~200–500 msg/s | ~15–40 M/day | 1 process, tuned (lean transforms; finite-retry on hot lanes) | Server DB recommended (PostgreSQL / SQL Server) | 4–8 cores / 16 GB |
-| **High single-node, concurrent** | up to ~500 – low-thousands msg/s | up to ~40 M+/day | 1 process, many connections / lanes draining concurrently via `SKIP LOCKED` | **PostgreSQL / SQL Server** (required — not SQLite) | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
+| **Pilot / light** | up to ~30 msg/s | up to ~1.0 M/day | 1 process, single node | SQLite | 2 cores / 4 GB |
+| **Standard single-node** | ~30–70 msg/s | ~1.0–2.2 M/day | 1 process, single node | SQLite, or PostgreSQL / SQL Server | 4 cores / 8 GB |
+| **High single-node** | ~70–100 msg/s | ~2.2–3.2 M/day | 1 process, tuned (lean transforms; low fan-out; the default `pooled` claim mode; finite-retry on hot lanes), many connections / lanes draining concurrently via `SKIP LOCKED` | Server DB on its **own** host (PostgreSQL / SQL Server) | 4–8 cores / 16 GB + a DB host sized to the commit load |
+| **Multi-process (engine shards)** | ~165 msg/s measured at 4 engine shards (**per-shard SQLite**); beyond that ≈ *N* × your measured single-shard rate × 0.85 | ~5.3 M/day at that measured rate | *N* `messagefoundry supervise` engine-shard processes, partitioned by inbound connection — **not yet certified as a production topology** (see above) | **PostgreSQL / SQL Server** — required above one shard, so all engine shards share **one unified store** | 8+ cores / 32 GB + a dedicated DB host sized to the commit load |
 
-**Reading the tiers**
+**Reading the tiers — and checking the arithmetic**
 
-- *Peak sustained* is a **per-second** capacity estimate. Healthcare feeds are bursty; real **average**
-  rate (and therefore daily volume) is typically a fraction of peak, so the *indicative daily volume*
-  columns assume a realistic duty cycle, not `peak × 86,400`.
-- The **single-stream / single-core ceiling is the part that has actually been measured**, and it sits far
-  below the upper tiers: **~60 msg/s end-to-end** for one strictly-ordered interface against an
+Every peak figure in the table is a **measured** rate with a named source run — the only extrapolation is
+the per-shard multiplier on the last row. Where a tier's *hardware* row was never itself measured, its
+bullet says so rather than interpolating. Here is the derivation, so you can check it.
+
+- **Units.** *Peak sustained ingress* is **messages received per second**, at the **low fan-out (~1–2
+  destinations per received message)** of every anchor run below. A high-fan-out hub commits and delivers
+  several copies per received message and sustains a **much lower** ingress rate — see the last bullet.
+- **Daily = peak × 86,400 ÷ 2.7**, i.e. `peak × ~32,000` — **not** `peak × 86,400`. Healthcare feeds are
+  bursty: in the production ADT feeds profiled in [THROUGHPUT.md](THROUGHPUT.md) §6 the **busiest hour runs
+  ~2.7× the all-day average**, and you must size to the peak hour, so a peak-rate figure carries only
+  `86,400 / 2.7` seconds' worth of messages a day. That is the duty cycle assumed in the *indicative daily
+  volume* column, and it is the same arithmetic THROUGHPUT.md §6 works through (60 msg/s → ~1.9 M/day, not
+  ~5.2 M). Substitute your own peak-hour ÷ daily-average ratio once you have measured one.
+- **Pilot / light — ~30 msg/s** is the **lowest** sustainable rate measured across the three backends on
+  the published reference config: **~30 msg/s on SQL Server**, conformance-clean, fan-out 2, on a 4-vCPU
+  runner with the database co-located ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Results). **No
+  2-core point has ever been measured**, so this tier deliberately takes the floor of the measured band
+  rather than interpolating a figure for its own hardware row. `30 × 32,000 ≈ 0.96 M/day`.
+- **Standard single-node — ~30–70 msg/s** is that same reference config's full measured band: **~30
+  (SQL Server) · ~50 (PostgreSQL) · ≥ 70 (SQLite, still not saturated at the top rate step)**. It brackets
+  the **~60 msg/s end-to-end** ceiling measured for one strictly-ordered interface against an
   *instant-acknowledging* partner, versus **~450 msg/s at intake** (ACK-on-receipt) — i.e. **~16 ms** of
-  engine overhead per message ([THROUGHPUT.md](THROUGHPUT.md) §8). On the published reference config the
-  sustainable single-node rates were **≥ 70 msg/s (SQLite) · ~50 (PostgreSQL) · ~30 (SQL Server)**, all
-  conformance-clean, on a 4-vCPU runner with the database co-located
-  ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Results). The ~1000 msg/s pass-through figure
-  quoted above is a **vendor's** self-benchmark, not a MEFOR measurement.
-- The **maximum as currently architected** is the **"High single-node, concurrent"** row: one engine
-  process, many connections / lanes draining the shared server DB concurrently via `SKIP LOCKED`,
-  bounded by the database's commit ceiling. **No measured run supports that row's "low thousands of
-  msg/s" — it is a projection, and must never be quoted as a demonstrated figure.** Nor do per-interface
-  ceilings **add**: a measured 16-lane run delivered **87/s in aggregate — 5.44/s per lane** — where
-  summing the per-lane ceilings would have predicted ~960/s, an **~11× over-report**
-  ([THROUGHPUT.md](THROUGHPUT.md) §7). Always take `min(measured concurrent aggregate, Σ per-interface)`.
-- To go past one engine, use the **built** multi-process **engine-shard** scale-out (`messagefoundry
-  supervise`, above), whose measured result is **~linear scaling: η ≈ 0.85** — 1 → 2 → 4 shards at ~50 →
-  88.7 → 165.5 msg/s aggregate ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Multi-process
-  sharding scale-out). That run used **per-shard SQLite on a consumer 8-core test box**, so the portable
-  result is the **speedup shape**, not the absolute rate: multiply η by *your* measured single-shard rate.
-  Group-commit and the wider "reduce committed transactions per event" lever are **closed, not pending** —
-  group-commit was withdrawn ([ADR 0055](adr/0055-group-commit-durable-write.md)) and the pre-registered
-  measurement returned ABANDON at an elasticity of −0.115
-  ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)), so do not size
-  on a future per-core lever.
+  engine overhead per message ([THROUGHPUT.md](THROUGHPUT.md) §8). `30–70 × 32,000 ≈ 0.96–2.24 M/day`. The
+  ~1000 msg/s pass-through figure quoted above is a **vendor's** self-benchmark, not a MEFOR measurement.
+- **High single-node — ~70–100 msg/s** is the highest rate ever measured from **one engine process**:
+  **~97 msg/s max sustainable** (zero-loss, bounded backlog) and **~107 msg/s** as a burst that still
+  drained — one process, **1,500 inbound connections**, the default `pooled` claim mode, SQL Server 2022 on
+  its own box, fan-out 1 ([`benchmarks/adr0066-pooled-claimer-744.md`](benchmarks/adr0066-pooled-claimer-744.md)
+  §2). Engine CPU sat at ~2 cores throughout and a 3× larger store pool did not move the ceiling, so this
+  is the **ceiling of a single engine process** — the tier above it is not "more concurrency", it is **more
+  processes**. `70–100 × 32,000 ≈ 2.24–3.2 M/day`.
+- **Multi-process (engine shards) — ~165 msg/s at 4 shards.** Measured 1 → 2 → 4 engine shards at **~50 →
+  88.7 → 165.5 msg/s** aggregate, i.e. ~linear scaling at an efficiency **η ≈ 0.85** per added shard
+  ([TUNING-BASELINE.md](benchmarks/TUNING-BASELINE.md) §Multi-process sharding scale-out).
+  `165.5 × 32,000 ≈ 5.3 M/day`. **Two limits travel with this row.** That run used **per-shard SQLite on a
+  consumer 8-core test box**, so the portable result is the **speedup shape**, not the absolute rate:
+  multiply η by *your* measured single-shard rate. And a production multi-shard deployment must share
+  **one unified server-DB store** ([ADR 0063](adr/0063-no-split-store-unified-store-for-sharding.md)) — a
+  shape that run never exercised, and one measured **worse** (next bullet).
+- **Where the tiers stop, and why.** Fan-out and the shared store — not the tier label — set the real
+  number. On **one shared SQL Server store at a fan-out of 8**, the definitive 900-second soak of a 4-shard
+  fleet sustained **10 msg/s of ingress** (80 deliveries/s, 90 total message events/s), and a fixed light
+  load scaled cleanly only to **4 engine shards** — N = 8 and N = 16 collapsed
+  ([`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §3). Nor do
+  per-interface ceilings **add**: a measured 16-lane run delivered **87/s in aggregate — 5.44/s per lane** —
+  where summing the per-lane ceilings would have predicted ~960/s, an **~11× over-report**
+  ([THROUGHPUT.md](THROUGHPUT.md) §7). Always take `min(measured concurrent aggregate, Σ per-interface)`,
+  and measure a high-fan-out hub rather than sizing it off the low-fan-out rows above.
+  **~165 msg/s of ingress is the highest end-to-end rate measured anywhere in this project**; no figure in
+  this document may be quoted as more.
+- **Do not size on a future per-core lever.** Group-commit and the wider "reduce committed transactions per
+  event" lever are **closed, not pending** — group-commit was withdrawn
+  ([ADR 0055](adr/0055-group-commit-durable-write.md)) and the pre-registered measurement returned ABANDON
+  at an elasticity of −0.115
+  ([ADR 0107](adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md)).
 
 > **Single-stream server-DB caveat.** Because each staged handoff is a committed round-trip, a single
 > delivery worker against a server DB drains far slower than in-process SQLite (the published baseline

@@ -610,10 +610,18 @@ for operator diagnostic logs; and the **attachment download** route (GET
 that serves a detached document back out. The **directory source's** handling of an untrusted drop
 directory is fixed policy (the HTTP uploaded-logs surface has its own policy block below):
 
-- **Permitted type — HL7 v2 text only.** Files are selected by the `pattern` glob (default `*.hl7`), and
-  every candidate is **content-sniffed** before its bytes reach the pipeline: it must begin with an HL7
-  header segment (`MSH`/`FHS`/`BHS`, after an optional UTF-8 BOM / MLLP start byte / leading whitespace).
-  A binary or non-HL7 file carrying a `.hl7` name is rejected on **content, not extension** (ASVS 5.2.2).
+- **Permitted type — the inbound's declared `content_type` (default `hl7v2`).** Files are selected by
+  the `pattern` glob (default `*.hl7`), and every candidate is **content-sniffed against that declared
+  type** before its bytes reach the pipeline: an `hl7v2` drop (the default, and how an inbound that
+  declares nothing is treated) must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`, after an
+  optional UTF-8 BOM / MLLP start byte / leading whitespace), and each other structured type must lead
+  with its own format signature. A file whose content **contradicts** its declaration — a PDF on a
+  `json` inbound, a headerless body on an `hl7v2` one — is rejected on **content, not extension**
+  (ASVS 5.2.2). It is a declared-type **conformance** check, not an HL7-only gate: an inbound declaring
+  a non-HL7 `content_type` bypasses HL7 handling entirely and its exact bytes reach the
+  content_type-aware pipeline (ADR 0004). The two declarations that carry no reliable leading signature
+  — `binary` (opaque bytes) and `text` (arbitrary) — are accepted **unchecked** by explicit policy; the
+  pipeline codec/parser stays the real validator that records `ERROR`.
 - **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
   is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
@@ -623,12 +631,13 @@ directory is fixed policy (the HTTP uploaded-logs surface has its own policy blo
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
   provide (ASVS 5.2.3). A corrupt or over-ceiling archive is **quarantined to `.error`, never
   accept-and-dropped**, and the decompressed body is never logged. Multi-entry zip stays Handler-composed.
-- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize or non-HL7 file
-  is **moved to the `.error` subdirectory** (preserved for the operator) and logged. A
-  *textual-but-non-conformant* HL7 file still flows through and is recorded as an `ERROR`-status message
-  by the parser (raw preserved in the store). A **transient** read failure (file locked / mid-write) or
-  an **infrastructure** failure (store unavailable) **leaves the file in place to retry** next scan —
-  never an accept-and-drop. Use `min_age_seconds` to skip files still being written.
+- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
+  whose content contradicts its declared type, is **moved to the `.error` subdirectory** (preserved for
+  the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
+  as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
+  (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
+  place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
+  written.
 - **Traversal-safe output naming.** The destination resolves `{HL7-path}` placeholders to a **single safe
   filename** (path separators / unsafe chars stripped, leading dots removed, `.`/`..`/reserved device
   names fall back), so an attacker-controlled field can't write outside the target dir or shadow
@@ -1972,7 +1981,7 @@ running at the scale pooled unlocks:
 How the engine bounds connections, threads, and retries **per external service**, what happens **when
 a limit is reached**, and how each service's resources are released — the resource-management
 contract a reviewer needs. The two tables below cover **every** hop in the communications inventory
-([security/ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
+([ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
 13.1.2/13.2.6 concurrency axis, Table B the 13.1.3 resource-strategy axis. They carry the **same row
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.

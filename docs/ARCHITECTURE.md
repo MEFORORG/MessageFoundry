@@ -148,12 +148,27 @@ siblings, and a slow transform never blocks routing.
 
 **Disposition flows with the message, decided by the store finalizer** (count-and-log): `RECEIVED` at
 ingress → `ROUTED` / `UNROUTED` after the router → `PROCESSED` (all delivered) / `FILTERED` (every
-handler ran, delivered nothing) / `ERROR` (dead-lettered at any stage) once nothing is still in
-flight. The finalizer is the **single authority** — it never finalizes while any earlier-stage row is
+handler ran, delivered nothing) / `NOT_DEPLOYED` (every destination the handlers addressed is in the
+graph but `deployed=false`) / `ERROR` (dead-lettered at any stage) once nothing is still in flight.
+The finalizer is the **single authority** — it never finalizes while any earlier-stage row is
 pending, so a delivered handler can't mark a message done while a sibling handler's routed row still
 awaits transform. The ACK means *receipt-and-persistence*, not a final disposition: a routing/
 transform failure is post-ACK, so it is logged + dead-lettered (operators rely on the disposition +
 AlertSink), not NAK'd.
+
+`NOT_DEPLOYED` (BACKLOG #233, [ADR 0111](adr/0111-not-deployed-connections.md)) is the one
+disposition the finalizer cannot read off the queue rows: it decides `FILTERED` **by absence** (no
+rows left, message still `ROUTED`), so a declined destination would otherwise collapse to `FILTERED`
+and misreport operator intent. The decline is therefore persisted where the finalizer can see it —
+the **transform worker** drops a `Send` whose target outbound is `deployed=false` *before* it becomes
+an outbound-stage row, and writes one `not_deployed` `message_events` row per declined destination in
+that same handoff transaction (`MessageStore.transform_handoff`). Zero deliveries **with** that event
+finalize `NOT_DEPLOYED`; without it, `FILTERED`. A deployed sibling that delivers still finalizes
+`PROCESSED`, with the event row carrying the skipped leg. That event is in the store's audit floor,
+so the `message_events` verbosity gate can never thin it away — dropping it would take the
+disposition with it. Dry-run and the Test Bench never run the finalizer, so a fully-declined message
+previews there as `FILTERED`: the declined names stop at `RouteOutcome.declined` and are not carried
+into `DryRunResult`.
 
 The router/transform split was taken after Step A's measured write amplification (now ~3 durable
 transactions/message for a single-handler message; +1 per extra handler) — recorded in
@@ -186,7 +201,7 @@ flowchart TB
   FIN{{"Store finalizer<br/>single disposition authority"}}:::disp
   D1["RECEIVED"]:::disp
   D2["ROUTED / UNROUTED"]:::disp
-  D3["PROCESSED / FILTERED / ERROR"]:::disp
+  D3["PROCESSED / FILTERED<br/>NOT_DEPLOYED / ERROR"]:::disp
 
   SRC --> LISTEN
   LISTEN -->|"decode/parse/validate fail"| NAK
@@ -278,7 +293,8 @@ Messages contain PHI. Access control and the *data* protections are tracked sepa
 [SECURITY.md](SECURITY.md) (identity, RBAC, action audit) and [PHI.md](PHI.md) (data-at-rest,
 transport, logging, retention, de-identification), which is the authoritative built-vs-planned map.
 The per-interface trust boundaries and STRIDE threats are in
-security/THREAT-MODEL.md (PW.1–2 / ASVS V15).
+security/THREAT-MODEL.md (PW.1–2 / ASVS V15), a maintainer-internal document —
+[SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 **Built today:** authentication + RBAC (PHI views gated by `messages:view_raw` /
 `messages:view_summary`), a user-attributed append-only **audit log** (hash-chained) of who

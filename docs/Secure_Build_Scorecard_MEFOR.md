@@ -12,7 +12,7 @@
 | **Status** | Draft for review |
 | **Version** | 0.5 |
 | **Maintained by** | Project maintainer |
-| **Evidence base** | The `docs/security/` corpus (§6) — the canonical ASVS-L3 assessment, the conformance review, the threat model, and the risk-acceptance register — which remain the single source of truth. This scorecard grades on top of them. |
+| **Evidence base** | The `docs/security/` corpus (§6) — the canonical ASVS-L3 assessment, the conformance review, the threat model, and the risk-acceptance register — which remain the single source of truth. Those are maintainer-internal working documents and are **not published in this repository**; they are named for provenance ([`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) states the rule and what you can request). This scorecard is public and grades on top of them. |
 
 > **How to read this.** This scorecard grades control **presence + evidence honesty** at HEAD, never runtime efficacy or an external challenge (none has run; see §5). Where this pass found a signal's asserted evidence overstated, the row says so. The rubric's anti-metric rule applies: no release is gated on any single row — only the composite is (see [Secure Build Standards §4.1](Secure_Build_Standards.md#41-the-anti-metric-rule-hard)).
 
@@ -117,7 +117,7 @@ This scorecard is graded under the same declared deviation that governs Secure_D
 
 ## 6. Evidence base & enforcement artifacts
 
-The canonical verdicts-of-record live in the cited `docs/security/` set. This scorecard grades on top of them and does not restate their per-requirement outcomes. Where an in-tree doc is superseded, it is flagged, not credited.
+The canonical verdicts-of-record live in the cited `docs/security/` set. That set is maintainer-internal and is **not published in this repository**, so the entries below are cited by name for provenance, not linked — this scorecard is the public-facing summary and stands on its own. It grades on top of them and does not restate their per-requirement outcomes. Where an in-tree doc is superseded, it is flagged, not credited.
 
 **Evidence base — `docs/security/` (cited, not restated):**
 - **ASVS-L3-ASSESSMENT-2026-07-16** — the **current** canonical verdict-of-record (Posture A 175 P / 50 Part / 2 Fail / 118 N/A; Posture B 199 / 51 / 2 / 93, at `363db4e3`; 11.7.1 full memory encryption scoped N/A as infrastructure). Grade off this doc. Supersedes ASVS-L3-ASSESSMENT-2026-07-09 (179 / 46 / 5 / 115; the reconciliation narrative in §2/§3 describes the state at that earlier assessment).

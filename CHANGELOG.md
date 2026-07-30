@@ -343,7 +343,9 @@ is additive / opt-in.
 2026-06-10 full review (v0.2.0 → v0.2.13) surfaced seven verified findings; this release fixes all of
 them. No new critical, no SQL injection, no auth bypass, no RCE — the most serious was an
 unauthenticated memory-exhaustion DoS in the new default HL7 parser. Each fix ships with a regression
-test. See [`docs/reviews/DELTA-REVIEW-2026-07-01.md`](docs/reviews/DELTA-REVIEW-2026-07-01.md).
+test. See `docs/reviews/DELTA-REVIEW-2026-07-01.md`, a maintainer-internal document —
+[`docs/SECURITY-DOCS-POLICY.md`](docs/SECURITY-DOCS-POLICY.md) states what is withheld and what you
+can request.
 
 ### Security
 - **Bounded the built-in HL7 rich-text repetition escape** (DELTA-01/02;

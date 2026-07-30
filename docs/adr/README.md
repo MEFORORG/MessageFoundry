@@ -26,6 +26,11 @@ Criteria** in EARS form, each linked (`→`) to the test or fixture that verifie
 recommended in [Secure Development Standards §5.](../Secure_Development_Standards.md) Run
 `messagefoundry adr-analyze` for an advisory report of criteria→test coverage and open clarifications.
 
+**Withheld cross-references.** Several ADRs cite a `docs/security/` document for provenance — the
+threat model, an ASVS assessment, a deployment runbook. Those are maintainer-internal and will not
+resolve here; [`SECURITY-DOCS-POLICY.md`](../SECURITY-DOCS-POLICY.md) states the rule that decides
+what is withheld and what you can request.
+
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-staged-pipeline-architecture.md) | Staged pipeline — per-stage durable queues | Accepted |

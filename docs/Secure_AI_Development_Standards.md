@@ -497,7 +497,7 @@ PHI data detail routes to [PHI.md](PHI.md); the **product** egress policy routes
 - SDD frameworks (**Spec Kit, Kiro, OpenSpec**) and **12-Factor Agents** — *practitioner, largely un-peer-reviewed; popularity ≠ quality; the field moves monthly.*
 - **GSD / Ralph Loop** — *cited as a supply-chain/governance **cautionary tale*** (governance moved to "open-gsd" after a trust incident).
 
-**Cross-links:** Secure Development Standards · [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the code-outcome measurement rubric) · [AI.md](AI.md) · [PHI.md](PHI.md) · [`../CLAUDE.md`](../CLAUDE.md) · [WORKTREES.md](WORKTREES.md) · security/RELEASE-GATE.md · [docs/adr/README.md](adr/README.md).
+**Cross-links:** Secure Development Standards · [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (the code-outcome measurement rubric) · [AI.md](AI.md) · [PHI.md](PHI.md) · [`../CLAUDE.md`](../CLAUDE.md) · [WORKTREES.md](WORKTREES.md) · security/RELEASE-GATE.md (maintainer-internal — see [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md)) · [docs/adr/README.md](adr/README.md).
 
 ---
 

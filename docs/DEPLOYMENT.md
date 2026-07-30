@@ -103,6 +103,11 @@ security-posture document not published in this repository):
 | **Certificate revocation** (12.1.4) | your **proxy / PKI** (OCSP/CRL at the terminator) | document the delegation, or add OCSP/CRL to the TLS contexts |
 | **Off-box log shipping** (16.4.3) | forward the audit + operational logs to your **SIEM/syslog** | **built** — `[logging].forward_*` ships operational logs + PHI-redacted audit rows to a syslog/SIEM collector, over **native TLS** with `forward_protocol = "tls"` (RFC 5425, ADR 0080; port 6514) (residual: the transport **default** is UDP, so set TLS explicitly or front the collector with a local TLS-forwarding agent) |
 
+**Scoring caveat.** That plan's **per-cell** scoring still reflects the pre-collapse posture columns:
+[ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) collapsed
+deployment scoring to `{loopback, off-loopback}`, but the per-cell re-score and the owner's
+re-signature are an owner act and remain **pending**.
+
 **Write the delegation into your deployment runbook.** "We run MEFOR inside our network behind
 \<perimeter / IdP / PKI / SIEM\>" is what turns these from open gaps into *addressed-by-environment* —
 for your own risk posture and for any ASVS-scoped review.

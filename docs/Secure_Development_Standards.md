@@ -439,7 +439,8 @@ MFA + admin-defense landed **2026-06-17**; owner: project maintainer). Each is d
 the fail-closed bind guard or off-loopback-conditional, with the compensating controls below. Detail +
 build triggers: `security/ASVS-FAILS-REMEDIATION-PLAN.md`;
 per-requirement verdicts: `security/ASVS-L3-ASSESSMENT.md`. Reviewed at
-each release and on any trigger below.
+each release and on any trigger below. Those are maintainer-internal documents;
+[`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 - **6.3.3 — multi-factor authentication.** **Satisfied for local accounts** — native RFC 6238 TOTP MFA
   is **built** (ADR 0002 WP-14, 2026-06-17), enforced for the Administrator role via `[auth].require_mfa`

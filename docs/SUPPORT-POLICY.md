@@ -35,5 +35,8 @@ is open.
 | Sign + attest release artifacts (SLSA / PEP 740) | Verify provenance on install (`verify-engine`) |
 | Ship secure **defaults** (127.0.0.1 bind, auth required, deny-by-default egress) | Operate securely: config-dir ACLs, secrets, TLS posture, deployment |
 
+(`security/ADVISORY-PROCESS.md` is maintainer-internal — [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)
+explains what is withheld and what you can request.)
+
 Neither half alone closes the window: the vendor makes a fix available fast **and discoverable**; the
 adopter adopts it fast. The SLA above is the adopter's half, made measurable.

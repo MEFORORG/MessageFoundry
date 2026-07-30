@@ -1562,7 +1562,8 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 functionality — including the surfaces that remain **unbounded** at this release — is
 security/THREAT-MODEL.md §Resource-demanding functionality (ASVS 15.1.3).
 Read the two together: the table above is the operator-surface half, and that section is the whole
-picture including the ingest plane.
+picture including the ingest plane. That document is maintainer-internal;
+[SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 **No limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields, nor
 `lockout_threshold` / `lockout_minutes`, carries a Pydantic validator. So a `per_key` or `glob` of `0`
