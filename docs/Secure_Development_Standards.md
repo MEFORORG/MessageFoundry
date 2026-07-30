@@ -69,6 +69,45 @@ NIST does **not** issue certificates for these frameworks. The project may **dis
 - **Back every claim** with the implemented practice and its evidence (this standard, test reports, the ASVS attestation, the applicability profile). A self-attestation is a formal, legally significant declaration — only make it if it is true.
 - A third-party assessor may **validate** an attestation; that raises its weight but is still not a NIST certificate.
 
+#### Reviewing security prose: ask what a reader would DO with it
+
+**Review security prose by asking what a reader would DO with it, not whether it is accurate.** This is
+the governing instruction; the three rules below are instances of it.
+
+It matters because the expensive failures are not false statements. A correctness review terminates at
+"yes, that sentence is accurate" — and every finding in the 2026-07-30 documentation audit passed that
+test. Each was **true about the mechanism and misleading about the posture**: a sentence that survives
+every spot-check while pointing the reader somewhere they cannot go. Six such findings were caught by
+asking what happens to someone who acts on the sentence; **none** was caught by accuracy checking.
+
+- **State a load-bearing fact ONCE, and link to it; never restate it.** A repo that states a fact twice
+  will eventually state it two ways, and the stale copy is the one that gets cited — a reader who finds
+  *a* statement stops looking for the other. Three instances in a single day: `harden_kex_groups`
+  described as pinning key-exchange groups across **five** live documents, when `SSLContext.set_groups`
+  is a Python 3.15 API that pins nothing; a superseded "Transit degrades to an unkeyed audit chain on
+  SQL Server/PostgreSQL" claim left in `PHI.md` after the code closed it, from where it propagated into
+  a public web page *and* an internal security review; and `PHI.md` §5 asserting "no PHI is placed in a
+  URL" while §7 documented the exact query parameters that carry it. In every case the repo held
+  **both** the right and the wrong version. The mitigation is structural, not diligence: pick the source
+  of record, link to it, and let the copy die.
+- **A completeness claim is a liability.** "Two configurations do X, and a reviewer should hear both"
+  invites the check and then survives it, because a reader who confirms the named case stops looking.
+  Twice this documentation set shipped such a sentence wrong in *both* directions at once — naming a
+  case that no longer existed while omitting one that did. Where you cannot enumerate exhaustively, say
+  "at least", name the case that matters, and point at the reference.
+- **A compensating control must not rest on a false premise.** A `Referrer-Policy` relaxation was
+  justified on the grounds that console URLs "carry opaque ids only (never PHI)" — untrue of the
+  console's own search route. The control itself was sound; the stated reason was not, and the next
+  person to touch it reasons from the comment. A wrong justification is worse than none.
+
+*Provenance (the evidence is the point):* the completeness-claim and false-premise rules, and the
+governing instruction above, came out of the 2026-07-30 public-documentation audit; the
+state-it-once rule was named by the parallel ASVS review session, which also supplied the
+`harden_kex_groups` and `PHI.md` §5/§7 instances. `CLAUDE.md` §11 carries these as bare one-line
+imperatives — deliberately duplicated, because an instruction that short cannot meaningfully drift and
+a pointer nobody follows mid-task changes no behaviour. **This section is the source of record for the
+reasoning, the evidence and the dates.**
+
 ---
 
 ## 4. Secure software development — NIST SP 800-218 (SSDF)
