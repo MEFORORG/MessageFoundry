@@ -35,6 +35,10 @@
     READ-ONLY. This script never writes, never deletes a registry file, and never contacts another
     session. It is a roster, not a channel.
 
+    The cwd -> worktree matcher and the availability receipt live in occupancy.ps1, shared with
+    prune-merged.ps1 (which DELETES a worktree, so it must reach the same verdict this roster does).
+    This script only labels and renders what that returns.
+
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\presence.ps1
     pwsh -NoProfile -File scripts\coord\presence.ps1 -All        # include stale/dead entries
@@ -61,40 +65,11 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-# --- Which worktrees count as "this repo" -------------------------------------------------------
-# A session is in-scope when its cwd is inside ANY worktree sharing this .git. Keyed on the worktree
-# set rather than a single path, because the whole point is seeing siblings, not just yourself.
-function Get-RepoWorktrees([string]$RepoHint) {
-    $gitArgs = @()
-    if ($RepoHint) { $gitArgs = @("-C", $RepoHint) }
-    $porcelain = & git @gitArgs worktree list --porcelain 2>$null
-    if ($LASTEXITCODE -ne 0 -or -not $porcelain) { return @() }
-    $out = @()
-    $cur = $null
-    foreach ($line in $porcelain) {
-        if ($line -like "worktree *") {
-            $cur = [pscustomobject]@{ Path = $line.Substring(9).Trim(); Branch = "" }
-            $out += $cur
-        }
-        elseif ($line -like "branch *" -and $cur) {
-            $cur.Branch = ($line.Substring(7).Trim() -replace '^refs/heads/', '')
-        }
-        elseif ($line -like "detached*" -and $cur) {
-            $cur.Branch = "(detached)"
-        }
-    }
-    return $out
-}
-
-function ConvertTo-Norm([string]$p) {
-    if (-not $p) { return "" }
-    return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
-}
-
-# --- Registry access + the liveness fence -------------------------------------------------------
-# Shared with sessions.ps1, which needs the SAME answer to "is this session alive" before it moves a
-# transcript. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
-. "$PSScriptRoot\session-registry.ps1"
+# --- Registry access, the liveness fence, and the cwd -> worktree matcher ------------------------
+# All shared: sessions.ps1 needs the SAME answer to "is this session alive" before it moves a
+# transcript, and prune-merged.ps1 needs the SAME answer to "is anybody in this checkout" before it
+# DELETES one. Two copies of a safety check drift, and the copy that drifts is the one nobody tests.
+. "$PSScriptRoot\occupancy.ps1"
 
 function Get-LoginLabel([string]$RootPath) {
     $leaf = Split-Path $RootPath -Leaf
@@ -141,61 +116,48 @@ function Get-SelfPids([int]$Override) {
 }
 
 # --- Collect ------------------------------------------------------------------------------------
-$worktrees = Get-RepoWorktrees $Repo
-if (-not $worktrees -or $worktrees.Count -eq 0) {
+$occ = Get-WorktreeOccupancy -Repo $Repo -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
+if (-not $occ.RepoFound) {
     if ($Json) { "[]" | Write-Output } else { Write-Host "Not inside a git repository -- nothing to scope presence to." }
     exit 0
 }
-$wtIndex = @{}
-foreach ($w in $worktrees) { $wtIndex[(ConvertTo-Norm $w.Path)] = $w }
-# The primary (trunk) checkout is the first entry git reports; naming it matters because a session
-# sitting there is the one most likely to collide with everyone else.
-$primaryNorm = ConvertTo-Norm $worktrees[0].Path
 
 $selfPids = Get-SelfPids $SelfPid
 
 $rows = @()
-foreach ($entry in (Get-SessionRecords -ConfigRoot $ConfigRoot)) {
-        $rec = $entry.Record
-        $root = $entry.Root
-        if (-not $rec.cwd) { continue }
-
-        # Scope: cwd inside one of this repo's worktrees. Exact match on the worktree root, or a
-        # descendant of it -- a session cd'd into a subdirectory is still that worktree's session.
-        $cwdNorm = ConvertTo-Norm $rec.cwd
-        $match = $null
-        foreach ($k in $wtIndex.Keys) {
-            if ($cwdNorm -eq $k -or $cwdNorm.StartsWith("$k/")) {
-                if (-not $match -or $k.Length -gt (ConvertTo-Norm $match.Path).Length) { $match = $wtIndex[$k] }
-            }
-        }
-        if (-not $match) { continue }
-
-        $live = Test-RecordLiveness -Record $rec -StartSkewMinutes $StartSkewMinutes
-        $matchNorm = ConvertTo-Norm $match.Path
-        $rows += [pscustomobject]@{
-            State     = $live.State
-            Detail    = $live.Detail
-            Surface   = Get-SurfaceLabel $rec.entrypoint
-            Login     = Get-LoginLabel $root
-            SessionId = [string]$rec.sessionId
-            Short     = if ($rec.sessionId) { ([string]$rec.sessionId).Substring(0, [Math]::Min(8, ([string]$rec.sessionId).Length)) } else { "?" }
-            Pid       = [int]$rec.pid
-            Cwd       = [string]$rec.cwd
-            Worktree  = if ($matchNorm -eq $primaryNorm) { "primary" } else { Split-Path $match.Path -Leaf }
-            IsPrimary = ($matchNorm -eq $primaryNorm)
-            Branch    = $match.Branch
-            Kind      = [string]$rec.kind
-            IsSelf    = ($selfPids -contains [int]$rec.pid)
-            StartedAt = if ($null -ne $rec.startedAt) { [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$rec.startedAt).LocalDateTime.ToString("o") } else { "" }
-        }
+foreach ($s in $occ.Sessions) {
+    $rows += [pscustomobject]@{
+        State     = $s.State
+        Detail    = $s.Detail
+        Surface   = Get-SurfaceLabel $s.Entrypoint
+        Login     = Get-LoginLabel $s.Root
+        SessionId = $s.SessionId
+        Short     = $s.Short
+        Pid       = $s.Pid
+        Cwd       = $s.Cwd
+        Worktree  = $s.Worktree
+        IsPrimary = $s.IsPrimary
+        Branch    = $s.Branch
+        Kind      = $s.Kind
+        IsSelf    = ($selfPids -contains [int]$s.Pid)
+        StartedAt = $s.StartedAt
+    }
 }
 
-$order = @{ "LIVE" = 0; "UNVERIFIED" = 1; "STALE" = 2; "DEAD" = 3 }
+$order = @{ "LIVE" = 0; "UNVERIFIED" = 1; "UNREADABLE" = 1; "STALE" = 2; "DEAD" = 3 }
 $rows = @($rows | Sort-Object @{ E = { $order[$_.State] } }, @{ E = { $_.Worktree } })
-if (-not $All) { $rows = @($rows | Where-Object { $_.State -eq "LIVE" -or $_.State -eq "UNVERIFIED" }) }
+# Anything that is live, or that we could not prove ISN'T, stays in the default view: an unverifiable
+# fence is not a passed fence.
+if (-not $All) { $rows = @($rows | Where-Object { Test-OccupancyVeto $_.State }) }
 
 if ($Json) {
+    # The receipt goes to STDERR, deliberately: stdout stays a pure JSON array so every existing
+    # consumer keeps working, but "the fence could not look" no longer renders as an indistinguishable
+    # `[]`. Without this, session-context.ps1's banner reports an unavailable fence as "nobody else is
+    # here" -- a green light derived from nothing having been measured.
+    if (-not $occ.Available) {
+        [Console]::Error.WriteLine("presence: roster UNAVAILABLE -- $($occ.Detail). $($occ.RootsExamined) config root(s), $($occ.RecordsExamined) record(s) examined. An empty list here is NOT 'nobody is live'.")
+    }
     # -Depth so nested pscustomobjects survive; -AsArray so a single row is still a JSON list and a
     # caller can index it without special-casing.
     ($rows | ConvertTo-Json -Depth 4 -AsArray) | Write-Output
@@ -203,7 +165,15 @@ if ($Json) {
 }
 
 if ($rows.Count -eq 0) {
-    Write-Host "No live sessions found for this repo." -ForegroundColor DarkGray
+    # "Nobody is here" and "I could not look" produce the same empty list, so say which one it is.
+    if (-not $occ.Available) {
+        Write-Host "Roster UNAVAILABLE -- $($occ.Detail)." -ForegroundColor Yellow
+        Write-Host "  This is NOT 'nobody is live'. Nothing was examined, so nothing can be concluded." -ForegroundColor Yellow
+    }
+    else {
+        Write-Host "No live sessions found for this repo." -ForegroundColor DarkGray
+        Write-Host "  (fence: $($occ.RootsExamined) config root(s), $($occ.RecordsExamined) record(s) examined.)" -ForegroundColor DarkGray
+    }
     Write-Host "(Add -All to include stale/dead registry entries.)" -ForegroundColor DarkGray
     exit 0
 }
