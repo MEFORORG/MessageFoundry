@@ -166,10 +166,11 @@ authority above:
 4. **Posture-B tails.** (a) A **cert-authenticated intra-service auth** is now **audited**: the
    `GET /service/identity` route (the only `require_service_cert` surface) writes a `service_cert_auth`
    row into the tamper-evident chain naming the mapped principal (PHI/secret-free — auth plane + route
-   only). (b) **Runtime KEX enforcement** is verified: when the engine terminates TLS in-process,
+   only). (b) ~~**Runtime KEX enforcement** is verified: when the engine terminates TLS in-process,
    `build_api_ssl_context` pins the approved forward-secret groups (`harden_kex_groups`), and a real
    handshake test proves a client offering only a non-approved FFDHE group is refused — runtime
-   enforcement, not the operator attestation the proxy-terminated (Posture-B) case still relies on. (c) A
+   enforcement, not the operator attestation the proxy-terminated (Posture-B) case still relies on.~~
+   **WITHDRAWN 2026-07-29 — see the amendment below.** (c) A
    real **mutual-TLS handshake** test exercises the exact server context the serve path builds
    (`CERT_REQUIRED`): a trusted client cert completes, a missing one is refused. **Genuinely deferred
    (infra-bound):** a full uvicorn-on-a-real-socket mTLS handshake through the live serve bind is left to
@@ -207,3 +208,40 @@ every escape-clamp is **byte-identical** to the former production-PHI behaviour 
 two carve-outs of the 2026-07-20 amendment re-key to `enforcement`, and the keyless-PHI ack is renamed
 `allow_unencrypted_phi_in_production` → `allow_unencrypted_phi_under_strict_enforcement` (see the ADR 0140
 amendment). The four hard-refused floor items and the unconditional ePHI audit are unchanged.
+
+## Amendment (2026-07-29) — §4(b) "runtime KEX enforcement" is WITHDRAWN as a measurement error
+
+The 2026-07-13 amendment's §4(b) made three assertions. **All three are wrong**, re-measured on the
+shipping interpreter (Python 3.14.6 / OpenSSL 3.5.7):
+
+1. *"`build_api_ssl_context` pins the approved forward-secret groups"* — it does not.
+   `SSLContext.set_groups` is a **Python 3.15** addition (typeshed guards it at
+   `sys.version_info >= (3, 15)`), so `harden_kex_groups` returns without pinning at **all six** of its
+   call sites and the built contexts inherit OpenSSL's default group list.
+2. *"a real handshake test proves…"* — that test
+   (`test_kex_allow_list_enforced_at_runtime`) reached its assertion only through a **client-side**
+   `set_groups`, so on every interpreter this project runs on it hit `pytest.skip`. It never executed.
+3. *"…a client offering only a non-approved FFDHE group is refused"* — the opposite is true. Measured by
+   pinning a client to one group at a time via `set_ecdh_curve` and handshaking against the real
+   `build_api_ssl_context`, at both `tls_min_version` 1.2 and 1.3: `ffdhe2048`, `ffdhe3072` and
+   `secp521r1` are all **accepted**. (`secp224r1` and `sect571r1` are refused.)
+
+A skip was concealing a false assertion, and this ADR cited it as proof. That is worse than an untested
+claim, because it reads as evidence.
+
+**What this ADR relies on is unaffected.** The forward-secrecy property comes from the **TLS 1.2+ floor**,
+which *is* enforced, and the inherited default list is itself forward-secret — the residual is *wider than
+policy*, not *weak*. §4(a) (the `service_cert_auth` audit row) and §4(c) (the real mutual-TLS handshake
+against the built `CERT_REQUIRED` context) were re-confirmed and stand.
+
+**Fixed alongside this amendment:** `harden_kex_groups` now **returns the group list it actually pinned**
+(`None` today), so the inertness is observable rather than silent; a failed pin returns `None` too, where
+it previously fell through as if it had succeeded. The skipping test is replaced by one that *measures*
+the accepted-group set and cannot skip, plus an unconditional receipt asserting the `None` — so the first
+interpreter to grow the API turns the suite red and forces this amendment, `PHI.md` §4 and the ASVS
+11.6.2 row to be re-derived together. See [PHI.md](../PHI.md) §4.
+
+**Do not re-assert a KEX pin anywhere until `harden_kex_groups` returns non-`None`.**
+`SSLContext.set_ecdh_curve` does exist and genuinely constrains the TLS 1.3 `supported_groups`, but it
+takes exactly one OpenSSL curve short name — it cannot express a preference list, and pinning through it
+would refuse two of the three approved groups. It is a costed hardening option, not a drop-in.

@@ -111,17 +111,87 @@ def test_validate_rejects_non_forward_secret() -> None:
 # --- harden_kex_groups -------------------------------------------------------------------------
 def test_harden_does_not_raise_on_real_context() -> None:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    harden_kex_groups(ctx)  # no-op pre-3.13, set_groups on 3.13+ — either way must not raise
+    harden_kex_groups(ctx)  # must never raise, whatever the runtime can or cannot pin
 
 
-def test_harden_is_noop_without_set_groups() -> None:
-    # A runtime/object lacking set_groups is handled gracefully (older interpreters).
+def test_the_group_pin_is_inert_on_this_runtime_and_says_so() -> None:
+    """A liveness receipt for ASVS 11.6.2 — written to FAIL on the interpreter upgrade.
+
+    ``SSLContext.set_groups`` is a **Python 3.15** addition, so ``harden_kex_groups`` pins nothing on
+    any interpreter this project runs on and ``APPROVED_KEX_GROUPS`` reaches zero of its six call
+    sites. That was already true; what was missing was any way to NOTICE. The tests that stood here
+    asserted (a) that the call does not raise, (b) that it no-ops on an object without the API, and (c)
+    the contents of a string constant — all three pass identically whether or not a single group is
+    ever pinned. That is how the docstring came to claim "Python 3.13+" and how ADR 0092 §4(b), PHI.md
+    §4 and the ASVS scorecard all came to assert a control that does not execute.
+
+    Asserted **unconditionally** on purpose: an ``if hasattr(ctx, "set_groups")`` branch here would
+    restore exactly the property being removed — a test that cannot fail.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    pinned = harden_kex_groups(ctx)
+    assert pinned is None, (
+        f"harden_kex_groups pinned {pinned!r}, so this interpreter HAS a group-list API and the ASVS "
+        f"11.6.2 residual has CHANGED. This is good news, not a bug. Re-derive, in one change: the "
+        f"harden_kex_groups docstring, docs/PHI.md §4, docs/ASVS-L2-PHASE0-CHANGES.md, the ADR 0092 "
+        f"§4(b) amendment and the 11.6.2 register row — then rewrite this test to assert the pin TOOK, "
+        f"via ctx.get_groups(), which lands in the same Python version."
+    )
+    assert not hasattr(ctx, "set_groups"), (
+        "set_groups EXISTS but harden_kex_groups still returned None, so the pin is failing silently — "
+        "worse than being unavailable, because the docs would read as satisfied. See the "
+        "logger.warning path."
+    )
+
+
+def test_harden_reports_none_without_set_groups() -> None:
+    # An object lacking the API must be handled gracefully AND report that nothing was pinned.
     fake = types.SimpleNamespace()
-    harden_kex_groups(fake)  # type: ignore[arg-type]
+    assert harden_kex_groups(fake) is None  # type: ignore[arg-type]
+
+
+def test_harden_reports_the_list_it_pinned_when_the_api_exists() -> None:
+    """The return value must be REAL, not incidentally-``None``.
+
+    ``test_the_group_pin_is_inert_on_this_runtime_and_says_so`` asserts ``is None`` — which a function
+    with no ``return`` statement at all also satisfies. On its own it therefore does NOT prove the
+    reporting works: reverting this helper to its old ``-> None`` signature would leave it green. Drive
+    the pinning path with a stand-in context that *has* ``set_groups`` so both halves of the contract
+    are covered, and assert the group list actually reached it.
+    """
+
+    class _Pinnable:
+        def __init__(self) -> None:
+            self.pinned: list[str] = []
+
+        def set_groups(self, grouplist: str) -> None:
+            self.pinned.append(grouplist)
+
+    ctx = _Pinnable()
+    assert harden_kex_groups(ctx) == APPROVED_KEX_GROUPS  # type: ignore[arg-type]
+    assert ctx.pinned == [APPROVED_KEX_GROUPS], "the group list never reached set_groups"
+
+
+def test_a_pin_that_raises_reports_nothing_pinned() -> None:
+    """An OpenSSL build that REJECTS the group list must report ``None``, not the list.
+
+    This was the shipped bug: the helper logged the warning and then fell off the end, so the caller
+    could not distinguish "pinned" from "tried and failed" — and once the helper started reporting, the
+    failure path returning the list would have been a lie with a warning line next to it.
+    """
+
+    class _Rejecting:
+        def set_groups(self, grouplist: str) -> None:
+            raise ValueError("this OpenSSL build rejects the group list")
+
+    assert harden_kex_groups(_Rejecting()) is None  # type: ignore[arg-type]
 
 
 def test_approved_groups_are_ecdhe_curves() -> None:
     assert APPROVED_KEX_GROUPS.split(":") == ["X25519", "secp384r1", "secp256r1"]
+    # NB `secp256r1` is a valid OpenSSL group-list alias but NOT a valid EC curve name — that spelling
+    # is `prime256v1`, and set_ecdh_curve("secp256r1") raises ValueError. Both are correct in their own
+    # API; do not "normalise" them to one.
 
 
 # --- harden_verify_flags -----------------------------------------------------------------------

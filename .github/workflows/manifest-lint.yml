@@ -8,8 +8,11 @@
 #   * It runs ONLY when a manifest, this workflow, or the docker/ docs change (paths filter), so docs/code
 #     PRs that don't touch manifests skip it entirely.
 #   * It is a SEPARATE workflow, deliberately not part of ci.yml's required `ci-gate`. The required set
-#     stays: the `test` matrix + bandit + pip-audit + cla (see docs/.. main required-checks). Do NOT add
-#     "manifest lint" to branch-protection required checks unless the owner decides to promote it.
+#     is recorded in .github/required-contexts.txt — read it there rather than trusting a copy in a
+#     comment; the copy that used to live on this line named 4 of the 12 and went stale. Do NOT add
+#     "manifest lint" to branch-protection required checks unless the owner decides to promote it: it is
+#     paths-filtered, so on a PR that touches no manifest it would never report and would block the PR
+#     forever (the required-but-absent trap, docs/CI.md).
 #   * It is fast + dependency-light (a single static binary + grep assertions), so it is cheap to run.
 
 name: manifest lint

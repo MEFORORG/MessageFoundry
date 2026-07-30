@@ -2120,10 +2120,22 @@ class AuthSettings(_Section):
         if missing:
             raise ValueError(f"oidc_enabled requires: {', '.join(missing)}")
 
-        if self.oidc_client_secret is None and self.oidc_client_secret_ref is None:
+        # EMPTY, not just absent. `is None` was the test here, and it let the most common shape of a
+        # missing secret straight through: an env var exported with no value. `MEFOR_AUTH_OIDC_CLIENT_SECRET=`
+        # in a service wrapper or an NSSM environment entry produces `""`, which is not None, so the guard
+        # that exists to make a missing client secret fail at CONFIG LOAD did not fire — the failure moved
+        # to the first token exchange, as an IdP rejection an operator has to go read a proxy log to
+        # understand. `if not value` is already the emptiness test used by the `missing` list ten lines
+        # above; this line was the only one in the validator that disagreed. Whitespace is stripped for the
+        # test only — the value itself is never rewritten.
+        if (
+            not (self.oidc_client_secret or "").strip()
+            and not (self.oidc_client_secret_ref or "").strip()
+        ):
             raise ValueError(
-                "oidc_enabled requires a client secret: set oidc_client_secret (via "
-                "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider reference)"
+                "oidc_enabled requires a NON-EMPTY client secret: set oidc_client_secret (via "
+                "MEFOR_AUTH_OIDC_CLIENT_SECRET) or oidc_client_secret_ref (a [secrets].provider "
+                "reference). An env var exported with no value counts as missing."
             )
 
         # Every pinned URL must be https (no dev escape — this is an off-box trust boundary) and its

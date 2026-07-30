@@ -208,6 +208,82 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 # and broke `build --wheel`.) tests/test_password_*.py load the corpus via importlib.resources, so a
 # build-config change that dropped it would fail the suite — that's the guard, not a force-include.
 
+# --- CI TOOLCHAIN — PEP 735 dependency groups (ADR 0034 §3) ----------------------------------------
+#
+# WHY THEY EXIST: a version pin does NOT satisfy Scorecard's PinnedDependenciesID. Proven by this
+# repo's own alert data — `bandit==1.9.4` (alert #74) and `zizmor==1.5.2` (alert 96) are EXACTLY pinned
+# and still flagged, while the two `--require-hashes` installs are flagged in neither the open nor the
+# dismissed set. Declaring the tools here routes them through `uv.lock`, out to `ci/locks/*.lock` via
+# `uv export` WITH HASHES, and into CI as `pip install --require-hashes -r ci/locks/<group>.lock`. The
+# same machinery (DEP-1 diff gate + the Dependabot resync) that keeps the other four exports fresh
+# keeps these fresh, which is what stops a hash-pinned toolchain rotting into a pinned-but-unpatched
+# one — the failure ADR 0034 §3 names as "worse posture than floating".
+#
+# NOT EXTRAS, deliberately: an extra is published wheel metadata, so `[ci-scanners]` would become a
+# real install target for every downstream consumer of the wheel. A dependency group never ships.
+#
+# NOT IN `[tool.uv] default-groups`, deliberately: a default group lands in all four committed DEP-1
+# artifacts — i.e. in the release SBOM, the container image locks, and in what `pip-audit` audits AS
+# RUNTIME. Measured with these groups non-default: all four re-export byte-identically (DIFFS=0).
+#
+# THE SPLIT IS THE MERGE PATH. `ci-scanners` is what the BLOCKING security gates install for
+# themselves (security.yml's pip-audit + bandit jobs, zizmor.yml); `ci-quality` is ADVISORY
+# measurement (quality-advisory.yml's coverage + mutation jobs). Keeping them apart keeps `mutmut` — a
+# mutation engine that rewrites and executes source — out of every required gate's install closure.
+#
+# NOT HERE: `semgrep`. It hard-conflicts with the `[otel]` extra (semgrep 1.172.0 requires
+# `opentelemetry-sdk>=1.37,<1.38` while `[otel]` resolves 1.44), so a plain group silently DOWNGRADES
+# the shipped otel runtime in all four DEP-1 artifacts — measured, bisected to semgrep alone. The only
+# fix is `[tool.uv] conflicts = [[{ extra = "otel" }, { group = "..." }]]`, which declares a PRODUCT
+# extra and a CI scanner permanently mutually exclusive. Excluded by decision, recorded as a reasoned
+# residual in ADR 0034 §3 with the exact recipe so a future owner can flip it in one commit.
+#
+# Each pin's rationale lives HERE rather than in the workflow: the workflow comments would otherwise
+# push every dismissed Scorecard alert anchored below them onto a new line number (ADR 0034's
+# convergence rule).
+[dependency-groups]
+# The scanners the BLOCKING security gates install for themselves. Exact `==` throughout — for each of
+# these the VERSION IS THE CONTRACT of a gate that can red a PR:
+#   bandit    an unpinned 1.9.x upgrade silently changed `# nosec` parsing (1.9.x wants space-separated
+#             test IDs) and broke a green branch; this is the findings baseline of a blocking gate.
+#   pip-audit `==` makes the audit reproducible — an unpinned auditor can change its advisory-database
+#             handling between two runs of the same commit.
+#   zizmor    zizmor.yml's gate asserts a CLEAN baseline, so a newly-added rule reds a green PR for a
+#             reason unrelated to its diff. Verify the tag at
+#             https://github.com/zizmorcore/zizmor/releases if an install 404s.
+# NB: this group also hash-pins `pip` itself (it arrives as a pip-audit → pip-api dependency), which is
+# what let security.yml drop two `pip install --upgrade pip` bootstraps outright rather than pin them.
+ci-scanners = [
+    "bandit==1.9.4",
+    "pip-audit==2.10.1",
+    "zizmor==1.5.2",
+]
+# The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's
+# output, a floor where nothing does:
+#   diff-cover     `==`: the inline-annotation surface depends on this version's
+#                  `--format github-annotations:<level>` and on adjacent-line coalescing inside
+#                  GitHubAnnotationsReportGenerator.
+#   mutmut         `==`: the workflow SHELL-PARSES mutmut's human-readable output (the `N/M` progress
+#                  line, `🎉 N`, `: survived`, `: no tests`) and reconciles two independent derivations
+#                  of the killed count. A reword produces a GREEN receipt off a wrong number — exactly
+#                  the failure class that workflow's liveness job exists for. Must stay 3.x: 2.5.1
+#                  crashes on Python 3.14 in its pony-ORM cache before generating a single mutant.
+#   pytest-cov     floor only — nothing parses it; it just has to emit a `coverage.xml` diff-cover
+#                  reads. Pinned at the current major so a re-lock cannot regress to 6.x, and left a
+#                  floor so Dependabot can move it without a pyproject edit.
+#   pytest-timeout DELIBERATELY the identical spec to `[project.optional-dependencies].dev`. mutmut 3
+#                  always passes `--timeout`/`--timeout-method` to pytest and dies inside
+#                  BadTestExecutionCommandsException without the plugin, so naming it here makes this
+#                  lock self-sufficient instead of depending on the editable `[dev]` install having
+#                  supplied it. Same spec in both places ⇒ uv resolves ONE version and they cannot
+#                  disagree.
+ci-quality = [
+    "diff-cover==10.4.1",
+    "mutmut==3.6.0",
+    "pytest-cov>=7.0",
+    "pytest-timeout>=2.3",
+]
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 # Run the whole suite on ONE shared asyncio event loop (tests AND fixtures). pytest-asyncio's default

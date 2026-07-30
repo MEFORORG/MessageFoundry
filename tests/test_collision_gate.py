@@ -1,0 +1,316 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (C) 2026 MessageFoundry Organization and contributors
+"""Tests for the collision gate (``scripts/hooks/collision_gate.ps1``) and its installer.
+
+The gate refuses to edit a file another LIVE session is already changing. Worktrees stop two sessions
+overwriting each other's bytes; they do not stop two sessions editing the same file in parallel and
+finding out at merge, when one of them has to throw work away.
+
+Two properties carry the weight, and they pull in opposite directions:
+
+* **It denies on a live session and only on a live session.** A dormant worktree cannot be racing you,
+  and a gate that blocks every file an abandoned branch ever touched gets uninstalled.
+* **It fails OPEN on every error.** This gate prevents rework; it must never be the reason a session
+  cannot work. That is deliberately the opposite of the worktree gate, which protects the shared tree
+  and fails closed.
+
+The gate is driven as a real subprocess with a real PreToolUse payload, against a stub overlap script
+supplying known rows. Splitting it there is intentional: these tests pin the gate's DECISION, and
+``test_coord_overlap.py`` pins how the rows are computed. Neither re-implements the other.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+GATE = ROOT / "scripts" / "hooks" / "collision_gate.ps1"
+INSTALLER = ROOT / "scripts" / "coord" / "install-coordination.ps1"
+
+pytestmark = pytest.mark.skipif(
+    shutil.which("pwsh") is None or os.name != "nt",
+    reason="collision_gate.ps1 needs pwsh on Windows",
+)
+
+
+def make_overlap_stub(tmp_path: Path, rows: list[dict[str, Any]]) -> Path:
+    """A stand-in for overlap.ps1 that emits the rows we want, in the real script's shape."""
+    stub = tmp_path / "overlap-stub.ps1"
+    payload = json.dumps(rows).replace("'", "''")  # '' escapes a quote in a PS single-quoted string
+    stub.write_text(
+        "param([string]$File,[switch]$Json,[switch]$Refresh,[int]$CacheSeconds,"
+        "[string]$Repo,[string[]]$ConfigRoot,[string]$TasksDir)\n"
+        f"Write-Output '{payload}'\n",
+        encoding="utf-8",
+    )
+    return stub
+
+
+def run_gate(overlap: Path | None, file_path: str | None = "a.py") -> dict[str, Any] | None:
+    """Invoke the gate exactly as Claude Code does. Returns the deny object, or None for allow."""
+    payload: dict[str, Any] = {"tool_name": "Edit", "tool_input": {}}
+    if file_path is not None:
+        payload["tool_input"]["file_path"] = file_path
+    args = ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(GATE)]
+    if overlap is not None:
+        args += ["-OverlapScript", str(overlap)]
+    proc = subprocess.run(
+        args, input=json.dumps(payload), capture_output=True, text=True, timeout=180, check=False
+    )
+    # A hook must never crash the tool call: a non-zero exit is ignored by the harness, which would
+    # leave the gate looking installed while permitting everything.
+    assert proc.returncode == 0, f"gate exited {proc.returncode}: {proc.stderr}"
+    out = proc.stdout.strip()
+    return json.loads(out) if out else None
+
+
+LIVE_ROW = {
+    "Worktree": "sibling-wt",
+    "Branch": "claude/other-work",
+    "Live": True,
+    "Short": "deadbeef",
+    "Surface": "vscode",
+    "Files": ["a.py"],
+    "Work": ["Rewrite the ingest path", "Add the retry test"],
+}
+DORMANT_ROW = {**LIVE_ROW, "Live": False, "Short": "", "Surface": "", "Worktree": "old-wt"}
+
+
+def test_denies_when_a_live_session_is_changing_the_file(tmp_path: Path) -> None:
+    got = run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]))
+    assert got is not None, "expected a deny, got allow"
+    out = got["hookSpecificOutput"]
+    assert out["hookEventName"] == "PreToolUse"
+    assert out["permissionDecision"] == "deny"
+
+
+def test_the_denial_names_the_session_branch_and_what_it_is_building(tmp_path: Path) -> None:
+    """A deny that doesn't say WHO or WHAT just looks like a broken tool and gets overridden."""
+    got = run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]))
+    assert got is not None
+    reason = got["hookSpecificOutput"]["permissionDecisionReason"]
+    assert "deadbeef" in reason
+    assert "claude/other-work" in reason
+    assert "Rewrite the ingest path" in reason  # the duplicate-work signal
+    assert "vscode" in reason  # surface matters: it cannot be reached by session messaging
+
+
+def test_allows_when_only_a_dormant_worktree_touches_the_file(tmp_path: Path) -> None:
+    """Nobody is typing in it, so it cannot be racing you."""
+    assert run_gate(make_overlap_stub(tmp_path, [DORMANT_ROW])) is None
+
+
+def test_allows_when_nobody_else_touches_the_file(tmp_path: Path) -> None:
+    assert run_gate(make_overlap_stub(tmp_path, [])) is None
+
+
+def test_fails_open_when_the_overlap_script_is_missing(tmp_path: Path) -> None:
+    assert run_gate(tmp_path / "does-not-exist.ps1") is None
+
+
+def test_fails_open_when_the_overlap_script_throws(tmp_path: Path) -> None:
+    broken = tmp_path / "broken.ps1"
+    broken.write_text("param([string]$File,[switch]$Json)\nthrow 'boom'\n", encoding="utf-8")
+    assert run_gate(broken) is None
+
+
+def test_fails_open_when_the_overlap_script_emits_junk(tmp_path: Path) -> None:
+    junk = tmp_path / "junk.ps1"
+    junk.write_text(
+        "param([string]$File,[switch]$Json)\nWrite-Output 'not json'\n", encoding="utf-8"
+    )
+    assert run_gate(junk) is None
+
+
+def test_allows_a_payload_with_no_file_path(tmp_path: Path) -> None:
+    assert run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]), file_path=None) is None
+
+
+# --------------------------------------------------------------------------------- installer
+
+
+def run_installer(settings: Path, *extra: str) -> str:
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(INSTALLER),
+            "-SettingsPath",
+            str(settings),
+            *extra,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0, proc.stderr
+    return proc.stdout
+
+
+@pytest.fixture
+def settings(tmp_path: Path) -> Path:
+    p = tmp_path / "settings.json"
+    p.write_text(
+        json.dumps(
+            {
+                "theme": "dark",
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo other"}]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    return p
+
+
+def load(settings: Path) -> dict[str, Any]:
+    parsed: dict[str, Any] = json.loads(settings.read_text(encoding="utf-8-sig"))
+    return parsed
+
+
+def test_install_wires_both_hooks(settings: Path) -> None:
+    run_installer(settings)
+    d = load(settings)
+    assert "SessionStart" in d["hooks"]
+    matchers = [g.get("matcher") for g in d["hooks"]["PreToolUse"]]
+    assert "Edit|Write|MultiEdit|NotebookEdit" in matchers
+
+
+def test_install_preserves_unrelated_hooks_and_settings(settings: Path) -> None:
+    """User settings is shared with other tooling AND edited by sibling sessions. Clobbering it is
+    the failure that costs the most, because a bad write disables every setting silently."""
+    run_installer(settings)
+    d = load(settings)
+    assert d["theme"] == "dark"
+    cmds = [g["hooks"][0]["command"] for g in d["hooks"]["PreToolUse"]]
+    assert any("echo other" in c for c in cmds), "pre-existing hook was dropped"
+
+
+def test_install_is_idempotent(settings: Path) -> None:
+    run_installer(settings)
+    first = load(settings)
+    run_installer(settings)
+    second = load(settings)
+    assert first == second, "re-install duplicated or altered entries"
+
+
+def test_uninstall_removes_only_our_entries(settings: Path) -> None:
+    run_installer(settings)
+    run_installer(settings, "-Uninstall")
+    d = load(settings)
+    assert "SessionStart" not in d["hooks"]
+    cmds = [g["hooks"][0]["command"] for g in d["hooks"]["PreToolUse"]]
+    assert cmds == ["echo other"]
+    assert d["theme"] == "dark"
+
+
+def test_status_reports_installed_state(settings: Path) -> None:
+    assert "missing" in run_installer(settings, "-Status")
+    run_installer(settings)
+    assert "INSTALLED" in run_installer(settings, "-Status")
+
+
+def shim_for(settings: Path, matcher_prefix: str, tmp_path: Path, name: str) -> Path:
+    cmd = next(
+        g["hooks"][0]["command"]
+        for g in load(settings)["hooks"]["PreToolUse"]
+        if g.get("matcher", "").startswith(matcher_prefix)
+    )
+    p = tmp_path / name
+    p.write_text(cmd, encoding="utf-8")
+    return p
+
+
+def test_shim_runs_the_primary_checkouts_script_not_the_worktrees(
+    settings: Path, tmp_path: Path
+) -> None:
+    """A worktree on a branch that predates a coordination change has none of the scripts.
+
+    Measured: a cwd-resolved shim found nothing there and exited silently -- no banner, no gate, and
+    no indication either was missing. Coordination is infrastructure and must be uniform, so the shim
+    resolves the PRIMARY checkout (which tracks main) rather than whatever branch the caller is on.
+    """
+    primary = tmp_path / "primary"
+    primary.mkdir()
+    _git_init(primary)
+    # Only the PRIMARY gets a gate script; the worktree deliberately does not have one.
+    (primary / "scripts" / "hooks").mkdir(parents=True)
+    (primary / "scripts" / "hooks" / "collision_gate.ps1").write_text(
+        "Write-Output 'PRIMARY-SCRIPT-RAN'\n", encoding="utf-8"
+    )
+    wt = tmp_path / "old-branch-wt"
+    subprocess.run(
+        ["git", "-C", str(primary), "worktree", "add", "-q", "-b", "old", str(wt)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    assert not (wt / "scripts" / "hooks" / "collision_gate.ps1").exists()
+
+    run_installer(settings)
+    shim = shim_for(settings, "Edit", tmp_path, "shim.ps1")
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(shim)],
+        cwd=str(wt),
+        input=json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "x.py"}}),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert "PRIMARY-SCRIPT-RAN" in proc.stdout, (
+        f"shim did not reach the primary checkout's script: {proc.stdout!r} {proc.stderr!r}"
+    )
+
+
+def _git_init(repo: Path) -> None:
+    for args in (
+        ["init", "-q"],
+        ["config", "user.email", "t@example.invalid"],
+        ["config", "user.name", "t"],
+    ):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True, text=True)
+    (repo / "f.txt").write_text("x", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "f.txt"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-qm", "init"], check=True, capture_output=True
+    )
+
+
+def test_installed_shim_is_inert_outside_a_git_repo(settings: Path, tmp_path: Path) -> None:
+    """User settings are global: this hook runs in every unrelated project on the machine and must
+    do nothing there rather than erroring on each tool call."""
+    run_installer(settings)
+    shim_cmd = next(
+        g["hooks"][0]["command"]
+        for g in load(settings)["hooks"]["PreToolUse"]
+        if g.get("matcher", "").startswith("Edit")
+    )
+    shim = tmp_path / "shim.ps1"
+    shim.write_text(shim_cmd, encoding="utf-8")
+    outside = tmp_path / "not-a-repo"
+    outside.mkdir()
+    proc = subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(shim)],
+        cwd=str(outside),
+        input=json.dumps({"tool_name": "Edit", "tool_input": {"file_path": "x.py"}}),
+        capture_output=True,
+        text=True,
+        timeout=180,
+        check=False,
+    )
+    assert proc.returncode == 0
+    assert proc.stdout.strip() == "", "shim produced output outside a repo"

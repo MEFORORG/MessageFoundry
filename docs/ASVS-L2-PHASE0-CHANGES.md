@@ -222,9 +222,12 @@ value. Under `[security].enforcement=ENFORCE` a DEK past its max-age + grace **e
 
 For the off-loopback transports the TLS floor is **1.2+** (`tls_min_version`), which constrains key
 exchange to forward-secret **(EC)DHE** suites. The **code-half is now built** (WP-L3-10 free lift):
-[config/tls_policy.py](../messagefoundry/config/tls_policy.py) pins the approved key-exchange groups
-(`X25519:secp384r1:secp256r1` via `SSLContext.set_groups` on Python ≥3.13; OpenSSL already defaults to
-these on 3.11/3.12) on every built API + MLLP TLS context (`harden_kex_groups`), and a `[api].tls_ciphers`
+[config/tls_policy.py](../messagefoundry/config/tls_policy.py) *attempts* the approved key-exchange
+group pin (`X25519:secp384r1:secp256r1` via `SSLContext.set_groups`) on every built API + MLLP TLS
+context (`harden_kex_groups`) — but **corrected 2026-07-29: `set_groups` is a Python 3.15 API, not 3.13,
+so today it pins nothing and those contexts inherit OpenSSL's default group list** (forward-secret, but
+wider than the approved three — see [PHI.md](PHI.md) §4 for the measured accepted set). The helper now
+reports what it pinned so the gap is visible rather than assumed. A `[api].tls_ciphers`
 settings validator (`validate_tls_ciphers`) rejects any non-forward-secret (static-RSA/DH) operator
 cipher string at config load. On the default `127.0.0.1` bind no TLS is presented, so this is immaterial
 today; the controls take effect once the engine terminates TLS off-loopback.

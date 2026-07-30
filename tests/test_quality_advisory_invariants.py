@@ -17,12 +17,43 @@ only holdable because the jobs surface findings via workflow commands rather tha
 """
 
 import re
+import tomllib
 from pathlib import Path
 
 import pytest
 import yaml
 
-_WORKFLOW = Path(__file__).resolve().parents[1] / ".github" / "workflows" / "quality-advisory.yml"
+_REPO = Path(__file__).resolve().parents[1]
+_WORKFLOW = _REPO / ".github" / "workflows" / "quality-advisory.yml"
+#: The hash-pinned `uv export` of `[dependency-groups].ci-quality` that this workflow installs from.
+_CI_QUALITY_LOCK = _REPO / "ci" / "locks" / "ci-quality.lock"
+#: The path as the workflow spells it.
+_CI_QUALITY_LOCK_REF = "ci/locks/ci-quality.lock"
+
+
+def _group_pin(package: str) -> str:
+    """The PEP 508 spec ``package`` is declared with in ``[dependency-groups]``.
+
+    The advisory tools' pins moved out of this workflow and into `pyproject.toml` so they could flow
+    into `uv.lock` and be exported WITH HASHES (ADR 0034 §3 — a version pin does not satisfy Scorecard's
+    PinnedDependenciesID). Fails loudly rather than returning a default: "the declaration is gone" and
+    "the declaration is unpinned" must not produce the same result.
+    """
+    groups = tomllib.loads((_REPO / "pyproject.toml").read_text(encoding="utf-8")).get(
+        "dependency-groups"
+    )
+    assert groups, "pyproject.toml declares no [dependency-groups]"
+    for specs in groups.values():
+        for spec in specs or []:
+            # A PEP 735 entry may be a `{include-group = "..."}` table rather than a requirement string.
+            if isinstance(spec, str) and re.match(
+                rf"^{re.escape(package)}(?![A-Za-z0-9._-])", spec
+            ):
+                return spec
+    raise AssertionError(
+        f"{package!r} is not declared in any [dependency-groups] entry: {groups!r}"
+    )
+
 
 # Steps that actually run a quality tool. Setup steps (checkout, setup-python, apt-get, the tool
 # installs) are deliberately NOT required to be continue-on-error: masking an infrastructure failure
@@ -77,6 +108,36 @@ def code(raw: str) -> str:
 
 def _steps(workflow: dict) -> list[tuple[str, dict]]:
     return [(name, step) for name, job in workflow["jobs"].items() for step in job["steps"]]
+
+
+def _assert_job_installs_the_toolchain_lock(workflow: dict, job: str) -> None:
+    """The NAMED job must install the hash-pinned toolchain lock — resolved per job, not file-wide.
+
+    A `"ci/locks/ci-quality.lock" in <whole workflow>` assertion is satisfied by EITHER job's install
+    line, so deleting the coverage job's while leaving the mutation job's (or vice versa) passes. Both
+    were individually deletable at zero test cost before this. The coverage job's failure mode is the
+    dangerous one because it is SILENT: without the install, `pytest -q --cov` dies on
+    `unrecognized arguments: --cov`, `|| true` swallows the exit code, no `coverage.xml` is written, and
+    the diff-coverage step reports "skipped" and exits 0 — a green advisory receipt measuring nothing.
+    """
+    assert job in workflow["jobs"], (
+        f"quality-advisory.yml has no `{job}` job — re-point this guard rather than letting it pass"
+    )
+    runs = [
+        step.get("run") or ""
+        for step in workflow["jobs"][job]["steps"]
+        if _CI_QUALITY_LOCK_REF in (step.get("run") or "")
+    ]
+    print(f"[quality-advisory] job {job!r}: {len(runs)} step(s) install {_CI_QUALITY_LOCK_REF}")
+    assert len(runs) == 1, (
+        f"the `{job}` job has {len(runs)} step(s) installing {_CI_QUALITY_LOCK_REF}, expected exactly 1. "
+        f"Its tools are pinned by that lock alone; with no install the job runs against whatever the "
+        f"editable install happened to pull in."
+    )
+    assert "--require-hashes" in runs[0], (
+        f"the `{job}` job installs {_CI_QUALITY_LOCK_REF} without --require-hashes — the hashes in the "
+        f"lock are inert unless the flag is passed."
+    )
 
 
 def _analysis_steps(workflow: dict) -> list[tuple[str, dict]]:
@@ -158,9 +219,29 @@ def test_jscpd_stays_on_4x(raw: str) -> None:
     assert re.search(r"jscpd@4\.\d+\.\d+", raw), "jscpd must stay pinned to a 4.x release"
 
 
-def test_diff_cover_is_pinned_exactly(raw: str) -> None:
-    """The annotation surface depends on this version's `--format github-annotations:<level>`."""
-    assert re.search(r'"diff-cover==\d+\.\d+\.\d+"', raw), "diff-cover must be pinned with =="
+def test_diff_cover_is_pinned_exactly(workflow: dict) -> None:
+    """The annotation surface depends on this version's `--format github-annotations:<level>`.
+
+    Re-pointed 2026-07-29: the pin moved OUT of this workflow. `diff-cover` is now declared in
+    `pyproject.toml`'s `[dependency-groups].ci-quality` and installed from the hash-pinned
+    `ci/locks/ci-quality.lock`, because a version pin alone does not satisfy Scorecard's
+    `PinnedDependenciesID` (ADR 0034 §3). So assert the pin where it now lives — in BOTH places, since
+    an exact spec in pyproject that the exported lock disagrees with would mean the lock is stale.
+
+    Also asserts the COVERAGE job specifically installs that lock. Dropping the `raw` parameter left
+    nothing per-job checking the coverage side at all: `_group_pin` reads `pyproject.toml`, and the
+    lock-install assertion in `test_mutmut_*` is workflow-wide.
+    """
+    _assert_job_installs_the_toolchain_lock(workflow, "coverage")
+    pin = _group_pin("diff-cover")
+    assert re.fullmatch(r"diff-cover==\d+\.\d+\.\d+", pin), (
+        f"diff-cover must be pinned exactly in [dependency-groups], got {pin!r}"
+    )
+    version = pin.split("==", 1)[1]
+    lock = _CI_QUALITY_LOCK.read_text(encoding="utf-8")
+    assert re.search(rf"^diff-cover=={re.escape(version)}\b", lock, re.MULTILINE), (
+        f"ci/locks/ci-quality.lock does not pin diff-cover=={version} — re-run the DEP-1 exports"
+    )
 
 
 def test_the_ruff_version_is_derived_from_the_lock_not_hardcoded(workflow: dict, code: str) -> None:
@@ -262,13 +343,32 @@ def test_step_summary_writes_are_size_guarded(code: str) -> None:
     )
 
 
-def test_mutmut_is_pinned_to_3x_with_pytest_timeout(code: str) -> None:
+def test_mutmut_is_pinned_to_3x_with_pytest_timeout(code: str, workflow: dict) -> None:
     """mutmut 2.5.1 crashes on Python 3.14 before generating a mutant, and `|| true` made that look
     green for months. pytest-timeout is not optional: mutmut 3 always passes `--timeout` to pytest,
-    and without the plugin every invocation dies inside BadTestExecutionCommandsException."""
-    assert re.search(r'"mutmut==3\.\d+\.\d+"', code), "mutmut must be pinned to an exact 3.x"
+    and without the plugin every invocation dies inside BadTestExecutionCommandsException.
+
+    Re-pointed 2026-07-29 to `[dependency-groups].ci-quality` + `ci/locks/ci-quality.lock` (ADR 0034
+    §3). The two BEHAVIOURAL assertions are kept and still asserted against the LOCK, which is what the
+    job actually installs: `mutmut` must be a 3.x, and `pytest-timeout` must be present. Those are
+    properties of the installed environment, not of a pin's spelling.
+    """
+    pin = _group_pin("mutmut")
+    assert re.fullmatch(r"mutmut==3\.\d+\.\d+", pin), (
+        f"mutmut must be pinned to an exact 3.x in [dependency-groups], got {pin!r}"
+    )
     assert "mutmut<3" not in code, "mutmut 2.x does not run on Python 3.14"
-    assert "pytest-timeout" in code, "mutmut 3 requires pytest-timeout"
+    lock = _CI_QUALITY_LOCK.read_text(encoding="utf-8")
+    assert re.search(r"^mutmut==3\.", lock, re.MULTILINE), (
+        "ci/locks/ci-quality.lock does not resolve mutmut to a 3.x — re-run the DEP-1 exports"
+    )
+    assert re.search(r"^pytest-timeout==", lock, re.MULTILINE), (
+        "ci/locks/ci-quality.lock carries no pytest-timeout; mutmut 3 always passes `--timeout` to "
+        "pytest, so every invocation would die inside BadTestExecutionCommandsException"
+    )
+    # Resolved under `jobs.mutation`, not searched file-wide: the coverage job's install line would
+    # otherwise satisfy this assertion for the mutation job.
+    _assert_job_installs_the_toolchain_lock(workflow, "mutation")
 
 
 def test_mutmut_copies_the_package_not_just_the_mutated_file(code: str) -> None:

@@ -70,6 +70,8 @@ Scorecard runs on the same mirror and surfaced **48 findings**. These are **repo
   → `tests/test_multipart.py::test_oversized_part_header_is_refused_not_parsed`
 - **AC-7** — WHEN the multipart parser scans a `Content-Disposition` line, THE SYSTEM SHALL do so in time linear in the line's length.
   → `tests/test_multipart.py::test_hostile_disposition_header_parses_in_linear_time`
+- **AC-8** — WHERE a CI job installs a third-party quality or security tool that this repo routes through a PEP 735 dependency group, THE SYSTEM SHALL install it from a hash-pinned `uv export` with `--require-hashes`, and THAT lock SHALL be regenerated and diff-gated by the DEP-1 step rather than hand-maintained.
+  → `tests/test_ci_venv_pinning.py` (`test_lock_installed_toolchain_*`, `test_moved_tools_are_declared_in_a_dependency_group`, `test_no_moved_tool_is_reinstalled_inline`) · `tests/test_dep1_lock_resync_lockstep.py`
 
 ## Options considered
 
@@ -221,3 +223,213 @@ an execution. Before the next tag, run `security.yml`'s sbom job via `workflow_d
 log — the install command there is byte-identical to `release.yml`'s, and
 `test_sbom_install_is_byte_identical_in_release_and_security` now enforces that identity, because the
 dry-run is evidence about the release step only for as long as the two commands are the same command.
+
+## Amendment — 2026-07-29: `py/insecure-protocol` on the ASVS 12.1.1 TLS-floor probe
+
+**Alert 145 — `py/insecure-protocol`, HIGH, `messagefoundry/config/tls_probe.py`. Dismissed `won't fix`.**
+
+CodeQL is factually right and the finding does not apply. `tls_probe.py` is the **measurement** for ASVS
+12.1.1: at startup, on a PHI instance behind a *declared* upstream TLS terminator under `enforce`, it dials
+the operator's own `public_origin` and offers TLS 1.0 and 1.1. **A successful handshake is the finding** —
+it proves the front door accepts a protocol NIST SP 800-52r2 withdrew, and the engine refuses to serve.
+Offering the withdrawn version *is* the control; there is no implementation that measures whether a peer
+accepts TLS 1.0 without asking it to.
+
+Two settings the rule flags are load-bearing and mutation-proven in `tests/test_tls_floor_probe.py`:
+
+- `minimum_version == maximum_version == TLSv1` **plus `ALL:@SECLEVEL=0`** — without the security-level
+  drop, modern OpenSSL will not even *send* the ClientHello, so the probe would measure **our** refusal to
+  ask rather than **their** refusal to answer, and a permissive front door would read as clean. Dropping
+  `SECLEVEL=0` is one of the five mutations that turn the suite red.
+- `CERT_NONE` — the probe measures the **protocol floor**. An internal CA the engine does not trust would
+  abort the handshake *before the version was settled*, reporting "TLS 1.0 refused" for a door that was
+  never knocked on. Chain validation is a separate control (12.1.4 / `harden_verify_flags`).
+
+**Scope, which is what makes the dismissal safe:** client contexts only, constructed in this module, used
+for exactly one handshake, never returned to a caller, carrying no application data and no PHI. This is
+**not a data path** and these settings must never be reused for one — the module docstring says so, and
+the crypto-inventory row (`scripts/security/crypto_inventory_check.py`) repeats the warning at the place a
+future author would look. Every TLS scanner (`testssl.sh`, `sslyze`, `nmap ssl-enum-ciphers`) is built the
+same way; suppressing this rule for a scanner is the industry-standard disposition, not a local shortcut.
+
+**Convergence note (per the rule above):** the anchor is `tls_probe.py:146`, inside `_offer_context`. That
+module is new and small, so expect this to re-fire as a fresh alert number the first time anything is
+inserted above line 146. Re-dismiss with this rationale rather than re-triaging from scratch.
+
+## Amendment — 2026-07-29: §3's convergence target is BUILT — the CI toolchain is hash-pinned
+
+§3 above ("A version pin does not satisfy this check") named the fix and deferred it: *"The correct fix
+is to route CI tooling through a `pyproject` dependency group so it flows into `uv.lock` and the
+exports."* That is now built. **This section supersedes §3's "Deferred, recorded here as the convergence
+target" and the "Option B … remains the only thing that closes the alert" sentence in *Recommended
+hardening*, and it retires the "four committed lock artifacts" count — there are now six.**
+
+### What is now genuinely hash-pinned
+
+`pyproject.toml` gained a PEP 735 `[dependency-groups]` table with two groups, exported to two new
+committed artifacts and consumed with `--require-hashes`:
+
+| Group | Lock | Installed by | Contents |
+|---|---|---|---|
+| `ci-scanners` | `ci/locks/ci-scanners.lock` (33 reqs, 163 hashes) | `security.yml` pip-audit + bandit jobs, `zizmor.yml` | `bandit==1.9.4`, `pip-audit==2.10.1`, `zizmor==1.5.2` |
+| `ci-quality` | `ci/locks/ci-quality.lock` (27 reqs, 164 hashes) | `quality-advisory.yml` coverage + mutation jobs | `diff-cover==10.4.1`, `mutmut==3.6.0`, `pytest-cov>=7.0`, `pytest-timeout>=2.3` |
+
+Four design decisions worth recording, because each is a place a later change could silently undo the
+posture:
+
+1. **The split is the merge path.** `ci-scanners` is what the *blocking* gates install for themselves;
+   `ci-quality` is *advisory* measurement. This keeps `mutmut` — a mutation engine that rewrites and
+   executes source — out of every required gate's dependency closure.
+2. **Not extras, and not `[tool.uv] default-groups`.** An extra is published wheel metadata, so
+   `pip install messagefoundry[ci-scanners]` would become a real install target; a dependency group
+   never ships. A *default* group would land in all four pre-existing DEP-1 artifacts — i.e. in the
+   release SBOM, the container image locks, and in what `pip-audit` audits **as runtime**. Verified:
+   with these groups non-default, all four re-export byte-identically (`git diff --exit-code` → 0).
+3. **The locks are inside the DEP-1 machinery, not beside it.** §3's own objection to a fifth lock was
+   that a hand-maintained one "would rot into a pinned, **stale, unpatched** toolchain — worse posture
+   than floating". So both are `uv export`ed by `security.yml`'s DEP-1 step, diff-gated there, and
+   re-exported + staged by `dependabot-lock-resync.yml`. `tests/test_dep1_lock_resync_lockstep.py`
+   enforces the six-place lockstep; `test_lock_installed_toolchain_locks_are_in_the_dep1_set` enforces
+   that a lock the workflows install is one the gate regenerates.
+4. **`pip-audit` now audits the toolchain locks too** (`pip-audit -r ci/locks/*.lock --desc`). This is
+   the load-bearing half of decision 3: hash-pinning makes a toolchain *sticky*, so without this a CVE
+   in a pinned scanner would be invisible to every gate. `--ignore-vuln <ID>` is the escape hatch, as
+   for the runtime lock.
+
+   **Consequence, and the measurement that frames it — this one is the owner's to confirm.** `pip-audit`
+   is a *required* context, so a CVE in `mutmut`'s or `diff-cover`'s closure will red the merge gate over
+   an **advisory** tool. Two facts bound how novel that is. It is **not a new posture**:
+   `requirements.lock` is exported `--all-extras`, so `ruff`, `mypy`, `pytest` and `pytest-timeout`
+   already sit in the blocking audit's input — the repo has always blocked merges on CVEs in dev
+   tooling. But it **is** a wider blast radius: **40** distributions are new to the blocking set (23 via
+   `ci-scanners` — `bandit`, `zizmor`, `pip-audit`, `cachecontrol`, `rich`, `msgpack`, … — and 17 via
+   `ci-quality` — `mutmut`, `diff-cover`, `pytest-cov`, `jinja2`, `markupsafe`, `coverage`, `libcst`,
+   `textual`, …). Measured at the time of writing: **0 advisories** across all 60 `name==version` pairs
+   (`pip-audit` on both locks, exit 0; independently cross-checked against OSV `querybatch`). If the
+   advisory half should not block, the one-line change is to move `pip-audit -r ci/locks/ci-quality.lock`
+   into its own step — keeping the *scanners*' audit blocking, which is the same "the split is the merge
+   path" line decision 1 already draws.
+
+Two unpinned `pip install --upgrade pip` bootstraps disappeared rather than being pinned: the
+`ci-scanners` lock hash-pins `pip==26.2` itself (it arrives as a `pip-audit` → `pip-api` dependency), so
+a hash-verified pip now lands in the same command that previously fetched an unverified one. **Two
+survive** in `security.yml` — the `uv` bootstrap and the `semgrep` step, both named in the residuals
+below and counted by `test_security_yml_pip_bootstrap_count_is_exact` so the number cannot drift out of
+this prose again.
+
+### Which findings this closes
+
+Three Scorecard-visible `pip install` lines became `--require-hashes` installs:
+
+| Line | Alert | Note |
+|---|---|---|
+| `security.yml` bandit step | **#74** | the exact proof-case §3 cites |
+| `zizmor.yml` zizmor install | **96** | §3's second proof-case |
+| `security.yml` pip-audit step | whichever anchors that line | previously `pip-audit==2.10.1`, unhashed |
+
+**Stated honestly: this does not reduce the OPEN count.** #74 and 96 are in the **dismissed
+(`won't fix`)** set, so the effect is that three dismissals whose recorded reason ("CI installs
+editably, which cannot use `--require-hashes`") is now *false for those lines* become re-triageable **as
+fixed**. Under this ADR's own Decision — a dismissal with a false reason is worse than an open finding —
+that is the point, not a consolation.
+
+The **2 genuinely open** `PinnedDependenciesID` alerts are untouched: they are the medium pair on the
+**SBOM scratch venv** (`python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"`, in `release.yml`
+and `security.yml`). Closing them needs a third group *and* moving **both** halves in lockstep, because
+`test_sbom_install_is_byte_identical_in_release_and_security` requires the two commands to stay
+identical. `release.yml` was deliberately scoped out of this change (see the residuals), so this is
+recorded as the next increment rather than done.
+
+### Residuals — dismissals that stay dismissed, and why
+
+A `won't fix` makes an item invisible, so each remaining one is named with its reason rather than
+implied:
+
+| Residual | Why it is not fixed here |
+|---|---|
+| **`release.yml`'s `sigstore==4.4.0`** | **Not a gap — an owner decision this change must not invert.** Routing `sigstore` through the lock **would** resolve it to **4.5.0** — stated counterfactually because that is what it is: `sigstore` is deliberately **absent** from `uv.lock` and from all six exports (0 hits), and the 4.5.0 figure was measured in a scratch resolve. A reader who greps `uv.lock`, finds nothing, and concludes this row is stale would re-open the very decision it exists to preserve. ADR 0034 pins 4.4.0 because `.github/dependabot.yml` sets `cooldown.default-days: 5` and 4.5.0 was <48 h old. Routing `sigstore` through the lock would pin the *signing* toolchain fresher than the repo's own update policy allows — inverting that policy at the highest-privilege point in the build (the job holding `contents`/`id-token`/`attestations: write`). Left exactly as it is. Re-evaluate when 4.5.0 ages out. |
+| **The `uv` bootstrap** (`security.yml`, `python -m pip install --upgrade pip "uv==0.12.0"`) | **Permanently circular: you cannot hash-lock `uv` with `uv`.** That install produces every lock this repo commits. `uv` stays an inline `==` pin, and `pip` remains the sole registered *name* in `SECURITY_YML_ACCEPTED_UNPINNED`. Note it is also the pip that runs the **six exports and the diff gate** — the `--require-hashes` install two steps later *downgrades* pip to the locked version afterwards, so the DEP-1 step's own posture is unchanged by this work. *Cheap out-of-band fix that removes it entirely:* `astral-sh/setup-uv@c771a70e…` is already SHA-pinned and used in 9 places (`ci.yml` ×6, `quality-advisory.yml` ×2, the resync ×1); swapping it in deletes the install. Separate change. |
+| **`security.yml`'s unpinned `pip` in the `semgrep` step** — `python -m pip install --upgrade pip "semgrep==1.172.0"` | **The SECOND surviving bootstrap, named because an undercounted inventory is how a real finding goes invisible.** The semgrep row below explains only the `[otel]` conflict that keeps *semgrep* inline; this row records that the same line is also an **unpinned `pip` fetch**. So two `--upgrade pip` bootstraps remain in the file, not one — now asserted as an exact count by `test_security_yml_pip_bootstrap_count_is_exact`, since `SECURITY_YML_ACCEPTED_UNPINNED` registers the *name* `pip` and cannot tell two accepted bootstraps from twenty. Mitigating: `semgrep` is **not** a required context (`tests/test_required_contexts.py`), so this one does not sit on the merge path. It disappears whenever the semgrep row's `[tool.uv] conflicts` recipe is taken. |
+| **`quality-advisory.yml`'s `pipx install ruff`** | **Outside the guard's regex and outside Scorecard's.** `test_ci_venv_pinning.py`'s `_PIP_INSTALL` matches `pip`/`pip3`/`python -m pip` only, so the unpinned fallback branch is invisible to every existing guard — and because it is not a `pip install`, **no alert exists to close**. `pipx` has no `--require-hashes`, so fixing it means changing the install mechanism, not the pin. Recorded, not done. |
+| **`semgrep`** | **Excluded by decision.** `semgrep==1.172.0` requires `opentelemetry-sdk>=1.37,<1.38` while the project's `[otel]` extra resolves 1.44. In a plain group the universal resolve silently **downgrades the shipped otel runtime** in all four pre-existing DEP-1 artifacts — measured and bisected to semgrep alone (the other tools give DIFFS=0). The only fix is `[tool.uv] conflicts = [[{ extra = "otel" }, { group = "semgrep-tools" }]]`, which declares a **product extra** and a **CI scanner** permanently mutually exclusive (`uv sync --all-extras --all-groups` would stop working) and still forces a `click 8.4.1 → 8.4.2` re-resolve across all four artifacts. Pinning a *scanner*'s supply chain is not worth a lasting constraint on a shipped surface. The recipe is written down here so a future owner can flip it in one commit rather than re-deriving the analysis. |
+| **The 5 editable `pip install -e ".[…]"` sites** + 7 `uv pip install --system -e` sites | Structurally unhashable; §3's original rationale is correct for these and stands. |
+| Docker digest-pinning (7), `TokenPermissions` (6), `BranchProtection`/`CodeReview`/`Maintained` (3), `Fuzzing`, `CIIBestPractices` | Different check classes; unchanged by this work. |
+
+### Two notes on evidence
+
+**Pre-merge coverage was the reason for the scope choice.** All three targeted workflows run on
+`pull_request` — `security.yml`'s pip-audit and bandit jobs are *required contexts*, `zizmor.yml`'s
+`paths: .github/**` filter matches this change, and `quality-advisory.yml`'s install steps are not
+`continue-on-error`, so a bad hashed install reds the job visibly. That is the opposite of the
+"What no test can see" problem the 2026-07-28 round had to accept, and it is why `release.yml` was left
+alone: nothing in PR CI executes it, so a break there first surfaces at a tag.
+
+**The one gap, and its bound.** `dependabot-lock-resync.yml` triggers on `pull_request` for
+`pyproject.toml`/`uv.lock`, but its `if:` requires `pull_request.user.login == 'dependabot[bot]'`, so it
+**skips** on a human PR and there is no `workflow_dispatch` route. Its two new export lines are
+text-verified only and first execute on the next Dependabot uv PR. The bound is the same one
+`test_sbom_install_is_byte_identical_in_release_and_security` already relies on:
+`test_export_flags_are_identical_per_lock_file` forces the resync's flag strings byte-identical to the
+gate's, **and the gate does execute on this PR** — a dry-run is evidence for as long as the two are the
+same command.
+
+**Unverified, and it cannot be verified before merge:** whether Dependabot's `uv` ecosystem enumerates
+`[dependency-groups]` at all. First observation is the next weekly uv PR. If it does not, routine
+staleness returns — which is precisely why the `pip-audit` addition (decision 4) is load-bearing: it
+converts "silently stale" into "loudly red within ~24 h on anything security-relevant" via the daily
+cron. Confirm after the next Dependabot run.
+
+### Convergence-rule consequence, stated rather than glossed
+
+**Measured, not estimated** (an earlier draft of this section guessed "~9", which would have understated
+the re-anchor budget by two thirds — a wrong number here costs a re-triage, so count it):
+
+| Workflow | `origin/main` | this change | drift | first changed line |
+|---|---|---|---|---|
+| `security.yml` | 464 | 490 | **+26** | ~81 (the DEP-1 export step) |
+| `quality-advisory.yml` | 619 | 637 | **+18** | ~301 (the coverage install step) |
+| `dependabot-lock-resync.yml` | 141 | 150 | **+9** | ~1 (the header) |
+| `zizmor.yml` | 89 | 90 | **+1** | ~39 (the install step) |
+
+Per the line-drift rule above, **every dismissed alert anchored below the first changed line re-fires as
+a new alert number** — up to 26 lines of drift in `security.yml`. That is unavoidable when adding exports
+to an early step. The mitigation applied: each *pin's* rationale moved to `pyproject.toml` beside the pin
+itself (which is also where a future bumper will look), so the workflow comments carry only what is
+specific to the call site. **No claim of line-neutrality is made here** — expect to re-dismiss, and
+re-dismiss with the rationale in this section rather than re-triaging from scratch. Re-measure this table
+if the change is rebased; do not carry the numbers forward on faith.
+
+### What the adversarial pass found in the guards, and what now enforces it
+
+Three reviews attacked this change before it landed. None found a wrong byte in a lock — `uv lock --check`
+exit 0, all six exports byte-identical, the runtime closure a `588 insertions / 0 deletions` diff (a
+version or edge change is impossible without a deletion). Every finding was a **guard gap**: a rule the
+prose asserted and nothing checked. Each was reproduced by injecting the regression and confirming the
+suite stayed **green**, then closed and confirmed **red**:
+
+| Hole | What passed green with the regression in place | Now enforced by |
+|---|---|---|
+| Moving `bandit`/`pip-audit` out of `RELEASE_PINNED_TOOLS` deleted the only check that rejected a **floor** | all three scanner specs rewritten to `>=` → re-locked, **re-exported byte-identically**, whole suite green. `uv export` writes `bandit==1.9.4` from `bandit>=1.9.4`, so lock-side checks are structurally blind | `EXACT_GROUP_PINS` / `FLOOR_BY_DESIGN` + `test_moved_tool_pins_are_exact_not_floors` — asserted at the **declaration**, where the decision lives |
+| The export **selector** was unpinned (`uv export .* -o <lock>`) | `--group` for `--only-group` grew `ci-scanners.lock` from **33 → 69** requirements, pulling `fastapi`/`uvicorn`/`hl7`/`httpx`/`aiosqlite` into the **blocking** bandit and zizmor jobs — fully pinned, fully hashed, byte-identical under DEP-1, every guard green | `test_lock_installed_toolchain_locks_are_in_the_dep1_set` now requires the exact `--only-group <stem>` command, and `test_each_group_pin_reaches_its_own_lock` ties group → lock from the other direction |
+| "The toolchain never enters the runtime/SBOM locks" was **prose only** | `default-groups = ["ci-scanners"]` puts the scanners into `requirements.lock` (98 → 121) **and** into `docker/locks/requirements-core.lock` (41 → 69), the SBOM input, straight past its `--no-dev` — because `--no-dev` disables only the group literally named `dev` | `test_dependency_groups_do_not_leak_into_the_runtime_exports` |
+| 5 install sites collapsed onto 3 table rows checked with "≥1" | 4 of the 5 individually deletable at **zero** test cost; the coverage job's failure is silent (`pytest -q --cov` dies on `unrecognized arguments`, `\|\| true` swallows it, diff-coverage reports "skipped" and exits 0) | exact site counts in `LOCK_INSTALLED_TOOLCHAINS`, plus per-**job** resolution in `test_quality_advisory_invariants.py` |
+| The bootstrap inventory said **one**, the file had **two** | — | `test_security_yml_pip_bootstrap_count_is_exact`, and the semgrep residual row above |
+| The inline-reinstall scan missed `pipx install` and swept only 3 workflows | `pipx install bandit`, or a `pip install bandit` in `ci.yml` | `_PIPX_INSTALL` + a sweep of all 16 workflows |
+| `_locked_requirements` silently skipped any non-`--hash` directive | an `--index-url` redirect or an `-e .` line, uncounted | that branch now raises |
+
+The pattern is the one this ADR's own Decision names: **a claim recorded without a check is a dismissal
+with a reason that can quietly become false.** Two false claims were also corrected in place rather than
+left standing — the `sigstore` row's tense (see the residuals) and a `security.yml` comment asserting a
+bootstrap was gone from a job that still runs one.
+
+### Adjacent fix folded in
+
+`.gitattributes` was missing **`constraints.lock`** (`git check-attr text -- constraints.lock` →
+`unspecified`), so under `core.autocrlf=true` it checks out CRLF — exactly the drift that stanza exists
+to prevent. Harmless so far only because git's clean filter normalizes before `git diff`, which is also
+why export sync must be verified with `git diff` and never a raw `diff`. Fixed alongside the new
+`ci/locks/*.lock text eol=lf` entry. Closes no alert.
+
+**Still open, not done:** `quality-advisory.yml`'s `pipx install ruff` fallback installs *unpinned* ruff
+instead of failing closed, and `constraints.lock` is `sed`-scraped for a `ruff==` pin that — unlike
+`packaging==` — has **no PR-time canary test**. Both are recorded here; neither closes a Scorecard alert.

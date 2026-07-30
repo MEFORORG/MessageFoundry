@@ -635,17 +635,27 @@ and a reverse-proxy / forwarded-header alternative are designed in
 [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md) (*Proposed* — build gated on a
 scheduled off-loopback exposure).
 
-**Key-exchange parameters `[BUILT — WP-L3-10 code half]` (ASVS 11.6.2).** Every TLS context the engine
+**Key-exchange parameters `[PARTIAL — the 1.2+ floor and the cipher validator are enforced; the group
+pin is INERT until Python 3.15]` (ASVS 11.6.2).** Every TLS context the engine
 builds — the API/WebSocket listener ([api/tls.py](../messagefoundry/api/tls.py)) and the per-connection
 MLLP server/client contexts ([transports/mllp.py](../messagefoundry/transports/mllp.py)) — enforces a
 **TLS 1.2+ floor**, which constrains 1.2 to **(EC)DHE** key exchange and makes 1.3 ECDHE-only: forward-
-secret key establishment, never static RSA/DH. Two controls in
-[config/tls_policy.py](../messagefoundry/config/tls_policy.py) pin the *parameters*:
+secret key establishment, never static RSA/DH. **That floor is the enforced control.** Two further
+controls in [config/tls_policy.py](../messagefoundry/config/tls_policy.py) address the *parameters* — and
+only the second of them actually takes effect on today's interpreters:
 
-- **Approved groups pinned where supported.** Built contexts call `harden_kex_groups`, which sets the
-  approved ECDHE groups `X25519:secp384r1:secp256r1` via `SSLContext.set_groups` on Python ≥ 3.13. On
-  3.11/3.12 there is no public group-pinning API and OpenSSL's defaults already lead with exactly these
-  curves, so it is a deliberate no-op, not a downgrade.
+- **Approved groups are *inherited*, not pinned — corrected 2026-07-29.** Built contexts call
+  `harden_kex_groups`, which pins the approved ECDHE groups `X25519:secp384r1:secp256r1` via
+  `SSLContext.set_groups` — an API that lands in **Python 3.15**. This bullet previously said "≥ 3.13",
+  and the practical effect of the error is that on every interpreter this project currently runs on
+  (measured: 3.14.6 / OpenSSL 3.5.7) the helper pins **nothing** and every built context inherits
+  OpenSSL's default group list. That default *is* forward-secret — the property the TLS 1.2+ floor
+  above exists to guarantee — but it is **wider than the approved list**: measured against the real API
+  context, it also accepts `ffdhe2048`, `ffdhe3072` and `secp521r1`. It refuses `secp224r1` and
+  `sect571r1`, so the gap is *wider than policy*, not *weak*. `harden_kex_groups` now **returns the
+  list it actually pinned** — `None` today — and `tests/test_tls_policy.py` asserts that `None`
+  unconditionally, so the first interpreter with the API turns the test red instead of letting the
+  claim drift back.
 - **`tls_ciphers` is validated, not trusted.** An operator `[api].tls_ciphers` string is rejected at
   config load if it would admit a **non-forward-secret** (static-RSA/DH) suite, so a misconfiguration
   cannot widen the key exchange below policy.

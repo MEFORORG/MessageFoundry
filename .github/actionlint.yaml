@@ -1,0 +1,15 @@
+# actionlint configuration.
+#
+# actionlint validates `runs-on:` against GitHub's HOSTED runner labels, so a custom self-hosted label
+# is reported as unknown. Declaring the label here is actionlint's own documented remedy and keeps the
+# runner-label check LIVE for genuine typos ("windows-2O25", "ubunutu-latest") — the alternative,
+# disabling the `runner-label` rule, would trade one real finding for the whole class.
+self-hosted-runner:
+  labels:
+    # .github/workflows/selfhosted-win2025-sql.yml — SQL Server 2025 suites on real hardware.
+    # NOTE: the NucBox self-hosted runners are RETIRED (ci.yml runs every leg on hosted runners now),
+    # so this label may currently resolve to no registered runner. Confirm with
+    # `gh api repos/MEFORORG/MessageFoundry/actions/runners` before relying on that workflow; if the
+    # runner is gone for good, delete the workflow and this label together rather than leaving a
+    # declaration that outlives its subject.
+    - mefor-win2025-sql

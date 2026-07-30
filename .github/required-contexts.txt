@@ -1,0 +1,102 @@
+# The status-check contexts REQUIRED to merge into `main`.
+#
+# WHY THIS FILE EXISTS. Branch protection lives on the server, so "is this check blocking?" was
+# unanswerable from a clone -- and five places in this repo answered it differently: docs/CI.md
+# listed 8 contexts, .github/workflows/manifest-lint.yml said 4, docs/design/freethread.md said 7,
+# tests/test_push_guard.py said 12. With `required_approving_review_count: 0` and auto-merge armed,
+# required-set membership is the ONLY thing separating "reviewed" from "merged unread", so a wrong
+# answer here mis-ranks which gates a change can safely touch.
+#
+# It stopped being hypothetical within hours of this file landing. On 2026-07-29 branch protection was
+# briefly reduced to a SINGLE required context -- the backlog-hygiene check -- dropping all twelve
+# gates, every test leg and security scanner among them, while auto-merge stayed armed and approvals
+# stayed at 0. Several PRs merged in that window. What surfaced it was reconciling a CI wait against
+# `required_status_checks.contexts` and seeing the count come back as 1: a monitor that had waited for
+# "nothing pending" would have reported green without ever waiting for a test leg, because with one
+# required context there was nothing to wait for. Count what SHOULD gate the merge, not what does.
+#
+# The set then moved four more times the same day (1 -> 13 -> 12 -> 15 -> 12). This snapshot is the
+# state it settled on, read from the API and unchanged for six minutes before being written down. Two
+# non-context settings moved with it and are recorded because they change merge semantics:
+#
+#   strict = TRUE  -- a PR must be up to date with `main` before it can merge. This closes the
+#                     stale-green hole: previously a PR validated against an older base could merge
+#                     without revalidation, so a semantic conflict with a newer `main` (a test that
+#                     reads a file the other PR changed) could land red on main.
+#   enforce_admins = FALSE -- the documented escape hatch in scripts/hooks/push_guard.py, for when a
+#                     permanently red required check blocks every merge. It was ON from 2026-07-28.
+#
+# This file is not the enforcement -- the server is. It is the CHECKED-IN CLAIM that every in-repo
+# statement must agree with, which is what `tests/test_required_contexts.py` asserts. When branch
+# protection changes, change this file in the same PR; the test will name every prose claim that
+# then needs updating.
+#
+# FORMAT. One context string per line, `#` starts a comment, blank lines ignored. These are the
+# exact strings branch protection matches -- the JOB NAME (`name:`), not the workflow name and not
+# the workflow file. Two ways that bites:
+#   * The CLA context is `cla` (the job key, because cla.yml's job declares no `name:`), NOT
+#     "CLA Assistant" (the workflow name). docs/CI.md claimed the latter for months.
+#   * A job name containing " #" must be QUOTED in YAML or it truncates at the comment marker --
+#     see .github/workflows/backlog-hygiene.yml, whose name is deliberately quoted for this reason.
+#
+# ADDING ONE: see the required-but-absent trap in docs/CI.md. A required check that never reports
+# blocks every PR forever, so confirm the job reports on a real PR (no `paths:` filter that can skip
+# it, no `if:` gated on a non-PR event) BEFORE it lands here or in branch protection.
+
+# --- ci.yml ---------------------------------------------------------------------------------------
+# NOTE: `CI gate` is NOT in this list. It was removed from branch protection on 2026-07-29 and the
+# reason is not recorded here -- this file states what the server enforces, not why. It matters,
+# because that roll-up is what gated ci.yml's CONDITIONAL/matrix legs (ci.yml, job `ci-gate`,
+# `if: always()` over its `needs:`). The three `test` legs below are required in their own right and
+# are unaffected; what no longer gates a merge is everything the roll-up covered beyond them. If the
+# removal was incidental, restoring it is one POST to the contexts endpoint plus a line here.
+test (ubuntu-latest, py3.14)
+test (windows-2022, py3.14)
+test (windows-2025, py3.14)
+
+# --- security.yml (every non-advisory job in that file; the advisory `sbom` and `trivy` jobs are
+# --- deliberately absent -- they declare `continue-on-error: true`) -------------------------------
+bandit (Python SAST)
+pip-audit (dependency vulnerabilities)
+npm-audit (ide dependency vulnerabilities)
+gitleaks (secret scan)
+semgrep (project SAST rules)
+crypto-inventory (ASVS 11.1.3 discovery gate)
+forbidden-content (customer/PHI leak guard)
+
+# --- cla.yml --------------------------------------------------------------------------------------
+cla
+
+# --- backlog-hygiene.yml ---------------------------------------------------------------------------
+# PROMOTED 2026-07-29 (verified against the live API the same day). Before that it hard-failed and
+# nothing waited for it, so it was decoration -- auto-merge blocks only on REQUIRED contexts. It exists
+# because #60 shipped while its banner still read "PRE-RESERVED", and that stale banner was then
+# repeated as fact in a merged PR; in a repo where the ledger is the only memory shared across isolated
+# sessions, a stale banner makes another session rebuild work that is already merged.
+#
+# The quoting in backlog-hygiene.yml is load-bearing: the job name contains " #", which YAML would
+# truncate at the comment marker, and the job NAME is the context string.
+a PR that implements BACKLOG #N must update BACKLOG.md
+
+# (Historical note, kept because it is the reasoning that made the promotion safe: it triggers on
+#   `pull_request: branches: [main]` with NO paths filter and no `if:`, so it always reports -- no
+#   required-but-absent trap. Its STRUCTURAL half, "every item declares
+#   exactly one status", is already enforced inside the required test legs by
+#   tests/test_backlog_status_check.py; only the behavioural half was unguarded.)
+#
+# ADDING ANOTHER ONE LATER: add the context to branch protection FIRST, then add the line here and
+# update the count pinned in tests/test_required_contexts.py, in the same PR. In that order, because
+# this file mirrors the live server -- a line added here first is exactly the lie the file exists to
+# prevent. Adding to protection is all-or-nothing: the REST endpoint 422s with `already_exists` if any
+# context in the request is already required, and then adds NONE of them, so send only the missing ones.
+
+# DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
+#   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
+#                                 tokens lack, so requiring them would block every fork PR.
+#   zizmor.yml                 -- paths-filtered to `.github/**`, so it does not report on most PRs.
+#   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
+#                                 pinned by tests/test_quality_advisory_invariants.py.
+#   freethread-smoke.yml       -- a 3.14t canary; informational only.
+#   manifest-lint.yml          -- paths-filtered to the k8s manifests.
+#   nightly / path-gated legs  -- server-DB store, load/throughput, service-smoke, DICOM/FHIR
+#                                 breadth: they do not run on every PR (required-but-absent trap).
