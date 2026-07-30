@@ -98,6 +98,29 @@ _RETIRED_CLAIMS = (
     # uses "no retention path" (the surviving gaps say "no purge"/"keep-forever").
     "no retention path at all",
     "no retention path exists at all",
+    # ASVS 14.2.7 (this change): `reference.value` gains purge_reference_snapshots, and the legacy
+    # SQL Server `outbox` table is migrated into `queue` and DROPped. The three statements below are
+    # TRUE TODAY and become false in Commits 3 and 6 — they are registered HERE, first, so that
+    # `test_retired_false_claims_do_not_reappear` goes RED against the UNEDITED docs and only turns
+    # green once the edits actually land. Registering after the edit proves nothing: it would pass on
+    # day one whether or not the guard works.
+    #
+    # A FOURTH candidate was DELIBERATELY STRUCK. The obvious string "no retention purge" collides
+    # with a still-TRUE sentence:
+    #     docs/security/ASVS-292-289-HANDOFF-2026-07-25.md:173
+    #     "`pending_approvals.params` is unencrypted and has no retention purge on any backend."
+    # `_retired_claim_hits()` globs docs/*.md PLUS docs/security/*.md — and docs/security/ is
+    # GIT-IGNORED. So registering it reds on a developer's machine and passes in CI, where the file
+    # does not exist. A guard that is strictly weaker in CI than on a laptop is not a guard.
+    # Grep evidence recorded at registration time (docs/*.md | docs/security/*.md):
+    #     "no retention purge"                    1 | 1   <- STRUCK, collides with a true statement
+    #     "**No purge path at all**"              1 | 0
+    #     "touched by no purge on any backend"    1 | 0
+    #     "is purged by nothing on any backend"   1 | 0
+    # Re-run that grep before adding any further string here.
+    "**No purge path at all**",
+    "touched by no purge on any backend",
+    "is purged by nothing on any backend",
 )
 #: Filename markers identifying an ASVS **scoring / evidence** artifact. Those documents quote the
 #: retired wording deliberately, as the record of what was found, so scanning them for it would be a
