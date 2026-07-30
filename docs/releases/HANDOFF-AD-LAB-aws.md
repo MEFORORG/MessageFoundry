@@ -4,8 +4,8 @@
 > **"as one window, or not at all"** — they share a single throwaway forest, and #275 hard-blocks two of
 > the others.
 >
-> **The authority is [`docs/security/AD-FEDERATION-LAB-RUNBOOK.md`](../security/AD-FEDERATION-LAB-RUNBOOK.md)**
-> (cells L0–L18) and its sibling [`KERBEROS-EPA-SPIKE-RUNBOOK.md`](../security/KERBEROS-EPA-SPIKE-RUNBOOK.md)
+> **The authority is `docs/security/AD-FEDERATION-LAB-RUNBOOK.md`**
+> (cells L0–L18) and its sibling `KERBEROS-EPA-SPIKE-RUNBOOK.md`
 > §§1–2 for provisioning. **This document does not restate them.** It is the AWS-specific wrapper: what to
 > stand up, in what order, what must not happen, and what "done" means per item.
 

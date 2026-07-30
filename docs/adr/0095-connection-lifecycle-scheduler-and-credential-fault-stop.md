@@ -2,7 +2,7 @@
 
 - **Status:** Accepted  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-12
-- **Related:** BACKLOG #147 · BACKLOG #109 · [ADR 0070](0070-pooled-infra-fault-lane-stop.md) · [ADR 0031](0031-per-connection-fault-isolation.md) · CLAUDE.md §2 (reliability invariant, count-and-log), §8 (ACK)
+- **Related:** BACKLOG #147 · BACKLOG #109 · [ADR 0070](0070-t17-infra-fault-bound.md) · [ADR 0031](0031-startup-connection-fault-isolation.md) · CLAUDE.md §2 (reliability invariant, count-and-log), §8 (ACK)
 
 ---
 

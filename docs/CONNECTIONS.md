@@ -20,6 +20,13 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 
 ### Connection‑type codes
 
+The **Built?** column is read off the **connector registry** — the `register_source` /
+`register_destination` calls in [`transports/`](../messagefoundry/transports/) — not maintained by hand.
+**Seventeen** connector types are registered today (`ConnectorType`,
+[config/models.py](../messagefoundry/config/models.py)): MLLP, TCP, HTTP, FILE, REMOTEFILE, X12,
+DATABASE, REST, SOAP, FHIR, DIMSE, DICOMWEB, EMAIL, DIRECT, TIMER, LOOPBACK, PT. Every one of them has a
+settings section under [*Settings*](#settings--whats-supported-today) below.
+
 | Code | Direction | Transport | Mirth equivalent | Built? |
 |------|-----------|-----------|------------------|--------|
 | `IB` | inbound | MLLP listener | MLLP/TCP Listener | ✅ |
@@ -32,33 +39,42 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `TCP-OUT` | outbound | raw TCP sender (configurable framing) | TCP Sender | ✅ |
 | `X12-IN` | inbound | raw TCP listener, ISA/IEA-framed X12 EDI | TCP Listener (X12) | ✅ |
 | `X12-OUT` | outbound | raw TCP sender, X12 EDI (verbatim) | TCP Sender (X12) | ✅ |
-| `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ⏳ planned |
-| `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ⏳ planned |
-| `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ⏳ planned † |
+| `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ✅ (`Sftp()`, `[sftp]` extra) |
+| `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ✅ (`Sftp()`, `[sftp]` extra) |
+| `FTP-IN` | inbound | FTP / FTPS poll | File Reader (FTP scheme) | ✅ (`Ftp()`, stdlib) |
+| `FTP-OUT` | outbound | FTP / FTPS write | File Writer (FTP scheme) | ✅ (`Ftp()`, stdlib) |
+| `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ~ receive-only † |
 | `SOAP-OUT` | outbound | SOAP client | Web Service Sender | ✅ |
-| `REST-IN` | inbound | HTTP endpoint | HTTP Listener | ⏳ planned † |
+| `REST-IN` | inbound | HTTP endpoint | HTTP Listener | ✅ (`Http()`, ADR 0023) † |
 | `REST-OUT` | outbound | HTTP client | HTTP Sender | ✅ |
-| `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server, exp.) |
-| `DB-OUT` | outbound | DB write | Database Writer | ✅ |
-| `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (ADR 0023) |
+| `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server + generic ODBC) |
+| `DB-OUT` | outbound | DB write | Database Writer | ✅ (SQL Server + generic ODBC) |
+| `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (BACKLOG #20) |
 | `FHIR-OUT` | outbound | FHIR REST client | (FHIR Sender) | ✅ |
 | `DICOM-IN` | inbound | DICOM C-STORE SCP listener | DICOM Listener | ✅ (ADR 0025 Phase 1) |
 | `DICOM-OUT` | outbound | DICOM C-STORE SCU + C-ECHO sender | DICOM Sender | ✅ (ADR 0025 Phase 2) |
 | `DICOMWEB-OUT` | outbound | DICOMweb STOW-RS store/send | (DICOMweb Sender) | ✅ (ADR 0025 Phase 2) |
+| `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ✅ (`Email()`/`SMTP()`, ADR 0029) |
+| `DIRECT-OUT` | outbound | Direct-Project S/MIME over SMTP | — | ✅ (ADR 0085, outbound only) |
+| `TIMER-IN` | inbound | clock-driven source (interval / cron) | — | ✅ (ADR 0011) |
+| `LOOP-IN` · `PT-*` | inbound | internal re-ingress — a captured reply (`Loopback()`) / a pass-through hop (`PassThrough()`) | Channel Reader | ✅ (ADR 0013) |
 | `JMS-IN` / `JMS-OUT` | in/out | JMS queue consumer/producer | JMS Listener/Sender | ⏳ planned |
 | `MAIL-IN` | inbound | POP3/IMAP mailbox poll | Email Reader | ⏳ planned |
-| `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ⏳ planned |
 
 \* **`IBC`/`OBC`** use the *same* MLLP transport as `IB`/`OB`; the `C` is a **monitoring hint**: for
 these, "waiting for connection" is the *normal, healthy* state (a low‑traffic feed or a persistent
 link that idles), so the Monitor shouldn't flag them. (The Monitor health rule that honors this is not
 yet implemented — the suffix documents intent today.)
 
-† **`REST-IN`** and **`SOAP-IN`** (non-HL7 inbound *sources*). The **payload-agnostic ingress** contract
-is **built** ([ADR 0004](adr/0004-payload-agnostic-ingress.md): an inbound's `content_type` selects the
-HL7 path vs. a `RawMessage` route), so what these rows await is a **source connector** (an HTTP listener)
-on top of it. The first source on that contract — the **`DB-IN`** poll (`DatabasePoll(...)`, below) — is
-**built**; the **`REST-OUT`**, **`DB-OUT`**, and **`SOAP-OUT`** destinations are built (below).
+† **`REST-IN`** and **`SOAP-IN`** (non-HL7 inbound *sources*). The two halves these rows once awaited are
+both built now: the **payload-agnostic ingress** contract ([ADR 0004](adr/0004-payload-agnostic-ingress.md) —
+an inbound's `content_type` selects the HL7 path vs. a `RawMessage` route) *and* the **inbound HTTP
+listener** it needed ([ADR 0023](adr/0023-inbound-http-listener.md) — `Http(...)`, below), so a partner
+can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. What is still
+deferred is the **SOAP-specific** half of `SOAP-IN` — the *synchronous* SOAP-envelope reply
+(block-on-captured-downstream-reply) — plus **request authentication** on the intake socket (API key /
+bearer): the listener's peer controls are the per-connection IP allowlist, TLS/mTLS, and the off-loopback
+exposed gate. Routing on HTTP method/path/headers is likewise deferred (the Handler sees the body).
 
 ## Authoring a connection
 
@@ -117,10 +133,12 @@ transport = "mllp"
   owner = "integration-team"
 ```
 
-- The `transport` maps to the same factory (`MLLP`/`Tcp`/`File`/`Rest`/`Database`/`DatabasePoll`/
-  `Soap`/`Sftp`/`Ftp`) — **the factory is the schema**; an unknown transport/key/router fails loud at
-  load (`messagefoundry check`), exactly like a bad `inbound()` call. A name declared in **both** a
-  `.py` module and `connections.toml` is a hard error (no silent shadowing).
+- The `transport` maps to the same factory — eleven are reachable as data (`mllp`/`tcp`/`http`/`file`/
+  `timer`/`rest`/`database`/`database_poll`/`soap`/`sftp`/`ftp`) and **the factory is the schema**; an
+  unknown transport/key/router fails loud at load (`messagefoundry check`), exactly like a bad
+  `inbound()` call. The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
+  `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
+  declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
   (comment/format-preserving, validate-before-persist with rollback) — which is what the **VS Code
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
@@ -237,10 +255,11 @@ simulated lane shows as `simulated` on `GET /connections` and `[SIMULATED]` in t
 
 **Operability (optional, validated at wiring time — caught in dry-run / `messagefoundry check`):**
 `metadata` — a free-form table of operator labels (owner / runbook / environment) on **either**
-direction, surfaced by the API and never used for routing. On an **MLLP/TCP inbound** only:
-`bind_address` overrides the service `[inbound].bind_host` for that one listener, and
+direction, surfaced by the API and never used for routing. On a **listen source** only (MLLP, TCP, X12,
+HTTP, DICOM): `bind_address` overrides the service `[inbound].bind_host` for that one listener, and
 `source_ip_allowlist` restricts it to the listed peer IPs / CIDR networks — fail-closed when set; omit
-or leave empty for no restriction.
+or leave empty for no restriction. Both are a wiring error on a poll or internal source (File, DB,
+RemoteFile, Timer, Loopback, PassThrough — none of them binds an interface).
 
 > **Inbound bind interface (service-level, with a per-connection override).** Inbound MLLP/TCP
 > listeners take **only a port** — passing a `host` is a wiring error. Every inbound binds to the
@@ -273,8 +292,10 @@ Two read/diagnostic endpoints back the console's connection view (auth + per-cha
 - **`POST /connections/{name}/test`** (`connections:test`) — a **reachability probe** that builds a
   *fresh* connector (never the live one), honors the `[egress]` allowlist fail-closed, and **sends no
   real message** — a socket connect (MLLP/TCP/X12), `SELECT 1` (Database), an HTTP `HEAD` (REST/SOAP),
-  a directory-writability check (File), or an SFTP/FTP connect (RemoteFile). It is **audited**. The
-  result is `{supported, success, detail}`: a listen source (MLLP/TCP/X12) or a Timer reports
+  a `GET {base}/metadata` (FHIR) or `OPTIONS` (DICOMweb), a **C-ECHO** (DICOM SCU), connect/EHLO/NOOP
+  with no `MAIL FROM`/`DATA` (Email, Direct), a directory-writability check (File), or an SFTP/FTP
+  connect (RemoteFile). It is **audited**. The result is `{supported, success, detail}`: a listen source
+  (MLLP/TCP/X12/HTTP/DICOM SCP), a Timer, or an internal `Loopback()`/`PassThrough()` inbound reports
   `supported=false` (nothing external to probe), and a `401/403` from an HTTP endpoint is a *failure*
   (bad credentials), not a pass. A probe never sends data, but a File/RemoteFile probe may create the
   target directory, exactly as a real delivery would.
@@ -430,9 +451,76 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Egress allowlist.** An `X12(...)` destination shares `[egress].allowed_tcp` (host or host:port);
   an inbound `X12(...)` is a local listener and is not connect-gated.
 - **Deferred follow-ups:** **TA1** classification on a *capturing outbound* is built (ADR 0016); an
-  *inbound* TA1/997/999 **generator**, outbound **999/997** functional-ack classification, and strict
-  implementation-guide validation are **not** built (a Router can branch on `X12Peek`'s `ST01`/`GS08`
-  today).
+  *inbound* TA1/997/999 **generator** and outbound **999/997** functional-ack classification are **not**
+  built (a Router can branch on `X12Peek`'s `ST01`/`GS08` today). Strict **implementation-guide**
+  validation *is* built as an on-demand library — `messagefoundry.parsing.x12.validate` behind the
+  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a conforming **999**
+  (005010) / **997** (004010) as a by-product a Handler may return; it is never run by the connector.
+
+### HTTP web-service listener — `Http(...)` (inbound only, ADR 0023)
+
+An **inbound HTTP/1.1 listener** — a connector-owned bound socket a partner `POST`s a body to (REST, a
+SOAP envelope, FHIR, a webhook). **Source only**: it never delivers, and it lives in `transports/`, not
+`api/` — the engine's FastAPI app stays the admin/RBAC surface and `transports/` must never import `api/`,
+so intake is a registry connector owning its own `asyncio` socket. Stdlib only
+(`asyncio.start_server`) — no second web framework. Pair it with `inbound(..., content_type=...)`
+([ADR 0004](adr/0004-payload-agnostic-ingress.md)): the default `hl7v2` runs the HL7 peek/validate path and
+routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler parses on demand.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `port` | — (required) | bind port. **Takes no host** — the listen interface is the service-level `[inbound].bind_host` (or a per-connection `bind_address`), exactly as MLLP/TCP/X12. |
+| `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
+| `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
+| `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` (or a read past the cap) is refused `413` **before the body is buffered whole** (OOM guard). `None`/`0` = unlimited. |
+| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
+| `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
+| `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
+| `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`. |
+| `tls_ca_file` | — | trust anchor — opt-in **mTLS** (require + verify a client certificate). |
+
+Plus on `inbound(...)`: `router`, `content_type`, `bind_address`, `source_ip_allowlist`, `metadata`,
+`capture_connection_errors`, and the per-connection overrides further below. A **non-loopback** HTTP
+listener without `tls=true` is **refused at start** (`check_http_tls_exposure`, the same generalized
+bind-guard MLLP/TCP/DICOM use) unless `serve --allow-insecure-bind` is passed.
+
+**Respond-with-receipt (ACK-on-receipt).** A `POST`/`PUT`/`PATCH` body is committed to the ingress stage
+and answered **`202 Accepted`** carrying the engine `message_id` the instant it is durably committed — the
+HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
+`202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
+disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
+synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
+request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
+`max_header_bytes`), `400` (malformed request line / header, a bad or duplicated framing header), `503` (at
+`max_connections` — the connection is accepted, then refused and closed at the application layer).
+`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
+
+**Not built (first slice, ADR 0023).** **Request authentication** on the intake socket (API key / bearer /
+per-request token) is shaped but not shipped — the peer controls are the IP allowlist, TLS/mTLS and the
+exposed gate, so an exposed listener belongs behind the reverse proxy that terminates auth. The
+**synchronous downstream-reply** (SOAP-envelope block-on-captured-reply) path and **routing metadata**
+(HTTP method / path / headers as Router inputs) are defined follow-ons — a Handler sees the body only. The
+inbound **FHIR facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this
+listener, each its own build. `POST /connections/{name}/test` reports `supported=false` — a bound listener
+has nothing external to probe.
+
+```python
+from messagefoundry import ContentType, Http, env, inbound, router
+
+# Receive JSON orders over HTTPS; route them opaquely as a RawMessage.
+inbound("REST-IN_ACME_ORDERS",
+        Http(port=8088, tls=True,
+             tls_cert_file="/etc/mefor/http.crt", tls_key_file="/etc/mefor/http.key",
+             tls_key_password=env("http_tls_key_password")),   # only if the key is encrypted
+        router="acme_orders_router", content_type=ContentType.JSON,
+        source_ip_allowlist=["10.0.0.0/8"])
+
+
+@router("acme_orders_router")
+def route(msg):
+    return ["acme_orders"] if msg.json().get("kind") == "order" else []   # else UNROUTED
+```
 
 ### File — `File(...)`
 
@@ -500,7 +588,8 @@ inbound(
 another system owns, a source may **leave** each file untouched instead of moving/deleting it. To avoid
 re-ingesting the same file every poll, the engine keeps a durable **processed-file dedup ledger** (the
 store's `processed_files` table, all three backends) keyed on a **hash** of the file's identity — the
-file's **path relative to the watch root** (the full remote path for SFTP/FTP) + mtime/size — **never a
+file's **path relative to the watch root** + mtime + size locally, or the **full remote path** + size for
+SFTP/FTP (a remote listing carries no reliable mtime, so size is the change signal) — **never a
 cleartext path** (a filename/path can embed an MRN), and never logged. Folding the *path* (not just the
 basename) in keeps two same-named files in different `recursive` subdirs distinct, so both are ingested.
 A file is recorded **after** its message(s) emit successfully, with the **file** (not each split message)
@@ -521,10 +610,18 @@ for operator diagnostic logs; and the **attachment download** route (GET
 that serves a detached document back out. The **directory source's** handling of an untrusted drop
 directory is fixed policy (the HTTP uploaded-logs surface has its own policy block below):
 
-- **Permitted type — HL7 v2 text only.** Files are selected by the `pattern` glob (default `*.hl7`), and
-  every candidate is **content-sniffed** before its bytes reach the pipeline: it must begin with an HL7
-  header segment (`MSH`/`FHS`/`BHS`, after an optional UTF-8 BOM / MLLP start byte / leading whitespace).
-  A binary or non-HL7 file carrying a `.hl7` name is rejected on **content, not extension** (ASVS 5.2.2).
+- **Permitted type — the inbound's declared `content_type` (default `hl7v2`).** Files are selected by
+  the `pattern` glob (default `*.hl7`), and every candidate is **content-sniffed against that declared
+  type** before its bytes reach the pipeline: an `hl7v2` drop (the default, and how an inbound that
+  declares nothing is treated) must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`, after an
+  optional UTF-8 BOM / MLLP start byte / leading whitespace), and each other structured type must lead
+  with its own format signature. A file whose content **contradicts** its declaration — a PDF on a
+  `json` inbound, a headerless body on an `hl7v2` one — is rejected on **content, not extension**
+  (ASVS 5.2.2). It is a declared-type **conformance** check, not an HL7-only gate: an inbound declaring
+  a non-HL7 `content_type` bypasses HL7 handling entirely and its exact bytes reach the
+  content_type-aware pipeline (ADR 0004). The two declarations that carry no reliable leading signature
+  — `binary` (opaque bytes) and `text` (arbitrary) — are accepted **unchecked** by explicit policy; the
+  pipeline codec/parser stays the real validator that records `ERROR`.
 - **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
   is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
@@ -534,12 +631,13 @@ directory is fixed policy (the HTTP uploaded-logs surface has its own policy blo
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
   provide (ASVS 5.2.3). A corrupt or over-ceiling archive is **quarantined to `.error`, never
   accept-and-dropped**, and the decompressed body is never logged. Multi-entry zip stays Handler-composed.
-- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize or non-HL7 file
-  is **moved to the `.error` subdirectory** (preserved for the operator) and logged. A
-  *textual-but-non-conformant* HL7 file still flows through and is recorded as an `ERROR`-status message
-  by the parser (raw preserved in the store). A **transient** read failure (file locked / mid-write) or
-  an **infrastructure** failure (store unavailable) **leaves the file in place to retry** next scan —
-  never an accept-and-drop. Use `min_age_seconds` to skip files still being written.
+- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
+  whose content contradicts its declared type, is **moved to the `.error` subdirectory** (preserved for
+  the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
+  as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
+  (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
+  place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
+  written.
 - **Traversal-safe output naming.** The destination resolves `{HL7-path}` placeholders to a **single safe
   filename** (path separators / unsafe chars stripped, leading dots removed, `.`/`..`/reserved device
   names fall back), so an attacker-controlled field can't write outside the target dir or shadow
@@ -621,12 +719,97 @@ to `application/octet-stream` on any non-clean value **and** on any **browser-ac
 scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
 so a browser-active representation can never execute in the application origin.
 
+### Remote file — `Sftp(...)` / `Ftp(...)`
+
+**One** connector type (`REMOTEFILE`) with two factories, each **source *and* destination** — the `File(...)`
+poll/write shape against a remote server, selected by an internal `protocol` setting:
+
+- **`Sftp(...)`** — SSH file transfer over **paramiko**, behind the **`[sftp]` extra**
+  (`pip install 'messagefoundry[sftp]'`, lazily imported so an install that never uses SFTP skips it).
+  **Host-key verification is ON by default** (the system host keys plus an optional extra `known_hosts`,
+  paramiko `RejectPolicy`); an unknown key is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` is set (and
+  loudly logged when it is).
+- **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
+  (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
+  certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
+  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused** (the credential
+  itself would cross in the clear) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
+
+| Setting | Dir | Default | Meaning |
+|---------|-----|---------|---------|
+| `host` | both | — (required) | the remote server — the `[egress].allowed_remote` key. Use `env()` for a DEV/PROD-specific host. |
+| `port` | both | `22` (`Sftp`) / `21` (`Ftp`) | server port |
+| `remote_dir` | both | — (required) | remote directory to poll / upload into |
+| `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
+| `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
+| `private_key` | both | — | **`Sftp` only** — PEM private-key text or a path; a **secret**, via `env()` |
+| `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
+| `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
+| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying chain + hostname (#129, ADR 0094) |
+| `pattern` | in | `*.hl7` | filename glob to pick up |
+| `poll_seconds` | in | `5.0` | poll interval |
+| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
+| `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
+| `max_file_bytes` | in | `16 MiB` | move a file larger than this to `error_subdir` instead of retrieving it (OOM guard). `None`/`0` = unlimited. |
+| `validate_directory` | in | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time |
+| `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
+| `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
+| `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
+| `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
+
+- **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
+  the far side never sees a partial file; a failed rename removes the temp before the delivery is
+  classified (transient → retry, permanent → dead-letter).
+- **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
+  [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
+  content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
+  quarantined before its bytes reach the pipeline), `max_file_bytes`, `.error` quarantine (never a silent
+  drop), and the fail-closed pre-ingest `set_scan_hook` AV/ICAP seam all apply. **Three File-source
+  behaviours do *not* carry over:** the HL7 **batch split** (a multi-message `MSH`/`FHS`/`BHS` file is one
+  hand-off here, not N), opt-in gzip `decompress` (ADR 0123, local `File(...)` only), and
+  `min_age_seconds` (above).
+- **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
+  lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
+- **No timeout knob.** Neither factory exposes one — the 30 s value is a hard-coded module fallback in
+  `transports/remotefile.py`, handed to `paramiko.SSHClient.connect(timeout=…)` (the **TCP connect only**;
+  the SFTP channel read/write is unbounded) and to `ftplib.FTP_TLS/FTP(timeout=…)` (the **whole socket**).
+  See [Table B](#table-b--per-service-resource-strategy-asvs-1313).
+- **Egress allowlist.** `[egress].allowed_remote` gates the host in **both** directions — a poll dials out
+  too, so the allowlist guards against polling an arbitrary server. Fail-closed once configured.
+- **At-least-once.** An upload may re-send, and a poll may re-emit a file that was handled but not yet
+  marked, so **downstream consumers must tolerate duplicates.**
+- **A client per operation.** No pooled or held session: each poll and each delivery opens, uses, and
+  closes its own client in a `finally`, mirroring the MLLP destination's fresh-connection-per-delivery.
+
+```python
+from messagefoundry import Ftp, Sftp, env, inbound, outbound
+
+# Poll a partner's SFTP drop directory, leaving their files in place (read-only share).
+inbound(
+    "SFTP-IN_ACME_ADT",
+    Sftp(host=env("acme_sftp_host"), remote_dir="/outbound/adt", pattern="*.hl7",
+         username=env("acme_sftp_user"), private_key=env("acme_sftp_key"),
+         after_read="leave", poll_seconds=30.0, validate_directory=True),
+    router="acme_adt_router",
+)
+# Publish results back over FTPS (explicit TLS; verifying by default).
+outbound(
+    "FTP-OUT_ACME_ORU",
+    Ftp(host=env("acme_ftp_host"), tls=True, remote_dir="/inbound/oru",
+        username=env("acme_ftp_user"), password=env("acme_ftp_password")),
+)
+# In the config dir's TOML: [egress] allowed_remote = ["acme-sftp.example.org", "acme-ftp.example.org"]
+```
+
 ### REST — `Rest(...)`
 
 An **outbound** HTTP(S) client ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)). The
 Handler produces the request body (JSON, XML, an HL7-in-FHIR document — whatever the endpoint expects);
-the connector delivers it. There is **no REST source yet** — a non-HL7 *inbound* awaits the
-payload-agnostic ingress decided in ADR 0003.
+the connector delivers it. `Rest(...)` is **outbound only** — the inbound side is its own connector,
+[`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023) (ADR 0023), not a direction on this
+one.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -844,8 +1027,11 @@ inbound(
 An **outbound** SOAP web-service client ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)) —
 a thin layer over the REST connector's HTTP client (same no-redirect, `http`/`https`-only opener and the
 `[egress].allowed_http` host gate). The Handler produces the **full SOAP envelope** (XML); this adds the
-SOAP `Content-Type` (+ a `SOAPAction` header for 1.1) and POSTs it. There is **no SOAP source yet** (a
-Web Service Listener awaits the payload-agnostic ingress of ADR 0003).
+SOAP `Content-Type` (+ a `SOAPAction` header for 1.1) and POSTs it. There is **no SOAP source connector**:
+a partner's SOAP envelope is *received* by [`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023)
+and un-wrapped in a Handler (`parsing/xml` has the hardened XPath model), but the *synchronous* SOAP-envelope
+reply — a Web Service Listener that blocks on a captured downstream reply — is a defined ADR 0023 / ADR 0013
+follow-on and is **not** built.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1004,7 +1190,8 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | |
 
-The egress host is **gated by `[egress].allowed_smtp`** (deny-by-default — add the host or it is refused).
+The egress host is **gated by `[egress].allowed_smtp`** (fail-closed once configured — add the host or it is
+refused; an empty allowlist gates nothing unless `[egress].deny_by_default` is set).
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
 connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
@@ -1028,6 +1215,74 @@ outbound(
 # In config dir TOML: [egress] allowed_smtp = ["smtp.example.org"]
 ```
 
+### Direct Project — `Direct(...)` (S/MIME over SMTP, outbound send, ADR 0085)
+
+An **outbound destination only** — the Direct Project's trusted-correspondent lane. The Handler produces the
+clinical **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this connector **SIGNs**
+it with the sender's key + cert (authenticity + integrity), **ENCRYPTs** the signed blob to the partner's
+`recipient_cert` (confidentiality — sign-then-encrypt, so the signature is itself confidential), and submits
+the S/MIME message to `host:port` over STARTTLS SMTP. PHI is therefore protected **end-to-end**, independent
+of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and SMTP is stdlib `smtplib` —
+**no new dependency, no extra**.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |
+| `sender` | — (required) | the Direct `From:` address |
+| `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string |
+| `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
+| `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
+| `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
+| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target) |
+| `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
+| `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
+| `subject` | `""` | static `Subject` |
+| `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`) |
+| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright** — the same posture as `Email(...)`. |
+| `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
+| `encoding` | `utf-8` | charset the body is encoded with before signing |
+
+**Fail-loud at construction.** Every piece of crypto material is loaded and cross-checked when the connector
+is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
+key/cert, a `signing_key` whose public half **does not match** `signing_cert`, and a `recipient_cert` **not
+issued by** any supplied `trust_anchor` (PHI is never encrypted to a certificate from an untrusted issuer).
+The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
+a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
+hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
+never the material or a cert subject (which can identify a patient's provider).
+
+**Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
+`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. Both an SMTP
+failure and an S/MIME **encode** failure raise `DeliveryError`, so the lane **retries** per its
+`RetryPolicy`. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
+is possible and **accepted by design** (a duplicate beats a drop), exactly as with `Email(...)`.
+`test_connection` does connect / STARTTLS / EHLO / optional login / NOOP — never `MAIL FROM` or `DATA`.
+
+**Scope (ADR 0085 PR1) — outbound only.** An **inbound** Direct mail source (IMAP/POP + S/MIME
+decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certificate discovery, per-recipient
+certificate maps, IHE **XDR/XDM**, and the Direct IG's CMS signed attributes (`signingTime`,
+`ESSCertIDv2`) are all deferred later phases and **not** built.
+
+```python
+from messagefoundry import Direct, env, outbound
+
+outbound(
+    "DIRECT-OUT_REFERRAL",
+    Direct(
+        host=env("hisp_host"),
+        sender="clinic@direct.example.org",
+        recipients=["intake@direct.partner.example"],
+        signing_cert=env("direct_signing_cert"),
+        signing_key=env("direct_signing_key"),
+        signing_key_password=env("direct_signing_key_pw"),  # a SECRET — always via env()
+        recipient_cert=env("direct_partner_cert"),
+        trust_anchor=env("direct_trust_anchor"),
+        subject="Referral",
+    ),
+)
+# In the config dir's TOML: [egress] allowed_direct = ["hisp.example.org"]
+```
+
 ### FHIR — `FHIR(...)`
 
 An **outbound** FHIR REST client ([ADR 0022](adr/0022-fhir-resource-codec-rest-client.md)) that delivers a
@@ -1037,9 +1292,11 @@ host gate) — it is **not** a wrapper around `Rest(...)`. The Handler produces 
 sets the `application/fhir+json` media type (Content-Type + Accept) and POSTs/PUTs it per the configured
 interaction. The pure `messagefoundry.parsing.fhir` codec — `FhirPeek` to route (cheap, no `[fhir]` extra),
 `FhirResource` to validate/transform (the `[fhir]` extra) — is called **on demand in Routers/Handlers**,
-never pushed through the pipeline. There is **no FHIR source yet** (the inbound FHIR server facade is gated
-on a future ADR 0023); `content_type="fhir"` routes a FHIR body received over any source (File, a `Loopback`
-re-ingress) as a `RawMessage`.
+never pushed through the pipeline. There is **no FHIR source connector**: the inbound FHIR **server facade**
+(a `/fhir` endpoint with resource-type routing and a CapabilityStatement) is still deferred — BACKLOG #20,
+now a *consumer* of the shipped [`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023)
+listener rather than blocked on it. Meanwhile `content_type="fhir"` routes a FHIR body received over **any**
+source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1337,6 +1594,46 @@ def stow(msg):
     return Send("OB_DICOMWEB", msg.encode())   # STOW-RS the carried object bytes
 ```
 
+### Timer — `Timer(...)` (clock-driven source, ADR 0011)
+
+An **inbound source that reads no external resource**: it *fires* on a clock and hands an
+operator-configured `body` to the pipeline — the shape behind a heartbeat, a nightly extract trigger, or a
+scheduled query a Handler fans out. **Source-only** (it generates, never delivers).
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `body` | — (required) | the payload emitted **verbatim** on every fire, pre-encoded once at construction so each fire is byte-identical (a re-run stays pure). Declare its format with `inbound(..., content_type=...)`: the default `hl7v2` runs the HL7 peek/validate path; `text`/`json` route a `RawMessage`. |
+| `interval_seconds` | — | fire every N seconds. The heartbeat **starts at t=0** (fires immediately on start, then every interval). Must be `> 0`. |
+| `run_once` | `false` | fire a **single** time, then idle until stop. |
+| `cron_expression` | — | a calendar schedule (ADR 0011 amendment, #160) — a standard **5-field** expression (`minute hour day-of-month month day-of-week`) with `*`, lists, ranges and steps; day-of-week is `0-6`, **Sunday = 0** (`7` also accepted). When *both* day-of-month and day-of-week are restricted, a match on **either** fires (the Vixie OR rule). Unlike the interval heartbeat, cron does **not** fire at t=0 — the first fire is the next scheduled minute. Named months/weekdays are out of scope (numeric only). |
+| `timezone` | — (system-local) | an IANA zone name (e.g. `"America/New_York"`) the cron schedule matches against, DST-aware. **Only** valid together with `cron_expression`. |
+| `encoding` | `utf-8` | charset `body` is encoded with |
+
+Exactly one of `interval_seconds` / `run_once` / `cron_expression`: the three are **mutually exclusive** and
+declaring none is an error, so a mis-scheduled timer fails at `messagefoundry check` — as does an
+unsatisfiable cron expression (e.g. `* * 30 2 *`, caught by a bounded horizon scan at parse) or an unknown
+`timezone`.
+
+- **Leader-gated.** The schedule is a *shared trigger*, so in a cluster **only the leader fires it** —
+  otherwise every node would emit the same message. A follower's loop still ticks, so a node that wins
+  leadership fires on its next tick with no restart; on a single node this is byte-identical to an ungated
+  loop.
+- **At-least-once on the *timing* boundary only.** The body is committed to the ingress stage and frozen
+  there, so downstream re-runs stay pure. A fire whose durable write fails (DB locked, disk full) is
+  **logged and retried on the next tick** — it never kills the source (that would silently stop intake
+  while still reporting `running`), and a `run_once` timer retries until it lands.
+- **Nothing to bind or probe.** A Timer takes no `bind_address`/`source_ip_allowlist`, and
+  `POST /connections/{name}/test` reports `supported=false`.
+
+```python
+from messagefoundry import ContentType, Timer, inbound
+
+# A weekday 08:00 trigger in a named zone; the Handler builds the real work from the fired body.
+inbound("TIMER-IN_NIGHTLY_EXTRACT",
+        Timer(body="EXTRACT", cron_expression="0 8 * * 1-5", timezone="America/New_York"),
+        router="extract_router", content_type=ContentType.TEXT)
+```
+
 ### Loopback — `Loopback()` + `reingress_to=` (request → response → route, ADR 0013)
 
 A **request/response** feed sends a query to a partner and **routes the partner's answer**. The capturing
@@ -1369,6 +1666,46 @@ inbound("IB-LOOP_PAYER_ELIG", Loopback(), router="route_elig_result", content_ty
 outbound("MLLP-OUT_PAYER_ELIG", MLLP(host=env("payer_host"), port=2575, reingress_to="IB-LOOP_PAYER_ELIG"))
 # a Handler Sends the eligibility query to MLLP-OUT_PAYER_ELIG; its reply re-ingresses into IB-LOOP_PAYER_ELIG.
 ```
+
+### Pass-through — `PassThrough()` (internal 1:N re-ingress, ADR 0013 generalized)
+
+Another **inert internal inbound** — no socket, no poll. A Handler `Send`s its **transformed** message *into*
+a PT inbound (naming it like an outbound) and the engine re-ingresses that body as a **new, independent
+inbound message** on that channel, where the PT inbound's **own** Router decides where it goes next. This is
+the Corepoint `PT_*` pattern: one logical feed fans out across internal connectors and re-routes deeper
+without an external hop. `PassThrough()` takes **no settings** — a PT inbound carries only its `router` and
+`content_type`.
+
+- **Loopback vs. PassThrough.** `Loopback()` is the **1:1 reply** sibling: it is fed by a *capturing
+  outbound*'s `reingress_to=` and its body is the partner's captured answer. `PassThrough()` is the **1:N
+  internal routing** sibling: *any* Handler may target it and the body is the transformed message. Both share
+  the same atomic content-addressed re-ingress shape.
+- **Atomic, idempotent handoff.** The child ingress row is produced in the **same transaction** that consumes
+  the parent's routed row (`transform_handoff`), so a crash/re-run is a no-op, never a double-injection. The
+  handoff never crosses the source/listener seam — the connector deliberately **never invokes its handler**
+  (that would be the bare-`enqueue_ingress` double-injection trap; a unit test pins it).
+- **Loop-bounded.** A PT chain is bounded by `[pipeline].max_correlation_depth` (default 8) exactly like a
+  loopback reply chain: work past the cap dead-letters and the origin is marked `ERROR`.
+- **Like `Loopback()` otherwise.** No `ack_mode` (forced `NONE` — no external peer), no
+  `bind_address`/`source_ip_allowlist` (no socket), and no `strict` validation (no untrusted intake — the body
+  is engine-internal, already-stored state). A **store-backend gate** runs on every config-application path
+  (start, reload, `reload(dry_run=True)`): all three shipped backends (SQLite, Postgres, SQL Server) support
+  PT re-ingress, so it only ever rejects a graph on a backend that doesn't — before any swap or start.
+
+```python
+from messagefoundry import MLLP, PassThrough, Send, handler, inbound
+
+inbound("IB_PT_Entry", MLLP(port=2576), router="pt_entry_router")
+# The internal hop: no socket; fed only by the Send-into-PT handoff below, then re-routed by its own router.
+inbound("PT_Relay", PassThrough(), router="pt_relay_router")
+
+
+@handler("pt_entry_handler")
+def to_passthrough(msg):
+    return Send("PT_Relay", msg)     # → re-ingresses as a NEW message on PT_Relay
+```
+
+A runnable graph ships at [`harness/config/passthrough/graph.py`](../harness/config/passthrough/graph.py).
 
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
@@ -1644,7 +1981,7 @@ running at the scale pooled unlocks:
 How the engine bounds connections, threads, and retries **per external service**, what happens **when
 a limit is reached**, and how each service's resources are released — the resource-management
 contract a reviewer needs. The two tables below cover **every** hop in the communications inventory
-([security/ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
+([ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
 13.1.2/13.2.6 concurrency axis, Table B the 13.1.3 resource-strategy axis. They carry the **same row
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.
@@ -1895,43 +2232,57 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **MLLP / LLP** (HL7 lower‑layer over TCP) | ✅ | ✅ | ✅ | ✅ | `IB`/`OB` shipped |
 | **Raw TCP** client/server (configurable framing) | ✅ | ✅ | ✅ | ✅ | `TCP-IN/OUT` shipped |
 | **File / Directory** (local) | ✅ | ✅ | ✅ | ✅ | `FILE-IN/OUT` shipped |
-| **FTP / FTPS** | ✅ | ✅ | ✅ | ❌ | File remote scheme, planned |
-| **SFTP** | ✅ | ✅ | ✅ | ❌ | `SFTP-IN/OUT` planned |
-| **SMB / network share** | ✅ | ✅ | ✅ | ❌ | File remote scheme, planned |
-| **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | File remote scheme, planned |
-| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ~ | `REST-OUT` shipped; `REST-IN` planned |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped; `SOAP-IN` planned |
-| **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server, exp.); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
-| **SMTP** (email send) | ✅ | ✅ | ✅ | ❌ | `SMTP-OUT` planned |
+| **FTP / FTPS** | ✅ | ✅ | ✅ | ✅ | `FTP-IN/OUT` shipped — `Ftp()`, source + destination, stdlib `ftplib` (no extra); `tls=True` = FTPS with verifying TLS |
+| **SFTP** | ✅ | ✅ | ✅ | ✅ | `SFTP-IN/OUT` shipped — `Sftp()`, source + destination, `[sftp]` extra; host-key verification on by default |
+| **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
+| **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
+| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped; request auth on the intake socket is deferred |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body can be **received** via `Http()`, but the *synchronous* SOAP-envelope reply is deferred |
+| **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
+| **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
 | **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
-| **FHIR** endpoint/client | ✅ | ✅ | ✅ | ❌ | `FHIR-IN/OUT` planned |
-| **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — not a transport |
+| **FHIR** endpoint/client | ✅ | ✅ | ✅ | ~ | `FHIR-OUT` shipped (`FHIR()`, ADR 0022) + SMART Backend Services client auth (ADR 0024); the inbound **server facade** is deferred (BACKLOG #20) |
+| **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — plus two first-class internal inbounds: `Loopback()` (a captured reply) and `PassThrough()` (1:N internal re-ingress), ADR 0013 |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |
+
+Two shipped MessageFoundry transports have **no row above** because they have no clean incumbent to grade
+against: the **Timer** clock-driven source (`Timer()`, ADR 0011) and — folded into the SMTP row — the
+**Direct Project** S/MIME-over-SMTP destination (`Direct()`, ADR 0085).
 
 **Priority of the gaps we'll close:**
 
-- **Tier 1 — table stakes (all three have these):** raw TCP, HTTP/REST, SOAP, Database, SFTP, plus
-  File remote schemes (FTP/FTPS/SMB/S3). `SFTP-*`/`SOAP-*`/`REST-*`/`DB-*` are already designed; raw
-  TCP closes the MLLP‑only gap. **FHIR** belongs here too — all three now ship it.
-- **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and Email (SMTP send + POP3/IMAP read). **DICOM
-  is now full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus the `DICOM-OUT` C-STORE SCU/C-ECHO and the
-  `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the DICOMweb send path **exceeds** both incumbents.
+- **Tier 1 — table stakes (all three have these): now shipped, bar one.** Raw TCP, HTTP/REST (**both**
+  directions), `SOAP-OUT`, Database (`DB-IN` + `DB-OUT`), SFTP, FTP/FTPS, UNC/SMB, and the **FHIR** client
+  all ship. What is left on this tier: **S3 / cloud blob**, and the two inbound facades — `SOAP-IN`'s
+  *synchronous* envelope reply and `FHIR-IN` (both consumers of the shipped `Http()` listener, not new
+  substrate).
+- **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and the **Email reader** (POP3/IMAP) are the open
+  ones — SMTP *send* shipped (ADR 0029). **DICOM is full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus
+  the `DICOM-OUT` C-STORE SCU/C-ECHO and the `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the
+  DICOMweb send path **exceeds** both incumbents.
 - **Tier 3 — Rhapsody‑only, lower priority:** Kafka/streaming (worth adding for modern credibility),
   IBM MQ/MSMQ, Serial, printer/command‑line.
 
-Each new type needs a `ConnectorType` value, a `transports/` module, and a `wiring.py` factory.
+Each new type needs a `ConnectorType` value, a `transports/` module, a `register_source`/
+`register_destination` call (which is what makes it *built*), and a `wiring.py` factory.
 
 ### Per‑transport feature gaps (not just new types)
 
-- **MLLP:** TLS/SSL, custom start/end frame bytes, keep‑connection‑open/pooling, MLLP v2 (commit) ACK,
-  response‑on‑same‑connection, max buffer size.
-- **File:** cron/time‑of‑day polling (vs. fixed interval), file‑age sorting, batch (line‑per‑message)
-  splitting, remote schemes (FTP/SMB/S3) beyond local.
+- **MLLP — now shipped:** TLS/SSL (`tls`, WP-13b / ADR 0002), keep‑connection‑open/pooling (`persistent`,
+  ADR 0067), max buffer size (`max_frame_bytes`), and enhanced-mode commit ACK codes (CA/CE/CR via
+  `ack_mode="enhanced"`). **Still open:** custom start/end frame bytes on `MLLP()` itself (a non-standard
+  sentinel is `Tcp(framing=None, start=…, end=…)` today), MLLP **release-2 block framing**, and
+  response‑on‑same‑connection (the synchronous downstream reply, an ADR 0013 follow-on).
+- **File — now shipped:** file‑age sorting (`sort="mtime"`), Corepoint-style **batch splitting** (an
+  `MSH`/`FHS`/`BHS` batch file becomes N hand-offs), and the remote schemes — FTP/FTPS (`Ftp()`), SFTP
+  (`Sftp()`), UNC/SMB (`File()` on a UNC path). **Still open:** **S3 / cloud blob**, and a cron
+  *expression* on the File poll itself — a time-of-day / day-of-week **active window** is available per
+  connection via `schedule` (ADR 0095), and cron *firing* via `Timer(cron_expression=…)`.
 - **Monitor:** honor the `IBC`/`OBC` "waiting = healthy" convention in connection health.
 
 ## Standards & formats — parity & roadmap
@@ -1940,17 +2291,21 @@ Formats are **orthogonal to transports**: any format can ride any connector (an 
 C‑CDA over a file, a FHIR bundle over HTTP). This section is the **format/standard** parity story; the
 catalog above is the **transport** one.
 
-**Where MF stands today:** HL7 v2.x is the default, with **X12 EDI**, **FHIR**, and (Phase 1) **DICOM**
-modeled lanes now shipped. [`parsing/`](../messagefoundry/parsing/) is python‑hl7 (tolerant peek, hot
-path) + hl7apy (opt‑in strict) for v2, plus pure codecs for X12 (`parsing/x12`), FHIR (`parsing/fhir`),
-and DICOM headers/SR (`parsing/dicom`); there is still no C‑CDA, NCPDP, or HL7 v3 model in the engine.
-The competitors are format‑agnostic and cover the full clinical catalog.
+**Where MF stands today:** HL7 v2.x is the default, with **X12 EDI**, **FHIR**, **XML/SOAP**, and (Phase 1)
+**DICOM** modeled lanes now shipped. [`parsing/`](../messagefoundry/parsing/) is python‑hl7 (tolerant peek,
+hot path) + hl7apy (opt‑in strict) for v2, plus pure codecs for X12 (`parsing/x12` — tolerant peek/edit
+*and* opt‑in strict implementation‑guide validation via the `[x12]` extra), FHIR (`parsing/fhir`), XML/SOAP
+(`parsing/xml` — hardened‑lxml XPath read/set + XSD + XML‑DSig, the `[xml]` extra), and DICOM headers/SR
+(`parsing/dicom`); there is still no C‑CDA, NCPDP, or HL7 v3 **model** in the engine. The competitors are
+format‑agnostic and cover the full clinical catalog.
 
 A useful split, because it sets the cost:
 
-- **"Free in Python" text formats** — JSON, delimited/CSV, fixed‑width, and *generic* XML are handled
-  **in a Handler today** with the standard library (`json`, `csv`, `xml`/`lxml`); no engine change is
-  needed to read or emit them. They're a documentation + helper‑ergonomics item, not a build.
+- **"Free in Python" text formats** — JSON, delimited/CSV, and fixed‑width are handled **in a Handler
+  today** with the standard library (`json`, `csv`) — `RawMessage` even exposes `.json()` and a
+  DTD‑rejecting `.xml()` accessor — so no engine change is needed to read or emit them. They're a
+  documentation + helper‑ergonomics item, not a build. (*Generic* XML has since graduated to a real
+  modeled lane, `parsing/xml` — see the table.)
 - **"Modeled standards"** — CDA/C‑CDA, FHIR, X12/EDI, NCPDP, DICOM, and HL7 v3 each need a real
   **parse + model + validate lane** parallel to the v2 lane (a document/resource model, a field/path
   façade so transforms stay code‑first, and a standard‑specific validator). Each is its own workstream.
@@ -1960,13 +2315,13 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 | Format / standard | Mirth | Corepoint | Rhapsody | MF today | MF plan |
 |-------------------|:-----:|:---------:|:--------:|:--------:|---------|
 | **HL7 v2.x** | ✅ | ✅ | ✅ | ✅ | shipped (python‑hl7 + hl7apy) |
-| **JSON** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
-| **Delimited / CSV / fixed‑width** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
-| **Generic XML** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
+| **JSON** | ✅ | ✅ | ✅ | ✅ | `content_type="json"` + `RawMessage.json()`; transforms are stdlib `json` in a Handler |
+| **Delimited / CSV / fixed‑width** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now (stdlib `csv`); ship helper |
+| **Generic XML** | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/xml` (`[xml]` extra): hardened‑lxml `XmlMessage` XPath read/set + XSD strict tier + XML‑DSig, plus the DTD‑rejecting core `RawMessage.xml()` (BACKLOG #31) |
 | **Raw / binary pass‑through** | ✅ | ✅ | ✅ | ✅ | stored/routed as opaque bytes today |
-| **FHIR** (R4/R5, JSON + XML) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 1** |
-| **C‑CDA / CDA / CCD** (HL7 v3 XML doc) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 1** |
-| **X12 / EDI** (270/271, 834, 835, 837…) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 2** |
+| **FHIR** (R4/R5, JSON + XML) | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/fhir` (`[fhir]` extra): `FhirPeek` routing tier + validated `FhirResource` (R4B default / R5 / STU3) + FHIRPath, ADR 0022. **JSON only** — FHIR‑XML is deferred to the hardened‑lxml path |
+| **C‑CDA / CDA / CCD** (HL7 v3 XML doc) | ✅ | ✅ | ✅ | ❌ | no CDA **model** — modeled lane, **Tier 1** (the shipped XML lane is the substrate it would build on) |
+| **X12 / EDI** (270/271, 834, 835, 837…) | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/x12`: dependency‑free tolerant `X12Peek`/`X12Message` (ADR 0012) + opt‑in **strict implementation‑guide** validation over pyx12's HIPAA maps (`[x12]` extra, #32), whose walk also emits a conforming 999/997. No *automatic* TA1/997/999 generation on the wire |
 | **NCPDP** (SCRIPT, Telecom) | ✅ | ~ | ✅ | ❌ | modeled lane — **Tier 2** |
 | **DICOM** object / SR | ✅ | ~ | ✅ | ~ | headers/SR codec shipped (`parsing/dicom`, ADR 0025 Phase 1, pairs w/ `DICOM-IN`); no pixel data |
 | **HL7 v3 messaging** (non‑CDA XML) | ✅ | ✅ | ~ | ❌ | modeled lane — **Tier 3** (low demand) |
@@ -1974,25 +2329,30 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 
 **Roadmap priority (modeled standards):**
 
-- **Tier 1 — FHIR and C‑CDA.** The two formats every modern RFP asks for; both are the highest‑value
-  gaps after the connector catalog. FHIR also pairs with the planned `FHIR-*` and `REST-*` transports;
-  C‑CDA most often arrives base64‑embedded in a v2 `MDM^T02`/`ORU` `OBX-5` (which MF already carries as
-  bytes — the lane adds *understanding* it). See the CCD phasing note below.
-- **Tier 2 — X12/EDI and NCPDP.** Eligibility/claims (X12) and pharmacy (NCPDP); needed for payer and
-  e‑prescribing integrations, lower frequency than FHIR/CDA in a pure clinical shop.
+- **Tier 1 — FHIR (shipped) and C‑CDA (open).** The two formats every modern RFP asks for. **FHIR
+  shipped** (ADR 0022) and pairs with the shipped `FHIR-OUT` / `REST-*` transports. **C‑CDA is the open
+  one:** it most often arrives base64‑embedded in a v2 `MDM^T02`/`ORU` `OBX-5` (which MF already carries as
+  bytes — the lane adds *understanding* it), and the shipped `[xml]` lane is the substrate step 2 below
+  now builds on. See the CCD phasing note.
+- **Tier 2 — X12/EDI (shipped) and NCPDP (open).** Eligibility/claims **X12 shipped** — tolerant codec
+  (ADR 0012) plus strict IG validation (#32); pharmacy **NCPDP** is still open, needed for e‑prescribing
+  and lower frequency than FHIR/CDA in a pure clinical shop.
 - **Tier 3 — DICOM object/SR and HL7 v3 messaging.** DICOM (headers/SR, no pixel data) is **shipped
   (ADR 0025 Phase 1)** and pairs with the `DICOM-IN` C-STORE SCP transport; v3 messaging (as distinct
   from CDA) sees little real‑world demand.
 
 **C‑CDA phasing (representative of how a modeled lane lands):**
 1. *Pass‑through (today):* route/store a CCD as opaque bytes — as a file, or base64 in v2 `OBX-5`.
-2. *Read‑only lane:* an XML model + XPath façade + Schematron/XSD validation + an `OBX-5` base64
-   extract — enough to route on and validate.
+2. *Read‑only lane:* an XML model + XPath façade + XSD validation + an `OBX-5` base64 extract — enough
+   to route on and validate. The generic half of this **shipped** with `parsing/xml` (#31); what a CDA
+   lane still adds is the document/section model and its conformance profile.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
-**Dependency note.** A modeled lane means a new parser/validator dependency. The DICOM lane ships under
-the `[dicom]` optional extra — `pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4` (pure‑Python, no numpy). Still
-to be *evaluated*, not yet chosen for the unbuilt lanes: `lxml` for XML/CDA and an NCPDP parser. Per the
+**Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
+optional extra — `[dicom]` (`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
+(`fhir.resources` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
+lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
+chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the
 project guardrails, each must be **verified as real and reputable, added to `pyproject.toml`, and
 re‑locked** before use — no ad‑hoc installs. Each modeled lane is a substantial architectural addition,
 so it follows the **plan‑first** rule (a written plan before code).

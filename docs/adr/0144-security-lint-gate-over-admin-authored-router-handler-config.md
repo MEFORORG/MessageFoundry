@@ -1,8 +1,8 @@
 # 0144 — Security-lint gate over admin-authored Router/Handler config
 
-- **Status:** Accepted (2026-07-21) — **Increments 1 + 2 + 3 built + verified** (advisory stdlib-AST rules incl. `unvetted-import`, curated Ruff-`S`, the `--strict-handler-security` block mode + `--handler-security-allow`, the opt-in Semgrep taint leg, and the operator pip-audit control). Operator setup: [SECURING-HANDLER-CONFIG-IN-CI.md](../security/SECURING-HANDLER-CONFIG-IN-CI.md).  <!-- Proposed → Accepted → Superseded/Rejected -->
+- **Status:** Accepted (2026-07-21) — **Increments 1 + 2 + 3 built + verified** (advisory stdlib-AST rules incl. `unvetted-import`, curated Ruff-`S`, the `--strict-handler-security` block mode + `--handler-security-allow`, the opt-in Semgrep taint leg, and the operator pip-audit control). Operator setup: SECURING-HANDLER-CONFIG-IN-CI.md.  <!-- Proposed → Accepted → Superseded/Rejected -->
 - **Date:** 2026-07-21
-- **Related:** [ADR 0087](0087-sandbox-subprocess-isolation.md) (runtime subprocess sandbox — the *runtime* half of 15.2.5) · [ADR 0034](0034-static-analysis-triage-policy-accepted-risk-register.md) (static-analysis triage on the *engine*'s own code) · [ADR 0084](0084-accepts-router-seam.md) (the advisory-lint precedent in `check`) · [checks.py](../../messagefoundry/checks.py) (`_check_raise_fstring` / `_check_accepts_candidate`) · [HANDLER-CODE-SHARED-RESPONSIBILITY.md](../security/HANDLER-CODE-SHARED-RESPONSIBILITY.md) (the framing) · [ASVS risk-acceptance register](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 6 (15.2.5) / BACKLOG #205 · [CLAUDE.md](../../CLAUDE.md) §8/§9 · BACKLOG #197 (the sandbox lane) · [ADR 0147](0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) (the runtime half) · [SECURING-HANDLER-CONFIG-IN-CI.md](../security/SECURING-HANDLER-CONFIG-IN-CI.md) (operator CI setup) · ASVS 5.0 15.1.5 / 15.2.4 / 15.2.5
+- **Related:** [ADR 0087](0087-sandbox-subprocess-isolation.md) (runtime subprocess sandbox — the *runtime* half of 15.2.5) · [ADR 0034](0034-static-analysis-triage-policy-accepted-risk-register.md) (static-analysis triage on the *engine*'s own code) · [ADR 0084](0084-accepts-router-seam.md) (the advisory-lint precedent in `check`) · [checks.py](../../messagefoundry/checks.py) (`_check_raise_fstring` / `_check_accepts_candidate`) · HANDLER-CODE-SHARED-RESPONSIBILITY.md (the framing) · ASVS risk-acceptance register (`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`) theme 6 (15.2.5) / BACKLOG #205 · [CLAUDE.md](../../CLAUDE.md) §8/§9 · BACKLOG #197 (the sandbox lane) · [ADR 0147](0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) (the runtime half) · SECURING-HANDLER-CONFIG-IN-CI.md (operator CI setup) · ASVS 5.0 15.1.5 / 15.2.4 / 15.2.5
 
 ---
 
@@ -11,7 +11,7 @@
 MessageFoundry executes operator-authored **Routers** and **Handlers** — ordinary Python — **in the
 engine's own process** ([ADR 0087](0087-sandbox-subprocess-isolation.md)). ASVS 5.0 classifies this as
 "dangerous functionality" (dynamic code execution) and the packages a Handler imports as "risky
-components" (15.1.5 / 15.2.4 / 15.2.5). The [shared-responsibility memo](../security/HANDLER-CODE-SHARED-RESPONSIBILITY.md)
+components" (15.1.5 / 15.2.4 / 15.2.5). The shared-responsibility memo
 establishes the load-bearing point: **a trusted *author* does not imply *safe* code.** Three failure modes
 occur under fully-trusted authorship — fallible authors (injection, PHI-to-log, unsafe egress, impure
 transforms), AI-generated code that looks right but isn't, and third-party **supply-chain** risk
@@ -165,7 +165,7 @@ the `ruff`/`mypy` run-if-installed convention in escalation.
 **Positive** — Shift-left coverage of the fallible-author, AI-generated, and supply-chain classes over the
 one body of code the scorecard otherwise assumes benign; extends a shipped, low-false-positive pattern;
 concrete, documented compensating control for 15.2.5/15.2.4 that strengthens the
-[shared-responsibility framing](../security/HANDLER-CODE-SHARED-RESPONSIBILITY.md) so the split isn't
+shared-responsibility framing so the split isn't
 asserted on paper alone.
 
 **Negative / risks** — **Low recall (16–70%)**: this must never be described as closing 15.2.5 — the
@@ -226,10 +226,10 @@ All four Increment-3 follow-ons shipped:
       (`messagefoundry.security.handler_semgrep_rules()`), an opt-in leg **not** part of `messagefoundry
       check` (Semgrep is not a dependency), `--validate`/`--test`/samples-clean in `security.yml`. Recovers
       the inter-statement-taint and aliased-import false-negatives above. Operator setup:
-      [SECURING-HANDLER-CONFIG-IN-CI.md](../security/SECURING-HANDLER-CONFIG-IN-CI.md).
+      SECURING-HANDLER-CONFIG-IN-CI.md.
 - [x] **`pip-audit`/OSV** — delivered as the operator control it is (the engine's samples import no
       third-party deps, so an engine-CI leg would only re-audit engine deps already covered): documented in
-      [SECURING-HANDLER-CONFIG-IN-CI.md](../security/SECURING-HANDLER-CONFIG-IN-CI.md) §Control C over the
+      SECURING-HANDLER-CONFIG-IN-CI.md §Control C over the
       config repo's `requirements.txt`, tied to the already-scaffolded `audit-pin` job.
 
 Further follow-ons (not scheduled): a `[check]` settings-file surface for the allowlist; narrowing the

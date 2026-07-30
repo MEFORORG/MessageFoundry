@@ -442,7 +442,7 @@ restored `mefor` DB must carry ≥ 1 `dr_backup` audit row, which a fresh bootst
 when falsely attested. **The engine does NOT verify the restore's *vintage* or *completeness*** — a stale-but-real
 restore, or a partial restore that carried `audit_log` but not the message tables, passes those checks. Proving
 the native restore is the **intended vintage and complete** is a **DBA runbook responsibility**, formally accepted
-as a residual risk in [`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md). The
+as a residual risk in `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`. The
 DBA/operator must, before attesting: (i) restore from the **intended** native backup (confirm its point-in-time
 against the change record, not just "a" backup); (ii) verify the restore completed (all tables present, not a
 truncated/aborted restore); and (iii) **optionally** set `[dr].restore_token` to a local JSON token

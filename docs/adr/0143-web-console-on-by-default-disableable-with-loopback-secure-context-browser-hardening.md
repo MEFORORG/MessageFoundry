@@ -5,7 +5,7 @@
 
 - **Status:** Accepted (2026-07-21)
 - **Date:** 2026-07-21
-- **Related:** [ADR 0065](0065-web-ops-dashboard.md) (the web ops console — amended: default flipped on) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) (the `[security]` secure-by-default section — `serve_web_console` default flipped; reframed as surface-reducing, not a loosening) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (the off-loopback exposure ladder — now runs for an explicitly-enabled console) · [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md) · [docs/security/OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md)
+- **Related:** [ADR 0065](0065-web-ops-dashboard.md) (the web ops console — amended: default flipped on) · [ADR 0118](0118-secure-by-default-security-configuration-section.md) (the `[security]` secure-by-default section — `serve_web_console` default flipped; reframed as surface-reducing, not a loosening) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (the off-loopback exposure ladder — now runs for an explicitly-enabled console) · [docs/SECURITY-LOOSENING.md](../SECURITY-LOOSENING.md) · docs/security/OFF-LOOPBACK-DEPLOYMENT.md
 
 ---
 

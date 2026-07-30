@@ -2,7 +2,7 @@
 
 - **Status:** Accepted
 - **Date:** 2026-07-01
-- **Related:** [ADR 0037](0037-multi-process-sharding-l3.md) (sharding — the connection-scale regime) · [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (no split store — one unified store) · [ADR 0053](0053-free-threaded-multicore-engine.md) (multicore direction) · [ADR 0052](0052-enterprise-scale-target.md) (enterprise scale target) · B11 connection-scale harness (#675) · [docs/throughput-build-plan.md](../throughput-build-plan.md) (B13) · [docs/DEPLOY-SERVER-DB.md](../DEPLOY-SERVER-DB.md) §3 · CLAUDE.md §2 (staged pipeline, at-least-once)
+- **Related:** [ADR 0037](0037-multi-process-sharding-l3.md) (sharding — the connection-scale regime) · [ADR 0063](0063-no-split-store-unified-store-for-sharding.md) (no split store — one unified store) · [ADR 0053](0053-free-threaded-multicore-engine.md) (multicore direction) · [ADR 0052](0052-enterprise-scale-target.md) (enterprise scale target) · B11 connection-scale harness (#675) · [docs/archive/throughput/throughput-build-plan.md](../archive/throughput/throughput-build-plan.md) (B13) · [docs/DEPLOY-SERVER-DB.md](../DEPLOY-SERVER-DB.md) §3 · CLAUDE.md §2 (staged pipeline, at-least-once)
 
 ---
 

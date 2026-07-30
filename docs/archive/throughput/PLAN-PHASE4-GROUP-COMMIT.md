@@ -1,8 +1,38 @@
 # Phase-4 "Group-Commit" — Implementation Plan
 
+> # ⛔ SUPERSEDED (2026-07-29) — P0 RAN, AND IT RETURNED **ABANDON**. See [ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md).
+> **The "Status: PROPOSED" line below is REVOKED, and so is the §1 recommendation to build F1 → F2 → F3 on a
+> PROCEED. Phase 4 is CLOSED: `txn/event` reduction is a MEASURED dead end. Do NOT build F2 or F3.**
+>
+> This plan's own pre-registered decision rule (§7.6) fired — the honest outcome it was written to make possible:
+>
+> - The intervention **engaged**: `committed_txns/msg` fell **10.4746 → 7.4865** (a **28.5%** cut), clear of the
+>   ≥0.9 manipulation-check floor. The disarmed-arm trap of §7.0 was avoided and shape-verified on every arm.
+> - Sustained throughput moved **−0.56%** — **inside the pre-registered NULL band (−3%…+3%)** and smaller than
+>   either arm's own replicate spread. **⇒ ABANDON THE ANGLE**, per §7.6 row 3.
+> - **Arm E (§7.4) — "the most valuable thing in this plan" — delivered.** It bounded the whole lever class, not
+>   just fusion: a **~3× swing in committed transactions moves throughput ~11.7%**, an elasticity of **−0.115**.
+>   *"No transaction-reduction mechanism — fusion, group-commit, or any other — can close a 5.79× gap."*
+> - **[ADR 0057](../../adr/0057-inline-step-a-fast-path.md) is ⛔ DO NOT PROMOTE** — permanently default-OFF
+>   (`inline: bool = False`, [`config/wiring.py:2452`](../../../messagefoundry/config/wiring.py)). The mechanism
+>   works; it buys nothing.
+> - **F1 survives, but NOT as a throughput lever** — ship the `record_ack_sent` fold, if at all, on
+>   latency/cleanliness grounds only. **Owner's call**, and ADR 0107 does not gate it.
+> - **Two honest caveats ADR 0107 records and this banner will not soften:** the ABANDON rests on the primary
+>   A/B null, **not** on arm E; and arm E does **not** prove F2 fails at high `H` (its H=8 ceiling is **+13.2%**,
+>   *above* the +8% bar). **F2 is DECLINED on cost/risk/evidence, not excluded by proof** — and it cannot be
+>   measured without being built (the gate is `inline and len(names) == 1`,
+>   [`pipeline/wiring_runner.py:4550`](../../../messagefoundry/pipeline/wiring_runner.py)).
+>
+> **The body below is retained as the record of why**, including the four angles and the three that lost — only
+> §6 carries a one-line resolution note. Its raw artifacts are in-repo at
+> `docs/benchmarks/results/2026-07-13-p0-inline-fusion/`. Measured
+> throughput lives in [`TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md); 45M/day remains a **target**
+> ([ADR 0052](../../adr/0052-enterprise-scale-target.md)), never a demonstrated capability.
+
 **Status:** PROPOSED — owner approval required before any code is written.
 **Date:** 2026-07-12
-**Supersedes the Phase-4 scope in** `docs/benchmarks/THROUGHPUT-EXECUTION-PLAN.md`.
+**Supersedes the Phase-4 scope in** `docs/archive/throughput/THROUGHPUT-EXECUTION-PLAN.md`.
 **Amends (on approval):** ADR 0057 (stage fusion), ADR 0055 / ADR 0069 (durable-write tier). ADR numbers to be
 allocated via `scripts\coord\alloc.ps1` — **never grepped**.
 
@@ -428,6 +458,14 @@ payoff we have not observed, and we have pre-registered the result that makes us
 
 Each phase is independently shippable, default-OFF, and cleanly backed out. **Nothing after P0 is authorised by
 this plan** — P0's result decides.
+
+> ⛔ **P0 decided: ABANDON (2026-07-13, null band, −0.56%).** So **F2 and F3 are NOT authorised** — see
+> [ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md). **F1 is the owner's
+> call on latency/cleanliness grounds only** — never on a throughput claim, which the measured elasticity (−0.115)
+> forbids. **B0b is FIXED** — `mark_batch_done` now finalizes in `sorted(finalize)` order
+> ([`store/sqlserver.py:6884`](../../../messagefoundry/store/sqlserver.py)). **B0 is part-done:** ADR 0057 carries its
+> DO-NOT-PROMOTE banner, but the `inline_fallbacks` counter and the heterogeneous-ordering test were never added —
+> they stand as findings against a path that is now permanently default-OFF.
 
 | # | what | prod code | flag | gate to proceed |
 |---|---|---|---|---|

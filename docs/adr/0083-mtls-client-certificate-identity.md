@@ -76,4 +76,4 @@ ASVS 11.6.2 runtime KEX enforcement — the Posture-B intra-service-auth and KEX
   `validate_proxy_tls_posture`, [config/tls_policy.py](../../messagefoundry/config/tls_policy.py)).
 
 See [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) §0/§4 and
-[OFF-LOOPBACK-DEPLOYMENT.md](../security/OFF-LOOPBACK-DEPLOYMENT.md).
+OFF-LOOPBACK-DEPLOYMENT.md.

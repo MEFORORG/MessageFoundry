@@ -2,7 +2,7 @@
 
 **Status:** Accepted (2026-07-10)
 **Deciders:** security working group
-**Related:** sec-offbox-log (PR #357/#361/#363 — the syslog/SIEM forwarder + cross-backend `audit_log` off-box tee); [`docs/SECURITY.md`](../SECURITY.md) (Audit → Off-box forwarding), [`docs/security/ASVS-L3-ASSESSMENT.md`](../security/ASVS-L3-ASSESSMENT.md) (16.4.3 / 16.2.4 / **16.2.2**), [`docs/PHI.md`](../PHI.md) §7; ADR 0002 (API TLS exposure gate — the posture template)
+**Related:** sec-offbox-log (PR #357/#361/#363 — the syslog/SIEM forwarder + cross-backend `audit_log` off-box tee); [`docs/SECURITY.md`](../SECURITY.md) (Audit → Off-box forwarding), `docs/security/ASVS-L3-ASSESSMENT.md` (16.4.3 / 16.2.4 / **16.2.2**), [`docs/PHI.md`](../PHI.md) §7; ADR 0002 (API TLS exposure gate — the posture template)
 
 ---
 
@@ -141,7 +141,7 @@ enforce it*, delegated where it cannot" line already drawn for TLS termination (
   `require_time_sync` / `ntp_peer` / `time_sync_*`), validators.
 - [`messagefoundry/__main__.py`](../../messagefoundry/__main__.py) — `serve()` forwarder wiring +
   the startup time-sync gate.
-- [`docs/security/ASVS-L3-ASSESSMENT.md`](../security/ASVS-L3-ASSESSMENT.md) — 16.4.3 / 16.2.4 /
+- `docs/security/ASVS-L3-ASSESSMENT.md` — 16.4.3 / 16.2.4 /
   16.2.2 rows updated.
 
 ## Amendment (2026-07-17) — TLS forwarding instructed at exposure (ASVS 16.4.3, ADR 0115 / WP #243)
@@ -152,7 +152,7 @@ CA-anchored) stays an explicit operator choice over the plaintext `udp` default.
 0115 treatment of 16.4.3: a global `forward_enabled` flip would fail an unconfigured engine (the
 `forward_enabled ⇒ forward_host` rule), so 16.4.3 is **instructed, not flipped**.
 
-[`docs/security/OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Off-box
+`docs/security/OFF-LOOPBACK-DEPLOYMENT.md` §"Off-box
 log/audit forwarding to your SIEM" now instructs setting `forward_host`, `forward_protocol = "tls"`
 (explicitly not the plaintext UDP default), `forward_port`, and the required `forward_tls_ca_file`
 (plus optional `forward_tls_client_cert` for mutual TLS). The secure-default machinery shipped in

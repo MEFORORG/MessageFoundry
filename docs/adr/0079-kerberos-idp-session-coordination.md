@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (mechanism 2 built 2026-07-22)  <!-- mech 1 Kerberos path closed by acceptance; mech 1 federated path shipped in ADR 0142 -->
 - **Date:** 2026-07-10
-- **Related:** [ADR 0002](0002-auth-rbac.md) (auth/RBAC, AD/Kerberos delegation) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (browser Kerberos SSO seed_reauth) · [docs/SECURITY.md](../SECURITY.md) · ASVS 7.1.3 · BACKLOG #187
+- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (auth/RBAC, AD/Kerberos delegation) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (browser Kerberos SSO seed_reauth) · [docs/SECURITY.md](../SECURITY.md) · ASVS 7.1.3 · BACKLOG #187
 
 ---
 
@@ -131,8 +131,8 @@ than the honest flat `session_absolute_hours` it would replace, because it invit
 the directory bounded the session when it did not.
 
 **Consequence for ASVS 7.1.3 — accepted, not built.** The cell is already signed-accepted
-([`ASVS-L3-RESCORE-2026-07-17.md`](../security/ASVS-L3-RESCORE-2026-07-17.md) §3; register row
-[`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md):73, signed
+(`ASVS-L3-RESCORE-2026-07-17.md` §3; register row
+`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`:73, signed
 theme 3, next review 2027-01-14). BACKLOG #187's residual therefore **closes by acceptance**, and this
 ADR's *"Proposed→Accepted if 7.1.3 is built"* promotion trigger is **NOT fired**.
 

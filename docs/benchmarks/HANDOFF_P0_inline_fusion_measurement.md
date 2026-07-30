@@ -150,7 +150,7 @@ could not see the harm this intervention could plausibly do. C7 proved that harm
    is the wall per-message?
 
 ## 10. Sources
-- The full design + why the other three Phase-4 angles were killed: [`PLAN-PHASE4-GROUP-COMMIT.md`](PLAN-PHASE4-GROUP-COMMIT.md).
+- The full design + why the other three Phase-4 angles were killed: [`PLAN-PHASE4-GROUP-COMMIT.md`](../archive/throughput/PLAN-PHASE4-GROUP-COMMIT.md).
 - The lever's status + the ledger reconciliation: [ADR 0099](../adr/0099-phase-4-group-commit-amortize-the-per-event-transaction-cost.md),
   [ADR 0057](../adr/0057-inline-step-a-fast-path.md).
 - The measurement discipline: [ADR 0101](../adr/0101-pre-registered-falsifier-discipline-for-performance-measurement.md).

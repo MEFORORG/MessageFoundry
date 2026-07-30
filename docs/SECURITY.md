@@ -803,7 +803,7 @@ explicitly-enabled console: with a **declared reverse proxy** (`tls_terminated_u
 anchors the same-origin CSRF check and the WebAuthn rp_id); an `http://` `public_origin` is refused
 under any declared TLS posture; a set `public_origin` on an *undeclared* posture warns loudly (the
 cookie would ship without `Secure`); and an exposed console emits the ASVS 8.4.2 pointer to
-[`OFF-LOOPBACK-DEPLOYMENT.md`](security/OFF-LOOPBACK-DEPLOYMENT.md) (managed-admin-host runbook +
+`OFF-LOOPBACK-DEPLOYMENT.md` (managed-admin-host runbook +
 reverse-proxy-mTLS reference configs) plus an advisory when `[auth].admin_new_ip_step_up` is off on
 a PHI instance (the default deliberately stays off — it remains advisory + step-up-forcing only,
 never an authorization input). At runtime, **`exposure_protected` forces the session cookie's
@@ -1560,9 +1560,10 @@ multi-host deployment must additionally front the API with a proxy/WAF limiter a
 
 **What these limits defend, and what they do not.** The full inventory of resource-demanding
 functionality — including the surfaces that remain **unbounded** at this release — is
-[security/THREAT-MODEL.md §Resource-demanding functionality (ASVS 15.1.3)](security/THREAT-MODEL.md#resource-demanding-functionality-asvs-1513).
+security/THREAT-MODEL.md §Resource-demanding functionality (ASVS 15.1.3).
 Read the two together: the table above is the operator-surface half, and that section is the whole
-picture including the ingest plane.
+picture including the ingest plane. That document is maintainer-internal;
+[SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what is withheld and what you can request.
 
 **No limiter has a validator floor.** None of the eleven `*_rate_limit_*` fields, nor
 `lockout_threshold` / `lockout_minutes`, carries a Pydantic validator. So a `per_key` or `glob` of `0`
@@ -1715,7 +1716,7 @@ runs bulk AES-256-GCM. #198 closes the **application-code-feasible** half and ac
   the caller plaintext, the returned marker (ciphertext-only), `cryptography`'s `decrypt()` output, the
   transient `bytes(dek)` copies its constructors consume, and **OpenSSL's internal `EVP` key copy** are
   **unreachable** to scrub. This residual is signed off in
-  [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5 (owner as
+  ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5 (owner as
   system + security owner), not hidden.
 - **Deployment requirement (11.7.1).** Full in-use memory *encryption* (Intel TME/SGX/TDX, AMD SEV,
   confidential VMs) is a **host/hypervisor capability no pure-Python application library can provide**.

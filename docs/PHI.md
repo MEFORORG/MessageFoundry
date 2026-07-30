@@ -621,7 +621,7 @@ and never serialized — only its SHA-256 **fingerprint** (`key_id`) is ever sur
 standing **ASVS 11.7.1 / CWE-316 / WP-BL3-28** residual: full in-use memory *encryption* is a host/OS
 capability (Intel TME / AMD SEV / confidential VMs), not something an application library can provide, so
 it is carried as a **stated deployment requirement** (§10) accepted via a signed risk-acceptance
-([ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5), not code.
+(ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5), not code.
 The compensating controls are the documented restricted-service-account + volume-encryption posture (§10)
 on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose memory and
 swap an attacker cannot reach without already owning the host.
@@ -641,7 +641,7 @@ where it is absent.
 
 **The scorecard is unchanged, and this document does not pre-empt it.** ADR 0152 holds that rung 2 is
 what would justify `Fail → Partial`, and the evidence for that now exists — but 11.7.1 is scored on the
-[ASVS L3 assessment of record](security/ASVS-L3-ASSESSMENT-2026-07-22.md), which still reads **Fail**,
+ASVS L3 assessment of record (`ASVS-L3-ASSESSMENT-2026-07-22.md`), which still reads **Fail**,
 and re-scoring it is an owner decision rather than a side effect of shipping a build. A **Pass** would
 in any case require SEV-SNP/TDX hardware plus a verified CPU-signed quote (ADR 0152 rung 3, not built),
 and even then the CPython-heap residual above is unchanged.
@@ -1170,7 +1170,7 @@ For operators standing up the engine (see also [SERVICE.md](SERVICE.md)):
       **restrict local administrator / debugger access** so no other principal can scrape process memory.
       Where a memory-forensics threat is in scope, deploy on a **confidential-compute / memory-encrypted
       host** (Intel TME/SGX/TDX, AMD SEV) — the stated deployment requirement accepted via
-      [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 5.
+      ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5.
 - [ ] **Keep the API on `127.0.0.1`.** Never `0.0.0.0` without TLS + auth in front.
 - [ ] **FastAPI docs are off by default** — `/docs`, `/redoc`, `/openapi.json` are disabled unless
       `[api] expose_docs = true` (they leak the schema, not data); leave them off for any non-localhost

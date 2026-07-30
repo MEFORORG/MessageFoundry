@@ -1041,10 +1041,36 @@ jobs:
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
           MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
-          # GIVEN 1 (ADR 0148): `dev` now derives PHI, so provision the secure PHI posture (this leg
-          # validates PHI+enforce green, not a synthetic opt-out): bounded PHI-body retention windows +
-          # a locked-down egress allowlisting the loopback sink. The store key is minted at runtime below.
-          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          # DECLARE THE DATA CLASS HONESTLY (ADR 0148 GIVEN 1 + docs/SECURITY-LOOSENING.md
+          # "`handles_real_patient_data = false`"). This leg processes harness-GENERATED synthetic HL7 on
+          # a throwaway service container; asserting PHI was a false declaration about the instance, and
+          # the register names exactly this case as acceptable: "a CI runner ... that only ever processes
+          # synthetic / sample HL7". Since GIVEN 1 the built-in `dev` env derives PHI, so a genuinely
+          # throwaway CI box must now set this EXPLICITLY — it is no longer the `dev` default.
+          #
+          # It is also what makes the leg run at all. This job was RED for four consecutive nights
+          # (2026-07-27..30) on:
+          #     ValueError: SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false)
+          # Under enforcing-PHI the `MEFOR_ALLOW_INSECURE_TLS` escape above is clamped INERT by design
+          # (#200 / ADR 0092 decision 2 — `weakened_tls_escape_permitted`), so a self-signed container
+          # can never be trusted from a PHI instance. The previous comment here said this leg "validates
+          # PHI+enforce green, not a synthetic opt-out" — an intent that is UNREACHABLE with a
+          # `services:` container: GitHub starts it before any step runs, so a cert generated in a step
+          # cannot be mounted into it. Whoever set that provisioned the PHI posture's retention and
+          # egress requirements but not its TLS one.
+          #
+          # WHAT THIS GIVES UP, stated plainly: the leg no longer exercises the PHI+enforce path. Its
+          # actual job is a load/throughput smoke of the SQL Server store, and `sqlserver-store` carries
+          # the functional coverage. Restoring PHI+enforce here needs a REAL certificate — the job moved
+          # off `services:` onto a `docker run` with a generated cert mounted and trusted — which is
+          # worth doing deliberately, not as a side effect of unbreaking a nightly.
+          #
+          # The PHI-shaped provisions below are KEPT even though synthetic does not require them: they
+          # cost nothing and keep the leg measuring a realistic configuration.
+          MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA: "false"
+          # Bounded PHI-body retention windows + a locked-down egress allowlisting the loopback sink.
+          # The store key is minted at runtime below. The security-notification gate is skipped because
+          # auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"

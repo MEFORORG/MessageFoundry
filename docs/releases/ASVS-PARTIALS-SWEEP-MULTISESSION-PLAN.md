@@ -123,7 +123,7 @@ and records its verdict-flip intent in its PR description for the Coordinator.
 ### Lane 4 — 12.3.5 console mTLS client cert *(Tier-C)*
 - **Worktree/branch:** `asvs-1235-console-mtls`.
 - **Build:** API mTLS (`CERT_REQUIRED`) is already built+tested; the console just never presents a client
-  cert (`httpx.Client` built with no `cert=`, [`console/client.py:139`](../../messagefoundry/console/client.py#L139)).
+  cert (`httpx.Client` built with no `cert=`, `console/client.py:139`).
   Add a `[console].tls_client_cert` / `tls_client_key` pair to `config/settings.py` (note: `settings.py:285`
   already reserves `tls_client_ca_file` "mTLS for the console; opt-in, future") and pass
   `cert=(certfile, keyfile)` to `httpx.Client`; thread it from the CLI ctor. Test asserts the cert is sent.

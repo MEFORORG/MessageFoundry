@@ -8,7 +8,7 @@
   design won 251–242, the count-showing signed-in design was eliminated).
 - **Related:** BACKLOG [#239](../BACKLOG.md); [#103](../BACKLOG.md) (retired the PySide6 desktop console —
   and named "a tiny standalone tray/service-manager" as the sanctioned home for out-of-band service control);
-  [ADR 0032](0032-console-desktop-launch.md) (retired); [ADR 0065](0065-zero-install-same-origin-browser-ops-dashboard.md)
+  [ADR 0032](0032-console-desktop-launch.md) (retired); [ADR 0065](0065-web-ops-dashboard.md)
   (the web console is the sole operator UI); [ADR 0088](0088-apiclient-service-cli-extraction.md) (Qt-free/FastAPI-free
   engine client; service control is inherently out-of-band); [ADR 0110](0110-ide-engine-link-doctor-the-status-bar-tells-the-truth-about-the-promote-target.md)
   / [ADR 0112](0112-ide-engine-lifecycle-from-the-status-bar-pill-guarded-start-stop-restart.md) (the IDE pill —

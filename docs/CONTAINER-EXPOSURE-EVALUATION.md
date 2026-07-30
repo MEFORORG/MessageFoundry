@@ -1,6 +1,7 @@
 # Off-Loopback Exposure Evaluation — Containerized MessageFoundry Engine
 
-**Status:** Evaluation / recommendation (no code, no Dockerfile). Scopes the ADR 0017
+**Status:** Evaluation / recommendation (this document itself ships no code and no Dockerfile — for
+what has since been built, see staleness flag 3 below). Scopes the ADR 0017
 "container fast-follow" — shipping the **headless engine** as an OCI image. The PySide6 console
 stays a host-side GUI client; only the engine containerizes.
 
@@ -26,6 +27,19 @@ operational notes.
 >    `tls_client_ca_file`/`tls_ca_file`; off-box logs via `[logging].forward_*`), and those docs were
 >    updated. **Left as-is** (point-in-time records, not current-state claims): the ASVS scorecard docs
 >    (owned by a parallel session) and the dated v0.1 release-plan / review snapshots.
+> 3. **Version context (2026-07-30).** This evaluation predates the container build, and its framing is
+>    the **v0.1** off-loopback TLS release gate ("**Gate #4**" — ADR 0002's WP-13a/13b/15 plus WP-14),
+>    a v0.1 milestone; the current shipped version is **v0.3.2**. It is **not** abandoned: the image it
+>    recommends has since been built — [`docker/Dockerfile`](../docker/Dockerfile) (a multi-stage build
+>    running as a non-root UID, `tini` as PID 1 so `SIGTERM` reaches uvicorn's graceful shutdown, and a
+>    `/health` `HEALTHCHECK`) plus [`docker/compose.yaml`](../docker/compose.yaml), whose default
+>    service is §1's topology **(a)**. So read §0–§6 as the standing topology guidance, and the "no
+>    Dockerfile / compose exists" statements (end of §0, §7 residual #6, the Appendix) as the
+>    point-in-time record they are. One architecture claim is likewise superseded: the **PySide6
+>    desktop console has been retired** ([ADR 0065](adr/0065-web-ops-dashboard.md),
+>    [ADR 0088](adr/0088-apiclient-service-cli-extraction.md)) — the operator UI is the browser web
+>    console served at `/ui`, and PySide6 now backs only the standalone test harness, so the host-side
+>    client of §5 is the Qt-free `apiclient` (today the harness), not a desktop console.
 
 ---
 
@@ -39,9 +53,9 @@ operational notes.
 | MLLP-over-TLS (WP-13b) | [`transports/mllp.py`](../messagefoundry/transports/mllp.py) `_mllp_ssl_context`; `MLLP(...)` in [`config/wiring.py`](../messagefoundry/config/wiring.py) ~540-610 | Per-connection `tls=true`. Inbound presents `tls_cert_file`/`tls_key_file`; `tls_ca_file` opts into mTLS (`CERT_REQUIRED`). Outbound verifies the peer (`tls_verify=true` default; `false` refused unless `MEFOR_ALLOW_INSECURE_TLS`), optional client cert. `start_server(ssl=)` / `open_connection(ssl=, server_hostname=)`. TLS 1.2+. |
 | MLLP exposed gate | [`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py) `check_mllp_tls_exposure` ~1655-1678 | A non-loopback MLLP listener **without** `tls=true` raises `WiringError` at wiring time (before start); `--allow-insecure-bind` downgrades to a warning; loopback or `tls=true` pass. Sibling `check_dimse_tls_exposure` covers DICOM SCP. |
 | Reverse-proxy trust (WP-15) | `ApiSettings.tls_terminated_upstream` / `trusted_proxies`; `forwarded_allow_ips` in `uvicorn.run` ([`__main__.py`](../messagefoundry/__main__.py) ~531-533) | `tls_terminated_upstream` satisfies the gate **without** in-process TLS, but the model validator **requires** `trusted_proxies` to be set with it. `forwarded_allow_ips` trusts XFF/XFP only from the named proxies (empty = trust nothing). |
-| TOTP MFA (WP-14) | ADR 0002 §3; `[auth].require_mfa`; console flow in [`console/client.py`](../messagefoundry/console/client.py) | Native RFC 6238 TOTP for local accounts; step-up boundary; admin reset; recovery codes. Built 2026-06-17. |
+| TOTP MFA (WP-14) | ADR 0002 §3; `[auth].require_mfa`; console flow in [`apiclient/client.py`](../messagefoundry/apiclient/client.py) | Native RFC 6238 TOTP for local accounts; step-up boundary; admin reset; recovery codes. Built 2026-06-17. |
 | Cert-expiry monitor | [`pipeline/cert_expiry.py`](../messagefoundry/pipeline/cert_expiry.py); `[cert_monitor]` in [`config/settings.py`](../messagefoundry/config/settings.py) | Engine-owned asyncio task (started in `Engine.start`). `certs_from_registry` watches the `[api]` cert + every connection `tls_cert_file`; reads `notAfter` only (never the key); `warn_days` default 30, 12 h cadence; raises a `cert_expiry` AlertSink event. |
-| Console transport guard | [`console/client.py`](../messagefoundry/console/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
+| Console transport guard | [`apiclient/client.py`](../messagefoundry/apiclient/client.py) `_assert_safe_transport` | `https` always allowed; loopback host allowed; non-loopback `http` **refused** unless `--insecure` (then warned). `httpx.Client(cert=...)` carries a client cert for mTLS via `--client-cert`/`--client-key`. |
 | At-rest PHI cipher | `[store].encryption_key` (`MEFOR_STORE_ENCRYPTION_KEY`), `require_encryption` | AES-256-GCM on PHI columns; `require_encryption=true` refuses start without a key; rotation via `messagefoundry rotate-key` + `encryption_keys_retired`. |
 
 **No Dockerfile / compose exists in the repo** (confirmed via glob). ADR 0017 decision 7 lists the
@@ -183,11 +197,13 @@ trusted_proxies = ["127.0.0.1"]               # so XFF from the sidecar gives th
 
 **The floor declared in (b) is worth exactly what the proxy container's config says.** Copy a
 reference terminator whole from
-[`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs](security/OFF-LOOPBACK-DEPLOYMENT.md#reverse-proxy-reference-configs-nginx-caddy-iis)
+`security/OFF-LOOPBACK-DEPLOYMENT.md` § Reverse-proxy reference configs
 — nginx, Caddy or IIS + ARR, each pinning an explicit protocol floor plus forward-secret ciphers and
 key-exchange groups — and move the fence and `proxy_tls_min_version` together, never one alone. The
 same-pod sidecar block needs no attestation pair: it is a loopback bind, so the exposure ladder's
 Posture-B refusal never fires (the engine still warns if you *declare* a terminator without them).
+That runbook is maintainer-internal — [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) explains what
+is withheld and what you can request.
 
 > **⚠ Keep `trusted_proxies` to the proxy's exact address(es).** Every host inside a `trusted_proxies`
 > entry may set `X-Forwarded-For` to any value, and the engine hands that value on as the client

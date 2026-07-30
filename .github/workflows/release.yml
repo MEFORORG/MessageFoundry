@@ -344,7 +344,7 @@ jobs:
       # version==tag smoke check already prevents a wrong-version upload).
       - name: Publish to PyPI (Trusted Publishing / OIDC)
         if: startsWith(github.ref, 'refs/tags/')
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: dist-pub/
           skip-existing: true
@@ -468,7 +468,7 @@ jobs:
       # before it is armed. Flipping the variable is what actually claims the PyPI name.
       - name: Publish messagefoundry-webconsole to PyPI (Trusted Publishing / OIDC)
         if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_WEBCONSOLE == 'true' }}
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: webconsole-dist/
           skip-existing: true
@@ -579,7 +579,7 @@ jobs:
       # repo variable PUBLISH_HARNESS=true. The build + version-check above still run every release.
       - name: Publish messagefoundry-harness to PyPI (Trusted Publishing / OIDC)
         if: ${{ startsWith(github.ref, 'refs/tags/') && vars.PUBLISH_HARNESS == 'true' }}
-        uses: pypa/gh-action-pypi-publish@ba38be9e461d3875417946c167d0b5f3d385a247 # v1.14.1
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
         with:
           packages-dir: harness-dist/
           skip-existing: true
