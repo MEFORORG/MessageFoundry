@@ -38,7 +38,15 @@ import json
 import logging
 import queue
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -5730,6 +5738,66 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(purged) if purged is not None else 0
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # See Store.purge_reference_snapshots for the full contract. ADR 0006 `reference.value` is PL-2
+        # and had no purge path at all before ASVS 14.2.7. Orphan-scoped: a DECLARED set is never
+        # touched however old its synced_at.
+        if not declared:
+            # Positive-signal guard — an empty `declared` reads as "every set is abandoned" and would
+            # wipe the store. Never a legitimate instruction, so it raises rather than deleting.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        deleted = 0
+        purged_names: list[str] = []
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT name FROM reference_version WHERE synced_at < ?", (older_than,)
+                )
+                candidates = [r[0] for r in await cur.fetchall() if r[0] not in declared]
+                for name in candidates:
+                    # Eligibility RE-ASSERTED inside the delete. `declared` is computed by the caller
+                    # outside any lock and write_reference_snapshot takes no applock here, so a config
+                    # reload can commit a fresh patient-keyed snapshot between the SELECT above and
+                    # this statement. This predicate is the only thing preventing a routine reload from
+                    # destroying live data. `older_than` is bound TWICE (T-SQL has no named params).
+                    await cur.execute(
+                        "DELETE FROM reference WHERE name = ?"
+                        " AND EXISTS (SELECT 1 FROM reference_version v"
+                        "             WHERE v.name = ? AND v.synced_at < ?)",
+                        (name, name, older_than),
+                    )
+                    count = int(cur.rowcount or 0)
+                    if not count:
+                        continue  # a concurrent re-sync won the race — leave it alone
+                    deleted += count
+                    # KEEP the pointer, BUMP the version — converge_reference_cache only reloads a set
+                    # whose active version DIFFERS, so an unchanged version leaves every follower
+                    # serving purged PHI from `_reference_cache` until restart, and deleting the
+                    # pointer is worse (converge only adds/updates names present in a fresh read).
+                    await cur.execute(
+                        "UPDATE reference_version SET row_count = 0,"
+                        " version = 'purged:' + version"
+                        " WHERE name = ? AND version NOT LIKE 'purged:%'",
+                        (name,),
+                    )
+                    purged_names.append(name)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        # Evict only AFTER the commit — a rolled-back purge must not leave the cache claiming rows the
+        # store still holds (the same post-commit discipline purge_state follows below).
+        for name in purged_names:
+            self._reference_cache.pop(name, None)
+            self._reference_versions.pop(name, None)
+        return deleted
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state rows last set before ``older_than`` (ADR 0005 retention), evicting

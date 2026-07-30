@@ -177,6 +177,10 @@ class RetentionPass:
     # the `search_preset_days` window. Metadata only — the count, never a needle. 0 when the window is
     # unset (the default), so a deployment that doesn't use it has a byte-identical audit detail.
     search_presets_purged: int = 0
+    # Orphaned reference-snapshot ROWS deleted (ADR 0006, ASVS 14.2.7) — sets config no longer
+    # declares. Metadata only: a count, never a key or a value. 0 when the window is unset, when no
+    # registry is wired, or when the registry declares no reference sets (the positive-signal skip).
+    reference_snapshots_purged: int = 0
     # This pass hit the `max_pass_seconds` between-phase duration cap (#121, ADR 0137) and SKIPPED its
     # remaining phases — the skipped tail (incl. any due WAL-checkpoint/VACUUM) re-runs next interval with
     # its last-run marker unadvanced. Always False when the cap is off (`max_pass_seconds<=0`, the
@@ -201,6 +205,7 @@ class RetentionPass:
             or self.app_logs_deleted > 0
             or self.app_logs_compressed > 0
             or self.search_presets_purged > 0
+            or self.reference_snapshots_purged > 0
             or self.vacuumed
             or self.over_limit
             or self.capped
@@ -266,6 +271,7 @@ class RetentionRunner:
             or s.state_max_age_days
             or s.connection_event_retention_hours
             or s.search_preset_days
+            or s.reference_snapshot_days
             or s.max_db_mb
             or s.wal_checkpoint_seconds
             or s.vacuum_time() is not None
@@ -503,6 +509,43 @@ class RetentionRunner:
                 older_than=now - s.search_preset_days * _SECONDS_PER_DAY, now=now
             )
 
+        # Orphaned reference snapshots (ADR 0006, ASVS 14.2.7): `reference.value` is PL-2 and had NO
+        # purge path at all — a set dropped from config kept its decryptable rows forever, because the
+        # only thing that ever replaced them was the next sync's build-new-then-flip, which never comes
+        # for a set nobody declares.
+        #
+        # THE GUARD IS POSITIVE-SIGNAL, and that is the whole design. `declared` is the keep-set, so an
+        # EMPTY one reads as "every set is abandoned" and would purge the entire store. `registry is
+        # None` does not cover it: a registry that LOADS FINE while declaring zero reference sets — a
+        # subset `--config`, a per-team config split, a harness-redirect run pointed at the real DB —
+        # yields `references == {}`. Absence-based guards fail open by construction, so this one
+        # requires a POSITIVE signal: at least one declared set, or the phase does not run at all. A
+        # registry declaring zero reference sets can never authorize purging any.
+        #
+        # The store ALSO raises on an empty `declared` rather than trusting this check — belt and
+        # braces, because the cost of one refactor dropping this line is every snapshot in the store.
+        #
+        # Worse without it: ReferenceSyncRunner deliberately does NOT advance `synced_at` when a source
+        # fetch fails, so the rows most likely to look "stale" belong to a still-wired set whose source
+        # is merely down — precisely the last-good copy an operator would want kept.
+        reference_snapshots_purged = 0
+        if not _deadline_hit() and s.reference_snapshot_days > 0:
+            registry = self._registry_source() if self._registry_source is not None else None
+            declared = frozenset(registry.references) if registry is not None else frozenset()
+            if declared:
+                reference_snapshots_purged = await self._store.purge_reference_snapshots(
+                    older_than=now - s.reference_snapshot_days * _SECONDS_PER_DAY,
+                    declared=declared,
+                    now=now,
+                )
+            else:
+                log.warning(
+                    "reference-snapshot retention skipped: the loaded registry declares no reference "
+                    "sets, so there is no keep-set and a purge would delete every snapshot in the "
+                    "store. Set [retention].reference_snapshot_days=0 to silence this, or check that "
+                    "--config points at the configuration this store belongs to."
+                )
+
         # Application log-file retention (#120): delete app-log FILES older than `app_log_days` from
         # `[logging].log_dir`. Filesystem I/O (scandir/stat/unlink is blocking), so it runs off the
         # event loop; metadata only (mtime) — file content is never read (no PHI). A no-op unless the
@@ -570,6 +613,7 @@ class RetentionRunner:
             app_logs_compressed=app_logs_compressed,
             app_log_bytes_reclaimed=app_log_bytes_reclaimed,
             search_presets_purged=search_presets_purged,
+            reference_snapshots_purged=reference_snapshots_purged,
             capped=capped,
         )
         if result.did_work:
@@ -979,6 +1023,12 @@ class RetentionRunner:
                 # only — a preset's criteria is a PHI-shaped needle and never enters the audit detail.
                 "search_preset_days": self._settings.search_preset_days,
                 "search_presets_purged": result.search_presets_purged,
+                # Orphaned reference-snapshot ROWS deleted (ADR 0006, ASVS 14.2.7) + the window. The
+                # COUNT only — never a set name, key or value. A set name is operator-authored config
+                # rather than PHI, but the ROWS are PL-2 and naming the set in a durable audit row would
+                # narrow which patient cohort was dropped; the count is what an assessor needs.
+                "reference_snapshot_days": self._settings.reference_snapshot_days,
+                "reference_snapshots_purged": result.reference_snapshots_purged,
                 # Between-phase duration cap (#121, ADR 0137): the configured ceiling + whether THIS pass
                 # hit it and skipped its remaining phases. Timing metadata only — no PHI.
                 "max_pass_seconds": self._settings.max_pass_seconds,

@@ -1509,6 +1509,18 @@ class RetentionSettings(_Section):
     # in-memory state cache + table bounded. A simple global age purge; per-namespace policy is a
     # follow-up. 0 = keep forever (the default — state correlation data is opt-in to purge).
     state_max_age_days: int = 0
+    # Past N days, DELETE ORPHANED reference snapshots (ADR 0006) — the rows of a set that config no
+    # longer declares, whose active version was synced before the cutoff. `reference.value` is PL-2
+    # (PHI.md §2) and a snapshot row can be patient-keyed, but until ASVS 14.2.7 it had NO purge path at
+    # all: the only thing that ever replaced a snapshot was the next sync's build-new-then-flip, which
+    # never comes for a set nobody declares any more. 0 = keep forever.
+    #
+    # ORPHAN-SCOPED, and the limit is the honest part: a set that IS still declared is never touched
+    # however old its `synced_at`, because its snapshot is live data the engine serves. So the normal
+    # case — a wired set holding live PHI — remains purged by nothing. That is a stated residual, not a
+    # closed cell; do not let a classification table describe this window as covering `reference.value`
+    # generally, which would machine-bless a false claim.
+    reference_snapshot_days: int = 0
     # Past N HOURS, DELETE connection_event rows (#46) — the Corepoint-style transport/lifecycle log can
     # be high-volume (a connect-per-message sender, a probe storm), so it has its own short window in
     # HOURS (not days). 0 = inherit the message-body window (messages_days), the ADR 0021 §7.5 default.
@@ -1591,6 +1603,7 @@ class RetentionSettings(_Section):
         "app_log_days",
         "app_log_compress_days",
         "search_preset_days",
+        "reference_snapshot_days",
     )
     @classmethod
     def _non_negative_days(cls, value: int) -> int:
