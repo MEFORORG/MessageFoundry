@@ -150,7 +150,19 @@ if ($LASTEXITCODE -ne 0) { throw "venv creation failed (is '$Python' on PATH?)" 
 
 Push-Location $WorktreePath
 try {
-    & $venvPy -m pip install -e ".[$extras]"
+    # --constraint constraints.lock, exactly as EVERY install in ci.yml does. constraints.lock is the
+    # HASHLESS export of uv.lock kept in sync by the DEP-1 gate; without it pip RE-RESOLVES inside
+    # pyproject's ranges and a fresh worktree gets whatever PyPI serves today.
+    #
+    # Not hypothetical: a worktree created 2026-07-29 came up with ruff 0.16.0 while constraints.lock
+    # pinned 0.15.22. That worktree then reported ~829 findings CI does not have — and because the
+    # ruff pre-commit hook runs `ruff check --fix`, it REWROTE files to match, stripping `# noqa`
+    # directives the pinned ruff still wants. A venv that lints differently from CI does not merely
+    # mislead; it edits your source on commit.
+    #
+    # This is the same reasoning as the DEP-1 `--require-hashes` install, one rung down: CI proves the
+    # lock installs, this makes a developer's environment agree with it.
+    & $venvPy -m pip install --constraint constraints.lock -e ".[$extras]"
     if ($LASTEXITCODE -ne 0) { throw "pip install -e .[$extras] failed (exit $LASTEXITCODE)" }
 } finally {
     Pop-Location
