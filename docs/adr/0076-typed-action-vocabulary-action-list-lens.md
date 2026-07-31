@@ -1,6 +1,6 @@
 # ADR 0076 — Typed action vocabulary + structured action-list lens over Python Handlers
 
-**Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — still PROPOSED and NOT ratified:** ADR 0089 Phase D "helper descent" is specified and priced but **not buildable**; its yield is unmeasured and may be negative, and its three §B.4 preconditions are unmet. Do not read A's ratification as covering B.
+**Status:** Accepted (2026-07-10) — ratified by the owner 2026-07-10; the PLAN-8 lanes may build. Gating rule: **phase 1 (the vocabulary) requires only the #26-amendment merge; phases 2–3 require this ADR Accepted.** In practice phase 1 builds after Acceptance anyway — its v1 roster is fixed by §2 and MULTISESSION-PLAN-8 bundles it with phase 2a in one lane. **Amendment A — ACCEPTED, ratified by the owner 2026-07-30 and IN FORCE:** a `note` row kind so comment-only rows stop projecting as opaque `code`, superseding ADR 0106 §5 (L); §3's enum and §4's ladder read as amended, and BACKLOG #248 is the build. **Amendment B — ⛔ DECLINED by owner ruling 2026-07-30 (too risky):** ADR 0089 Phase D "helper descent" is **not adopted and not to be built** — aliasing across duplicate call sites has no solution in any ADR, and the yield is unmeasured and may be negative. The specification is retained so the decline is auditable, not as a plan; reopening needs a **new** amendment. The better lever, explicitly not declined, is teaching Phase A the `msg["X"] = v` subscript form — it widens what is editable without touching the row shape.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#222** (this build), **#26 amendment** (the narrow carve-out this ADR operates under), **#221** (sibling IDE-polish lane), the deep-research findings ([`docs/research/ide-low-code-options.md`](../research/ide-low-code-options.md) — verified precedents: InterSystems low-code custom editors, Kaoto/Karavan/AWS Workflow Studio, Iguana annotations, Corepoint action-lists), ADR 0007/0033/0014 (the sanctioned config-as-data GUIs), ADR 0072 (traced dry-run — the live values rendered beside action rows), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned read-only lookups the lens renders as DBSelect-style rows), ADR 0035 (IDE workspace-trust — `lens` CLI calls are exec-gated like every CLI call), CLAUDE.md §9 (PHI), §12 (the amended bright line).
 Plan: [`docs/releases/MULTISESSION-PLAN-8.md`](../releases/MULTISESSION-PLAN-8.md) (L2 builds phases 1+2a; L3 builds phase 2b; L4 = phase 3, owner-gated).
@@ -363,12 +363,28 @@ New residual: pragma notes are visible but read-only, an intentional and documen
 - **AC-N6** — WHEN a construct is unrecognized, THE SYSTEM SHALL emit a `code` row; a whole-file refusal
   SHALL occur only on `ast.parse` failure → unchanged ladder assertion, re-run over the note corpus.
 
-## Amendment B (PROPOSED, 2026-07-30) — ADR 0089 Phase D "helper descent"
+## Amendment B (DECLINED, 2026-07-30) — ADR 0089 Phase D "helper descent"
 
-> **Status of this amendment: PROPOSED — owner-gated, not ratified, not buildable.** Amendment A above
-> is independent of this one and does not depend on it. This section exists so the grammar change Phase
-> D implies is specified and priced *before* anyone builds it, per §2's amendment rule; it is not a
-> licence to start.
+> **Status of this amendment: ⛔ DECLINED by owner ruling 2026-07-30 — too risky.** The grammar
+> widening described below is **not adopted**, and **ADR 0089 Phase D is not to be built**. Amendment A
+> above is independent of this one, was ratified separately, and is unaffected.
+>
+> **This is a decline-by-design, not a deferral.** The specification is kept — not as a plan, but so the
+> decline is auditable and so the next session that reads ADR 0089 §Phase D and thinks "265 delegating
+> call-sites is the biggest remaining win" finds the reasoning already done. The case against it is
+> §B.1 (aliasing has no solution in any ADR: two call sites of one helper produce identical child spans,
+> `expect_src` matches both, and an edit to one silently rewrites the other) and §B.2 (the yield is
+> unmeasured and may be **negative** — the shipped sample helper writes exclusively in the unrecognized
+> `msg["X"] = v` form, so descending it returns six opaque rows and zero editable ones).
+>
+> **What is NOT declined, and is the better lever:** teaching Phase A the `ast.Assign`-to-`ast.Subscript`
+> form (`msg["X"] = v`). It converts writes into editable rows **without touching the row shape at all**,
+> is on no phase list, and may move the coverage number further than descent for a fraction of the risk.
+> §B.4 precondition 2 already argued this; the decline promotes it from precondition to recommendation.
+>
+> **Reopening requires a new amendment**, not a reading of this one. Any future proposal must first
+> answer §B.1's aliasing question and produce the §B.4(1) measurement — a real per-helper editable-share
+> number, not the `218/522` heuristic superset.
 
 ADR 0089 §2 names Phase D — "descend into same-module helper functions … projecting each `_fn(msg, …)`
 call as an expandable group whose rows are the helper body's recognized actions, edited in place
