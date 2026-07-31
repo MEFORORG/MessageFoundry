@@ -1,7 +1,17 @@
 # ADR 0154 — Synchronous captured-downstream-reply and intake authentication for the inbound HTTP listener (the ADR 0023 deferred tail)
 
-- **Status:** Proposed (revision 3 — drafted, awaiting sign-off, no code yet)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
-- **Date:** 2026-07-30 (rev 1), 2026-07-30 (rev 2), 2026-07-30 (rev 3)
+- **Status:** Proposed (revision 4 — drafted, awaiting sign-off, no code yet)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Date:** 2026-07-30 (rev 1–4)
+- **Revision 4 — priority correction, no design change.** The owner confirmed on 2026-07-30 that **there
+  is no committed customer and no migration date**. Revisions 1–3 described the proxy-API shape as "the
+  forcing case … a real migration" whose two halves were both "not optional for that feed" — language that
+  read as a commitment and would have misled a later reader into treating a prospect's shape as a
+  deadline. That framing is corrected in Context, and a new **Increments** section splits the *build* (not
+  the ADR) so the live security defect in D6/D7 ships now rather than waiting on a speculative feature
+  that carries the document's entire concurrency risk. The acceptance criteria already fell along that
+  seam, so nothing was renumbered and no decision changed. This also settles open item 1: with nobody to
+  disappoint, increment 1 is acceptable without `capture_error_responses`, which becomes an ordinary
+  roadmap item rather than a release gate.
 - **Revision 3 — what changed and why.** Revision 2 was itself audited (8 agents, four hostile lenses,
   each followed by a refutation pass). Its factual base held up well — 31 claims confirmed correct, and
   the adversarial stage **refuted** the audit's own headline finding (two auditors claimed the new
@@ -142,11 +152,17 @@ It named two things it would not build, and this ADR is both of them.
 > **distinct from the admin API's session RBAC** … This is a **per-inbound `settings` concern** (the secret
 > from `env()`/`MEFOR_*`, never the TOML — ADR 0003 §1), shaped here as a follow-on knob, not the first slice."
 
-**The forcing case is a real migration.** A prospect runs Corepoint as a **proxy API**: their customers call
-an endpoint, the engine forwards the call to a Salesforce instance, and the customer receives Salesforce's
-answer in the same HTTP turn — over an authenticated socket, because those customers are external. Today
-MessageFoundry can accept the POST and can call Salesforce, but it can only answer `202` and it performs no
-credential verification at all. That is (a) + (b), together, and neither is optional for that feed.
+**The motivating shape is a prospect's, and there is no committed customer.** A prospect runs Corepoint as
+a **proxy API**: their customers call an endpoint, the engine forwards the call to a Salesforce instance,
+and the customer receives Salesforce's answer in the same HTTP turn — over an authenticated socket, because
+those customers are external. Today MessageFoundry can accept the POST and can call Salesforce, but it can
+only answer `202` and it performs no credential verification at all. That is (a) + (b), together.
+
+**State this plainly, because it sets the priority of everything below: as of 2026-07-30 there is no
+customer waiting on this and no migration date.** The proxy-API shape is a credible design driver and it is
+why the two halves are specified together — but it is a *prospect's* shape, not a commitment, and this ADR
+should not be read as carrying a deadline. The two halves consequently have very different justifications,
+and the build order in "Increments" below follows from that difference rather than from the prospect.
 
 **The invariants that bound the design.** Quoting [CLAUDE.md](../../CLAUDE.md) §2 verbatim:
 
@@ -211,6 +227,29 @@ connector, its secret from `env()`/`MEFOR_*` only, with a new posture-keyed star
 off-loopback HTTP listener that has no *effective* peer control.** Neither changes the `202` receipt semantics,
 the `InboundHandler` contract, or any store schema. Two additive store surfaces are required and are named
 explicitly in D3 and D8 rather than being denied.
+
+### Increments — the two halves ship separately, and the security half does not wait on a customer
+
+The two capabilities are specified in one ADR because they share a listener and were deferred by one
+parent (ADR 0023). They are **not** of equal urgency, and bundling their *build* would hold a live defect
+hostage to a speculative feature.
+
+| | Driver | When |
+|---|---|---|
+| **Increment A — intake auth + the peer-control gate** (D6, D7) | A **live defect in shipped code.** `check_http_tls_exposure` returns early on truthy `tls`, so an off-loopback `Http(tls=True)` listener binds a PHI intake socket with no peer identity requirement — and `tests/test_exposed_with_tls_passes` pins that configuration as passing. This is wrong today, in any such deployment, with or without a customer. | **Now.** Independent of the prospect. |
+| **Increment B — the synchronous captured-downstream reply** (D1–D5, D8) | The prospect's proxy-API shape. Roughly 70 % of this document's complexity and effectively all of its concurrency risk: the multi-handler terminality test, the rendezvous, the throughput envelope and the `max_connections` interaction. | **When a customer exists,** so their partner's real error and latency semantics shape it rather than a guess. |
+
+The acceptance criteria already fall along this seam, so the split costs no renumbering and no design
+change: **AC-11 … AC-16 and AC-19** cover increment A, **AC-1 … AC-10 and AC-18** cover increment B, and
+**AC-17** (dependency boundaries) spans both.
+
+The one genuine coupling is the `_read_request` → `_read_head`/`_read_body` split (D5, D6). It lands in
+**increment A**, because authenticating *before* buffering a 16 MiB body is a requirement of the auth work
+itself, not of the reply work.
+
+Deferring increment B also defers its headline gap — `capture_error_responses` (see the open items). With
+no customer to disappoint, a fixed-JSON `502` on a partner rejection is a documented limitation rather than
+a broken promise, and the knob is better designed against a real partner's error semantics than in advance.
 
 ### D1 — The committed row is the sole authority for the returned bytes; every in-process signal is a latency hint
 
@@ -631,7 +670,7 @@ because `build_response` hardcodes `Connection: close`.
 is check-**and**-record — it appends on every call, and every existing caller consumes it per *attempt*. So
 injecting it as a predicate consulted "before any comparison", as revision 1 specified, would have made
 `intake_auth_rate_limit=10` a hard **10-requests-per-minute-per-peer throughput cap**: the 11th correctly
-authenticated message from the forcing customer's partner would take a `429` and, being a pre-ingress
+authenticated message from the prospect's partner would take a `429` and, being a pre-ingress
 refusal, would not even be counted — silent, uncounted message loss on the feature's motivating happy path.
 This ADR therefore requires an additive read-only `SlidingWindowRateLimiter.would_allow(key)` (prune and
 compare, no append), consulted before comparison, with `allow(key)` called **only on the failure branch**.
@@ -643,7 +682,7 @@ unbounded, and each refusal drives a `record_audit` write that takes the store-w
 `SELECT … ORDER BY id DESC LIMIT 1` before inserting, a global serialisation point shared with every
 operator PHI-access audit write. **But the global arm must never refuse a peer that has already
 authenticated in the window.** `SlidingWindowRateLimiter` refuses on the global bucket *regardless of
-key*, so a naive global arm hands one attacker a denial-of-service against the forcing customer's
+key*, so a naive global arm hands one attacker a denial-of-service against the prospect's
 correctly-authenticated partner: ~1 bad request/second exhausts the shared budget, `would_allow(key)`
 then returns `False` for **every** peer, and the partner's valid message is refused `429` pre-ingress
 and therefore **uncounted** — which is verbatim the silent-loss defect this ADR diagnoses in revision 1,
@@ -965,7 +1004,7 @@ to skip auth.
    shows a new type silently skips the egress arm that gates the existing one, and ADR 0023 Option 5 already
    rejected per-facade sockets.
 8. **Terminate intake auth only at the WP-15 reverse proxy.** Rejected as the *only* answer: it is a valid
-   deployment and stays supported, but the forcing customer **is** the proxy, and an engine that cannot
+   deployment and stays supported, but the prospect **is** the proxy, and an engine that cannot
    authenticate its own PHI intake socket has no answer for the direct-bind case.
 9. **Intake auth as a constructor `ValueError` (the `DicomScpSource` shape).** Rejected for the *gate*, not the
    idea — but on narrower grounds than revision 1 claimed. The constructor form **does** fire at
@@ -985,9 +1024,11 @@ to skip auth.
 
 ## Consequences
 
-**Positive** — The forcing migration becomes expressible: a partner calls an authenticated MessageFoundry
-endpoint and receives the downstream system's answer in the same HTTP turn, with the whole exchange counted,
-logged, dispositioned, and stored exactly like every other message. It closes both of ADR 0023's named
+**Positive** — Increment A closes a live hole on its own schedule: an off-loopback `Http(tls=True)` listener
+authenticates nobody today, and the peer-control gate plus `intake_auth` fix that whether or not the
+proxy-API prospect ever signs. Increment B then makes the proxy-API shape expressible: a partner calls an
+authenticated MessageFoundry endpoint and receives the downstream system's answer in the same HTTP turn,
+with the whole exchange counted, logged, dispositioned, and stored exactly like every other message. It closes both of ADR 0023's named
 deferrals and two of its eight open items, and it retires the "†" deferral paragraph in
 [`docs/CONNECTIONS.md`](../CONNECTIONS.md). It adds **no** `Stage` value and no schema change — the reply
 rides `correlate_response` as it ships, at parity on SQLite, PostgreSQL and SQL Server. Because the committed
@@ -1025,7 +1066,7 @@ worth its own look, as that asymmetry is a request-smuggling shape).
 **Out of scope / deferred** — **Relaying the partner's error body and status code.** `RestDestination`
 captures only `accepted`/`no_reply`; a partner 4xx raises `NegativeAckError(permanent=True)`, dead-letters,
 and writes **no** `response` row — so a Salesforce validation message cannot reach the caller in increment 1
-(they get a fixed-JSON `502`). **This is assessed as blocking the forcing migration** (see open items): a
+(they get a fixed-JSON `502`). **With no committed customer this is a documented limitation rather than a blocker** (rev 4; it would be a serious gap for a live proxy API, and increment B is deferred until one exists): a
 proxy API that is correct only when the partner succeeds is not a Corepoint replacement for that feed. Full
 parity needs an outbound-side `capture_error_responses` knob plus a typed `DeliveryResponse.status_code` and
 an additive nullable `response.status_code` column, as an ADR 0013 amendment. **ADR 0013 Increment 2
@@ -1046,10 +1087,15 @@ the CIDR-aware predicate; the others are left as found.
 
 **Answered in this revision:**
 
-1. **Relaying the partner's error body — does it block the migration? YES.** The dead-row premise is verified
-   in both halves. For a proxy API a partner validation error is a routine business outcome, not an
-   exception, so increment 1 is correct only on the happy path. **Build increment 1 as the mechanism; do not
-   cut the forcing customer over until `capture_error_responses` lands.**
+1. **Relaying the partner's error body — does it block? NO, because there is nobody to block.** The
+   dead-row premise is verified in both halves: a partner 4xx raises `NegativeAckError(permanent=True)`,
+   dead-letters, and writes no `response` row, so the caller gets fixed JSON rather than the partner's
+   message. For a *live* proxy API that would be a serious gap, since a partner validation error is a
+   routine business outcome rather than an exception. **But the owner confirmed there is no committed
+   customer** (rev 4), so this is a documented limitation, not a broken promise. `capture_error_responses`
+   becomes an ordinary roadmap item, best designed against a real partner's error semantics rather than
+   guessed at now. Revisions 1–3 answered this "YES, it blocks the migration"; that answer was built on a
+   migration that does not exist.
 2. **Health probes inside the gate — confirmed `require`.** Verified shipped behaviour: GET/HEAD return a
    static non-PHI `200` with no ingress row. It ships as a **documented breaking change**, not a footnote.
 3. **`sync_reply_degraded` AlertSink reason — do not add one; reuse `saturation`.** The deferral was right,
@@ -1086,9 +1132,9 @@ the CIDR-aware predicate; the others are left as found.
 
 **Still open:**
 
-- [ ] **Sequencing `capture_error_responses`.** Given answer 1, does it become a blocking prerequisite of the
-  same release, or a fast-follow with the migration gated behind it? This is a commercial call, not a
-  technical one.
+- [x] **Sequencing `capture_error_responses`.** ~~Blocking prerequisite, or fast-follow?~~ **Resolved by
+  rev 4:** neither. With no committed customer it is a normal roadmap item, and increment B — which is
+  where it would land — is itself deferred until a customer exists. Revisit when one does.
 - [ ] **The `reply_wait_state` read.** Confirm the additive metadata-only store method (three backends) rather
   than reusing `outbox_for`, which is `SELECT *` and decrypts `last_error` on every tick.
 - [ ] **`record_message_event` as a public store method.** Confirm accepting one new public store method for
