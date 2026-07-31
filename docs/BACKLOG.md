@@ -7164,7 +7164,7 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 **Source:** Windmill/Kestra evaluation (2026-07-30), "Anvil Ops Tasks" design. Recorded here because the design memo holding the conditions has been deleted.
 ## 252. DICOM SCP peer-control gate counts a spoofable AE-title list as sufficient
 
-> 🔢 **Filed 2026-07-30.** P2. Surfaced while fixing the refusal message that named a non-existent settings key (that half is fixed; this half is a contract change and was deliberately not ridden in on it).
+> ✅ **SHIPPED — 2026-07-30. Option (a): pair, do not remove.** Off-loopback, the gate now requires a **verifiable** control — `source_ip_allowlist` or mTLS. `calling_ae_allowlist` no longer satisfies it alone, but is **kept and still enforced** at association time as a filter, so nothing that was useful about it is lost. Measured: AE-title-only off-loopback goes STARTS → REFUSED; AE-title **paired** with an IP allowlist starts; IP-only and mTLS-only are unchanged; every loopback case is unchanged. Breaking for a site relying on AE-title-alone off-loopback — see CHANGELOG. Options (b) audited-opt-out and (c) document-only were declined by the owner in favour of (a).
 
 **Type:** security hardening — authentication strength of a fail-closed gate.
 

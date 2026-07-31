@@ -6,6 +6,31 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **BREAKING — a non-loopback DICOM C-STORE SCP now requires a *verifiable* peer control;
+  `calling_ae_allowlist` no longer satisfies the gate on its own.** The fail-closed peer-control check
+  refuses a remotely-reachable SCP that has no peer control, and it accepted any one of three:
+  `calling_ae_allowlist`, `source_ip_allowlist`, or mTLS. It **counted** them rather than weighing
+  them. But a Calling AE Title is a string the caller asserts about **itself** in the association
+  request — no key, no signature, nothing to verify — and AE Titles are published in conformance
+  statements and visible in any capture. An SCP whose only control was an AE-title list was therefore
+  reachable by anyone who could route to it and knew one string, while passing a check named
+  "fail-closed peer controls". Server TLS does not close this: without `tls_ca_file` there is no client
+  certificate, so the cleartext bind guard (confidentiality) and this gate (authentication) are
+  orthogonal.
+  **What changed:** off-loopback, the gate now requires `source_ip_allowlist` **or** mTLS
+  (`tls` + `tls_ca_file`). `calling_ae_allowlist` is **kept and still enforced** at association time —
+  it is a genuinely useful filter that catches a misrouted sender and pins intent — it simply has to be
+  **paired** with one of the two. Measured: AE-title-only off-loopback goes from starting to refused;
+  AE-title **paired** with an IP allowlist starts; IP-only and mTLS-only are unchanged; and every
+  loopback bind (the common dev/single-box case) is unchanged.
+  **Who this bites:** a site running a non-loopback SCP whose only peer control is
+  `calling_ae_allowlist`. It starts today and will refuse after upgrading. The fix is one line — add
+  `source_ip_allowlist=[...]` to the `inbound(...)` call, which for a DICOM SCP is the only authoring
+  surface — and the refusal names it. Keep the AE list; it is still doing work.
+  Tracked as **BACKLOG #252**. Options considered and declined: an audited opt-out switch, and
+  documenting the weakness without changing the gate.
+
 ### Fixed
 - **The load harness's no-loss reconcile did not enforce the `read >= sent // 2` intake guarantee
   0.3.2 documented.** The unconfirmed-send excusal is capped at `max(connections, half the run)`, but
