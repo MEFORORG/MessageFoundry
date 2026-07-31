@@ -158,9 +158,17 @@ if ($Json) {
     if (-not $occ.Available) {
         [Console]::Error.WriteLine("presence: roster UNAVAILABLE -- $($occ.Detail). $($occ.RootsExamined) config root(s), $($occ.RecordsExamined) record(s) examined. An empty list here is NOT 'nobody is live'.")
     }
-    # -Depth so nested pscustomobjects survive; -AsArray so a single row is still a JSON list and a
-    # caller can index it without special-casing.
-    ($rows | ConvertTo-Json -Depth 4 -AsArray) | Write-Output
+    # -Depth so nested pscustomobjects survive. -InputObject @(...) rather than a PIPELINE, and that
+    # is the whole point rather than a style choice: piping an EMPTY array sends ConvertTo-Json zero
+    # objects, so the cmdlet never runs and emits NOTHING -- not `[]`, zero bytes. session-context.ps1
+    # reads that empty stdout as `rosterError = 'presence.ps1 produced no output'` and the SessionStart
+    # banner every session in this repo reads then announces PEER ROSTER UNAVAILABLE on a perfectly
+    # healthy repo whose only fault is that nobody else is currently in it. That is the same
+    # false-positive-on-a-quiet-window shape footprint.ps1's canary 4 was rewritten to remove, and it
+    # is worse here: it fires on the ROSTER, which is the one surface whose whole job is to tell a
+    # session who else is live. @() makes the array-ness explicit, which is why -AsArray is gone --
+    # with -InputObject it would wrap the array a second time and emit [[]].
+    ConvertTo-Json -InputObject @($rows) -Depth 4 | Write-Output
     exit 0
 }
 
