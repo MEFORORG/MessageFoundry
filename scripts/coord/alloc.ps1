@@ -120,26 +120,52 @@ function Get-Floor {
     [int](($seen | Measure-Object -Maximum).Maximum)
 }
 
-# The public backlog number space is partitioned at #1000 -- see PUBLIC_BACKLOG_FLOOR in
-# scripts/hooks/ledger_check.py for why. Keep the two in step: the allocator must never emit a number
-# the gate will refuse, or the tool sends you straight into a blocked commit.
-$PublicBacklogFloor = 1000
+# THE FLOOR IS DEFINED ONCE, IN THE GATE, AND READ HERE.
+#
+# Two integers that must agree is the next place this rots: the allocator would go on emitting numbers
+# the gate refuses, and the tool would be sending people straight into a blocked commit while insisting
+# it had given them a valid number. So parse it out of ledger_check.py rather than restating it, and
+# REFUSE to allocate a backlog number if it cannot be read -- guessing a floor the gate will not honour
+# is the failure this whole partition exists to prevent, reintroduced by its own tooling.
+$gateFile = Join-Path $repo "scripts/hooks/ledger_check.py"
+$PublicBacklogFloor = $null
+if (Test-Path $gateFile) {
+    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*=\s*(\d+)')
+    if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
+}
 
 $observed = Get-Floor
 if ($Kind -eq "backlog") {
-    # THE RESIDUAL DETECTOR. The partition binds only the PUBLIC side; nothing can stop the
-    # maintainer-internal sequence allocating past the boundary, and CI cannot see it -- a public
-    # runner checks out origin only. But THIS machine can: Get-Floor already swept every ref, internal
-    # ones included. So the one place the breach is observable is here, at allocation time, and it is
-    # cheap to say so. Without this the partition fails SILENTLY and the first symptom is another
-    # duplicate; with it, the next allocation on any machine that can see both sides reports it.
+    if ($null -eq $PublicBacklogFloor) {
+        throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
+    }
+
+    # THE RESIDUAL DETECTOR, ON APPROACH RATHER THAN ARRIVAL.
+    #
+    # The partition binds only the PUBLIC side; nothing can stop the maintainer-internal sequence
+    # allocating past the boundary, and CI cannot see it -- a public runner checks out origin only. But
+    # THIS machine can: Get-Floor already swept every ref, internal ones included. So the one place the
+    # breach is observable is here, at allocation time.
+    #
+    # Warning only on ARRIVAL would fire exactly when it is too late -- at that point the next internal
+    # allocation already collides and there is no room to move. A check that fires only on collision has
+    # the same practical value as no check for every moment until the collision. So: warn at 90% of the
+    # boundary, with hundreds of numbers of runway left, and REFUSE at the boundary itself.
+    $warnAt = [int]($PublicBacklogFloor * 0.9)
     if ($observed -ge $PublicBacklogFloor) {
+        throw @"
+REFUSING TO ALLOCATE. The all-refs backlog maximum ($observed) has reached the public floor ($PublicBacklogFloor).
+The partition assumes the maintainer-internal sequence stays BELOW that boundary, and it no longer does
+-- so the next number this would hand out is not safe to use. Raise PUBLIC_BACKLOG_FLOOR in
+scripts/hooks/ledger_check.py (the allocator reads it from there), and say so in the PR.
+"@
+    }
+    elseif ($observed -ge $warnAt) {
         Write-Host ""
-        Write-Host "WARNING: the all-refs backlog maximum ($observed) has reached the public floor ($PublicBacklogFloor)." -ForegroundColor Red
-        Write-Host "         The partition assumed the internal sequence stays BELOW that boundary." -ForegroundColor Red
-        Write-Host "         Either the internal ledger has crossed it, or the public one has run up to it." -ForegroundColor Red
-        Write-Host "         Do not just take the next number -- raise PUBLIC_BACKLOG_FLOOR in" -ForegroundColor Red
-        Write-Host "         scripts/hooks/ledger_check.py and here, together, and say so in the PR." -ForegroundColor Red
+        Write-Host "WARNING: the all-refs backlog maximum ($observed) is approaching the public floor ($PublicBacklogFloor)." -ForegroundColor Yellow
+        Write-Host "         Still safe -- but the partition's headroom is running out, and at the boundary" -ForegroundColor Yellow
+        Write-Host "         this script will refuse to allocate. Plan to raise PUBLIC_BACKLOG_FLOOR in" -ForegroundColor Yellow
+        Write-Host "         scripts/hooks/ledger_check.py before that happens, not after." -ForegroundColor Yellow
         Write-Host ""
     }
     $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
