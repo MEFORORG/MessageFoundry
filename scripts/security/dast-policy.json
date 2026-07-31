@@ -1,0 +1,41 @@
+{
+  "_about": "Tunables for scripts/security/dast_auth_sweep.py. Every floor is a MINIMUM with headroom under a value measured against an unchanged app; a count drifting BELOW a floor exits 2 (could not measure), never 0. Raise a floor when the real number grows; NEVER lower one to make a run pass.",
+  "_provenance": {
+    "min_route_rows_examined": "measured 105 on 2026-07-31 against 2fd1ad8a",
+    "min_gated_http_rows": "measured 99 on 2026-07-31 against 2fd1ad8a",
+    "min_negative_probes": "measured 198 on 2026-07-31 against 2fd1ad8a",
+    "min_get_rows_reached": "measured 46 on 2026-07-31 against 2fd1ad8a",
+    "min_bfla_probes": "measured 19 on 2026-07-31 against 2fd1ad8a",
+    "_canary_floor_units": "The two canary floors below are compared against negative_non_401 and bfla_violations, which count PROBES, not rows. The open-auth canary sends 2 probes per gated row, so its finding count is roughly twice the row count -- do not re-derive a floor from a row number.",
+    "open-auth_min_negative_findings": "measured 196 failing PROBES (98 of 99 gated rows x 2 probes; the holdout is the mTLS-only GET /service/identity) on 2026-07-31 against 2fd1ad8a",
+    "bfla_min_violations": "measured 19 failing PROBES (all 19 GET BFLA candidates) on 2026-07-31 against 2fd1ad8a"
+  },
+  "floors": {
+    "min_route_rows_examined": 95,
+    "min_gated_http_rows": 90,
+    "min_negative_probes": 180,
+    "min_get_rows_reached": 40,
+    "min_bfla_probes": 15
+  },
+  "max_unexplained_unreached": 0,
+  "canary_floors": {
+    "open-auth_min_negative_findings": 50,
+    "bfla_min_violations": 5
+  },
+  "unreachable_allowlist": [
+    {
+      "method": "GET",
+      "path": "/service/identity",
+      "reason": "mTLS client-certificate identity only; it accepts no bearer token by design (ADR 0083)"
+    }
+  ],
+  "anonymous_allowlist": [
+    { "method": "GET", "path": "/auth/providers" },
+    { "method": "POST", "path": "/auth/login" },
+    { "method": "POST", "path": "/auth/negotiate" },
+    { "method": "GET", "path": "/health" },
+    { "method": "GET", "path": "/ai/policy" }
+  ],
+  "low_privilege_role": "viewer",
+  "path_param_placeholder": "dast-probe"
+}

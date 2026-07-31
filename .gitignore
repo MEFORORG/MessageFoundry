@@ -74,6 +74,12 @@ mutmut-results.txt
 c901-head.json
 c901-base.json
 base-tree/
+# DAST scan receipts (ADR 0155). The documented verification commands write these into the repo root,
+# and committed scan output is a class this project does not produce: the receipt carries no body,
+# header or token, but it is still a machine-readable inventory of which routes are ungated and which
+# are unreachable. CI uploads them as artifacts instead.
+dast-auth-receipt.json
+canary-*.json
 
 # Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)
 .claude/settings.local.json

@@ -72,6 +72,9 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "the Cert tooling row)",
     "Tray → engine TLS": "a tokenless local TLS probe; no engine-held key",
     "Engine-shard lane ownership": "a coordination record, not cryptographic material",
+    "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
+    "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
+    "not a key and it protects nothing",
 }
 
 
