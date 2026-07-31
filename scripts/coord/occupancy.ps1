@@ -326,8 +326,9 @@ function Get-WorktreeOccupancy {
                 RootsExamined = 0; RootsWithCorpus = 0
                 TranscriptsFound = 0; TranscriptsInWindow = 0; TranscriptsVanished = 0; TranscriptsWithNeedle = 0
                 BytesScanned = [long]0; LinesScanned = 0; LinesParsed = 0; LinesUnparseableElsewhere = 0
-                PathToolBlocks = 0; PathBlocksExamined = 0; ToolNamesSeen = @()
+                PathToolBlocks = 0; PathBlocksExamined = 0; PathBlocksUnclassified = 0; ToolNamesSeen = @()
                 WriteToolsAllowList = @(); WriteToolNamesSeen = @()
+                KnownNonWriteTools = @(); UnclassifiedPathToolNames = @()
                 WritesExamined = 0; WritesOutsideWindow = 0; WritesUndated = 0
                 WritesPlaced = 0; WritesUnplaced = 0
                 PlacedByPrefix = 0; PlacedByGitdir = 0; GitdirProbes = 0; GitdirUnresolvable = 0

@@ -2340,11 +2340,39 @@ def test_a_pin_vetoes_a_worktree_no_other_signal_can_see(fx: Fixture, sleeper: i
 
 
 def test_name_cannot_override_a_pin(fx: Fixture, sleeper: int) -> None:
-    """Same rule as signals 1 and 3: the flag reached for when the tool refuses cannot reach it."""
+    """Same rule as signals 1 and 3: the flag reached for when the tool refuses cannot reach it.
+
+    ASSERTED ON THE DECISION, and that is the point of this test rather than a detail of it. It used to
+    assert only ``Outcome != "removed"`` and that the directory survived -- and BOTH of those are
+    supplied by the -Apply re-check, which re-derives the occupants from scratch and knows nothing
+    about ``$Confirmed``. Mutation-proven: dropping the pin occupants from ``$occupants`` in
+    ``Get-Decision`` when ``$Confirmed`` is set leaves the old assertions GREEN while a plain dry run
+    prints PRUNE and ``vetoedByPin: 0`` for a worktree a human pinned by hand. That is the
+    defence-in-depth trap the module docstring opens with: the second layer catching what the first one
+    dropped reads exactly like the first one working.
+
+    ``Decision`` and ``Reason`` are the fields that cannot be back-filled -- the decision pass writes
+    them once and the re-check only ever touches ``Outcome``, ``OutcomeDetail`` and ``Occupants``. The
+    receipt's ``vetoedByPin`` is no use here for the same reason the survival assertion was not: it is
+    RECOMPUTED after the apply loop from the occupant rows the re-check writes back, so it survives the
+    mutation too. ``vetoedCandidatesAtDecision`` is the one veto count taken before the loop runs, so
+    it is asserted instead.
+
+    Structure follows ``test_name_cannot_override_the_write_footprint``, which has always done this
+    correctly; no ``_quiesce`` here for the same reason it has none -- -Name turns signal 2 off for
+    this candidate, so the pin is the only thing left standing between it and --force.
+    """
     fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
     _write_pin(fx, "clean")
     res = run(fx, "-Apply", "-Name", "clean")
-    assert by_leaf(res, "clean")["Outcome"] != "removed"
+    d = by_leaf(res, "clean")
+    assert d["Confirmed"] is True, "the override was accepted for signal 2"
+    assert d["Decision"] == "SKIP", "the DECISION pass refused it -- not the -Apply re-check"
+    assert "operator pin" in d["Reason"]
+    assert res["fence"]["vetoedCandidatesAtDecision"] == 1, (
+        "the veto is recorded before the apply loop, where the re-check cannot have supplied it"
+    )
+    assert d["Outcome"] != "removed"
     assert fx.sibling("clean").exists()
 
 
@@ -2720,6 +2748,179 @@ def test_a_shell_only_window_does_not_brick_the_pruner(fx: Fixture, sleeper: int
     assert fp["available"] is True, "a shell-only window is not a schema change"
     assert fp["faults"] == []
     assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+
+def test_a_READ_ONLY_window_does_not_brick_the_pruner(fx: Fixture, sleeper: int) -> None:
+    """Canary 4 must fire on a write-tool RENAME, never on a window that simply did no writing.
+
+    The rename twin above drives canary 4's true positive, and until this test nothing in the file
+    could reach its FALSE positive. ``test_a_shell_only_window_does_not_brick_the_pruner`` is the
+    nearest thing and is structurally unable to: a ``Bash`` block carries ``command``, so that fixture
+    asserts ``pathBlocksExamined == 0`` and canary 4's precondition (``pathBlocksExamined > 0``) is
+    never met. The other half was just as unreachable -- every other test in the file used the fixture
+    default ``tool="Edit"``, so ``writeToolNamesSeen`` was never empty anywhere. A canary whose
+    precondition no test can construct is a canary whose false positive nobody can see.
+
+    A window of reads with no writes is not exotic, it is the ordinary case. Measured 2026-07-30 on the
+    real corpus: 87% of transcripts contain no write block at all, and replaying this canary hourly
+    over 1,109 h of real history fired it once -- 2026-06-22T18Z, one in-window file, one path-bearing
+    block, zero writes. One hour in 1,109 is not a vendor renaming the write tools, it is a quiet
+    afternoon, and the price of calling it one is EXIT_REFUSED for every candidate with no override
+    flag: the exact failure canary 1 was rewritten to remove (footprint.ps1's ``FootprintPathToolNames``
+    comment), reintroduced one canary further down the same list.
+
+    The reads deliberately target the candidate about to be pruned. A read is NOT occupancy -- signal 3
+    is denominated on writes by design, and a session that only read here is not working here -- so
+    ``repo-clean`` must still come back ``removed``, which doubles as the positive control proving the
+    run was capable of removing something.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    # A Read carries ``file_path`` -- the SAME key a Write carries, which is what lets a read-only
+    # window reach canary 4 at all. It is also the dominant shape of the real corpus: of the
+    # path-bearing blocks in the 36 h measured on 2026-07-30, Read accounted for 4841, more than Write
+    # and Edit together (909 + 3509).
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        tool="Read",
+        stem="agent-read",
+    )
+    # A Grep carries a DIFFERENT known key (``path``) and names a directory rather than a file. Both
+    # tools are in ``FootprintPathToolNames`` and both in ``FootprintKnownNonWriteTools``, so both
+    # count toward the canaries' denominator while neither can leave any residue -- which is the whole
+    # shape under test. A distinct ``stem`` is load-bearing: the fixture derives the transcript
+    # filename from it, so a second call reusing the default would overwrite the first and this would
+    # silently become a one-block window. The directory named is one INSIDE the candidate rather than
+    # the candidate itself: a needle is ``<worktree><separator>`` (Get-FootprintNeedles), so the bare
+    # worktree path carries no needle by construction, and grepping ``repo-clean`` itself would leave
+    # this transcript needle-less -- scanned all the same, but with nothing in the receipt able to
+    # prove it was reached.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "scripts"],
+        tool="Grep",
+        path_key="path",
+        extra_input={"pattern": "def "},
+        stem="agent-grep",
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["transcriptsWithNeedle"] >= 2, (
+        "both transcripts must name a worktree of this repo, or the scan never looked at them"
+    )
+    assert fp["toolNamesSeen"] == ["Grep", "Read"], "both read tools parsed, and nothing else did"
+    assert fp["pathToolBlocks"] == 2, "tools that target a path by definition WERE called"
+    assert fp["pathBlocksExamined"] == 2, "...and both carried a known key: canary 4's precondition"
+    assert fp["writeToolNamesSeen"] == [], "no write tool was named: the other half of the guard"
+    assert fp["writesExamined"] == 0
+    # The numerator that decides fault-vs-note. Zero here is the ENTIRE claim: every path-bearing name
+    # was accounted for by a tool that provably cannot write through the path it carries.
+    assert fp["pathBlocksUnclassified"] == 0
+    assert fp["unclassifiedPathToolNames"] == []
+    assert fp["available"] is True, "a window that did no writing is not a moved tool vocabulary"
+    assert fp["faults"] == []
+    # Not a refusal, but not silence either: the operator is told, in red, that signal 3 abstained and
+    # why that is believable. An assertion on the note is what stops a future "fix" from downgrading
+    # the refusal to nothing at all.
+    assert "an idle corpus, not a moved vocabulary" in fp["note"], fp["note"]
+    assert any(
+        "write-footprint source contributed nothing" in r for r in res["fence"]["reducedAssurance"]
+    )
+    assert res["_exit"] == 0, "a quiet window must not refuse the whole run"
+    assert res["fence"]["vetoedByFootprint"] == 0, "a READ is not occupancy and must veto nothing"
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "it must not brick the tool"
+
+
+def test_an_ENTERWORKTREE_only_window_does_not_brick_the_pruner(fx: Fixture, sleeper: int) -> None:
+    """The one real-corpus tool name that is path-bearing, non-write, and NOT a Read/Grep/Glob.
+
+    ``EnterWorktree`` was the only path-bearing name neither allow-list claimed in the 2026-07-30
+    census (13 blocks), so it is the single entry in ``FootprintKnownNonWriteTools`` that rests on a
+    judgement rather than on the obvious. It is listed there on the tool's own declared schema -- two
+    inputs, ``name`` and ``path``, where ``path`` is an existing WORKTREE DIRECTORY to switch into --
+    so it cannot write a file through the key this scanner reads. This pins that judgement: drop
+    ``EnterWorktree`` from the list and a corpus that merely switched worktrees starts refusing every
+    prune for up to 36 h.
+
+    It is a separate test from the Read/Grep one on purpose. That one would stay green if somebody
+    narrowed the negative list back down to the three obvious readers, and the entry that would break
+    is precisely the one nobody would think to check.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    # The BARE worktree path, which is the only thing EnterWorktree is ever handed. It therefore
+    # carries no needle -- a needle is ``<worktree><separator>`` -- and that is deliberately fine here:
+    # the needle is a counter and canary 1's numerator, and it gates nothing. Every in-window
+    # transcript is parsed regardless, which is what ``pathBlocksExamined`` below proves.
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean")],
+        tool="EnterWorktree",
+        path_key="path",
+        stem="agent-enter",
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["toolNamesSeen"] == ["EnterWorktree"]
+    # NOT in FootprintPathToolNames, so canary 1's denominator stays at zero -- which is exactly why
+    # this reaches canary 4 and nothing else, and why a failure here can only be canary 4's.
+    assert fp["pathToolBlocks"] == 0
+    assert fp["pathBlocksExamined"] == 1, "it DID carry a known path key"
+    assert fp["writeToolNamesSeen"] == []
+    assert fp["pathBlocksUnclassified"] == 0, "the negative allow-list must still claim this name"
+    assert fp["available"] is True
+    assert fp["faults"] == []
+    assert "an idle corpus, not a moved vocabulary" in fp["note"], fp["note"]
+    assert res["_exit"] == 0
+    assert by_leaf(res, "clean")["Outcome"] == "removed"
+
+
+def test_an_UNCLASSIFIED_path_bearing_tool_name_is_a_fault(fx: Fixture, sleeper: int) -> None:
+    """Canary 4's numerator is not vacuous, proved WITHOUT mutating the file under test.
+
+    ``test_a_write_tool_RENAME_is_a_fault_not_a_silent_zero`` proves the same refusal by rewriting
+    ``$FootprintWriteTools`` in a copy of the script tree. That is a good test and it is not enough on
+    its own -- but NOT because the mutation could silently fail to apply: ``_mutant`` asserts
+    ``old in text`` on every substitution precisely so a mutant that did not take cannot pass as a
+    green run. The gap is narrower and is about the ROUTE, not the harness. That test reaches canary 4
+    by editing the script's own allow-list, so it only ever proves the predicate fires when the repo
+    changes underneath it. This one drives the identical refusal through the CORPUS with the script
+    untouched, which is how the failure actually arrives in the field -- a vendor ships a tool this
+    scan has never heard of, it carries ``file_path``, and nothing in the repo has changed at all.
+
+    ``Frobnicate`` stands for any such name: a new first-party tool, or an MCP connector like
+    desktop-commander's ``edit_block``. The fence REFUSES rather than guessing what it does, because a
+    false PRUNE destroys a live session's work while a false SKIP is merely annoying. Clearing it is
+    one line in one of the two allow-lists once somebody has established the semantics.
+    """
+    _quiesce(fx, "clean", "gone")
+    fx.write_session(pid=sleeper, cwd=fx.primary, session_id=SID_WRITER)
+    fx.write_transcript(
+        session_id=SID_WRITER,
+        cwd=fx.primary,
+        writes=[fx.sibling("clean") / "x.py"],
+        tool="Frobnicate",
+        stem="agent-frob",
+    )
+    res = run(fx, "-Apply")
+    fp = res["fence"]["footprint"]
+    assert fp["pathToolBlocks"] == 0, "canary 1 is NOT what fired -- this is canary 4 alone"
+    assert fp["pathBlocksExamined"] == 1
+    assert fp["writeToolNamesSeen"] == []
+    assert fp["pathBlocksUnclassified"] == 1, "the residue canary 4 refuses on"
+    assert fp["unclassifiedPathToolNames"] == ["Frobnicate"]
+    assert fp["available"] is False, "an unknown path-bearing tool must not be waved through"
+    assert any("tool vocabulary has moved" in x for x in fp["faults"])
+    assert any("Frobnicate" in x for x in fp["faults"]), (
+        "the fault must NAME what to classify, or it sends the operator to grep the corpus"
+    )
+    assert res["_exit"] == 2
+    assert res["counts"]["removed"] == 0
+    assert fx.sibling("clean").exists()
 
 
 def test_an_unrelated_project_subagent_does_not_brick_the_pruner(

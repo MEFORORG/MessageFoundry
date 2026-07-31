@@ -85,14 +85,20 @@
         => the subagent marker moved;
       * sidechain path-tool calls exist but NOT ONE carries a known path key => subagent extraction
         specifically has gone to zero, while parent extraction stays green;
-      * path-bearing tool calls exist but NOT ONE of them is named by the WRITE allow-list => the tool
-        vocabulary moved.
+      * path-bearing tool calls exist, NOT ONE of them is named by the WRITE allow-list, AND at least
+        one of them is named by something NEITHER allow-list claims => the tool vocabulary moved.
+        The third clause is the canary, not decoration on it. Without it the same test also fires on a
+        window that was merely quiet -- it did, once, in an hourly replay across 1,109 h of real
+        history -- because a rename leaves Read/Grep/Glob intact and "no write was seen" is therefore
+        the signature of a rename AND of an idle afternoon. Zero writes with every path-bearing name
+        accounted for by a tool that cannot write is a NOTE instead, and signal 3 abstains for the run.
     Canary 1 is denominated on the TOOL NAME and canary 4 on the extracted PATH, deliberately in
     opposite directions: a pure key move zeroes the paths while the names stay, a pure name rename
     zeroes the names while the paths stay, and each canary is blind to the one the other catches.
     RESIDUAL, STATED: both moving in the same release defeats both, because every counter goes to zero
-    together. What is left then is the Note ("not one write placed"), which the caller prints as
-    REDUCED ASSURANCE in red -- visible, but not a refusal.
+    together -- and canary 4's residue test with them, since a renamed tool that also dropped the path
+    key never reaches PathBlocksExamined at all. What is left then is the Note ("not one write
+    placed"), which the caller prints as REDUCED ASSURANCE in red -- visible, but not a refusal.
     The third is the reason the first two are not enough: every cross-tree write on this repo came from
     a sidechain line, so a canary that only proves a PARENT write is extractable would stay green while
     the entire signal disappeared. The fourth is the reason the first three are not enough either --
@@ -154,6 +160,54 @@ $script:FootprintPathKeys = @('file_path', 'notebook_path', 'path')
 # and blaming a vendor schema change that had not happened. Asking instead "did a tool that MUST carry
 # a path fail to carry one" is the same detection with none of the false positives.
 $script:FootprintPathToolNames = @('Read', 'Write', 'Edit', 'MultiEdit', 'NotebookEdit', 'NotebookRead', 'Glob', 'Grep')
+
+# Tools that carry a path key and CANNOT write a file through it. The NEGATIVE half of the write
+# allow-list, and the entire reason canary 4 below no longer refuses a run on a window that was merely
+# quiet. Canary 4 used to be denominated on the ABSENCE of writes, and absence is not evidence: a
+# rename of the write tools leaves Read/Grep/Glob completely intact, so "known reads present, zero
+# writes" is the signature of a moved vocabulary AND the signature of an ordinary idle afternoon, and
+# nothing about the write names can tell those two apart inside one window. This list is what moves the
+# question off absence and onto residue -- "did anything carry a path that NEITHER list can account
+# for" -- which a single window CAN answer, because a renamed write tool arrives as a name that is by
+# construction in neither list while still carrying file_path.
+# MEASURED 2026-07-30, on the real corpus over the preceding 36 h (779 in-window transcripts), the tool
+# names that actually carried a path key: Read 4841, Edit 3509, Grep 1048, Write 909, Glob 32,
+# EnterWorktree 13. EnterWorktree was the ONLY path-bearing name neither allow-list claimed, so it is
+# named here and that day's healthy corpus classified at 100% with canary 4's numerator sitting at
+# exactly zero.
+# ENTERWORKTREE IS LISTED ON THE TOOL'S OWN DECLARED SCHEMA, not on an inference from 13 observed
+# blocks. Verified 2026-07-30 against the live tool definition: it accepts exactly two inputs, `name`
+# and `path`, and `path` is documented as the path of an existing worktree to switch INTO instead of
+# creating one -- a DIRECTORY the session enters, never a file it modifies. It therefore cannot be a
+# write through the path key this scanner reads, whatever else it does.
+# DO NOT ADD ExitWorktree HERE "BY SYMMETRY", which is the mistake this comment exists to head off: it
+# takes only `action` and `discard_changes`, carries no path key at all, and so can never reach the
+# path-bearing branch these lists are consulted from. Adding it would be a claim about a tool this
+# scanner never sees, and every unnecessary name in this list is a name that would silently absorb a
+# future rename onto it.
+# Whether entering a worktree should VETO in its own right is a real question and a DIFFERENT one; it
+# is not answered here, and behaviour is unchanged either way (placement has always been gated on the
+# write allow-list above, so listing EnterWorktree here loses no veto that exists today).
+# AN MCP-NAMESPACED TOOL THAT CARRIES A PATH KEY IS NOT EXEMPT AND MUST NOT BE MADE EXEMPT BY ITS
+# NAMESPACE. A blanket "anything with a `mcp__` prefix is harmless" escape fails open in the
+# destructive direction -- a connector that edits files would be waved through by the shape of its
+# name -- so such names stay in the numerator and hard-fault like any other unknown. The 2026-07-30
+# census found no MCP tool carrying a path key at all, so this is a theoretical cost today, and the
+# remedy when it is not is per-NAME classification after somebody has established what that one tool
+# does, never a namespace-wide carve-out.
+# DO NOT LATER REPLACE THE RESIDUE TEST WITH A SHARE OR A VOLUME THRESHOLD -- it is the one change that
+# would silently undo this fix, because the ratio is backwards at exactly the volumes the fence has to
+# be right about. At the arming condition (all four write names absent) the unclassified SHARE simply
+# IS the window's write share, so a quiet window carrying a handful of renamed edits sits below any
+# workable bar while a single unclassified block in a one-block window sits at 100%. The rename this
+# canary exists to catch is the low-volume case; a threshold suppresses precisely that one.
+# THE MAINTENANCE HAZARD, SAID OUT LOUD BECAUSE THIS LIST IS THE ONLY WAY THE FIX CAN BE UNDONE: every
+# name added here is an assertion about a vendor's semantics that nobody promised us, and adding a name
+# to silence a fault is how a real rename becomes invisible. A fault from canary 4 means some name
+# carried a path and this scan cannot say what it does. The remedy is to find out and then put it in
+# $FootprintWriteTools (it writes) or here (it provably cannot) -- never to put it here because that is
+# the branch that stops complaining.
+$script:FootprintKnownNonWriteTools = @('Read', 'NotebookRead', 'Glob', 'Grep', 'EnterWorktree')
 
 # WHICH STATES VETO IS NOT DECIDED HERE. Only DEAD/STALE release a footprint (see the header on
 # UNREGISTERED), and that rule lives in ONE place -- $OccupancyVetoStates / Test-OccupancyVeto in
@@ -299,12 +353,23 @@ Returns a pscustomobject:
     PathToolBlocks       [int]    tool_use blocks naming a tool that targets a path BY DEFINITION.
                                   Canary 1's denominator -- see the comment on FootprintPathToolNames
     PathBlocksExamined   [int]    tool_use blocks that actually carried a known path key
+    PathBlocksUnclassified [int]  of those, the ones whose tool name is claimed by NEITHER allow-list.
+                                  Canary 4's numerator, and the ONLY thing separating a renamed write
+                                  tool from a quiet window: a rename lands here by construction, an
+                                  idle afternoon leaves it at zero
+    UnclassifiedPathToolNames [array] the distinct names behind that count (capped, sanitised) -- what
+                                  the operator has to go and classify
     ToolNamesSeen        [array]  distinct tool names observed on those blocks (capped). The receipt
                                   for canary 4: it is how an operator sees the vocabulary drift
     WriteToolsAllowList  [array]  the names this scan was looking for, reported by the scanner that
                                   used them rather than re-derived by a caller
-    WriteToolNamesSeen   [array]  of those, the ones actually observed. EMPTY while
-                                  PathBlocksExamined is non-zero is canary 4
+    KnownNonWriteTools   [array]  the names it was willing to EXCUSE for not being a write. Reported
+                                  for the same reason as the line above: a negative allow-list that is
+                                  not legible is a negative allow-list nobody audits
+    WriteToolNamesSeen   [array]  of those in WriteToolsAllowList, the ones actually observed. EMPTY
+                                  while PathBlocksExamined is non-zero is canary 4's GUARD; whether
+                                  that refuses the run or merely notes it is decided by
+                                  PathBlocksUnclassified
     WritesExamined       [int]    write tool calls with a path, inside the window
     WritesOutsideWindow  [int]    write tool calls dropped for being older than the window
     WritesUndated        [int]    write tool calls with no readable timestamp -- kept, fail-closed
@@ -344,8 +409,9 @@ function Get-WorktreeFootprints {
         RootsExamined = 0; RootsWithCorpus = 0
         TranscriptsFound = 0; TranscriptsInWindow = 0; TranscriptsVanished = 0; TranscriptsWithNeedle = 0
         BytesScanned = [long]0; LinesScanned = 0; LinesParsed = 0; LinesUnparseableElsewhere = 0
-        PathToolBlocks = 0; PathBlocksExamined = 0; ToolNamesSeen = @()
+        PathToolBlocks = 0; PathBlocksExamined = 0; PathBlocksUnclassified = 0; ToolNamesSeen = @()
         WriteToolsAllowList = @($script:FootprintWriteTools); WriteToolNamesSeen = @()
+        KnownNonWriteTools = @($script:FootprintKnownNonWriteTools); UnclassifiedPathToolNames = @()
         WritesExamined = 0; WritesOutsideWindow = 0; WritesUndated = 0
         WritesPlaced = 0; WritesUnplaced = 0
         PlacedByPrefix = 0; PlacedByGitdir = 0; GitdirProbes = 0; GitdirUnresolvable = 0
@@ -472,6 +538,11 @@ function Get-WorktreeFootprints {
     $agg = @{}
     $toolNames = @{}
     $writeNamesSeen = @{}
+    # Canary 4's numerator carries the NAMES as well as the count: a fault whose text is "3 blocks were
+    # unclassified" sends an operator to grep the corpus, and a fault whose text names them tells them
+    # what the vendor renamed. Bounded and sanitised on exactly the same terms as $toolNames below --
+    # a tool name is structural metadata, but nothing from a transcript reaches a receipt unchecked.
+    $unclassifiedPathNames = @{}
 
     foreach ($f in $inWindow) {
         $isSidechainFile = ((ConvertTo-Norm $f) -match '/subagents/')
@@ -563,7 +634,22 @@ function Get-WorktreeFootprints {
                 # window and make the canary vacuous.
                 $r.PathBlocksExamined++
                 if ($sidechain) { $r.SidechainPathBlocks++ }
-                if ($script:FootprintWriteTools -notcontains $tn) { continue }
+                if ($script:FootprintWriteTools -notcontains $tn) {
+                    # CANARY 4'S POSITIVE EVIDENCE, counted here because this is the only point in the
+                    # scan where the tool name and the fact that this block carried a path are both in
+                    # hand. A block that is not a write is one of two very different things: a tool we
+                    # know cannot write (a Read, a Grep -- the shape of a quiet window), or a name
+                    # neither allow-list has ever heard of (the shape of a renamed write tool). Only
+                    # the second is evidence that the vocabulary moved, and separating them here is
+                    # what lets the canary below refuse on evidence instead of on silence.
+                    if ($script:FootprintKnownNonWriteTools -notcontains $tn) {
+                        $r.PathBlocksUnclassified++
+                        if ($tn -and $tn.Length -le 60 -and $tn -match '^[A-Za-z0-9_.:-]+$' -and $unclassifiedPathNames.Count -lt 40) {
+                            $unclassifiedPathNames[$tn] = $true
+                        }
+                    }
+                    continue
+                }
                 $writeNamesSeen[$tn] = $true
 
                 # ConvertFrom-Json has ALREADY turned the ISO-8601 timestamp into a [datetime] with
@@ -676,6 +762,7 @@ function Get-WorktreeFootprints {
     }
     $r.ToolNamesSeen = @($toolNames.Keys | Sort-Object)
     $r.WriteToolNamesSeen = @($writeNamesSeen.Keys | Sort-Object)
+    $r.UnclassifiedPathToolNames = @($unclassifiedPathNames.Keys | Sort-Object)
 
     # --- The canary ------------------------------------------------------------------------------
     # See the header. Each condition requires the extractor to have PRODUCED something, so none of them
@@ -703,10 +790,57 @@ function Get-WorktreeFootprints {
     # whole signal drops to zero vetoes with Available true, no fault and an empty Note. Measured on
     # this repo: renaming Write/Edit in the allow-list turned a LIVE session's worktree (61 cross-tree
     # writes) from SKIP into PRUNE while pathBlocksExamined went UP.
-    if ($r.PathBlocksExamined -gt 0 -and $r.WriteToolNamesSeen.Count -eq 0) {
-        $faults += [pscustomobject]@{
-            File = '(canary)'
-            Why = "$($r.PathBlocksExamined) path-bearing tool call(s) were examined and NOT ONE is named by the write allow-list ($($script:FootprintWriteTools -join ', ')) -- the tool vocabulary has moved and this signal can no longer see a write at all. Observed instead: $(@($r.ToolNamesSeen | Select-Object -First 12) -join ', ')"
+    #
+    # IT IS SPLIT IN TWO, BECAUSE "NOT ONE WRITE WAS SEEN" IS NOT ONE FACT. Denominated on the absence
+    # of writes, this test fires identically on a moved vocabulary and on an afternoon where nobody
+    # edited anything, and no amount of looking at the write names will tell those apart -- a rename
+    # leaves Read/Grep/Glob completely intact. So the numerator moved off "writes are missing" and onto
+    # "something carried a path and neither allow-list can say what it does", which is a fact a single
+    # window actually contains (see $FootprintKnownNonWriteTools above for the measured classification,
+    # for why a share or volume threshold must never replace this test, and for why a namespaced MCP
+    # tool gets no exemption from it).
+    #   * residue present => FAULT, on exactly the old terms and down exactly the old path. This is the
+    #     shape the measured rename produces: the renamed tool still carries file_path, and its new
+    #     name is in neither list by construction. Refusing is right here because the failure is not
+    #     symmetric -- a false PRUNE destroys a live session's work and a red line an operator can
+    #     scroll past does not stop -Apply.
+    #   * residue absent  => a NOTE, and signal 3 abstains for this run at no extra cost: nothing was
+    #     recognised as a write, so there are no footprints to contribute and the receipt says so in
+    #     those words. Refusing here is the bug the comment on $FootprintPathToolNames records canary 1
+    #     being rewritten to remove -- "fires on a perfectly healthy 36 h window ... refusing every
+    #     prune, with no override flag, and blaming a vendor schema change that had not happened".
+    #     Replayed hourly across 1,109 h of real history (13,315 transcripts, 4 config roots) on
+    #     2026-07-30, the undivided test fired once: 2026-06-22T18Z, 1 in-window transcript, 1
+    #     path-bearing block, 0 writes. That is a quiet corpus, not a schema change -- 87% of all
+    #     transcripts contain no write block at all. The note rides the channel the header already
+    #     points at (the caller prints $fp.Note as REDUCED ASSURANCE in red); no new channel is
+    #     invented for it.
+    # THE FAULT SET IS A STRICT SUBSET OF THE OLD ONE. Every window that faults here also faulted
+    # before, so this change cannot invent a refusal; it can only decline to make one. What it CAN get
+    # wrong is the other direction, and there is exactly one way in: a name that writes but sits in
+    # $FootprintKnownNonWriteTools. That is why that list is short, argued per entry, and carries the
+    # warning it does.
+    $canary4Note = ''
+    if ($r.WriteToolNamesSeen.Count -eq 0 -and $r.PathBlocksExamined -gt 0) {
+        if ($r.PathBlocksUnclassified -gt 0) {
+            # THE EVIDENCE FIELD IS NEVER ALLOWED TO RENDER EMPTY. The count above is incremented for
+            # every unclassified block, but the NAME is only kept when it survives the same shape and
+            # cap test every other transcript-sourced string in here survives -- so a name too hostile
+            # to record, or a 41st distinct one, leaves the list short while the count stands. An
+            # accusation printed with an empty bracket is the same self-contradicting-receipt defect
+            # this rewrite exists to repair, one field over. The count stays unconditional either way:
+            # a block whose name could not be recorded is still a block that happened.
+            $unclassifiedEvidence =
+            if (@($r.UnclassifiedPathToolNames).Count -gt 0) { @($r.UnclassifiedPathToolNames | Select-Object -First 12) -join ', ' }
+            else { 'none of them recordable as a name' }
+            $isAre = if ($r.PathBlocksUnclassified -eq 1) { 'is' } else { 'are' }
+            $faults += [pscustomobject]@{
+                File = '(canary)'
+                Why = "not one of the $($r.PathBlocksExamined) path-bearing tool call(s) examined is named by the write allow-list ($($script:FootprintWriteTools -join ', ')), AND $($r.PathBlocksUnclassified) of them $isAre named by something NEITHER allow-list claims ($unclassifiedEvidence) -- the tool vocabulary has moved and this signal can no longer see a write at all. Establish what those names do, then extend `$FootprintWriteTools if they write or `$FootprintKnownNonWriteTools if they provably cannot; do NOT extend the second one merely to stop this firing"
+            }
+        }
+        else {
+            $canary4Note = "not one of the $($r.PathBlocksExamined) path-bearing tool call(s) examined is a write either, and every one of them is named by a tool that cannot write a file through the path it carries ($($script:FootprintKnownNonWriteTools -join ', ')) -- an idle corpus, not a moved vocabulary, so this is a note and NOT a refusal (a rename would have left a path-bearing name neither list claims, and that is still a hard fault). Worth an eye all the same: measured 2026-07-30, over the preceding 21 days the in-window write-bearing transcript count never fell below 6, and typically ran 238"
         }
     }
 
@@ -793,6 +927,15 @@ function Get-WorktreeFootprints {
             # a write can be placed through .git in a file that carries no needle at all. "Nothing was
             # placed" is the honest statement of "this signal contributed nothing".
             $r.Note = "$($r.TranscriptsInWindow) transcript(s) were in the window and not one write placed in a worktree of this repo, so this signal contributed nothing to this run"
+        }
+        # Canary 4's soft half, APPENDED and never assigned. When it fires, WritesPlaced is zero by
+        # construction -- nothing was recognised as a write, so nothing could be placed -- which means
+        # the branch above has already claimed this string. An assignment here would silently drop the
+        # honest "contributed nothing" sentence that the caller promotes to REDUCED ASSURANCE, and
+        # replace a statement about the OUTCOME with one about the VOCABULARY. The operator needs both:
+        # the first says the signal is not vetoing anything, the second says why that is believable.
+        if ($canary4Note) {
+            $r.Note = if ($r.Note) { "$($r.Note); $canary4Note" } else { $canary4Note }
         }
     }
     return [pscustomobject]$r

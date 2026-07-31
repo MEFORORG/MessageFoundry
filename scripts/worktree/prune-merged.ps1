@@ -51,22 +51,42 @@
          overrides signals 1 or 3, a nested worktree, or a lock.
       3. THE WRITE FOOTPRINT (scripts/coord/footprint.ps1, -FootprintHours, default 36). Reads Claude
          Code's own transcripts and places a session by where it actually WROTE, which is the question
-         signal 1 was never able to answer. It exists because signal 1 was measured contributing
-         NOTHING to this tool's decisions: of the writes landing in a `<primary>-<slug>` sibling on
-         this repo, 88.9% came from a session whose recorded cwd was a different checkout, and signal 1
-         placed a session inside 0 of the 4 siblings that existed when it was measured. Measured after
-         (2026-07-30, real repo, 7 candidates): signal 1 = 1 of 7, signal 3 = 6 of 7, and the five it
-         adds include three worktrees a session that is LIVE RIGHT NOW had written 257 times between
-         them from a cwd of the PRIMARY, plus one being written into from a checkout of an entirely
-         different repository. Like signal 1 it can only veto, and -Name cannot override it.
-         WHAT THAT NUMBER IS AND IS NOT, because it is a placement count and reads like a protection
-         delta: at the DEFAULT windows, every candidate signal 3 covered had also had its git metadata
+         signal 1 was never able to answer. The design rule it encodes is that where a session SITS is
+         irrelevant and only where it WRITES matters, and that rule is not an inference from one
+         afternoon of this script's own logs. A 30-day audit of real session records -- recorded in
+         docs/WORKTREE-GATE.md in this repo, so an operator deciding whether to trust -Name can go and
+         check it -- reached the same rule independently at roughly 25x the sample: 166 sessions ran
+         with their cwd in the shared primary, and of their Edit/Write calls 6,075 (44%) landed inside
+         the primary's own tree while 4,010 (29%) landed inside a WORKTREE, by absolute path. Read
+         that 29% as a CEILING on the share aimed at a tree this script could delete rather than as
+         that share itself: the audit counted worktrees of every shape, while the candidate set here
+         is only the `<primary>-<slug>` siblings -- nested and `.claude/worktrees/` trees are excluded
+         outright (see below).
+         This repo shows the same effect at its own scale, which is why signal 1 was described as
+         contributing NOTHING: of the writes landing in a `<primary>-<slug>` sibling on this
+         repo, 88.9% came from a session whose recorded cwd was a different checkout, and signal 1
+         placed a session inside 0 of the 4 siblings that existed when it was measured. Measured again
+         after signal 3 landed (2026-07-30, real repo, 7 candidates): signal 1 = 1 of 7, signal 3 =
+         6 of 7, and the five it adds include three worktrees a session that was LIVE at that moment
+         had written 257 times between them from a cwd of the PRIMARY, plus one being written into
+         from a checkout of an entirely different repository. That run was taken by the session that
+         BUILT signal 3, so it is not independent of its measurer; an independent dry run the same day
+         over 10 real candidates reproduced the shape -- signal 1 = 1 of 10, signal 3 = 9 of 10, on
+         164 cross-tree writes -- and, re-run with signal 2 disarmed (-IdleHours 0), the pre-signal-3
+         code DECIDED PRUNE on 4 worktrees that live sessions were actively writing into, where this
+         one decides SKIP on all 4. BOTH RUNS WERE DRY RUNS and nothing was removed: -Apply is never
+         pointed at the real repo, so the 4 is a decision this script would have acted on, not damage
+         it did. Like signal 1 it can only veto, and -Name cannot override it.
+         WHAT THOSE NUMBERS ARE AND ARE NOT, because a placement count reads like a protection delta:
+         at the DEFAULT windows, every candidate signal 3 covered had also had its git metadata
          touched more recently than its last tool-call write, so signal 3's veto set was a strict
          SUBSET of signal 2's and the unattended default-flag run behaved identically without it. That
          is an empirical fact about one afternoon, not a structural one -- a session editing files
-         without running a git command is seen by signal 3 and not by signal 2 -- but the measured
-         value of signal 3 today is concentrated where signal 2 is off or narrowed: -Name, a reduced
-         -IdleHours, and the per-candidate re-check during -Apply.
+         without running a git command is seen by signal 3 and not by signal 2 -- and the -IdleHours 0
+         result above is that same fact from the other side: the instant signal 2 is narrowed, signal
+         3 is the only thing left, and 4 occupied worktrees is what "the only thing left" is worth.
+         The measured value of signal 3 today is therefore concentrated where signal 2 is off or
+         narrowed: -Name, a reduced -IdleHours, and the per-candidate re-check during -Apply.
 
     WHAT THE FENCE CANNOT SEE (printed on every run, because a fence believed to be wider than it is
     is worse than no fence):
@@ -781,7 +801,13 @@ $blindSpots = @(
     # The two residuals the fixed canaries still cannot reach. Named here rather than left in a script
     # header, because this list is what an operator actually reads before deciding to trust the fence.
     'a transcript torn mid-write on its FIRST write into a brand-new worktree, in a file that has never named this repo family -- counted (linesUnparseableElsewhere), not refused; that worktree is covered by signal 4 and by fresh git metadata instead',
-    'a vendor release that renames the write tools AND moves the path keys at the same time -- canary 1 catches the second, canary 4 the first, and neither catches both together; what is left is the footprint note saying no write placed'
+    'a vendor release that renames the write tools AND moves the path keys at the same time -- canary 1 catches the second, canary 4 the first, and neither catches both together; what is left is the footprint note saying no write placed',
+    # The two residuals canary 4 acquired when it was split on positive evidence. The first is the way
+    # the fix can be defeated; the second is the way the fix can bite an operator who has done nothing
+    # wrong, and the point of naming it here is so nobody is sent hunting a vendor schema change that
+    # did not happen.
+    'a vendor release that renames a write tool ONTO a name already listed in $FootprintKnownNonWriteTools (footprint.ps1) -- canary 4 classifies the new name as provably-harmless and never fires; that list is short and argued per entry for exactly this reason',
+    'nothing at all, in the other direction: a path-bearing tool name this scan has never classified -- an MCP connector such as a desktop-commander read_file/edit_block, or any new first-party tool -- makes canary 4 REFUSE the run rather than guess what it does, and there is no override flag for that. It is a refusal, never a silent prune. Clearing it is one line in $FootprintKnownNonWriteTools (or $FootprintWriteTools) once somebody has established what the tool does; a blanket namespace exemption is NOT the fix, because it fails open in the destructive direction'
 )
 
 if (-not $Json) {
@@ -798,13 +824,18 @@ if (-not $Json) {
                 $fp.TranscriptsFound, $fp.RootsWithCorpus, $fp.TranscriptsInWindow, $fp.WindowHours,
                 $fp.TranscriptsWithNeedle, $fp.LinesParsed, $fp.WritesExamined, $fp.WritesPlaced,
                 $fp.WritesUnplaced, $fp.CrossTreeWrites) -ForegroundColor DarkGray
-            # The allow-list, and what was actually observed against it. Canary 4 fires only when the
-            # intersection is EMPTY; a PARTIAL rename (one tool renamed, the rest intact) leaves it
-            # green, so the vocabulary has to be legible rather than merely asserted.
-            Write-Host ("    write tools recognised: {0} of {1}; {2} distinct tool name(s) seen over {3:n0} path-tool block(s). Placement: {4} by path, {5} through .git ({6} director(ies) probed)." -f
+            # The allow-list, its negative half, and what was actually observed against both. Canary 4
+            # refuses only when the write intersection is EMPTY *and* something carried a path that
+            # neither list claims; a PARTIAL rename (one tool renamed, the rest intact) leaves it green
+            # and so does a quiet window, so the vocabulary has to be legible rather than merely
+            # asserted. A non-zero "named by neither" here with writes still being seen is the early
+            # warning that precedes the refusal.
+            Write-Host ("    write tools recognised: {0} of {1}; {2} distinct tool name(s) seen over {3:n0} path-tool block(s); {7} path-bearing call(s) named by neither list{8}. Placement: {4} by path, {5} through .git ({6} director(ies) probed)." -f
                 (@($fp.WriteToolNamesSeen) -join '/'), (@($fp.WriteToolsAllowList) -join '/'),
                 @($fp.ToolNamesSeen).Count, $fp.PathToolBlocks,
-                $fp.PlacedByPrefix, $fp.PlacedByGitdir, $fp.GitdirProbes) -ForegroundColor DarkGray
+                $fp.PlacedByPrefix, $fp.PlacedByGitdir, $fp.GitdirProbes,
+                $fp.PathBlocksUnclassified,
+                $(if (@($fp.UnclassifiedPathToolNames).Count -gt 0) { " ($(@($fp.UnclassifiedPathToolNames) -join '/'))" } else { '' })) -ForegroundColor DarkGray
             if ($fp.LinesUnparseableElsewhere -gt 0) {
                 Write-Host ("    {0} unparseable line(s) in transcripts with no connection to this repo family -- counted, not refused (a machine-wide scan cannot fault on every session that is mid-append)." -f
                     $fp.LinesUnparseableElsewhere) -ForegroundColor DarkGray
@@ -1225,8 +1256,11 @@ if ($Json) {
                     linesUnparseableElsewhere = $fp.LinesUnparseableElsewhere
                     pathToolBlocks       = $fp.PathToolBlocks
                     pathBlocksExamined   = $fp.PathBlocksExamined
+                    pathBlocksUnclassified = $fp.PathBlocksUnclassified
+                    unclassifiedPathToolNames = @($fp.UnclassifiedPathToolNames)
                     toolNamesSeen        = @($fp.ToolNamesSeen)
                     writeToolsAllowList  = @($fp.WriteToolsAllowList)
+                    knownNonWriteTools   = @($fp.KnownNonWriteTools)
                     writeToolNamesSeen   = @($fp.WriteToolNamesSeen)
                     writesExamined       = $fp.WritesExamined
                     writesOutsideWindow  = $fp.WritesOutsideWindow
