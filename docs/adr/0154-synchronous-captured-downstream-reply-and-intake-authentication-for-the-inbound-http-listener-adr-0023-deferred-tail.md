@@ -1,7 +1,22 @@
 # ADR 0154 — Synchronous captured-downstream-reply and intake authentication for the inbound HTTP listener (the ADR 0023 deferred tail)
 
-- **Status:** Proposed (revision 5 — **all open items resolved; ready for owner ratification**, no code yet)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
-- **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5)
+- **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5; no code yet. Authorises INCREMENT A ONLY.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
+- **⚠️ What acceptance does and does not authorise.** "Accepted" normally means *build may start*. Here it
+  is **scoped**, because rev 4 split the build and that split is part of what was ratified:
+  - **Increment A — `intake_auth` + the D7 peer-control gate (D6, D7), plus the three incidental listener
+    defects — is AUTHORISED and may start now.** It closes a live hole: `check_http_tls_exposure` returns
+    early on truthy `tls`, so an off-loopback `Http(tls=True)` listener binds a PHI intake socket with no
+    peer identity requirement, and `tests/test_exposed_with_tls_passes` currently pins that as passing.
+    Acceptance criteria: **AC-11 … AC-16, AC-19**, plus **AC-17**.
+  - **Increment B — the synchronous captured-downstream reply (D1–D5, D8) — is NOT authorised yet.** It
+    remains deferred until a customer exists whose partner semantics can shape it. It carries roughly 70 %
+    of this document's complexity and effectively all of its concurrency risk, and there is no one to
+    serve. Do **not** read this Accepted status as a green light for `reply_from`. Acceptance criteria
+    **AC-1 … AC-10 and AC-18** are specified but dormant.
+
+  Building increment B requires a further owner decision, not merely a reading of this line. The design is
+  ratified; the *schedule* is deliberately partial.
 - **Revision 5 — every open item resolved, on one principle.** The owner confirmed there are **no deployed
   instances of MessageFoundry**: no production installs, no installed base, nobody to upgrade. That single
   fact settles the six remaining `To resolve on acceptance` items, because every one was a trade between
