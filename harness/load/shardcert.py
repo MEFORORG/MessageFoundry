@@ -61,7 +61,7 @@ from harness.load.coord import (
 from harness.load.corpus import SEQ_BASE_STRIDE, build_corpus
 from harness.load.correlator import Correlator
 from harness.load.enginepoll import EMPTY_POOL_STATS, EnginePoller, PoolStats
-from harness.load.failover import EngineNode
+from harness.load.failover import EngineNode, _insecure_bind_args
 from harness.load.failover_track import FailoverTracker
 from harness.load.ids import SHARDCERT_IDS
 from harness.load.metrics import Counters, Histogram, LiveMetrics
@@ -825,27 +825,6 @@ _FILLING_MIN_SAMPLES = 30
 # built to produce. A motivated instrument is worse than no instrument, so the ramp is dropped and the two
 # halves are EQUAL-LENGTH steady cohorts: ramp = [0, R*H), first = [R*H, (R+(1-R)/2)*H), second = [.., H).
 _FILLING_RAMP_FRACTION = 0.2
-
-# The loopback interfaces a co-located run binds — these NEVER trip serve's off-loopback plaintext-MLLP
-# exposure gate, so a co-located run's serve argv stays byte-identical (no extra flag). The two-box
-# engine binds ``0.0.0.0`` (off-box reach), which DOES trip the gate → the dev override below.
-_LOOPBACK_BIND_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
-
-
-def _insecure_bind_args(env: Mapping[str, str]) -> list[str]:
-    """``["--allow-insecure-bind"]`` when the serve subprocess binds its inbound listener on a
-    NON-loopback interface (``MEFOR_INBOUND_BIND_HOST`` = ``0.0.0.0`` / a NIC IP), else ``[]``.
-
-    A non-loopback plaintext MLLP bind trips serve's off-loopback exposure gate (ADR 0002 §0,
-    ``check_mllp_tls_exposure``) and is REFUSED at start without this dev override. The two-box cert
-    binds ``0.0.0.0`` so the off-box load-gen senders can reach the inbound ports, and accepts the
-    cleartext risk on the trusted, firewalled bench network — never a co-located loopback run (the
-    single-box ``run_shardcert`` + the SS-gated cert test), which omits the flag and keeps a
-    byte-identical argv."""
-    host = env.get("MEFOR_INBOUND_BIND_HOST")
-    if host is None or host in _LOOPBACK_BIND_HOSTS or host.startswith("127."):
-        return []
-    return ["--allow-insecure-bind"]
 
 
 class ShardCertNode(EngineNode):
