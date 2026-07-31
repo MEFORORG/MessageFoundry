@@ -72,6 +72,11 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "the Cert tooling row)",
     "Tray → engine TLS": "a tokenless local TLS probe; no engine-held key",
     "Engine-shard lane ownership": "a coordination record, not cryptographic material",
+    "Inbound HTTP intake credential comparison": "keyless — SHA-256 digests of both sides compared "
+    "with hmac.compare_digest, which is a constant-time byte comparison and NOT a keyed MAC. The "
+    "digesting exists to make the comparison length-blind, not to authenticate anything. The "
+    "configured secret is an env()-sourced connector setting whose lifecycle is the rotation "
+    "schedule, not engine-held key material",
 }
 
 
