@@ -19,7 +19,8 @@ dependency** (FastAPI/uvicorn are an ``api/`` concern).
 
 It is a faithful ``MLLPSource`` sibling: it inherits the per-connection IP allowlist, per-connection
 inbound TLS, the runner's exposed-gate (``check_http_tls_exposure``), ADR 0031 fault isolation, and the
-ADR 0021 OFF-by-default ``connection_event`` log. The DoS guards have HTTP analogs: ``max_connections``
+ADR 0021 ``connection_event`` log (**on by default** — ``[diagnostics].connection_events`` is ``True``
+and the per-connection flag inherits it; see ``docs/PHI.md`` §7). The DoS guards have HTTP analogs: ``max_connections``
 (connection-flood), ``receive_timeout`` (slow-loris — bounds the time to read the request line +
 headers + body), and ``max_body_bytes`` (the ``MLLPDecoder`` frame cap's HTTP twin — a
 ``Content-Length`` / read ceiling).
@@ -51,6 +52,7 @@ from messagefoundry.transports.mllp import (
     DEFAULT_RECEIVE_TIMEOUT,
     _mllp_ssl_context,
     _peer_host,
+    _set_tcp_nodelay,
 )
 
 __all__ = [
@@ -277,7 +279,7 @@ class HttpSource(SourceConnector):
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
 
     A faithful :class:`~messagefoundry.transports.mllp.MLLPSource` sibling: same bind/stop lifecycle,
-    per-connection IP allowlist, inbound TLS, and OFF-by-default ``connection_event`` plumbing."""
+    per-connection IP allowlist, inbound TLS, and on-by-default ``connection_event`` plumbing."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -378,6 +380,11 @@ class HttpSource(SourceConnector):
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
+        # Kill Nagle on the accepted socket, as MLLPSource does. One request per connection
+        # (build_response hardcodes Connection: close), so the 202 receipt is a single small write with
+        # no unacked data outstanding — precisely the shape Nagle holds until the peer's delayed-ACK
+        # timer fires. Best-effort and framing-neutral; see _set_tcp_nodelay.
+        _set_tcp_nodelay(writer)
         peer_host = _peer_host(writer)
         established = False
         failed = False
@@ -484,8 +491,24 @@ class HttpSource(SourceConnector):
         return False
 
     async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+        """Write the success-path response, bounding the drain.
+
+        The drain was unbounded: a peer that stops reading held the connection — and its
+        ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
+        liked, with no clock on it (``receive_timeout`` bounds the *read*, not the write). The refuse
+        path already bounds its drain the same way in ``_write_safely``; only the success path did not.
+
+        A timeout raises, and is handled by ``_on_client``'s existing ``OSError`` arm (``TimeoutError``
+        subclasses ``OSError``), which emits ``peer_reset`` and drops the connection. Deliberately not a
+        new ``connection_event`` kind: the vocabulary is asserted in CI against ``docs/PHI.md`` §7 and
+        the console's filter tuple as an exact set, so minting one is a three-file change, and
+        "the peer stopped reading" is what ``peer_reset`` already means to an operator.
+
+        The message is unaffected either way — it was durably committed to ingress before this write
+        (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
+        """
         writer.write(data)
-        await writer.drain()
+        await asyncio.wait_for(writer.drain(), _CLIENT_SHUTDOWN_GRACE)
 
     async def _write_safely(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         """Best-effort error/refuse response — never raise out of the refuse/close path (the socket may

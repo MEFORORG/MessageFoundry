@@ -30,6 +30,7 @@ from messagefoundry.pipeline.wiring_runner import (
     check_http_tls_exposure,
 )
 from messagefoundry.store.store import MessageStatus, MessageStore, Stage
+from messagefoundry.transports import http_listener as http_mod
 from messagefoundry.transports.base import build_source
 from messagefoundry.transports.http_listener import (
     DEFAULT_MAX_BODY_BYTES,
@@ -493,6 +494,63 @@ def test_status_line_reason_phrases() -> None:
     # An unmapped code must not inherit a phrase that contradicts it. RFC 9110 §15 allows an empty
     # reason-phrase; the SP before it is still required, so the line stays well-formed.
     assert _status_line(599) == "HTTP/1.1 599 "
+
+
+async def test_accepted_socket_disables_nagle(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # asyncio already sets TCP_NODELAY on selector-loop transports, so asserting the option value on
+    # the accepted socket would pass whether or not _on_client calls _set_tcp_nodelay — vacuous. Spy
+    # instead, the same way tests/test_mllp_tcp_nodelay.py proves the outbound dial.
+    calls: list[Any] = []
+    real_set = http_mod._set_tcp_nodelay
+
+    def spy(writer: Any) -> None:
+        calls.append(writer)
+        real_set(writer)  # keep the real effect so the round-trip below is unaffected
+
+    monkeypatch.setattr(http_mod, "_set_tcp_nodelay", spy)
+
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
+    )
+    src = await _start_source(store, ic)
+    try:
+        resp = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
+    finally:
+        await src.stop()
+    assert resp.status == 202
+    assert calls, "_on_client accepted a connection without disabling Nagle"
+
+
+async def test_respond_drain_is_bounded(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The success-path drain was unbounded, so a peer that stopped reading held its max_connections
+    # slot indefinitely — receive_timeout bounds the READ, nothing bounded the write. _write_safely
+    # already bounded the refuse path; only _respond did not.
+    assert issubclass(TimeoutError, OSError)  # so _on_client's existing OSError arm catches this
+
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
+    )
+    src = await _start_source(store, ic)
+    monkeypatch.setattr(http_mod, "_CLIENT_SHUTDOWN_GRACE", 0.05)
+
+    class _StalledWriter:
+        """A peer that accepts the write but never drains."""
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            await asyncio.sleep(30)
+
+    try:
+        with pytest.raises(TimeoutError):
+            await src._respond(_StalledWriter(), b"x")  # type: ignore[arg-type]
+    finally:
+        await src.stop()
 
 
 # --- API-18: bounded functional DoS-guard tests (slow-loris / max_connections / body-flood) ------
