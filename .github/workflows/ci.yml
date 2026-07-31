@@ -212,8 +212,17 @@ jobs:
       #     per-test dump is attributed first; this is the last-resort stack when the thread method is
       #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
       #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
-      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
-      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
+      # The step `timeout-minutes` (matrix `step_timeout`) is the outer backstop, held well under the
+      # job's own cap, so a hang both watchdogs somehow miss still fails the STEP (not the whole job at
+      # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
+      # an uninformative job-level kill with no step attribution.
+      #
+      # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
+      # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
+      # a failure on a run whose last line was "9598 passed, 855 skipped". A watchdog that cannot
+      # separate "deadlocked" from "slow today" stops being a watchdog and becomes a coin flip, so the
+      # ubuntu budget is raised here. Re-check the margin when the suite grows; the Windows legs are
+      # unchanged because 26 min against the same suite is still ~2x headroom.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
@@ -371,7 +380,7 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":15,"step_timeout":13,"pytest_timeout":60,"fault_timeout":90}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":22,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
