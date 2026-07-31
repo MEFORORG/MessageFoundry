@@ -55,6 +55,51 @@ scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracke
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
 
+## Your PR won't merge — triage before you touch anything
+
+With several sessions merging into one `main`, a PR that was green ten minutes ago routinely stops
+being mergeable. **Four states read as "can't merge" and three of them need different fixes**, so read
+the state before acting:
+
+```powershell
+gh pr view <N> --repo MEFORORG/MessageFoundry --json state,mergeStateStatus,mergeable
+```
+
+| `mergeStateStatus` | What it means | What to do |
+|---|---|---|
+| `BEHIND` | Branch isn't up to date with `main`; branch protection is strict | Rebase onto `origin/main`, `git push --force-with-lease`. Mechanical. |
+| `DIRTY` | A real merge **conflict** | Resolve hunks by hand. Not a rebase-and-push. |
+| `BLOCKED` | Required checks pending/failing, or a review is missing | **Usually: wait.** Check `statusCheckRollup` for actual failures before assuming it's yours. |
+| `UNKNOWN` | GitHub is still recomputing after a push | Re-query in a few seconds. Not a state to act on. |
+| `CLEAN` / `UNSTABLE` | Mergeable (`UNSTABLE` = a non-required check is red/pending) | Merge. |
+
+Three things that cost real time here:
+
+- **`BLOCKED` is the one that looks actionable and usually isn't.** Right after a push, every required
+  check is pending and the PR reads `BLOCKED` — identical to genuinely failing. Count failures in
+  `statusCheckRollup` before diagnosing; zero failures plus pending checks means wait.
+- **Armed auto-merge does *not* update a `BEHIND` branch here.** Landing PR A puts PR B `BEHIND`, and B
+  sits armed and stalled indefinitely. Someone has to rebase it. If you queue two PRs, expect to rebase
+  the second after the first lands.
+- **`BEHIND` and `DIRTY` are easy to confuse and the wrong fix is destructive.** Treating `DIRTY` as
+  `BEHIND` means resolving conflicts in a hurry to make a force-push succeed.
+
+### Resolving a conflict: never take a side wholesale
+
+`docs/BACKLOG.md` and `CHANGELOG.md` are single large files every session appends to, so they conflict
+most. **`--ours` and `--theirs` both produce a file that passes every check while silently dropping
+someone's work** — no gate catches it, because the result is well-formed.
+
+Re-apply intent instead: keep every entry from both sides, then verify the specific things you expect
+to survive. A real example — two PRs each adding a `### Changed` block under `[Unreleased]`: the union
+was correct, `--ours` would have dropped two already-published breaking-change notices, `--theirs`
+would have dropped the incoming one.
+
+And if your change involved a find-and-replace, **re-verify it after resolving**, not just after the
+original edit — conflict fixup is exactly when a sweep gets re-run carelessly. A renumber of `252` to
+`316` across `CHANGELOG.md` will happily turn `cp1252` into `cp1316`, in a file nobody re-reads. Scope
+replacements to the anchored forms (`BACKLOG #252`, `## 252.`), never the bare number.
+
 ## What's isolated vs shared
 
 | Isolated per worktree | Shared across worktrees |
