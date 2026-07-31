@@ -64,6 +64,12 @@ BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 # holding those refs, and it warns at allocation time if the all-refs maximum ever reaches this
 # boundary. Raising this number is a one-line reviewable source change, deliberately not an allowlist
 # file that would rot out of sight.
+#
+# THIS LINE IS PARSED, not imported: scripts/coord/alloc.ps1 regex-matches it so the floor is defined
+# exactly once and the allocator can never emit a number this gate refuses. Keep the name and the
+# literal on ONE line. A type annotation is tolerated; splitting, computing, or renaming it is not, and
+# would make every backlog allocation refuse. tests/test_ledger_check.py pins the contract, so that
+# break lands in CI on whoever edits this line rather than on an unrelated session days later.
 PUBLIC_BACKLOG_FLOOR = 1000
 
 

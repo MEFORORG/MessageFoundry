@@ -130,7 +130,11 @@ function Get-Floor {
 $gateFile = Join-Path $repo "scripts/hooks/ledger_check.py"
 $PublicBacklogFloor = $null
 if (Test-Path $gateFile) {
-    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*=\s*(\d+)')
+    # The optional `(?::[^=]+)?` tolerates a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000`
+    # is idiomatic in a mypy-strict codebase and would otherwise fail to match -- silently disarming
+    # every backlog allocation as the result of an ordinary tidy-up. tests/test_ledger_check.py pins
+    # this contract so the break lands in CI on whoever edits the constant, not on a session days later.
+    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)')
     if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
 }
 

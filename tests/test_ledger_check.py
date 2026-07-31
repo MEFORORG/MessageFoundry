@@ -11,6 +11,7 @@ what is asserted is the contract git will actually invoke.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -517,4 +518,45 @@ def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
     # ...and it must still MIGRATE an old standalone install away, or upgrading users stay broken.
     assert "Remove-Item -LiteralPath $preCommit" in src, (
         "the installer must remove a previously-installed standalone ledger hook"
+    )
+
+
+_ALLOC = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "alloc.ps1"
+
+# Kept deliberately identical to the pattern in scripts/coord/alloc.ps1 — the point of this test is to
+# fail the moment the two drift. A duplicated regex that is TESTED is not the same hazard as a
+# duplicated value that is not: this one fails loudly on drift, which is the property being bought.
+_FLOOR_RE = re.compile(r"(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)")
+
+
+def test_the_public_floor_is_parseable_by_the_allocator() -> None:
+    """`alloc.ps1` PARSES the floor out of this gate so the value is defined exactly once.
+
+    That coupling is to SOURCE TEXT, which is a weaker contract than an import, so it is pinned here.
+    Without this test the break is silent and lands on the wrong person: whoever reformats the constant
+    gets a green CI, and an unrelated session hits "refusing to allocate" days later — where the
+    tempting repair is to hardcode the floor back into alloc.ps1, re-creating the two-copies drift the
+    single source exists to remove.
+
+    The realistic break is a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000` is idiomatic in
+    a mypy-strict codebase and is tolerated; splitting, computing or renaming the value is not.
+    """
+    matches = _FLOOR_RE.findall(CHECK.read_text(encoding="utf-8"))
+    assert len(matches) == 1, (
+        "scripts/coord/alloc.ps1 parses PUBLIC_BACKLOG_FLOOR out of ledger_check.py and expects exactly "
+        f"one match; found {len(matches)}. Keep the name and the literal on one line."
+    )
+    assert int(matches[0]) > 0
+
+
+def test_the_allocator_still_parses_the_floor_the_same_way() -> None:
+    """The allocator's own regex must accept the constant as written — not merely a similar one."""
+    alloc_src = _ALLOC.read_text(encoding="utf-8")
+    assert "PUBLIC_BACKLOG_FLOOR" in alloc_src, (
+        "alloc.ps1 no longer reads the floor from the gate — the value is defined twice again"
+    )
+    # The annotation-tolerant form; if alloc.ps1 reverts to the naive `\s*=\s*` it breaks on Final[int].
+    assert r"(?::[^=]+)?" in alloc_src, (
+        "alloc.ps1's floor regex must tolerate a type annotation "
+        "(PUBLIC_BACKLOG_FLOOR: Final[int] = 1000), or an ordinary tidy-up silently disarms allocation"
     )
