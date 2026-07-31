@@ -1,7 +1,33 @@
 # ADR 0154 — Synchronous captured-downstream-reply and intake authentication for the inbound HTTP listener (the ADR 0023 deferred tail)
 
-- **Status:** Proposed (revision 4 — drafted, awaiting sign-off, no code yet)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
-- **Date:** 2026-07-30 (rev 1–4)
+- **Status:** Proposed (revision 5 — **all open items resolved; ready for owner ratification**, no code yet)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5)
+- **Revision 5 — every open item resolved, on one principle.** The owner confirmed there are **no deployed
+  instances of MessageFoundry**: no production installs, no installed base, nobody to upgrade. That single
+  fact settles the six remaining `To resolve on acceptance` items, because every one was a trade between
+  *the clean answer* and *not disturbing existing users* — and the second half of that trade does not
+  exist. The resolutions therefore all run the same way: **take the strict, clean option now, because this
+  is the cheapest it will ever be.**
+  - The peer-control gate **refuses** rather than warns (D7). A bare `tls`+`tls_ca_file` — "any cert this
+    CA ever signed", no subject binding — is an ineffective control and is treated as none. Rev 3 softened
+    this to a warning to avoid an "upgrade cliff"; there is no upgrade path, so that reasoning is
+    withdrawn. It also removes an internal inconsistency, since AC-16 always specified refusal.
+  - The `source_ip_allowlist` floor stays `/8` IPv4 and `/32` IPv6 — now justified on its merits
+    (`10.0.0.0/8` is a legitimate private scope; `0.0.0.0/0` is not) rather than on compatibility.
+  - All three additive methods are adopted — `reply_wait_state`, `record_message_event`,
+    `SlidingWindowRateLimiter.would_allow`. Each exists because a shipped primitive genuinely cannot serve
+    the need, and with no installed base a new store or limiter method disturbs nothing.
+  - A message with **two rows naming `reply_from` is refused** at check time rather than resolved by
+    "highest `response_seq` wins".
+  - The `gzip, chunked` framing gap is **filed separately as engine issue #98**, so a real defect is not
+    gated behind an ADR still in Proposed.
+
+  **The general lesson, recorded because it caused real errors in this document's own drafting:** this
+  engine *looks* mature — 0.3.x on PyPI, a large ADR corpus, a capacity certification, HA design, an
+  ASVS L3 self-assessment — and that appearance repeatedly induced reasoning about an installed base that
+  does not exist: a "forcing customer migration" in rev 1–3, an "upgrade cliff" in rev 3. Neither was real.
+  **Until there are deployments, backward compatibility is not a constraint and must not be argued as
+  one.** Every lab figure is likewise lab-measured, never field-observed.
 - **Revision 4 — priority correction, no design change.** The owner confirmed on 2026-07-30 that **there
   is no committed customer and no migration date**. Revisions 1–3 described the proxy-API shape as "the
   forcing case … a real migration" whose two halves were both "not optional for that feed" — language that
@@ -748,8 +774,15 @@ nobody is theatre. The predicate is therefore:
   (`/8` for IPv4, `/32` for IPv6 — generous, but it excludes `0.0.0.0/0` and `::/0`).
 
 `tls + tls_ca_file` **alone** no longer satisfies the gate; it satisfies the *confidentiality* gate, which is
-a different question. A configuration that fails the strength test but passes the presence test WARNs and
-records a `security_loosenings` row rather than refusing outright, so the upgrade path is not a cliff.
+a different question. A configuration that fails the strength test is treated exactly like one with no peer
+control at all — **refused** under `posture.enforcing and posture.is_phi`, warned otherwise — and is not
+given a softer landing for having a control that does not work. There is no installed base to protect:
+**MessageFoundry has no production deployments**, so nobody is running a CA-only client-cert listener that
+this would break. Strictness costs nothing today and never gets cheaper — the only moment a weak
+configuration can be stopped from becoming established practice is before anyone depends on it. An earlier
+draft softened this to a warning plus a `security_loosenings` row "so the upgrade path is not a cliff";
+there is no upgrade path, and that reasoning is withdrawn. This also removes an internal inconsistency,
+since AC-16 always specified refusal.
 
 Three deliberate choices:
 
@@ -1130,21 +1163,41 @@ the CIDR-aware predicate; the others are left as found.
     `tests/test_backlog_status_check.py` fails, so retiring BACKLOG #7's deferred tail is not a trivial doc
     touch-up.
 
-**Still open:**
+**All resolved as of rev 5 — see the header note for the through-line.**
 
-- [x] **Sequencing `capture_error_responses`.** ~~Blocking prerequisite, or fast-follow?~~ **Resolved by
-  rev 4:** neither. With no committed customer it is a normal roadmap item, and increment B — which is
-  where it would land — is itself deferred until a customer exists. Revisit when one does.
-- [ ] **The `reply_wait_state` read.** Confirm the additive metadata-only store method (three backends) rather
-  than reusing `outbox_for`, which is `SELECT *` and decrypts `last_error` on every tick.
-- [ ] **`record_message_event` as a public store method.** Confirm accepting one new public store method for
-  the two `message_events` kinds, or drop them to `connection_event` only (which is already public).
-- [ ] **The peer-control strength floor.** `/8` for IPv4 and `/32` for IPv6 are proposed as the
-  `source_ip_allowlist` prefix floor. Confirm the numbers, and confirm that a bare `tls`+`tls_ca_file` no
-  longer satisfying the gate is an acceptable upgrade-path break (WARN + `security_loosenings`, not refuse).
-- [ ] **`would_allow` on `SlidingWindowRateLimiter`.** Confirm the additive read-only method rather than
-  reshaping the intake limiter around the existing check-and-record `allow`.
-- [ ] **Multiple rows sharing `destination_name == reply_from`.** "Highest `response_seq` wins" is defined but
-  not designed. Refuse the configuration, or specify the semantics?
-- [ ] **The `gzip, chunked` read-to-EOF asymmetry.** A literal `Transfer-Encoding: chunked` is refused but a
-  legal multi-token value falls through. Fix here as a fourth incidental defect, or file separately?
+- [x] **Sequencing `capture_error_responses`.** ~~Blocking prerequisite, or fast-follow?~~ **rev 4:**
+  neither. With no committed customer it is a normal roadmap item, and increment B — where it would land —
+  is itself deferred until a customer exists. Revisit when one does.
+- [x] **The `reply_wait_state` read — YES, add it.** `outbox_for` is `SELECT *`, decrypts `last_error` on
+  every tick, and is scoped to `stage='outbound'` so it structurally cannot see a pending `routed` row —
+  the state D3 must distinguish. A metadata-only read on three backends is additive, touches no schema,
+  and there is no installed base for a new store method to disturb.
+- [x] **`record_message_event` as a public store method — YES, add it.** `_event` is private with no public
+  writer on the `QueueStore` protocol, so `reply_timeout` — the row this ADR calls its single most valuable
+  diagnostic — is otherwise unwritable from `pipeline/`. Dropping to `connection_event` alone would trade a
+  tamper-evident, operator-undisableable record for a diagnostics stream an operator can switch off.
+- [x] **The peer-control strength floor — `/8` IPv4, `/32` IPv6, and REFUSE rather than warn.** The floor
+  stands on its merits, not on compatibility: `10.0.0.0/8` is a legitimate private-network scope and
+  refusing it would be wrong, while `0.0.0.0/0` and `::/0` are excluded. A bare `tls`+`tls_ca_file` does
+  not satisfy the gate and is refused under an enforcing PHI posture like any other ineffective control —
+  see D7. There is nothing deployed to break.
+- [x] **`would_allow` on `SlidingWindowRateLimiter` — YES, add it.** The shipped `allow()` is
+  check-**and**-record with no read-only peek, so a pre-comparison consultation charges every request and
+  turns the failed-attempt budget into a throughput cap. Reshaping the intake path around the mutating
+  `allow` instead would mean charging successful authentications, which is the defect, not a workaround
+  for it.
+- [x] **Multiple rows sharing `destination_name == reply_from` — REFUSE the configuration.** "Highest
+  `response_seq` wins" is defined but not designed, and silently picking one of two captured replies to
+  return to a caller is the kind of ambiguity that produces an unreproducible support ticket. Refuse at
+  check time (two handlers both sending to `reply_from`, or a `resend_to` targeting it) and revisit only
+  with a real fan-out requirement. Nothing is deployed that this refusal could break.
+- [x] **The `gzip, chunked` read-to-EOF asymmetry — filed separately.** Verified against the source and
+  raised as engine issue **#98**: the check tests `transfer-encoding` for exact equality with `"chunked"`,
+  so a legal multi-token value falls through to `_read_to_eof`. It is a pre-existing listener defect
+  unrelated to this design, and gating it behind an ADR still in Proposed would delay a real fix. The two
+  remaining pre-existing gaps this ADR names — `Expect: 100-continue`, and `max_header_bytes` above 64 KiB
+  not honoured because `asyncio.start_server` is called without `limit=` — are recorded in #98 and remain
+  unfiled.
+
+**Nothing in this ADR now awaits an answer.** It is ready for the owner to accept or reject; the status
+line stays **Proposed** because ratification is the owner's, not the author's.
