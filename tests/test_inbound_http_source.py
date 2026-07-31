@@ -36,6 +36,8 @@ from messagefoundry.transports.http_listener import (
     DEFAULT_MAX_BODY_BYTES,
     HttpRequestError,
     HttpSource,
+    _read_body,
+    _read_head,
     _read_request,
     _status_line,
     build_response,
@@ -456,6 +458,44 @@ async def test_read_request_allows_single_content_length_get() -> None:
         await _reader_from(raw), max_header_bytes=8192, max_body_bytes=DEFAULT_MAX_BODY_BYTES
     )
     assert req.method == "GET" and req.body == b""
+
+
+async def test_read_head_returns_before_the_body_arrives() -> None:
+    # The point of the ADR 0154 D6 split, and the only way AC-11's "before any request body byte is
+    # read" is satisfiable. This head DECLARES a 1 MiB body and never sends a byte of it; if
+    # _read_head waited on the body — as the combined _read_request does — this would hang until the
+    # timeout instead of handing back a request whose credentials can be checked.
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1048576\r\n\r\n")
+    head = await asyncio.wait_for(_read_head(reader, max_header_bytes=8192), 2.0)
+    assert head.method == "POST"
+    assert head.body == b""
+
+
+async def test_read_head_then_read_body_reassembles_the_request() -> None:
+    # The halves compose losslessly: the head read must not consume or discard the body.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO")
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert head.body == b""
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b"HELLO"
+
+
+async def test_read_body_keeps_the_get_before_chunked_ordering() -> None:
+    # Pins a quirk the split could silently "fix": the GET/HEAD short-circuit runs BEFORE the chunked
+    # refusal, so a GET carrying Transfer-Encoding: chunked is accepted with an empty body. Hoisting
+    # the refusal into the head phase would look like hardening and would change shipped behaviour.
+    reader = await _reader_from(
+        b"GET /health HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+    # ... while a POST carrying it is still refused, in the body phase.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
+    head = await _read_head(reader, max_header_bytes=8192)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES)
+    assert excinfo.value.status == 400
 
 
 def test_build_response_shape() -> None:

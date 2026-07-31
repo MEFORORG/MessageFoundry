@@ -154,20 +154,28 @@ def build_response(status: int, body: str = "", *, content_type: str = "applicat
     return "\r\n".join(headers).encode("ascii") + payload
 
 
-async def _read_request(
+async def _read_head(
     reader: asyncio.StreamReader,
     *,
     max_header_bytes: int,
-    max_body_bytes: int | None,
 ) -> HttpRequest:
-    """Read + parse one HTTP/1.1 request from ``reader``, applying the header + body caps.
+    """Read + parse the request line and headers only, applying the header cap.
 
-    Hardened against the classic stdlib-HTTP pitfalls: an unbounded header read (header flood),
-    an unbounded / mismatched body (``Content-Length`` larger than the cap, or a body that never
-    arrives — bounded by the caller's ``receive_timeout``), and a malformed request line. Raises
-    :class:`HttpRequestError` (carrying the status + connection-event kind) on any of these so the
-    caller can answer synchronously **before** any ingress row is written."""
-    # 1. Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
+    Returns an :class:`HttpRequest` whose ``body`` is still empty; the caller decides when — and
+    whether — to read it, via :func:`_read_body`.
+
+    **The split is a security boundary, not tidying** (ADR 0154 D6). It is what lets intake
+    authentication examine a request's credentials *before* its body is buffered. Authenticating
+    after a combined read would let an anonymous peer command up to
+    ``max_connections × max_body_bytes`` of resident heap — transiently about twice that on the
+    no-``Content-Length`` path, where :func:`_read_to_eof` accumulates a chunk list and then joins it
+    — before a single credential byte was examined. The connection cap cannot shed that load either,
+    because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
+
+    Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
+    header read, a malformed request line, or ambiguous framing, so the caller can answer
+    synchronously **before** any ingress row is written."""
+    # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
     try:
         head = await reader.readuntil(b"\r\n\r\n")
     except asyncio.IncompleteReadError as exc:
@@ -213,13 +221,29 @@ async def _read_request(
         )
 
     method = method.upper()
-    # 2. Body — only for methods that carry one. GET/HEAD are health probes (no body read, no ingress).
-    if method in ("GET", "HEAD"):
-        return HttpRequest(method, target, headers, b"")
+    return HttpRequest(method, target, headers, b"")
+
+
+async def _read_body(
+    reader: asyncio.StreamReader,
+    head: HttpRequest,
+    *,
+    max_body_bytes: int | None,
+) -> bytes:
+    """Read the body belonging to an already-parsed ``head``, applying the body cap.
+
+    Split out of :func:`_read_request` so authentication can run between the two halves (see
+    :func:`_read_head`). The ordering inside is load-bearing and is preserved exactly as it shipped:
+    the GET/HEAD short-circuit runs **before** the chunked refusal, so a ``GET`` carrying
+    ``Transfer-Encoding: chunked`` is accepted with an empty body rather than refused. Hoisting that
+    refusal would read as hardening and would in fact be a silent behaviour change."""
+    # Only methods that carry a body read one. GET/HEAD are health probes (no body, no ingress).
+    if head.method in ("GET", "HEAD"):
+        return b""
 
     body = b""
-    cl_raw = headers.get("content-length")
-    if headers.get("transfer-encoding", "").lower() == "chunked":
+    cl_raw = head.headers.get("content-length")
+    if head.headers.get("transfer-encoding", "").lower() == "chunked":
         # Chunked intake is not part of the first slice — a partner that streams must use Content-Length.
         raise HttpRequestError(
             400, "chunked transfer-encoding is not supported", kind="framing_error"
@@ -235,10 +259,26 @@ async def _read_request(
             # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
             raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
         body = await _read_exactly(reader, content_length)
-    elif method in ("POST", "PUT", "PATCH"):
+    elif head.method in ("POST", "PUT", "PATCH"):
         # No Content-Length and not chunked: read to EOF (Connection: close), still bounded by the cap.
         body = await _read_to_eof(reader, max_body_bytes)
-    return HttpRequest(method, target, headers, body)
+    return body
+
+
+async def _read_request(
+    reader: asyncio.StreamReader,
+    *,
+    max_header_bytes: int,
+    max_body_bytes: int | None,
+) -> HttpRequest:
+    """Read + parse one whole HTTP/1.1 request — :func:`_read_head`, then :func:`_read_body`.
+
+    Retained as the composing wrapper after the ADR 0154 D6 split rather than replaced by it. It is
+    the shape the shipped 202-only path and its tests already use, and it keeps "read the whole
+    request" expressible in one call for any caller with no credential to check between the halves."""
+    head = await _read_head(reader, max_header_bytes=max_header_bytes)
+    head.body = await _read_body(reader, head, max_body_bytes=max_body_bytes)
+    return head
 
 
 async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
