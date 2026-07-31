@@ -7,6 +7,38 @@ All notable changes to MessageFoundry are documented here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **BREAKING — an `[[alerts.rules]]` block that routes to an unconfigured transport now refuses at
+  startup instead of being silently ignored.** `notifier_from_settings` returned early when **no**
+  transport was configured, *before* the loop that cross-checks each rule's `transports` against the
+  ones that exist. So the fail-loud guarantee held everywhere except the state an operator is most
+  likely to be in while first setting alerts up: with one transport configured, a rule naming a
+  different one was a hard `ValueError` at startup; with **zero** configured, the identical rule was
+  accepted and then **never applied**, and nothing said so. Validation now runs first.
+  **Who this bites:** an instance where `[[alerts.rules]]` exist AND at least one rule or escalation
+  tier sets a non-empty `transports` AND no transport is actually configured (`webhook_url` unset, and
+  **not all three** of `email_smtp_host` + `email_from` + `email_to` set — the email transport needs
+  all three, which is what makes a half-filled `[alerts]` block look configured). Such an instance
+  starts today and will refuse after upgrading.
+  **Why this is safe to take:** in that state the rule has **never routed a single alert**. The
+  refusal removes no working behaviour — it converts a permanent silent no-op into a startup error
+  that names the exact keys to add. A rule that names **no** transport is unaffected and still starts
+  (now with a warning when rules exist that cannot notify anyone), so the ordinary "write the rules
+  first, wire the transport later" flow keeps working.
+  The same cross-check now runs at **authoring** time: `messagefoundry alert add` (which the VS Code
+  "New Alert" command shells) refuses a rule routing to an unconfigured transport rather than
+  persisting a file that only fails at the next boot. It is scoped to the rule being added, so a file
+  that already contains a bad rule can still be repaired with `alert remove`.
+- **A mail-only or Direct-only PHI instance can now satisfy the open-egress startup gate by declaring
+  its destinations.** `[egress]` has eight `allowed_*` lists and all eight are enforced downstream,
+  but the startup gate hand-enumerated six: `allowed_smtp` and `allowed_direct` were absent, so an
+  instance whose only egress is `Email()` or `Direct()` exited 2 with *"outbound egress is
+  UNRESTRICTED"* while holding a fully-enumerated allow-list, and nothing in the message named the two
+  lists that did not count. The two are now counted — deliberately **only** when
+  `[security].block_unlisted_outbound` is left unset, which is exactly the state the deny-by-default
+  flip turns ON, so such an instance starts **fail-closed**. An instance that explicitly set
+  `block_unlisted_outbound = false` is unchanged and still refused, because there the other six
+  transports stay allow-any; the refusal now names that override as the reason. **No shipped refusal
+  stops firing.**
 - **BREAKING — a non-loopback DICOM C-STORE SCP now requires a *verifiable* peer control;
   `calling_ae_allowlist` no longer satisfies the gate on its own.** The fail-closed peer-control check
   refuses a remotely-reachable SCP that has no peer control, and it accepted any one of three:
@@ -32,6 +64,25 @@ All notable changes to MessageFoundry are documented here. The format follows
   documenting the weakness without changing the gate.
 
 ### Fixed
+- **The DICOM C-STORE SCP's fail-closed refusal named a settings key that does not exist.** It told
+  the operator to set `[inbound].source_ip_allowlist`; `InboundSettings` has no such field and section
+  models ignore unknown keys, so an operator following the engine's **own error message** wrote a key
+  into `messagefoundry.toml` that was accepted and silently discarded — leaving a non-loopback SCP
+  with no peer-IP gate while believing it had one. Aggravated by the construction gate *counting*
+  controls: a `calling_ae_allowlist` (a caller-asserted AE Title with no cryptographic binding) plus
+  the discarded key passed the check. The message now names the working surface — the `inbound(...)`
+  keyword, which for a DICOM SCP is the **only** one, since `DICOM()` is not authorable in
+  `connections.toml` — and distinguishes it from the `connections.toml` `[[inbound]]` key that *is*
+  real, so a site running MLLP alongside DICOM cannot read it as licence to delete a working
+  allowlist. The same wrong spelling is corrected in the module docstring, the gate comment,
+  `config/wiring.py`, `config/settings.py`, `docs/SECURITY.md` and `docs/ASVS-L2-PHASE0-CHANGES.md`.
+  Whether an AE-title list alone should keep satisfying that gate is tracked as **BACKLOG #252** — it
+  is an ADR 0025 §9 contract change and is deliberately **not** decided here.
+- **Two startup gates described themselves against the deployment tier rather than the enforcement
+  dial.** Comments on the managed-identity and security-notification gates read "refuse (production) /
+  warn (non-production)" over branches that read `enforcing` — and `enforce` is the shipped default on
+  `dev` and `staging` as much as on `prod`, so all three refuse. Comment-only, no behaviour change,
+  but these are the comments two published documentation defects were copied from.
 - **The load harness's no-loss reconcile did not enforce the `read >= sent // 2` intake guarantee
   0.3.2 documented.** The unconfirmed-send excusal is capped at `max(connections, half the run)`, but
   that `max()` takes the connection count as a *floor*, and every call site passes a connection count
