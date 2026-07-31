@@ -158,13 +158,30 @@ def test_nonloopback_scp_without_any_peer_control_fails_closed() -> None:
     with pytest.raises(ValueError) as exc:
         _scp("0.0.0.0")
     msg = str(exc.value)
-    assert "calling_ae_allowlist" in msg
     assert "source_ip_allowlist" in msg
     assert "mTLS" in msg
 
 
-def test_nonloopback_scp_with_calling_ae_allowlist_ok() -> None:
-    _scp("0.0.0.0", calling_ae_allowlist=["MOD1"])  # no raise
+def test_nonloopback_scp_with_only_calling_ae_allowlist_fails_closed() -> None:
+    """BACKLOG #316: an AE-title list no longer satisfies the gate alone.
+
+    A Calling AE Title is asserted by the caller in the association request — no key, no signature,
+    nothing to verify — and AE Titles are published in conformance statements. Before the amendment
+    this construction succeeded, so an SCP reachable by anyone who knew one string passed a check
+    named "fail-closed peer controls". The refusal must say specifically why the AE list is not
+    enough, or the operator just re-reads it as "I already set an allowlist".
+    """
+    with pytest.raises(ValueError) as exc:
+        _scp("0.0.0.0", calling_ae_allowlist=["MOD1"])
+    msg = str(exc.value)
+    assert "calling_ae_allowlist" in msg
+    assert "cannot be verified" in msg
+    assert "filter" in msg  # tells them to KEEP it, not delete it
+
+
+def test_nonloopback_scp_with_paired_ae_and_ip_allowlist_ok() -> None:
+    # The amendment PAIRS rather than removes: the AE list stays useful, alongside a verifiable control.
+    _scp("0.0.0.0", calling_ae_allowlist=["MOD1"], source_ip_allowlist=["10.0.0.0/8"])  # no raise
 
 
 def test_nonloopback_scp_with_source_ip_allowlist_ok() -> None:
