@@ -36,8 +36,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import ssl
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.redaction import safe_exc
@@ -138,19 +139,64 @@ def _status_line(status: int) -> str:
     return f"HTTP/1.1 {status} {reason}"
 
 
-def build_response(status: int, body: str = "", *, content_type: str = "application/json") -> bytes:
+#: A header field-name: RFC 9110 ``token`` — one or more ``tchar``. Notably excludes ``:`` and space.
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+#: A header field-value: printable US-ASCII, no leading or trailing space, and **no control
+#: characters at all** — which is what excludes CR and LF, the header-injection primitive.
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+
+
+def _validated_header(name: str, value: str) -> str:
+    """One serialized ``Name: value`` line, or raise if either side could break the header block.
+
+    **Rejects rather than sanitises** (ADR 0154 D5 / AC-9). The existing
+    ``_strip_header_control_chars`` helper cannot serve here: it contains no regex and it *removes*
+    offending characters, which would silently reshape a partner's ``Content-Type`` into something
+    they never sent instead of failing the turn.
+
+    Uses ``re.fullmatch`` deliberately, never a ``$``-anchored ``re.match``: in Python ``$`` also
+    matches immediately before a trailing newline, so ``match(r"...$", "text/plain\\r\\n...")`` would
+    accept the very injection this exists to stop.
+
+    The offending **value is never placed in the exception** — it is partner-controlled and, on the
+    capture path, potentially PHI. The header name is enough to diagnose the configuration.
+    """
+    if not _HEADER_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid HTTP header name: {name!r}")
+    if not _HEADER_VALUE_RE.fullmatch(value):
+        raise ValueError(
+            f"invalid HTTP header value for {name!r} (control characters or whitespace)"
+        )
+    return f"{name}: {value}"
+
+
+def build_response(
+    status: int,
+    body: str = "",
+    *,
+    content_type: str = "application/json",
+    extra_headers: Mapping[str, str] | None = None,
+) -> bytes:
     """Serialize a minimal HTTP/1.1 response. ``Connection: close`` — the first slice is
     one-request-per-connection (no keep-alive), which sidesteps a pipelining/half-close attack surface
-    and matches the fire-and-forget webhook shape. No PHI is ever placed in a response body here."""
+    and matches the fire-and-forget webhook shape. No PHI is ever placed in a response body here.
+
+    ``extra_headers`` carries the auth challenges intake authentication owes a peer —
+    ``WWW-Authenticate`` on a ``401``, ``Retry-After`` on a ``429``.
+
+    **Every header name and value, including ``content_type``, is validated here rather than at the
+    call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
+    value carrying CR or LF is a header-injection primitive, and validating in the callers would mean
+    each future consumer has to remember. Today every caller passes a literal, so this guards against
+    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``."""
     payload = body.encode("utf-8")
     headers = [
         _status_line(status),
-        f"Content-Type: {content_type}",
+        _validated_header("Content-Type", content_type),
         f"Content-Length: {len(payload)}",
-        "Connection: close",
-        "",
-        "",
     ]
+    headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
+    headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload
 
 

@@ -506,6 +506,46 @@ def test_build_response_shape() -> None:
     assert out.endswith(b'{"ok":1}')
 
 
+def test_build_response_carries_extra_headers() -> None:
+    # What lets a 401 carry WWW-Authenticate and a 429 carry Retry-After (ADR 0154 D6 wire shapes).
+    out = build_response(
+        401,
+        '{"error":"unauthorized"}',
+        extra_headers={"WWW-Authenticate": "Bearer", "Retry-After": "60"},
+    )
+    assert out.startswith(b"HTTP/1.1 401 Unauthorized\r\n")
+    assert b"WWW-Authenticate: Bearer\r\n" in out
+    assert b"Retry-After: 60\r\n" in out
+    assert b"Connection: close\r\n" in out
+
+
+def test_build_response_rejects_header_injection_rather_than_stripping_it() -> None:
+    # AC-9: REJECT, do not sanitise. _strip_header_control_chars removes offending characters, which
+    # would silently reshape a partner's Content-Type into something they never sent.
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\r\nX-Injected: 1")
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", extra_headers={"Retry-After": "60\r\nX-Injected: 1"})
+    with pytest.raises(ValueError, match="header name"):
+        build_response(200, "{}", extra_headers={"X-Bad\r\nInjected": "1"})
+    with pytest.raises(ValueError, match="header name"):
+        build_response(200, "{}", extra_headers={"X Bad": "1"})  # space is not a tchar
+
+    # The specific trap the guard is written against: a $-anchored re.match ACCEPTS a trailing
+    # newline, so a lone LF at the end must be rejected too — not just an embedded CRLF.
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\n")
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\r")
+
+    # A rejected value must not leak into the error text: on the capture path it is partner
+    # controlled and potentially PHI. The header NAME is enough to diagnose.
+    with pytest.raises(ValueError) as excinfo:
+        build_response(200, "{}", extra_headers={"X-Reply-Type": "application/json\r\nMRN: 100"})
+    assert "100" not in str(excinfo.value)
+    assert "X-Reply-Type" in str(excinfo.value)
+
+
 def test_status_line_reason_phrases() -> None:
     # The at-capacity refusal (_on_client) has always emitted 503, and _status_line's "OK" default
     # serialised it as `HTTP/1.1 503 OK` — a success phrase on a failure code. Asserted here rather
