@@ -163,7 +163,7 @@ def test_nonloopback_scp_without_any_peer_control_fails_closed() -> None:
 
 
 def test_nonloopback_scp_with_only_calling_ae_allowlist_fails_closed() -> None:
-    """BACKLOG #252: an AE-title list no longer satisfies the gate alone.
+    """BACKLOG #316: an AE-title list no longer satisfies the gate alone.
 
     A Calling AE Title is asserted by the caller in the association request — no key, no signature,
     nothing to verify — and AE Titles are published in conformance statements. Before the amendment

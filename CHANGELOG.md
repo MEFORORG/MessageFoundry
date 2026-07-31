@@ -28,7 +28,7 @@ All notable changes to MessageFoundry are documented here. The format follows
   `calling_ae_allowlist`. It starts today and will refuse after upgrading. The fix is one line — add
   `source_ip_allowlist=[...]` to the `inbound(...)` call, which for a DICOM SCP is the only authoring
   surface — and the refusal names it. Keep the AE list; it is still doing work.
-  Tracked as **BACKLOG #252**. Options considered and declined: an audited opt-out switch, and
+  Tracked as **BACKLOG #316**. Options considered and declined: an audited opt-out switch, and
   documenting the weakness without changing the gate.
 
 ### Fixed

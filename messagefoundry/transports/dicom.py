@@ -177,7 +177,7 @@ class DicomScpSource(SourceConnector):
         self._timeout = float(s.get("timeout_seconds", 30.0))
         # Build the TLS context now so a bad cert/key fails at build, not at bind (like MLLP/LDAPS).
         self._ssl = _server_ssl_context(s)
-        # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #252):
+        # Fail-closed peer controls (SEC-012, deny-by-default; tightened by BACKLOG #316):
         # a non-loopback SCP with no VERIFIABLE peer control is refused at construction. DIMSE has no
         # transport auth of its own, so a remotely-reachable SCP must gate peers by the per-connection
         # source_ip_allowlist (an inbound(...) keyword — NOT an [inbound] service-settings key, which does
@@ -199,7 +199,7 @@ class DicomScpSource(SourceConnector):
         if self._host not in _LOOPBACK_HOSTS and not (self._source_ip_allowlist or mtls_on):
             unpaired = (
                 " You set calling_ae_allowlist, but an AE Title is asserted by the caller and cannot be"
-                " verified, so it no longer satisfies this gate alone (BACKLOG #252) — keep it as a"
+                " verified, so it no longer satisfies this gate alone (BACKLOG #316) — keep it as a"
                 " filter and add one of the two controls above."
                 if self._calling_ae_allowlist
                 else ""
