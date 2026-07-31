@@ -317,6 +317,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).
     "tee/mefor_api.py": frozenset({"ssl"}),
+    # ADR 0155: the DAST scan target generates a THROWAWAY per-run password (secrets.token_urlsafe) for
+    # the two ephemeral scan identities it provisions into a store it creates empty in a temp directory
+    # and destroys with it. Not a key and never persisted: a checked-in constant would be strictly
+    # weaker, and the alternative — an operator-supplied credential — is the optional escape hatch only.
+    "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 
 
