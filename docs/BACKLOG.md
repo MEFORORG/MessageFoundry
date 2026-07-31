@@ -7275,3 +7275,37 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 **Related:** ADR 0025 §9, `docs/SECURITY.md` DICOM peer-control row, `tests/test_dicom_scp_security.py::test_nonloopback_scp_with_calling_ae_allowlist_ok` (pins the current behaviour, so it changes with the decision).
 
 **Source:** adversarial documentation security review (2026-07-30); the message/doc half shipped alongside this filing.
+
+## 319. AG-rig validation: prove the multi-subnet failover reconnect
+
+> 🔢 **Filed 2026-07-31 — not started. This needs HARDWARE, not a decision.** `[store].multi_subnet_failover` shipped (#100, 2026-07-10) and is **unit-tested only** — it has never been pointed at a real cross-subnet availability group. Until it is, [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5 must keep mandating a planned DB outage, because "the setting exists" is not the same claim as "the reconnect works".
+
+**Cluster:** Server DB / HA. **Priority:** P2. **Verdict:** build (test execution). **Severity:** medium — no defect is known; the cost is a maintenance window every multi-subnet adopter takes and may not need.
+
+**What:** stand up a two-subnet WSFC with an Always On availability group and a listener, run the engine against it with `[store].multi_subnet_failover = true`, force a failover, and measure whether the engine reconnects — and how that compares to the DNS-side workaround §4.5 currently prescribes.
+
+**Why it is worth hardware:** §4.5 tells a DBA to run `Stop-ClusterResource` / `Start-ClusterResource` on the AG listener to apply Microsoft's `RegisterAllProvidersIP=0` workaround. That is a planned DB outage, and the doc's own comment schedules it "like a §5.2 short planned DB blip". The premise for it was that the engine had no AG-aware connection keyword — which stopped being true on 2026-07-10. The premise is corrected (PR #99) but the instruction stands, deliberately: telling a hospital DBA they can skip a maintenance window on the strength of an unvalidated setting risks converting a scheduled outage into an unplanned one during a real failover. Only a rig can retire it.
+
+**Set the listener back to the default first.** If the rig's listener is already at `RegisterAllProvidersIP = 0` — because someone followed §4.5 — you are measuring the workaround, not the keyword. Confirm `RegisterAllProvidersIP = 1` before starting, and state that you did.
+
+**What to measure:**
+
+1. Does the engine reconnect at all after a cross-subnet failover, with the workaround **not** applied?
+2. How long, from failover to first successful store write — against the workaround path (DNS TTL expiry plus cross-site DNS/AD replication) as the comparison. If the keyword is not clearly better, that is a real result and changes the answer.
+3. What happens to in-flight messages across the gap — lost, duplicated, or held? The engine is at-least-once; confirm rather than assume.
+4. Failover **and** failback.
+5. A control run with `multi_subnet_failover = false` on the same rig. Without it the improvement cannot be attributed to the setting.
+
+**The three questions the §4.5 rewrite is waiting on:**
+
+- Does the keyword remove the need for the listener restart on a **greenfield** listener (still at `RegisterAllProvidersIP = 1`)?
+- What does a **brownfield** site do — one already at `RegisterAllProvidersIP = 0`? The keyword only helps when every subnet IP is published, so the expectation is that undoing the workaround still costs a restart. Confirm or refute; it decides whether the rewrite can promise existing deployments anything.
+- What is the **engine-version floor**? The setting shipped 2026-07-10; `AOAG-DEPLOYMENT.md` carries no version vocabulary today.
+
+**Explicitly not this item:** the `db_lookup` gap. `transports/database.py` builds its own connection string and emits no `MultiSubnetFailover`, so a deployment reaching the same listener through the DATABASE connector needs the DNS-side configuration regardless of what this rig measures. Whether that connector should get the keyword is a separate owner decision — do not let a green result here be read as "the workaround is obsolete".
+
+**Do not extrapolate from the AD lab.** [`plan-11/w19-ad-lab-integration-validation.md`](releases/plan-11/w19-ad-lab-integration-validation.md) covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
+
+**Related:** #100 (the shipped setting), [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5 / §5.3, `messagefoundry/config/settings.py` (`multi_subnet_failover`, default `false`), `messagefoundry/store/sqlserver.py` (`connection_string`), [`CONFIGURATION.md`](CONFIGURATION.md).
+
+**Source:** filed 2026-07-31 while correcting two stale claims in `AOAG-DEPLOYMENT.md` (PR #99). The validation gap was visible only as a line in a plan-11 doc and was not tracked work — a closed item with outstanding validation, which is the shape that goes missing.
