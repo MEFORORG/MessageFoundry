@@ -9,7 +9,27 @@
   land (both append providers). Increment 1 is **table-only** — it touches **no** `Stage` enum value or
   stage-aware `queue` primitive — so it does **not** require the fleet-wide stage-model freeze (that gate
   applies only to an Increment-2 `Stage.RESPONSE`).
-- **Built:** nothing yet. This document is the design only.
+- **Built:** **both increments.** *Increment 1 (capture + correlate)* — `complete_with_response`
+  ([store.py:4905](../../messagefoundry/store/store.py)) and `correlate_response`
+  ([store.py:5526](../../messagefoundry/store/store.py)) on the `QueueStore` protocol
+  ([base.py:639](../../messagefoundry/store/base.py)), at parity on Postgres
+  ([postgres.py:3256](../../messagefoundry/store/postgres.py)) and SQL Server
+  ([sqlserver.py:4098](../../messagefoundry/store/sqlserver.py)), called by the delivery worker at
+  [wiring_runner.py:4143](../../messagefoundry/pipeline/wiring_runner.py) (`tests/test_response_capture.py`).
+  *Increment 2 (re-ingress)* — subsequently given its own "go" and built under
+  [ADR 0013 Increment 2](0013-increment-2-reingress-design.md): the `Stage.RESPONSE` work-row
+  ([store.py:357](../../messagefoundry/store/store.py)), the atomic `ingress_handoff`
+  ([store.py:5212](../../messagefoundry/store/store.py)) drained by `_response_worker`
+  ([wiring_runner.py:4656](../../messagefoundry/pipeline/wiring_runner.py)), and the `Loopback()`
+  ([wiring.py:1274](../../messagefoundry/config/wiring.py)) / `reingress_to=`
+  ([wiring.py:3444](../../messagefoundry/config/wiring.py)) declaration surface
+  (`tests/test_reingress.py`) — **core built**, with its Q7 follow-up still open (a per-delivery
+  `OutboxItem.correlation_id` and the `GET /messages/{id}/chain` view; message-level
+  `correlation_id`/`correlation_root_id` already link the chain). Both amendments below are built too —
+  the `response_headers=` carriage on `complete_with_response` (stored as `resp_headers`, #154) and
+  `capture_out_params` ([wiring.py:1757](../../messagefoundry/config/wiring.py), #67). **The Status
+  line's "Increment 1 … authorized to build; Increment 2 … deferred" is the 2026-06-14 ratification
+  record, not current state.**
 - **Decision in one line:** let a response-capable outbound **return its partner's reply** from `send()`
   as a typed `DeliveryResponse`; the delivery worker persists it **inside the same single committed
   transaction as `mark_done`** into a dedicated **immutable `response` artifact table** (a sibling of
