@@ -14,14 +14,16 @@ configuration whose failure mode would otherwise be silent or total.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 from typing import Any
 
 import pytest
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.config.wiring import Http, WiringError, env
-from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter
+from messagefoundry.pipeline.wiring_runner import _IntakeRateLimiter, check_http_intake_auth
 from messagefoundry.transports.http_listener import HttpRequestError, HttpSource
 
 KEY = "acme-intake-key"
@@ -481,6 +483,114 @@ def test_global_limit_trip_does_not_deny_authenticated_peer() -> None:
 
     # An unknown third peer is correctly subject to the exhausted global arm.
     assert not limiter.check("stranger")
+
+
+# --- D7: the posture-keyed peer-control gate ----------------------------------------------------
+
+PROD_PHI = HopPosture(is_phi=True, enforcing=True)
+STAGING_PHI = HopPosture(is_phi=True, enforcing=False)  # PHI, but the dial is at warn
+SYNTHETIC = HopPosture(is_phi=False, enforcing=True)  # no real PHI
+
+
+def _http_source(**settings: Any) -> Source:
+    base: dict[str, Any] = {"host": "0.0.0.0", "port": 8080}
+    base.update(settings)
+    return Source(type=ConnectorType.HTTP, settings=base)
+
+
+def test_offloopback_without_effective_peer_control_refused_by_posture() -> None:
+    """AC-16, and the live hole this increment exists to close."""
+    # THE HOLE: tls=True satisfies check_http_tls_exposure, which returns early on truthy tls, so this
+    # binds a PHI intake socket off-loopback with no peer identity requirement at all.
+    exposed = _http_source(tls=True, tls_cert_file="/tmp/server.pem")
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(exposed, "IB_HTTP", posture=PROD_PHI)
+
+    # Warn, don't refuse, outside an enforcing PHI posture — and never crash the engine.
+    check_http_intake_auth(exposed, "IB_HTTP", posture=STAGING_PHI)
+    check_http_intake_auth(exposed, "IB_HTTP", posture=SYNTHETIC)
+    # posture=None is a direct/embedding call: a NEW refusal must not start firing for those.
+    check_http_intake_auth(exposed, "IB_HTTP", posture=None)
+
+    # A loopback bind is untouched — byte-identical start, whatever the posture.
+    for host in ("127.0.0.1", "localhost", "::1", "127.0.0.5", ""):
+        check_http_intake_auth(_http_source(host=host), "IB_HTTP", posture=PROD_PHI)
+
+    # A non-HTTP source is not this gate's business.
+    check_http_intake_auth(
+        Source(type=ConnectorType.MLLP, settings={"host": "0.0.0.0"}), "IB", posture=PROD_PHI
+    )
+
+
+def test_a_bare_ca_does_not_satisfy_the_gate() -> None:
+    # tls + tls_ca_file means "any certificate this CA ever signed" — no subject binding, so it is not
+    # a peer control. It satisfies the CONFIDENTIALITY gate, which is a different question.
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(
+            _http_source(tls=True, tls_cert_file="/tmp/s.pem", tls_ca_file="/tmp/ca.pem"),
+            "IB_HTTP",
+            posture=PROD_PHI,
+        )
+    # ... and it does once a subject list binds it to someone in particular.
+    check_http_intake_auth(
+        _http_source(
+            tls=True,
+            tls_cert_file="/tmp/s.pem",
+            tls_ca_file="/tmp/ca.pem",
+            intake_auth="mtls_subject",
+            intake_client_subjects=["CN:partner.example"],
+        ),
+        "IB_HTTP",
+        posture=PROD_PHI,
+    )
+
+
+def test_intake_auth_satisfies_the_gate() -> None:
+    for mode in ("api_key", "bearer"):
+        check_http_intake_auth(
+            _http_source(intake_auth=mode, intake_api_key=KEY), "IB_HTTP", posture=PROD_PHI
+        )
+    # A mode with no resolved credential is not a control — it would refuse everything, not admit
+    # the right peer, and an operator reading the config would think they were protected.
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(
+            _http_source(intake_auth="api_key", intake_api_key=None), "IB_HTTP", posture=PROD_PHI
+        )
+
+
+def test_source_ip_allowlist_must_meet_the_prefix_floor() -> None:
+    # The floor is what stops an allow-list that allow-lists the internet from reading as a control.
+    for permitted in (["10.0.0.0/8"], ["192.168.1.0/24"], ["10.1.2.3"], ["fd00::/32"]):
+        check_http_intake_auth(
+            _http_source(source_ip_allowlist=permitted), "IB_HTTP", posture=PROD_PHI
+        )
+
+    for worthless in (["0.0.0.0/0"], ["::/0"], ["10.0.0.0/7"], ["fd00::/31"]):
+        with pytest.raises(WiringError, match="no effective peer control"):
+            check_http_intake_auth(
+                _http_source(source_ip_allowlist=worthless), "IB_HTTP", posture=PROD_PHI
+            )
+
+    # ONE too-wide entry defeats the whole list — otherwise a narrow entry launders a broad one.
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(
+            _http_source(source_ip_allowlist=["10.0.0.0/8", "0.0.0.0/0"]),
+            "IB_HTTP",
+            posture=PROD_PHI,
+        )
+
+    # An unparseable entry cannot be SHOWN to restrict anyone, so it does not count as one.
+    with pytest.raises(WiringError, match="no effective peer control"):
+        check_http_intake_auth(
+            _http_source(source_ip_allowlist=["not-a-cidr"]), "IB_HTTP", posture=PROD_PHI
+        )
+
+
+def test_the_gate_never_consults_allow_insecure_bind() -> None:
+    # Deliberate signature divergence from its four siblings: handing a CLEARTEXT escape hatch the
+    # power to also waive AUTHENTICATION is a category error. Asserted structurally so nobody
+    # "restores consistency" by adding the parameter later.
+    assert "allow_insecure_bind" not in inspect.signature(check_http_intake_auth).parameters
 
 
 def test_per_peer_arm_still_bounds_an_authenticated_peer() -> None:

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import functools
+import ipaddress
 import json
 import logging
 import time
@@ -71,6 +72,8 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
+    current_hop_posture,
+    is_loopback_hop_host,
 )
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -2074,6 +2077,11 @@ class RegistryRunner:
             allow_insecure_bind=self._allow_insecure_bind,
             posture=self._hop_posture,
         )
+        # ADR 0154 D7, immediately after its confidentiality sibling and deliberately separate from it:
+        # check_http_tls_exposure returns early whenever tls is truthy, which is exactly the case an
+        # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
+        # cleartext escape hatch does not get to waive authentication.
+        check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -5944,6 +5952,14 @@ def _build_check_connectors(
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
+        # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
+        # fire at `messagefoundry check`, so without this a config that refuses to start would pass
+        # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
+        # the ADR describes this arm as running "without a posture", but that is not true of the
+        # source — build_check_registry takes one and `messagefoundry check` passes the real derived
+        # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
+        # would leave this gate weaker at check time than every posture-keyed neighbour.
+        check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
         build_source(source_cfg)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a
@@ -6332,6 +6348,94 @@ def check_http_tls_exposure(
         "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
         "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
+
+
+#: Minimum prefix length an entry of ``source_ip_allowlist`` must carry before it counts as an
+#: effective peer control (ADR 0154 D7). Generous on purpose — ``/8`` admits ``10.0.0.0/8``, a
+#: legitimate private scope — but it excludes ``0.0.0.0/0`` and ``::/0``, which allow-list the entire
+#: internet while reading, in a config file, exactly like a restriction.
+_INTAKE_ALLOWLIST_MIN_PREFIX_V4 = 8
+_INTAKE_ALLOWLIST_MIN_PREFIX_V6 = 32
+
+
+def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
+    """Whether this HTTP listener actually requires a peer to be someone in particular.
+
+    **Strength-based, not presence-based.** Each of the obvious presence tests has a trivially
+    worthless satisfying instance: ``source_ip_allowlist = ["0.0.0.0/0"]`` parses fine and restricts
+    nobody, and ``tls`` + ``tls_ca_file`` means *"any certificate this CA ever signed"* — no subject
+    binding at all. A gate satisfied by controls that authenticate nobody is theatre, so a
+    configuration that fails this test is treated exactly as one with no control, and is not given a
+    softer landing for having a control that does not work.
+    """
+    mode = str(settings.get("intake_auth") or "none")
+    if mode in ("api_key", "bearer"):
+        return bool(settings.get("intake_api_key"))
+    if mode == "mtls_subject":
+        # The subject list is what tls_ca_file alone does not give you.
+        return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
+
+    allowlist = settings.get("source_ip_allowlist")
+    if not allowlist:
+        return False
+    for entry in allowlist:
+        try:
+            net = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            return False  # unparseable: cannot be shown to restrict anyone, so it does not count
+        floor = (
+            _INTAKE_ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else _INTAKE_ALLOWLIST_MIN_PREFIX_V6
+        )
+        if net.prefixlen < floor:
+            return False  # ONE too-wide entry defeats the whole list
+    return True
+
+
+def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:
+    """Peer-control gate (ADR 0154 D7): refuse an **off-loopback HTTP listener with no effective peer
+    control** — no sufficiently narrow ``source_ip_allowlist``, no ``intake_auth``, and no
+    ``mtls_subject`` binding. Refuses under an enforcing PHI posture, warns otherwise.
+
+    **A separate function, never folded into :func:`check_http_tls_exposure`.** That gate returns early
+    the moment ``tls`` is truthy — precisely the case an authentication requirement most needs to
+    cover. ``Http(port=..., tls=True, tls_cert_file=...)`` on ``0.0.0.0`` therefore binds a PHI intake
+    socket today with no peer identity requirement at all, and passes every gate.
+
+    **The composition rule, stated once: TLS is confidentiality; intake auth is authentication.**
+    Enabling auth is never an argument for relaxing the exposed gate, and TLS being on is never a
+    reason to skip auth. ``check_http_tls_exposure`` is unchanged and unweakened by this.
+
+    **It ignores ``allow_insecure_bind`` entirely** — note the deliberate signature divergence from its
+    four siblings. Handing a *cleartext* escape hatch the power to also waive *authentication* is a
+    category error, so this gate is posture-keyed only. ``posture is None`` (a direct or embedding
+    call) warns rather than refusing: a new refusal must not start firing for un-postured callers.
+
+    A raise is a :class:`WiringError`, so ADR 0031 degrades that one connection rather than the engine.
+    Loopback binds start byte-identical (ADR 0148 GIVEN 1).
+    """
+    if source.type is not ConnectorType.HTTP:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    # CIDR-aware, and it treats an empty host as loopback — which matches HttpSource's own
+    # `s.get("host") or "127.0.0.1"` fallback. Reused rather than minting another _LOOPBACK_HOSTS
+    # frozenset; the tree already carries five same-named copies across two distinct contents.
+    if is_loopback_hop_host(host):
+        return
+    if _has_effective_peer_control(source.settings):
+        return
+
+    detail = (
+        f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
+        "control: anyone who can reach the socket can submit a message. Set intake_auth "
+        "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
+        "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
+        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
+        "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
+        "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
+    )
+    if posture is not None and posture.enforcing and posture.is_phi:
+        raise WiringError(detail)
+    log.warning("%s (warned, not refused: this instance is not an enforcing PHI posture)", detail)
 
 
 def check_dimse_tls_exposure(
