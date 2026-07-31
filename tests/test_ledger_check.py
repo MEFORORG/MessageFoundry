@@ -211,22 +211,66 @@ def test_duplicate_index_rows_are_blocked(repo: Path) -> None:
 
 
 def test_a_new_backlog_number_must_be_allocated(repo: Path) -> None:
-    """Two sessions adding '## 227.' land ~1,600 lines apart in one file and BOTH ship."""
-    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
+    """Two sessions adding '## 227.' land ~1,600 lines apart in one file and BOTH ship.
+
+    Uses an ABOVE-FLOOR number deliberately. With a below-floor one this test still goes red, but on
+    the partition rule instead of the ownership rule — passing for the wrong reason and asserting
+    nothing about allocation. The reason is asserted below for the same reason.
+    """
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
     assert code == 1
-    assert "BACKLOG item #2" in out
+    assert "BACKLOG item #1001" in out
+    assert "was not allocated to this worktree" in out, (
+        "must fail on the OWNERSHIP rule; if this now reports the public floor, the test has stopped "
+        f"exercising allocation:\n{out}"
+    )
 
 
 def test_an_allocated_backlog_number_passes(repo: Path) -> None:
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
+    allocate(repo, "backlog", "1001")
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_backlog_number_below_the_public_floor_is_refused(repo: Path) -> None:
+    """The partition: new items live at #1000+, so the overlap with the internal ledger stays closed.
+
+    Allocated to THIS worktree, so ownership is satisfied and the floor is the only thing that can
+    reject it — otherwise the test would pass on the ownership rule and prove nothing.
+    """
     write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
     allocate(repo, "backlog", "2")
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
-    assert code == 0, out
+    assert code == 1
+    assert "below the public floor" in out, out
+
+
+def test_the_public_floor_also_refuses_in_ci_mode(repo: Path) -> None:
+    """The floor is the FIRST backlog rule that can fail in --ci.
+
+    The ownership rule cannot: it reads a per-clone registry and compares a worktree path, and a runner
+    has neither — so `check_backlog()` computed the added-number set and discarded it, leaving the CI
+    ledger step unable to fail on the backlog half at all.
+    """
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-m", "add a below-floor item", "--no-verify")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "below the public floor" in out, out
 
 
 def test_editing_backlog_without_adding_a_number_passes(repo: Path) -> None:
@@ -264,13 +308,17 @@ def test_a_utf8_backlog_still_catches_an_unallocated_number(repo: Path) -> None:
     write(
         repo,
         "docs/BACKLOG.md",
-        f"# Backlog\n\n## 1. First item\n\n{NON_ASCII_BODY}\n## 2. Mine — ⚠️ unallocated\n\nbody\n",
+        f"# Backlog\n\n## 1. First item\n\n{NON_ASCII_BODY}\n## 1001. Mine — ⚠️ unallocated\n\nbody\n",
     )
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
     assert code == 1, out
-    assert "BACKLOG item #2" in out
+    assert "BACKLOG item #1001" in out
+    # Above the floor deliberately: a below-floor number would be rejected by the partition rule even
+    # if the UTF-8 read had crashed to empty, so this test would pass while proving nothing about the
+    # decode — the exact false-clean it exists to catch.
+    assert "was not allocated to this worktree" in out, out
 
 
 def test_ci_mode_works_on_a_SHALLOW_clone_with_no_reachable_merge_base(
