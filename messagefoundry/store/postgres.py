@@ -108,6 +108,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     CapturedResponse,
     ClaimedHeads,
+    ClaimProcStatus,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
@@ -1273,6 +1274,11 @@ class PostgresStore:
             idle=self._pool.get_idle_size(),
             acquire_wait=self._acquire_wait.summary(),
         )
+
+    def claim_proc_status(self) -> ClaimProcStatus | None:
+        """``None``: the ADR 0114 sub-lever A stored-procedure claim path is SQL-Server-only (AC-6 —
+        this backend never reads its flag), so there is no gate verdict to report here."""
+        return None
 
     async def _fetchall(self, sql: str, *params: Any) -> list[Any]:
         return list(await self._pool.fetch(sql, *params))
