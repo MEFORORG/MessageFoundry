@@ -75,7 +75,13 @@ from typing import Any
 #: so an older console simply ignores it; bumped rather than corrected in place because v14 SHIPPED
 #: (v0.3.2). Under "one shipped posture, loosen only" a subset that reads as the whole posture is the
 #: failure this field exists to prevent, so the console must be able to render the caveat.
-ENGINE_UI_SEAM: int = 15
+#: seam v16: SystemStatus gained the additive `claim_proc` — ADR 0114 AC-7's degraded gauge (whether the
+#: SQL Server stored-procedure claim path passed its startup gate, and the reason string when it did
+#: not), which the status page's store panel renders. Additive with a default and `None` on every
+#: backend without the lever, so an older console simply ignores it; a separate seam rather than a
+#: correction to v15 because v15 is a SecurityPosture change and folding an unrelated DTO into it would
+#: make that note describe a field set it does not cover.
+ENGINE_UI_SEAM: int = 16
 
 
 @dataclass(frozen=True, slots=True)

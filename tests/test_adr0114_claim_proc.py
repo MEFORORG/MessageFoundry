@@ -295,6 +295,8 @@ def _gate_rows(
     compat: int = 150,
     cid_body: str | None = "STORED",
     dst_body: str | None = "STORED",
+    cid_oid: int | None = None,
+    dst_oid: int | None = None,
 ) -> dict[str, dict[str, Any] | None]:
     """Build the _fetchone stub's answers.
 
@@ -307,6 +309,12 @@ def _gate_rows(
     identity function. Both sides of the gate's comparison were then the same function of the same
     argument, so the suite could not distinguish a working gate from a broken one — the defect that
     let ADR 0114 sub-lever A ship inert. Do not restore it.
+
+    ``*_oid`` is the ``OBJECT_ID`` the same probe returns. It DEFAULTS to "present iff the body is",
+    which is the server's behaviour for the two ordinary cases (deployed-and-readable, absent) and
+    keeps ``cid_body=None`` meaning "genuinely missing". Pass an id WITH a ``None`` body to model
+    the third case a real server produces: deployed, but its definition unreadable by this
+    principal (no VIEW DEFINITION, or WITH ENCRYPTION).
     """
 
     def resolve(value: str | None, proc: str, col: str) -> str | None:
@@ -316,14 +324,18 @@ def _gate_rows(
             return _as_object_definition(ss._claim_proc_body(proc, col))
         return value
 
+    def answer(value: str | None, oid: int | None, proc: str, col: str) -> dict[str, Any]:
+        body = resolve(value, proc, col)
+        return {"oid": oid if oid is not None else (917578307 if body else None), "body": body}
+
     return {
         "compat": {"compatibility_level": compat},
-        "dbo.mefor_claim_fifo_heads_cid_v1": {
-            "body": resolve(cid_body, "mefor_claim_fifo_heads_cid_v1", "channel_id")
-        },
-        "dbo.mefor_claim_fifo_heads_dst_v1": {
-            "body": resolve(dst_body, "mefor_claim_fifo_heads_dst_v1", "destination_name")
-        },
+        "dbo.mefor_claim_fifo_heads_cid_v1": answer(
+            cid_body, cid_oid, "mefor_claim_fifo_heads_cid_v1", "channel_id"
+        ),
+        "dbo.mefor_claim_fifo_heads_dst_v1": answer(
+            dst_body, dst_oid, "mefor_claim_fifo_heads_dst_v1", "destination_name"
+        ),
     }
 
 
@@ -333,7 +345,12 @@ def _stub_fetchone(store: SqlServerStore, answers: dict[str, dict[str, Any] | No
     async def fake_fetchone(sql: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
         if sql == "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()":
             return answers["compat"]
-        assert sql == "SELECT OBJECT_DEFINITION(OBJECT_ID(?)) AS body", f"unexpected probe: {sql}"
+        assert sql == "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (
+            f"unexpected probe: {sql}"
+        )
+        # Both placeholders bind the SAME name — a probe that bound two different objects would
+        # report one proc's id against another's body.
+        assert params[0] == params[1], f"the probe must bind one object: {params!r}"
         return answers[params[0]]
 
     store._fetchone = fake_fetchone  # type: ignore[method-assign]
@@ -508,6 +525,51 @@ async def test_ac7_gate_degrades_loudly(
     # Degraded => the claim stays on the batch path (never a lane outage).
     ops, _, _ = await _drive_proc("ingress", ["lane-0"], store=store)
     assert ops[0][1].startswith("SET NOCOUNT ON;")
+
+
+@pytest.mark.parametrize(
+    "answers_kw",
+    [{"cid_body": None, "cid_oid": 917578307}, {"dst_body": None, "dst_oid": 917578307}],
+)
+async def test_ac7_gate_names_view_definition_when_the_proc_is_deployed_but_unreadable(
+    answers_kw: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL ``OBJECT_ID`` and a
+    NULL ``OBJECT_DEFINITION`` — the module is deployed and working. Before the id rode along on
+    the probe, that fired the MISSING arm and sent the operator to grant CREATE PROCEDURE, which is
+    neither the cause nor the cure (the cure is GRANT VIEW DEFINITION; WITH ENCRYPTION produces the
+    identical NULL). This is not a hypothetical posture: the sub-lever B design comment in the same
+    module explicitly designs for a fleet whose principal can never hold CREATE PROCEDURE.
+
+    RED without the fix — the old arm keys on the body alone, so it cannot see the id at all."""
+    with caplog.at_level(logging.WARNING, logger="messagefoundry.store.sqlserver"):
+        store = await _gate(_gate_rows(**answers_kw), monkeypatch)
+    assert store.claim_proc_effective is False
+    reason = store.claim_proc_degraded_reason or ""
+    assert "VIEW DEFINITION" in reason, "the reason must name the grant that actually fixes it"
+    assert "WITH ENCRYPTION" in reason, "the other cause of the identical NULL"
+    assert "is missing" not in reason, "a deployed proc must not be reported as absent"
+    assert any("DEGRADED to the shipped ad-hoc batch" in r.getMessage() for r in caplog.records)
+    # Still a degrade, not an outage: the claim runs on the shipped batch.
+    ops, _, _ = await _drive_proc("ingress", ["lane-0"], store=store)
+    assert ops[0][1].startswith("SET NOCOUNT ON;")
+
+
+async def test_ac7_gate_still_reports_a_genuinely_absent_proc_as_missing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other side of the split. OBJECT_ID NULL is a real absence and must keep pointing at the
+    DDL/permission cause — the fix above must not relabel every NULL body as a readability problem.
+    """
+    store = await _gate(
+        _gate_rows(cid_body=None), monkeypatch
+    )  # oid defaults to None with the body
+    reason = store.claim_proc_degraded_reason or ""
+    assert "is missing" in reason
+    assert "CREATE PROCEDURE" in reason
+    assert "VIEW DEFINITION" not in reason
 
 
 async def test_ac7_no_error_2812_handling_on_the_hot_path() -> None:
