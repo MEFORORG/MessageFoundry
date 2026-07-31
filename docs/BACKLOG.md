@@ -4043,6 +4043,19 @@ reconciled the same day.
 ## 96. Built-in "setup tester" — self-service capacity estimator that benchmarks the deployed setup and reports how much traffic it can handle (P2, adopter-facing)
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **5/10** · _quick win_. Adopter capacity self-test; the manual dev-harness workaround is awkward; net-new is a ramp-to-knee estimator plus backend-aware diagnosis. _(was DEMAND-GATE · V3/5 · D3/5)_
+>
+> ⛔ **BUILD GATED (2026-07-14) — the MEASUREMENT layer only.** A validity re-check of the governing
+> [ADR 0074](adr/0074-adopter-capacity-estimator.md) against STEP-4 Arm 0 returned **14 confirmed blockers**, each
+> over-reporting capacity to an adopter: the named *"only success gate"* admits **3–5.5×** the true sustainable rate
+> (`R ≤ C·(1 + D/H)`); the **poller-zero failure mode satisfies that gate**; the per-step estimand is **intake
+> acceptance, not delivery**; the *sum-across-interfaces* aggregate is **measured-false (~11×)**; the ceiling is an
+> unstated **instant-partner** bound; and *"reuse, don't reinvent"* does **not** hold — **there is no knee-finder and
+> no per-step gate in the harness** (`grep -rn "knee" harness/` → zero code), so **v1 must be re-priced** (the
+> _quick win_ / Difficulty 5 score above is no longer trustworthy).
+> **Still valid and buildable:** the premise, the hard requirements, and the fail-closed **guard** layer
+> (isolated-store refusal, synthetic-only, backend-aware *negative* rule, sink-cap **with an `INCONCLUSIVE`
+> outcome**). **Do not build the measurement layer** until the owner re-ratifies the sustain gate + estimand —
+> 11 open decisions are listed in the ADR's 2026-07-14 Amendment.
 
 **Type:** feature — an operator/adopter-facing **capacity self-test** shipped *with the engine*. It runs the
 same style of measurement we do for throughput testing, but as a first-class, on-demand command an adopter
@@ -4083,6 +4096,15 @@ the no-loss reconciliation — packaged as a supported engine capability rather 
   ordered feed is core-bound (owner principle: fan out feeds at source, not infinite single-feed speed) — an
   engine-wide total is the sum across interfaces, not a single-feed number. Sequence-keyed lanes (#3) are the
   sanctioned single-feed escape hatch when one feed outgrows a core.
+  > ⚠️ **CORRECTION (2026-07-14):** the *"engine-wide total is the **sum** across interfaces"* rule is
+  > **MEASURED-FALSE and over-reports** — interfaces are **not independent**; they contend on a shared upstream
+  > (store-side) wall, so per-interface ceilings do **not** add.
+  > [`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §4 measured **87
+  > delivered/s across 16 lanes — 5.44/s per lane**, far below the ~60/s per-lane ceiling, because *"those lanes are
+  > starved **upstream** by a **store-side** wall"*; summing predicts 16 × 60 = **960/s vs a measured 87/s (~11×)**.
+  > **Take `min(measured concurrent multi-interface aggregate, Σ per-interface)` and prefer the measured concurrent
+  > run — never compose the aggregate.** (Blocker **B4**, [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md);
+  > the same rule is corrected in [`THROUGHPUT.md`](THROUGHPUT.md) §7.)
 - **Name the limiting factor**, reusing the #93/#64 signals (commit/write latency, `[store].pool_size`
   busy/wait, CPU/mem via #74, `in_pipeline` growth) so the output is *"~N msg/s, engine-CPU-bound"* rather than
   a bare number. The named factor must be **store-backend-aware**: the 2026-07 throughput campaign (evidence
@@ -4096,6 +4118,23 @@ isolated `mfbench` DB — no PHI).** The WS-B / WS-C / pooled-A/B work produced 
 the PASS/FAIL methodology this tester would productize — recorded here so the eventual ADR/build *reuses* it
 rather than rediscovering it. Facts below are **MEASURED**; the shaping suggestions are **RECOMMENDATIONS** (the
 scoping is the ADR's call).
+
+> ⚠️ **CORRECTION (2026-07-14) — two pieces of the guidance below are now known-unsafe. Read them with these fixes.**
+> (Source: the [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md), a validity re-check vs STEP-4 Arm 0.)
+>
+> 1. **"delivered/offered with loss reconciled … as the *only* trustworthy success gate" is NOT sufficient — on its
+>    own it OVER-REPORTS by 3–5.5×.** A rung can be lossless-and-eventually-drained yet have been **FILLING** the
+>    whole hold (Arm 0: E2E climbed **455 ms → 50,672 ms** while no-loss *and* drain both passed — it drained only
+>    because the offer stopped). Drain-clearance admits `R ≤ C·(1 + D/H)`. **Note this list already names the right
+>    companion signal one bullet up — *"`in_pipeline` trajectory (flat vs climbing) is the clearest pass/fail"*.
+>    Keep BOTH: a rung is sustained only if it is no-loss AND non-filling.** ADR 0074 took the loss gate and dropped
+>    the trajectory signal; that is the regression the amendment gates.
+> 2. **The poller-zero remedy is CIRCULAR.** *"Detect it and default to a sub-ceiling rate-walk (report the no-loss
+>    knee)"* does not work: `/stats` zeroes **`in_pipeline`** under overload, the drain gate *requires*
+>    `in_pipeline == 0`, and the knee is read from **the same zeroed fields** — so the failure mode **satisfies** the
+>    gate and the fallback inherits the contamination. A `/stats` staleness detector must be a **hard precondition**;
+>    a poller-zeroed rung is **INCONCLUSIVE**, not "fallen back"; **sink-side counters** must be the primary
+>    loss/backlog authority.
 
 - *Metrics that actually discriminated good vs bad config — report these, not one blended "throughput" number:*
   **intake (acked/s) and delivery (delivered/s) are separate walls** (runs saw ~517/s acked at 98.5% while
