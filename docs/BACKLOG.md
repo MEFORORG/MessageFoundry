@@ -4043,6 +4043,19 @@ reconciled the same day.
 ## 96. Built-in "setup tester" — self-service capacity estimator that benchmarks the deployed setup and reports how much traffic it can handle (P2, adopter-facing)
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **5/10** · _quick win_. Adopter capacity self-test; the manual dev-harness workaround is awkward; net-new is a ramp-to-knee estimator plus backend-aware diagnosis. _(was DEMAND-GATE · V3/5 · D3/5)_
+>
+> ⚠️ **BUILD GATED (2026-07-14) — the MEASUREMENT layer only.** A validity re-check of the governing
+> [ADR 0074](adr/0074-adopter-capacity-estimator.md) against STEP-4 Arm 0 returned **14 confirmed blockers**, each
+> over-reporting capacity to an adopter: the named *"only success gate"* admits **3–5.5×** the true sustainable rate
+> (`R ≤ C·(1 + D/H)`); the **poller-zero failure mode satisfies that gate**; the per-step estimand is **intake
+> acceptance, not delivery**; the *sum-across-interfaces* aggregate is **measured-false (~11×)**; the ceiling is an
+> unstated **instant-partner** bound; and *"reuse, don't reinvent"* does **not** hold — **there is no knee-finder and
+> no per-step gate in the harness** (`grep -rn "knee" harness/` → only TOML comments, zero code), so **v1 must be
+> re-priced** (the _quick win_ / Difficulty 5 score above is no longer trustworthy).
+> **Still valid and buildable:** the premise, the hard requirements, and the fail-closed **guard** layer
+> (isolated-store refusal, synthetic-only, backend-aware *negative* rule, sink-cap **with an `INCONCLUSIVE`
+> outcome**). **Do not build the measurement layer** until the owner re-ratifies the sustain gate + estimand —
+> the required changes are listed in the ADR's 2026-07-14 Amendment.
 
 **Type:** feature — an operator/adopter-facing **capacity self-test** shipped *with the engine*. It runs the
 same style of measurement we do for throughput testing, but as a first-class, on-demand command an adopter
@@ -4083,6 +4096,15 @@ the no-loss reconciliation — packaged as a supported engine capability rather 
   ordered feed is core-bound (owner principle: fan out feeds at source, not infinite single-feed speed) — an
   engine-wide total is the sum across interfaces, not a single-feed number. Sequence-keyed lanes (#3) are the
   sanctioned single-feed escape hatch when one feed outgrows a core.
+  > ⚠️ **CORRECTION (2026-07-14):** the *"engine-wide total is the **sum** across interfaces"* rule is
+  > **MEASURED-FALSE and over-reports** — interfaces are **not independent**; they contend on a shared upstream
+  > (store-side) wall, so per-interface ceilings do **not** add.
+  > [`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §4 measured **87
+  > delivered/s across 16 lanes — 5.44/s per lane**, far below the ~60/s per-lane ceiling, because *"those lanes are
+  > starved **upstream** by a **store-side** wall"*; summing predicts 16 × 60 = **960/s vs a measured 87/s (~11×)**.
+  > **Take `min(measured concurrent multi-interface aggregate, Σ per-interface)` and prefer the measured concurrent
+  > run — never compose the aggregate.** (Blocker **B4**, [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md);
+  > the same rule is corrected in [`THROUGHPUT.md`](THROUGHPUT.md) §7.)
 - **Name the limiting factor**, reusing the #93/#64 signals (commit/write latency, `[store].pool_size`
   busy/wait, CPU/mem via #74, `in_pipeline` growth) so the output is *"~N msg/s, engine-CPU-bound"* rather than
   a bare number. The named factor must be **store-backend-aware**: the 2026-07 throughput campaign (evidence
@@ -4096,6 +4118,23 @@ isolated `mfbench` DB — no PHI).** The WS-B / WS-C / pooled-A/B work produced 
 the PASS/FAIL methodology this tester would productize — recorded here so the eventual ADR/build *reuses* it
 rather than rediscovering it. Facts below are **MEASURED**; the shaping suggestions are **RECOMMENDATIONS** (the
 scoping is the ADR's call).
+
+> ⚠️ **CORRECTION (2026-07-14) — two pieces of the guidance below are now known-unsafe. Read them with these fixes.**
+> (Source: the [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md), a validity re-check vs STEP-4 Arm 0.)
+>
+> 1. **"delivered/offered with loss reconciled … as the *only* trustworthy success gate" is NOT sufficient — on its
+>    own it OVER-REPORTS by 3–5.5×.** A rung can be lossless-and-eventually-drained yet have been **FILLING** the
+>    whole hold (Arm 0: E2E climbed **455 ms → 50,672 ms** while no-loss *and* drain both passed — it drained only
+>    because the offer stopped). Drain-clearance admits `R ≤ C·(1 + D/H)`. **Note the same bullet already names the
+>    right companion signal — *"`in_pipeline` trajectory (flat vs climbing) is the clearest pass/fail"*. Keep BOTH:
+>    a rung is sustained only if it is no-loss AND non-filling.** ADR 0074 took the loss gate and dropped the
+>    trajectory signal; that is the regression the amendment gates.
+> 2. **The poller-zero remedy is CIRCULAR.** *"detect it and **default to a sub-ceiling rate-walk** (report the clean
+>    no-loss knee)"* does not work: `/stats` zeroes **`in_pipeline`** under overload, the drain gate *requires*
+>    `in_pipeline == 0`, and the knee is read from **the same zeroed fields** — so the failure mode **satisfies** the
+>    gate and the fallback inherits the contamination. A `/stats` staleness detector must be a **hard precondition**;
+>    a poller-zeroed rung is **INCONCLUSIVE**, not "fallen back"; **sink-side counters** must be the primary
+>    loss/backlog authority.
 
 - *Metrics that actually discriminated good vs bad config — report these, not one blended "throughput" number:*
   **intake (acked/s) and delivery (delivered/s) are separate walls** (runs saw ~517/s acked at 98.5% while
@@ -4922,6 +4961,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
+> **AMENDED 2026-07-30 — Basic is BUILT, Digest is BUILT for http destinations, and NTLM/Windows are REFUSED at construction.** Adversarial verification refuted a full close. **BUILT** ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md), landed with #112/#128): `proxy_user` / `proxy_password` / `proxy_auth_type` on **`Rest`** (`messagefoundry/config/wiring.py:1332`), **`FHIR`** (`:1412`), **`DICOMweb`** (`:1659`) and **`Soap`** (`:2004`), dispatched by `proxy_auth_handler_from_settings` (`messagefoundry/transports/rest.py:929`). **Basic** — the default once a credential is set — is a **pre-emptive** `Proxy-Authorization` header and works for **both** http and https destinations, because urllib moves it into the `CONNECT` tunnel headers (`:981-984`). **Digest** is the reactive stdlib handler and is supported for an **http destination only**; an https destination is refused **at construction** because the `407` arrives inside the `CONNECT` tunnel (`:985-992`). A credential over a cleartext `http` proxy hop is refused posture-keyed regardless of destination scheme (`:971-979`). Tests: `tests/test_outbound_forward_proxy.py`.
+>
+> ⚠️ **NTLM and Windows are NOT built — the engine REFUSES them, so do not read this banner as four-scheme parity.** `proxy_auth_type` in `{ntlm, windows}` raises at construction (`messagefoundry/transports/rest.py:993-998`): the handshake is **connection-bound** (type1/type2/type3 must ride one keep-alive TCP connection) and `urllib.request` opens a new connection per `open()`, so a correct build needs a keep-alive client driven by `pyspnego` — the same reasoning that scoped them out of **#65** (`messagefoundry/transports/http_auth.py:27-31`). ADR 0126 records them as **deferred, refused loudly** (`0126:65-68`, `:154`) and lists NTLM/Windows/Negotiate under **Out of scope** (`:159`); the documented workaround is a local authenticating proxy such as `cntlm`. Locked by `tests/test_outbound_forward_proxy.py::test_digest_https_and_ntlm_windows_refused` (ADR AC-6, `0126:116-119`).
+
 **Cluster:** Web Services & HTTP. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
 **Scope:** Authenticate outbound web-service traffic to the forward proxy itself, selecting the proxy credential type. Meaningless without the forward-proxy address item - build together.
@@ -5003,6 +5046,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. DX/console-polish flag+filter; not interop, nobody blocked, no existing marker covers it (v4); model field + render/filter in both consoles (d3). _(was P3 · V2/5 · D2/5)_
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-30 — the CONNECTION flag and the Flagged-only filter are BUILT; "every configuration object" is a ratified scope fork.** Adversarial verification refuted a full close. **BUILT** ([ADR 0007 amendment 2026-07-19](adr/0007-gui-manageable-connections-toml.md)): a display-only `flagged` field on `InboundConnection` / `OutboundConnection` (`messagefoundry/config/wiring.py:2531`, `:2589` — **no runtime path reads it**), authored code-first **and** in `connections.toml` (`config/connections_file.py:118`, `:139`, round-tripped by `tests/test_connections_roundtrip.py`); `POST /connections/{name}/flag` (`messagefoundry/api/app.py:1944`) → `Engine.set_connection_flag` (`messagefoundry/pipeline/engine.py:1286`) through the comment-preserving validate-before-persist writer — the FIRST console→`connections.toml` write seam — reachable from the console at `POST /ui/connections/{name}/flag` (`messagefoundry_webconsole/routes/connection_writes.py:103`); and the **Flagged-only** filter itself (`messagefoundry_webconsole/pages/connections.py:297`, re-applied after each poll/ws swap by `static/app.js:943-961`). 6 tests in `tests/test_connection_flag.py`.
+>
+> ⚠️ **The REMAINDER is the word "every" in the Scope.** This item's own Why names **Connection/Router/Handler**; only *connections* carry the flag, and only `connections.toml`-managed ones are console-settable — a code-first connection is refused **409** (it can still declare `flagged=True` in Python). ADR 0007's amendment records that fork deliberately (`0007:190-197`): a durable console-settable flag on *every* object would need a new name-keyed annotation table across all three store backends, which it declines, leaving the universal-object-flag branch "for a future, owner-chosen, store-serialized effort". So this is a **ratified narrowing, not an accidental one** — keep the item open at that reduced scope, and do **not** rebuild the connection half.
 
 **Cluster:** Repository & Config. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5803,6 +5850,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. Ops/console polish: runtime log level plus a viewer over the already-produced redacted tail; the config dial (restart) and support-bundle pulls work, nobody blocked. _(was DEMAND-GATE · V2/5 · D3/5)_
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-30 — the API half is BUILT; the console half is DEAD CODE.** Adversarial verification refuted a full close. **BUILT** ([ADR 0130](adr/0130-runtime-ephemeral-log-verbosity-control-and-phi-redacted-log-tail-viewer.md)): the restart-free runtime verbosity control — `set_runtime_level` / `current_log_level` (`messagefoundry/logging_setup.py:417`, `:440`; root + uvicorn, ephemeral, survives `/config/reload`) behind `GET`/`PATCH /logging/level` (`messagefoundry/api/app.py:4527`, `:4541`), gated by `monitoring:diagnose` and audited as `logging_level_change` — plus the paginated **redacted** tail `GET /logs/tail` (`:4570`) behind the new `logs:view` PHI-read permission (`messagefoundry/auth/permissions.py:57`), reusing the #49 redactor, hop-guarded and audited as `logs_view`. 11 tests in `tests/test_logging_surfaces.py`.
+>
+> ⚠️ **The REMAINDER is the in-console viewer the Scope names, and it is worse than missing — it is wired to nothing.** `messagefoundry_webconsole/static/app.js` registers both features, `[data-mf-log-level]` (`:1252`) and `[data-mf-log-viewer]` (`:1294`), but **no page builder emits either attribute** (`data-mf-log` occurs nowhere outside `app.js`), and the URLs the JS fetches — `/ui/logging/level` (`:1259`) and `/ui/logs/tail` (`:1308`) — **have no route**: neither appears in the golden `/ui` surface (`packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt`). During an incident an operator still reaches both only through the JSON API. ⚠️ ADR 0130's **Built:** block correctly lists routes + DTOs only, but its Related line calls [ADR 0065](adr/0065-web-ops-dashboard.md) "the console that renders it" (`0130:13-14`) — nothing renders it today; amend that when the console half lands. Per-logger/per-area targeting is an ADR-recorded MVP scope-out (`0130:97-98`), not a gap.
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
