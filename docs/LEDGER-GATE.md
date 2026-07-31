@@ -53,9 +53,27 @@ back is not a registry at all.
 The registry lives beside the **shared object store**, so every worktree of this repo sees the same
 allocations, and a different clone automatically gets its own.
 
-The floor is the maximum over: `origin/main`, **every local and remote ref**, and every existing
-allocation. The all-refs term closes the "wipe the registry → re-issue a number that only exists on an
-unpushed branch" hole. It costs about a second, once per ADR — not per edit.
+The floor is the maximum over: `origin/main`, **every local and remote ref**, every existing
+allocation, and a **persisted high-water mark**. The all-refs term closes the "wipe the registry →
+re-issue a number that only exists on an unpushed branch" hole. It costs about a second, once per ADR —
+not per edit.
+
+**The all-refs term is only as good as the refs this clone still has, so the floor ratchets.** Measured
+on the maintainer clone: the backlog floor is **314** counting every ref, but **252** counting only
+`refs/remotes/origin` and local heads — the missing 62 live on remote-tracking refs for a remote that
+`git remote -v` no longer lists. If those refs are removed, every derived term collapses and the
+allocator silently resumes issuing numbers that are already in use, with no error. So the highest floor
+ever computed is stored at `<git-common-dir>/mefor-coord/alloc/<kind>/.floor-highwater` and the floor
+never goes below it; a computed floor beneath the mark prints a loud NOTE rather than quietly handing
+out a used number. The mark can only rise.
+
+Two consequences worth knowing before you tidy refs:
+
+- **`git fetch origin --prune` is safe** — it prunes only `refs/remotes/origin/*`, which is not where the
+  high numbers live. It is also what you *should* run before allocating.
+- **Removing a non-`origin` remote, deleting its refs, or an aggressive `gc` / `reflog expire` that drops
+  unreachable objects is what the ratchet defends against.** It keeps the number space correct, but the
+  underlying history would still be gone — the ratchet is a backstop, not a substitute for the refs.
 
 **Numbers are never reclaimed.** An abandoned branch holds its number forever and the sequence develops
 holes. That is deliberate: holes are free, collisions are not.
