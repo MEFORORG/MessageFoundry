@@ -33,6 +33,8 @@ from messagefoundry.netaddr import peer_ip_allowed
 __all__ = [
     "InboundHandler",
     "ConnectionEventSink",
+    "IntakeAuditSink",
+    "IntakeRateLimiter",
     "ProcessedFileLedger",
     "DeliveryError",
     "NegativeAckError",
@@ -60,6 +62,51 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 # default) makes every emit site a no-op (byte-identical when off). Metadata only — never a raw frame
 # or message body; the source passes a ``safe_exc``-scrubbed reason and the store scrubs again (#120).
 ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
+
+# A source reports an intake-authentication refusal to this OPTIONAL, store-agnostic sink (ADR 0154
+# D6): ``(action, client, detail)``. The runner injects an adapter that writes a tamper-evident
+# ``audit_log`` row binding the connection; the source knows only the wire-level facts.
+#
+# Why this exists alongside :data:`ConnectionEventSink`, which already carries the same refusal:
+# ``connection_event`` is operator-disableable diagnostics, while ``audit_log`` is a hash chain an
+# operator cannot silently switch off — and an authentication refusal on a PHI intake socket belongs
+# in the record that survives someone turning diagnostics off.
+#
+# **No credential material ever crosses this seam** — not the value, not a prefix, not its length.
+# ``detail`` carries the mode and the outcome only.
+IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
+
+
+class IntakeRateLimiter(Protocol):
+    """The failed-attempt budget an intake-authenticating source consults (ADR 0154 D6).
+
+    Injected by the runner as a **synchronous** predicate so ``transports/`` gains no ``auth/`` edge,
+    and synchronous is honest: the underlying sliding window completes without awaiting, so it is
+    atomic on the event loop.
+
+    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    and charging in one call — which is what the shipped ``allow()`` does — would turn a
+    brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
+    traffic pre-ingress, where it is not even counted.
+    """
+
+    def check(self, peer: str) -> bool:
+        """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
+        ...
+
+    def charge_failure(self, peer: str) -> None:
+        """Record one FAILED attempt against ``peer``. Called only on the refusal branch."""
+        ...
+
+    def note_success(self, peer: str) -> None:
+        """Record that ``peer`` authenticated successfully within the current window.
+
+        This is what keeps the global arm from denying a legitimate partner (AC-19): a global
+        failed-attempt budget refuses irrespective of key, so without this an attacker generating
+        refusals from any address would exhaust the shared budget and lock out a peer that is
+        authenticating correctly.
+        """
+        ...
 
 
 class ProcessedFileLedger(Protocol):
@@ -254,6 +301,19 @@ class SourceConnector(abc.ABC):
     #: falls back to an in-process set. Same runtime-injection shape as :attr:`on_connection_event`;
     #: ``transports/`` stays store-agnostic.
     processed_ledger: ProcessedFileLedger | None = None
+
+    #: Optional intake-authentication audit sink (ADR 0154 D6), **injected by the runner after build**
+    #: — same runtime-injection shape as :attr:`on_connection_event`, and for the same reason: it keeps
+    #: ``transports/`` free of any ``store`` import while still letting a refusal reach the
+    #: tamper-evident ``audit_log``. ``None`` (the default) makes the emit site a no-op, so a direct
+    #: caller or test that never sets it is byte-identical.
+    on_intake_audit: IntakeAuditSink | None = None
+
+    #: Optional intake-auth failed-attempt budget (ADR 0154 D6), **injected by the runner after build**.
+    #: A synchronous predicate, so ``transports/`` gains no ``auth/`` edge. ``None`` (the default)
+    #: disables rate limiting entirely — a direct caller or test is byte-identical, and an operator who
+    #: sets ``intake_auth_rate_limit=None`` gets the same.
+    intake_rate_limiter: IntakeRateLimiter | None = None
 
     @abc.abstractmethod
     async def start(

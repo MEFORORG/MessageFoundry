@@ -38,6 +38,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
 from messagefoundry.config.fhir_lookup import (
@@ -134,7 +135,7 @@ from messagefoundry.store import (
     Stage,
     StreamingAttachmentsUnsupported,
 )
-from messagefoundry.store.base import pool_over_provisioned_warning
+from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports import (
     DeliveryError,
@@ -144,7 +145,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
-from messagefoundry.transports.base import ConnectionEventSink
+from messagefoundry.transports.base import ConnectionEventSink, IntakeAuditSink, IntakeRateLimiter
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
@@ -158,6 +159,75 @@ log = logging.getLogger(__name__)
 # so a stable read-only share never churns the store.
 PROCESSED_FILE_LEDGER_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
+
+
+#: Peers whose successful authentication we remember, to exempt them from the GLOBAL failed-attempt
+#: arm (AC-19). Bounded so a churn of distinct source addresses cannot grow it without limit.
+_INTAKE_SUCCESS_KEEP_MAX = 10_000
+
+
+class _IntakeRateLimiter:
+    """Runner-side failed-attempt budget for an intake-authenticating source (ADR 0154 D6).
+
+    Two windows, deliberately:
+
+    * **per-peer** — bounds one address guessing a credential;
+    * **global** — bounds aggregate refusal volume, which matters because every refusal drives an
+      ``audit_log`` write that takes the store-wide lock.
+
+    **The global arm never refuses a peer that has already authenticated in this window** (AC-19).
+    ``SlidingWindowRateLimiter`` refuses on the global bucket *regardless of key*, so consulting it for
+    everyone would hand an attacker a denial-of-service against a legitimate partner: roughly one bad
+    request per second exhausts the shared budget, and the partner's valid message is then refused
+    ``429`` **pre-ingress**, where it is not even counted. That is exactly the silent-loss defect this
+    design exists to avoid, merely relocated from the per-peer arm to the global one.
+
+    Injected as a synchronous predicate, so ``transports/`` gains no ``auth/`` edge. In-process and
+    non-distributed: under HA only the leader binds (so it is effectively global), and under engine
+    sharding each shard counts separately, making the effective ceiling N x limit for N shards.
+    """
+
+    def __init__(self, *, per_peer: int, glob: int, window_seconds: float = 60.0) -> None:
+        self._window = window_seconds
+        self._per_peer = SlidingWindowRateLimiter(
+            per_key=per_peer, glob=0, window_seconds=window_seconds
+        )
+        self._global = (
+            SlidingWindowRateLimiter(per_key=0, glob=glob, window_seconds=window_seconds)
+            if glob
+            else None
+        )
+        self._succeeded: dict[str, float] = {}
+
+    def check(self, peer: str) -> bool:
+        # would_allow, never allow: consulting must not consume the budget, or a correctly
+        # authenticated partner's Nth request would be refused as though it had been guessing.
+        if not self._per_peer.would_allow(peer):
+            return False
+        if self._global is None or self._authenticated_recently(peer):
+            return True
+        return self._global.would_allow(peer)
+
+    def charge_failure(self, peer: str) -> None:
+        self._per_peer.allow(peer)
+        if self._global is not None:
+            self._global.allow(peer)
+
+    def note_success(self, peer: str) -> None:
+        now = time.monotonic()
+        if len(self._succeeded) >= _INTAKE_SUCCESS_KEEP_MAX:
+            cutoff = now - self._window
+            self._succeeded = {k: v for k, v in self._succeeded.items() if v > cutoff}
+        self._succeeded[peer] = now
+
+    def _authenticated_recently(self, peer: str) -> bool:
+        stamp = self._succeeded.get(peer)
+        if stamp is None:
+            return False
+        if time.monotonic() - stamp > self._window:
+            del self._succeeded[peer]
+            return False
+        return True
 
 
 class _StoreProcessedLedger:
@@ -1145,6 +1215,54 @@ class RegistryRunner:
 
         return _sink
 
+    def _intake_auth_enabled(self, ic: InboundConnection) -> bool:
+        return (
+            ic.spec.type is ConnectorType.HTTP
+            and str(ic.spec.settings.get("intake_auth") or "none") != "none"
+        )
+
+    def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
+        """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
+
+        ``None`` unless this inbound actually authenticates, so every other connection is
+        byte-identical. Unlike the ``connection_event`` sink this one **awaits** a store write: an
+        ``audit_log`` row is a hash chain and cannot be enqueued out of order. It is on the refusal
+        path only, never the accept path, so it cannot slow legitimate intake.
+
+        This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
+        column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
+        """
+        if not self._intake_auth_enabled(ic):
+            return None
+        # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
+        # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
+        # Guarded rather than assumed, so a store without the audit plane degrades to the log +
+        # connection_event channels instead of raising on every refusal.
+        if not hasattr(self.store, "record_audit"):
+            return None
+        audit_store = cast(AuditStore, self.store)
+        name = ic.name
+
+        async def _sink(action: str, client: str | None, detail: str | None) -> None:
+            try:
+                await audit_store.record_audit(
+                    action, channel_id=name, client=client, detail=detail
+                )
+            except Exception as exc:  # fail-soft: an audit failure must not drop an HTTP client
+                log.warning("intake auth audit write failed: %s", safe_exc(exc))
+
+        return _sink
+
+    def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        if not self._intake_auth_enabled(ic):
+            return None
+        per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
+        glob = int(ic.spec.settings.get("intake_auth_rate_limit_global") or 0)
+        if not per_peer and not glob:
+            return None
+        return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
+
     def _enqueue_connection_event(self, **fields: Any) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
         connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
@@ -1969,6 +2087,12 @@ class RegistryRunner:
         # sniffing poll source (RemoteFileSource) reads it to gate its HL7-header quarantine to hl7v2
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
+        # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
+        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
+        # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
+        source.on_intake_audit = self._make_intake_audit_sink(ic)
+        source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
