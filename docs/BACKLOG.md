@@ -20,19 +20,51 @@ already say. They were never published here, and they are not back-filled: their
 defined only in the `docs/security/` remediation plan, which
 [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) withholds. Read those citations the way the
 `docs/reviews/` and `docs/security/` paths above are read — **provenance into the internal ledger, not a
-pointer into this file.** The same applies to every ASVS-programme number above #231; that programme
-continued well past #246. Whether any of it is republished here is an owner decision.
+pointer into this file.** Whether any of it is republished here is an owner decision.
+
+**The resolution rule, stated generally — it is not only the ASVS numbers.** For **any** cited `#N`
+above **#231** (in an ADR, a plan, a commit message, a code comment, or an operator-facing string),
+resolve it against the **internal** ledger unless the citation is demonstrably about this file. The two
+sequences diverged at #231 and have been allocated independently since, so a number appearing both here
+and in a citation is *not* evidence they are the same item. If you cannot see the internal ledger,
+**ask rather than resolving it here** — landing on a same-numbered but unrelated item is the failure
+mode, and it looks like success.
 
 **Consequently the numbers in this file above #231 are a second, independent sequence**, and items
 #232–#239 and #248–#251 do not correspond to the internal items sharing those numbers. This is recorded,
 not repaired: renumbering would rewrite ratified ADRs, and republishing would cross the policy above.
 
+⚠️ **This has already shipped once, and nothing in CI can catch it.** On 2026-07-30 an item was filed
+here at a number the internal ledger had already used for unrelated work, and it reached `main` before
+anyone noticed; the number was cited in a gate comment, an operator-facing refusal message, a test
+docstring, two docs and the CHANGELOG. It was corrected on 2026-07-31 by re-allocating against the fixed
+floor. **`backlog_status_check.py`'s duplicate detection cannot see this class of collision** — it reads
+this one file, where the number appears exactly once. The published baseline is not a safe place to
+check a number against; only the allocator is.
+
 **#240–#247 are permanent holes — do not file there.** They were allocated on 2026-07-30 by repeated
 runs for the same four titles; only the last run's numbers (#248–#251) were filed. #240–#243 are held by
 a worktree that no longer exists, and `alloc.ps1` has no release verb by design ("holes are free,
 collisions are not"), so those claims stand permanently and the ledger gate will refuse a commit that
-files there. **#315** is a deliberate probe allocation used to verify the floor fix below; it is also a
-hole. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
+files there. **#315** and **#317** are deliberate probe allocations used to verify the floor fix below;
+they are holes too. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this
+file.
+
+**If you allocated a backlog number before 2026-07-31T00:31Z, re-check it — the trigger is the
+timestamp, not the value.** That is when the floor fix landed. Any number issued before it came from a
+floor that could not see most of the namespace, so it is suspect **regardless of how low or high it
+looks**; a bounded "suspect range" is the wrong instrument and gave at least one session false comfort.
+To check one, search **every** ref, not the published file and not a single branch:
+
+```bash
+for r in $(git for-each-ref --format='%(refname)' refs/heads refs/remotes); do
+  git show "$r:docs/BACKLOG.md" 2>/dev/null | grep -qE '^## <N>\.' && echo "$r"
+done
+```
+
+Checking one ref is not checking the namespace — the numbers are scattered across hundreds of refs,
+which is exactly why the floor sweeps them all. A single-ref check reported one number as free that was
+in fact in use on 28 refs.
 
 The root cause is fixed: the backlog floor in `alloc.ps1` now sweeps **every** local and remote ref, as
 its own header comment always promised and as the ADR path already did. Before the fix it read only
