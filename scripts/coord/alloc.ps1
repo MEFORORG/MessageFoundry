@@ -120,7 +120,33 @@ function Get-Floor {
     [int](($seen | Measure-Object -Maximum).Maximum)
 }
 
-$start = (Get-Floor) + 1
+# The public backlog number space is partitioned at #1000 -- see PUBLIC_BACKLOG_FLOOR in
+# scripts/hooks/ledger_check.py for why. Keep the two in step: the allocator must never emit a number
+# the gate will refuse, or the tool sends you straight into a blocked commit.
+$PublicBacklogFloor = 1000
+
+$observed = Get-Floor
+if ($Kind -eq "backlog") {
+    # THE RESIDUAL DETECTOR. The partition binds only the PUBLIC side; nothing can stop the
+    # maintainer-internal sequence allocating past the boundary, and CI cannot see it -- a public
+    # runner checks out origin only. But THIS machine can: Get-Floor already swept every ref, internal
+    # ones included. So the one place the breach is observable is here, at allocation time, and it is
+    # cheap to say so. Without this the partition fails SILENTLY and the first symptom is another
+    # duplicate; with it, the next allocation on any machine that can see both sides reports it.
+    if ($observed -ge $PublicBacklogFloor) {
+        Write-Host ""
+        Write-Host "WARNING: the all-refs backlog maximum ($observed) has reached the public floor ($PublicBacklogFloor)." -ForegroundColor Red
+        Write-Host "         The partition assumed the internal sequence stays BELOW that boundary." -ForegroundColor Red
+        Write-Host "         Either the internal ledger has crossed it, or the public one has run up to it." -ForegroundColor Red
+        Write-Host "         Do not just take the next number -- raise PUBLIC_BACKLOG_FLOOR in" -ForegroundColor Red
+        Write-Host "         scripts/hooks/ledger_check.py and here, together, and say so in the PR." -ForegroundColor Red
+        Write-Host ""
+    }
+    $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
+}
+else {
+    $start = $observed + 1
+}
 for ($i = $start; $i -lt $start + 500; $i++) {
     $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
     $file = Join-Path $alloc "$name.json"

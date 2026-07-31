@@ -33,6 +33,39 @@ ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
 BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 
+# THE PUBLIC BACKLOG NUMBER SPACE IS PARTITIONED AT #1000.
+#
+# docs/BACKLOG.md is a published baseline of a larger maintainer-internal ledger. The two sequences
+# diverged around #231 and have been allocated INDEPENDENTLY since, so one number can name two
+# unrelated items: public #248 and internal #248 are different work. That overlap is recorded, not
+# repaired -- renumbering would rewrite ratified ADRs and an operator-facing refusal string that ships
+# inside the wheel, and it would not stop the NEXT one. It would only make stale citations resolve
+# uniquely and WRONGLY, which is worse than resolving ambiguously.
+#
+# The partition stops the next one. New items here are allocated at #1000+, the internal sequence stays
+# below (high-water 314 when this landed), so the overlapping set is CLOSED at the numbers already
+# issued and a cited #N >= 1000 is unambiguously an item in THIS file.
+#
+# Why a constant and not a manifest of reserved numbers: a manifest cannot fire. `## 316.` is already
+# on origin/main and alloc.ps1's floor is max(...)+1 over a sweep that includes it, so every clone
+# issues >= 317 while a manifest of internal numbers tops out at 314 -- the reject set and the emit set
+# never intersect. A manifest would also be born stale (its source refs belong to a remote this clone
+# no longer lists), be regenerable on exactly one machine, and be the very instrument the erratum
+# convicts: "the published baseline is not a safe place to check a number against; only the allocator
+# is." A constant has no source data, so it cannot rot.
+#
+# This is the ONE backlog rule that also runs in --ci. The ownership rule cannot: it reads a per-clone
+# registry under .git and compares a worktree path, and a runner has neither -- which left the CI half
+# of check_backlog() computing a set and discarding it, i.e. unable to fail at all. A floor needs no
+# registry, no worktree, and no sight of the internal ledger (CI checks out origin only).
+#
+# KNOWN RESIDUAL, and where it is detected: this binds only the public side. Nothing here can stop the
+# internal ledger allocating past #1000. CI cannot see that -- but alloc.ps1 can, on any machine
+# holding those refs, and it warns at allocation time if the all-refs maximum ever reaches this
+# boundary. Raising this number is a one-line reviewable source change, deliberately not an allowlist
+# file that would rot out of sight.
+PUBLIC_BACKLOG_FLOOR = 1000
+
 
 def git(*args: str) -> str:
     # encoding= is REQUIRED, not cosmetic: `text=True` alone decodes with the LOCALE default, which is
@@ -237,8 +270,24 @@ class Ledger:
             return
         head = set(BACKLOG_HEADING.findall(self.head_text("docs/BACKLOG.md")))
         base = set(BACKLOG_HEADING.findall(self.base_text("docs/BACKLOG.md")))
+        # Only `head - base` is examined, so everything already on origin/main -- including the
+        # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
         for number in sorted(head - base, key=int):
-            if not self.ci and not self.owns("backlog", number):
+            # Floor first: a below-floor number gets the reason that is actionable, rather than
+            # "not allocated to this worktree", which would send you to re-run the allocator and file
+            # at whatever it prints -- correct by luck rather than because you were told why.
+            if int(number) < PUBLIC_BACKLOG_FLOOR:
+                self.fail(
+                    f"BACKLOG item #{number} is below the public floor (#{PUBLIC_BACKLOG_FLOOR})",
+                    "Numbers under the floor belong to the maintainer-internal ledger this file is a "
+                    "published baseline of, or to the pre-partition overlap. Filing one means every "
+                    "citation of it resolves to two unrelated items -- and it looks like success. This "
+                    "also catches a branch cut before the partition whose number has since been "
+                    "re-allocated. See the Ledger erratum at the top of docs/BACKLOG.md.",
+                    'pwsh -NoProfile -File scripts\\coord\\alloc.ps1 -Kind backlog -Title "<title>"'
+                    "   # issues >=1000 now; move your heading to the number it prints",
+                )
+            elif not self.ci and not self.owns("backlog", number):
                 self.fail(
                     f"BACKLOG item #{number} was not allocated to this worktree",
                     "BACKLOG numbers are '## N.' headings inside ONE 6.7k-line file. Two sessions adding "
