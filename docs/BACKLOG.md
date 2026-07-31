@@ -8,6 +8,37 @@ cited report. Several of those reports — the `docs/reviews/` and `docs/securit
 maintainer-internal and will not resolve here; [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)
 states the rule that decides what is withheld and what you can request.
 
+### Ledger erratum (2026-07-30) — read this before citing or allocating a number
+
+**`#242`–`#246` as written in the ADRs are not indices into this file.**
+[ADR 0115](adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md) partitioned
+the ASVS L3 drive-to-Pass programme across five work packages and writes them `BACKLOG #242`–`#246`;
+ADRs 0004, 0014, 0018, 0019, 0068, 0077, 0080 and 0105 cite the same numbers as `WP #243`–`WP #246`.
+Those items were filed in the maintainer-internal ledger that **this file is a published baseline of**,
+and the published baseline stops at **#231** — as the #185 banner and the `#313` reference further down
+already say. They were never published here, and they are not back-filled: their per-cell scope is
+defined only in the `docs/security/` remediation plan, which
+[`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) withholds. Read those citations the way the
+`docs/reviews/` and `docs/security/` paths above are read — **provenance into the internal ledger, not a
+pointer into this file.** The same applies to every ASVS-programme number above #231; that programme
+continued well past #246. Whether any of it is republished here is an owner decision.
+
+**Consequently the numbers in this file above #231 are a second, independent sequence**, and items
+#232–#239 and #248–#251 do not correspond to the internal items sharing those numbers. This is recorded,
+not repaired: renumbering would rewrite ratified ADRs, and republishing would cross the policy above.
+
+**#240–#247 are permanent holes — do not file there.** They were allocated on 2026-07-30 by repeated
+runs for the same four titles; only the last run's numbers (#248–#251) were filed. #240–#243 are held by
+a worktree that no longer exists, and `alloc.ps1` has no release verb by design ("holes are free,
+collisions are not"), so those claims stand permanently and the ledger gate will refuse a commit that
+files there. **#315** is a deliberate probe allocation used to verify the floor fix below; it is also a
+hole. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
+
+The root cause is fixed: the backlog floor in `alloc.ps1` now sweeps **every** local and remote ref, as
+its own header comment always promised and as the ADR path already did. Before the fix it read only
+`origin/main` + `HEAD`, so numbers living on refs this branch does not carry were invisible and were
+handed out as free — which is exactly how #240–#247 were issued over cited numbers.
+
 ---
 
 ## Shipped — v0.1.0 (enterprise / HA milestone)
@@ -4012,6 +4043,19 @@ reconciled the same day.
 ## 96. Built-in "setup tester" — self-service capacity estimator that benchmarks the deployed setup and reports how much traffic it can handle (P2, adopter-facing)
 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **6/10** · Difficulty **5/10** · _quick win_. Adopter capacity self-test; the manual dev-harness workaround is awkward; net-new is a ramp-to-knee estimator plus backend-aware diagnosis. _(was DEMAND-GATE · V3/5 · D3/5)_
+>
+> ⚠️ **BUILD GATED (2026-07-14) — the MEASUREMENT layer only.** A validity re-check of the governing
+> [ADR 0074](adr/0074-adopter-capacity-estimator.md) against STEP-4 Arm 0 returned **14 confirmed blockers**, each
+> over-reporting capacity to an adopter: the named *"only success gate"* admits **3–5.5×** the true sustainable rate
+> (`R ≤ C·(1 + D/H)`); the **poller-zero failure mode satisfies that gate**; the per-step estimand is **intake
+> acceptance, not delivery**; the *sum-across-interfaces* aggregate is **measured-false (~11×)**; the ceiling is an
+> unstated **instant-partner** bound; and *"reuse, don't reinvent"* does **not** hold — **there is no knee-finder and
+> no per-step gate in the harness** (`grep -rn "knee" harness/` → only TOML comments, zero code), so **v1 must be
+> re-priced** (the _quick win_ / Difficulty 5 score above is no longer trustworthy).
+> **Still valid and buildable:** the premise, the hard requirements, and the fail-closed **guard** layer
+> (isolated-store refusal, synthetic-only, backend-aware *negative* rule, sink-cap **with an `INCONCLUSIVE`
+> outcome**). **Do not build the measurement layer** until the owner re-ratifies the sustain gate + estimand —
+> the required changes are listed in the ADR's 2026-07-14 Amendment.
 
 **Type:** feature — an operator/adopter-facing **capacity self-test** shipped *with the engine*. It runs the
 same style of measurement we do for throughput testing, but as a first-class, on-demand command an adopter
@@ -4052,6 +4096,15 @@ the no-loss reconciliation — packaged as a supported engine capability rather 
   ordered feed is core-bound (owner principle: fan out feeds at source, not infinite single-feed speed) — an
   engine-wide total is the sum across interfaces, not a single-feed number. Sequence-keyed lanes (#3) are the
   sanctioned single-feed escape hatch when one feed outgrows a core.
+  > ⚠️ **CORRECTION (2026-07-14):** the *"engine-wide total is the **sum** across interfaces"* rule is
+  > **MEASURED-FALSE and over-reports** — interfaces are **not independent**; they contend on a shared upstream
+  > (store-side) wall, so per-interface ceilings do **not** add.
+  > [`benchmarks/THROUGHPUT-STATUS-2026-07-10.md`](benchmarks/THROUGHPUT-STATUS-2026-07-10.md) §4 measured **87
+  > delivered/s across 16 lanes — 5.44/s per lane**, far below the ~60/s per-lane ceiling, because *"those lanes are
+  > starved **upstream** by a **store-side** wall"*; summing predicts 16 × 60 = **960/s vs a measured 87/s (~11×)**.
+  > **Take `min(measured concurrent multi-interface aggregate, Σ per-interface)` and prefer the measured concurrent
+  > run — never compose the aggregate.** (Blocker **B4**, [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md);
+  > the same rule is corrected in [`THROUGHPUT.md`](THROUGHPUT.md) §7.)
 - **Name the limiting factor**, reusing the #93/#64 signals (commit/write latency, `[store].pool_size`
   busy/wait, CPU/mem via #74, `in_pipeline` growth) so the output is *"~N msg/s, engine-CPU-bound"* rather than
   a bare number. The named factor must be **store-backend-aware**: the 2026-07 throughput campaign (evidence
@@ -4065,6 +4118,23 @@ isolated `mfbench` DB — no PHI).** The WS-B / WS-C / pooled-A/B work produced 
 the PASS/FAIL methodology this tester would productize — recorded here so the eventual ADR/build *reuses* it
 rather than rediscovering it. Facts below are **MEASURED**; the shaping suggestions are **RECOMMENDATIONS** (the
 scoping is the ADR's call).
+
+> ⚠️ **CORRECTION (2026-07-14) — two pieces of the guidance below are now known-unsafe. Read them with these fixes.**
+> (Source: the [ADR 0074 Amendment](adr/0074-adopter-capacity-estimator.md), a validity re-check vs STEP-4 Arm 0.)
+>
+> 1. **"delivered/offered with loss reconciled … as the *only* trustworthy success gate" is NOT sufficient — on its
+>    own it OVER-REPORTS by 3–5.5×.** A rung can be lossless-and-eventually-drained yet have been **FILLING** the
+>    whole hold (Arm 0: E2E climbed **455 ms → 50,672 ms** while no-loss *and* drain both passed — it drained only
+>    because the offer stopped). Drain-clearance admits `R ≤ C·(1 + D/H)`. **Note the same bullet already names the
+>    right companion signal — *"`in_pipeline` trajectory (flat vs climbing) is the clearest pass/fail"*. Keep BOTH:
+>    a rung is sustained only if it is no-loss AND non-filling.** ADR 0074 took the loss gate and dropped the
+>    trajectory signal; that is the regression the amendment gates.
+> 2. **The poller-zero remedy is CIRCULAR.** *"detect it and **default to a sub-ceiling rate-walk** (report the clean
+>    no-loss knee)"* does not work: `/stats` zeroes **`in_pipeline`** under overload, the drain gate *requires*
+>    `in_pipeline == 0`, and the knee is read from **the same zeroed fields** — so the failure mode **satisfies** the
+>    gate and the fallback inherits the contamination. A `/stats` staleness detector must be a **hard precondition**;
+>    a poller-zeroed rung is **INCONCLUSIVE**, not "fallen back"; **sink-side counters** must be the primary
+>    loss/backlog authority.
 
 - *Metrics that actually discriminated good vs bad config — report these, not one blended "throughput" number:*
   **intake (acked/s) and delivery (delivered/s) are separate walls** (runs saw ~517/s acked at 98.5% while
@@ -4891,6 +4961,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
+> **AMENDED 2026-07-30 — Basic is BUILT, Digest is BUILT for http destinations, and NTLM/Windows are REFUSED at construction.** Adversarial verification refuted a full close. **BUILT** ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md), landed with #112/#128): `proxy_user` / `proxy_password` / `proxy_auth_type` on **`Rest`** (`messagefoundry/config/wiring.py:1332`), **`FHIR`** (`:1412`), **`DICOMweb`** (`:1659`) and **`Soap`** (`:2004`), dispatched by `proxy_auth_handler_from_settings` (`messagefoundry/transports/rest.py:929`). **Basic** — the default once a credential is set — is a **pre-emptive** `Proxy-Authorization` header and works for **both** http and https destinations, because urllib moves it into the `CONNECT` tunnel headers (`:981-984`). **Digest** is the reactive stdlib handler and is supported for an **http destination only**; an https destination is refused **at construction** because the `407` arrives inside the `CONNECT` tunnel (`:985-992`). A credential over a cleartext `http` proxy hop is refused posture-keyed regardless of destination scheme (`:971-979`). Tests: `tests/test_outbound_forward_proxy.py`.
+>
+> ⚠️ **NTLM and Windows are NOT built — the engine REFUSES them, so do not read this banner as four-scheme parity.** `proxy_auth_type` in `{ntlm, windows}` raises at construction (`messagefoundry/transports/rest.py:993-998`): the handshake is **connection-bound** (type1/type2/type3 must ride one keep-alive TCP connection) and `urllib.request` opens a new connection per `open()`, so a correct build needs a keep-alive client driven by `pyspnego` — the same reasoning that scoped them out of **#65** (`messagefoundry/transports/http_auth.py:27-31`). ADR 0126 records them as **deferred, refused loudly** (`0126:65-68`, `:154`) and lists NTLM/Windows/Negotiate under **Out of scope** (`:159`); the documented workaround is a local authenticating proxy such as `cntlm`. Locked by `tests/test_outbound_forward_proxy.py::test_digest_https_and_ntlm_windows_refused` (ADR AC-6, `0126:116-119`).
+
 **Cluster:** Web Services & HTTP. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
 **Scope:** Authenticate outbound web-service traffic to the forward proxy itself, selecting the proxy credential type. Meaningless without the forward-proxy address item - build together.
@@ -4972,6 +5046,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. DX/console-polish flag+filter; not interop, nobody blocked, no existing marker covers it (v4); model field + render/filter in both consoles (d3). _(was P3 · V2/5 · D2/5)_
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-30 — the CONNECTION flag and the Flagged-only filter are BUILT; "every configuration object" is a ratified scope fork.** Adversarial verification refuted a full close. **BUILT** ([ADR 0007 amendment 2026-07-19](adr/0007-gui-manageable-connections-toml.md)): a display-only `flagged` field on `InboundConnection` / `OutboundConnection` (`messagefoundry/config/wiring.py:2531`, `:2589` — **no runtime path reads it**), authored code-first **and** in `connections.toml` (`config/connections_file.py:118`, `:139`, round-tripped by `tests/test_connections_roundtrip.py`); `POST /connections/{name}/flag` (`messagefoundry/api/app.py:1944`) → `Engine.set_connection_flag` (`messagefoundry/pipeline/engine.py:1286`) through the comment-preserving validate-before-persist writer — the FIRST console→`connections.toml` write seam — reachable from the console at `POST /ui/connections/{name}/flag` (`messagefoundry_webconsole/routes/connection_writes.py:103`); and the **Flagged-only** filter itself (`messagefoundry_webconsole/pages/connections.py:297`, re-applied after each poll/ws swap by `static/app.js:943-961`). 6 tests in `tests/test_connection_flag.py`.
+>
+> ⚠️ **The REMAINDER is the word "every" in the Scope.** This item's own Why names **Connection/Router/Handler**; only *connections* carry the flag, and only `connections.toml`-managed ones are console-settable — a code-first connection is refused **409** (it can still declare `flagged=True` in Python). ADR 0007's amendment records that fork deliberately (`0007:190-197`): a durable console-settable flag on *every* object would need a new name-keyed annotation table across all three store backends, which it declines, leaving the universal-object-flag branch "for a future, owner-chosen, store-serialized effort". So this is a **ratified narrowing, not an accidental one** — keep the item open at that reduced scope, and do **not** rebuild the connection half.
 
 **Cluster:** Repository & Config. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -5772,6 +5850,10 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 > 🔢 **Re-scored 2026-07-10 → DEMAND-GATE.** Value **4/10** · Difficulty **3/10** · _fill-in_. Ops/console polish: runtime log level plus a viewer over the already-produced redacted tail; the config dial (restart) and support-bundle pulls work, nobody blocked. _(was DEMAND-GATE · V2/5 · D3/5)_
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
+
+> **AMENDED 2026-07-30 — the API half is BUILT; the console half is DEAD CODE.** Adversarial verification refuted a full close. **BUILT** ([ADR 0130](adr/0130-runtime-ephemeral-log-verbosity-control-and-phi-redacted-log-tail-viewer.md)): the restart-free runtime verbosity control — `set_runtime_level` / `current_log_level` (`messagefoundry/logging_setup.py:417`, `:440`; root + uvicorn, ephemeral, survives `/config/reload`) behind `GET`/`PATCH /logging/level` (`messagefoundry/api/app.py:4527`, `:4541`), gated by `monitoring:diagnose` and audited as `logging_level_change` — plus the paginated **redacted** tail `GET /logs/tail` (`:4570`) behind the new `logs:view` PHI-read permission (`messagefoundry/auth/permissions.py:57`), reusing the #49 redactor, hop-guarded and audited as `logs_view`. 11 tests in `tests/test_logging_surfaces.py`.
+>
+> ⚠️ **The REMAINDER is the in-console viewer the Scope names, and it is worse than missing — it is wired to nothing.** `messagefoundry_webconsole/static/app.js` registers both features, `[data-mf-log-level]` (`:1252`) and `[data-mf-log-viewer]` (`:1294`), but **no page builder emits either attribute** (`data-mf-log` occurs nowhere outside `app.js`), and the URLs the JS fetches — `/ui/logging/level` (`:1259`) and `/ui/logs/tail` (`:1308`) — **have no route**: neither appears in the golden `/ui` surface (`packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt`). During an incident an operator still reaches both only through the JSON API. ⚠️ ADR 0130's **Built:** block correctly lists routes + DTOs only, but its Related line calls [ADR 0065](adr/0065-web-ops-dashboard.md) "the console that renders it" (`0130:13-14`) — nothing renders it today; amend that when the console half lands. Per-logger/per-area targeting is an ADR-recorded MVP scope-out (`0130:97-98`), not a gap.
 
 **Cluster:** Logging & Audit. **Priority:** P3. **Verdict:** demand-gate. **Severity (vs Corepoint):** minor.
 
@@ -6901,3 +6983,263 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 **Related:** [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the authoring palette this defers from), [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) / [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) (the lens), #222 (Steps view), #26 (the declined visual-authoring line + its structured-Steps-view carve-out).
 
 **Source:** ADR 0106 palette design (2026-07-12); owner deferred Block pending an idiomatic fit.
+
+## 232. Steps view for routers
+
+> 🔢 **Filed 2026-07-30 — not started.** ADR-first: a `route` row kind widens the ADR 0076 §3 grammar, so the amendment lands before any build.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
+
+**What:** `lens parse` emits rows per `@handler` only — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) §3 states routers are "**out of v1 scope**" — so a `@router` function gets **no Steps view at all**: no "Reopen in Steps view" CodeLens on the def, no rows. An analyst who can read a Handler as steps drops back to raw Python the moment *routing* is the question, which is exactly where destination selection and fan-out are decided.
+
+**Why this is not simply "point the lens at routers":** a router does not mutate `msg` — it **selects destinations**. The shipped shape is a guard-and-return of handler names:
+
+```python
+@router("demo_oru_router")
+def route_demo_oru(msg):
+    if msg["MSH-9.1"] != "ORU":
+        return []
+    return ["demo_oru_relay"]
+```
+
+(`samples/config/IB_DEMO_ORU_router.py:22-27`). The §3 row contract has no kind that fits: `send` rows model `Send(...)` to an **outbound**, a router returns **handler** names, and a bare `return []` already means *filter* inside a Handler. So the build needs (a) a `route` row kind (or an explicit widening of `send`), (b) `return []` disambiguated by the enclosing decorator, (c) a router-specific Add-palette group, and (d) the same coverage-partition + byte-stable splice guarantees the handler path holds.
+
+**Gate:** widening the row *grammar* requires **amending ADR 0076** (§2: "widening the roster is an ordinary addition, widening the *grammar* requires amending this ADR"). ADR-first, not a straight build.
+
+**Related:** #222 (the Steps view), ADR 0076 §3 (routers out of v1), [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) (recognition-first), [ADR 0108](adr/0108-steps-view-accumulator-send-fan-out-copy-on-send-authoring.md) (send fan-out), #228 (sidebar search already finds routers by name).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30) — surfaced while comparing the Steps view's coverage against general-purpose flow editors; owner filed the same day.
+
+## 233. Steps view move-drop logic implemented twice (model + webview)
+
+> 🔢 **Filed 2026-07-30 — not started.** Prerequisite for #237; option (c), a differential test across both implementations, can land first on its own.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (de-duplicate). **Severity:** medium — a silent-divergence class, not a visible bug.
+
+**What:** the row move/drop semantics exist in **two independent implementations** that must agree and are not mechanically kept in agreement:
+
+| Function | Tested TS model | CSP-isolated webview |
+|---|---|---|
+| `blockExtent` | `ide/src/stepsModel.ts:1767` | `ide/media/stepsWebview.js:68` |
+| `walkMove` | `ide/src/stepsModel.ts:1861` | `ide/media/stepsWebview.js:126` |
+| `resolveDrop` | `ide/src/stepsModel.ts:1531` | `ide/media/stepsWebview.js:404` |
+
+The webview cannot import from `src/` (it is loaded as a plain script into a `default-src 'none'` webview, `stepsView.ts:917`), so the drag/drop *preview* the user sees is computed by the webview copy while the *committed* splice is computed by the model copy. They can drift, and the fixture tests only cover the model side — so a divergence shows up as "the drop landed somewhere other than where the indicator said", with green tests.
+
+**Why it matters beyond tidiness:** these functions decide the line ranges handed to `lens rewrite`. ADR 0076 §5's byte-stability guarantee is only as good as the extent computation that feeds it, and ADR 0089 §6 already records that "each native form is a new corruption-risk class — the ADR 0076 review history shows this is where bugs hide".
+
+**Options (pick at build time):** (a) build the shared pure functions into a small bundled module the webview loads as a local resource (esbuild already runs — `ide/esbuild.js`); (b) move the preview computation into the extension host and post results to the webview; (c) keep both but add a differential test that runs the same fixture corpus through **both** implementations and asserts identical output. (c) is the cheapest guard and could land first regardless of which structural fix is chosen.
+
+**Related:** #222, [ADR 0103](adr/0103-steps-view-row-context-menu.md) (row context menu — move/paste entry points), ADR 0076 §5 (byte-stable splice).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); duplication verified by direct read of both files.
+
+## 234. Steps view projection refreshes on save only
+
+> 🔢 **Filed 2026-07-30 — not started. Re-framed 2026-07-30 to match the instruction that filed it.** This was originally recorded as "revisit — do not treat as a bug", which contradicted the owner's actual words: *"Put that fix on the backlog too."* It is a **fix**, gated on an ADR amendment — not a question about whether to act. The engineering caveat that motivated the softer framing is preserved below and is unchanged.
+
+**Cluster:** IDE & Authoring. **Priority:** P3. **Verdict:** **build (ADR-first)** — owner asked for the fix; the save-gate it touches is a deliberate ADR 0076 §5 guardrail, so the amendment lands before the change. **Severity:** low (UX latency).
+
+**What:** the Steps view re-projects the handler on **save**, not on edit. Type in the split text editor and the rows do not follow until the buffer is written. Live values go further and are **skipped entirely while `document.isDirty`**.
+
+**Read this before building:** sync-on-save is a **deliberate guardrail**, not an oversight. ADR 0076 §5 adopts the verified InterSystems/VS Code set *wholesale*: "**Sync on save only; one editor at a time; update-loop guard; Reopen With: Python always available**". And the live-value skip is a **correctness** fix, not laziness (#225): the trace reads the module **from disk** while rows are projected from the **live buffer**, so after an unsaved structural edit the disk trace's line numbers describe the pre-edit file and mapping them by line containment would attach a value marker to the **wrong row**.
+
+**So the item is:** decide whether a *bounded* relaxation is safe — e.g. debounced re-projection of **rows only** (already partly present: `RERENDER_DEBOUNCE_MS = 250`, `stepsView.ts:89`) while keeping live values save-gated; and whether the update-loop guard (`EditLoopGuard`) still holds if projection races an in-flight `lens rewrite`. Any change here **amends ADR 0076 §5** and must re-argue the guardrail it removes.
+
+**Non-goal:** removing the save gate on live values. #225's dirty-buffer misalignment is a real correctness hazard and its fix (re-attach on save) should stand unless the trace itself learns to read the buffer.
+
+**Related:** #222, #225 (live values + the dirty-buffer skip), ADR 0076 §5.
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner asked for it to be filed the same day.
+
+## 235. Generate Steps view parameter forms from Python type hints
+
+> 🔢 **Filed 2026-07-30 — not started.** Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
+
+**What:** today a recognized row exposes **enabled inputs only for literal params**; anything else renders visibly disabled (`stepsView.ts:11-13`). Windmill's pattern is to derive a **JSON Schema from the script's Python type hints** and render the step's parameter form from that schema. Applied here: `lens parse` (or a sibling `lens schema`) emits, per recognized action, a small parameter schema derived from the vocabulary helper's own **type hints** — which ADR 0076 §2 already requires to be "fully type-hinted, mypy-strict".
+
+**Why it is attractive:** it widens what is *editable* without widening the **recognition grammar** — the expensive, ADR-amendment-gated axis. The row set stays exactly as recognized today; only the input widgets get richer (enum → dropdown, `Literal["upper","lower","title"]` → radio, int → number field with validation, code-set name → the existing `codesetList` picker).
+
+**Build sketch:** engine side, derive the schema from `messagefoundry/actions.py` signatures (stdlib `inspect`/`typing`, no new runtime dep — ADR 0076 §6.5 forbids one in phases 1–2); IDE side, replace the hand-rolled per-op input rendering in `stepsModel.ts` (`ADD_MENU_CATALOG`, `TOOLBAR_INSERT_DEFAULTS`) with a schema-driven renderer. Keep `code`/`control` rows read-only.
+
+**Open question:** whether the schema is emitted by the engine (one source of truth beside the vocabulary, matching the ADR 0072 L5/L6 split the lens already follows) or hard-coded in the IDE. Engine-side is the consistent choice and is the recommendation to test first.
+
+**Related:** #222, ADR 0076 §2 (typed, mypy-strict vocabulary), [ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the 27-item palette this would re-render), #237 (per-argument input modes — same form surface, land them together or in a deliberate order).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30) — "borrow the idea, not the product"; owner approved testing it as a separate lane.
+
+## 236. Test-this-step and test-up-to-step with pinned upstream values
+
+> 🔢 **Filed 2026-07-30 — not started.** Largely a stop condition + state dump on ADR 0072's traced dry-run; lookup rows must mock by default, not as an afterthought.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
+
+**What:** the Steps view's Test control delegates to the Test Bench — it runs the **whole** handler. Windmill's OSS editor offers *test this step*, *test up to this step*, and **step mocking** (pin an upstream step's output and run from there). The analog: run a handler **up to row N** against a chosen synthetic sample and show the message state at that point; optionally pin an upstream row's result so a lower row can be exercised without re-running an expensive lookup.
+
+**Why it fits the existing machinery:** the pieces are already shipped. ADR 0072's traced dry-run (`dryrun --trace json`) already produces per-line values and the lens already folds them onto rows by line containment (`mergeLiveValues`, `traceRowValues`), and the sample picker already exists (Test Bench pattern, defaulting to `messageSetsDir`). "Up to row N" is largely a **stop condition + a state dump** on a path that already runs.
+
+**Hard parts:** (a) `db_lookup`/`fhir_lookup` rows do real I/O — "pin/mock upstream" is what makes partial runs safe and must be the default for lookup rows, not an afterthought; (b) the dirty-buffer misalignment of #225 applies identically (the trace reads disk); (c) **PHI**: any state dump reuses ADR 0072's `--show-phi` redaction gate unchanged, adds no second gate, and persists nothing — the lens's trace argv must remain incapable of emitting `--show-phi` (`buildLensTraceArgs`).
+
+**Related:** #222, #225 (live values), [ADR 0072](adr/0072-traced-dryrun-mode.md) (traced dry-run + the redaction gate), Test Bench (`ide/src/testBench.ts`).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved testing it as a separate lane from #235.
+
+## 237. Per-argument input modes (static templated dynamic) in the Steps view
+
+> 🔢 **Filed 2026-07-30 — not started.** Gated on #233: the duplicated move/drop logic is a prerequisite for touching this form surface.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** today a parameter slot is effectively **literal-or-refused** — a literal is editable, anything else (a `msg[...]` read, a concat, a conditional) collapses the row's editability. Windmill's flow editor instead gives every argument an explicit **mode**: *static* (a literal), *templated* (an interpolation over upstream values), or *dynamic* (an expression), with a picker over what is available upstream. Adopting the mode concept turns "this row is not editable" into "this argument is in dynamic mode", which is both more honest and more useful.
+
+**Why it matters here specifically:** ADR 0089's estate scan found the editable/opaque split is driven by **value-expression shape** — it classifies every `msg.set` value as literal / field-copy / conditional / lookup / concat / replace / split / substring / trim / case. Those classes map almost one-to-one onto modes, so this is a presentation of a distinction the lens **already computes**, not new recognition.
+
+**Build sketch:** surface the value-expression class in the `lens parse` row contract; render a mode selector per argument; static mode keeps today's plain input; templated mode offers the HL7 path picker (`hl7Picker.ts`) over the segment scope already built by `hl7scope.ts`; dynamic mode stays read-only in v1 (shows the verbatim source) so no new rewrite class is introduced.
+
+**Sequencing:** shares the parameter-form surface with **#235**. Deciding the schema shape first (#235) and layering modes on top (#237) avoids reworking the renderer twice — but they are separately valuable and can be evaluated independently.
+
+**Related:** #222, #235 (schema-driven forms), ADR 0089 §5 (the value-expression classifier this reuses), ADR 0104 §2.3 / `hl7Picker.ts` (the path picker).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved.
+
+## 238. OpenFlow step-attribute completeness pass over the engine vocabulary
+
+> 🔢 **Filed 2026-07-30 — not started.** A review whose output is findings, not a feature; OpenFlow is explicitly **not** a compatibility target.
+
+**Cluster:** IDE & Authoring / Engine. **Priority:** P3. **Verdict:** build (a review, not a feature). **Severity:** none — this is a gap-analysis task whose output is findings.
+
+**What:** read Windmill's **OpenFlow** step-attribute vocabulary as a **completeness checklist** against MessageFoundry's own step/connector semantics, and record what is missing, what is deliberately absent, and what is already covered under a different name. The attributes to walk: `retry`, `timeout`, `stop_after_if`, `skip_if`, `continue_on_error`, `mock`, `cache_ttl`.
+
+**Explicitly NOT the goal — do not target OpenFlow compatibility.** OpenFlow is an open standard (Apache-2.0, so safe to read and cite) but its `info.version` tracks Windmill's own release tag, i.e. one vendor's weekly train. Emitting or consuming OpenFlow is a **separate** question and is not authorized by this item. Adopting a *declarative artifact* remains declined by ADR 0076 §7 and #26.
+
+**Expected output:** a short findings note (a research doc or an amendment to this item) listing, per attribute: covered / not covered / deliberately declined, with the MessageFoundry construct that covers it. Some will already be covered engine-side rather than in the Steps view (retry/timeout live in connector + delivery semantics, not in a handler row), and saying so precisely is most of the value.
+
+**Related:** #222, ADR 0076 §7 (declarative artifact declined), #26 (the visual/declarative-authoring line).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); owner approved the checklist framing explicitly ("don't target compatibility").
+
+## 239. Re-measure Steps view estate coverage (opaque vs editable rows) after the palette
+
+> ✅ **SHIPPED (2026-07-30, PR #81).** `scripts/quality/lens_coverage.py` drives the shipped `lens parse --json` — not a second `ast` walk — so the number cannot drift from what the Steps view actually renders. Measured against the de-identified estate: 388 files · 145 handlers · 1,423 rows · **0 parse refusals**; editable share **42.0%**, fully-typed handlers **14.5%** (21/145), median opaque rows/handler **3**. Full result and the pre-registered decision rule are recorded on PR #81.
+>
+> ⚠️ **The pre-registered rule fired 🔴 RED, and the RED prescription was *not* adopted** — both triggers landed exactly on their boundaries (B = 14.5% missed the 15% floor by 0.5pp; median opaque = 3 hit `≥ 3` exactly), while A = 42.0% sat mid-AMBER. The AMBER prescription (breadth before depth) was taken instead, on the argument that the opacity is *mechanical* — comment-only rows (28%) plus helper delegation (41.8%) are ~70% of the opaque mass and both are addressable within the projection model. **This override was a delegated judgment call, never explicitly ratified by the owner**; treat it as open if the next measurement does not move. See **#248** (comment-only rows — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment A, ratified 2026-07-30). ⚠️ **The other half of that "~70% of the opaque mass" argument no longer stands:** helper delegation was to be addressed by ADR 0089 Phase D, which the owner **declined 2026-07-30 as too risky** (ADR 0076 Amendment B) — and its 41.8% was a heuristic superset whose real yield may be negative. So the breadth-before-depth case now rests on comment-only rows alone; re-measure before assuming the number moves.
+
+**Cluster:** IDE & Authoring. **Priority:** P1 — this number decides how much further Steps-view investment is justified. **Verdict:** build (cheap, reproducible). **Severity:** none (measurement).
+
+**What:** re-run [ADR 0089](adr/0089-recognition-first-lens-native-idioms.md) §5's AST coverage scan against the current production estate and publish the delta. **The measurement already exists and must not be re-invented:** ADR 0089 §1 scanned **87 files / 486 `msg`-manipulating functions / 3,852 statements** and found **~66% of projected rows opaque** (`code` / `UNRECOGNIZED control`) with **100% of handlers rendering zero editable action rows**; the index row records **~42% editable after Phase A**. §5 states the scan is explicitly "a **repeatable** coverage check — re-running it after each phase measures the coverage lift and surfaces the shrinking residual".
+
+**What is genuinely unknown:** the number *today*, after Phase A **plus** ADR 0106's 27-item palette, ADR 0108's send fan-out, and ADR 0104's picker landed. ADR 0089 §4 projects Phases A–D reaching **~80–90%** of transform statements against ~13% at baseline; nobody has confirmed where the current build actually sits, so the decision to build Phases B–E (or to stop) is being taken without the number that was designed to inform it.
+
+**Estate note (owner, 2026-07-30):** the production corpus this scan runs against has been **renamed** since ADR 0089 was written — confirm the current path with the owner before scanning rather than assuming the ADR's. (Estate identifiers are customer tokens and stay out of the repo; the forbidden-content gate enforces this.) Note also that the ADR 0104 estate scan cites **152 handlers**, a different slice than ADR 0089's **486** `msg`-manipulating functions — state which population any new number describes.
+
+**PHI:** the scan "reads only code (no PHI) and runs on any estate" (ADR 0089 §5) — keep that property; publish counts and shapes, never message content.
+
+**Why P1:** if the residual opaque fraction is still high, the palette is decorating a surface most production handlers fall out of, and Phases B–E (or a different bet entirely) matter more than any new row type. If it is low, #232/#235/#236/#237 are the right next investments. Either way this is a scan re-run, not a build.
+
+**Related:** ADR 0089 (the scan, the phases, and the erratum that phase work is tracked per-item at filing time — **not** by the stale #226–#230 range), #222, #235, #236, #237.
+
+**Source:** Windmill/Kestra evaluation (2026-07-30). ⚠️ That evaluation initially asserted "nobody has measured" this — **incorrect**; the owner corrected it the same day and ADR 0089 carries the prior numbers. Filed as a **re-measure**, not a first measurement.
+
+## 248. Steps view: reclassify comment-only rows as a non-opaque note row
+
+> 🔢 **Filed 2026-07-30 — not started. UNBLOCKED 2026-07-30:** the ADR gate is cleared — **ADR 0076 Amendment A is ACCEPTED and in force** (owner-ratified 2026-07-30), so the grammar widening this item needs is authorized and the build may proceed. Treat Amendment A §A.4's invariants as **build gates, not caveats**, and note §A.6: this item does **not** fix comment re-attachment on move/delete, nor the parent-nesting of a comment at the end of an `if`/`for` body.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** medium — three of the sub-defects are shipped user-visible breakage, not a coverage gap.
+
+**What:** a run of standalone comment lines inside a handler body projects as an opaque `code` row. "Comment" is already an Add-palette item ([ADR 0106](adr/0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) §5 (L)) that emits `# <text>`, so the palette writes a step the lens cannot read back as its own kind. Add a `note` row kind; see [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment A for the row shape, the invariants it must preserve, and AC-N1…N6.
+
+**Why this is not merely cosmetic — three defects reproducible on `main` today:**
+
+1. **A Comment inserted after a handler's last statement is not rendered at all.** The partition covers `[body[0].lineno, node.end_lineno]` and `end_lineno` is the last *statement's* last line (`messagefoundry/lens.py:20-21`, by design), so the comment falls outside every row. Not degraded — absent. The row context menu offers **Insert after** on any non-return row, so it is one click away.
+2. **A Comment adjacent to any other opaque or blank line produces no row of its own.** `_merge_code_rows` coalesces contiguous same-nesting `code` rows; an existing Code row silently grows by one line and the insert is invisible as a step.
+3. **An inserted Comment cannot be edited, deleted, or moved.** `rewrite_source` gates on `_EDITABLE_KINDS` (`messagefoundry/lens.py:1377`), which excludes `code`. This contradicts the shipped user doc — `docs/STEPS-PALETTE.md:71`, "**Everything is editable after insert**" — for which Comment is the sole exception.
+
+The existing test is too weak to catch any of it: `test_insert_comment_reads_back_as_code_row` asserts only `any(r["kind"] == "code" …)`, which passes even when the comment merged into an unrelated row. **Land failing tests for (1) and (2) first.**
+
+**Coverage context (secondary, and must be re-derived, not quoted):** the #239 scan attributed **28% of opaque `code` rows (146 of 522)** to comment/blank-only content. That split was reported in PR #81's comments and is **not committed as data**; `scripts/quality/lens_coverage.py` is now on `main`, so re-run it rather than citing this line. Note also that counting notes as *editable* would move the #239 editable share by roughly ten points without converting a single transform statement — Amendment A §A.8 requires notes to be counted in their own bucket and excluded from the editable-share numerator.
+
+**Gate:** a new row kind is a **grammar** widening — [ADR 0076](adr/0076-typed-action-vocabulary-action-list-lens.md) §2: "widening the roster is an ordinary addition, widening the *grammar* requires amending this ADR." Amendment A also **supersedes an owner-ratified decision** (ADR 0106 §5 (L) called the `code` degrade an "honest degrade"), so the owner must rule before any build.
+
+**Explicitly not this item:** grouping, collapse, `#region` folding, or any "the steps below belong to this note" membership — that is #231, **declined by owner ruling 2026-07-20**, and Amendment A §A.5 restates the boundary so it is not re-litigated in good faith.
+
+**Related:** #222 (the Steps view), #231 (declined Block grouping), #233 (duplicated move/drop logic — gates comment *attachment*), #239 (the scan), ADR 0076 Amendment A, ADR 0106 §5 (L).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); the three defects were verified against `origin/main` on 2026-07-30 while drafting Amendment A.
+
+## 249. `lens graph`: mermaid and dot export formats
+
+> 🔢 **Filed 2026-07-30 — not started, and not yet accepted.** Salvaged from a declined design; the owner has not ruled on whether to fund it.
+
+**Cluster:** IDE & Authoring. **Priority:** P3. **Verdict:** **owner decision pending** — proposed, not approved. **Severity:** none (additive capability).
+
+**What:** add `--format mermaid|dot` to the existing `graph --json` command, so an interface's topology can be rendered as a diagram from the CLI without a second tool.
+
+**Where it came from:** the 2026-07-30 Windmill/Kestra evaluation scored five integration designs. The one called "Tracing Paper" — a one-way OpenFlow export — **scored 5.7 and was declined**. This is the salvage from it: the estimate recorded at the time was **2–3 days**, and unlike the declined design it introduces no foreign artifact format and no second execution path.
+
+**Why it is filed rather than built:** it was a recommendation in a design memo that the owner never answered, and that memo has since been deleted. Filing preserves the option at its stated price; it does not approve it.
+
+**Related:** #238 (OpenFlow attribute checklist — the other salvage from the same evaluation), ADR 0076 (the lens CLI surface).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30), "Tracing Paper" design, declined; salvage recorded here so the estimate is not lost with the memo.
+
+## 250. Frozen ops OpenAPI + `messagefoundry-ops` wheel
+
+> ⛔ **DECLINED by owner ruling 2026-07-30 — decline-by-design.** The premise is rejected, not the price: *"a customer can drive MessageFoundry from tooling they already run"* is **not a direction this project takes**. The ~6-week estimate below was never the question. Recorded so it is not re-proposed as an obvious ops win — it is the shape that is refused, not the cost.
+>
+> ⚠️ **This ruling is broader than this item.** It rejects the whole *external-tooling-drives-MessageFoundry* line, which is why **#251 falls with it** (see below). It does **not** touch capabilities MessageFoundry drives itself and merely *emits* from — e.g. #249's `--format mermaid|dot` export is unaffected, because nothing external is driving anything. The distinction that matters is **direction of control**, not whether an interface exists.
+
+**Cluster:** Operations. **Verdict:** **⛔ declined-by-design (2026-07-30)** — the premise is refused; do not re-score. **Severity:** none.
+
+**The buyer question below is now moot for this item, and is NOT the reason it was declined.** It was filed as unresolved because the source memo's ranking assumed a small-team buyer and inverted for health systems with platform teams. The owner declined on the *shape of the integration*, without needing that question answered — so nothing here is waiting on a buyer-segment decision, and a future session must not reopen this item by claiming the assumption has since been settled.
+
+**What:** a frozen, versioned OpenAPI description of the operational surface plus a `messagefoundry-ops` client wheel, so a customer can drive MessageFoundry from tooling they already run.
+
+**Why it was surfaced:** the 2026-07-30 evaluation of Windmill and Kestra concluded **against** adopting either as a runtime or an authoring UI. This is the finding that survived that conclusion: the estimate recorded at the time was **~6 weeks**, and it was described as paying off against a customer's existing Ansible/Jenkins/PowerShell **with no orchestrator adopted at all** — i.e. its value does not depend on the orchestrator question being reopened.
+
+**Unresolved, and material to the decision:** the same memo flagged that its ranking assumed a **small-team buyer**, and that the ranking **inverts** if MessageFoundry is targeting health systems with platform teams. That assumption was never confirmed with the owner and should be settled before this is priced seriously.
+
+**Related:** #251 (the reduced Kestra-only form of the same ops surface), ADR 0072 (traced dry-run).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30). Recorded here because the design memo holding it has been deleted.
+
+## 251. Kestra-only read-only ops tasks (reduced "Anvil Ops")
+
+> ⛔ **DECLINED 2026-07-30 — falls with #250, under the same owner ruling.** This item *is* the rejected idea in reduced form: exposing MessageFoundry as tasks inside a customer's existing Kestra instance is exactly *"a customer drives MessageFoundry from tooling they already run."* Read-only scope and a ticket-not-replay dead-letter rule narrow the blast radius; they do not change the direction of control, which is what was refused. Its own stated precondition — *"only if #250 is funded first"* — is independently unmet, since #250 is declined.
+>
+> ⚠️ **Provenance:** the owner ruled explicitly on **#250**. This item was declined by the session recording that ruling, as a direct consequence of it plus the unmet precondition — **not by a separate owner ruling on #251**. If the intent was to refuse only the OpenAPI/wheel and keep a reduced Kestra-only form alive, this banner is the thing to correct.
+
+**Cluster:** Operations. **Verdict:** **⛔ declined (2026-07-30)** — consequent to #250; do not re-score. **Severity:** none.
+
+**What:** expose MessageFoundry as a small set of **read-only** tasks inside a customer's existing Kestra instance — Health, Status, ClusterStatus, SecurityPosture, DeadLetters-list — with dead-letter handling that raises a **ticket rather than replaying**, and a hard 12-month review. Estimate recorded at the time: **~5 weeks**.
+
+**The conditions are the point.** The full "Anvil Ops Tasks" design scored **6.3** and was accepted **in reduced form only, Kestra-only, if ever** — never as a general orchestrator integration. The message path stays entirely inside MessageFoundry: no orchestrator owns route → transform → deliver (that design, "Two-Queue Windmill", scored **1.0** and was declined). Anything that lets the orchestrator mutate or replay messages is a different item and was rejected.
+
+**Related:** #250 (the ops API this would sit on), #238, #26 (the declined visual-authoring line — why a declarative artifact interpreted by a second execution path is out).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30), "Anvil Ops Tasks" design. Recorded here because the design memo holding the conditions has been deleted.
+## 252. DICOM SCP peer-control gate counts a spoofable AE-title list as sufficient
+
+> 🔢 **Filed 2026-07-30.** P2. Surfaced while fixing the refusal message that named a non-existent settings key (that half is fixed; this half is a contract change and was deliberately not ridden in on it).
+
+**Type:** security hardening — authentication strength of a fail-closed gate.
+
+**What:** `transports/dicom.py` refuses a non-loopback C-STORE SCP that has *no* peer control, but the check **counts controls rather than weighing them**:
+
+```python
+mtls_on = bool(s.get("tls")) and bool(s.get("tls_ca_file"))
+if self._host not in _LOOPBACK_HOSTS and not (
+    self._calling_ae_allowlist or self._source_ip_allowlist or mtls_on
+):
+```
+
+So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to fail closed. A DICOM Calling AE Title is a **caller-asserted string with no cryptographic binding** — any peer that guesses or learns one AE Title is admitted. Empirically confirmed: an SCP on `0.0.0.0` with only `calling_ae_allowlist=["MOD1"]` constructs without error.
+
+**Why it is filed rather than fixed:** the three-control set is a documented contract — [ADR 0025](adr/0025-dicom-codec-store-connectors.md) §9 and the `docs/SECURITY.md` decision-table row both enumerate `calling_ae_allowlist` / `source_ip_allowlist` / mTLS as co-equal satisfiers. Demoting one is an ADR amendment and a breaking change for any site relying on it, so it needs its own decision rather than being a rider on a message correction.
+
+**Options:** (a) keep three satisfiers but require AE-title to be paired with an IP allowlist or mTLS off-loopback; (b) demote AE-title to *not* satisfying the gate alone, with an explicit audited opt-out mirroring the other loosenings; (c) accept as-is and document the weakness at the gate (the refusal message now warns about it in-band).
+
+**Related:** ADR 0025 §9, `docs/SECURITY.md` DICOM peer-control row, `tests/test_dicom_scp_security.py::test_nonloopback_scp_with_calling_ae_allowlist_ok` (pins the current behaviour, so it changes with the decision).
+
+**Source:** adversarial documentation security review (2026-07-30); the message/doc half shipped alongside this filing.

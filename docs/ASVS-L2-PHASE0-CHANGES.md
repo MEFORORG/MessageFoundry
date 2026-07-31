@@ -374,7 +374,8 @@ tables in [`CONNECTIONS.md`](CONNECTIONS.md) §"Resource management & limits" (A
 > HTTP listeners) are **listeners**: no egress arm applies to them at any setting, because
 > `check_egress_allowed` gates destinations and `check_source_allowed` gates only the DATABASE
 > poll source and the REMOTEFILE source — the two source kinds that dial out. A listener is
-> gated by `calling_ae_allowlist` / `[inbound].source_ip_allowlist` instead. DICOMWEB rides
+> gated by `calling_ae_allowlist` / the per-connection `source_ip_allowlist` (an `inbound(...)`
+> keyword, not an `[inbound]` service key) instead. DICOMWEB rides
 > `allowed_http` like REST/SOAP/FHIR; DIRECT has its **own** `allowed_direct` list, deliberately
 > separate from `allowed_smtp`; and the **AI broker rides neither** — it is gated only by the
 > dedicated fail-closed `[ai].allowed_endpoints`.

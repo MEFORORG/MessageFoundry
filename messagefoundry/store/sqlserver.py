@@ -167,9 +167,23 @@ def _utf16_units(text: str) -> int:
     return len(text.encode("utf-16-le")) // 2
 
 
-def _encode_proc_lanes(lanes: Sequence[str]) -> str:
-    """Encode the (deduped, chunk-clamped) lane list as the proc's one JSON-array parameter.
-    ``json.dumps`` default escaping — no delimiter contract is ever imposed on connection names."""
+def _keep_matchable_lanes(lanes: Sequence[str]) -> list[str]:
+    """Drop requested lane names that exceed the NVARCHAR(256) lane column (AC-11).
+
+    Such a lane can never equal a stored lane, so skipping it client-side is a pure no-op on the
+    RESULT — but it is NOT optional, and it must run for EVERY dispatch path. The ad-hoc batch
+    binds the lane list into a ``(VALUES (?),…)`` derived table that lands in a
+    ``DECLARE @heads TABLE (lane NVARCHAR(256) NOT NULL`` — SQL Server evaluates that narrowing
+    conversion on the outer constant scan BEFORE the CROSS APPLY filters it, and with ANSI_WARNINGS
+    ON it raises 2628 ("String or binary data would be truncated") even when zero rows would have
+    matched. So an unfiltered oversized lane makes the batch RAISE where the contract says it must
+    claim nothing — no-match parity broken, and 2628 is not 1222 so it is not translated to
+    EMPTY-all either: it rolls back and re-raises to the dispatcher.
+
+    Applied once in ``claim_fifo_heads`` ahead of the dispatch-path split, so the proc, prepared and
+    batch branches cannot disagree. (Before this, only the two flagged branches filtered, via
+    ``_encode_proc_lanes`` — and the gap was unreachable in practice only because sub-lever A's
+    startup gate never passed, so the parity test never reached its batch arm.)"""
     kept = []
     for lane in lanes:
         units = _utf16_units(lane)
@@ -183,7 +197,15 @@ def _encode_proc_lanes(lanes: Sequence[str]) -> str:
             )
             continue
         kept.append(lane)
-    return json.dumps(kept)
+    return kept
+
+
+def _encode_proc_lanes(lanes: Sequence[str]) -> str:
+    """Encode the (deduped, filtered, chunk-clamped) lane list as the proc's one JSON-array
+    parameter. ``json.dumps`` default escaping — no delimiter contract is ever imposed on
+    connection names. Oversized lanes are removed upstream by ``_keep_matchable_lanes``; the call
+    here is idempotent and kept so this encoder is safe to use on an unfiltered list."""
+    return json.dumps(_keep_matchable_lanes(lanes))
 
 
 def _claim_proc_param_pins() -> list[tuple[int, int, int]]:
@@ -802,11 +824,22 @@ _CLAIM_PROC_EPOCH_GUARD = (
     " WHERE ll.lease_key = @lease_key) <= @leader_epoch)"
 )
 
+# The module head the shipped deploy path emits — the ONE place this literal lives in production
+# code. ``_claim_proc_body`` renders it and ``_claim_proc_stored_forms`` anchors on it, so an edit
+# to the head is mechanically an edit to BOTH sides of the gate's comparison. The anchor is
+# load-bearing: a leading ``--`` comment or ``;`` in the body would otherwise blind the gate
+# silently, so ``_claim_proc_stored_forms`` RAISES rather than falling through.
+# tests/test_adr0114_claim_proc.py re-states this literal independently on purpose — do NOT
+# collapse that assertion onto this constant, or the check stops being a check.
+_CLAIM_PROC_HEAD: Final[str] = "CREATE OR ALTER PROCEDURE dbo."
+
 
 def _claim_proc_body(proc_name: str, lane_col: str) -> str:
     """The full ``CREATE OR ALTER PROCEDURE`` statement for one lane family — the text inside the
-    guarded ``EXEC(N'...')`` and the text ``OBJECT_DEFINITION()`` returns for the startup gate's
-    normalized-hash comparison. The body is the shipped batch verbatim (via ``_fifo_heads_steps``)
+    guarded ``EXEC(N'...')``. This is the text SUBMITTED, which is NOT the text
+    ``OBJECT_DEFINITION()`` returns: the engine deletes the ``OR`` and ``ALTER`` tokens from the
+    stored module, so the startup gate compares against ``_claim_proc_stored_forms()`` — never
+    against this string directly. The body is the shipped batch verbatim (via ``_fifo_heads_steps``)
     with exactly the ADR 0114 §4 mechanical substitutions: the DECLARE block becomes the parameter
     list, the VALUES lane list becomes the one-JSON-parameter OPENJSON decode, the spliced epoch
     guard becomes the fixed nullable form, plus the conditional ``@fold_reset`` tail (sub-lever C's
@@ -823,7 +856,7 @@ def _claim_proc_body(proc_name: str, lane_col: str) -> str:
     honestly-stated delta from the batch (the outbound post-proc H2 statements may emit rowcount
     DONE tokens; harmless for the execute/fetchone consumers — ADR 0114 §3)."""
     return (
-        f"CREATE OR ALTER PROCEDURE dbo.{proc_name}"
+        f"{_CLAIM_PROC_HEAD}{proc_name}"
         " @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32),"
         " @lanes NVARCHAR(MAX),"
@@ -882,20 +915,92 @@ def _claim_proc_ddl(proc_name: str, lane_col: str) -> str:
 
 def _normalize_tsql(text: str) -> str:
     """Whitespace-normalize a T-SQL module body for the startup gate's hash comparison: collapse
-    every whitespace run to one space and strip. OBJECT_DEFINITION() preserves the definition text
-    as executed, but line endings / trailing whitespace may differ across deployment paths."""
+    every whitespace run to one space and strip — line endings and interior spacing differ across
+    deployment paths and across the engine's own module rewrite.
+
+    LOAD-BEARING, do not "simplify" to a line-ending normalizer: the engine deletes the ``OR`` and
+    ``ALTER`` TOKENS from a ``CREATE OR ALTER`` head and KEEPS their separators, so the stored head
+    comes back as ``CREATE`` + three spaces + ``PROCEDURE``. Collapsing runs is what folds that
+    residual spacing away; without it the gate re-breaks even with the head expansion in place.
+
+    Note this normalization is applied to the DEPLOYED text too, so it is semantically lossy inside
+    string literals and comments. The compensating control is the AC-8 body lint
+    (``test_ac8_proc_body_hard_rules``), which pins the shipped body free of quotes, ``--``, ``/*``
+    and non-ASCII — keep those assertions."""
     return " ".join(text.split())
 
 
-def _claim_proc_shipped_hashes() -> dict[str, str]:
-    """proc name -> SHA-256 of the normalized shipped body (the startup gate's expected values)."""
+# Every module head a SQL Server may STORE for a module THIS code deployed as _CLAIM_PROC_HEAD.
+#
+# OBJECT_DEFINITION() does not return a CREATE OR ALTER module verbatim: the engine deletes the OR
+# and ALTER keyword TOKENS and keeps their delimiting separators, so the submitted head comes back
+# as "CREATE" + three spaces + "PROCEDURE" (char delta exactly 7). MEASURED on SQL Server 2022
+# 16.0.4255.1 and 2025 17.0.4055.5, compat 130/160/170, across five deploy paths: fresh CREATE, the
+# OR ALTER re-apply, a plain batch, the shipped guarded EXEC(N'...') wrapper, and an out-of-band
+# ALTER PROCEDURE (which the engine ALSO rewrites, to a single-spaced CREATE PROCEDURE). Case is
+# preserved, not folded. _normalize_tsql collapses the spacing, so the rewritten head is keyed here
+# in its collapsed spelling. THIS GATE WAS INERT IN EVERY DEPLOYMENT since it shipped, because it
+# compared only against the verbatim form — which no SQL Server can return.
+#
+# The VERBATIM head is retained as a second accepted form for an engine that does not rewrite. It
+# is the text this code SUBMITTED, so accepting it asserts strictly LESS than accepting the rewrite
+# does: an engine handing back our own bytes is zero drift, not a tamper event. Which form was
+# observed is recorded and logged, so a non-rewriting engine stays DISCOVERABLE — it just is not
+# alarmed on.
+#
+# RULE for any future entry — a head belongs here ONLY if a server can produce it from the text
+# _claim_proc_body() renders. `CREATE PROC`, a lower-cased head, or any other spelling this deploy
+# path cannot emit is positive evidence of an out-of-band hand deploy, which is precisely the AC-7
+# signal, and MUST keep failing the gate. This is not a compatibility grab-bag.
+_CLAIM_PROC_STORED_HEADS: Final[tuple[tuple[str, str], ...]] = (
+    ("rewritten", "CREATE PROCEDURE dbo."),
+    ("verbatim", _CLAIM_PROC_HEAD),
+)
+
+
+def _claim_proc_stored_forms(proc_name: str, lane_col: str) -> dict[str, str]:
+    """label -> the normalized text ``OBJECT_DEFINITION()`` may return for OUR deployed module.
+
+    SHIPPED-SIDE ONLY: the deployed text is still hashed as ``_normalize_tsql(deployed)``,
+    untouched. The accepted set is therefore a small collection of code-controlled CONSTANTS rather
+    than a preimage class of a lossy transform over server-supplied text — a wrong constant can only
+    make the gate expect the wrong body (degrade loudly), never widen what it accepts.
+
+    Raises ValueError if the shipped body no longer starts with the anchor; ``_gate_claim_proc``'s
+    blanket ``except Exception`` turns that into a loud degrade, never an open() failure."""
+    shipped = _claim_proc_body(proc_name, lane_col)
+    if not shipped.startswith(_CLAIM_PROC_HEAD):
+        raise ValueError(
+            f"_claim_proc_body({proc_name!r}) no longer starts with {_CLAIM_PROC_HEAD!r}: the AC-7"
+            " startup gate anchors its stored-head expansion on that literal, so a leading comment,"
+            " semicolon or SET statement would silently blind the gate. Change _claim_proc_body,"
+            " _CLAIM_PROC_HEAD and _CLAIM_PROC_STORED_HEADS together."
+        )
+    tail = shipped[len(_CLAIM_PROC_HEAD) :]
+    return {label: _normalize_tsql(head + tail) for label, head in _CLAIM_PROC_STORED_HEADS}
+
+
+def _claim_proc_shipped_hashes() -> dict[str, dict[str, str]]:
+    """proc name -> {SHA-256 of an accepted normalized body: which stored head form it is}.
+
+    Keyed PER PROC, deliberately: ONE flat set across both procs would accept the cid body served
+    under the dst name (``sp_rename`` does not rewrite ``sys.sql_modules.definition``, so a rename
+    or a botched blue/green swap reaches that state with no tampering intent) — a silent cross-lane
+    predicate swap that claims zero rows forever. Do NOT flatten.
+
+    NEVER memoize this at module scope. The ValueError from ``_claim_proc_stored_forms`` is caught
+    by ``_gate_claim_proc`` and becomes a loud degrade; evaluated at import time it would be an
+    ImportError for the whole module — a hard outage. (``_SCHEMA`` already calls ``_claim_proc_ddl``
+    at import time, so that refactor is plausible; this one must not follow it.)"""
     return {
-        _CLAIM_PROC_CID: hashlib.sha256(
-            _normalize_tsql(_claim_proc_body(_CLAIM_PROC_CID, "channel_id")).encode()
-        ).hexdigest(),
-        _CLAIM_PROC_DST: hashlib.sha256(
-            _normalize_tsql(_claim_proc_body(_CLAIM_PROC_DST, "destination_name")).encode()
-        ).hexdigest(),
+        proc_name: {
+            hashlib.sha256(text.encode()).hexdigest(): label
+            for label, text in _claim_proc_stored_forms(proc_name, lane_col).items()
+        }
+        for proc_name, lane_col in (
+            (_CLAIM_PROC_CID, "channel_id"),
+            (_CLAIM_PROC_DST, "destination_name"),
+        )
     }
 
 
@@ -1555,6 +1660,10 @@ class SqlServerStore:
         self._claim_proc_effective = False
         self._claim_proc_degraded_reason: str | None = None
         self._claim_proc_input_sizes: list[tuple[int, int, int]] | None = None
+        # proc name -> which _CLAIM_PROC_STORED_HEADS form the deployed module actually matched
+        # ("rewritten" on every engine measured to date; "verbatim" would mean this server does NOT
+        # rewrite CREATE OR ALTER — an engine difference worth knowing about, not a tamper event).
+        self._claim_proc_head_forms: dict[str, str] = {}
         self._claim_proc_setinputsizes_warned = False
         # ADR 0114 sub-lever B (fifo_claim_prepared): stable claim text + a retained prepared
         # cursor on store-owned dedicated connections (INGRESS/ROUTED). Read ONCE at open; the
@@ -1644,12 +1753,16 @@ class SqlServerStore:
         """ADR 0114 §4 startup gate — fail-safe to the batch, loudly (AC-7). With
         ``fifo_claim_proc`` ON, open() probes (a) both procs exist, (b) each deployed body's
         normalized SHA-256 (via OBJECT_DEFINITION — existence alone cannot catch a hand-edited
-        body, and the proc IS the claim logic) matches the shipped DDL text, and (c)
-        compatibility_level >= 130 (OPENJSON). Any miss records the reason, logs a WARNING, and
+        body, and the proc IS the claim logic) matches one of ``_claim_proc_stored_forms()``, and
+        (c) compatibility_level >= 130 (OPENJSON). Any miss records the reason, logs a WARNING, and
         leaves ``_claim_proc_effective`` False — the shipped batch runs; NEVER a lane outage.
-        Out-of-band drift is caught at the next open; ``DELETE FROM schema_meta`` forces a full
-        re-create."""
+
+        The comparison is against the STORED forms, not against ``_claim_proc_body()`` directly:
+        the engine rewrites the ``CREATE OR ALTER`` head when it stores the module, so comparing
+        with the submitted text can never match (the defect that left this gate inert in every
+        deployment from the feature shipping until this commit)."""
         reason: str | None = None
+        head_forms: dict[str, str] = {}
         try:
             row = await self._fetchone(
                 "SELECT compatibility_level FROM sys.databases WHERE name = DB_NAME()"
@@ -1672,13 +1785,19 @@ class SqlServerStore:
                         )
                         break
                     got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
-                    if got != expected[proc_name]:
+                    matched = expected[proc_name].get(got)
+                    if matched is None:
                         reason = (
-                            f"stored procedure dbo.{proc_name} body does not match the shipped"
-                            " definition (out-of-band edit? DELETE FROM schema_meta forces a"
-                            " re-create at next open)"
+                            f"stored procedure dbo.{proc_name} body matches no form this build"
+                            " deploys — an out-of-band edit, a hand deploy (a head spelling this"
+                            " code cannot emit, e.g. CREATE PROC or a differing case), a renamed"
+                            " proc (sp_rename does not rewrite the stored definition), or a build"
+                            " whose body was changed without bumping the _v1 proc name. The"
+                            " shipped batch runs. Compare OBJECT_DEFINITION(OBJECT_ID('dbo."
+                            f"{proc_name}')) against this build's own definition to see the drift"
                         )
                         break
+                    head_forms[proc_name] = matched
         except Exception as exc:  # noqa: BLE001 - §4: ANY gate failure degrades, never an outage
             # A transient probe failure (e.g. a hiccup on the metadata read) must not fail the
             # open — the ADR's rule is total: any gate miss runs the shipped batch, loudly.
@@ -1687,12 +1806,25 @@ class SqlServerStore:
             self._claim_proc_effective = True
             self._claim_proc_degraded_reason = None
             self._claim_proc_input_sizes = _claim_proc_param_pins()
+            self._claim_proc_head_forms = head_forms
             log.info(
                 "fifo_claim_proc: startup gate PASSED — pooled claims will use"
-                " dbo.%s / dbo.%s (ADR 0114 sub-lever A)",
+                " dbo.%s / dbo.%s (ADR 0114 sub-lever A); stored head forms: %s",
                 _CLAIM_PROC_CID,
                 _CLAIM_PROC_DST,
+                head_forms,
             )
+            if any(form == "verbatim" for form in head_forms.values()):
+                # Not a fault: this engine stores CREATE OR ALTER as submitted rather than deleting
+                # the tokens. Every engine measured to date rewrites, so this is worth surfacing —
+                # it means the compatibility assumption in _CLAIM_PROC_STORED_HEADS has a live
+                # counterexample and the ADR should record it.
+                log.info(
+                    "fifo_claim_proc: this server stored the CREATE OR ALTER head VERBATIM"
+                    " (%s) — no engine measured to date does this; please report it, the gate"
+                    " accepts it deliberately",
+                    head_forms,
+                )
         else:
             self._claim_proc_effective = False
             self._claim_proc_degraded_reason = reason
@@ -1703,37 +1835,72 @@ class SqlServerStore:
                 reason,
             )
 
-    def _apply_claim_input_sizes(self, cur: Any, sizes: list[tuple[int, int, int]] | None) -> None:
-        """Pin the claim-path parameter descriptors on ``cur`` (ADR 0114 §4/§5 NULL-typing
-        hazard; 9 descriptors on the proc path, 8 on the prepared stable-text path).
-        ``setinputsizes`` is pure client-side descriptor state (no I/O), so the SYNC
-        pyodbc call is loop-safe — but the surface matters: aioodbc 0.5.0 wraps it as
-        ``async def setinputsizes`` (cursor.py:148, executor-routed), so calling the WRAPPER
-        synchronously would merely create a never-awaited coroutine and silently apply nothing
-        (the adversarial-review finding this method is shaped around). Therefore the underlying
-        pyodbc cursor (``_impl``) is preferred FIRST; the wrapper attribute is used only when it
-        is a plain sync callable (a bare pyodbc cursor, or a test fake). If neither surface is
-        reachable, warn ONCE and proceed unpinned (the G-A0 wire trace decides whether describe
-        traffic appears — degraded observability, never an outage)."""
-        if sizes is None:
-            return
+    @staticmethod
+    def _sync_setinputsizes(cur: Any) -> Any | None:
+        """The SYNC ``setinputsizes`` callable for ``cur``, or None if unreachable. The surface
+        matters: aioodbc 0.5.0 wraps ``setinputsizes`` as ``async def`` (cursor.py:148,
+        executor-routed), so calling the WRAPPER synchronously merely creates a never-awaited
+        coroutine that does NOTHING. So the underlying pyodbc cursor (``_impl``) is preferred
+        FIRST; the wrapper attribute is used only when it is a plain sync callable (a bare pyodbc
+        cursor, or a test fake). ``setinputsizes`` is pure client-side descriptor state (no I/O),
+        so the sync call is loop-safe."""
         raw = getattr(cur, "_impl", None)
         target = getattr(raw, "setinputsizes", None)
         if target is None:
             candidate = getattr(cur, "setinputsizes", None)
             if candidate is not None and not inspect.iscoroutinefunction(candidate):
                 target = candidate
+        return target
+
+    def _warn_setinputsizes_unreachable(self) -> None:
+        if not self._claim_proc_setinputsizes_warned:
+            self._claim_proc_setinputsizes_warned = True
+            log.warning(
+                "ADR 0114 claim path: no synchronous setinputsizes is reachable through this"
+                " cursor stack — proceeding without parameter-descriptor pin/clear (NULL params"
+                " may incur SQLDescribeParam round trips; the ADR 0114 G-A0/G-B0 preflights"
+                " measure this)"
+            )
+
+    def _apply_claim_input_sizes(self, cur: Any, sizes: list[tuple[int, int, int]] | None) -> None:
+        """Pin the claim-path parameter descriptors on ``cur`` (ADR 0114 §4/§5 NULL-typing
+        hazard; 9 descriptors on the proc path, 8 on the prepared stable-text path). If no sync
+        surface is reachable, warn ONCE and proceed unpinned (the G-A0 wire trace decides whether
+        describe traffic appears — degraded observability, never an outage)."""
+        if sizes is None:
+            return
+        target = self._sync_setinputsizes(cur)
         if target is None:
-            if not self._claim_proc_setinputsizes_warned:
-                self._claim_proc_setinputsizes_warned = True
-                log.warning(
-                    "ADR 0114 claim path: no synchronous setinputsizes is reachable through this"
-                    " cursor stack — proceeding without parameter-descriptor pins (NULL params"
-                    " may incur SQLDescribeParam round trips; the ADR 0114 G-A0/G-B0 preflights"
-                    " measure this)"
-                )
+            self._warn_setinputsizes_unreachable()
             return
         target(sizes)
+
+    def _clear_claim_input_sizes(self, cur: Any) -> None:
+        """Clear the claim-CALL parameter pins on ``cur`` before it runs the H2 DELIVERY DML.
+
+        ``setinputsizes`` is PERSISTENT cursor state. On the proc path the pooled claim cursor is
+        pinned for the ``{CALL}`` (descriptor[0] = ``SQL_DOUBLE`` for ``@now FLOAT``) and then, at
+        OUTBOUND, the SAME cursor runs the H2 ``SELECT 1 FROM delivered_keys WHERE outbox_id=?`` —
+        binding the NVARCHAR ``d["id"]`` against the stale ``SQL_DOUBLE`` descriptor throws a
+        client-side ``22018`` cast error, rolls the claim back, and collapses outbound delivery.
+        The pins' only purpose was the CALL's NULL-fence describe-avoidance, so clear them the
+        moment the CALL's result is drained.
+
+        Only PARAMETERIZED statements are affected — a zero-parameter execute (notably the shielded
+        ``SET LOCK_TIMEOUT -1;`` reset in this method's ``finally``) tolerates surplus descriptors,
+        measured on pyodbc 5.3.0 / ODBC Driver 18. So the exposure is exactly the H2 bind chain and
+        clearing here covers all of it.
+
+        ``setinputsizes(None)`` reverts all params to default inference (pyodbc 5.3.0), on the SYNC
+        ``_impl`` surface — a bare ``cur.setinputsizes(None)`` on the async wrapper is a
+        never-awaited no-op, and ``_apply_claim_input_sizes(cur, None)`` early-returns on its None
+        guard, so neither clears anything. Best-effort: if no sync surface is reachable the pins
+        were never applied either, so there is nothing to clear."""
+        target = self._sync_setinputsizes(cur)
+        if target is None:
+            self._warn_setinputsizes_unreachable()
+            return
+        target(None)
 
     @property
     def claim_prepared_effective(self) -> bool:
@@ -6309,8 +6476,20 @@ class SqlServerStore:
             # outstanding-head retry semantics — exactly as ADR 0058 excludes them from batching.
             per_lane_limit = 1
         # Dedupe (preserving request order; duplicate lanes would violate @heads' PRIMARY KEY) +
-        # chunk clamp; the caller covers the remainder with a second call.
-        lane_list = list(dict.fromkeys(lanes))[:_FIFO_HEADS_LANE_CHUNK]
+        # chunk clamp; the caller covers the remainder with a second call. THEN drop lanes too long
+        # to ever match (AC-11). The clamp deliberately runs BEFORE the skip: an oversized lane
+        # occupies a chunk slot it can never match, which is the pre-existing, tested contract
+        # (test_prepared_lane_encoding_shares_the_proc_rules pins 499, not 500). Reordering these
+        # would serve more lanes per call, but that is a separate decision and not part of this fix.
+        #
+        # The skip sits here, ahead of the dispatch-path split below, so the proc, prepared and
+        # ad-hoc batch branches cannot disagree about it. Previously only the two flagged branches
+        # filtered (inside _encode_proc_lanes) and the batch bound the raw list — where an oversized
+        # lane is not merely useless but FATAL (2628 on the @heads narrowing conversion; see
+        # _keep_matchable_lanes). That gap was unreachable in practice only because sub-lever A's
+        # startup gate never passed, so the AC-11 parity test never reached its batch arm.
+        # The existing empty guard then covers a request that was entirely oversized.
+        lane_list = _keep_matchable_lanes(list(dict.fromkeys(lanes))[:_FIFO_HEADS_LANE_CHUNK])
         if not lane_list:
             return ClaimedHeads(by_lane={}, rearm=frozenset())
         # H1 FENCING TOKEN — identical to the single claim, applied to the probe AND the UPDATE so a
@@ -6494,6 +6673,18 @@ class SqlServerStore:
                 # before the connection returns to the pool (no-MARS).
                 rows = await cur.fetchall()
                 decoded = [dict(zip(columns, r)) for r in rows]  # noqa: B905
+                if use_proc:
+                    # The proc CALL pinned 9 parameter descriptors on this POOLED cursor
+                    # (descriptor[0] = SQL_DOUBLE for @now FLOAT); those pins are PERSISTENT cursor
+                    # state, and the H2 delivery DML below runs on the SAME cursor at OUTBOUND —
+                    # binding the NVARCHAR d["id"] against the stale SQL_DOUBLE descriptor throws a
+                    # client 22018 cast error and collapses delivery. Clear the pins now, the moment
+                    # the CALL's result is drained and before any H2 bind. (use_prepared is
+                    # INGRESS/ROUTED-only, where the H2 branch is a no-op — its retained-cursor pins
+                    # are never poisoned AND must persist for reuse across calls, so they are NOT
+                    # cleared here. On ingress/routed the proc's own H2 branch is also a no-op, so
+                    # this clear is simply harmless there.)
+                    self._clear_claim_input_sizes(cur)
                 if any(d["id"] is None for d in decoded):
                     # kept != claimed (ADR 0066 §3.2 STEP 5) — fail closed: roll the whole call
                     # back, claim nothing. Reachable via an ordinary fence race, not only a bug:
