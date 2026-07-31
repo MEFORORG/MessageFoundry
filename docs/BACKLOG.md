@@ -7135,9 +7135,13 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 
 ## 250. Frozen ops OpenAPI + `messagefoundry-ops` wheel
 
-> 🔢 **Filed 2026-07-30 — not started, and not yet accepted.** A ~6-week estimate the owner has not ruled on. Do not treat as approved.
+> ⛔ **DECLINED by owner ruling 2026-07-30 — decline-by-design.** The premise is rejected, not the price: *"a customer can drive MessageFoundry from tooling they already run"* is **not a direction this project takes**. The ~6-week estimate below was never the question. Recorded so it is not re-proposed as an obvious ops win — it is the shape that is refused, not the cost.
+>
+> ⚠️ **This ruling is broader than this item.** It rejects the whole *external-tooling-drives-MessageFoundry* line, which is why **#251 falls with it** (see below). It does **not** touch capabilities MessageFoundry drives itself and merely *emits* from — e.g. #249's `--format mermaid|dot` export is unaffected, because nothing external is driving anything. The distinction that matters is **direction of control**, not whether an interface exists.
 
-**Cluster:** Operations. **Priority:** P3 (unscored — pending the buyer question below). **Verdict:** **owner decision pending** — proposed, not approved. **Severity:** none (additive capability).
+**Cluster:** Operations. **Verdict:** **⛔ declined-by-design (2026-07-30)** — the premise is refused; do not re-score. **Severity:** none.
+
+**The buyer question below is now moot for this item, and is NOT the reason it was declined.** It was filed as unresolved because the source memo's ranking assumed a small-team buyer and inverted for health systems with platform teams. The owner declined on the *shape of the integration*, without needing that question answered — so nothing here is waiting on a buyer-segment decision, and a future session must not reopen this item by claiming the assumption has since been settled.
 
 **What:** a frozen, versioned OpenAPI description of the operational surface plus a `messagefoundry-ops` client wheel, so a customer can drive MessageFoundry from tooling they already run.
 
@@ -7151,9 +7155,11 @@ The existing test is too weak to catch any of it: `test_insert_comment_reads_bac
 
 ## 251. Kestra-only read-only ops tasks (reduced "Anvil Ops")
 
-> 🔢 **Filed 2026-07-30 — not started, and not yet accepted.** Offered conditionally in a design memo and never answered; filed so the conditions survive the memo.
+> ⛔ **DECLINED 2026-07-30 — falls with #250, under the same owner ruling.** This item *is* the rejected idea in reduced form: exposing MessageFoundry as tasks inside a customer's existing Kestra instance is exactly *"a customer drives MessageFoundry from tooling they already run."* Read-only scope and a ticket-not-replay dead-letter rule narrow the blast radius; they do not change the direction of control, which is what was refused. Its own stated precondition — *"only if #250 is funded first"* — is independently unmet, since #250 is declined.
+>
+> ⚠️ **Provenance:** the owner ruled explicitly on **#250**. This item was declined by the session recording that ruling, as a direct consequence of it plus the unmet precondition — **not by a separate owner ruling on #251**. If the intent was to refuse only the OpenAPI/wheel and keep a reduced Kestra-only form alive, this banner is the thing to correct.
 
-**Cluster:** Operations. **Priority:** P3 (unscored). **Verdict:** **owner decision pending** — proposed in a reduced form only, and only if #250 is funded first. **Severity:** none.
+**Cluster:** Operations. **Verdict:** **⛔ declined (2026-07-30)** — consequent to #250; do not re-score. **Severity:** none.
 
 **What:** expose MessageFoundry as a small set of **read-only** tasks inside a customer's existing Kestra instance — Health, Status, ClusterStatus, SecurityPosture, DeadLetters-list — with dead-letter handling that raises a **ticket rather than replaying**, and a hard 12-month review. Estimate recorded at the time: **~5 weeks**.
 
