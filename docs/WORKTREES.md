@@ -78,11 +78,26 @@ Three things that cost real time here:
 - **`BLOCKED` is the one that looks actionable and usually isn't.** Right after a push, every required
   check is pending and the PR reads `BLOCKED` — identical to genuinely failing. Count failures in
   `statusCheckRollup` before diagnosing; zero failures plus pending checks means wait.
-- **Armed auto-merge does *not* update a `BEHIND` branch here.** Landing PR A puts PR B `BEHIND`, and B
+- **Armed auto-merge wins the race against checks finishing, not against `main` moving.** It does *not*
+  update a `BEHIND` branch. Landing PR A puts PR B `BEHIND`, and B
   sits armed and stalled indefinitely. Someone has to rebase it. If you queue two PRs, expect to rebase
   the second after the first lands.
 - **`BEHIND` and `DIRTY` are easy to confuse and the wrong fix is destructive.** Treating `DIRTY` as
   `BEHIND` means resolving conflicts in a hurry to make a force-push succeed.
+
+### If you poll for "is it merged yet", watch for three outcomes, not two
+
+A watcher that checks *merged?* and *failing?* is blind to the outcome that actually happens most:
+**`main` moved and the branch went `BEHIND` again.** That state produces no failure and no merge, so a
+two-armed watcher reports "still running" right up to its timeout while nothing is progressing. Add the
+third arm — merged / failing / **went stale** — and act on the third by re-syncing.
+
+The same blindness has a second form: polling immediately after a push, when the new run's check legs
+do not exist yet. "Nothing pending" then reads as "all checks settled" when it means "no checks have
+started". Assert on the count of legs you *expect*, not on the absence of pending ones.
+
+Both are the same failure as taking `--ours` on a conflict: **the instrument was accurate about what it
+looked at and silent about what it did not.** `main` moved seven times during one pair of PRs.
 
 ### Resolving a conflict: never take a side wholesale
 
