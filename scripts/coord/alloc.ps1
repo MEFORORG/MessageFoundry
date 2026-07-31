@@ -81,15 +81,34 @@ function Get-Floor {
             }
         }
     } else {
-        # BACKLOG.md is one big file: read it from origin/main and from this worktree's HEAD + index.
-        $texts = @(
-            (& git show "origin/main:docs/BACKLOG.md" 2>$null) -join "`n"
-            (& git show "HEAD:docs/BACKLOG.md" 2>$null) -join "`n"
-        )
+        # BACKLOG.md is ONE BIG FILE, so the floor needs its CONTENT, not a filename listing -- but it
+        # still needs EVERY ref, exactly like the adr branch above and exactly as this function's own
+        # header comment promises. Reading only origin/main + HEAD is what re-issued #240-#247 on
+        # 2026-07-30 over numbers ADR 0115 and seven amended ADRs already cite: the items holding
+        # those numbers live on refs the published branch does not carry, so they were invisible here
+        # and the allocator handed the numbers out as free. A number that exists on ANY ref is taken.
+        #
+        # Batched deliberately: ~550 refs share ~190 distinct BACKLOG.md blobs, and a `git show` per
+        # ref costs ~34s on Windows (one process each). Two `git cat-file` processes do it in ~3s.
+        $refs = @("origin/main", "HEAD") + @(& git for-each-ref --format='%(refname)' refs/heads refs/remotes)
+        $specs = ($refs | Select-Object -Unique | ForEach-Object { "${_}:docs/BACKLOG.md" })
+
+        $oids = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($line in ($specs -join "`n" | & git cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
+        }
+
+        $rx = [regex]'^#{2,3} (\d+)\.'
+        if ($oids.Count -gt 0) {
+            foreach ($line in (($oids -join "`n") | & git cat-file --batch 2>$null)) {
+                $m = $rx.Match("$line")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            }
+        }
         $wip = Join-Path $repo "docs/BACKLOG.md"
-        if (Test-Path $wip) { $texts += (Get-Content $wip -Raw) }
-        foreach ($t in $texts) {
-            foreach ($m in [regex]::Matches($t, '(?m)^#{2,3} (\d+)\.')) { $seen.Add([int]$m.Groups[1].Value) }
+        if (Test-Path $wip) {
+            foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
         }
     }
 
