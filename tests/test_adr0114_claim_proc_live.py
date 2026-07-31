@@ -89,6 +89,33 @@ async def test_open_deploys_procs_and_gate_passes(proc_store: SqlServerStore) ->
         assert row is not None and row["body"], f"dbo.{proc} not deployed"
 
 
+async def test_a_deployed_proc_can_return_a_null_definition(proc_store: SqlServerStore) -> None:
+    """The premise the gate's missing-vs-unreadable split rests on, and the one thing no offline
+    stub can show: on a real engine ``OBJECT_ID`` and ``OBJECT_DEFINITION`` genuinely disagree — a
+    procedure can be DEPLOYED and its definition still come back NULL.
+
+    Before the gate probed the id it read that NULL as "the proc is missing" and sent the operator
+    to grant ``CREATE PROCEDURE`` — neither the cause nor the cure.
+
+    ``WITH ENCRYPTION`` is used because it needs no security principal, so this leg creates no login
+    or user and impersonates nobody; it drops its own proc. The OTHER cause the reason string names
+    — a principal with ``EXECUTE`` but no ``VIEW DEFINITION`` — produces the byte-identical NULL and
+    is deferred with AC-10's other permission scenarios to a purpose-configured server.
+    """
+    name = "mefor_gate_null_definition_probe"
+    await proc_store._execute(f"CREATE PROCEDURE dbo.{name} WITH ENCRYPTION AS SELECT 1;")  # noqa: S608
+    try:
+        probe = await proc_store._fetchone(
+            "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
+            (f"dbo.{name}", f"dbo.{name}"),
+        )
+        assert probe is not None
+        assert probe["oid"] is not None, "the proc is deployed — this is the PRESENT half"
+        assert probe["body"] is None, "and its definition is unreadable — the NULL half"
+    finally:
+        await proc_store._execute(f"DROP PROCEDURE IF EXISTS dbo.{name};")  # noqa: S608
+
+
 async def test_ac8_trancount_on_exit_equals_entry(proc_store: SqlServerStore) -> None:
     # Execute the proc inside an open transaction and read @@TRANCOUNT before/after: the proc
     # must not BEGIN/COMMIT/ROLLBACK (it runs inside the client's autocommit=False txn).

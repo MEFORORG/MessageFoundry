@@ -83,6 +83,7 @@ from messagefoundry.api.models import (
     CapturedResponseInfo,
     ChannelInfo,
     ClaimPoolInfo,
+    ClaimProcInfo,
     ClusterNode,
     ClusterNodeList,
     ClusterStatus,
@@ -4477,6 +4478,21 @@ def create_app(
             if pool_status is not None
             else None
         )
+        # ADR 0114 AC-7's degraded gauge. Until this field existed the ONLY signal that the proc
+        # claim path had fallen back to the shipped batch was a WARNING at store open — which is a
+        # load-bearing part of why the gate could degrade in every deployment unnoticed. None unless
+        # [store].fifo_claim_proc is on and the backend has the lever, so the payload is unchanged
+        # by default. Synchronous + free (attributes the gate recorded once at open).
+        cps = engine.store.claim_proc_status()
+        claim_proc = (
+            ClaimProcInfo(
+                effective=cps.effective,
+                degraded_reason=cps.degraded_reason,
+                head_forms=dict(cps.head_forms),
+            )
+            if cps is not None
+            else None
+        )
         # App-log disk metering (#50), alongside the DB metrics — only when a log dir is configured.
         # Run the blocking stat()s off the event loop (the DB metering is itself off-loop in the store);
         # None when stdout-only or the directory is unreadable, so /status never raises on it.
@@ -4520,6 +4536,7 @@ def create_app(
             logs=logs,
             update=update,
             pool=pool,
+            claim_proc=claim_proc,
         )
 
     # --- runtime log verbosity + redacted log-tail viewer (BACKLOG #171, ADR 0130) ----

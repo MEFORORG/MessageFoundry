@@ -86,6 +86,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     CapturedResponse,
     ClaimedHeads,
+    ClaimProcStatus,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
@@ -1757,6 +1758,14 @@ class SqlServerStore:
         (c) compatibility_level >= 130 (OPENJSON). Any miss records the reason, logs a WARNING, and
         leaves ``_claim_proc_effective`` False — the shipped batch runs; NEVER a lane outage.
 
+        (a) and (b) are probed in ONE statement that returns ``OBJECT_ID`` beside the definition,
+        because a NULL body has two very different causes: the proc is absent, or it is deployed
+        and this principal simply cannot READ it (no ``VIEW DEFINITION``, or ``WITH ENCRYPTION``).
+        Both degrade — the gate cannot hash a body it cannot see — but they need opposite remedies,
+        and the second is the exact posture the sub-lever B design note above anticipates — a fleet
+        whose DB principal can never hold CREATE PROCEDURE, i.e. DBA-provisioned procs plus a
+        least-privilege app principal.
+
         The comparison is against the STORED forms, not against ``_claim_proc_body()`` directly:
         the engine rewrites the ``CREATE OR ALTER`` head when it stores the module, so comparing
         with the submitted text can never match (the defect that left this gate inert in every
@@ -1773,16 +1782,34 @@ class SqlServerStore:
             else:
                 expected = _claim_proc_shipped_hashes()
                 for proc_name in (_CLAIM_PROC_CID, _CLAIM_PROC_DST):
+                    # OBJECT_ID rides along so a NULL body can be told apart from an ABSENT proc.
+                    # MEASURED: a principal holding only EXECUTE on the proc gets a non-NULL
+                    # OBJECT_ID and a NULL OBJECT_DEFINITION — the module is deployed and working,
+                    # and the compat probe above still passes. Without the id, that reads as
+                    # "missing" and sends the operator to grant CREATE PROCEDURE, which is not the
+                    # problem and does not fix it. WITH ENCRYPTION produces the identical NULL.
                     row = await self._fetchone(
-                        "SELECT OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (f"dbo.{proc_name}",)
+                        "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
+                        (f"dbo.{proc_name}", f"dbo.{proc_name}"),
                     )
                     deployed = row["body"] if row else None
                     if not deployed:
-                        reason = (
-                            f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
-                            " CREATE PROCEDURE / ALTER-on-schema denied, or a pre-2016-SP1"
-                            " engine?)"
-                        )
+                        if (row["oid"] if row else None) is None:
+                            reason = (
+                                f"stored procedure dbo.{proc_name} is missing (guarded DDL skipped —"
+                                " CREATE PROCEDURE / ALTER-on-schema denied, or a pre-2016-SP1"
+                                " engine?)"
+                            )
+                        else:
+                            reason = (
+                                f"stored procedure dbo.{proc_name} is DEPLOYED but its definition is"
+                                " unreadable (OBJECT_ID resolves, OBJECT_DEFINITION is NULL) — the"
+                                " proc is not missing and CREATE PROCEDURE is not the fix. Either"
+                                " this principal lacks VIEW DEFINITION on it (GRANT VIEW DEFINITION"
+                                f" ON OBJECT::dbo.{proc_name} TO <the engine's principal>) or the"
+                                " module was created WITH ENCRYPTION. The gate compares the body"
+                                " hash, so it cannot pass on a body it cannot read"
+                            )
                         break
                     got = hashlib.sha256(_normalize_tsql(deployed).encode()).hexdigest()
                     matched = expected[proc_name].get(got)
@@ -2906,6 +2933,22 @@ class SqlServerStore:
             idle=self._pool.freesize,
             acquire_wait=self._acquire_wait.summary(),
             claim_pool=claim_pool,
+        )
+
+    def claim_proc_status(self) -> ClaimProcStatus | None:
+        """The ADR 0114 sub-lever A startup-gate verdict — AC-7's **degraded gauge** (``/status``,
+        ``/metrics``, the console's store panel).
+
+        ``None`` when ``fifo_claim_proc`` is off, so "not requested" stays distinguishable from
+        "requested and degraded"; otherwise the gate's own recorded outcome. Synchronous and free —
+        it copies three attributes ``open()`` set once, no DB round-trip. Read-only: nothing here
+        feeds the claim path, and the accept/degrade decision is not re-evaluated."""
+        if not self._fifo_claim_proc:
+            return None
+        return ClaimProcStatus(
+            effective=self._claim_proc_effective,
+            degraded_reason=self._claim_proc_degraded_reason,
+            head_forms=dict(self._claim_proc_head_forms),
         )
 
     @asynccontextmanager
