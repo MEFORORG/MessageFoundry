@@ -1,0 +1,170 @@
+name: DAST
+
+# Dynamic security testing of the RUNNING engine (ADR 0155) — the tier every other gate in this repo
+# structurally cannot reach. bandit/semgrep read source, pip-audit/trivy read dependency closures, and
+# the pytest legs drive the app in-process. None of them answers "does this deployed HTTP surface
+# actually refuse an unauthenticated caller, and does a privileged caller actually get through?"
+#
+# WHAT IT RUNS. One authenticated authorization sweep against a real loopback uvicorn listener in front
+# of a real Engine + a real AuthService, in ONE process. Three passes: negative (every gated operation
+# must 401 a no-credential and an invalid-credential request), authorized reach (how many gated GET
+# operations a privileged token actually got PAST auth on — the anti-fake-green number), and viewer
+# BFLA. It installs NO scanner: the sweep runs on uvicorn + httpx, which are BASE runtime deps.
+#
+# WHY "authorized reach" is the number that matters: an unauthenticated scan of a deny-by-default API
+# answers 401 everywhere, exits 0, and reads as "all endpoints protected" having tested nothing. The
+# receipt therefore counts units EXAMINED, and the runner exits 2 (fail closed) when a floor is unmet.
+#
+# NO PHI. The runner creates an EMPTY store in a temporary directory and the receipt records method,
+# path template, status code and counts only — never a request or response body, never a header value,
+# never a token. Any message content this scan could ever see would be synthetic; none is generated.
+#
+# HONESTY BOUNDARY: see the Scope boundary section of
+# docs/adr/0155-dast-dynamic-security-testing-of-the-running-engine.md. It is stated ONCE there and
+# carried verbatim by the INDEPENDENCE_NOTICE constant in scripts/security/dast_auth_sweep.py (the
+# receipt travels outside the repo). Those are the only two carriers; this file deliberately holds a
+# pointer and no wording of its own, and tests/test_dast_claims.py reds on a third copy.
+on:
+  schedule:
+    # 05:00 UTC — deliberately offset from security.yml's and zizmor.yml's 06:00 cron so the nightlies
+    # do not contend for runners, and so a DAST failure is already visible when those two report.
+    - cron: "0 5 * * *"
+  # Release-tag arm: the running app is scanned at the exact commit that becomes a release.
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+# DELIBERATELY NO pull_request TRIGGER. That is what makes this workflow structurally incapable of
+# wedging a PR, and it is why it is safe to leave out of branch protection: it never reports on a PR,
+# so it can never become the required-but-absent trap (docs/CI.md).
+#
+# The merge-blocking half is somewhere else ON PURPOSE. tests/test_dast_auth_sweep.py and
+# tests/test_dast_claims.py drive the SAME shipped code inside the EXISTING required `test` legs
+# (~3 s), and they prove the canaries below still detect an injected defect. So the probe's ABILITY TO
+# FAIL is merge-blocking while the probe RUN is advisory — you cannot merge a change that blinds the
+# detector, and no new required context is created.
+
+concurrency:
+  # Unique per run (never superseded, never cancelled): a cron or tag run has no successor to defer to,
+  # and a cancelled security scan that reads as "not failed" is the failure mode this repo keeps
+  # closing. Same posture as security.yml's schedule/dispatch arm.
+  group: dast-${{ github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  dast-auth:
+    # THE JOB NAME IS THE STATUS-CHECK CONTEXT and it must be globally unique and template-free:
+    # tests/_workflow_contexts.py keys reportable jobs by DECLARED NAME across ALL workflow files and
+    # expands an Actions expression to a `.+` wildcard, so a colliding or templated name would silently
+    # re-map an existing REQUIRED context onto this job.
+    name: dast-auth-sweep (authenticated authorization sweep)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # GATING POSTURE, stated so it cannot be mistaken: ADVISORY means NOT IN BRANCH PROTECTION. It does
+    # NOT mean continue-on-error. GitHub reports a continue-on-error job as SUCCESS, which is a job that
+    # CANNOT fail — a measurement-gate lie. This job therefore carries no `continue-on-error`, no
+    # `|| true`, no `--exit-zero`, and it goes red on a finding. Its context is deliberately absent from
+    # .github/required-contexts.txt (see the DELIBERATELY NOT REQUIRED block there).
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # This job uploads artifacts, so the persisted git credential is exactly the artipacked risk;
+          # fixed at the source rather than suppressed in .github/zizmor.yml.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      # uv via the SHA-pinned action (ci.yml's pin), not an unpinned `pip install uv`: a version pin
+      # does not satisfy Scorecard PinnedDependenciesID and this repo already carries two such findings.
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          # NO CACHE, unlike every other setup-uv use in this repo. Left at the default this would be
+          # the only workflow here that BOTH restores a dependency cache AND is reachable from a
+          # publishing event (the tag arm above) — the precondition for the cache-poisoning class,
+          # where an entry seeded from a lower-trust ref is replayed into a release-time job. The job
+          # installs once and runs for well under a minute, so the cache buys nothing worth that.
+          # Removing the precondition is the fix; a suppression in .github/zizmor.yml would not be.
+          enable-cache: false
+
+      - name: Install the engine (base deps only — NO scanner)
+        run: |
+          # Base extras only: the sweep needs uvicorn + httpx, which are BASE runtime deps, so nothing
+          # new enters the dependency closure for this gate. `--constraint constraints.lock` (the
+          # hashless export of uv.lock, kept in sync by the DEP-1 gate) so a fresh resolve cannot drift
+          # off pyproject's `>=` floors — the same idiom every ci.yml leg uses.
+          #
+          # No scanner is installed here at all, deliberately: bandit / pip-audit / zizmor / mutmut /
+          # diff-cover / pytest-cov are routed through the hash-pinned PEP 735 toolchain locks, and
+          # tests/test_ci_venv_pinning.py sweeps EVERY workflow for an inline reinstall of one.
+          uv pip install --system --constraint constraints.lock -e "."
+
+      - name: Canary — prove the sweep can detect a real defect
+        run: |
+          # FAIL ON PURPOSE, BEFORE the real scan. Each canary rebuilds the target with a REAL defect
+          # injected through supported configuration and provisioning — never a source patch, so there
+          # is nothing to re-anchor and nothing to rot:
+          #   open-auth : authentication disabled at the target, so every gated route answers a
+          #               tokenless caller. The sweep must report negative findings.
+          #   bfla      : the low-privilege identity over-granted, while the sweep's expectation set
+          #               stays the low-privilege permission set. Authentication is untouched, which is
+          #               exactly why it is a SEPARATE canary from open-auth.
+          #
+          # ONLY EXIT 1 COUNTS AS PROOF, and the test is on the EXACT code, never on "non-zero".
+          # The runner has three outcomes and two of them mean this run measured NOTHING:
+          #   0 -> clean: the injected defect was not seen at all, i.e. the sweep is BLIND;
+          #   2 -> could not measure: the canary detected too little for its floor, the target never
+          #        came up, the policy was unreadable, or the sweep crashed mid-scan;
+          #   1 -> findings: the ONLY outcome that demonstrates the sweep can see the injected defect.
+          # An earlier revision of this step tested `if <the sweep succeeded>`, which is dead code —
+          # a canary run can never exit 0 — while silently accepting exit 2 as proof. That is precisely
+          # the shape it exists to prevent, so the code is compared literally against 1 below.
+          #
+          # The receipt is checked too: on the fail-closed paths the runner returns before writing one,
+          # and `if-no-files-found: error` on the upload only fires when EVERY path is empty, so a
+          # missing canary receipt would otherwise ride along invisibly beside the real one.
+          for c in open-auth bfla; do
+            rc=0
+            python scripts/security/dast_auth_sweep.py \
+              --policy scripts/security/dast-policy.json \
+              --canary "$c" --receipt "canary-$c.json" || rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::canary $c exited $rc, expected exit code 1 (findings). 0 means the sweep is BLIND to the injected defect; 2 means it could not measure; anything else is a crash. Either way this run measured nothing, so the real scan is not run."
+              exit 1
+            fi
+            if [ ! -f "canary-$c.json" ]; then
+              echo "::error::canary $c exited 1 but wrote no receipt at canary-$c.json -- the proof of detection is missing, so this run measured nothing"
+              exit 1
+            fi
+          done
+
+      - name: Authenticated authorization sweep
+        run: |
+          # Exit contract: 0 = clean AND a liveness receipt naming how many units were EXAMINED;
+          # 1 = findings (each emitted as a `::error::` annotation); 2 = FAIL CLOSED, i.e. it could not
+          # measure — a floor unmet, zero gated operations derived, an unreadable policy, a failed login
+          # preflight, or any escape that stopped the sweep from finishing (a transport failure mid-scan
+          # is the canonical one, and it must never be reported as a finding). A floor that is not met
+          # is 2, never 0.
+          python scripts/security/dast_auth_sweep.py \
+            --policy scripts/security/dast-policy.json \
+            --receipt dast-auth-receipt.json \
+            --summary "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the receipts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        # if: always() so the receipts survive the run that needs them most — the failing one.
+        if: always()
+        with:
+          name: dast-receipts
+          path: |
+            dast-auth-receipt.json
+            canary-*.json
+          # `error`, NOT this repo's usual `ignore`. A missing receipt means the gate did not measure,
+          # which is the one outcome that must be loud rather than quietly tolerated: every other upload
+          # here retains a best-effort artifact, this one carries the PROOF that the scan happened.
+          if-no-files-found: error

@@ -111,6 +111,10 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 #   zizmor.yml                 -- paths-filtered to `.github/**`, so it does not report on most PRs.
 #   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
 #                                 pinned by tests/test_quality_advisory_invariants.py.
+#   dast.yml                   -- nightly/tag/dispatch only, with no pull_request trigger, so it can
+#                                 never report on a PR (required-but-absent trap). Advisory by
+#                                 placement, not by continue-on-error: the job goes red on a finding.
+#                                 See ADR 0155.
 #   freethread-smoke.yml       -- a 3.14t canary; informational only.
 #   manifest-lint.yml          -- paths-filtered to the k8s manifests.
 #   nightly / path-gated legs  -- server-DB store, load/throughput, service-smoke, DICOM/FHIR
