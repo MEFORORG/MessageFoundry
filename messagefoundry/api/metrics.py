@@ -38,7 +38,12 @@ from prometheus_client.core import (
 
 from messagefoundry import __version__
 from messagefoundry.store.pool_metrics import PoolStatus
-from messagefoundry.store.store import DestinationMetrics, InboundMetrics, LatencyHistogram
+from messagefoundry.store.store import (
+    ClaimProcStatus,
+    DestinationMetrics,
+    InboundMetrics,
+    LatencyHistogram,
+)
 
 if TYPE_CHECKING:  # avoid pulling the heavy engine import into the default path
     from messagefoundry.pipeline import Engine
@@ -192,6 +197,10 @@ class _Snapshot:
     pool: PoolStatus | None = None
     committed_txns: int = 0
     body_copies: int = 0
+    # ADR 0114 AC-7's degraded gauge. None when the backend has no fifo_claim_proc lever or the flag
+    # is off — the gauges are then ABSENT rather than 0, so a scrape can tell "not requested" from
+    # "requested and degraded" (a constant 0 on every SQLite fleet would be pure alert noise).
+    claim_proc: ClaimProcStatus | None = None
 
 
 async def gather_snapshot(engine: Engine) -> _Snapshot:
@@ -230,6 +239,7 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
         pool=pool,
         committed_txns=committed_txns,
         body_copies=body_copies,
+        claim_proc=engine.store.claim_proc_status(),
     )
 
 
@@ -368,6 +378,33 @@ class _MetricsCollector:
         )
         body_copies.add_metric([], float(s.body_copies))
         yield body_copies
+
+        # ADR 0114 AC-7 degraded gauge. Emitted ONLY when [store].fifo_claim_proc is on: a constant
+        # 0 on every fleet that never asked for the lever is noise a scraper cannot alert on, and
+        # absence is the honest encoding of "not applicable here". Numeric and LABEL-LESS by
+        # design — the human-readable degrade reason is free text (it embeds a proc name and, on the
+        # probe-failure arm, an exception string), so carrying it as a label would both blow the
+        # cardinality budget and break this module's strict {connection,destination,status,version,le}
+        # allowlist. The reason string lives on /status and the console store panel instead.
+        cp = s.claim_proc
+        if cp is not None:
+            effective = GaugeMetricFamily(
+                "messagefoundry_store_claim_proc_effective",
+                "1 when the ADR 0114 stored-procedure claim path passed its startup gate and is"
+                " active, 0 when it degraded to the shipped ad-hoc batch (claims still flow).",
+            )
+            effective.add_metric([], 1.0 if cp.effective else 0.0)
+            yield effective
+            # Which stored head form the deployed modules matched. "verbatim" means this server did
+            # NOT rewrite the CREATE OR ALTER head — no engine measured to date does, so a fleet
+            # reporting 1 here is a live counterexample worth knowing about, not a fault.
+            verbatim = GaugeMetricFamily(
+                "messagefoundry_store_claim_proc_head_verbatim",
+                "1 when at least one deployed claim procedure's stored definition kept the CREATE"
+                " OR ALTER head verbatim (this server does not rewrite it), else 0.",
+            )
+            verbatim.add_metric([], 1.0 if "verbatim" in cp.head_forms.values() else 0.0)
+            yield verbatim
 
         # Connection-pool saturation + acquire-wait (server backends only; absent on SQLite, which has
         # no pool). [store].pool_size previously emitted NO saturation metric — these close that gap.

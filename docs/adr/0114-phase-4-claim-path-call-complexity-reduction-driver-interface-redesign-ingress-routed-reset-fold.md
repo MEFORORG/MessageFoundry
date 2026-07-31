@@ -398,9 +398,9 @@ compat-120 database and under a DDL-denied principal.
 `OBJECT_ID` of **both** procs; (b) a SHA-256 of each deployed body via `OBJECT_DEFINITION()` against the
 **stored forms** of the shipped DDL text (normalized) — **existence alone cannot catch a hand-edited body**, and
 the ADR 0064 marker covers only in-repo edits, while the proc *is* the claim logic; (c) `compatibility_level ≥
-130`. Any failure → the store records `claim_proc_effective = False`, logs a **WARNING naming the reason** and
-runs the shipped batch — never a lane outage; the hot path contains **no error-2812 handling**. Out-of-band
-drift is caught at the next open.
+130`. Any failure → the store records `claim_proc_effective = False`, logs a **WARNING naming the reason**,
+publishes the degraded gauge (see the second amendment below), and runs the shipped batch — never a lane
+outage; the hot path contains **no error-2812 handling**. Out-of-band drift is caught at the next open.
 
 > **AMENDMENT (2026-07-30) — `OBJECT_DEFINITION()` does not return the submitted text, and this gate was
 > inert until it was fixed.**
@@ -436,6 +436,65 @@ drift is caught at the next open.
 > **`DELETE FROM schema_meta` was previously prescribed here as the remedy for a body mismatch. It could not
 > work** — the re-apply submits the same text, the engine rewrites it the same way, and the hash mismatches
 > again — so the advice has been removed from the ADR and from the operator-facing degraded reason.
+
+> **AMENDMENT (2026-07-31) — the degraded gauge now exists, and probe (a) is a real probe again.** Two
+> follow-ups the amendment above deliberately held out of the bug fix.
+>
+> **1. The gauge was aspirational.** AC-7 requires "a WARNING naming the reason **+ degraded gauge**", and this
+> section's compensating-control story assumes an operator can SEE the degraded state. Until this amendment
+> nobody could: `claim_proc_effective` / `claim_proc_degraded_reason` were read by the store's own tests and
+> **nothing else** — no `/stats`, no `/status`, no `/metrics`, no console. The entire operator signal was one
+> WARNING line at `open()`. That is not a missing nicety, it is a load-bearing part of *why the amendment above
+> was needed*: a fleet running the flag degraded on every open, forever, and the only thing that could have
+> told anyone was a log line nobody was watching which named the wrong cause.
+>
+> The gauge is now a store accessor, `claim_proc_status()`, surfaced on three operator surfaces:
+>
+> | surface | carries |
+> |---|---|
+> | `GET /status` → `claim_proc` | `effective`, the human-readable `degraded_reason`, and the matched `head_forms` |
+> | `GET /metrics` | `messagefoundry_store_claim_proc_effective` (0/1) and `messagefoundry_store_claim_proc_head_verbatim` (0/1) |
+> | the console's store panel (`/ui/status`) | active-vs-degraded, plus the reason when degraded / the head forms when green |
+>
+> Three shape decisions, so they are not re-litigated. **`None` when the flag is off**, so "not requested" is a
+> distinct state from "requested and degraded"; the Prometheus series are correspondingly **absent**, not a
+> constant `0` that every SQLite fleet would publish unalertably. **No reason label in the exposition** — the
+> reason is free text embedding a proc name and, on the probe-failure arm, an exception string, so a label
+> would be unbounded cardinality *and* a breach of the exporter's strict `{connection, destination, status,
+> version, le}` allowlist; the string lives on `/status` and the console instead. **It does not feed the
+> console's engine-health heart**: a degrade is a performance lever not paying off, claims keep flowing, and
+> making the nav cry wolf about it would devalue the signal that means the store is actually unwell.
+>
+> `head_forms` (proc name → `rewritten` | `verbatim`) is surfaced for the same reason it is logged: a fleet
+> reporting `verbatim` is a live counterexample to `_CLAIM_PROC_STORED_HEADS`'s compatibility assumption — no
+> engine measured to date stores the `CREATE OR ALTER` head unrewritten — and it was previously visible only
+> at INFO. Observability only: the accept/degrade logic is untouched.
+>
+> **2. A missing `VIEW DEFINITION` grant was reported as a missing proc.** This section has always specified
+> probe (a) as "`OBJECT_ID` of **both** procs", but the implementation folded (a) into (b) and inferred absence
+> from a NULL `OBJECT_DEFINITION`. **MEASURED** (2026-07-31, on the lab SQL Server): a principal holding only
+> `EXECUTE` on the proc gets a non-NULL `OBJECT_ID` and a **NULL** `OBJECT_DEFINITION`; the compat probe still
+> passes. So a deployed, working, correct procedure was reported as *missing*, and the operator was sent to fix
+> a `CREATE PROCEDURE` permission that was neither the cause nor the cure. `WITH ENCRYPTION` produces the
+> identical NULL and the identical misdiagnosis — and because *that* half needs no security principal, it is
+> now a live test leg (`test_a_deployed_proc_can_return_a_null_definition`), which pins on a real server the
+> one thing an offline stub cannot show: that the two functions genuinely disagree. The permission half stays
+> deferred with AC-10's other permission scenarios to a purpose-configured server.
+>
+> This is not a hypothetical posture here: §5's sub-lever B design explicitly serves "a fleet whose DB
+> principal can never hold `CREATE PROCEDURE`" — DBA-provisioned procs plus a least-privilege app principal —
+> which is exactly the deployment shape that hits it. The probe now returns `OBJECT_ID` beside the definition
+> and the two conditions get separate reasons:
+>
+> | condition | reason |
+> |---|---|
+> | `OBJECT_ID` NULL | genuinely absent — guarded DDL skipped, `CREATE PROCEDURE`/ALTER-on-schema denied, or a pre-2016-SP1 engine |
+> | `OBJECT_ID` non-NULL, `OBJECT_DEFINITION` NULL | deployed but unreadable — **`GRANT VIEW DEFINITION`**, or the module is `WITH ENCRYPTION` |
+>
+> Both still **degrade** — the gate hashes the body and cannot pass on one it cannot read — so no accept/reject
+> behaviour changed; only the diagnosis did. The probe SQL is pinned by an exact-match assertion in the
+> offline suite (a typo'd probe must fail loudly rather than silently match), so that pin moved with it and
+> stayed exact.
 
 **Versioning, mixed vintages, downgrade.** Procs are **name-versioned** (`_v1`, `_v2`, …): engine sharding runs
 N processes against ONE unified store (ADR 0037/0063), so a rolling upgrade briefly runs two builds against one
@@ -679,10 +738,18 @@ states, including the mismatch and 1222 translations). **Any miss = the flag sta
   injected-row test.
 - **AC-6** — The three flags SHALL be provable no-ops on SQLite and Postgres (neither backend references them).
   → sentinel test (the ADR 0075 precedent).
-- **AC-7** — WHEN `fifo_claim_proc` is ON and a proc is missing, its `OBJECT_DEFINITION` hash mismatches every
-  form this build deploys, or compat < 130, the store SHALL degrade loudly to the shipped batch (WARNING naming
-  the reason + degraded gauge), never a lane outage; the hot path SHALL contain no error-2812 handling. →
-  startup-gate tests incl. a hand-edited-body leg.
+- **AC-7** — WHEN `fifo_claim_proc` is ON and a proc is missing, is deployed but its definition unreadable
+  (`OBJECT_ID` resolves, `OBJECT_DEFINITION` NULL), its `OBJECT_DEFINITION` hash mismatches every form this
+  build deploys, or compat < 130, the store SHALL degrade loudly to the shipped batch (WARNING naming the
+  reason + degraded gauge), never a lane outage; the hot path SHALL contain no error-2812 handling. → startup-
+  gate tests incl. a hand-edited-body leg and an unreadable-definition leg.
+- **AC-7c** — The degraded gauge SHALL be a surface an operator can READ, not merely an attribute: `/status`
+  (with the reason string), `/metrics` (numeric, label-less, ABSENT rather than 0 when the lever is not
+  requested) and the console store panel SHALL each emit it. → surface-emission tests
+  (`test_adr0114_claim_proc_surfaces.py`), asserting the rendered output, not the property.
+  > Added by the 2026-07-31 amendment. AC-7 as written required a gauge and nothing required anyone to be able
+  > to see it; the two properties existed and were read by the store's own tests alone. A "loud" degrade whose
+  > only audience is a log line is how this lever stayed inert in every deployment for its whole life.
 - **AC-7b** — WHEN `fifo_claim_proc` is ON and both procs are deployed **by this build's own DDL**, the gate
   SHALL **PASS** and `claim_proc_effective` SHALL be True, verified against a **real SQL Server** (not a stub
   that echoes the submitted text back as the deployed body). → `test_adr0114_claim_proc_live.py`, plus an

@@ -48,6 +48,7 @@ from messagefoundry.store.store import (
     AlertInstance,
     CapturedResponse,
     ClaimedHeads,
+    ClaimProcStatus,
     ConnectionEvent,
     ConnectionMetrics,
     DbStatus,
@@ -1292,6 +1293,17 @@ class QueueStore(StoreLifecycle, Protocol):
         snapshot of the in-process acquire-wait histogram — no DB round-trip), and additive: an older
         client deserializes ``/status`` unchanged because the field defaults ``None``. Returns ``None``
         on SQLite (no pool)."""
+        ...
+
+    def claim_proc_status(self) -> ClaimProcStatus | None:
+        """The ADR 0114 sub-lever A stored-procedure-claim startup-gate verdict, or ``None`` when
+        this backend has no such lever (AC-6: SQL Server is the only one that reads its flag, whose
+        literal name this module therefore does not write) or that flag is off. AC-7's **degraded
+        gauge** — the surface an operator can actually see the degraded
+        state on (``/status``, ``/metrics``, the console store panel); before it existed the whole
+        signal was one WARNING at ``open()``. Synchronous + free (three attributes the gate recorded
+        once at open — no DB round-trip), read-only, and additive: the ``/status`` field defaults
+        ``None``, so an older client deserializes it unchanged."""
         ...
 
     async def integrity_check(self) -> tuple[bool, str]: ...
