@@ -112,14 +112,27 @@ def _status_line(status: int) -> str:
     reason = {
         200: "OK",
         202: "Accepted",
+        204: "No Content",
         400: "Bad Request",
+        401: "Unauthorized",
         403: "Forbidden",
         405: "Method Not Allowed",
         408: "Request Timeout",
         411: "Length Required",
         413: "Payload Too Large",
+        422: "Unprocessable Content",
+        429: "Too Many Requests",
         500: "Internal Server Error",
-    }.get(status, "OK")
+        502: "Bad Gateway",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+    }.get(status, "")
+    # The fallback is the empty reason-phrase, not "OK". RFC 9110 §15 makes the phrase advisory and
+    # allows it to be empty (the SP before it is still required), so an unmapped code goes out as
+    # `HTTP/1.1 599 ` — uninformative but true. Defaulting to "OK" is what serialised the
+    # at-capacity refusal as `HTTP/1.1 503 OK`: a response whose line claimed success while its code
+    # reported failure. Completing the table fixes the code we emit today; the honest fallback fixes
+    # whichever one we forget to add next.
     return f"HTTP/1.1 {status} {reason}"
 
 

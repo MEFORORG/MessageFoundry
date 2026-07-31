@@ -36,6 +36,7 @@ from messagefoundry.transports.http_listener import (
     HttpRequestError,
     HttpSource,
     _read_request,
+    _status_line,
     build_response,
 )
 
@@ -462,6 +463,36 @@ def test_build_response_shape() -> None:
     assert b"Content-Length: 8\r\n" in out
     assert b"Connection: close\r\n" in out
     assert out.endswith(b'{"ok":1}')
+
+
+def test_status_line_reason_phrases() -> None:
+    # The at-capacity refusal (_on_client) has always emitted 503, and _status_line's "OK" default
+    # serialised it as `HTTP/1.1 503 OK` — a success phrase on a failure code. Asserted here rather
+    # than through the flood test because the in-file _http() client parses only the numeric code,
+    # so no end-to-end test in this suite can see a wrong reason phrase.
+    assert _status_line(503) == "HTTP/1.1 503 Service Unavailable"
+
+    for status, reason in (
+        (200, "OK"),
+        (202, "Accepted"),
+        (204, "No Content"),
+        (400, "Bad Request"),
+        (401, "Unauthorized"),
+        (403, "Forbidden"),
+        (405, "Method Not Allowed"),
+        (408, "Request Timeout"),
+        (413, "Payload Too Large"),
+        (422, "Unprocessable Content"),
+        (429, "Too Many Requests"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+        (504, "Gateway Timeout"),
+    ):
+        assert _status_line(status) == f"HTTP/1.1 {status} {reason}"
+
+    # An unmapped code must not inherit a phrase that contradicts it. RFC 9110 §15 allows an empty
+    # reason-phrase; the SP before it is still required, so the line stays well-formed.
+    assert _status_line(599) == "HTTP/1.1 599 "
 
 
 # --- API-18: bounded functional DoS-guard tests (slow-loris / max_connections / body-flood) ------
