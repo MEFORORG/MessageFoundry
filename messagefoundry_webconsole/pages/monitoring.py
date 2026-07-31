@@ -352,6 +352,30 @@ def status(
         ],
         adjustable=False,
     )
+    # ADR 0114 AC-7's degraded gauge, on the panel an operator actually reads. Empty unless
+    # [store].fifo_claim_proc is on (SQL Server only), so the default page is unchanged — no blank
+    # row, no "—" that would read as a broken lever. A degrade is NOT an engine-health fault: claims
+    # keep flowing on the shipped batch, so it stays a row here and deliberately does not feed the
+    # nav heart, which would then cry wolf about a performance lever merely not paying off.
+    # Metadata only: proc names, a head-form word, and the gate's own reason string.
+    claim_proc_rows: list[list[object]] = []
+    cp = sys.claim_proc
+    if cp is not None:
+        claim_proc_rows.append(
+            [
+                "Claim path (ADR 0114 stored procedures)",
+                "active" if cp.effective else "DEGRADED — running the shipped batch",
+            ]
+        )
+        if not cp.effective:
+            claim_proc_rows.append(["Claim path — why it degraded", _opt(cp.degraded_reason)])
+        elif cp.head_forms:
+            claim_proc_rows.append(
+                [
+                    "Claim path — stored head forms",
+                    ", ".join(f"{k}: {v}" for k, v in sorted(cp.head_forms.items())),
+                ]
+            )
     store_tbl = rows_table(
         ["Field", "Value"],
         [
@@ -415,6 +439,7 @@ def status(
             ["Messages", db.messages],
             ["Events", db.events],
             ["Audit rows", db.audit],
+            *claim_proc_rows,
         ],
         adjustable=False,
     )
