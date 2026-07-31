@@ -7062,7 +7062,7 @@ The webview cannot import from `src/` (it is loaded as a plain script into a `de
 
 ## 248. Steps view: reclassify comment-only rows as a non-opaque note row
 
-> 🔢 **Filed 2026-07-30 — not started.** ADR-first: gated on **ADR 0076 Amendment A**, which is PROPOSED and not yet ratified. Do not build ahead of the ruling.
+> 🔢 **Filed 2026-07-30 — not started. UNBLOCKED 2026-07-30:** the ADR gate is cleared — **ADR 0076 Amendment A is ACCEPTED and in force** (owner-ratified 2026-07-30), so the grammar widening this item needs is authorized and the build may proceed. Treat Amendment A §A.4's invariants as **build gates, not caveats**, and note §A.6: this item does **not** fix comment re-attachment on move/delete, nor the parent-nesting of a comment at the end of an `if`/`for` body.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** medium — three of the sub-defects are shipped user-visible breakage, not a coverage gap.
 
