@@ -8,6 +8,37 @@ cited report. Several of those reports — the `docs/reviews/` and `docs/securit
 maintainer-internal and will not resolve here; [`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md)
 states the rule that decides what is withheld and what you can request.
 
+### Ledger erratum (2026-07-30) — read this before citing or allocating a number
+
+**`#242`–`#246` as written in the ADRs are not indices into this file.**
+[ADR 0115](adr/0115-asvs-l3-drive-to-pass-secure-by-default-flips-and-residual-closure.md) partitioned
+the ASVS L3 drive-to-Pass programme across five work packages and writes them `BACKLOG #242`–`#246`;
+ADRs 0004, 0014, 0018, 0019, 0068, 0077, 0080 and 0105 cite the same numbers as `WP #243`–`WP #246`.
+Those items were filed in the maintainer-internal ledger that **this file is a published baseline of**,
+and the published baseline stops at **#231** — as the #185 banner and the `#313` reference further down
+already say. They were never published here, and they are not back-filled: their per-cell scope is
+defined only in the `docs/security/` remediation plan, which
+[`SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md) withholds. Read those citations the way the
+`docs/reviews/` and `docs/security/` paths above are read — **provenance into the internal ledger, not a
+pointer into this file.** The same applies to every ASVS-programme number above #231; that programme
+continued well past #246. Whether any of it is republished here is an owner decision.
+
+**Consequently the numbers in this file above #231 are a second, independent sequence**, and items
+#232–#239 and #248–#251 do not correspond to the internal items sharing those numbers. This is recorded,
+not repaired: renumbering would rewrite ratified ADRs, and republishing would cross the policy above.
+
+**#240–#247 are permanent holes — do not file there.** They were allocated on 2026-07-30 by repeated
+runs for the same four titles; only the last run's numbers (#248–#251) were filed. #240–#243 are held by
+a worktree that no longer exists, and `alloc.ps1` has no release verb by design ("holes are free,
+collisions are not"), so those claims stand permanently and the ledger gate will refuse a commit that
+files there. **#315** is a deliberate probe allocation used to verify the floor fix below; it is also a
+hole. Always allocate with `scripts/coord/alloc.ps1`; never pick a number by reading this file.
+
+The root cause is fixed: the backlog floor in `alloc.ps1` now sweeps **every** local and remote ref, as
+its own header comment always promised and as the ADR path already did. Before the fix it read only
+`origin/main` + `HEAD`, so numbers living on refs this branch does not carry were invisible and were
+handed out as free — which is exactly how #240–#247 were issued over cited numbers.
+
 ---
 
 ## Shipped — v0.1.0 (enterprise / HA milestone)
