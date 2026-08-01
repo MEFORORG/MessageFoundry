@@ -46,6 +46,26 @@ When a `msg.set` value (or a computed local) is a recognizable transform of a fi
 `for i in range(1, msg.count_segments("SEG")+1)` → **For each SEG segment** (segment id editable) (111); `for x in msg.groups()/segments()` → native iteration (24, already recognized — keep); `if current_environment() in (...)` → **Environment gate** (44); `if <field cond>` → **When field …** condition (206); `if <regex>.search(...)` → **Filter/guard** (36); `return None` → **Filter (drop)** row (150). Control rows may stay structure-only (read-only header) where the body is what's edited, but the *header operands* (segment id, environment list, field path) should be editable where unambiguous.
 
 ### Phase D — helper descent  (265 delegating call-sites + the writes inside them)
+
+> ⛔ **DECLINED by owner ruling 2026-07-30 — too risky. Do not build this phase.** Phase D is a
+> *grammar* widening under [ADR 0076](0076-typed-action-vocabulary-action-list-lens.md) §2, so it was
+> specified and priced as **ADR 0076 Amendment B** and declined there; read that amendment before
+> re-proposing anything in this section. Two findings killed it: **aliasing** — two call sites of the
+> same helper produce identical child row spans, `expect_src` matches both, and an edit to one silently
+> rewrites the other, which no ADR addresses — and **yield**, which is unmeasured and may be *negative*:
+> `msg["X"] = v` is not recognized (only `msg.set(...)` is), and the shipped sample helper
+> `samples/config/_demo_oru_transforms.py` writes exclusively in that form, so descending it returns six
+> opaque rows and zero editable ones.
+>
+> **The "265 delegating call-sites" figure below is a statement-scan count and is not a yield estimate.**
+> Descent makes nothing editable by itself — it replaces opaque delegating rows with helper-body rows
+> whose editability is whatever Phases A–C already achieve *inside* helpers.
+>
+> **Better lever, not declined:** teach Phase A the `ast.Assign`-to-`ast.Subscript` form (`msg["X"] = v`).
+> It converts writes into editable rows without touching the row shape, and is on no phase list.
+>
+> The paragraph below is the original Phase D text, retained unchanged for the record.
+
 Handlers delegate to `_`-prefixed helper functions (`_msh(msg)`, `_pid(msg)`); the bulk of the 1,283 native writes live **inside** those helpers, invisible when you open the calling Handler. To satisfy "see *everything* editable," the lens must **descend into same-module helper functions** — projecting each `_fn(msg, …)` call as an expandable group whose rows are the helper body's recognized actions, edited in place (rewrites target the helper's own line span). This is the largest structural lever and the highest-risk (cross-function byte-stable rewrite); it ships after A–C prove the recognition rules.
 
 ### Phase E — compute chains  (688 computed locals; partial by design)

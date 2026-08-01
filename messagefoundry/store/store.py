@@ -652,6 +652,31 @@ class ConnectionMetrics:
 
 
 @dataclass(frozen=True)
+class ClaimProcStatus:
+    """The ADR 0114 sub-lever A stored-procedure-claim startup-gate verdict — AC-7's **degraded
+    gauge**, as an operator-readable snapshot.
+
+    ``None`` from :meth:`~messagefoundry.store.base.QueueStore.claim_proc_status` on any backend
+    without the lever and on SQL Server when its flag is off, so "not requested" is a distinct
+    state from "requested and degraded" rather than an indistinguishable ``False``. (The flag's
+    name is deliberately not written in this module — AC-6's sentinel proves the lever is a no-op
+    here by the absence of that literal.)
+
+    AC-7's compensating-control story assumes an operator can SEE the degraded state. Until this
+    existed the whole signal was one WARNING at ``open()``, in a log nobody was watching — which is
+    a load-bearing part of why the gate could degrade on every open, in every deployment, for the
+    entire life of the feature without anyone noticing.
+    """
+
+    effective: bool  # the gate passed and pooled claims run through the procs
+    degraded_reason: str | None  # why it fell back to the shipped batch; None when effective
+    # proc name -> which stored head form the deployed module matched ("rewritten" | "verbatim").
+    # Populated only when effective. "verbatim" means this engine does NOT rewrite CREATE OR ALTER —
+    # no engine measured to date does, so it is worth reporting (not a fault).
+    head_forms: Mapping[str, str] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class MessageSearchResult:
     """The outcome of a scan-and-decrypt content search (ADR 0046 #51). ``rows`` are matched message
     summaries (the same metadata-only shape ``list_messages`` returns — never a decrypted body, so the
@@ -8249,6 +8274,11 @@ class MessageStore:
         """No connection pool on SQLite (a single writer + lockfree read connections, not a contended
         pool), so the server-only pool-wait observability surface (B11) is ``None`` here — the wall it
         measures does not exist on this backend."""
+        return None
+
+    def claim_proc_status(self) -> ClaimProcStatus | None:
+        """``None``: the ADR 0114 sub-lever A stored-procedure claim path is SQL-Server-only (AC-6 —
+        no other backend so much as reads its flag), so there is no gate verdict to report here."""
         return None
 
     async def integrity_check(self) -> tuple[bool, str]:

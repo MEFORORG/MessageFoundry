@@ -19,7 +19,8 @@ dependency** (FastAPI/uvicorn are an ``api/`` concern).
 
 It is a faithful ``MLLPSource`` sibling: it inherits the per-connection IP allowlist, per-connection
 inbound TLS, the runner's exposed-gate (``check_http_tls_exposure``), ADR 0031 fault isolation, and the
-ADR 0021 OFF-by-default ``connection_event`` log. The DoS guards have HTTP analogs: ``max_connections``
+ADR 0021 ``connection_event`` log (**on by default** — ``[diagnostics].connection_events`` is ``True``
+and the per-connection flag inherits it; see ``docs/PHI.md`` §7). The DoS guards have HTTP analogs: ``max_connections``
 (connection-flood), ``receive_timeout`` (slow-loris — bounds the time to read the request line +
 headers + body), and ``max_body_bytes`` (the ``MLLPDecoder`` frame cap's HTTP twin — a
 ``Content-Length`` / read ceiling).
@@ -35,10 +36,12 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import ssl
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 
 from messagefoundry.config.models import ConnectorType, Source
+from messagefoundry.credential import client_cert_principal, constant_time_match_any
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     InboundHandler,
@@ -51,6 +54,7 @@ from messagefoundry.transports.mllp import (
     DEFAULT_RECEIVE_TIMEOUT,
     _mllp_ssl_context,
     _peer_host,
+    _set_tcp_nodelay,
 )
 
 __all__ = [
@@ -77,6 +81,16 @@ _READ_CHUNK = 65536  # body read granularity
 # in-flight commit before the connection tasks are cancelled (mirrors MLLPSource; bounds shutdown).
 _CLIENT_SHUTDOWN_GRACE = 5.0
 
+#: ``connection_event`` kind -> ``audit_log`` action for an intake-auth refusal (ADR 0154 D6). The
+#: kinds double as the connection_event vocabulary, which CI derives from these literal call sites and
+#: asserts against ``docs/PHI.md`` §7 and the console's filter tuple as an exact set — so adding a kind
+#: here without those two is a build failure, by design.
+_INTAKE_AUDIT_ACTIONS = {
+    "intake_auth_failed": "intake.auth_failed",
+    "auth_subject_denied": "intake.auth_subject_denied",
+    "auth_rate_limited": "intake.auth_rate_limited",
+}
+
 
 class HttpRequestError(Exception):
     """A request could not be parsed / exceeded a cap **before** an ingress row was written.
@@ -85,11 +99,17 @@ class HttpRequestError(Exception):
     NAK) and a connection-event ``kind`` (ADR 0021 §7, metadata-only) for the pre-ingress failure.
     """
 
-    def __init__(self, status: int, reason: str, *, kind: str) -> None:
+    def __init__(
+        self, status: int, reason: str, *, kind: str, headers: Mapping[str, str] | None = None
+    ) -> None:
         super().__init__(reason)
         self.status = status
         self.reason = reason
         self.kind = kind
+        #: Extra response headers this refusal owes the peer — ``WWW-Authenticate`` on a ``401``,
+        #: ``Retry-After`` on a ``429`` (ADR 0154 D6). Additive so the intake-auth refusals ride the
+        #: shipped ``HttpRequestError`` arm in ``_serve_one`` rather than growing a parallel one.
+        self.headers = dict(headers) if headers else None
 
 
 class HttpRequest:
@@ -112,47 +132,113 @@ def _status_line(status: int) -> str:
     reason = {
         200: "OK",
         202: "Accepted",
+        204: "No Content",
         400: "Bad Request",
+        401: "Unauthorized",
         403: "Forbidden",
         405: "Method Not Allowed",
         408: "Request Timeout",
         411: "Length Required",
         413: "Payload Too Large",
+        422: "Unprocessable Content",
+        429: "Too Many Requests",
         500: "Internal Server Error",
-    }.get(status, "OK")
+        502: "Bad Gateway",
+        503: "Service Unavailable",
+        504: "Gateway Timeout",
+    }.get(status, "")
+    # The fallback is the empty reason-phrase, not "OK". RFC 9110 §15 makes the phrase advisory and
+    # allows it to be empty (the SP before it is still required), so an unmapped code goes out as
+    # `HTTP/1.1 599 ` — uninformative but true. Defaulting to "OK" is what serialised the
+    # at-capacity refusal as `HTTP/1.1 503 OK`: a response whose line claimed success while its code
+    # reported failure. Completing the table fixes the code we emit today; the honest fallback fixes
+    # whichever one we forget to add next.
     return f"HTTP/1.1 {status} {reason}"
 
 
-def build_response(status: int, body: str = "", *, content_type: str = "application/json") -> bytes:
+#: A header field-name: RFC 9110 ``token`` — one or more ``tchar``. Notably excludes ``:`` and space.
+_HEADER_NAME_RE = re.compile(r"[!#$%&'*+\-.^_`|~0-9A-Za-z]+")
+#: A header field-value: printable US-ASCII, no leading or trailing space, and **no control
+#: characters at all** — which is what excludes CR and LF, the header-injection primitive.
+_HEADER_VALUE_RE = re.compile(r"[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?")
+
+
+def _validated_header(name: str, value: str) -> str:
+    """One serialized ``Name: value`` line, or raise if either side could break the header block.
+
+    **Rejects rather than sanitises** (ADR 0154 D5 / AC-9). The existing
+    ``_strip_header_control_chars`` helper cannot serve here: it contains no regex and it *removes*
+    offending characters, which would silently reshape a partner's ``Content-Type`` into something
+    they never sent instead of failing the turn.
+
+    Uses ``re.fullmatch`` deliberately, never a ``$``-anchored ``re.match``: in Python ``$`` also
+    matches immediately before a trailing newline, so ``match(r"...$", "text/plain\\r\\n...")`` would
+    accept the very injection this exists to stop.
+
+    The offending **value is never placed in the exception** — it is partner-controlled and, on the
+    capture path, potentially PHI. The header name is enough to diagnose the configuration.
+    """
+    if not _HEADER_NAME_RE.fullmatch(name):
+        raise ValueError(f"invalid HTTP header name: {name!r}")
+    if not _HEADER_VALUE_RE.fullmatch(value):
+        raise ValueError(
+            f"invalid HTTP header value for {name!r} (control characters or whitespace)"
+        )
+    return f"{name}: {value}"
+
+
+def build_response(
+    status: int,
+    body: str = "",
+    *,
+    content_type: str = "application/json",
+    extra_headers: Mapping[str, str] | None = None,
+) -> bytes:
     """Serialize a minimal HTTP/1.1 response. ``Connection: close`` — the first slice is
     one-request-per-connection (no keep-alive), which sidesteps a pipelining/half-close attack surface
-    and matches the fire-and-forget webhook shape. No PHI is ever placed in a response body here."""
+    and matches the fire-and-forget webhook shape. No PHI is ever placed in a response body here.
+
+    ``extra_headers`` carries the auth challenges intake authentication owes a peer —
+    ``WWW-Authenticate`` on a ``401``, ``Retry-After`` on a ``429``.
+
+    **Every header name and value, including ``content_type``, is validated here rather than at the
+    call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
+    value carrying CR or LF is a header-injection primitive, and validating in the callers would mean
+    each future consumer has to remember. Today every caller passes a literal, so this guards against
+    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``."""
     payload = body.encode("utf-8")
     headers = [
         _status_line(status),
-        f"Content-Type: {content_type}",
+        _validated_header("Content-Type", content_type),
         f"Content-Length: {len(payload)}",
-        "Connection: close",
-        "",
-        "",
     ]
+    headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
+    headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload
 
 
-async def _read_request(
+async def _read_head(
     reader: asyncio.StreamReader,
     *,
     max_header_bytes: int,
-    max_body_bytes: int | None,
 ) -> HttpRequest:
-    """Read + parse one HTTP/1.1 request from ``reader``, applying the header + body caps.
+    """Read + parse the request line and headers only, applying the header cap.
 
-    Hardened against the classic stdlib-HTTP pitfalls: an unbounded header read (header flood),
-    an unbounded / mismatched body (``Content-Length`` larger than the cap, or a body that never
-    arrives — bounded by the caller's ``receive_timeout``), and a malformed request line. Raises
-    :class:`HttpRequestError` (carrying the status + connection-event kind) on any of these so the
-    caller can answer synchronously **before** any ingress row is written."""
-    # 1. Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
+    Returns an :class:`HttpRequest` whose ``body`` is still empty; the caller decides when — and
+    whether — to read it, via :func:`_read_body`.
+
+    **The split is a security boundary, not tidying** (ADR 0154 D6). It is what lets intake
+    authentication examine a request's credentials *before* its body is buffered. Authenticating
+    after a combined read would let an anonymous peer command up to
+    ``max_connections × max_body_bytes`` of resident heap — transiently about twice that on the
+    no-``Content-Length`` path, where :func:`_read_to_eof` accumulates a chunk list and then joins it
+    — before a single credential byte was examined. The connection cap cannot shed that load either,
+    because it is consulted earlier still, in ``_on_client``. Keep any new pre-body refusal here.
+
+    Raises :class:`HttpRequestError` (carrying the status + connection-event kind) on an unbounded
+    header read, a malformed request line, or ambiguous framing, so the caller can answer
+    synchronously **before** any ingress row is written."""
+    # Request line + headers, bounded by max_header_bytes (so a peer can't stream headers forever).
     try:
         head = await reader.readuntil(b"\r\n\r\n")
     except asyncio.IncompleteReadError as exc:
@@ -198,13 +284,29 @@ async def _read_request(
         )
 
     method = method.upper()
-    # 2. Body — only for methods that carry one. GET/HEAD are health probes (no body read, no ingress).
-    if method in ("GET", "HEAD"):
-        return HttpRequest(method, target, headers, b"")
+    return HttpRequest(method, target, headers, b"")
+
+
+async def _read_body(
+    reader: asyncio.StreamReader,
+    head: HttpRequest,
+    *,
+    max_body_bytes: int | None,
+) -> bytes:
+    """Read the body belonging to an already-parsed ``head``, applying the body cap.
+
+    Split out of :func:`_read_request` so authentication can run between the two halves (see
+    :func:`_read_head`). The ordering inside is load-bearing and is preserved exactly as it shipped:
+    the GET/HEAD short-circuit runs **before** the chunked refusal, so a ``GET`` carrying
+    ``Transfer-Encoding: chunked`` is accepted with an empty body rather than refused. Hoisting that
+    refusal would read as hardening and would in fact be a silent behaviour change."""
+    # Only methods that carry a body read one. GET/HEAD are health probes (no body, no ingress).
+    if head.method in ("GET", "HEAD"):
+        return b""
 
     body = b""
-    cl_raw = headers.get("content-length")
-    if headers.get("transfer-encoding", "").lower() == "chunked":
+    cl_raw = head.headers.get("content-length")
+    if head.headers.get("transfer-encoding", "").lower() == "chunked":
         # Chunked intake is not part of the first slice — a partner that streams must use Content-Length.
         raise HttpRequestError(
             400, "chunked transfer-encoding is not supported", kind="framing_error"
@@ -220,10 +322,26 @@ async def _read_request(
             # Refuse on the DECLARED size before reading a single body byte (don't buffer to find out).
             raise HttpRequestError(413, "body exceeds cap", kind="frame_oversize")
         body = await _read_exactly(reader, content_length)
-    elif method in ("POST", "PUT", "PATCH"):
+    elif head.method in ("POST", "PUT", "PATCH"):
         # No Content-Length and not chunked: read to EOF (Connection: close), still bounded by the cap.
         body = await _read_to_eof(reader, max_body_bytes)
-    return HttpRequest(method, target, headers, body)
+    return body
+
+
+async def _read_request(
+    reader: asyncio.StreamReader,
+    *,
+    max_header_bytes: int,
+    max_body_bytes: int | None,
+) -> HttpRequest:
+    """Read + parse one whole HTTP/1.1 request — :func:`_read_head`, then :func:`_read_body`.
+
+    Retained as the composing wrapper after the ADR 0154 D6 split rather than replaced by it. It is
+    the shape the shipped 202-only path and its tests already use, and it keeps "read the whole
+    request" expressible in one call for any caller with no credential to check between the halves."""
+    head = await _read_head(reader, max_header_bytes=max_header_bytes)
+    head.body = await _read_body(reader, head, max_body_bytes=max_body_bytes)
+    return head
 
 
 async def _read_exactly(reader: asyncio.StreamReader, n: int) -> bytes:
@@ -264,7 +382,7 @@ class HttpSource(SourceConnector):
     pipeline handler, and return a ``202`` respond-with-receipt once it is durably committed (ADR 0023).
 
     A faithful :class:`~messagefoundry.transports.mllp.MLLPSource` sibling: same bind/stop lifecycle,
-    per-connection IP allowlist, inbound TLS, and OFF-by-default ``connection_event`` plumbing."""
+    per-connection IP allowlist, inbound TLS, and on-by-default ``connection_event`` plumbing."""
 
     def __init__(self, config: Source) -> None:
         s = config.settings
@@ -290,6 +408,24 @@ class HttpSource(SourceConnector):
         # Per-connection inbound TLS (present a server cert; opt-in mTLS via tls_ca_file), built once at
         # construction so a bad cert/key fails at build. None when tls is off → plaintext, byte-identical.
         self._ssl: ssl.SSLContext | None = _mllp_ssl_context(s, server=True)
+        # Intake authentication (ADR 0154 D6) — a PEER control: it authorises SUBMITTING a message on
+        # this inbound, mints no identity and opens no session. Defaults to "none", which makes every
+        # path below a no-op and every shipped configuration byte-identical. The env() refs are already
+        # resolved to strings by the time a Source reaches here (_source_config → resolve_env_settings).
+        self.intake_auth: str = str(s.get("intake_auth") or "none")
+        self._intake_keys: tuple[str | None, str | None] = (
+            s.get("intake_api_key"),
+            s.get("intake_api_key_next"),
+        )
+        self.intake_api_key_header: str = str(s.get("intake_api_key_header") or "x-api-key").lower()
+        subjects = s.get("intake_client_subjects")
+        #: Matched through ``client_cert_principal``, so the allow-list is a map to itself: it gives us
+        #: that helper's deny-by-default and its qualified CN/SAN namespacing for free, rather than a
+        #: second subject-matching implementation that could disagree with the API's.
+        self._intake_subjects: dict[str, str] = (
+            {str(x): str(x) for x in subjects} if subjects else {}
+        )
+        self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -358,6 +494,151 @@ class HttpSource(SourceConnector):
         except Exception as exc:  # swallow + log; a capture bug can't drop an HTTP client
             logger.warning("HTTP connection-event emit failed: %s", safe_exc(exc))
 
+    # ---- intake authentication (ADR 0154 D6) ---------------------------------------------------
+    #
+    # Every refusal below is PRE-INGRESS: it happens before the pipeline handler runs, so nothing is
+    # committed and count-and-log is intact — there is no accepted message to account for. That is
+    # only true because the budget is consulted read-only and charged on failure; a limiter that
+    # charged per attempt would refuse authenticated traffic here, and THAT would be silent loss.
+
+    def _rate_limit_refusal(self, peer: str) -> HttpRequestError | None:
+        """The ``429`` if ``peer`` has spent its failed-attempt budget, else ``None``.
+
+        Consulted **read-only** and **before** any credential comparison: the point of the budget is
+        to bound guessing, and a successful authentication must never consume it.
+        """
+        limiter = self.intake_rate_limiter
+        if limiter is None or limiter.check(peer):
+            return None
+        return HttpRequestError(
+            429,
+            "too many failed authentication attempts",
+            kind="auth_rate_limited",
+            headers={"Retry-After": "60"},
+        )
+
+    def _charged(self, peer: str, refusal: HttpRequestError) -> HttpRequestError:
+        """Charge one FAILED attempt against ``peer`` and hand the refusal straight back.
+
+        Takes an already-built refusal rather than its parts so every ``kind=`` stays a literal at a
+        visible ``HttpRequestError(...)`` call site. CI derives the whole ``connection_event``
+        vocabulary by AST-walking for exactly that shape, so a kind hidden behind a helper's parameter
+        would silently drop out of ``docs/PHI.md`` §7 and the console's filter — the drift this
+        codebase spends real effort preventing.
+        """
+        if self.intake_rate_limiter is not None:
+            self.intake_rate_limiter.charge_failure(peer)
+        return refusal
+
+    def _note_intake_success(self, peer: str) -> None:
+        if self.intake_rate_limiter is not None:
+            self.intake_rate_limiter.note_success(peer)
+
+    def _authorize_peer_cert(
+        self, writer: asyncio.StreamWriter, peer_host: str | None
+    ) -> HttpRequestError | None:
+        """``mtls_subject`` authentication, run at accept — **before a single byte is read**.
+
+        The certificate is already verified against ``tls_ca_file`` by the TLS handshake, so all that
+        is left is the subject binding the CA does not give us: ``tls_ca_file`` alone means "any
+        certificate this CA ever signed".
+
+        Worth noting as an architectural asymmetry: ADR 0083's blocker on the admin API was that stock
+        uvicorn does not surface the peer certificate to the ASGI scope. ``HttpSource`` owns its own
+        socket, so mTLS-as-identity is strictly *easier* here than there.
+        """
+        if self.intake_auth != "mtls_subject":
+            return None
+        peer = peer_host or "unknown"
+        limited = self._rate_limit_refusal(peer)
+        if limited is not None:
+            return limited
+        ssl_object = writer.get_extra_info("ssl_object")
+        peercert = ssl_object.getpeercert() if ssl_object is not None else None
+        if not peercert:
+            # No verified chain presented at all — an AUTHENTICATION failure.
+            return self._charged(
+                peer,
+                HttpRequestError(401, "intake authentication required", kind="intake_auth_failed"),
+            )
+        if client_cert_principal(peercert, self._intake_subjects) is None:
+            # A chain this CA signed, carrying a subject nobody allow-listed — an AUTHORIZATION
+            # failure, and deliberately distinct from the 401 above (deny-by-default).
+            return self._charged(
+                peer,
+                HttpRequestError(
+                    403,
+                    "client certificate subject is not permitted",
+                    kind="auth_subject_denied",
+                ),
+            )
+        self._note_intake_success(peer)
+        return None
+
+    def _presented_credential(self, head: HttpRequest) -> str | None:
+        """The credential this request presents, or ``None``. Header names are already lower-cased."""
+        if self.intake_auth == "api_key":
+            return head.headers.get(self.intake_api_key_header)
+        if self.intake_auth == "bearer":
+            scheme, _, token = head.headers.get("authorization", "").partition(" ")
+            return token.strip() if scheme.lower() == "bearer" else None
+        return None
+
+    def _authorize_head(self, head: HttpRequest, peer_host: str | None) -> None:
+        """Header-mode authentication, run **between the head and body reads** (the D6 split).
+
+        Raises :class:`HttpRequestError`, so the refusal rides the shipped arm in ``_serve_one`` and
+        is answered synchronously with nothing committed.
+        """
+        if self.intake_auth not in ("api_key", "bearer"):
+            return
+        if head.method in ("GET", "HEAD") and self.intake_auth_health == "allow":
+            return  # explicit opt-out for a load-balancer probe that cannot carry the credential
+        peer = peer_host or "unknown"
+        limited = self._rate_limit_refusal(peer)
+        if limited is not None:
+            raise limited
+        if constant_time_match_any(self._presented_credential(head), self._intake_keys):
+            self._note_intake_success(peer)
+            return
+        # Missing and wrong take the SAME path — one status, one body, no oracle telling an attacker
+        # whether the header name was right.
+        raise self._charged(
+            peer,
+            HttpRequestError(
+                401,
+                "intake authentication required",
+                kind="intake_auth_failed",
+                headers={"WWW-Authenticate": "Bearer"} if self.intake_auth == "bearer" else None,
+            ),
+        )
+
+    async def _audit_intake_refusal(self, exc: HttpRequestError, peer_host: str | None) -> None:
+        """Channels 1 and 2 of the three D6 audit channels (channel 3 is the ``connection_event``).
+
+        **No credential material crosses this boundary** — not the value, not a prefix, not its
+        length. The peer address and the mode are what an operator needs; the credential is what an
+        attacker would need.
+        """
+        action = _INTAKE_AUDIT_ACTIONS.get(exc.kind)
+        if action is None:
+            return
+        logger.warning(
+            "HTTP intake authentication refused: peer=%s mode=%s outcome=%s",
+            peer_host or "unknown",
+            self.intake_auth,
+            exc.kind,
+        )
+        sink = self.on_intake_audit
+        if sink is None:
+            return
+        try:
+            # The tamper-evident arm: connection_event is operator-disableable diagnostics, audit_log
+            # is a hash chain they cannot silently switch off.
+            await sink(action, peer_host, f"mode={self.intake_auth}")
+        except Exception as sink_exc:  # fail-soft; an audit bug cannot drop an HTTP client
+            logger.warning("HTTP intake audit emit failed: %s", safe_exc(sink_exc))
+
     async def _on_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         assert self._handler is not None
         # Register before anything else so stop() can always find + close this connection (H-2).
@@ -365,6 +646,11 @@ class HttpSource(SourceConnector):
         self._clients.add(writer)
         if task is not None:
             self._client_tasks.add(task)
+        # Kill Nagle on the accepted socket, as MLLPSource does. One request per connection
+        # (build_response hardcodes Connection: close), so the 202 receipt is a single small write with
+        # no unacked data outstanding — precisely the shape Nagle holds until the peer's delayed-ACK
+        # timer fires. Best-effort and framing-neutral; see _set_tcp_nodelay.
+        _set_tcp_nodelay(writer)
         peer_host = _peer_host(writer)
         established = False
         failed = False
@@ -382,6 +668,23 @@ class HttpSource(SourceConnector):
                 await self._emit_event("at_capacity", peer_host=peer_host)
                 await self._write_safely(writer, build_response(503, '{"error":"at capacity"}'))
                 return  # at capacity — refuse the new client
+            # mTLS intake auth needs no request bytes at all, so it refuses here, alongside the
+            # allowlist and capacity guards, without consuming a connection slot.
+            cert_refusal = self._authorize_peer_cert(writer, peer_host)
+            if cert_refusal is not None:
+                await self._emit_event(
+                    cert_refusal.kind, peer_host=peer_host, reason=cert_refusal.reason
+                )
+                await self._audit_intake_refusal(cert_refusal, peer_host)
+                await self._write_safely(
+                    writer,
+                    build_response(
+                        cert_refusal.status,
+                        json.dumps({"error": cert_refusal.reason}),
+                        extra_headers=cert_refusal.headers,
+                    ),
+                )
+                return  # pre-ingress refusal — nothing accepted, so nothing to count
             self._active += 1
             established = True
             await self._emit_event("established", peer_host=peer_host)
@@ -419,33 +722,43 @@ class HttpSource(SourceConnector):
         outer ``closed`` event is suppressed — the failure already emitted its specific kind). Reading
         the whole request is bounded by ``receive_timeout`` (the slow-loris guard)."""
         assert self._handler is not None
+
+        async def _read_authenticated() -> HttpRequest:
+            """Head, then authentication, then body — the ADR 0154 D6 ordering.
+
+            Header-mode auth sits between the two reads so an unauthenticated peer cannot make us
+            buffer a body first: the credential is examined while the request is still just a head.
+            """
+            head = await _read_head(reader, max_header_bytes=self.max_header_bytes)
+            self._authorize_head(head, peer_host)
+            head.body = await _read_body(reader, head, max_body_bytes=self.max_body_bytes)
+            return head
+
         try:
+            # The whole head -> auth -> body sequence stays inside ONE receive_timeout budget; the
+            # refusal RESPONSE is written below, outside it, so a 401 write cannot be cut off by the
+            # slow-loris clock.
             if self.receive_timeout:
-                request = await asyncio.wait_for(
-                    _read_request(
-                        reader,
-                        max_header_bytes=self.max_header_bytes,
-                        max_body_bytes=self.max_body_bytes,
-                    ),
-                    self.receive_timeout,
-                )
+                request = await asyncio.wait_for(_read_authenticated(), self.receive_timeout)
             else:
-                request = await _read_request(
-                    reader,
-                    max_header_bytes=self.max_header_bytes,
-                    max_body_bytes=self.max_body_bytes,
-                )
+                request = await _read_authenticated()
         except TimeoutError:
             # Slow-loris: the request didn't fully arrive within receive_timeout. Pre-ingress refuse.
             await self._emit_event("idle_timeout", peer_host=peer_host)
             await self._write_safely(writer, build_response(408, '{"error":"request timeout"}'))
             return True
         except HttpRequestError as exc:
-            # Oversize / malformed / unsupported — a synchronous 4xx + the ADR 0021 §7 pre-ingress
-            # connection_event (metadata only — never a body or field value).
+            # Oversize / malformed / unsupported / unauthenticated — a synchronous 4xx + the ADR 0021
+            # §7 pre-ingress connection_event (metadata only — never a body or field value). An
+            # intake-auth refusal additionally writes its tamper-evident audit row here; it is a no-op
+            # for every other kind.
             await self._emit_event(exc.kind, peer_host=peer_host, reason=exc.reason)
+            await self._audit_intake_refusal(exc, peer_host)
             await self._write_safely(
-                writer, build_response(exc.status, json.dumps({"error": exc.reason}))
+                writer,
+                build_response(
+                    exc.status, json.dumps({"error": exc.reason}), extra_headers=exc.headers
+                ),
             )
             return True
 
@@ -471,8 +784,24 @@ class HttpSource(SourceConnector):
         return False
 
     async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
+        """Write the success-path response, bounding the drain.
+
+        The drain was unbounded: a peer that stops reading held the connection — and its
+        ``max_connections`` slot, since ``_active`` spans all of ``_serve_one`` — for as long as it
+        liked, with no clock on it (``receive_timeout`` bounds the *read*, not the write). The refuse
+        path already bounds its drain the same way in ``_write_safely``; only the success path did not.
+
+        A timeout raises, and is handled by ``_on_client``'s existing ``OSError`` arm (``TimeoutError``
+        subclasses ``OSError``), which emits ``peer_reset`` and drops the connection. Deliberately not a
+        new ``connection_event`` kind: the vocabulary is asserted in CI against ``docs/PHI.md`` §7 and
+        the console's filter tuple as an exact set, so minting one is a three-file change, and
+        "the peer stopped reading" is what ``peer_reset`` already means to an operator.
+
+        The message is unaffected either way — it was durably committed to ingress before this write
+        (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
+        """
         writer.write(data)
-        await writer.drain()
+        await asyncio.wait_for(writer.drain(), _CLIENT_SHUTDOWN_GRACE)
 
     async def _write_safely(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         """Best-effort error/refuse response — never raise out of the refuse/close path (the socket may

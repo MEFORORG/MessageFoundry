@@ -212,8 +212,17 @@ jobs:
       #     per-test dump is attributed first; this is the last-resort stack when the thread method is
       #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
       #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
-      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
-      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
+      # The step `timeout-minutes` (matrix `step_timeout`) is the outer backstop, held well under the
+      # job's own cap, so a hang both watchdogs somehow miss still fails the STEP (not the whole job at
+      # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
+      # an uninformative job-level kill with no step attribution.
+      #
+      # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
+      # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
+      # a failure on a run whose last line was "9598 passed, 855 skipped". A watchdog that cannot
+      # separate "deadlocked" from "slow today" stops being a watchdog and becomes a coin flip, so the
+      # ubuntu budget is raised here. Re-check the margin when the suite grows; the Windows legs are
+      # unchanged because 26 min against the same suite is still ~2x headroom.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
@@ -371,7 +380,7 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":15,"step_timeout":13,"pytest_timeout":60,"fault_timeout":90}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":22,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
           W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
           W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
@@ -431,7 +440,7 @@ jobs:
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
           # pull these legs, not just the SQLite suite.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte)|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -722,6 +731,63 @@ jobs:
           bash scripts/ci/retry-native-crash.sh
           pytest -v tests/test_x12_rte.py
 
+      - name: Run the engine-shard + statement-dispatch suites on real SQL Server
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # Every file here is MEFOR_TEST_SQLSERVER-gated at MODULE level, so before this step they were
+        # collected nowhere and reported nothing — not a pass, not a skip, on any trigger. That covered
+        # engine-shard crash recovery and the shard TLS-cert ladder (ADR 0037 over the ADR 0063 unified
+        # store), the ADR 0071 statement dispatch/fusion wiring, the ADR 0075 batch backend, the ADR 0114
+        # live claim procedure, and the synchronous handoff path. tests/test_serverdb_ci_coverage.py now
+        # fails if a module-gated suite is added without being named here.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v
+          tests/test_shard_recovery_sqlserver.py
+          tests/test_shard_cert_sqlserver.py
+          tests/test_adr0071_dispatch_wiring_sqlserver.py
+          tests/test_adr0071_fused_callables_sqlserver.py
+          tests/test_adr0075_batch_sqlserver.py
+          tests/test_adr0114_claim_proc_live.py
+          tests/test_sqlserver_sync_handoff.py
+          tests/test_database_source_integration.py
+
+      - name: Run the DR seed-gate + backup suites on real SQL Server
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # ADR 0048/0049 disaster recovery, SQL Server side: the seed gate that must REFUSE to activate a
+        # standby onto a non-empty store, the .mfbak backup runner against a real server DB, and the DR7
+        # config-only backup + DbaDelegatedError path. Module-gated and never executed; a DR control that
+        # has never run is a DR control that has never been proven.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v
+          tests/test_dr_server_seed_gate_sqlserver.py
+          tests/test_backup_runner_server_db_sqlserver.py
+          tests/test_dr7_server_config_only_backup_sqlserver.py
+
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
   # `gh workflow run ci.yml --ref <branch>` to exercise it on a feature branch) + on PRs that touch
@@ -867,6 +933,49 @@ jobs:
         # `postgres` param). Postgres declares the same two capability flags True, so the same
         # connector->runner gap existed here.
         run: pytest -v tests/test_x12_rte.py
+
+      - name: Run the failover + engine-shard recovery suites on real Postgres
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # These are MEFOR_TEST_POSTGRES-gated at MODULE level, so until this step existed they were
+        # collected nowhere and reported nothing — not a pass, not a skip. The SQL Server failover twin
+        # (test_cluster_failover_sqlserver.py) has run for some time; its Postgres counterpart never had.
+        # Engine-shard crash recovery (ADR 0037 over the ADR 0063 unified store) was dark on BOTH server
+        # backends. tests/test_serverdb_ci_coverage.py now fails if a module-gated suite is added without
+        # being named here.
+        run: >-
+          pytest -v
+          tests/test_cluster_failover_postgres.py
+          tests/test_shard_recovery_postgres.py
+
+      - name: Run the DR seed-gate + backup suites on real Postgres
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # ADR 0048/0049 disaster recovery: the seed gate that must REFUSE to activate a standby onto a
+        # non-empty store, the .mfbak backup runner against a real server DB, and the DR7 config-only
+        # backup + DbaDelegatedError path. All three are module-gated and were never executed against
+        # PostgreSQL; a DR control that has never run is a DR control that has never been proven.
+        run: >-
+          pytest -v
+          tests/test_dr_server_seed_gate_postgres.py
+          tests/test_backup_runner_server_db_postgres.py
+          tests/test_dr7_server_config_only_backup_postgres.py
 
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,

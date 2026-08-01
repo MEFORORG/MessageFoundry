@@ -327,8 +327,10 @@ class StoreSettings(_Section):
         description=(
             "Execute the pooled claim via the two lane-family versioned procs "
             "(dbo.mefor_claim_fifo_heads_cid_v1/_dst_v1; fixed-arity CALL) instead of the ~3KB ad-hoc "
-            "batch. Fails safe to the batch (loud) if the procs are missing/stale or compat < 130. "
-            "SQL Server only; OFF = byte-identical."
+            "batch. Fails safe to the batch (loud) whenever the startup gate cannot verify both "
+            "deployed bodies against this build — at least: a missing proc, a body matching no form "
+            "this build deploys, a definition this principal cannot read (no VIEW DEFINITION, or "
+            "WITH ENCRYPTION), or compat < 130. SQL Server only; OFF = byte-identical."
         ),
     )
     fifo_claim_prepared: bool = Field(
@@ -3496,7 +3498,8 @@ class SecuritySettings(_Section):
     # host address ("10.20.4.7" -> /32); IPv4 and IPv6, mixed freely. Same syntax as an inbound
     # connection's source_ip_allowlist, and the same matcher (messagefoundry.netaddr).
     # SCOPE: the OPERATOR surface only. It does NOT restrict the MLLP/TCP/X12/DICOM/HTTP ingest
-    # listeners — those have their own per-connection [inbound].source_ip_allowlist.
+    # listeners — those have their own per-connection source_ip_allowlist (an inbound(...) keyword,
+    # NOT an [inbound] service key: that spelling is accepted and silently discarded).
     # LOOPBACK IS ALWAYS ALLOWED, unconditionally and with no knob: the credential-less on-box clients
     # (the tray's tokenless /health poll (ADR 0113), a browser opening /ui on the engine host,
     # `messagefoundry check`, the harness/apiclient, a container HEALTHCHECK) cannot be allow-listed, so

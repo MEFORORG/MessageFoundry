@@ -9,18 +9,27 @@ bound, BUT the excusal is BOUNDED: past the bound the timeout count is a systemi
 NOTHING is excused. With ``timeouts == 0`` (every healthy run) the check is exactly as strict as
 ``read >= sent``.
 
-The systemic-fault threshold is ``max(unconfirmed_budget, sent // 2)``. It was ``unconfirmed_budget``
-alone — "~one stranded in-flight frame per connection" — until that model was found to be wrong for
-this sender: ``_inflight`` is an unbounded deque and open-loop sends are paced by the offered rate,
-not by an ACK slot, so genuine teardown stranding scales with rate x ACK-latency rather than the
-connection count. It false-failed a zero-loss run (14 stranded of 90 against a budget of 4) and red
-the required windows-2025 leg.
+The systemic-fault threshold is ``max(unconfirmed_budget, 3 * sent // 4)``. It was
+``unconfirmed_budget`` alone — "~one stranded in-flight frame per connection" — until that model was
+found to be wrong for this sender: ``_inflight`` is an unbounded deque and open-loop sends are paced
+by the offered rate, not by an ACK slot, so genuine teardown stranding scales with rate x
+ACK-latency rather than the connection count. It false-failed a zero-loss run (14 stranded of 90
+against a budget of 4) and red the required windows-2025 leg.
+
+The fraction was then ``sent // 2``, sized against that 14/90 (~16%) worst-observed as "~3x the worst
+seen". It was raised to three quarters after windows-2025 produced **46/90 (~51%)** on a run that lost
+nothing and red ``main`` at ``9b03057f`` by ONE message over the budget of 45 — a threshold sitting on
+the centre of the healthy distribution is a coin flip, not a detector (the same defect as the ubuntu
+step cap in #104: a green 775s run against a 780s bound). Three quarters is ~1.5x the worst healthy
+value on record while a dead ACK path strands ~100% and still blows it, and it agrees with the sibling
+detector in ``tests/test_load_runner.py`` (``acked >= sent // 4``, i.e. tolerate up to 75% stranding),
+which previously contradicted this budget.
 
 That ``max()`` does NOT by itself keep ``read >= sent // 2`` required, though it was once documented
 as doing so: the connection count is a FLOOR, not a ceiling, and every call site passes a connection
 count (connscale and estate pass the step's ``count`` verbatim). Whenever the count exceeds half the
 sends — the normal shape of a short, low-rate step, e.g. connscale-smoke's N=100 cell at ~105 sends
-against a budget of ``max(100, 52) = 100`` — the bound degrades to ``read >= sent - connections``,
+against a budget of ``max(100, 78) = 100`` — the bound degrades to ``read >= sent - connections``,
 i.e. ``read >= 5``; and since nothing clamps the excusal to ``sent``, ``timeouts > sent`` degrades it
 to ``read >= 0`` outright. So the guarantee is enforced SEPARATELY, as an unconditional intake floor
 the excusal cannot lower: ``read >= sent // 2``, in all three copies, at every call site.
@@ -78,12 +87,12 @@ _BASE = _sample(read=0, written=0)
 _BUDGET = 2  # a tiny run's connection count
 
 # connscale-smoke's real shape at the N=100 cell: a fixed_aggregate step offering 35 msg/s for 3s is
-# ~105 sends against 100 connections, so `max(unconfirmed_budget, sent // 2)` is max(100, 52) = 100 —
+# ~105 sends against 100 connections, so `max(unconfirmed_budget, 3 * sent // 4)` is max(100, 78) = 100 —
 # the CONNECTION COUNT wins the max() and the excusal alone would allow read >= 5. Every other test
-# in this module uses a budget of 2 or 4 against 36/90 sends, where sent // 2 always wins, so this
+# in this module uses a budget of 2 or 4 against 36/90 sends, where the fraction always wins, so this
 # constant is the only thing that exercises the floor arm at all.
 _SMOKE_SENT = 105
-_SMOKE_BUDGET = 100  # >= sent // 2 == 52: the regime where the budget stops bounding anything
+_SMOKE_BUDGET = 100  # >= 3 * sent // 4 == 78: the regime where the budget stops bounding anything
 
 
 # --- connscale _reconcile ------------------------------------------------------------------------
@@ -122,9 +131,10 @@ def test_connscale_reconcile_timeout_flood_fails_even_without_shortfall() -> Non
     # arrived (read == sent) — an engine that ingests but never ACKs is broken, and excusing an
     # unbounded count would let `timeouts == sent` degrade the intake bound to `read >= 0`.
     #
-    # NB the flood must now be a REAL one. The budget is max(connections, half the run), so the old
-    # 6-of-36 scenario is ordinary teardown stranding under the current bound, not a fault — it would
-    # pass here for the wrong reason. 30 of 36 unconfirmed is unambiguously a dead ACK path.
+    # NB the flood must be a REAL one. The budget is max(connections, three quarters of the run), so
+    # the old 6-of-36 scenario is ordinary teardown stranding under the current bound, not a fault —
+    # it would pass here for the wrong reason. 30 of 36 unconfirmed is unambiguously a dead ACK path
+    # (30 > max(2, 27)).
     c = Counters(sent=36, acked=6, timeouts=30, sink_received=36)
     result = connscale_reconcile(c, _BASE, _sample(read=36, written=36), unconfirmed_budget=_BUDGET)
     assert not result.ok
@@ -284,20 +294,41 @@ def test_load_reconcile_ci_teardown_stranding_is_not_a_flood() -> None:
     assert result.ok, result.detail
 
 
-def test_load_reconcile_excusal_is_capped_at_half_the_run() -> None:
-    # Mutation pin on the NEW bound. Half the run is the most the reconcile will ever forgive, so
-    # `read >= sent // 2` is always required and the intake bound can never go vacuous. Exactly at
-    # the cap passes; one over flips to a systemic fault with nothing excused.
-    at_cap = Counters(sent=90, acked=45, timeouts=45, sink_received=90)
+def test_load_reconcile_excusal_is_capped_at_three_quarters_of_the_run() -> None:
+    # Mutation pin on the bound. Three quarters of the run is the most the reconcile will ever
+    # forgive, so the separate `read >= sent // 2` floor still holds and the intake bound can never go
+    # vacuous. Exactly at the cap passes; one over flips to a systemic fault with nothing excused.
+    #
+    # WAS half, and half was too tight to be a detector. It was sized when the worst teardown
+    # stranding on record was 14/90 (~16%); windows-2025 then produced 46/90 (~51%) on a run that lost
+    # nothing (104 written, 104 received, backlog drained in 4.7s of a 30s bound) and red `main` at
+    # 9b03057f by ONE message. A threshold sitting on the healthy distribution's centre is a coin
+    # flip. See test_load_reconcile_teardown_stranding_at_the_old_half_bound_passes below, which pins
+    # that exact scenario so it cannot regress.
+    at_cap = Counters(sent=90, acked=23, timeouts=67, sink_received=90)
     assert load_reconcile(
         at_cap, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
     ).ok
-    over = Counters(sent=90, acked=44, timeouts=46, sink_received=88)
+    over = Counters(sent=90, acked=22, timeouts=68, sink_received=90)
     result = load_reconcile(
-        over, _poller(_sample(read=44, written=88)), 1.0, tolerance=0, unconfirmed_budget=4
+        over, _poller(_sample(read=45, written=90)), 1.0, tolerance=0, unconfirmed_budget=4
     )
     assert not result.ok
     assert "stranding budget" in result.detail
+
+
+def test_load_reconcile_teardown_stranding_at_the_old_half_bound_passes() -> None:
+    # THE REGRESSION PIN for the windows-2025 flake: the exact observed counters from `main` at
+    # 9b03057f — 90 sent, 46 stranded at teardown, 52 read at intake, nothing lost downstream. Under
+    # the old `sent // 2` budget this was one message over and failed as a "systemic no-ACK fault"
+    # while claiming "lost 38 on intake" for a run that lost nothing. It must pass.
+    observed = Counters(sent=90, acked=44, timeouts=46, sink_received=104)
+    result = load_reconcile(
+        observed, _poller(_sample(read=52, written=104)), 1.0, tolerance=0, unconfirmed_budget=4
+    )
+    assert result.ok, result.detail
+    # And the anti-vacuity floor was never in question on that run: 52 read >= 45 required.
+    assert result.engine_read >= observed.sent // 2
 
 
 def test_load_reconcile_loss_beyond_a_large_excusal_still_fails() -> None:

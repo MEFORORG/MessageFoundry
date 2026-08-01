@@ -99,6 +99,8 @@ CRITICAL_SECRETS: dict[str, str] = {
     "ws_password": "SOAP WS-Security UsernameToken password",
     "credential_password": "File-endpoint UNC-share / Windows alternate credential password (ADR 0132)",
     "body_secret_value": "SOAP body_secret_value_<i> injected secrets (ADR 0015)",
+    "intake_api_key": "inbound HTTP intake-auth peer credential (ADR 0154)",
+    "intake_api_key_next": "inbound HTTP intake-auth rotation key, live alongside intake_api_key (ADR 0154)",
 }
 
 

@@ -633,7 +633,12 @@ as a **separate, later** step so you retain a fallback.
 **Verify-it-runs (after every start/restart):** `GET /health` → `{"status":"ok"}`, send a synthetic
 message, and confirm the **"wiring started"** banner in `service.out.log`.
 
-**Monitoring surfaces (poll the API + parse logs — there is no Prometheus exporter):**
+**Monitoring surfaces (scrape `/metrics`; poll the API and parse logs for what it does not cover):**
+- `/metrics` — **Prometheus exposition** (`text/plain`). Gated by `monitoring:read` like `/stats`, so a
+  scraper authenticates with a service token. Aggregate counts and latency histograms keyed by
+  connection / destination / status only — never PHI (BACKLOG #21). **Prefer this to polling `/stats`
+  if you already run Prometheus.**
+- `/metrics/history` — the same counters over time, for a dashboard without a scraper.
 - `/stats` — outbox counts by status.
 - `/status` — DB size vs disk free, journal mode, counts. **Scrape db-size-vs-disk-free.**
 - `/status/integrity-check` — on-demand store integrity.

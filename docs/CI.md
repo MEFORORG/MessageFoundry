@@ -22,6 +22,7 @@ claims move with it.
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
 | `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered to `.github/**`, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
+| `dast.yml` | Authenticated authorization sweep against a live loopback listener in front of a real engine. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
 | `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 
 Several heavier legs (server-DB store tests, load/throughput, service-smoke, DICOM/FHIR breadth) run
@@ -150,6 +151,13 @@ an unrelated PR without turning the gate red.
   `run:` as template injection. The fix is to route the value through `env:` — the remedy endorsed in
   `.github/zizmor.yml` — not to suppress the rule. The same applies to any secret used in a `run:` step:
   write it to a file via an intermediate `env:` var rather than inlining `${{ secrets.* }}`.
+- **The advisory `dast.yml` scan has a merge-blocking half, and it lives somewhere else.**
+  `tests/test_dast_auth_sweep.py` runs inside the existing required `test` legs and drives the *same*
+  shipped sweep, proving its two canaries still detect an injected defect. So a change that **blinds the
+  detector** reds a PR even though the nightly scan itself is advisory: the probe's *ability to fail*
+  gates the merge, the probe *run* does not. `dast.yml` has no `pull_request` arm, so it never reports on
+  a PR — and `nightly-notice.yml` watches only `ci.yml`, so a red DAST nightly surfaces in the Actions
+  tab rather than as an issue. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md).
 - **A SQL-Server test leg can die with a native segfault** (exit 139, in the DB driver). It hits `main`
   too — it is not a regression in your PR. Clear it with `gh run rerun <run-id> --failed`.
 - **`prod` is a fail-closed PHI environment.** `serve --env prod` refuses to start without a store

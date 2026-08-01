@@ -128,6 +128,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
+    # ADR 0154 (D6): the neutral credential leaf both the transports and the API depend on.
+    # `hmac.compare_digest` over fixed-width SHA-256 digests of BOTH sides — the digesting is what
+    # makes the comparison length-blind, so a credential's length cannot leak by timing. Not a
+    # password hash (no KDF, no stored verifier): this compares a presented shared secret against a
+    # configured one that is already in memory from env(). Password storage remains argon2 in
+    # auth/passwords.py.
+    "messagefoundry/credential.py": frozenset({"hashlib", "hmac"}),
     # CONSOLE-3 (ADR 0088: extracted from console/client.py to the Qt-free apiclient library): the
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
@@ -310,6 +317,11 @@ INVENTORY: dict[str, frozenset[str]] = {
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).
     "tee/mefor_api.py": frozenset({"ssl"}),
+    # ADR 0155: the DAST scan target generates a THROWAWAY per-run password (secrets.token_urlsafe) for
+    # the two ephemeral scan identities it provisions into a store it creates empty in a temp directory
+    # and destroys with it. Not a key and never persisted: a checked-in constant would be strictly
+    # weaker, and the alternative — an operator-supplied credential — is the optional escape hatch only.
+    "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 
 

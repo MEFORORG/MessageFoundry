@@ -16,10 +16,14 @@ on:
     types: [created]
   pull_request_target:
     # No `closed` (CI cost): the action's on-close behavior (locking the sign-comment thread) is
-    # moot on this private repo where every author is allowlisted below — each merged/closed PR was
-    # billing a 1-min runner to do nothing. Signing enforcement lives on the opened/synchronize
-    # runs + the required `cla` status context, both untouched. Re-add `closed` if the repo ever
-    # takes fork PRs from non-allowlisted contributors.
+    # moot while every author is allowlisted below — each merged/closed PR was billing a 1-min
+    # runner to do nothing. Signing enforcement lives on the opened/synchronize runs + the required
+    # `cla` status context, both untouched.
+    #
+    # NOTE: this previously read "moot on this private repo". The repo is PUBLIC, so the re-add
+    # condition is no longer hypothetical — a fork PR from a non-allowlisted contributor is
+    # possible today. It is the ALLOWLIST, not repo visibility, that currently makes the on-close
+    # behavior unnecessary. Re-add `closed` if/when such PRs are accepted.
     types: [opened, synchronize]
 
 permissions:

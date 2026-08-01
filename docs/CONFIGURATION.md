@@ -70,14 +70,14 @@ backend-limited.
 | `group_commit_max_batch` | int | `64` | **SQLite only.** Flush threshold for the group-commit committer: once this many members are enrolled in the open batch it commits immediately rather than waiting out the rest of `group_commit_window_ms`, bounding batch size + latency under load. Ignored when group-commit is off (`group_commit_window_ms = 0`). |
 | `fifo_claim_batch` | int | `1` | all backends (ADR 0058). Max rows the **INGRESS/ROUTED** FIFO claim takes per commit. `1` = **OFF** (the workers claim one row per commit — byte-identical to before). `> 1` (clamped `1..64`) claims the **contiguous due head-prefix** in one commit and then processes each row in strict FIFO order with its own off-loop route/transform + separate handoff, amortizing the standalone claim commit toward 1/N. A not-due or producer-locked head still blocks the lane (strict per-lane FIFO, #285). The **outbound/delivery** claim is never batched. Opt-in throughput tuning (recommend `8`–`16`); size against worst-case message size, since N decrypted bodies are resident per lane between the claim and the N handoffs. |
 | `fifo_claim_fold_reset` | bool | `false` | **SQL Server only** ([ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) sub-lever C). Folds the pooled claim's session `LOCK_TIMEOUT` reset into the claim batch on the **clean success path at INGRESS/ROUTED** (the write-less commit#2 disappears; the shielded finally-guard still runs on every non-clean exit — 1222, kept≠claimed, cancellation, any error). OUTBOUND/RESPONSE are never folded. `false` = **byte-identical** shipped batch + guard. Flip only after its own ADR 0114 §8 bench gate (AC-14). |
-| `fifo_claim_proc` | bool | `false` | **SQL Server only** (ADR 0114 sub-lever A). Executes the pooled claim via the two lane-family versioned procs `dbo.mefor_claim_fifo_heads_cid_v1` / `_dst_v1` (fixed-arity `{CALL}`, one JSON lanes parameter) instead of the ~3 KB ad-hoc batch. Needs database `COMPATIBILITY_LEVEL >= 130` (SQL Server 2016); **fails safe to the batch, loudly**, when the procs are missing, hand-edited (body-hash mismatch), or compat < 130 — never a lane outage. A hardened split-principal deployment must `GRANT EXECUTE` on both procs to the runtime principal (the bootstrap principal owns them). `false` = byte-identical. Flip only after its own §8 gate (AC-14). |
+| `fifo_claim_proc` | bool | `false` | **SQL Server only** (ADR 0114 sub-lever A). Executes the pooled claim via the two lane-family versioned procs `dbo.mefor_claim_fifo_heads_cid_v1` / `_dst_v1` (fixed-arity `{CALL}`, one JSON lanes parameter) instead of the ~3 KB ad-hoc batch. Needs database `COMPATIBILITY_LEVEL >= 130` (SQL Server 2016); **fails safe to the batch, loudly**, whenever the startup gate cannot verify both deployed bodies against this build — at least: a missing proc, a body matching no form this build deploys (hand edit, hand deploy, or a body changed without bumping the `_v1` proc name), a definition this principal cannot read (no `VIEW DEFINITION`, or `WITH ENCRYPTION`), or compat < 130 — never a lane outage. A hardened split-principal deployment must `GRANT EXECUTE` on both procs to the runtime principal (the bootstrap principal owns them), and `GRANT VIEW DEFINITION` so the gate can read the bodies it verifies. `false` = byte-identical. Flip only after its own §8 gate (AC-14). |
 | `fifo_claim_prepared` | bool | `false` | **SQL Server only** (ADR 0114 sub-lever B). Stabilizes the pooled claim's statement text (one JSON lanes parameter) and retains a prepared claim cursor on store-owned dedicated connections (INGRESS/ROUTED; the non-DDL fallback lane to `fifo_claim_proc`). **Logs + no-ops unless `fifo_claim_fold_reset` is on** (without the fold the finally-guard's reset would evict the one-slot prepare cache every call). `false` = byte-identical. Flip only after its own §8 gate (AC-14). |
 | `encryption_key` | secret | — | **env only** (`MEFOR_STORE_ENCRYPTION_KEY`); base64 32-byte **active** key — when set, PHI columns (`raw`/`payload` + `error`/`last_error`/`detail`) are AES-256-GCM-encrypted at rest. Mint one with `messagefoundry gen-key`. Empty = off. See [PHI.md §3](PHI.md#3-encryption-at-rest). |
 | `encryption_keys_retired` | secret | — | **env only** (`MEFOR_STORE_ENCRYPTION_KEYS_RETIRED`); comma-separated base64 **decrypt-only** keys kept available during a rotation until `messagefoundry rotate-key` finishes re-encrypting under the active key (ASVS 11.2.2). |
 | `encryption_key_file` | path | — | Windows **DPAPI-protected** key file (WP-11d, ASVS 13.3.1) — a path produced by `messagefoundry protect-key`. When `encryption_key` is unset and this is set, the active key is `CryptUnprotectData`'d from this file at store open, so the plaintext key never sits in the service environment. Windows-only, and the **env key takes precedence** when both are present. A **path, not a secret** — it may live in the file. Unset = use `encryption_key` (the cross-platform default). |
 | `aad_bind` | bool | `true` | **not a secret** (`MEFOR_STORE_AAD_BIND`); cell binding (ASVS 11.3.3, [ADR 0019](adr/0019-pluggable-keyprovider-hsm-kms-vault.md)). New at-rest AES-256-GCM writes use the cell-bound `mfenc:v2` writer — each value is bound to its `(table, column, row)` cell via GCM Associated Data, so a ciphertext cut-and-pasted into another cell **fails the auth tag** (dead-lettered `CipherError`) instead of silently decrypting. **On by default** (ADR 0148 GIVEN 1: the shipped configuration runs the hardened path). Setting it `false` selects the frozen `mfenc:v1` writer (byte-identical at rest) and is a **loosening** — `security_loosenings()` names it, so the opt-out is never silent. No effect without an `encryption_key` (the identity cipher has nothing to bind). Legacy `v1` rows still decrypt (dual-read); `messagefoundry rotate-key` upgrades them `v1`→`v2`, so the default is safe and reversible on an existing store. |
 | `key_provider` | enum | `auto` | selects **how** the active/retired DEK bytes are *sourced* — never how they are used (the cipher, keyring, and `mfenc:v1` format are unchanged; ADR 0019, ASVS 13.3.3). `auto` (default) is the env-then-DPAPI ladder, **byte-identical** to the pre-seam behavior; `env`/`dpapi` pin a single built-in source; `aws_kms`·`azure_kv`·`gcp_kms`·`vault`·`pkcs11` envelope-decrypt a wrapped DEK inside an HSM/KMS/Vault (lazy **optional extras — not built yet**; selecting one **fails closed** at `serve`, never a silent downgrade). Names a *provider*, not key material, so it is **not** a secret. |
-| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. |
+| `cipher_provider` | enum | `aesgcm` | selects the at-rest **cipher itself** — distinct from `key_provider`, which only *sources* DEK bytes for the in-process cipher ([ADR 0138](adr/0138-transit-bulk-crypto-provider-dek-out-of-engine-heap-for-asvs-13-3-3-demand-gated.md), ASVS 13.3.3). `aesgcm` (the default) is that in-process AES-256-GCM cipher, byte-identical to today. `vault_transit` performs the bulk encrypt/decrypt **inside** Vault/OpenBao Transit, so the plaintext DEK never enters engine heap; at-rest values then carry the `mfenc:v3:` marker, the local `encryption_key`/`key_provider` go unused (Transit holds the key), and the audit chain is keyed by Transit's `generate_hmac` — computed inside the vault, so no HMAC key enters heap either. Threaded through **all three** backends. Vault address / token / data-key name come from `MEFOR_STORE_VAULT_ADDR`, `MEFOR_STORE_VAULT_TOKEN` and `MEFOR_STORE_TRANSIT_KEY` (optionally `MEFOR_STORE_TRANSIT_AUDIT_KEY`). Names a *provider*, not key material, so it is **not** a secret. Any other value **fails closed** at `open_store` — never a silent downgrade to plaintext. **Needs the optional `[vault]` extra** (`pip install 'messagefoundry[vault]'` — hvac); lazy-imported, so a base install pulls no Vault SDK and an absent extra fails closed at `open_store` rather than degrading. **Two preconditions before you plan a deployment on this — read both.** (1) *The keyless-PHI serve gate does not consult this setting yet.* [`__main__.py`](../messagefoundry/__main__.py)'s gate tests only `encryption_key` / `encryption_key_file`, and all three built-in environment names derive PHI, so a PHI instance configured for `vault_transit` **with no local key still refuses to start (exit 2)** and points you at `messagefoundry gen-key`. Forcing past it with `[security].allow_unencrypted_phi` (+ `…_under_strict_enforcement`) makes `security_loosenings()` and `GET /security/posture` publish the instance as *PHI stored UNENCRYPTED at rest* while it is in fact encrypted inside Transit — a false read-out, not a real posture. Until the gate learns `cipher_provider`, **also configure a local `encryption_key`**: the Transit cipher never reads it, but it satisfies the gate, and it remains the key `.mfbak` DR archives actually use (`resolve_active_key` never consults `cipher_provider`, so Transit does **not** cover backups). (2) *Greenfield stores only.* The Transit cipher **fails closed** (`CipherError`) on any pre-existing `mfenc:v1`/`v2` value, and `rotate-key` both refuses to run without an active *local* key and would itself have to decrypt those values through the Transit cipher — so there is **no in-place migration** off an already-encrypted store today. Flipping this on a populated store makes its historical PHI unreadable. |
 | `require_encryption` | bool | `false` | when `true`, `serve` **refuses to start** without an encryption key in **any** environment, even a synthetic one. Off by default. |
 | `allow_unencrypted_phi` | | | **→ moved to `[security].allow_unencrypted_phi`** (ADR 0118) — set it there; no longer accepted in `[store]`. |
 | `server`, `port` | str/int | — / 1433 | server DBs (required for `sqlserver`) |
@@ -85,7 +85,7 @@ backend-limited.
 | `auth` | enum | `sql` | `sql` · `integrated` · `entra` (SQL Server). `integrated` connects `Trusted_Connection=yes` — the **service account's** Windows identity authenticates (no SQL password); the turnkey **gMSA** walkthrough (grant the gMSA a SQL login + run the service under it) is [`DEPLOY-SERVER-DB.md` §1.1](DEPLOY-SERVER-DB.md). |
 | `username` | str | — | server DBs (required when `auth = sql`) |
 | `password` | secret | — | **env only** (`MEFOR_STORE_PASSWORD`) |
-| `require_managed_identity` | bool | `false` | delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when `true`, `serve` **refuses** (production) / **warns** (non-production) unless the store authenticates via a managed identity — SQL Server `auth = integrated`/`entra`. SQLite is exempt; Postgres cannot satisfy it. Off by default |
+| `require_managed_identity` | bool | `false` | delegated-identity precondition (#203, ASVS 13.2.1/13.3.2): when `true`, `serve` **refuses to start (exit 2)** unless the store authenticates via a managed identity — SQL Server `auth = integrated`/`entra`. SQLite is exempt; Postgres cannot satisfy it. Off by default. **The refuse/warn split is `[security].enforcement`, not the production tier** — the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py), the `managed_identity_precondition` block), and `enforce` is the shipped default on `dev` and `staging` as much as on `prod`, so a staging box that turns this on and leaves `auth = "sql"` is **refused**, not warned. It downgrades to a warning only under `enforcement = warn` |
 | `encrypt`, `trust_server_certificate` | bool | `true`/`false` | TLS to the DB |
 | `ssl_root_cert` | path | — | server DBs — pin the DB server's certificate by **file** so a private/self-signed DB CA verifies **without** a machine-wide trust import, on the **secure** posture only (`encrypt = true`, `trust_server_certificate = false`) — it never disables verification. **Postgres:** an asyncpg `SSLContext` CA-bundle (chain + hostname still checked). **SQL Server:** the ODBC Driver **18.1+** `ServerCertificate` keyword (a leaf/exact-cert match; needs driver ≥ 18.1). Rejected for SQLite (no TLS); a missing file fails loud at load. A path, not a secret — may live in the file. See [`DEPLOY-SERVER-DB.md` §5](DEPLOY-SERVER-DB.md). |
 | `multi_subnet_failover` | bool | `false` | **SQL Server only** — emit the ODBC `MultiSubnetFailover=Yes` keyword so a client connecting to an Always On Availability Group **listener** reaches the current primary promptly across subnets, instead of serially waiting out each replica subnet's DNS/TCP timeout on failover. A no-op for Postgres/SQLite (they never see the ODBC string). Off by default — only a multi-subnet AOAG needs it. |
@@ -160,7 +160,7 @@ The one row that *does* vary:
 | `tls_ciphers` | str | _unset_ | optional OpenSSL cipher string (default = the interpreter's secure defaults). |
 | `tls_client_ca_file` | str | _unset_ | CA bundle to **require + verify client certs** (opt-in mTLS, e.g. the console). Requires `tls_cert_file`. |
 | `tls_client_ca_pin` | str | _unset_ | optional lowercase-hex SHA-256 pin over the corresponding CA anchor PEM (`tls_client_ca_file`); a mismatch refuses at load + reload (ASVS 6.7.1); unset = no pin (dormant). |
-| `tls_client_cert_identities` | map str→str | `{}` | **(#200, ADR 0002):** mTLS client-cert → MessageFoundry principal map. Meaningful only with in-process mTLS (`tls_client_ca_file` set, so uvicorn `CERT_REQUIRED`-verifies the peer): a **verified** peer cert's subject CN / SAN is resolved to an existing username through this **allow-list**, and that principal's RBAC authorizes the request — a service-to-service identity that carries no bearer token. Keys are the qualified cert name `CN:<commonName>` or `SAN:<type>:<value>` (e.g. `SAN:DNS:svc.internal`); values are existing usernames. **Deny-by-default:** an unmapped verified cert — or a spoofed CN not listed here — resolves to no identity and is denied. A structured map, so **TOML-only** (no env-string form). Empty (the default) disables cert-identity. **Honest caveat:** stock uvicorn does not surface the peer cert to the ASGI scope, so the resolver is **inert** until a TLS-extension-capable server/shim populates it. |
+| `tls_client_cert_identities` | map str→str | `{}` | **(#200, ADR 0002; activated by [ADR 0083](adr/0083-mtls-client-certificate-identity.md)):** mTLS client-cert → MessageFoundry principal map. Meaningful only with in-process mTLS (`tls_client_ca_file` set, so uvicorn `CERT_REQUIRED`-verifies the peer): a **verified** peer cert's subject CN / SAN is resolved to an existing username through this **allow-list** — a service-to-service identity that carries no bearer token. Keys are the qualified cert name `CN:<commonName>` or `SAN:<type>:<value>` (e.g. `SAN:DNS:svc.internal`); values are existing usernames. **Deny-by-default:** an unmapped verified cert — or a spoofed CN not listed here — resolves to no identity and is denied. A structured map, so **TOML-only** (no env-string form). Empty (the default) disables cert-identity. **LIVE, not inert (ADR 0083).** Stock uvicorn does not surface the peer cert to the ASGI scope — so `serve` swaps in a scope-populating uvicorn HTTP-protocol subclass ([`api/tls_client_cert.py`](../messagefoundry/api/tls_client_cert.py)) **whenever `tls_client_ca_file` and this map are both set** ([`__main__.py`](../messagefoundry/__main__.py), the `ssl_context_factory` block), and that shim is why a `CERT_REQUIRED`-verified peer cert reaches the resolver. Both conditions are required: a mutual-auth-only bind (client CA, empty map) keeps the stock protocol. **What a cert identity can reach — narrower than "the request".** It is admitted **only** on routes declared with `require_service_cert` — today exactly one, `GET /service/identity` (`monitoring:read`). That plane is cert-**only** and never crosses the bearer/session plane (a cert-only caller gets 401 on every bearer route, a bearer-only caller gets 401 here); it carries **no session, no second factor and no step-up**; and it is **PHI-fenced** — `require_service_cert` raises at app construction if asked to gate a PHI-view permission. So mapping a cert to a privileged principal does **not** confer general API access, and can never reach the interactive or patient-data surface. |
 | `tls_client_cert_files` | list[str] | `[]` | **(ASVS 6.4.5):** PEM paths of **inbound service callers'** client certs you hold a copy of. Folded into the [`[cert_monitor]`](#cert_monitor) scan, so a caller's cert expiry is caught **even while that caller has stopped connecting** — the handshake-time check can only see a cert still being presented. These are certs the engine *verifies*, not ones it *presents*, so the served-cert scan cannot see them. Public certificates only (never a key); empty = off. |
 | `trusted_proxies` | list[str] | `[]` | **`[BUILT]` (WP-15):** reverse-proxy IP(s) whose `X-Forwarded-For`/`-Proto` are trusted (uvicorn `forwarded_allow_ips`), so the audit/rate-limit source IP is the **real client**, not the proxy. **Empty = trust nothing** (the direct TCP peer is used). Set ONLY to the proxy's address(es), or XFF spoofing returns — every host inside an entry may declare its own source address, so a broad range (e.g. `10.0.0.0/8` on a LAN numbered out of 10/8) makes every workstation a trusted spoofer. `"*"` and unparseable entries are **refused at load** (uvicorn would silently treat the latter as a never-matching literal, collapsing every client to the proxy). |
 | `tls_terminated_upstream` | bool | `false` | **`[BUILT]` (WP-15):** declare that a reverse proxy / load balancer terminates TLS in front of the engine. Lets a non-loopback bind satisfy the TLS gate **without** in-process TLS — but only when `trusted_proxies` is set (else refused at load). |
@@ -170,35 +170,108 @@ The one row that *does* vary:
 | `serve_ui` | | | **→ moved to `[security].serve_web_console`** (ADR 0118) — set it there; no longer accepted in `[api]`. |
 | `serve_ui_explicit` | bool | `false` | **Internal plumbing — not an operator knob.** The loader sets it `true` when `[security].serve_web_console` was **explicitly** provided (at either value), so `serve` can tell an explicit `serve_web_console = true` with the console wheel absent (**hard refuse** — the operator asked for the console by name) from the default-on posture with the wheel absent (JSON-only serve + a warning, never a start failure). Set `[security].serve_web_console`, not this. |
 | `public_origin` | | | **→ moved to `[security].web_console_public_address`** (ADR 0118) — set it there; no longer accepted in `[api]`. |
-| `ws_allowed_origins` | list[str] | `[]` | browser `Origin` allowlist for the **native/bearer** `/ws/stats` path only — NOT the `/ui` browser WebSocket (that authorizes via the cookie + `public_origin`/Host match). Don't conflate the two knobs. |
+| `ws_allowed_origins` | list[str] | `[]` | browser `Origin` allowlist for the **native/bearer** `/ws/stats` path only — NOT the `/ui` browser WebSocket (that authorizes via the cookie + a match against `[security].web_console_public_address`, falling back to the `Host` header when unset). Don't conflate the two knobs. |
 
 > **MLLP-over-TLS** is built too (WP-13b — per-connection `tls`/`tls_*` on the `MLLP(...)` connector,
 > see [CONNECTIONS.md](CONNECTIONS.md)), and the §0 **exposed-gate is enforced**: a non-loopback
-> *plaintext* MLLP listener is refused at startup unless `serve --allow-insecure-bind`. Gate #4's
-> transport-TLS subset is complete, and **native TOTP MFA (WP-14) is also built** (`[auth].require_mfa`,
-> local accounts). See [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md).
+> *plaintext* MLLP listener is refused (a `WiringError`, before the engine starts). **Do not plan on
+> `serve --allow-insecure-bind` here** — it is clamped inert whenever the hop is enforcing PHI
+> (`[security].enforcement = enforce` **and** a PHI data label, which is every one of `dev`/`staging`/
+> `prod` on shipped defaults), so on a stock instance passing it changes nothing and the bind still
+> refuses. The fix is `tls = true` (+ `tls_cert_file`/`tls_key_file`) on the connection. Gate #4's
+> transport-TLS subset is complete, and **native TOTP MFA (WP-14) is also built**
+> (`[security].require_mfa`, local accounts — `[auth].require_mfa` is a relocated key and is **rejected
+> at config load**). See [ADR 0002](adr/0002-phase2-transport-security-and-strong-auth.md).
 
 > **WebAuthn passkeys (WP-14b, [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md)).**
 > Browser passkeys for local users need the optional **`[webauthn]` extra**
 > (`pip install messagefoundry[webauthn]`) — no new `[auth]` setting: installing the extra + a user
 > enrolling on `/ui/account` is the opt-in (extra-less installs show a legible notice, never an
-> error). The WebAuthn RP identity rides **`[api].public_origin`** when set; a plain loopback
-> deployment derives it from the request URL, but **behind a declared reverse proxy**
-> (`tls_terminated_upstream`) ceremonies **fail closed until `public_origin` is set** — and note
-> that **changing `public_origin`'s host later invalidates every enrolled passkey** (they pin
-> their mint-time RP; the account page marks them "unusable (origin changed)").
+> error). The WebAuthn RP identity rides the external origin — set it as
+> **`[security].web_console_public_address`** (the internal field is still `api.public_origin`, but
+> `[api].public_origin` is a relocated key and is **rejected at config load**, row above). A plain
+> loopback deployment derives the RP from the request URL. **Behind a declared reverse proxy
+> (`tls_terminated_upstream`) an unset origin is a startup REFUSAL, not a degraded ceremony**: with
+> the console served, `serve` exits 2 until `web_console_public_address` is set, because the `Host`
+> header is client-forwardable there and both the `/ui` CSRF check and the passkey origin binding
+> need the exact external origin. It is only in the **in-process-TLS off-loopback** case that the
+> engine warns and starts — and *there* the ceremonies do fail closed (no passkeys) until you set it.
+> Either way, **changing its host later invalidates every enrolled passkey** (they pin their
+> mint-time RP; the account page marks them "unusable (origin changed)").
 
-> **Off-loopback browser-console walkthrough (L5b, ADR 0068 §8).** The two supported postures:
+> **Off-loopback browser-console walkthrough (L5b, ADR 0068 §8).**
+>
+> **Step 0, and it is not optional: set `[security].serve_web_console = true` explicitly.** Every
+> posture below — a non-loopback bind, a declared terminator, **or** merely setting
+> `web_console_public_address` — makes the instance *exposed*, and an exposed instance
+> **auto-degrades a default-on console to JSON-only** (ADR 0143; [`__main__.py`](../messagefoundry/__main__.py)
+> flips `serve_ui` off in place). That degrade is the **one precondition on this page whose absence
+> produces no error**: the engine starts clean, prints a single stderr warning, and `/ui` 404s. It is
+> the *explicitness* that saves you, not the value — the loader only marks the console explicit when
+> you wrote the key yourself, so inheriting the `true` default is exactly what trips it. Verified by
+> loading the terminator recipe below through `load_settings()`: without the key,
+> `serve_ui = True, serve_ui_explicit = False` and the exposure predicate is true, so the console is
+> dropped; with it, `serve_ui_explicit = True` and the console is served (and then has to satisfy the
+> ladder). Setting it also arms the refusals below — which is the point: an explicit `true` converts
+> every silent degrade on this page into a loud `exit 2`.
+>
+> With that set, the two supported postures:
 > **in-process TLS** (`tls_cert_file` [+`tls_key_file`]) — the browser connects directly to the
 > engine — or a **declared upstream terminator** (`tls_terminated_upstream = true` +
-> `trusted_proxies = ["<proxy egress IP or CIDR>"]` + **`public_origin`**, which the L5b ladder now
-> requires). `trusted_proxies` entries match the proxy's **direct TCP peer address exactly** (CIDR
+> `trusted_proxies = ["<proxy egress IP or CIDR>"]` + **`[security].web_console_public_address`**,
+> which the L5b ladder now requires — set it under `[security]`, not as the rejected
+> `[api].public_origin`). `trusted_proxies` entries match the proxy's **direct TCP peer address exactly** (CIDR
 > supported, but scope it to the proxy pool — every host inside an entry may forge its own source
 > address; watch the `::1`-vs-`127.0.0.1` mismatch) — a *syntactically valid but wrong* entry silently
 > disables the forwarded-header rewrite, collapsing audit/rate-limit source IPs to the proxy. An
 > **unparseable** entry, or `"*"`, is refused at config load rather than degrading silently. With either
 > posture declared (`exposure_protected`), the `/ui` session cookie ships `Secure` and HSTS is
-> emitted regardless of the per-request scheme. Full runbook + reverse-proxy-mTLS reference
+> emitted regardless of the per-request scheme.
+>
+> The two postures, written out — each is the **console** half only; a PHI instance still has to
+> satisfy the encryption / egress / retention / security-notification gates catalogued below before
+> `serve` will start at all:
+>
+> ```toml
+> # A — declared upstream terminator (loopback bind behind a reverse proxy)
+> [security]
+> serve_web_console = true                                 # step 0 — without this /ui silently 404s
+> web_console_public_address = "https://mefor.example.org"  # required under a declared terminator
+> [api]
+> tls_terminated_upstream = true
+> trusted_proxies = ["10.20.0.5"]        # the proxy's DIRECT TCP peer address, not a broad range
+> # On THIS (loopback-bind) topology the two Posture-B attestations only WARN if you omit them; they
+> # become an exit 2 once the bind itself is off-loopback. Declare them anyway — the warning is the
+> # record that the proxy->engine hop was considered.
+> proxy_intra_service_auth = "mtls"      # how the proxy->engine hop is authenticated (attestation only)
+> proxy_tls_min_version = "1.3"          # the TLS floor the proxy negotiates with browsers
+> ```
+>
+> ```toml
+> # B — in-process TLS (the browser connects straight to the engine)
+> [security]
+> serve_web_console = true               # step 0 — same silent degrade applies to this posture
+> local_access_only = false
+> listen_address = "10.20.4.7"
+> web_console_public_address = "https://mefor.example.org"  # optional here, but WebAuthn fails closed without it
+> [api]
+> tls_cert_file = "C:/mefor/tls/server.pem"
+> tls_key_file  = "C:/mefor/tls/server.key"
+> ```
+> Posture **B** additionally needs `MEFOR_TLS_REVOCATION_ATTESTED=1` in the service environment — see
+> the next paragraph.
+>
+> **Neither posture starts a stock instance from the keys above alone** — beyond step 0, each has a
+> second, fail-closed precondition outside the `[api]` section:
+> in-process TLS off-loopback additionally needs the environment variable
+> **`MEFOR_TLS_REVOCATION_ATTESTED=1`** ([ADR 0078](adr/0078-certificate-revocation-posture.md); that
+> gate reads neither the data label nor `[security].enforcement`, so a synthetic lab box hits it
+> too), and the terminator additionally needs **`[api].proxy_intra_service_auth`** *and*
+> **`[api].proxy_tls_min_version`** on a PHI instance under `enforcement = enforce` with an
+> off-loopback bind (the rows above). Both are `exit 2`, both land before the console gates, and
+> `--allow-insecure-bind` covers neither. The worked recipes are
+> [REMOTE-CONSOLE.md](REMOTE-CONSOLE.md) §1 Options A/B and [DEPLOYMENT.md](DEPLOYMENT.md) § *Before
+> you expose off-loopback*. Full runbook + reverse-proxy-mTLS reference
 > configs: security/OFF-LOOPBACK-DEPLOYMENT.md — a maintainer-internal document; see
 > [SECURITY-DOCS-POLICY.md](SECURITY-DOCS-POLICY.md) for what is withheld and what you can request.
 
@@ -221,7 +294,7 @@ byte-identical SSL context.
 ### `[inbound]` — inbound listener defaults
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `bind_host` | str | `127.0.0.1` | the **default** network interface every inbound MLLP/TCP listener binds to. Authors never set a `host` on an inbound connection (a wiring error if they do) — it's a per-environment operator decision here. Binding `0.0.0.0` exposes unauthenticated MLLP to the network, so it's deliberate (DEV typically loopback, PROD a specific NIC behind a firewall). A non-loopback bind **requires `tls=true`** on each MLLP connection (the §0 exposed-gate refuses a plaintext off-loopback listener at startup) unless `serve --allow-insecure-bind` is passed. A single connection may override this with a per-connection `bind_address` (and restrict peers with `source_ip_allowlist`) — MLLP/TCP only; see [CONNECTIONS.md](CONNECTIONS.md). |
+| `bind_host` | str | `127.0.0.1` | the **default** network interface every inbound MLLP/TCP listener binds to. Authors never set a `host` on an inbound connection (a wiring error if they do) — it's a per-environment operator decision here. Binding `0.0.0.0` exposes unauthenticated MLLP to the network, so it's deliberate (DEV typically loopback, PROD a specific NIC behind a firewall). A non-loopback bind **requires `tls=true`** on each MLLP connection: the §0 exposed-gate (`check_mllp_tls_exposure`) raises a `WiringError` for a plaintext off-loopback listener at wiring time, before the engine starts. `serve --allow-insecure-bind` downgrades that to a warning **only on a non-enforcing or synthetic instance** — it is clamped inert whenever the hop is enforcing PHI, which is the shipped default on all three built-in env names, so on a stock instance the flag buys nothing. A single connection may override the interface with a per-connection `bind_address` (and restrict peers with a per-connection `source_ip_allowlist`) — MLLP/TCP only; see [CONNECTIONS.md](CONNECTIONS.md). |
 | `ack_after` | enum | `ingest` | the **default** ACK timing every inbound inherits (staged pipeline, [ADR 0001](adr/0001-staged-pipeline-architecture.md)). `ingest` = ACK-on-receipt, once the raw message is durably committed to the ingress stage and **before** routing/transform/delivery. `delivered` (defer the ACK until delivery succeeds) is **not built** — wiring it raises a `WiringError`, so it fails loud rather than silently ACKing early. A connection's own `ack_after=` overrides this. |
 | `stream_inflight_budget_bytes` | int (bytes) | `0` | aggregate cap on the **total** bytes of over-threshold message bodies concurrently mid-detach across **all** inbounds (#149, [ADR 0105](adr/0105-streaming-very-large-hl7-attachments-detach-the-opaque-document-from-the-transformable-skeleton.md)). A detach that would push the running total over it is refused with backpressure (the message is NAK'd/`ERROR`'d, never accepted-and-dropped), so a burst of very large documents can't exhaust memory. `0` (default) = unlimited — a *single* body is still bounded by the per-connection `max_message_bytes`. Only over-threshold streaming detaches count against it. |
 
@@ -575,7 +648,7 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 ### `[logging]`
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `level` | enum | `info` | log level; never run prod at `debug` (PHI) — `serve` refuses it (Gate #1) |
+| `level` | enum | `info` | log level. `debug` can surface full message bodies / raw field values into the general log. **`serve` refuses `debug` on a `production_instance` only** (Gate #1, keyed on the production tier alone — see `[security].production_instance`). It is **not** keyed on PHI: since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) a `dev`/`staging` instance also carries PHI, and one of those **will start at `debug` with nothing refusing**. Don't raise any PHI box to `debug` — the gate will not stop you. |
 | `format` | enum | `text` | stdout rendering: `text` (default) or structured `json` (one object per line). Stdlib only — no structlog |
 | `log_dir` | str | _unset_ | the directory NSSM (or another supervisor) **rotates the engine's captured stdout/stderr into**. The engine never writes log **files** itself (it logs to stdout); set this only to tell it where the supervisor parks them, and `GET /status` then **meters that directory's total bytes + filesystem free space** alongside the DB metrics (#50). Unset = stdout-only, no metering. **Metadata only** — the file contents are never read. |
 | `forward_enabled` | bool | _derived_ | ship a copy of every record off-box to a syslog/SIEM collector (sec-offbox-log) so evidence survives a host compromise. **Default-on-when-configured (ADR 0080):** unset ⇒ on iff `forward_host` is set. Set `false` to opt out even with a host; no `forward_host` ⇒ off (stdout-only, unchanged) |
@@ -595,9 +668,20 @@ Only `baa_attested` is still a forward-compat placeholder (accepted-but-ignored)
 | `file`, `max_bytes`, `backups` | str/int | — | **accepted-but-ignored** (planned) rotation — none is a `LoggingSettings` field. The engine logs to stdout and NSSM rotates it; `log_dir` above is how you point the engine at where it lands |
 
 > PHI redaction + control-char scrubbing are **always-on handler filters** (not a toggle) applied to
-> **every** sink, including the off-box forwarder. For an encrypted hop set `forward_protocol = "tls"`
-> (native RFC 5425, no agent needed); alternatively front a plaintext `udp`/`tcp` forward with a local
-> TLS-forwarding agent or a trusted network. See [PHI.md §7](PHI.md#7-logging--phi-redaction) and
+> **every** sink, including the off-box forwarder ([`logging_setup.py`](../messagefoundry/logging_setup.py),
+> `_install_phi_filters`). **What they are is a conservative *redaction*, not de-identification**
+> ([`redaction.py`](../messagefoundry/redaction.py)): a stdlib-regex pass over HL7 segment/field-delimited
+> spans plus a free-text date/DOB and multi-token-name heuristic, erring toward over-redaction. Its own
+> named residual is **an adversarially-crafted single-token or non-name-shaped identifier** — a lone MRN
+> or surname with no second token and no delimiter — for which *"never put PHI in an exception message"*
+> remains the control. So "always-on, every sink" is the coverage guarantee; it is **not** a guarantee
+> that PHI cannot reach a log. Size log-handling risk accordingly, and keep `level` off `debug`.
+> For an encrypted hop set `forward_protocol = "tls"`
+> (native RFC 5425, no agent needed); the one plaintext alternative that still starts on a stock
+> instance is a **loopback** `udp`/`tcp` forward into a local TLS-forwarding agent. "Plaintext across
+> a trusted network" is **not** an option you can simply choose — an off-box plaintext hop is refused
+> on an enforcing PHI instance and needs the explicit `forward_hop_attested` + reason below.
+> See [PHI.md §7](PHI.md#7-logging--phi-redaction) and
 > [ADR 0080](adr/0080-offbox-forwarding-tls-defaults.md).
 >
 > **The plaintext default is now gated, not silent (#200, ADR 0092).** The forwarded stream is
@@ -631,7 +715,7 @@ three built-in environment names (`dev`, `staging`, `prod`) derive PHI. The audi
 | `app_log_days` | int | `0` | past N days, **delete** application **log files** (`.log`/`.txt`, one level) from the configured `[logging].log_dir` (#120). The supervisor (NSSM `AppRotateBytes`) rotates the daily logs by **size** but never by **age**, so the log dir grows unbounded; this bounds it (by file mtime, so the currently-written file is never eligible). `0` = keep. **No-op unless `[logging].log_dir` is set.** Metadata only — file content is never read. While `app_log_compress_days` is on, the same window also ages out the `*.log.gz`/`*.txt.gz` archives that setting produces — so compressing a log doesn't make it immortal; with compression off the eligible set is exactly what it was |
 | `app_log_compress_days` | int | `0` | past N days, **gzip** application **log files** (`.log`/`.txt`, one level — the same selection as `app_log_days`, by mtime, so the currently-written file is never eligible) in `[logging].log_dir` to `<name>.gz` (#119). The log stays readable (`gzip -d`) at a fraction of the disk, so a long-running box keeps far more history for the same footprint. Each file is **free-space prechecked** (`shutil.disk_usage` must show room for the source **plus** its archive plus a `max(10%, 1 MiB)` margin — short, and the file is **skipped and logged**, never attempted) and each written archive is **integrity-validated** — staged to an **exclusively created, randomly named** temp file beside it (`tempfile.mkstemp`: `O_CREAT\|O_EXCL`, so it never truncates an existing file, never follows a symlink, and never collides with a sibling engine shard compressing the same directory), `fsync`ed, re-read **off disk**, decompressed and compared **byte-for-byte** against the original, renamed into place, and then **validated again at `<name>.gz` itself** — and it is that last check, on the bytes actually sitting where the log used to be, that authorizes removing the original. Any failure leaves the original **in place**, does not count it as compressed, and logs it; an existing `<name>.gz` is never clobbered. The archive inherits the source's mtime, so `app_log_days` still ages it out. Files over 64 MiB are skipped (the codec is in-memory), and so is a file whose archive would not be **smaller** than it (an empty or already-compressed log — compressing must never *cost* disk). Names/counts/sizes are logged, **never file content**. `0` = never compress. **No-op unless `[logging].log_dir` is set.** Set it **shorter** than `app_log_days` — a longer window compresses nothing, since the delete sweep runs first |
 | `search_preset_days` | int | `0` | past N days, **delete** saved-search presets (ADR 0136) neither used nor edited since the cutoff. The stored `criteria` is the operator's own content/`field_value` needle — **PHI-shaped by construction**, encrypted at rest — so it needs a window like any other PHI tier (ASVS 14.2.7). The whole **row** is deleted, not blanked: a preset's entire payload *is* its criteria. **Keys on last-USED** (BACKLOG #306) — the cutoff is compared against the *later* of `updated_at` (written by a save) and `last_used_at` (written by a recall), so a preset you run daily but never re-save is **kept**. A preset last touched before the `last_used_at` column existed has it NULL and ages out on `updated_at` alone. `0` = keep forever (the default) |
-| `audit_days` | int | `0` | **reserved / not enforced — keep-forever by design.** The rationale rests on the **audit-retention requirement** (45 CFR 164.316(b)(2)(i) six-year documentation retention; every framework floor is far below it — CIS Control 8.10 is 90 days, PCI DSS 4.0 §10.5.1 is 12 months, NIST SP 800-53 AU-11 defers to organizational policy), **not** on chain-breakage. *Corrected 2026-07-30:* this row used to argue "deleting rows would break the chain". That is true only of deleting the **oldest** rows, and it is exactly **inverted** for the threat that motivates audit retention — `verify_audit_chain`'s own docstring (`store/store.py:7385`) records that deleting the **newest** rows is *not* caught by the walk alone, because the surviving prefix still chains cleanly. An attacker hiding what they just did truncates the newest rows. **And the anchor that would catch it is not reachable from the shipped CLI** (`__main__.py:3418` calls `verify_audit_chain()` with no `expected_anchor`, and no flag supplies one), so `audit-verify` returns CLEAN after a tail-truncation; as shipped, truncation detection depends on the off-box tee, not on anything runnable locally. Do **not** restore the chain-breakage argument, and do **not** upgrade this to "the anchor detects it" without also shipping a way to pass one. Archive-first pruning is a tracked follow-up. See `docs/PHI.md` §8, which is the source of record for this reasoning |
+| `audit_days` | int | `0` | **reserved / not enforced — keep-forever by design.** The rationale rests on the **audit-retention requirement** (45 CFR 164.316(b)(2)(i) six-year documentation retention; every framework floor is far below it — CIS Control 8.10 is 90 days, PCI DSS 4.0 §10.5.1 is 12 months, NIST SP 800-53 AU-11 defers to organizational policy), **not** on chain-breakage. *Corrected 2026-07-30:* this row used to argue "deleting rows would break the chain". That is true only of deleting the **oldest** rows, and it is exactly **inverted** for the threat that motivates audit retention — `verify_audit_chain`'s own docstring (`store/store.py:7385`) records that deleting the **newest** rows is *not* caught by the walk alone, because the surviving prefix still chains cleanly. An attacker hiding what they just did truncates the newest rows. **And the anchor that would catch it is not reachable from the shipped CLI** (`__main__.py:3418` calls `verify_audit_chain()` with no `expected_anchor`, and no flag supplies one), so `audit-verify` returns CLEAN after a tail-truncation; as shipped, truncation detection depends on the off-box tee, not on anything runnable locally. Do **not** restore the chain-breakage argument, and do **not** upgrade this to "the anchor detects it" without also shipping a way to pass one. Archive-first pruning is a tracked follow-up. **This row is the source of record for the chain-truncation reasoning**; `docs/PHI.md` §8 carries the retention-window inventory, and wherever its §8 still withholds pruning on the ground that "deleting rows would break the chain", that rationale is **superseded here** — do not read it as the authority |
 | `max_db_mb` | int | `0` | advisory only: warn (WARNING log + an `AlertSink` `storage_threshold` event) when the database exceeds this — measured as the **SQLite file + `-wal`/`-shm`**, `SUM(size)` over `sys.database_files` on **SQL Server**, and `pg_database_size()` on **Postgres**. Never auto-deletes. `0` = off |
 | `purge_interval_seconds` | float | `3600` | how often the purge/maintenance loop runs a pass |
 | `max_pass_seconds` | float | `0` | maximum wall-clock seconds **one maintenance pass** may spend (#121, [ADR 0137](adr/0137-time-boxed-retention-maintenance-pass-between-phase-cap.md)). A **between-phase soft cap**: `run_once` checks elapsed monotonic time before each phase and, once this is reached, **skips the remaining phases** (marking the pass `capped`) so a long pass can't run unbounded into the next maintenance window — the skipped tail re-runs next interval, and a skipped WAL-checkpoint/VACUUM does **not** advance its last-run marker. Checked only *between* phases, never inside one, so a running VACUUM is non-interruptible. `0` = off (the default — no cap); ~`14400` (4 h, the Corepoint off-peak ceiling) is the recommended value when enabled |
@@ -746,21 +830,52 @@ keeps a compliance floor even at `off`. The fourth row is a relocated key, rejec
 
 ### `[egress]`
 Fail-closed **outbound destination allowlist** (WP-11c; ASVS 13.2.4/13.2.5/14.2.3) — bounds where the
-engine may **send** PHI, so a fat-fingered or hostile destination can't exfiltrate it. Each list is
-**opt-in**: empty = unrestricted (today's behavior); once a transport's list is set, an outbound of
-that transport not on it is **refused at config load/reload** (a `WiringError` → 422 / refused reload),
-checked against the resolved (`env()`-substituted) destination.
+engine may **send** PHI, so a fat-fingered or hostile destination can't exfiltrate it. Once a
+transport's list is set, an outbound of that transport not on it is **refused at config load/reload**
+(a `WiringError` → 422 / refused reload), checked against the resolved (`env()`-substituted) destination.
+
+> **Do not record "egress allowlist: opt-in, unrestricted by default."** That is the `EgressSettings`
+> *field* default, and on a **PHI** instance `serve` overrides it before the engine ever runs
+> ([`__main__.py`](../messagefoundry/__main__.py): the open-egress gate, then the deny-by-default flip;
+> ASVS 13.2.4/13.2.5). **All three built-in environment names derive PHI**
+> ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)), so this is
+> what `serve --env dev|staging|prod` actually does under `[security].enforcement = enforce` (the default):
+>
+> | `[egress]` / `[security]` as configured | What `serve` does |
+> |---|---|
+> | **none of the six *counted* lists** set (see the ⚠️ below), `block_unlisted_outbound` left unset | **exits 2** — *"outbound egress is UNRESTRICTED … refusing to start"*. A PHI instance with no egress config does **not** start — **and neither does one whose only list is `allowed_smtp` or `allowed_direct`**. |
+> | none of the six set, `block_unlisted_outbound = false` | **exits 2** — same gate; the explicit opt-out does not buy a fully-open PHI instance. |
+> | **≥1 of the six *counted* lists** set (see below), `block_unlisted_outbound` left unset | starts, and **flips deny-by-default ON** (an `info:` line on stderr): every transport whose own list is **empty** now refuses **every** destination of that type. This is the case that bites — a partially-configured instance does not allow-any the transports you didn't list. |
+> | `block_unlisted_outbound = true` | starts, deny-by-default — enumerate every permitted destination. |
+> | **≥1** counted list set, `block_unlisted_outbound = false` | starts **allow-any** for the transports you left empty, with a `warning:` plus a WARNING-level `AUDIT:` line, and reported by `security_loosenings()`. |
+>
+> ⚠️ **Only SIX of the eight lists satisfy the open-egress gate.** Its predicate
+> ([`__main__.py`](../messagefoundry/__main__.py), the `egress_open` expression) reads
+> `allowed_mllp`, `allowed_tcp`, `allowed_http`, `allowed_db`, `allowed_remote` and
+> `allowed_file_dirs` — and **nothing else**. `allowed_smtp` and `allowed_direct` appear nowhere in
+> that gate. So a PHI instance whose *only* declared egress is an `Email()` relay or a `Direct()`
+> HISP relay is still `egress_open` and still **exits 2** with *"outbound egress is UNRESTRICTED …
+> refusing to start"*, having declared a list. Measured, one list at a time, on `--env prod`: each of
+> the six starts and flips deny-by-default on; `allowed_smtp`-only and `allowed_direct`-only both
+> exit 2. If your deployment is mail-only or Direct-only, set
+> **`[security].block_unlisted_outbound = true`** — that arm of the predicate is what a mail-only
+> instance has to use. (The two lists still *gate* their own transports normally once the instance
+> starts; they just do not count as "egress is restricted" for this gate.)
+>
+> Under `enforcement = warn` the two refusals become warnings and start. A **synthetic** instance
+> (`[security].handles_real_patient_data = false`) is exempt entirely — there, and only there, empty
+> really does mean unrestricted. **Practical rule: enumerate the destinations you intend, per transport.**
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `allowed_mllp` | list | `[]` | allowed MLLP destinations; each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_MLLP` |
-| `allowed_tcp` | list | `[]` | allowed raw-TCP (`Tcp(...)`) destinations; each entry is `host` (any port) or `host:port`. An inbound `Tcp(...)` is a local listener and is not gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
+| `allowed_tcp` | list | `[]` | allowed raw-TCP destinations; each entry is `host` (any port) or `host:port`. **Covers three connectors, not one:** `Tcp(...)`, `X12(...)` and the **DICOM C-STORE SCU** (`DICOM()` outbound) all resolve to this list — they are all raw sockets ([`pipeline/wiring_runner.py`](../messagefoundry/pipeline/wiring_runner.py), the `TCP`/`X12`/`DIMSE` egress arms). Populate it for every one of them, or with deny-by-default flipped on your X12/PACS destinations are refused at load. An inbound `Tcp(...)`/`X12(...)`/`DICOM()` is a local listener and is not connect-gated. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_TCP` |
 | `allowed_file_dirs` | list | `[]` | allowed File output directories; a destination's directory must resolve at/under one of these |
-| `allowed_http` | list | `[]` | allowed REST/SOAP (HTTP) destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
+| `allowed_http` | list | `[]` | allowed HTTP destination hosts; each entry is `host` (any port) or `host:port` (ADR 0003). **Covers the whole HTTP family, not just REST/SOAP:** `Rest()`, `Soap()`, `FHIR()`, `DICOMweb()` (STOW-RS), the read-only `fhir_lookup` / `FhirLookup(...)` (ADR 0043), **and** the SMART / OAuth2 **token endpoints** — a token endpoint is a second egress host and is checked against this same list, so list it too. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_HTTP` |
 | `allowed_db` | list | `[]` | allowed DATABASE destination servers; each entry is `host` (any port) or `host:port` (ADR 0003). Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DB` |
 | `allowed_remote` | list | `[]` | allowed RemoteFile (SFTP/FTP/FTPS) hosts — gates the connector in **both** directions (source poll + destination upload); each entry is `host` (any port) or `host:port`. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_REMOTE` |
-| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
-| `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
+| `allowed_smtp` | list | `[]` | allowed **email (SMTP)** destination hosts for the `Email(...)` outbound ([ADR 0029](adr/0029-email-smtp-destination.md)); each entry is `host` (any port) or `host:port`. Distinct from `[alerts].smtp_allowed_hosts`, which gates the **alert notifier's** own SMTP dial. **Does NOT count toward the open-egress startup gate** (see the ⚠️ above the key table) — setting only this on a PHI instance still exits 2. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_SMTP` |
+| `allowed_direct` | list | `[]` | allowed **Direct** (S/MIME-over-SMTP HISP relay) destination hosts ([ADR 0085](adr/0085-direct-hisp-smime-connector.md)); each entry is `host` (any port) or `host:port`. Kept deliberately **separate from `allowed_smtp`** so an operator can permit a Direct HISP relay without opening generic email egress — a distinct trust relationship carrying encrypted PHI. **Does NOT count toward the open-egress startup gate** either — a Direct-only PHI instance needs `[security].block_unlisted_outbound = true` to start. Via env: comma-separated `MEFOR_EGRESS_ALLOWED_DIRECT` |
 | `proxy_url` | str | _unset_ | site-wide **default forward/egress web proxy** for the HTTP family — REST/SOAP/FHIR/`fhir_lookup`/DICOMweb plus the OAuth2/SMART token endpoints ([ADR 0126](adr/0126-outbound-forward-egress-web-proxy-for-the-stdlib-http-family.md)). A connection that sets no per-connection `proxy` inherits this; a per-connection value overrides it. Unset (default) = no site-wide proxy (byte-identical — only per-connection proxies apply). `"default"` selects the OS default web proxy (`getproxies()`); an `http(s)://` address names an explicit one. **Proxy credentials stay per-connection** (secrets via `env()`), never a global TOML value. Via env: `MEFOR_EGRESS_PROXY_URL` |
 | `proxy_no_proxy` | list | `[]` | the site-wide `NO_PROXY`-style **bypass list** inherited by a connection that sets no per-connection `proxy_no_proxy`. Each entry is a host, `.suffix`, `*.suffix` or `*`. Via env: comma-separated `MEFOR_EGRESS_PROXY_NO_PROXY` |
 | `deny_by_default` | | | **→ moved to `[security].block_unlisted_outbound`** (ADR 0118) — set it there; no longer accepted in `[egress]`. |
@@ -772,9 +887,14 @@ checked against the resolved (`env()`-substituted) destination.
 > search parameter. Default-off keeps the flat form for back-compat, which leaves the query-encoding an author
 > responsibility — the structured form is the safe path either way.
 
-> `serve` warns at startup in a `prod`/`staging` environment when egress is fully open (no allowlist set
-> **and** `deny_by_default` off) — a transform could then send PHI anywhere. Lock it down with
-> `deny_by_default = true` or the per-transport lists above.
+> **Fully-open egress on a PHI instance is a startup REFUSAL, not a warning** (see the table above).
+> With none of the six **counted** allowlists set (`allowed_smtp`/`allowed_direct` do not count —
+> see the ⚠️ above), `serve` **exits 2** on any **PHI** instance — all three built-in env names, not
+> just `prod`/`staging` — under `[security].enforcement = enforce`, the default; it downgrades to a
+> stderr warning only under `enforcement = warn`. A synthetic instance stays quiet. Lock it down with
+> the per-transport lists above and/or **`[security].block_unlisted_outbound = true`** — note that key
+> lives in `[security]`; `[egress].deny_by_default` is a relocated key and is **rejected at config
+> load** (row below).
 
 > The webhook/SMTP **alert** sinks carry no message bodies (no PHI) and keep their own host allowlists
 > in `[alerts]` (`webhook_allowed_hosts` / `smtp_allowed_hosts`).
@@ -784,11 +904,27 @@ checked against the resolved (`env()`-substituted) destination.
 > Separately from this allowlist, a plaintext `http://` outbound to a **non-loopback** host is decided by
 > [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py)'s `insecure_hop_disposition`, enforced
 > at construction by `refuse_cleartext_egress`
-> ([`transports/rest.py`](../messagefoundry/transports/rest.py)). The precedence is: a loopback / on-box
-> hop is **allowed**; a per-connection `tls_hop_attested` hop is **allowed** (the operator asserts it is
-> secure by other means); a per-connection `cleartext_accepted` hop is **crossed with a loud, audited
-> WARN** (the operator accepts that it is not secure); a non-enforcing instance
+> ([`transports/rest.py`](../messagefoundry/transports/rest.py)). The authority's precedence, in the
+> order it is evaluated: a loopback / on-box hop is **allowed**; a `tls_hop_attested` hop is
+> **allowed** (the operator asserts it is secure by other means) — **but see the warning below: this
+> rung has no authoring surface, so it is not a lever you can reach**; a per-connection
+> `cleartext_accepted` hop (+ a mandatory `cleartext_reason`) is **crossed with a loud, audited WARN**
+> (the operator accepts that it is not secure); a non-enforcing instance
 > (`[security].enforcement = warn`) **warns**; everything else is **refused** (fail-closed).
+>
+> ⚠️ **`tls_hop_attested` is not an operator lever — do not plan around it.** It is a field on the
+> internal connection model that the connectors read, but there is **no way to set it**: no
+> connector-factory keyword (`MLLP()`, `Rest()`, `Soap()`, … — check any signature in
+> [`config/wiring.py`](../messagefoundry/config/wiring.py)) and no `connections.toml` key (that
+> loader calls the factory with your `[settings]` table, so *the factory is the schema* and an
+> unknown key is rejected). It is listed here only because it is the first ALLOW arm in the
+> authority and would otherwise look like a missing case. **The one crossing you can actually
+> author on a connection is `cleartext_accepted = true` + `cleartext_reason = "…"`** — and it WARNs
+> and audits at every construction rather than crossing silently, which is the point. The
+> `[logging]` forwarder's `forward_hop_attested` (above) is a genuine, settable sibling; the
+> connection-level flag is not. Same for `tls_revocation_attested` on the revocation gate — its only
+> reachable form is the blanket `MEFOR_TLS_REVOCATION_ATTESTED` environment variable.
+>
 > **`data_class` is no longer read here** — a `synthetic` label used to allow every cleartext hop
 > silently, which made a typo in one file indistinguishable from a deliberate declaration, with every
 > transport hop in the product as its blast radius. `MEFOR_ALLOW_INSECURE_TLS` no longer influences this
@@ -846,7 +982,7 @@ best-effort and runs on a background task, so it never blocks or hangs a deliver
 | `email_subject_template` | str | _unset_ | optional **operator-editable** alert-email subject (#138, [ADR 0127](adr/0127-operator-editable-alert-email-templates-with-a-non-phi-variable-allowlist.md)). Unset (the default, with its two siblings) = the fixed subject + key/value body, byte-identical to before. When set it is a `{name}` template over a **closed non-PHI variable allow-list**, validated at config load and **fail-closed** — an unknown or message-derived reference raises rather than rendering |
 | `email_body_template` | str | _unset_ | the same, for the **plain-text** body. The plain-text part is **always** sent, even when an HTML alternative is configured |
 | `email_html_template` | str | _unset_ | the same, adding an **HTML alternative** part whose substituted *values* are HTML-escaped. Never HTML-only — it supplements `email_body_template`, it does not replace it |
-| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start in production** and **warns** in a non-production PHI env. Set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). |
+| `security_notifications_required` | bool | `true` | **secure-by-default gate (BACKLOG #188, ASVS 6.3.5/6.3.7).** On a **PHI** instance with sign-in on, if no effective out-of-band security-notification channel is configured — `[auth].notify_security_events` on **and** `email_smtp_host` + `email_from` set — `serve` **refuses to start (exit 2)**. **The refuse/warn split is `[security].enforcement`, not the production tier:** the gate reads `enforcing` ([`__main__.py`](../messagefoundry/__main__.py)), which is `enforce` by default on **all three** built-in env names, and all three derive PHI ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) — so `serve --env dev` and `--env staging` on shipped defaults with no `[alerts]` SMTP are refused exactly like `prod`, not warned. (Measured: `dev`/`staging`/`prod` all resolve `data_class=phi, enforcing=True, channel_ready=False`.) It downgrades to a warning only under `enforcement = warn`. **This gate is why `[alerts]` is not optional on a stock instance** — configure the SMTP transport, or set `false` to accept the pull-only `GET /me/security-events` feed instead (audited). |
 | `realert_seconds` | num | 300 | suppress re-notifying the same (event, connection) more often than this (anti-spam for a flapping lane). A matching rule's `cooldown_seconds` overrides it. |
 | `rules` | list | `[]` | ordered `[[alerts.rules]]` table array — per-event severity, transport routing, thresholds, suppression, cooldown (see below). Empty = today's behaviour (every event → every transport at `warning`). |
 
@@ -858,7 +994,7 @@ silences an event you didn't name. Matching is pure config (no code/`eval`).
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `event_type` | str | `any` | match this event: `any`, `connection_stopped`, `queue_buildup`, `storage_threshold`, `cert_expiry`, `connection_error`, `message_stall`, `integrity_drift`, or `gcm_invocations` |
+| `event_type` | str | `any` | match this event. The validator (`AlertRule._check_event_type`) accepts `any` plus exactly these **18**, and **rejects anything else at config load**, so a typo is loud rather than a rule that never matches: `backup_failed`, `bootstrap_admin_expiring`, `cert_expiry`, `connection_error`, `connection_stopped`, `content_match`, `dr_activated`, `gcm_invocations`, `integrity_drift`, `lane_stuck`, `leadership_acquired`, `message_stall`, `queue_buildup`, `rcsi_off_degraded`, `saturation`, `secret_rotation`, `storage_threshold`, `update_available`. Note the **event names are shorter than the prose names** used elsewhere in this file — the secret-rotation reminder is routed as `secret_rotation`, not `secret_rotation_due` |
 | `connection` | str (glob) | `*` | glob over the connection name (e.g. `OB_*`, `IB_ACME_*`) |
 | `min_depth` | int | _unset_ | `queue_buildup` only — match only when pending depth is at/over this |
 | `min_oldest_seconds` | num | _unset_ | `queue_buildup` only — …or the oldest pending message has waited at least this long |
@@ -898,8 +1034,17 @@ connection = "OB_LOADTEST"
 transports = []   # suppress every event for this connection
 ```
 
-> A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with no SMTP
-> settings) is rejected at startup, so a typo can't silently black-hole an alert. Severity travels in
+> A rule routing to a transport that isn't configured (e.g. `transports = ["email"]` with a webhook
+> but no SMTP settings) is rejected at startup, so a typo can't silently black-hole an alert.
+> **That check has one gap worth knowing, because the recipes below sit in it:** it lives inside the
+> notifier factory ([`pipeline/alert_sinks.py`](../messagefoundry/pipeline/alert_sinks.py),
+> `notifier_from_settings`), which returns early when **no** transport is configured at all. So with
+> **zero** `[alerts]` transports your `[[alerts.rules]]` are never validated and never applied —
+> events fall through to the `LoggingAlertSink` and are logged at `WARNING`, which is not a
+> black-hole but is also not the page you asked for, and nothing tells you. Measured: a file with a
+> `transports = ["webhook"]` rule and no `[alerts]` block loads and starts with `notifier = None`;
+> add an email-only `[alerts]` and the same rule becomes `exit 2`. **A routing rule is only ever live
+> alongside a configured transport — write the `[alerts]` block first.** Severity travels in
 > the payload; **timed multi-stage escalation** ("email now, page in 15 min") is future work (ADR 0014
 > §3) — rules give the static routing primitive it would build on.
 
@@ -929,6 +1074,11 @@ connecting** — a handshake can only reveal a cert that is still being presente
 ```toml
 [cert_monitor]
 warn_days = 45            # start warning 45 days out
+
+# The rule below only does anything alongside a configured transport — a `[[alerts.rules]]` in a file
+# with no [alerts] block is silently inert (the notifier is never built). Declare the webhook here:
+[alerts]
+webhook_url = "https://hooks.example.com/services/XXX"
 
 # Page (don't just email) when a served cert is close to expiry.
 [[alerts.rules]]
@@ -961,8 +1111,10 @@ the secret-side twin of [`[cert_monitor]`](#cert_monitor). A TLS cert carries it
 long-lived secret (the **store data-encryption key** today; connector credentials in a future
 `SecretProvider`) has none, so a stale key can sit unrotated with no in-engine signal. The engine
 periodically compares each tracked secret's operator-recorded **last-rotated date** against its **max
-age** and raises a **`secret_rotation_due`** alert (an [`[alerts]`](#alerts) event — route it with a
-`[[alerts.rules]]` rule) when it is overdue or within `warn_days` of due. It reads only the rotation
+age** and raises the rotation-due alert (an [`[alerts]`](#alerts) event) when it is overdue or within
+`warn_days` of due. **Route it as `event_type = "secret_rotation"`** — that is the wire name the rule
+validator accepts; the longer `secret_rotation_due` is the internal `AlertSink` method name and is
+**rejected at config load** if you write it in a rule. It reads only the rotation
 **dates** you configure here — **never any secret value** (PHI-free). This is a *reminder*, not
 enforcement: it never rotates a key or blocks startup (run `rotate-key` to rotate the store DEK). Under
 `[security].enforcement = enforce`, a store DEK past `store_key_max_age_days + enforce_grace_days`
@@ -990,9 +1142,15 @@ store_key_last_rotated = "2026-01-15"   # when you last ran rotate-key
 store_key_max_age_days = 365            # remind me a year later
 warn_days = 30                          # start 30 days ahead
 
-# Page when the store DEK is overdue for rotation.
+# As above: without a configured transport the rule is inert, so declare the email one here.
+[alerts]
+email_smtp_host = "smtp.example.com"
+email_from = "alerts@example.com"
+email_to   = ["oncall@example.com"]
+
+# Notify when the store DEK is overdue for rotation.
 [[alerts.rules]]
-event_type = "secret_rotation"
+event_type = "secret_rotation"          # the WIRE name — "secret_rotation_due" is rejected at load
 severity = "warning"
 transports = ["email"]
 ```
@@ -1185,7 +1343,29 @@ an **editable** install (`pip install -e .` — no RECORD baseline) is a **no-op
 |---|---|---|---|
 | `enabled` | bool | `true` | run startup attestation at all. On by default (alert-only is harmless); a **no-op** off an editable install. Set `false` only to suppress the check entirely (e.g. an unusual packaging where RECORD is known-stale) — you then lose the in-place-tamper tripwire. |
 | `fail_closed_on_drift` | bool | `false` | when `true`, drift makes `serve` **refuse to start** (after recording the audit row + alerting). Default `false` = **alert-only**: a legitimate reviewed in-place security hotfix (the documented vendored-parser patch contingency) would itself trip a RECORD mismatch, so fail-closed-by-default would brick a legitimate patch. Opt in for hard enforcement on a locked-down instance. |
-| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the tamper-evident `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. |
+| `audit_verify_on_start` | bool | `false` | when `true`, the engine **re-walks the `audit_log` hash chain once at startup** (#190). **Alert-only by construction:** a broken chain logs a WARNING and fires the `AlertSink` but **never** crashes startup — a refuse-to-start on a tripped tamper alarm would be a self-inflicted DoS. Default `false` (opt in): on a very large `audit_log` the full re-walk adds startup latency, so it is not on by default. **Read the two limits below before citing this as tamper detection.** |
+
+**The chain is *tamper-evident* only when the store is keyed.** With no store encryption key the cipher
+is `IdentityCipher`, whose `audit_mac_key()` returns `None` — "no DEK → no derived key → the audit chain
+stays the keyless SHA-256 chain" ([`store/crypto.py`](../messagefoundry/store/crypto.py)). An unkeyed
+SHA-256 chain is a **corruption** detector: anyone who can write `audit_log` rows can recompute it end to
+end, which is exactly the actor the control exists to catch. With a key configured the chain becomes an
+HMAC on an HKDF-derived subkey (`mefor/audit-chain/v1`), which that actor cannot forge without the DEK;
+under `cipher_provider = "vault_transit"` the MAC is computed **inside** Transit instead
+(`audit_mac_key()` is `None` there **by design** — that is not the keyless case).
+
+In practice a **PHI** instance cannot start keyless without deliberate acknowledgment (the keyless-PHI
+refusal, `[security].allow_unencrypted_phi` + `…_under_strict_enforcement`), so a normally-configured PHI
+deployment does get the keyed chain. The unkeyed chain is what a **synthetic** instance runs, and what an
+**acknowledged keyless** PHI instance runs — check `[store].encryption_key` / `encryption_key_file` before
+you record "tamper-evident audit log" in a risk register.
+
+**And the walk does not catch a truncated tail.** `verify_audit_chain` detects modified or deleted
+**older** rows, but deleting the **newest** rows leaves a prefix that still chains cleanly — and the
+shipped `messagefoundry audit-verify` passes no `expected_anchor`, so it returns CLEAN after a
+tail-truncation. An attacker hiding what they just did truncates the newest rows. Truncation detection
+depends on the off-box log forward / tee, not on anything runnable locally. The full reasoning is the
+[`[retention]`](#retention) `audit_days` row, which is the source of record for it.
 
 ### `[engine]`
 **Not implemented.** There is **no `EngineSettings` model**, so an `[engine]` block in
@@ -1230,35 +1410,64 @@ Under the hood the loader **desugars** `[security]` into those internal fields, 
 `checks.py` commit/CI mirror keep enforcing exactly as before — **no shipped refusal is loosened**
 (the *No-loosen rule*, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) §5),
 and a PHI weakening under **strict enforcement** (`enforcement = enforce`, the default) still fails closed
-regardless of any value here — byte-identical to the former production-PHI refusal
+— byte-identical to the former production-PHI refusal
 ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)).
+
+> **Two acknowledged exceptions — `enforcement = enforce` is not the whole answer.** The No-loosen rule
+> ships with exactly two dedicated second-acknowledgment switches ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md);
+> [SECURITY-LOOSENING.md](SECURITY-LOOSENING.md) invariant 1), each of which drops **one** strict-enforcement
+> refusal to a loud, audited warning that starts:
+> `allow_unencrypted_phi_under_strict_enforcement` (keyless PHI at rest) and
+> `allow_single_factor_admin_when_exposed` (single-factor admin on an exposed instance) — both rows below.
+> Separately, `enforcement = warn` downgrades **every** PHI serve-gate refusal at once. So confirming
+> `enforcement = enforce` is necessary but **not sufficient**: read those three values before recording
+> a posture. Each is reported by `security_loosenings()` on `GET /security/posture`, so none is silent.
 
 | key | type | default | meaning |
 |---|---|---|---|
 | `local_access_only` | bool | `true` | reachable only from this machine (loopback bind) |
 | `listen_address` | str | `"127.0.0.1"` | bind address — used only when `local_access_only = false` |
-| `require_encryption_for_remote` | bool | `true` | any off-machine access must be over TLS (config-file twin of `--allow-insecure-bind`; can't relax production-PHI) |
-| `serve_web_console` | bool | `true` | mount the browser ops console at `/ui` — **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)); set `false` to shrink to a JSON-only surface. Default-on applies to **local loopback** binds; on an exposed instance a default-on console auto-degrades to JSON-only unless explicitly enabled with TLS + `web_console_public_address` |
+| `require_encryption_for_remote` | bool | `true` | any off-machine access must be over TLS. Setting it `false` is the config-file twin of `--allow-insecure-bind` and rides the **same** clamp: it cannot relax a cleartext bind on a **PHI instance under `enforcement = enforce`** — note that is *enforcing*-PHI, not merely production, so a `dev` or `staging` box on shipped defaults is refused exactly like `prod`. It also does not reach `/ui` (the browser surface refuses an unprotected off-loopback bind under either escape) |
+| `serve_web_console` | bool | `true` | mount the browser ops console at `/ui` — **on by default** ([ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)); set `false` to shrink to a JSON-only surface. Default-on applies to **local loopback** binds. On an **exposed** instance (a non-loopback bind, a declared TLS terminator, **or** a set `web_console_public_address`) the two cases diverge and it matters which you are in: a **default-on** console — one you never asked for by name — **auto-degrades to JSON-only** with only a stderr warning, so `/ui` 404s on a cleanly-started engine; an **explicit** `serve_web_console = true` stays on and then must satisfy the exposure ladder or `serve` **refuses** (exit 2) — off-loopback `/ui` requires in-process TLS or a declared terminator, and behind a declared terminator it additionally requires `web_console_public_address`. So "explicit" is what stops the silent degrade; TLS and the origin are separate refusals on top |
 | `web_console_public_address` | str | `""` | external origin when the console is exposed off-box (CSRF/CSWSH + WebAuthn RP-id) |
-| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own per-connection `[inbound].source_ip_allowlist`. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read OFF-LOOPBACK-DEPLOYMENT.md first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
+| `allowed_client_networks` | list[str] | `[]` | **`[BUILT]` ([ADR 0151](adr/0151-operator-surface-source-network-allow-list-security-allowed-client-networks.md)):** source-address allow-list for the **operator API + web console**. **Empty (the default) = no restriction.** Non-empty = a request whose client address is outside every listed network is refused **403 in middleware, before routing and before sign-in** (also covers `/ui`, `/ui/static`, `/ws/stats`). **One route is exempt for *every* source address, not just loopback: `/health`** ([`api/client_networks.py`](../messagefoundry/api/client_networks.py), `_EXEMPT_PATHS = {"/health"}`) — the tokenless liveness probe an off-box monitor or load balancer needs, and the reason this row's own diagnostic below works from a blocked address at all. Do not read the enumerated coverage as "every operator-surface route is address-gated". Entries are CIDR networks or bare hosts (`"10.20.0.0/16"`, `"2001:db8::/48"`, `"10.20.4.7"` → `/32`), IPv4 + IPv6 mixed; malformed entries are **refused at load** and valid ones are stored normalized (`10.1.2.3/24` → `10.1.2.0/24`). **Loopback is always allowed**, with no knob (the tray `/health` poll, an on-box browser, `messagefoundry check` and a container HEALTHCHECK cannot be allow-listed). **Operator surface only** — the ingest listeners keep their own peer restriction, a per-connection `source_ip_allowlist` set on the `inbound(...)` call or in `connections.toml`. Note the spelling: it is **not** a key of the `[inbound]` service-settings section (that section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`), and because every section model is `extra="ignore"`, writing `source_ip_allowlist` into `[inbound]` in `messagefoundry.toml` is accepted silently and does nothing. **It matches the address uvicorn reports, so it is INERT behind an UNDECLARED proxy / NAT / a bridged container** — declare the proxy in `[api].trusted_proxies` or this does nothing; `curl /health` and read `observed_client` to check. Setting it **tightens `[api].trusted_proxies` to single hosts** (a broad range would let every host inside it forge its own source address). Startup-only: a lockout costs a service restart. Defence-in-depth **behind** the host firewall, not the primary network control — read OFF-LOOPBACK-DEPLOYMENT.md first. Env: `MEFOR_SECURITY_ALLOWED_CLIENT_NETWORKS` (**comma**-separated). |
 | `encrypt_stored_data` | bool | `true` | PHI encrypted at rest (key from the environment) |
 | `allow_unencrypted_phi` | bool | `false` | audited escape: start a PHI instance with **no** key |
 | `allow_unencrypted_phi_under_strict_enforcement` | bool | `false` | the **second acknowledgment** required to start a PHI instance keyless under strict enforcement ([ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md)). Under `enforcement = enforce`, `allow_unencrypted_phi = true` on its own is **not** enough — `serve` still refuses to start (exit 2) unless this is also set, so the highest-risk posture (real PHI + strict enforcement) is never one flag away from plaintext at rest. Under `enforcement = warn` the single `allow_unencrypted_phi` flag still governs. With both set the instance starts with PHI bodies, summary/metadata and the error columns **unencrypted at rest**, and the startup AUDIT line names **both** flags. A **loosening** — `security_loosenings()` reports it, so it is never silent |
-| `allow_single_factor_admin_when_exposed` | bool | `false` | permit **single-factor admin on an exposed PHI instance** (ADR 0140). With `require_sign_in` on, `require_mfa` explicitly off, and the operator surface exposed (a non-loopback bind, or the console reached through a declared TLS-terminating proxy), a PHI instance under `enforcement = enforce` **refuses to start** (exit 2) — the Administrator role would authenticate with a single factor over the network. Setting this permits that start; it is recorded in a WARNING-level AUDIT line and the ordinary exposure warning still prints. A **loosening** — `security_loosenings()` reports it. Prefer `require_mfa = true`: it gates only **local** Administrator accounts (directory MFA is delegated), so it is safe to leave on even on an AD-only deployment |
+| `allow_single_factor_admin_when_exposed` | bool | `false` | permit **single-factor admin on an exposed PHI instance** (ADR 0140). With `require_sign_in` on, `require_mfa` explicitly off, and the operator surface exposed — a **non-loopback bind**, or the console reached through a declared TLS-terminating proxy **with `serve_web_console` explicitly `true`** — a PHI instance under `enforcement = enforce` **refuses to start** (exit 2) — the Administrator role would authenticate with a single factor over the network. Setting this permits that start; it is recorded in a WARNING-level AUDIT line and the ordinary exposure warning still prints. A **loosening** — `security_loosenings()` reports it. **Blind spot — do not treat this refusal as your MFA control.** The proxy arm keys on the console actually being *served*, and a **default-on** console auto-degrades to JSON-only on an exposed instance (ADR 0143, flipped in place at startup), so the topology this document recommends — loopback bind behind a declared terminator, `serve_web_console` left at its default — does **not** trip the refusal even on a PHI instance under `enforce` with `require_mfa = false`. The JSON operator API is still reachable off-box through that proxy with single-factor admin. Set `require_mfa = true` there regardless; the gate will not catch you. **Prefer `require_mfa = true` — and know its scope.** Under the shipped `require_mfa_scope = "every_local_account"` it requires a second factor from **every** local account, *not* only Administrators, so a non-interactive **local** bearer-token service account becomes MFA-pending and cannot enrol unattended. **There are two remedies, not three.** Either make it a **directory (AD/Kerberos) principal** — those are out of scope under either value, their factor delegated to the directory — or set `require_mfa_scope = "administrators"` (itself reported as a loosening, and it leaves every local Administrator in scope) — see that row below. **mTLS is *not* the third.** A `[api].tls_client_cert_identities` mapping does grant a cert-identity that never meets the MFA gate, but that plane is admitted on exactly **one** route (`GET /service/identity`, `require_service_cert`) and carries no session, so an account "moved to mTLS" can read back its own identity and nothing else — it cannot replay, purge, poll status, or do any work a service account exists for. The `[api].tls_client_cert_identities` row above is the authority on that reach. Directory identities being out of scope also means an AD-only deployment is safe **for its AD users**; its local bootstrap admin and any local service accounts are still in scope |
 | `memory_encryption_operator_declared` | bool | `false` | **`[BUILT]` ([ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) rung 2, ASVS 11.7.1):** the operator's **declaration** that this host provides hardware memory encryption (AMD SEV-SNP / Intel TDX), so PHI is protected in RAM **while it is being processed**. The engine cannot verify it — a local CPU flag is emitted by the OS whose integrity the requirement protects against — so this records **who took responsibility**, the same discipline as `MEFOR_TLS_REVOCATION_ATTESTED`. It is deliberately **not** called "attested": in confidential computing that word means a CPU-signed quote verified against the silicon vendor's root PKI (ADR 0152 rung 3, **not built**). An **exposed** PHI instance without it **warns and starts** — on every environment, at both `enforcement` settings; it refuses only if `require_memory_encryption_declaration` is also set. A **positive platform read-out does not substitute for it** (a read-out must never relax a control). **Loopback and synthetic instances are byte-identical** (never consulted). If the platform read-out positively contradicts this, the contradiction is **warned at start and reported** as `memory_encryption_readout_contradicts_declaration` on `GET /security/posture` — but **never refused** (the read-out is a self-report, not evidence, and has known false negatives: driver not loaded, container without the device node mapped, Azure CVM paravisor). **Setting this does not make the instance ASVS 11.7.1-compliant** — see the read-out note below the table. Env: `MEFOR_SECURITY_MEMORY_ENCRYPTION_OPERATOR_DECLARED` |
 | `require_memory_encryption_declaration` | bool | `false` | **`[BUILT]` (ADR 0152 rung 2):** turn the row-12 warning above into a **refusal** — an **exposed** PHI instance with no `memory_encryption_operator_declared` then **refuses to start** under `enforcement=enforce` (and still warns under `warn`). **Opt-in by design, and the default is load-bearing:** the property is a **host** property that no operator can satisfy on Windows (the read-out is always `null` there), and "exposed" includes the recommended loopback-behind-proxy topology, so a refusal by default would stop working dev/staging/prod deployments from booting on upgrade over something they cannot change. Same scoping rule as `[security].allowed_client_networks`' companion refusal (ADR 0151): a new refusal fires only on a new opt-in. Set it in an estate that has standardized on confidential-computing hosts and wants a missing declaration to be fatal. Env: `MEFOR_SECURITY_REQUIRE_MEMORY_ENCRYPTION_DECLARATION` |
 | `require_sign_in` | bool | `true` | authenticate every request |
-| `require_mfa` | bool | `true` | second factor (native TOTP or a WebAuthn passkey), enforced as an **access gate** since ASVS 6.3.3 — an MFA-pending session is refused on *every* authorized route with `403` + `X-MFA-Required: 1`, and a browser session is confined to `/ui/mfa`. |
-| `require_mfa_scope` | `"administrators"` \| `"every_local_account"` | `"every_local_account"` | **Which local accounts must ENROL a factor** when `require_mfa` is on (ASVS 6.3.3). An account that has already enrolled one must always satisfy it, under either value — this dial only decides who is required to enrol in the first place. `administrators` restores the pre-6.3.3 posture and is reported as a **loosening** on `GET /security/posture` (advisory, not a refusal: refusing to boot on it would break every existing deployment on upgrade). Directory (AD/Kerberos) identities are out of scope under either value — their MFA is delegated to the directory. **Operator note:** under the default a non-interactive **local bearer-token service account** becomes MFA-pending and cannot enrol unattended — move it to mTLS (`require_service_cert`, exempt by design) or to AD, or set this to `administrators`. Env: `MEFOR_SECURITY_REQUIRE_MFA_SCOPE` |
+| `require_mfa` | bool | `true` | second factor (native TOTP or a WebAuthn passkey), enforced as an **access gate** since ASVS 6.3.3 — an MFA-pending session is refused on *every* authorized route with `403` + `X-MFA-Required: 1`, and a browser session is redirected to `/ui/mfa`. **The enrolment path is a deliberate exemption, not a re-route:** `/ui/mfa` itself and the account/enrolment routes (`GET /ui/account`, the password and factor-enrolment routes) are declared `allow_mfa_pending=True` ([`messagefoundry_webconsole/_auth.py`](../messagefoundry_webconsole/_auth.py), `routes/account.py`), so a user with **no** factor enrolled is not stranded — send them to **`/ui/account`** to enrol TOTP or a passkey. Say "redirected to", not "confined to": `/ui/mfa` renders a code field only once TOTP is enrolled and a passkey button only once WebAuthn is, so a zero-factor user who is told they cannot leave that page is looking at a page with no form. |
+| `require_mfa_scope` | `"administrators"` \| `"every_local_account"` | `"every_local_account"` | **Which local accounts must ENROL a factor** when `require_mfa` is on (ASVS 6.3.3). An account that has already enrolled one must always satisfy it, under either value — this dial only decides who is required to enrol in the first place. `administrators` restores the pre-6.3.3 posture and is reported as a **loosening** on `GET /security/posture` (advisory, not a refusal: refusing to boot on it would break every existing deployment on upgrade). Directory (AD/Kerberos) identities are out of scope under either value — their MFA is delegated to the directory. **Operator note:** under the default a non-interactive **local bearer-token service account** becomes MFA-pending and cannot enrol unattended. The two available fixes are **make it an AD principal** or **set this to `administrators`** — mTLS is **not** a third: a cert-identity is exempt from the MFA gate but is admitted on exactly one route (`GET /service/identity`), so it cannot carry a working service account (see the [`[api]`](#api) `tls_client_cert_identities` row). Env: `MEFOR_SECURITY_REQUIRE_MFA_SCOPE` |
 | `sign_out_after_idle_minutes` | int | `30` | session idle timeout |
 | `max_session_hours` | int | `12` | session absolute lifetime |
-| `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send |
-| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited) |
+| `block_unlisted_outbound` | bool | `true` | deny-by-default egress — only allow-listed destinations send. **Leaving it unset does not apply `true`** — the internal flag stays `false` and the `[egress]` startup gate decides; see the note under this table |
+| `delete_message_bodies_after_days` | int | `30` | bounded PHI-body retention; `0` = keep indefinitely (audited). **Leaving it unset does not apply 30** — the internal window stays `0` and the `[retention]` startup gate decides (refuse under `enforce`, auto-bound to 30 under `warn`); see the note under this table |
 | `allow_keeping_phi_indefinitely` | bool | `false` | audited escape: unbounded PHI retention |
-| `audit_all_authorization_decisions` | bool | `false` | ePHI access is **always** audited regardless; this adds full authz tracing (off by default — forcing it on risks flooding the audit log) |
+| `audit_all_authorization_decisions` | bool | `false` | ePHI access is **always** audited regardless of this switch; this adds full *authorization-decision* tracing on top (off by default — forcing it on risks flooding the audit log). "Always audited" is about **coverage**, not about how hard those rows are to alter afterwards: the audit chain is only cryptographically tamper-*evident* on a **keyed** store, and its verify does not catch a truncated tail — see [`[integrity]`](#integrity) |
 | `handles_real_patient_data` | bool | *derived* | the master data-class lever (was `[ai].data_class = "phi"`). Unset ⇒ derived from the environment name — **all three built-in names (`dev`/`staging`/`prod`) now derive PHI** ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 1, so the default/CI path exercises the encryption/egress/retention controls rather than first meeting them in production); a genuinely-synthetic dev/CI box must set `false` **explicitly** (a loud, audited opt-out), and a custom-named env must declare it |
 | `enforcement` | `enforce` \| `warn` | `enforce` | the serve-gate **refuse/warn dial** + the [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) escape-clamp key ([ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md) GIVEN 2). `enforce` (default) **refuses** every PHI serve-gate violation and shuts every blunt escape-clamp — byte-identical to the former production-tier behaviour; `warn` logs + audits + continues and honours the escapes (a loud, audited loosening, named by `security_loosenings()`). **Decoupled from `production_instance`** (env `MEFOR_SECURITY_ENFORCEMENT`) |
 | `production_instance` | bool | *derived* | production-tier posture (was `[ai].production`). Derived from the environment name when unset (`prod` → yes; `dev`/`staging` → no). **Informational since [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)** — drives the AI data-scope ceiling, the DEBUG-log refusal, and reporting, **not** the serve-gate refuse/warn dial (that is `enforcement`) |
+
+> **The Default column is the *field* default — for exactly two rows that is not what an
+> unconfigured instance runs.** The loader desugars `[security]` **presence-gated**: only a switch you
+> set *explicitly* is written through to its internal field, so an omitted switch leaves the internal
+> default in place and lets the posture gate decide. Measured on a `messagefoundry.toml` with no
+> `[security]` block at all — the other nine pass-throughs agree with their rows; these two do not:
+>
+> | Row | Reads as | Internal field with `[security]` absent | What an unconfigured PHI instance actually does |
+> |---|---|---|---|
+> | `block_unlisted_outbound` | `true` | `egress.deny_by_default = False` | the [`[egress]`](#egress) gate decides: with none of the six **counted** `allowed_*` lists `serve` **exits 2** (`allowed_smtp`/`allowed_direct` do not count); with ≥1 counted list it **flips deny-by-default on** for the transports you left empty |
+> | `delete_message_bodies_after_days` | `30` | `retention.messages_days = 0` | under `enforcement = enforce` (the default) an unbounded window **refuses to start (exit 2)**; under `warn` each *unset* window is auto-bounded to 30 days; a synthetic instance keeps bodies forever |
+>
+> Neither is a silent fail-open — both paths end in a refusal or an audited flip, and `serve`
+> back-fills the `[security]` object from the resolved internal values before serving, so
+> `GET /security/posture` reports the **effective** posture rather than these field defaults. But do
+> not read the Default column as "what my unconfigured box is doing": **set the switch you intend to
+> rely on**, and read the [`[egress]`](#egress) and [`[retention]`](#retention) sections for the two
+> above. (An unrecognized `[security]` key is *ignored* with a startup WARNING, not rejected — so a
+> typo leaves the permissive default in force. Check spelling against this table.)
 
 **Editing is IDE-only**: the VS Code extension's *Edit Security Settings* command (which shells
 `messagefoundry security show|set`) is the sole authoring surface. The **web console is read-only** — the
@@ -1314,6 +1523,20 @@ step-by-step is in OFF-LOOPBACK-DEPLOYMENT.md
 
 ## Example
 
+A **complete, startable** `messagefoundry.toml` for a loopback PHI instance on a SQL Server store,
+run as `messagefoundry serve --config <dir> --env prod` (the active environment is required and has
+no default; `--env` is the CLI layer over `[ai].environment`, which is why it is not in the file).
+
+**Three of these blocks exist only because a shipped serve gate refuses without them** — they are not
+optional garnish. An earlier version of this example carried none of the three and would have hit
+`exit 2` three times over. The four gates a stock PHI instance meets, and what satisfies each:
+**keyless PHI** → `MEFOR_STORE_ENCRYPTION_KEY` in the environment; **open egress** → at least one
+*counted* `[egress]` list (see the [`[egress]`](#egress) ⚠️ — `allowed_smtp` alone does not count);
+**unbounded retention** → `[security].delete_message_bodies_after_days` **and**
+`[retention].dead_letter_days`; **no security-notification channel** → the `[alerts]` SMTP transport.
+`[logging]` and `[api]` here are illustrative, not gate-required. `backend = "sqlserver"` also needs
+the `sqlserver` extra + ODBC Driver 18 installed (see the note under [`[store]`](#store--message-store--db)).
+
 ```toml
 # messagefoundry.toml
 [store]
@@ -1323,6 +1546,8 @@ database = "MessageFoundry"
 auth = "sql"
 username = "mefor_service"
 encrypt = true
+# The at-rest key itself is env-only: MEFOR_STORE_ENCRYPTION_KEY (see the shell block below).
+# Without it a PHI instance — which is every built-in env name — refuses to start.
 
 [security]
 local_access_only = true                # loopback bind (ADR 0118; the bind host lives here, not [api])
@@ -1330,6 +1555,20 @@ delete_message_bodies_after_days = 30   # the PHI-body window (ADR 0118; NOT [re
 
 [api]
 port = 8765
+
+# REQUIRED on a PHI instance: with none of the six counted allow-lists set, serve exits 2.
+[egress]
+allowed_mllp = ["epic-adt.hospital.local:6661"]
+allowed_db   = ["sql02.hospital.local"]
+# Any transport left empty here now refuses every destination of its type — deny-by-default is
+# flipped ON for you the moment one counted list is present. Enumerate what you actually send to.
+
+# REQUIRED on a PHI instance with sign-in on: no out-of-band security-notification channel is an
+# exit 2 under the default [security].enforcement = enforce, on dev and staging as much as prod.
+[alerts]
+email_smtp_host = "smtp.hospital.local"
+email_from = "mefor@hospital.local"
+email_to   = ["oncall@hospital.local"]
 
 [logging]
 level = "info"
@@ -1346,12 +1585,14 @@ forward_tls_ca_file = "C:/mefor/siem-ca.pem"   # required for tls unless forward
 [retention]
 # The inbound-body window is [security].delete_message_bodies_after_days above — setting
 # messages_days here is REJECTED at load (ADR 0118). Only the plumbing keys stay in this section:
-dead_letter_days = 90   # null dead-letter bodies after 90 days
-vacuum_at = "03:30"     # daily off-peak VACUUM to reclaim space (SQLite only)
+dead_letter_days = 90   # REQUIRED: an unbounded dead-letter window is its own exit 2 under enforce
+# NOTE: vacuum_at / wal_checkpoint_seconds are SQLite-only and a documented NO-OP on this
+# backend = "sqlserver" store — space reclamation is a DBA operation there. Deliberately not set.
 ```
 ```bash
-# secret via env (never in the file)
+# secrets via env (never in the file)
 set MEFOR_STORE_PASSWORD=...
+set MEFOR_STORE_ENCRYPTION_KEY=...   # `messagefoundry gen-key` mints one; without it, exit 2
 ```
 
 ## Build order (incremental)

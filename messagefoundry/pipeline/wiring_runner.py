@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import functools
+import ipaddress
 import json
 import logging
 import time
@@ -38,6 +39,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
 from messagefoundry.config.fhir_lookup import (
@@ -70,6 +72,8 @@ from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
+    current_hop_posture,
+    is_loopback_hop_host,
 )
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -134,7 +138,7 @@ from messagefoundry.store import (
     Stage,
     StreamingAttachmentsUnsupported,
 )
-from messagefoundry.store.base import pool_over_provisioned_warning
+from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports import (
     DeliveryError,
@@ -144,7 +148,7 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
-from messagefoundry.transports.base import ConnectionEventSink
+from messagefoundry.transports.base import ConnectionEventSink, IntakeAuditSink, IntakeRateLimiter
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
@@ -158,6 +162,75 @@ log = logging.getLogger(__name__)
 # so a stable read-only share never churns the store.
 PROCESSED_FILE_LEDGER_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
+
+
+#: Peers whose successful authentication we remember, to exempt them from the GLOBAL failed-attempt
+#: arm (AC-19). Bounded so a churn of distinct source addresses cannot grow it without limit.
+_INTAKE_SUCCESS_KEEP_MAX = 10_000
+
+
+class _IntakeRateLimiter:
+    """Runner-side failed-attempt budget for an intake-authenticating source (ADR 0154 D6).
+
+    Two windows, deliberately:
+
+    * **per-peer** — bounds one address guessing a credential;
+    * **global** — bounds aggregate refusal volume, which matters because every refusal drives an
+      ``audit_log`` write that takes the store-wide lock.
+
+    **The global arm never refuses a peer that has already authenticated in this window** (AC-19).
+    ``SlidingWindowRateLimiter`` refuses on the global bucket *regardless of key*, so consulting it for
+    everyone would hand an attacker a denial-of-service against a legitimate partner: roughly one bad
+    request per second exhausts the shared budget, and the partner's valid message is then refused
+    ``429`` **pre-ingress**, where it is not even counted. That is exactly the silent-loss defect this
+    design exists to avoid, merely relocated from the per-peer arm to the global one.
+
+    Injected as a synchronous predicate, so ``transports/`` gains no ``auth/`` edge. In-process and
+    non-distributed: under HA only the leader binds (so it is effectively global), and under engine
+    sharding each shard counts separately, making the effective ceiling N x limit for N shards.
+    """
+
+    def __init__(self, *, per_peer: int, glob: int, window_seconds: float = 60.0) -> None:
+        self._window = window_seconds
+        self._per_peer = SlidingWindowRateLimiter(
+            per_key=per_peer, glob=0, window_seconds=window_seconds
+        )
+        self._global = (
+            SlidingWindowRateLimiter(per_key=0, glob=glob, window_seconds=window_seconds)
+            if glob
+            else None
+        )
+        self._succeeded: dict[str, float] = {}
+
+    def check(self, peer: str) -> bool:
+        # would_allow, never allow: consulting must not consume the budget, or a correctly
+        # authenticated partner's Nth request would be refused as though it had been guessing.
+        if not self._per_peer.would_allow(peer):
+            return False
+        if self._global is None or self._authenticated_recently(peer):
+            return True
+        return self._global.would_allow(peer)
+
+    def charge_failure(self, peer: str) -> None:
+        self._per_peer.allow(peer)
+        if self._global is not None:
+            self._global.allow(peer)
+
+    def note_success(self, peer: str) -> None:
+        now = time.monotonic()
+        if len(self._succeeded) >= _INTAKE_SUCCESS_KEEP_MAX:
+            cutoff = now - self._window
+            self._succeeded = {k: v for k, v in self._succeeded.items() if v > cutoff}
+        self._succeeded[peer] = now
+
+    def _authenticated_recently(self, peer: str) -> bool:
+        stamp = self._succeeded.get(peer)
+        if stamp is None:
+            return False
+        if time.monotonic() - stamp > self._window:
+            del self._succeeded[peer]
+            return False
+        return True
 
 
 class _StoreProcessedLedger:
@@ -1145,6 +1218,54 @@ class RegistryRunner:
 
         return _sink
 
+    def _intake_auth_enabled(self, ic: InboundConnection) -> bool:
+        return (
+            ic.spec.type is ConnectorType.HTTP
+            and str(ic.spec.settings.get("intake_auth") or "none") != "none"
+        )
+
+    def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
+        """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
+
+        ``None`` unless this inbound actually authenticates, so every other connection is
+        byte-identical. Unlike the ``connection_event`` sink this one **awaits** a store write: an
+        ``audit_log`` row is a hash chain and cannot be enqueued out of order. It is on the refusal
+        path only, never the accept path, so it cannot slow legitimate intake.
+
+        This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
+        column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
+        """
+        if not self._intake_auth_enabled(ic):
+            return None
+        # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
+        # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
+        # Guarded rather than assumed, so a store without the audit plane degrades to the log +
+        # connection_event channels instead of raising on every refusal.
+        if not hasattr(self.store, "record_audit"):
+            return None
+        audit_store = cast(AuditStore, self.store)
+        name = ic.name
+
+        async def _sink(action: str, client: str | None, detail: str | None) -> None:
+            try:
+                await audit_store.record_audit(
+                    action, channel_id=name, client=client, detail=detail
+                )
+            except Exception as exc:  # fail-soft: an audit failure must not drop an HTTP client
+                log.warning("intake auth audit write failed: %s", safe_exc(exc))
+
+        return _sink
+
+    def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        if not self._intake_auth_enabled(ic):
+            return None
+        per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
+        glob = int(ic.spec.settings.get("intake_auth_rate_limit_global") or 0)
+        if not per_peer and not glob:
+            return None
+        return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
+
     def _enqueue_connection_event(self, **fields: Any) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
         connection-event flood must never block a listener/delivery lane or grow memory unbounded."""
@@ -1956,6 +2077,11 @@ class RegistryRunner:
             allow_insecure_bind=self._allow_insecure_bind,
             posture=self._hop_posture,
         )
+        # ADR 0154 D7, immediately after its confidentiality sibling and deliberately separate from it:
+        # check_http_tls_exposure returns early whenever tls is truthy, which is exactly the case an
+        # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
+        # cleartext escape hatch does not get to waive authentication.
+        check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -1969,6 +2095,12 @@ class RegistryRunner:
         # sniffing poll source (RemoteFileSource) reads it to gate its HL7-header quarantine to hl7v2
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
+        # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
+        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
+        # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
+        source.on_intake_audit = self._make_intake_audit_sink(ic)
+        source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
@@ -5820,6 +5952,14 @@ def _build_check_connectors(
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
+        # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
+        # fire at `messagefoundry check`, so without this a config that refuses to start would pass
+        # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
+        # the ADR describes this arm as running "without a posture", but that is not true of the
+        # source — build_check_registry takes one and `messagefoundry check` passes the real derived
+        # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
+        # would leave this gate weaker at check time than every posture-keyed neighbour.
+        check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
         build_source(source_cfg)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a
@@ -6058,26 +6198,49 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
             )
 
 
-def _check_smart_token_url_egress(
+# Every settings key naming a SECOND egress host that the HTTP family POSTs **credentials** to — a
+# host distinct from the data ``url`` the caller's own gate already checks. Each one must ride the
+# same ``[egress].allowed_http`` allowlist or it is a fail-open credential-exfiltration hole: the
+# allowlist would gate the data host while the credential leaves for anywhere.
+#
+# ADD A KEY HERE when a new credential-bearing endpoint setting is introduced. That is the whole
+# maintenance contract — both call sites iterate this table, so a new key is gated on both arms at
+# once and cannot repeat the DELTA-04 drift (one arm gated, the other not).
+_CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
+    # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
+    ("smart_token_url", "SMART token endpoint"),
+    # ADR 0126 — the client-credentials grant POSTs ``client_id`` + ``client_secret`` here, either as
+    # form fields or as a Basic header (``transports/http_auth.py`` ``_fetch_token``). Ungated until
+    # 2026-07-31: the scheme was constrained to http(s) and nothing else, so a crafted
+    # ``oauth2_token_url`` exfiltrated the client credentials to any host while ``[egress]
+    # .allowed_http`` gated only the data URL. Found re-scoring ASVS 14.2.3.
+    ("oauth2_token_url", "OAuth2 token endpoint"),
+)
+
+
+def _check_credential_token_url_egress(
     label: str, settings: Mapping[str, Any], allowed_http: list[str]
 ) -> None:
-    """Gate a SMART Backend Services token endpoint (ADR 0024): the connector POSTs the signed
-    ``client_assertion`` there, so a crafted ``smart_token_url`` pointing at an un-allowlisted host
-    would exfiltrate the assertion (a fail-open hole). Shared by the FHIR **outbound** and the
-    **FhirLookup** read arm so the two never drift out of lockstep — DELTA-04 was exactly that drift
-    (the read arm gated only ``url``). Only REST/FHIR/FhirLookup carry the key; an unset value is a
-    no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
-    token_url = str(settings.get("smart_token_url", ""))
-    if token_url and not _http_egress_allowed(token_url, allowed_http):
-        host = urllib.parse.urlsplit(token_url).hostname or ""
-        log.warning(
-            "egress denied: %s SMART token endpoint host %r not in [egress].allowed_http",
-            label,
-            host,
-        )
-        raise WiringError(
-            f"{label}: SMART token endpoint host {host!r} is not in the [egress].allowed_http allowlist"
-        )
+    """Gate every credential-bearing token endpoint on an HTTP-family connection against
+    ``[egress].allowed_http`` — see :data:`_CREDENTIAL_EGRESS_URL_KEYS` for the keys and why each one
+    carries a secret. A crafted token URL pointing at an un-allowlisted host would exfiltrate the
+    credential (a fail-open hole), so this is checked at config load/reload/start alongside the data
+    host. Shared by the FHIR/REST **outbound** and the **FhirLookup** read arm so the two never drift
+    out of lockstep — DELTA-04 was exactly that drift (the read arm gated only ``url``). An unset key
+    is a no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
+    for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
+        token_url = str(settings.get(key, "") or "")
+        if token_url and not _http_egress_allowed(token_url, allowed_http):
+            host = urllib.parse.urlsplit(token_url).hostname or ""
+            log.warning(
+                "egress denied: %s %s host %r not in [egress].allowed_http",
+                label,
+                what,
+                host,
+            )
+            raise WiringError(
+                f"{label}: {what} host {host!r} is not in the [egress].allowed_http allowlist"
+            )
 
 
 def check_fhir_lookup_allowed(
@@ -6106,10 +6269,11 @@ def check_fhir_lookup_allowed(
             raise WiringError(
                 f"FhirLookup {name!r}: host {host!r} is not in the [egress].allowed_http allowlist"
             )
-        # The SMART token endpoint (ADR 0024) is a SECOND egress host on this read arm — gate it with
-        # the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
-        # with_smart_backend()) exfiltrates the signed client_assertion to an unlisted host (DELTA-04).
-        _check_smart_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
+        # Every credential-bearing token endpoint is a SECOND egress host on this read arm — gate
+        # each with the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
+        # with_smart_backend()) exfiltrates the signed client_assertion, and a crafted
+        # oauth2_token_url exfiltrates client_id + client_secret, to an unlisted host (DELTA-04).
+        _check_credential_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
@@ -6208,6 +6372,94 @@ def check_http_tls_exposure(
         "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
         "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
+
+
+#: Minimum prefix length an entry of ``source_ip_allowlist`` must carry before it counts as an
+#: effective peer control (ADR 0154 D7). Generous on purpose — ``/8`` admits ``10.0.0.0/8``, a
+#: legitimate private scope — but it excludes ``0.0.0.0/0`` and ``::/0``, which allow-list the entire
+#: internet while reading, in a config file, exactly like a restriction.
+_INTAKE_ALLOWLIST_MIN_PREFIX_V4 = 8
+_INTAKE_ALLOWLIST_MIN_PREFIX_V6 = 32
+
+
+def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
+    """Whether this HTTP listener actually requires a peer to be someone in particular.
+
+    **Strength-based, not presence-based.** Each of the obvious presence tests has a trivially
+    worthless satisfying instance: ``source_ip_allowlist = ["0.0.0.0/0"]`` parses fine and restricts
+    nobody, and ``tls`` + ``tls_ca_file`` means *"any certificate this CA ever signed"* — no subject
+    binding at all. A gate satisfied by controls that authenticate nobody is theatre, so a
+    configuration that fails this test is treated exactly as one with no control, and is not given a
+    softer landing for having a control that does not work.
+    """
+    mode = str(settings.get("intake_auth") or "none")
+    if mode in ("api_key", "bearer"):
+        return bool(settings.get("intake_api_key"))
+    if mode == "mtls_subject":
+        # The subject list is what tls_ca_file alone does not give you.
+        return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
+
+    allowlist = settings.get("source_ip_allowlist")
+    if not allowlist:
+        return False
+    for entry in allowlist:
+        try:
+            net = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            return False  # unparseable: cannot be shown to restrict anyone, so it does not count
+        floor = (
+            _INTAKE_ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else _INTAKE_ALLOWLIST_MIN_PREFIX_V6
+        )
+        if net.prefixlen < floor:
+            return False  # ONE too-wide entry defeats the whole list
+    return True
+
+
+def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:
+    """Peer-control gate (ADR 0154 D7): refuse an **off-loopback HTTP listener with no effective peer
+    control** — no sufficiently narrow ``source_ip_allowlist``, no ``intake_auth``, and no
+    ``mtls_subject`` binding. Refuses under an enforcing PHI posture, warns otherwise.
+
+    **A separate function, never folded into :func:`check_http_tls_exposure`.** That gate returns early
+    the moment ``tls`` is truthy — precisely the case an authentication requirement most needs to
+    cover. ``Http(port=..., tls=True, tls_cert_file=...)`` on ``0.0.0.0`` therefore binds a PHI intake
+    socket today with no peer identity requirement at all, and passes every gate.
+
+    **The composition rule, stated once: TLS is confidentiality; intake auth is authentication.**
+    Enabling auth is never an argument for relaxing the exposed gate, and TLS being on is never a
+    reason to skip auth. ``check_http_tls_exposure`` is unchanged and unweakened by this.
+
+    **It ignores ``allow_insecure_bind`` entirely** — note the deliberate signature divergence from its
+    four siblings. Handing a *cleartext* escape hatch the power to also waive *authentication* is a
+    category error, so this gate is posture-keyed only. ``posture is None`` (a direct or embedding
+    call) warns rather than refusing: a new refusal must not start firing for un-postured callers.
+
+    A raise is a :class:`WiringError`, so ADR 0031 degrades that one connection rather than the engine.
+    Loopback binds start byte-identical (ADR 0148 GIVEN 1).
+    """
+    if source.type is not ConnectorType.HTTP:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    # CIDR-aware, and it treats an empty host as loopback — which matches HttpSource's own
+    # `s.get("host") or "127.0.0.1"` fallback. Reused rather than minting another _LOOPBACK_HOSTS
+    # frozenset; the tree already carries five same-named copies across two distinct contents.
+    if is_loopback_hop_host(host):
+        return
+    if _has_effective_peer_control(source.settings):
+        return
+
+    detail = (
+        f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
+        "control: anyone who can reach the socket can submit a message. Set intake_auth "
+        "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
+        "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
+        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
+        "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
+        "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
+    )
+    if posture is not None and posture.enforcing and posture.is_phi:
+        raise WiringError(detail)
+    log.warning("%s (warned, not refused: this instance is not an enforcing PHI posture)", detail)
 
 
 def check_dimse_tls_exposure(
@@ -6401,10 +6653,13 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: {dest.type.value} host {host!r} is not in the "
                 "[egress].allowed_http allowlist"
             )
-        # ADR 0024: the SMART Backend Services token endpoint is a SECOND egress host — the connector
-        # POSTs the signed client_assertion there — so gate it with the same allowlist. Shared helper,
-        # so the FhirLookup read arm in check_fhir_lookup_allowed stays in lockstep (DELTA-04).
-        _check_smart_token_url_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_http)
+        # Credential-bearing token endpoints are SECOND egress hosts — the connector POSTs the signed
+        # client_assertion (ADR 0024) or client_id + client_secret (ADR 0126) there — so gate each
+        # with the same allowlist. Shared helper, so the FhirLookup read arm in
+        # check_fhir_lookup_allowed stays in lockstep (DELTA-04).
+        _check_credential_token_url_egress(
+            f"outbound {dest.name!r}", dest.settings, egress.allowed_http
+        )
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(dest.settings.get("server", ""))
         port = dest.settings.get("port", 1433)

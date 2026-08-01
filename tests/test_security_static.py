@@ -1015,6 +1015,9 @@ _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),
+    # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
+    # identities it provisions into a temp-directory store it destroys with the run.
+    "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 
 

@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.1 |
-| **Date** | July 13, 2026 |
+| **Version** | 2.2 |
+| **Date** | July 30, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -375,7 +375,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 |---|---|---|---|
 | V1 | Encoding and Sanitization | Yes | HL7 input validation, output encoding, parameterized SQL |
 | V2 | Validation and Business Logic | Yes | HL7 structural/content validation; routing/business-rule checks |
-| V3 | Web Frontend Security | **No** | No browser-delivered UI (PySide6 desktop + APIs); documented exclusion. Re-scope if a web/admin UI is added |
+| V3 | Web Frontend Security | Yes | **Core surface** — the browser operator console at `/ui`, the sole operator UI since the PySide6 desktop client was retired (BACKLOG #103, 2026-07-13). Security headers, CSP, COOP/CORP and clickjacking defenses apply |
 | V4 | API and Web Service | Yes | **Core surface** — the localhost engine API: authn/authz per endpoint, payload size limits, WS-Origin checks. REST/SOAP outbound destinations plus a **generic inbound HTTP listener** (ADR 0023); **XXE/DTD defenses apply when inbound XML / SOAP-IN body parsing is added** — no inbound XML attack surface yet |
 | V5 | File Handling | Yes | File-handler interface: path confinement, content validation, atomic write-then-rename, malware scan, encryption at rest |
 | V6 | Authentication | Yes | Per §7.4; align to NIST SP 800-63 |
@@ -391,7 +391,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 | V16 | Security Logging and Error Handling | Yes | Tamper-resistant audit log; fail-closed errors; no PHI/secrets in logs |
 | V17 | WebRTC | **No** | Not applicable — no WebRTC; documented exclusion |
 
-*In scope: 12 chapters active today (V1, V2, V4–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusions: V3, V17.*
+*In scope: 14 chapters active today (V1–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusion: V17.*
 
 ### A.4 Interface authentication mechanisms
 
@@ -462,8 +462,11 @@ compensating control (the standard requires exclusions/deviations be documented,
   [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md), the companion standard
   that owns and expands this deviation.
 - **Independent ASVS-L3 review & DAST (§6.3 / §6.4).** Not yet performed; a **dated risk acceptance**
-  is in force while pre-1.0 and loopback-only, and the independent engagement is **required before any
-  off-loopback/production exposure** — see `security/RELEASE-GATE.md`.
+  is in force pre-1.0. An independent engagement is planned — it is a **$25,000–$50,000** commitment
+  that the project intends to fund through a grant or sponsorship rather than licence revenue.
+  MessageFoundry is **self-hosted**, so the decision to deploy it beyond loopback, and the assessment
+  that justifies that decision, rest with the **implementing organization**: this standard states what
+  has and has not been independently verified, and does not gate your deployment on it.
 - **Federated operator SSO (§7.4).** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
   cert config) and **native TOTP MFA for local accounts is built** (ADR 0002 WP-14); the remaining
   deferred operator-auth item is **federated SSO (OIDC/SAML via Entra)**, held safe by the fail-closed
@@ -543,5 +546,6 @@ PW.8 (test executable code) is the home of `messagefoundry check` (validate + dr
 
 | Version | Date | Change |
 |---|---|---|
+| 2.2 | July 30, 2026 | **Independent-review deviation reframed.** The independent ASVS-L3 review & DAST is no longer stated as a precondition for off-loopback/production exposure. MessageFoundry is self-hosted, so the deployment decision — and the assessment supporting it — belong to the implementing organization; this standard records what has and has not been independently verified rather than gating deployment on it. The engagement remains planned, at an estimated $25,000–$50,000, intended to be grant- or sponsor-funded. Also drops a dangling citation to `security/RELEASE-GATE.md`, which is not present in this repository. No change to the SSDF / ASVS / HIPAA mappings. |
 | 2.1 | July 29, 2026 | **Code-quality companion added.** Cross-linked the new [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (evidence-based anti-slop rubric, ISO/IEC 25010): a companion-standards pointer in §1 and a test-*quality* + anti-metric note at PW.8. No change to the SSDF / ASVS / HIPAA mappings or Appendix A. |
 | 2.0 | June 24, 2026 | Restructured baseline around SSDF, spec-driven development, NIST SP 800-115 testing tiers and SP 800-66 Rev. 2 safeguards. Content carried forward unchanged at this baseline. The full prior changelog — MEFOR-specific drafts → genericization (project-agnostic, with an Appendix A applicability profile) → OWASP ASVS 5.0 Level 3 re-target → NIST SP 800-53 removal → §5 Spec-Driven Development addition and the §5–§9 → §6–§10 renumbering — is preserved in git history. |
