@@ -375,7 +375,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 |---|---|---|---|
 | V1 | Encoding and Sanitization | Yes | HL7 input validation, output encoding, parameterized SQL |
 | V2 | Validation and Business Logic | Yes | HL7 structural/content validation; routing/business-rule checks |
-| V3 | Web Frontend Security | **No** | No browser-delivered UI (PySide6 desktop + APIs); documented exclusion. Re-scope if a web/admin UI is added |
+| V3 | Web Frontend Security | Yes | **In scope since the console became browser-delivered.** The exclusion here rested on "no browser-delivered UI (PySide6 desktop + APIs)"; that premise died when BACKLOG #103 retired the PySide6 desktop console (2026-07-13) and made the browser web console at `/ui` the sole operator UI, which ADR 0143 then defaulted on (2026-07-21). The scoring lineage has scored V3 in full since the 2026-07-22 assessment — the prose simply never caught up. Covers the console's CSP/nonce policy, cookie attributes, COOP/CORP, referrer policy and same-origin assertions |
 | V4 | API and Web Service | Yes | **Core surface** — the localhost engine API: authn/authz per endpoint, payload size limits, WS-Origin checks. REST/SOAP outbound destinations plus a **generic inbound HTTP listener** (ADR 0023); **XXE/DTD defenses apply when inbound XML / SOAP-IN body parsing is added** — no inbound XML attack surface yet |
 | V5 | File Handling | Yes | File-handler interface: path confinement, content validation, atomic write-then-rename, malware scan, encryption at rest |
 | V6 | Authentication | Yes | Per §7.4; align to NIST SP 800-63 |
@@ -391,7 +391,12 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 | V16 | Security Logging and Error Handling | Yes | Tamper-resistant audit log; fail-closed errors; no PHI/secrets in logs |
 | V17 | WebRTC | **No** | Not applicable — no WebRTC; documented exclusion |
 
-*In scope: 12 chapters active today (V1, V2, V4–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusions: V3, V17.*
+*In scope: 13 chapters active today (V1–V2, V3, V4–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. **Documented exclusion: V17 only** — V3 was excluded while the console was a PySide6 desktop app and came into scope when the browser console replaced it (see the V3 row above).*
+
+> **This roll-up and the V3 row above must move together.** They were inconsistent once already: the
+> table said V3 was excluded on a premise retired in July 2026, while the scoring lineage had been
+> scoring V3 in full since the 2026-07-22 assessment. If you change one, change the other in the same
+> commit.
 
 ### A.4 Interface authentication mechanisms
 
