@@ -375,7 +375,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 |---|---|---|---|
 | V1 | Encoding and Sanitization | Yes | HL7 input validation, output encoding, parameterized SQL |
 | V2 | Validation and Business Logic | Yes | HL7 structural/content validation; routing/business-rule checks |
-| V3 | Web Frontend Security | **No** | No browser-delivered UI (PySide6 desktop + APIs); documented exclusion. Re-scope if a web/admin UI is added |
+| V3 | Web Frontend Security | Yes | **Core surface** — the browser operator console at `/ui`, the sole operator UI since the PySide6 desktop client was retired (BACKLOG #103, 2026-07-13). Security headers, CSP, COOP/CORP and clickjacking defenses apply |
 | V4 | API and Web Service | Yes | **Core surface** — the localhost engine API: authn/authz per endpoint, payload size limits, WS-Origin checks. REST/SOAP outbound destinations plus a **generic inbound HTTP listener** (ADR 0023); **XXE/DTD defenses apply when inbound XML / SOAP-IN body parsing is added** — no inbound XML attack surface yet |
 | V5 | File Handling | Yes | File-handler interface: path confinement, content validation, atomic write-then-rename, malware scan, encryption at rest |
 | V6 | Authentication | Yes | Per §7.4; align to NIST SP 800-63 |
@@ -391,7 +391,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 | V16 | Security Logging and Error Handling | Yes | Tamper-resistant audit log; fail-closed errors; no PHI/secrets in logs |
 | V17 | WebRTC | **No** | Not applicable — no WebRTC; documented exclusion |
 
-*In scope: 12 chapters active today (V1, V2, V4–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusions: V3, V17.*
+*In scope: 13 chapters active today (V1–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusion: V17.*
 
 ### A.4 Interface authentication mechanisms
 
