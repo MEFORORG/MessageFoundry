@@ -96,6 +96,15 @@ Frequently forgotten in discussions of "the gate", but it is the same problem cl
 Both use exclusive-create because a read-modify-write on a shared list silently lost 4 of 8 concurrent
 writes when measured.
 
+- **[`scripts/hooks/announce-session.ps1`](../scripts/hooks/announce-session.ps1)** — a
+  `UserPromptSubmit` hook that closes the **push** direction of D4. Every control above is pull-based or
+  commit-time: the peers of a new session learn nothing until someone trips a gate or writes a commit
+  subject, which is too late for two sessions building the same *thing* in different files. This one
+  hands the model its live peer roster plus the id-resolution rule at the first prompt that has intent
+  to report, and asks it to introduce itself. It cannot send anything by itself — hooks cannot call MCP
+  — so it is an instruction, and whether a message was actually delivered is recorded by the model in
+  `sent/<key>.tsv`, not by the hook. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
+
 ### Recovery and lifecycle
 
 `rescue.ps1` (move dirty primary work into a worktree), `restore-primary.ps1` (re-attach a detached
@@ -123,6 +132,9 @@ reading the emitted decision — not by reading source alone.
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
 | `session-context.ps1` banner | project | LIVE where the branch carries the file |
+| Announce-on-join (`announce-session.ps1`) | user | **NEW** — the only **push** control; asks, cannot send, and every decision leaves a receipt |
+| Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
+| Announce missing-script notice | user | **NEW** — the one surface that still reports when the script itself fails to resolve |
 | Claim / alloc / ledger gates | git hooks | LIVE |
 | `new.ps1` / `remove.ps1` / `prune-merged.ps1` | manual | LIVE, **sibling-layout only** |
 | `tests/test_worktree_gate*.py`, `test_install_gate_wiring.py` | CI + local | Was **85 green, and blind** — every one bound the repo copy; nothing read the installed copy or any live `settings.json`. Now 91 across six files, plus the local-only parity check below |
