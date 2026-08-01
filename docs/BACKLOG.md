@@ -7304,17 +7304,25 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 
 **What:** the `test (windows-2025, py3.14)` leg cannot service the load smoke's offered rate. `tests/test_load_runner.py` offers **60 msg/s for 1.5s** (90 messages, `pool_size = 4`) at a listener whose ingress is **strictly serial per connection** — `mllp.py:1433` is `read chunk → for each frame → await handler → next`, where the handler is the durable ingress commit the ACK depends on. Total ingress throughput is therefore `pool_size ÷ per-message-commit-latency`. On windows-2025 that product is under 60/s, so roughly half the offered run is never ingested inside the measurement window and strands unacknowledged at teardown.
 
-**Measured (2026-08-01).** The same signature reproduces on a healthy developer box purely by raising the offered rate — same profile, same code, same `run_load` path:
+**Measured (2026-08-01), and one measurement RETRACTED — read this before quoting a number.**
 
-| offered | sent | acked | stranded | engine_read |
-|---|---|---|---|---|
-| 60/s | 90 | 90 | **0 (0.0%)** | 90 |
-| 300/s | 450 | 450 | **0 (0.0%)** | 450 |
-| **600/s** | 900 | 444 | **456 (50.7%)** | **452** |
+The first write-up of this item claimed the CI signature reproduces on a healthy developer box purely by raising the offered rate, on the strength of a single 600/s run that stranded **456 of 900 (50.7%)** — a near-exact match for windows-2025's 51.1%. **Four repeats of that same command on that same box then stranded 0, every time.** The outlier was taken while an unrelated test suite was running concurrently.
 
-windows-2025 observed at **60/s**: sent 90, acked 44, stranded 46 (**51.1%**), `engine_read` 52 — the 600/s row, at one tenth the offered rate. **windows-2025 hits at 60/s what a healthy box hits at 600/s.**
+So that reproduction is **withdrawn**. Stranding on a developer box is a **contention** artifact, not a clean function of offered rate, and n=1 is not a measurement — which is exactly the failure mode this item is about, committed while documenting it.
 
-**Why it matters even though nothing is lost:** the same numbers recurred **byte-identically** on two different commits (`9b03057f`, `56f7d240` — 90/44/46/52 both times), so this is deterministic queueing, not runner weather. It will recur on any profile whose offered rate approaches the leg's service rate, and it is invisible to a correctness check because delivery is complete (104 written, 104 received, backlog drained in 4.7s of a 30s bound).
+What the repeats support:
+
+| offered | runs | stranded | engine_read |
+|---|---|---|---|
+| 60/s | 1 | **0 (0.0%)** | 90 of 90 |
+| 300/s | 1 | **0 (0.0%)** | 450 of 450 |
+| 600/s | 5 | **0 in 4 runs**; 50.7% in the 1 contended run | ~899 of ~899 when unloaded |
+
+**The surviving claim is weaker and still worth acting on:** an unloaded box strands **zero** at up to 10× the CI profile's offered rate, while windows-2025 stranded ~51% at the profile's own **60/s** — twice, on `9b03057f` and `56f7d240`, with **byte-identical** counters (90 sent / 44 acked / 46 stranded / 52 read). Byte-identical repetition is what rules out weather *on that leg*; it is not evidence about a developer box, and the earlier entry conflated the two.
+
+**Why it matters even though nothing is lost:** it recurs, it will recur on any profile whose offered rate approaches that leg's service rate, and it is invisible to a correctness check because delivery is complete every time (104 written, 104 received, backlog drained in 4.7s of a 30s bound).
+
+**Tooling:** `harness/load/ingress_probe.py` + `.github/workflows/ingress-rate-probe.yml` (dispatch-only) now sweep the rate across ubuntu / windows-2022 / windows-2025 with `--repeat`, so the next person reads a distribution instead of a lucky row.
 
 **Correcting the record:** `harness/load/report.py` previously justified the stranding budget with *"observed teardown stranding is ~16%, so half is ~3x the worst seen."* Both halves are wrong. **Healthy stranding at this rate is 0%**, not 16% — the 16% figure was itself measured on a partially-saturated run — and "half" was ~1.0x the worst seen by the time it red `main`, not 3x.
 
