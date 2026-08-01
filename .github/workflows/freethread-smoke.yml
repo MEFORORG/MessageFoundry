@@ -74,6 +74,13 @@ jobs:
       # free-threaded-relevant compiled surface: pydantic-core, cryptography, and the argon2-cffi + cffi
       # chain. --prerelease handling: pip resolves the cp314t wheels; the cffi 2.0 chain may need a
       # prerelease allowance depending on the index state at run time.
+      #
+      # DELIBERATELY UNCONSTRAINED — the ONE install in any workflow without `--constraint
+      # constraints.lock`. The lock records what resolved for the GIL build; pinning those versions here
+      # can leave a dependency with no cp314t wheel at that exact version and send pip to a source
+      # build, which either fails or quietly produces a differently-built extension. Either way the
+      # canary stops measuring free-threading and starts measuring the lock. It soft-fails
+      # (continue-on-error) precisely because this leg is allowed to be ahead of the pinned world.
       - name: Install the core engine (dev extra; no compiled-heavy extras)
         id: install
         if: steps.setup.outcome == 'success'
