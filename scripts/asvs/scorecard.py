@@ -305,6 +305,12 @@ def _sort_key(cell_id: str) -> tuple[int, ...]:
         return (9_999,)
 
 
+def load_meta(path: Path) -> dict[str, str]:
+    """The ``[scorecard]`` table: version pin, corpus digest, and the assessment anchor commit."""
+    data = tomllib.loads(path.read_text(encoding="utf-8"))
+    return {k: str(v) for k, v in data.get("scorecard", {}).items()}
+
+
 def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
     """The scorecard must declare which ASVS version it scores, and pin the corpus by digest.
 
@@ -421,7 +427,10 @@ def main(argv: list[str] | None = None) -> int:
         "--root", type=Path, default=Path.cwd(), help="tree the evidence anchors point into"
     )
     ap.add_argument("--render", type=Path, help="write the generated CURRENT.md here")
-    ap.add_argument("--anchor-sha", default="unknown")
+    # NO --anchor-sha injected by CI. The anchor is the commit the EVIDENCE was read on — a property
+    # of the assessment, recorded in [scorecard].anchor_commit. Passing ${{ github.sha }} made the
+    # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
+    # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
 
     try:
@@ -442,7 +451,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  FAIL {p}", file=sys.stderr)
 
     if args.render and findings.ok:
-        args.render.write_text(render_current(cells, anchor_sha=args.anchor_sha), encoding="utf-8")
+        anchor = load_meta(args.scorecard).get("anchor_commit", "unrecorded")
+        args.render.write_text(render_current(cells, anchor_sha=anchor), encoding="utf-8")
         print(f"rendered {args.render}")
 
     return 0 if findings.ok else 1
