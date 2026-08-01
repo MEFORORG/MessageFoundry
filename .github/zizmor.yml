@@ -10,7 +10,8 @@ rules:
       # A CLA assistant REQUIRES pull_request_target to record signatures + comment on fork PRs. This
       # workflow never checks out untrusted PR code, pins the third-party action by SHA, and gates on the
       # immutable comment body / event name — so the usual pull_request_target risk (running attacker
-      # code with a write token) does not apply. See the SECURITY note in cla.yml.
+      # code with a write token) does not apply. The action is pinned at ca4a40a7d100 (v2.6.1); its
+      # archived-upstream status is adjudicated under archived-uses below.
       - cla.yml
       # A notice that a SCHEDULED run failed can only be written by something observing that run AFTER
       # it finishes — no other trigger sees another workflow's conclusion, so `workflow_run` is not a
@@ -22,7 +23,9 @@ rules:
       # tests/test_nightly_notice.py rather than merely asserted here:
       #   * NO checkout, and no third-party actions at all — `test_it_pulls_in_no_third_party_actions`
       #     fails if a `uses:` ever appears. Nothing from the triggering ref is fetched, let alone run.
-      #     That is a STRONGER claim than cla.yml's above, which does check out.
+      #     That is a STRONGER claim than cla.yml's above: cla.yml runs a third-party action with a
+      #     write token — SHA-pinned, so it cannot change under us, but still third-party code —
+      #     whereas this job runs no third-party code at all.
       #   * It only reacts to `workflow_run.event == 'schedule'`
       #     (`test_it_only_reacts_to_scheduled_runs`), so a PR — including a fork PR — has no path to
       #     the job at all.
@@ -36,16 +39,15 @@ rules:
   artipacked:
     ignore:
       # artipacked flags a checkout that persists the token's git credential — a risk only if that
-      # credential can leak into an uploaded artifact. The jobs below do not push and never upload the
-      # repo/.git tree, so the persisted credential is inert noise here.
+      # credential can leak into an uploaded artifact. The jobs below never upload the repo/.git tree,
+      # so the persisted credential is inert noise here.
       #
-      # NOT suppressed (fixed at the source instead): release.yml sets persist-credentials: false on both
-      # checkouts because it DOES upload build artifacts. dependabot-lock-resync.yml persists a
+      # NOT suppressed (fixed at the source instead): release.yml's checkouts set persist-credentials:
+      # false, because it DOES upload build artifacts. dependabot-lock-resync.yml persists a
       # narrowly-scoped App token ON PURPOSE to push the resynced locks (documented inline) and is listed
       # here for that reason.
       - benchmark.yml
       - ci.yml
       - dependabot-lock-resync.yml
-      - release-sync-check.yml
       - security.yml
       - vuln-metrics.yml
