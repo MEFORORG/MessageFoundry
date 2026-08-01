@@ -63,6 +63,8 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "WebAuthn credentials": "COSE PUBLIC keys supplied by the authenticator; the engine holds no "
     "private half and the row already says they are verification material, not a secret",
     "Config fingerprint": "a keyless content hash for change attribution",
+    "ASVS corpus pin": "a keyless content hash over a build input (the OWASP ASVS corpus file), "
+    "not a key, a secret, or a message authenticator",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "AD transport": "a TLS hop whose key material is the OS/directory trust store, not engine-held",
