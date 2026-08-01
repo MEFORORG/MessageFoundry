@@ -132,7 +132,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneResultKind,
     StageDispatcher,
 )
-from messagefoundry.pipeline.sync_reply import SyncReplyResolverImpl
+from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
@@ -743,6 +743,8 @@ class RegistryRunner:
         #: the right scope. It carries no information — every signal is a latency hint and the waiter
         #: re-reads the store — so a shard that never sees a signal is merely slower, never wrong.
         self._reply_rendezvous = ReplyRendezvous()
+        #: Per-inbound sync-reply counters, exposed via sync_reply_metrics() (ADR 0154 D8).
+        self._sync_reply_metrics: dict[str, SyncReplyMetrics] = {}
         # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
@@ -1295,13 +1297,26 @@ class RegistryRunner:
             ),
         )
         settings = ic.spec.settings
+        metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
         return SyncReplyResolverImpl(
             self.store,
             self._reply_rendezvous,
             destination=str(settings["reply_from"]),
             timeout=float(settings.get("reply_timeout") or 30.0),
             content_type=str(settings.get("reply_content_type") or "passthrough"),
+            on_timeout=str(settings.get("reply_on_timeout") or "504"),
+            metrics=metrics,
         )
+
+    def sync_reply_metrics(self) -> dict[str, SyncReplyMetrics]:
+        """Per-inbound synchronous-reply counters, keyed by connection name (ADR 0154 D8).
+
+        The PUBLIC accessor the metrics exporter reads. api/metrics.py builds every family per scrape
+        from engine.store alone and has no view of the runner, while transports/ may not import api/
+        (AC-17) — so the counters live with the runner that owns the resolvers, and the exporter pulls
+        them through here rather than reaching into a private attribute.
+        """
+        return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""

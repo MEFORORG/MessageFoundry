@@ -15,7 +15,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
-from messagefoundry.pipeline.sync_reply import SyncReplyResolverImpl, poll_period
+from messagefoundry.pipeline.sync_reply import (
+    SyncReplyMetrics,
+    SyncReplyResolverImpl,
+    poll_period,
+)
 from messagefoundry.store.store import MessageStatus, ReplyWaitState
 from messagefoundry.transports.base import ReplyOutcome
 
@@ -69,6 +73,7 @@ def _resolver(store: Any, **kw: Any) -> SyncReplyResolverImpl:
         destination=DEST,
         timeout=kw.pop("timeout", 2.0),
         content_type=kw.pop("content_type", "passthrough"),
+        metrics=kw.pop("metrics", None),
     )
 
 
@@ -219,3 +224,113 @@ def test_the_poll_period_widens_with_load() -> None:
     assert poll_period(1) == poll_period(8)  # light load: the floor
     assert poll_period(64) > poll_period(8)  # heavier: backs off
     assert poll_period(10_000) <= 0.25  # ... but bounded, so latency stays predictable
+
+
+# --- AC-18: observability ------------------------------------------------------------------------
+
+
+class _RecordingStore(_Store):
+    def __init__(self, *a: Any, **kw: Any) -> None:
+        super().__init__(*a, **kw)
+        self.events: list[tuple[str, str, str | None, str | None]] = []
+        self.event_error: Exception | None = None
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        if self.event_error is not None:
+            raise self.event_error
+        self.events.append((message_id, event, destination, detail))
+
+
+async def test_a_returned_reply_records_reply_returned_without_any_body() -> None:
+    store = _RecordingStore([_flowing(seq=1)], [_Row()])
+    metrics = SyncReplyMetrics("IB_HTTP")
+    await _resolver(store, metrics=metrics)("m1")
+
+    assert len(store.events) == 1
+    message_id, event, destination, detail = store.events[0]
+    assert (message_id, event, destination) == ("m1", "reply_returned", DEST)
+    assert "seq=1" in detail and "outcome=reply" in detail and "waited_ms=" in detail
+    # The PHI property: names, counts and timings only — never a fragment of the partner's body.
+    for leak in ("mrn", "100", BODY):
+        assert leak not in detail
+
+    assert metrics.totals == {"reply": 1}
+
+
+async def test_rejected_and_empty_also_count_as_a_reply_returned() -> None:
+    # The partner answered; a negative or deliberately blank answer is still the thing the caller
+    # was waiting for, so it belongs in the same row rather than looking like nothing happened.
+    for outcome, row in (
+        ("rejected", _Row(outcome="rejected")),
+        ("no_reply", _Row(outcome="no_reply", body="")),
+    ):
+        store = _RecordingStore([_flowing(seq=1)], [row])
+        await _resolver(store)("m1")
+        assert [e[1] for e in store.events] == ["reply_returned"], outcome
+
+
+async def test_a_timeout_records_reply_timeout_with_its_fallback() -> None:
+    store = _RecordingStore([_flowing()])
+    await _resolver(store, timeout=0.15)("m1")
+
+    assert len(store.events) == 1
+    _, event, destination, detail = store.events[0]
+    assert (event, destination) == ("reply_timeout", DEST)
+    assert "fallback=504" in detail, "an operator reading this needs to know what the caller got"
+    assert "waited_ms=" in detail
+
+
+async def test_outcomes_with_their_own_disposition_trail_mint_no_second_row() -> None:
+    # A dead row, an UNROUTED message and a degraded read each already leave their own record.
+    # Duplicating them here would make the timeline read as two events where one thing happened.
+    for states in (
+        _flowing(row_states=("dead",)),
+        _flowing(status=MessageStatus.UNROUTED.value, row_states=()),
+    ):
+        store = _RecordingStore([states])
+        await _resolver(store, timeout=0.2)("m1")
+        assert store.events == []
+
+    store = _RecordingStore([RuntimeError("db gone")])
+    await _resolver(store)("m1")
+    assert store.events == []
+
+
+async def test_observability_failure_never_costs_the_caller_their_reply() -> None:
+    # The wait has already resolved by this point, so losing a diagnostic row is strictly better
+    # than turning a perfectly good partner reply into a 500.
+    store = _RecordingStore([_flowing(seq=1)], [_Row()])
+    store.event_error = RuntimeError("message_events write failed")
+
+    reply = await _resolver(store)("m1")
+    assert reply.outcome is ReplyOutcome.REPLY
+    assert reply.body == BODY
+
+
+async def test_the_metrics_separate_degraded_from_timeout() -> None:
+    # rate(timeout)/rate(total) IS the proxy API's error budget, so our own failures must not be
+    # counted as the partner failing to answer.
+    metrics = SyncReplyMetrics("IB_HTTP")
+    await _resolver(_RecordingStore([RuntimeError("x")]), metrics=metrics)("m1")
+    await _resolver(_RecordingStore([_flowing()]), metrics=metrics, timeout=0.1)("m2")
+
+    assert metrics.totals == {"degraded": 1, "timeout": 1}
+    assert metrics.wait_count == 2
+    assert metrics.mean_wait_seconds > 0
+
+
+def test_the_metric_labels_stay_inside_the_closed_allowlist() -> None:
+    # api/metrics.py states a CLOSED label allowlist as a PHI contract and a test asserts it. The
+    # outcome enum is a fixed non-PHI constant set, so it rides `status` rather than widening it.
+    from tests.test_metrics_exporter import ALLOWED_LABELS
+
+    assert "status" in ALLOWED_LABELS
+    assert "outcome" not in ALLOWED_LABELS, "the allowlist was widened — re-check the PHI contract"

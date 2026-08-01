@@ -56,10 +56,61 @@ def poll_period(waiters: int) -> float:
     return min(scaled, _POLL_CEILING_SECONDS)
 
 
+#: Outcomes that count as "a reply came back", so they get a ``reply_returned`` row. ``rejected`` and
+#: ``empty`` belong here: the partner answered, and the answer is what the caller was waiting for even
+#: when it is negative or deliberately blank.
+_RETURNED_OUTCOMES: Final = frozenset(
+    {ReplyOutcome.REPLY, ReplyOutcome.REJECTED, ReplyOutcome.EMPTY}
+)
+
+
+class SyncReplyMetrics:
+    """In-process counters for one inbound's sync-reply path (ADR 0154 D8).
+
+    **Labelled ``status``, not ``outcome``.** ``api/metrics.py`` states a CLOSED label allowlist as a
+    PHI contract — ``connection``/``destination``/``status``/``version``/``le`` — and
+    ``tests/test_metrics_exporter.py`` asserts it. The outcome enum is a fixed, non-PHI constant set,
+    so reusing ``status`` is honest rather than a workaround, and it keeps a contract that was
+    deliberately closed from being widened for a label that adds no new information.
+
+    Counters live here rather than in ``api/metrics.py`` because that module builds every family
+    per-scrape from ``engine.store`` alone and has no view of the runner — and ``transports/`` may not
+    import ``api/`` (AC-17). The runner owns these and exposes them; the exporter reads them.
+    """
+
+    __slots__ = ("connection", "totals", "wait_seconds_sum", "wait_count")
+
+    def __init__(self, connection: str) -> None:
+        self.connection = connection
+        #: ``{status: count}`` — the SLO series. ``rate(timeout)/rate(total)`` is the proxy API's
+        #: error budget, which is exactly why ``degraded`` is a distinct label rather than folded in.
+        self.totals: dict[str, int] = {}
+        self.wait_seconds_sum = 0.0
+        self.wait_count = 0
+
+    def record(self, outcome: ReplyOutcome, waited_ms: int) -> None:
+        self.totals[outcome.value] = self.totals.get(outcome.value, 0) + 1
+        self.wait_seconds_sum += waited_ms / 1000.0
+        self.wait_count += 1
+
+    @property
+    def mean_wait_seconds(self) -> float:
+        """Mean blocked time. Answers *"is p99 approaching reply_timeout?"* before the pager does."""
+        return self.wait_seconds_sum / self.wait_count if self.wait_count else 0.0
+
+
 class SyncReplyResolverImpl:
     """Resolves one blocked HTTP turn into an :class:`InboundReply`. Never raises."""
 
-    __slots__ = ("_store", "_rendezvous", "_destination", "_timeout", "_content_type")
+    __slots__ = (
+        "_store",
+        "_rendezvous",
+        "_destination",
+        "_timeout",
+        "_content_type",
+        "_on_timeout",
+        "_metrics",
+    )
 
     def __init__(
         self,
@@ -69,14 +120,68 @@ class SyncReplyResolverImpl:
         destination: str,
         timeout: float,
         content_type: str,
+        on_timeout: str = "504",
+        metrics: SyncReplyMetrics | None = None,
     ) -> None:
         self._store = store
         self._rendezvous = rendezvous
         self._destination = destination
         self._timeout = timeout
         self._content_type = content_type
+        self._on_timeout = on_timeout
+        self._metrics = metrics
 
     async def __call__(self, message_id: str) -> InboundReply:
+        reply = await self._resolve(message_id)
+        await self._observe(message_id, reply)
+        return reply
+
+    async def _observe(self, message_id: str, reply: InboundReply) -> None:
+        """Record the outcome (ADR 0154 D8/AC-18) — names, counts and timings only.
+
+        **Fail-soft, and that is a decision rather than caution.** This runs after the wait has
+        already resolved, so a store hiccup here must not turn a perfectly good partner reply into a
+        ``500``: the caller's answer is already determined, and losing a diagnostic row is strictly
+        better than losing the reply it describes.
+
+        **No fragment of the partner's body reaches ``detail``.** The structural rule is that
+        reply-derived bytes never leave the resolver's return value, so the only things interpolated
+        here are the destination name, the sequence number, the outcome enum and a duration —
+        every one of which is config metadata or a count.
+        """
+        if self._metrics is not None:
+            self._metrics.record(reply.outcome, reply.waited_ms)
+
+        if reply.outcome in _RETURNED_OUTCOMES:
+            event, detail = (
+                "reply_returned",
+                f"dest={self._destination} seq={reply.response_seq} "
+                f"outcome={reply.outcome.value} waited_ms={reply.waited_ms}",
+            )
+        elif reply.outcome is ReplyOutcome.TIMEOUT:
+            event, detail = (
+                "reply_timeout",
+                f"dest={self._destination} waited_ms={reply.waited_ms} fallback={self._on_timeout}",
+            )
+        else:
+            # Every other outcome already has its own disposition trail — a dead/cancelled row, an
+            # UNROUTED message, or (for degraded) the metric label. Minting a second record of the
+            # same fact would make the timeline read as two events where one thing happened.
+            return
+
+        try:
+            await self._store.record_message_event(
+                message_id, event, destination=self._destination, detail=detail
+            )
+        except Exception as exc:  # noqa: BLE001 - observability must never fail the turn
+            log.warning(
+                "sync reply: could not record %s for %s: %s",
+                event,
+                message_id,
+                exc.__class__.__name__,
+            )
+
+    async def _resolve(self, message_id: str) -> InboundReply:
         """Block until the awaited reply commits, the message goes terminal, or the budget expires.
 
         **Total by construction.** Every exit is an :class:`InboundReply`; nothing propagates. A
