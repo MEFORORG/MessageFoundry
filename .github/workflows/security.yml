@@ -13,8 +13,11 @@ name: Security
 #   `|| true`, `--exit-zero`, and a skippable job-level `if:`) for any job in the required set. To take
 #   a gate off the merge path, remove its context from branch protection AND
 #   `.github/required-contexts.txt` — deliberately, in a reviewed diff. Never neuter it in place.
-# CodeQL and native push-protection secret scanning need GitHub Advanced Security on this private
-# repo; gitleaks below is the no-GHAS secret scanner. See docs/SECURITY.md.
+# This repo is PUBLIC, so CodeQL runs free and IS a required context (codeql.yml) — it is not gated
+# behind GitHub Advanced Security. This comment previously said "this private repo", written when it
+# was; CodeQL reporting on every PR is itself the disproof. gitleaks below is retained deliberately:
+# it scans on the same run as the other gates rather than relying on native push protection.
+# See docs/SECURITY.md.
 #
 # NO push-to-main trigger (dropped for CI cost): every push to main is an auto-merged PR whose head
 # was JUST scanned by the pull_request run of this same workflow, so the post-merge re-scan re-ran
