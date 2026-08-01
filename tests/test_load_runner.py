@@ -172,7 +172,14 @@ def test_run_load_end_to_end_no_loss(engine: tuple[str, int, int]) -> None:
     # an engine failure; the reconcile accounts for it as unconfirmed, never as loss (no_loss below is
     # the correctness authority). This is NOT a tight timing bound: a slow runner (windows-2025) can
     # strand a large share of in-flight frames at teardown — observed ~half (timeouts=46/sent=90) with
-    # zero loss — so a fixed small cap flakes. What this MUST still catch is a systemic ACK-path
+    # zero loss — so a fixed small cap flakes.
+    #
+    # That observation used to be recorded HERE while the reconcile's own stranding budget still
+    # capped at `sent // 2` — so this assertion tolerated 75% stranding (`acked >= sent // 4`) while
+    # the budget failed at half + 1, and `main` red at 9b03057f on exactly the 46/90 case above. The
+    # budget is now three quarters, so the two detectors encode the SAME tolerance; keep them in step
+    # if either moves. Pinned by tests/test_harness_reconcile.py, which asserts those exact counters
+    # reconcile clean. What this MUST still catch is a systemic ACK-path
     # regression: an engine that receives-but-never-ACKs strands the WHOLE run (acked~0, timeouts~sent)
     # yet still passes no_loss (internal delivery is fine, only the client-facing ACK never returns).
     # nak==0 + the identity alone would pass that, so require that a real fraction of sends were
