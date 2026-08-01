@@ -7295,3 +7295,33 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 **Related:** ADR 0155, `.github/workflows/dast.yml`, `scripts/security/dast_auth_sweep.py`, `scripts/security/route_gates.py`, `scripts/security/dast-policy.json`, `tests/test_dast_auth_sweep.py`, `tests/test_dast_claims.py`, [`Secure_Development_Standards`](Secure_Development_Standards.md) §6.1 / §A.6.
 
 **Source:** the empty §6.1 *Dynamic* tier row, filed and built 2026-07-31.
+
+## 320. windows-2025 MLLP ingress is ~10x slower than a healthy runner
+
+> 📋 **Filed 2026-08-01, not started.** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to.
+
+**Type:** CI/runner capacity — not a correctness defect. No message was ever lost in any observed instance.
+
+**What:** the `test (windows-2025, py3.14)` leg cannot service the load smoke's offered rate. `tests/test_load_runner.py` offers **60 msg/s for 1.5s** (90 messages, `pool_size = 4`) at a listener whose ingress is **strictly serial per connection** — `mllp.py:1433` is `read chunk → for each frame → await handler → next`, where the handler is the durable ingress commit the ACK depends on. Total ingress throughput is therefore `pool_size ÷ per-message-commit-latency`. On windows-2025 that product is under 60/s, so roughly half the offered run is never ingested inside the measurement window and strands unacknowledged at teardown.
+
+**Measured (2026-08-01).** The same signature reproduces on a healthy developer box purely by raising the offered rate — same profile, same code, same `run_load` path:
+
+| offered | sent | acked | stranded | engine_read |
+|---|---|---|---|---|
+| 60/s | 90 | 90 | **0 (0.0%)** | 90 |
+| 300/s | 450 | 450 | **0 (0.0%)** | 450 |
+| **600/s** | 900 | 444 | **456 (50.7%)** | **452** |
+
+windows-2025 observed at **60/s**: sent 90, acked 44, stranded 46 (**51.1%**), `engine_read` 52 — the 600/s row, at one tenth the offered rate. **windows-2025 hits at 60/s what a healthy box hits at 600/s.**
+
+**Why it matters even though nothing is lost:** the same numbers recurred **byte-identically** on two different commits (`9b03057f`, `56f7d240` — 90/44/46/52 both times), so this is deterministic queueing, not runner weather. It will recur on any profile whose offered rate approaches the leg's service rate, and it is invisible to a correctness check because delivery is complete (104 written, 104 received, backlog drained in 4.7s of a 30s bound).
+
+**Correcting the record:** `harness/load/report.py` previously justified the stranding budget with *"observed teardown stranding is ~16%, so half is ~3x the worst seen."* Both halves are wrong. **Healthy stranding at this rate is 0%**, not 16% — the 16% figure was itself measured on a partially-saturated run — and "half" was ~1.0x the worst seen by the time it red `main`, not 3x.
+
+**Not yet determined:** *why* that runner's per-message commit is ~10x slower. Disk/fsync characteristics of the hosted windows-2025 image, Defender scanning the temp SQLite DB, and CPU contention are all plausible; none has been measured, and it cannot be measured from outside the runner.
+
+**Adjacent finding, unverified:** at saturation `engine_read` (452) cleared the reconcile's unconditional anti-vacuity floor `read >= sent // 2` (450) by **two messages**. A breach of that floor is a hard failure no budget widening can rescue. A probe at 1200/s did *not* reproduce it, but that run is not comparable — its drain timed out (`max_drain_seconds` observed `-1.0`) and it took the branch that skips the settle-poll. Untested, not disproven.
+
+**Related:** #115 (`06fd327d`, the budget fix), `harness/load/report.py` `_reconcile`, `harness/load/connscale/runner.py`, `harness/load/estate/runner.py`, `tests/test_load_runner.py`, `tests/test_harness_reconcile.py`, `messagefoundry/transports/mllp.py:1433`, and the sibling windows-2025 failure `test_coord_lock` (fixed in #109) — a *different* mechanism on the same leg.
+
+**Source:** investigation of the `test_run_load_end_to_end_no_loss` failures on `main` at `9b03057f` and `56f7d240`, 2026-08-01.
