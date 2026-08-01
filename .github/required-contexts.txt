@@ -108,7 +108,7 @@ a PR that implements BACKLOG #N must update BACKLOG.md
 # DELIBERATELY NOT REQUIRED (do not add without the owner's decision; each has a recorded reason):
 #   codeql.yml, scorecard.yml  -- their SARIF upload needs `security-events: write`, which fork-PR
 #                                 tokens lack, so requiring them would block every fork PR.
-#   zizmor.yml                 -- paths-filtered to `.github/**`, so it does not report on most PRs.
+#   zizmor.yml                 -- paths-filtered, so it does not report on most PRs.
 #   quality-advisory.yml       -- advisory BY DESIGN and must never be promoted; the invariant is
 #                                 pinned by tests/test_quality_advisory_invariants.py.
 #   dast.yml                   -- nightly/tag/dispatch only, with no pull_request trigger, so it can
