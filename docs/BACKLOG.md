@@ -7298,7 +7298,7 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 
 ## 320. windows-2025 MLLP ingress is ~10x slower than a healthy runner
 
-> 📋 **Filed 2026-08-01, not started.** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to.
+> 🚧 **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is blocked: that runner is unregistered (`actions/runners` → `total_count: 0`) and `selfhosted-win2025-sql.yml` has never run.
 
 **Type:** CI/runner capacity — not a correctness defect. No message was ever lost in any observed instance.
 
