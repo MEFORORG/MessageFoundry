@@ -205,13 +205,18 @@ def build_response(
     call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
     value carrying CR or LF is a header-injection primitive, and validating in the callers would mean
     each future consumer has to remember. Today every caller passes a literal, so this guards against
-    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``."""
+    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``.
+
+    **A ``204`` carries no entity headers.** RFC 9110 §15.3.5 forbids a body on a ``204``, and
+    ``Content-Length: 0`` beside it is at best noise and at worst a parser tripwire — some clients
+    treat an entity header on a bodyless status as a framing error. That matters here rather than
+    academically: ``reply_on_empty="204"`` is the default answer for a partner reply that is
+    deliberately empty, so this is ordinary traffic, not an edge case."""
     payload = body.encode("utf-8")
-    headers = [
-        _status_line(status),
-        _validated_header("Content-Type", content_type),
-        f"Content-Length: {len(payload)}",
-    ]
+    headers = [_status_line(status)]
+    if status != 204:
+        headers.append(_validated_header("Content-Type", content_type))
+        headers.append(f"Content-Length: {len(payload)}")
     headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
     headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload
@@ -426,6 +431,14 @@ class HttpSource(SourceConnector):
             {str(x): str(x) for x in subjects} if subjects else {}
         )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
+        # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
+        # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
+        self.reply_from: str | None = s.get("reply_from") or None
+        self.reply_timeout: float = float(s.get("reply_timeout") or 30.0)
+        self.reply_on_timeout: str = str(s.get("reply_on_timeout") or "504")
+        self.reply_content_type: str = str(s.get("reply_content_type") or "passthrough")
+        self.reply_on_empty: str = str(s.get("reply_on_empty") or "204")
+        self.reply_write_timeout: float = float(s.get("reply_write_timeout") or 30.0)
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -801,7 +814,23 @@ class HttpSource(SourceConnector):
         (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
         """
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), _CLIENT_SHUTDOWN_GRACE)
+        await asyncio.wait_for(writer.drain(), self._drain_budget())
+
+    def _drain_budget(self) -> float:
+        """Seconds allowed to drain a response to the caller.
+
+        ``_CLIENT_SHUTDOWN_GRACE`` for the shipped ``202`` path, which writes a few dozen bytes and
+        was bounded by that constant in increment A. A ``reply_from`` inbound instead uses its own
+        ``reply_write_timeout``, because it now carries a **partner-sized** body to a possibly slow
+        reader and a receipt-sized budget would truncate a legitimate large reply.
+
+        The two are not interchangeable in the other direction either: ``reply_write_timeout``
+        defaults to 30 s against a 5 s shutdown grace, so ``stop()`` clamps this to its own
+        sub-budget rather than letting one drain outlive the entire teardown by 6x.
+        """
+        if self.reply_from and self.reply_write_timeout:
+            return float(self.reply_write_timeout)
+        return _CLIENT_SHUTDOWN_GRACE
 
     async def _write_safely(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         """Best-effort error/refuse response — never raise out of the refuse/close path (the socket may
