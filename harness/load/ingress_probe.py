@@ -64,6 +64,37 @@ _CONFIG_DIR = Path("harness/config/load")
 _START_TIMEOUT_S = 15.0
 
 
+def _allow_repo_config_on_windows() -> None:
+    """Let the probe load `harness/config/load` from the checkout on a Windows CI runner.
+
+    The engine refuses to load config from a writable-by-others directory (SEC-003) because
+    `_exec_module` runs that config as the service account. A GitHub-hosted Windows workspace grants
+    `BUILTIN\\Users` (S-1-5-32-545) write on the checkout, so the guard fail-closes and the engine
+    never starts::
+
+        WiringError: refusing to load config from writable-by-others path harness\\config\\load
+
+    That is the control working correctly. It is also why the FIRST dispatched sweep returned no
+    Windows data at all: the probe was validated on Linux and on a developer Windows box, where those
+    ACLs do not apply, and never on the runner it exists to measure. ubuntu produced a full 12-run
+    table; both Windows legs died in the first second.
+
+    This sets the SAME documented dev/test escape the suite already uses for the SAME reason —
+    `tests/conftest.py::_allow_insecure_config_source_in_tests` — which is why
+    `tests/test_load_runner.py` loads this identical config dir on those runners and passes. Kept
+    win32-only for the same reason it is there: a POSIX checkout is not group/world-writable, so the
+    escape must stay OFF so the POSIX refusal path keeps being exercised.
+
+    `setdefault`, not assignment: an operator who deliberately set it to "0" keeps that choice.
+
+    NEVER set in production. Scoped to a throwaway measurement whose engine binds loopback on
+    ephemeral ports, writes a temp SQLite file, and dies with the process.
+    """
+    if sys.platform != "win32":
+        return
+    os.environ.setdefault("MEFOR_ALLOW_INSECURE_CONFIG_SOURCE", "1")
+
+
 def _reserve() -> socket.socket:
     """A bound-but-unlistened loopback socket, kept open so the OS cannot re-hand the port.
 
@@ -104,6 +135,7 @@ duration_s = {duration_s}
 
 def probe(rate: float, duration_s: float = 1.5, pool_size: int = 4) -> int:
     """Run one phase at ``rate`` and print a single machine-parseable RESULT line."""
+    _allow_repo_config_on_windows()
     tmp = tempfile.mkdtemp(prefix="mefor-ingress-probe-")
     adt_s, res_s, oth_s, sink_s, api_s = (_reserve() for _ in range(5))
     adt_port, sink_port, api_port = (
