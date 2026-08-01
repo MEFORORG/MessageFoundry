@@ -72,6 +72,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # The uv/npm blocks' fresh-publish dodge, for the ecosystem where auto-merge actually fires: #75
+    # took two of its five bumps to main under 24h from upstream publish (codeql-action v4.37.4 was 7h
+    # old), and a compromised action runs INSIDE CI with whatever token the job holds. SHA-pinning
+    # stops tag mutation, not a malicious new release — Dependabot just bumps the pin to the new SHA.
+    # Only default-days is honored here (this ecosystem does not support the semver-*-days knobs) and
+    # it ages off the tag's commit date rather than the release date, so treat 5 as approximate.
+    # Security updates bypass cooldown, so an advisory fix is unaffected. Watch codeql-action — a
+    # frequent releaser — for stalls after this lands.
+    cooldown:
+      default-days: 5
     groups:
       # One weekly PR for all action bumps instead of one PR per action (CI cost: every extra PR
       # buys a full required-check pass + a push-to-main run when it auto-merges). Mirrors the
