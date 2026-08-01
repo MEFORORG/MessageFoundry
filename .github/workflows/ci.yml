@@ -129,10 +129,11 @@ jobs:
       #
       # EVERY install below passes `--constraint constraints.lock` — the HASHLESS export of uv.lock, kept
       # in sync by the DEP-1 gate. Without it, `uv pip install -e ".[extras]"` RE-RESOLVES from
-      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 (626
-      # lint errors) and annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY
-      # open PR on the same day. The constraint pins every version to the lock while each job still
-      # installs only ITS OWN extras (so the narrow image-smoke set stays narrow).
+      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 and
+      # annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY open PR on the same
+      # day — see each cap's rationale in pyproject.toml. The constraint pins every version to the lock
+      # while each job still installs only ITS OWN extras (so windows-service-smoke's deliberately
+      # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0

@@ -48,9 +48,13 @@ dependencies = [
     "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
     # CONSTRAINT PIN (transitive, via pydantic/fhir-core): annotated-types 0.8.0 dropped `SLOTS`,
-    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. CI installs with a
-    # FRESH resolve (uv pip install -e ".[dev,...]"), so it ignores the lock's annotated-types==0.7.0.
-    # Drop this cap once fhir-core supports 0.8.x, or once CI installs from the hashed lock.
+    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. The cap bounds the
+    # RESOLVER, the only place it CAN be bounded: `uv lock` would otherwise choose 0.8.0 and every
+    # downstream artifact inherits it (uv.lock -> constraints.lock -> ci.yml's `--constraint`), which
+    # is exactly how PR #66 went red. It also binds every resolve CI does not constrain — an end user's
+    # `pip install messagefoundry[fhir]`, the local dev venv behind pre-commit, the dispatch-only
+    # workflow legs. Drop it once fhir-core ships a 0.8-compatible release — NOT once CI installs from
+    # the hashed lock; the lock carries whatever the resolver already chose.
     "annotated-types<0.8",
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
     "fastapi>=0.137.1",     # localhost engine API
@@ -118,8 +122,10 @@ otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
 # optional lxml extra and is deferred (JSON-only MVP) — never bare-parsed (ADR 0022 §6, Options #5).
 # annotated-types is CAPPED <0.8: fhir-core (dragged in by fhir.resources) imports the `SLOTS`
 # constant that annotated-types 0.8.0 REMOVED, so any fhir.resources parse dies with
-# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". It is a transitive dep, so the cap
-# lives here rather than in [project.dependencies] (pydantic, the other consumer, is fine on 0.8).
+# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". Declared BOTH here and in
+# [project.dependencies]: this copy documents the consumer, the base copy is what bounds a plain
+# `pip install messagefoundry`. One Dependabot ignore entry covers both (it matches by package name,
+# not declaration site) — lift the ignore and both caps together.
 # Drop the bound once fhir-core ships a 0.8-compatible release.
 fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
 # DICOM (DIMSE C-STORE SCP/SCU) connectors + codec for parsing/dicom/ (ADR 0025, BACKLOG #24). Lazy-imported,
@@ -182,10 +188,11 @@ dev = [
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
-    # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag ~525
-    # findings in existing code. CI installs with a FRESH resolve (uv pip install -e ".[dev,...]"), so an
-    # unbounded ">=" silently adopts a new major lint baseline and reds every PR. Lift the cap in a
-    # deliberate PR that also clears the new findings.
+    # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag
+    # hundreds of findings in existing code — at least ~870 on PR #66's ubuntu leg (whole-repo scope,
+    # 2026-08-01). An unbounded ">=" lets `uv lock` adopt that new baseline, and it flows out through
+    # uv.lock -> constraints.lock -> ci.yml's `--constraint`, plus every unconstrained resolve. Lift the
+    # cap in a deliberate PR that also clears the new findings.
     "ruff>=0.4,<0.16",
     "mypy>=1.10",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it

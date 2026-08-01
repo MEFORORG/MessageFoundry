@@ -76,7 +76,7 @@ repos:
   # docs/CI.md carried this as an instruction ("run actionlint on every ci.yml edit") aimed at human
   # memory. That is the wrong mechanism for a failure whose only symptom is silence, so it is a hook.
   # The hook is the LOAD-BEARING half: the matching CI step lives in zizmor.yml, which is deliberately
-  # NOT a required check (it is paths-filtered to `.github/**`, so requiring it would wedge every PR
+  # NOT a required check (it is paths-filtered, so requiring it would wedge every PR
   # that touches no workflow). Keep the `rev` in step with the version zizmor.yml installs.
   #
   # The upstream hook already scopes itself to `types: [yaml]` + `files: ^\.github/workflows/`, so no
