@@ -1,6 +1,6 @@
 # ADR 0156 — ASVS scorecard as data: a derived count, verified evidence anchors, and a fail-closed drift gate
 
-**Status:** Proposed
+**Status:** **Accepted (2026-08-01)** — built and merged the same day; §7 amended at ratification, see below
 **Date:** 2026-08-01
 **Supersedes:** —
 **Related:** ADR 0155 (DAST) · BACKLOG #205 (risk-acceptance register) · ASVS cell 15.1.3
@@ -119,9 +119,34 @@ precisely what 15.1.3 does today and why a green CI proves nothing about these d
 |---|---|---|
 | Verifier + schema + unit tests (fixture data) | **Development repo** | Generic tooling, no posture data; runs in public CI on every PR |
 | `asvs-scorecard.toml` (real verdicts + evidence) | **Vault** | Posture data; `docs/security/`-class |
-| Job running the verifier against the real data | **Vault CI** | The vault has `ci.yml`, `tests/`, `pyproject.toml` — the guards can run where the documents actually live |
+| Enforcement against the real data | **Vault pre-commit hook + one narrow vault workflow** | See the amendment — the obvious answer was wrong |
 
 That last row is the fix for **15.1.3**: the guards stop being inspection-only theatre.
+
+> ### ⚠️ Amendment at ratification (2026-08-01) — §7's original placement was WRONG
+>
+> This ADR was drafted proposing *"a vault CI job runs the verifier against the real data"*, reasoning
+> from the fact that the vault has `ci.yml`, `tests/` and `pyproject.toml`. **Open question 1 asked
+> whether that CI actually executes. It does not.**
+>
+> The GitHub actions API reports **every vault workflow as `disabled_manually`** — CI, Security,
+> CodeQL, backlog-hygiene, release, all of them. The last run was **2026-07-27**, and the two vault
+> PRs merged on 2026-08-01 both merged with **zero checks**. The estate was switched off at the
+> cutover to avoid duplicating public CI, which is a reasonable decision and is not being reversed.
+>
+> **A CI-only design would have shipped dead.** The built design is therefore:
+>
+> 1. **A vault pre-commit hook** — the enforcement that works *today*, needs no CI, and fires at
+>    authoring time, which is when the drift is introduced.
+> 2. **One narrow new workflow** (`asvs-scorecard.yml`) — new workflows are active by default even
+>    though the estate is disabled, so this runs without resurrecting any of it. Stdlib-only, no
+>    install step, path-filtered, 5-minute cap. It additionally fails if the rendered
+>    `ASVS-CURRENT.md` has drifted from the data.
+>
+> **The lesson is the ADR's own thesis applied to itself.** §7 was a confident, plausible statement
+> about system state that nobody had checked — exactly the failure mode the rest of this document
+> exists to prevent. It was caught only because ratification was gated on answering the open question
+> rather than on the argument reading well.
 
 ### 8. A generated entry point
 
@@ -163,10 +188,26 @@ page instead of reconstructing state from ten superseding documents.
 - *Put the vault documents in the public repo so the guards see them.* Refused: they are an attacker
   roadmap (`SECURITY-DOCS-POLICY.md`). Running the guards in the vault achieves the same end.
 
+## Status at ratification
+
+Built and merged 2026-08-01, same day as the decision:
+
+- **Tool** — `scripts/asvs/scorecard.py` (development repo), stdlib only, no new dependency.
+- **Tests** — `tests/test_asvs_scorecard.py`, 17 tests. **Every check is proved to go RED before it is
+  trusted green**: dropped cell, duplicate cell, an id ASVS retired, a level disagreeing with the
+  corpus, a moved token, a deleted file, a blind absence search, an absence that became false.
+  Exit codes verified by hand — **0** clean, **1** findings, **2** could-not-measure on a missing file.
+- **Data** — `docs/security/asvs-scorecard.toml` (vault), **all 345 cells** seeded from the held
+  corpus. 14 carry verified 2026-08-01 evidence; **331 are `unverified`, not `pass`**. The file
+  therefore does **not** reproduce the published headline and must not be read as doing so — what it
+  reports today is the state of *verification*, which had never been visible.
+- **Entry point** — `docs/security/ASVS-CURRENT.md`, generated, never hand-written.
+
 ## Open questions
 
-1. **Does the vault CI run `pytest` today?** The workflows exist; whether the suite executes there is
-   unconfirmed, and the whole 15.1.3 fix rests on it.
+1. ~~**Does the vault CI run `pytest` today?**~~ **ANSWERED 2026-08-01 — no.** Every vault workflow is
+   `disabled_manually`. §7 was amended accordingly *before* ratification. This is the question that
+   would have shipped a broken control had it been waved through.
 2. **Do ADR and BACKLOG numbers collide across the two repos?** The allocator is per-clone. BACKLOG
    spaces are being partitioned; ADR is unresolved and this ADR was allocated in the development repo
    deliberately.
