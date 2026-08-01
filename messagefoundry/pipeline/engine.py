@@ -1180,9 +1180,16 @@ class Engine:
             await self._leader_maintenance.recover_on_promotion()
         elif self._coordinator.is_clustered():
             # Active-passive without per-row leases (SQL Server): on promotion, re-pend the prior
-            # leader's in-flight rows. The prior leader self-fenced and its leadership lease EXPIRED
-            # before this node could acquire it, so it has stopped processing — and the graph runs ONLY
-            # on the leader, so there is no live sibling whose rows an unconditional reset could steal.
+            # leader's in-flight rows. Note what justifies this and what does not. The prior leader
+            # self-fenced and its leadership lease expired before this node could acquire — but that
+            # ordering only means it stopped REPORTING itself leader, not that it stopped working: the
+            # margin is short by the renew round trip plus a fence tick, and graph teardown is not
+            # budgeted against the remainder. This reset is also owner-BLIND (WHERE status/stage only),
+            # so unlike the Postgres path it cannot even scope itself to the prior leader's rows.
+            # It is correct anyway, for the same directional reason as recover_inflight_on_promotion:
+            # re-pending a row whose sender is still winding down risks a DUPLICATE (permitted by
+            # at-least-once, absorbed by idempotent outbounds), while not re-pending it risks a STRAND
+            # (forbidden). Erring toward duplication is the invariant-safe direction.
             # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
             # residue was already recovered by the unconditional reset_stale_inflight in start().)
             await self.store.reset_stale_inflight()
