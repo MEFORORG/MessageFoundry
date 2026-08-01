@@ -67,7 +67,7 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.settings import DeliverySettings, EgressSettings, StoreBackend
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
@@ -81,6 +81,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
     resolve_env_settings,
@@ -5877,6 +5878,7 @@ def build_check_registry(
     reserved_bindings: Sequence[tuple[str, str, int]] = (),
     posture: HopPosture | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
     connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
@@ -5914,7 +5916,7 @@ def build_check_registry(
         # so it need not run inside the scope.
         with active_hop_posture(posture):
             _build_check_connectors(
-                registry, inbound_bind_host, env_values, egress, trust_anchor_policy
+                registry, inbound_bind_host, env_values, egress, trust_anchor_policy, delivery
             )
     except WiringError:
         raise
@@ -5928,6 +5930,7 @@ def _build_check_connectors(
     env_values: Mapping[str, Any],
     egress: EgressSettings,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
@@ -5947,11 +5950,17 @@ def _build_check_connectors(
     nothing. The fail-loud guarantee is UNCHANGED for a deployed connection: a missing ``env()`` value on
     one still raises here, which is exactly the promote-time gate ("a graph whose env keys aren't defined
     for the target never goes live")."""
+    # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
+    # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
+    apply_sync_reply_capture_implication(registry)
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
+        # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
+        # responses, and resolve to a lane that can actually serve concurrent callers.
+        check_http_sync_reply(ic, registry, delivery=delivery)
         # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
         # fire at `messagefoundry check`, so without this a config that refuses to start would pass
         # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
@@ -6413,6 +6422,110 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
         if net.prefixlen < floor:
             return False  # ONE too-wide entry defeats the whole list
     return True
+
+
+def check_http_sync_reply(
+    ic: InboundConnection,
+    registry: Registry,
+    *,
+    delivery: DeliverySettings | None = None,
+) -> None:
+    """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
+
+    These are the facts one ``Http()`` call cannot know, because they are about the *other*
+    connection. Runs with no store, so it fires at ``messagefoundry check`` and in dry-run exactly as
+    at serve.
+
+    The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
+    warnings because together they make the feature's headline use case unserviceable. ``ordering``
+    resolves to **FIFO**, which drains one message at a time and blocks the head on failure — so N
+    concurrent HTTP callers do not get N concurrent downstream calls; they serialise behind a single
+    lane bounded by one partner round-trip, and one transiently-failing head message holds that lane
+    until an operator purges it, timing out **every** concurrent and subsequent caller.
+    ``max_attempts`` resolves to retry-forever, which is not merely incoherent with "the caller gave
+    up 30 seconds ago" — it is a total outage with a config-shaped cause.
+
+    **Both are read as EFFECTIVE values, never declared ones.** ``OutboundConnection.ordering``
+    defaults to ``None`` meaning *inherit*, and ``retry`` defaults to no ``RetryPolicy`` object at
+    all; resolution against ``[delivery]`` happens in the runner. A literal ``ordering == FIFO`` test
+    would therefore pass cleanly for the overwhelmingly common shape — the exact shape this refusal
+    exists to catch. When ``delivery`` is not supplied the caller could not resolve them either, so
+    that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
+    values always exist.
+    """
+    settings = ic.spec.settings
+    reply_from = settings.get("reply_from")
+    if not reply_from:
+        return
+    name, target = ic.name, str(reply_from)
+
+    oc = registry.outbound.get(target)
+    if oc is None:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names unknown outbound {target!r} — a "
+            "synchronous reply can only come from an outbound declared in this graph"
+        )
+    if not oc.deployed:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which is declared "
+            "deployed=False — it will never run, so every HTTP turn could only time out"
+        )
+    if not oc.spec.settings.get("capture_response"):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
+            "capture_response=True — with no captured reply there is nothing to return, and every "
+            "call would block until reply_timeout"
+        )
+
+    # apply_sync_reply_capture_implication has already added content-type for any factory that HAS
+    # the allow-list. One that does not cannot echo a content type at all, so refuse here rather than
+    # let it surface as an AttributeError deep in the capture path.
+    if (
+        settings.get("reply_content_type") == "passthrough"
+        and "capture_response_headers" not in oc.spec.settings
+    ):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_content_type='passthrough' needs {target!r} to "
+            "capture the partner's content-type, but that connector has no "
+            "capture_response_headers setting — pin a literal MIME type on reply_content_type "
+            "instead"
+        )
+
+    if ic.ack_after is AckAfter.DELIVERED:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from cannot be combined with ack_after='delivered' "
+            "— the HTTP turn already blocks on the downstream reply, so deferring the receipt too "
+            "would mean waiting for the same delivery twice"
+        )
+
+    if delivery is None:
+        return  # the caller could not resolve [delivery]; the runner re-checks at start
+
+    if (oc.ordering or delivery.ordering) is OrderingMode.FIFO:
+        declared = oc.ordering.value if oc.ordering else "unset, inheriting [delivery].ordering"
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE ordering is "
+            f"FIFO (declared: {declared}). A FIFO lane drains one message at a time and blocks the "
+            "head on failure, so concurrent HTTP callers serialise behind a single partner "
+            "round-trip and one stuck message times out every caller — set ordering=UNORDERED on "
+            "that outbound"
+        )
+
+    effective_attempts = (
+        oc.retry.max_attempts if oc.retry is not None else delivery.retry_max_attempts
+    )
+    if effective_attempts is None:
+        declared = (
+            "no retry policy, inheriting [delivery].retry_max_attempts"
+            if oc.retry is None
+            else "max_attempts=None"
+        )
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE max_attempts "
+            f"is unset — retry forever (declared: {declared}). Retrying forever is incoherent with a "
+            "caller that gave up seconds ago; set a finite max_attempts so a failed delivery "
+            "dead-letters instead of holding the lane"
+        )
 
 
 def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:

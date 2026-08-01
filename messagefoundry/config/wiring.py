@@ -1240,6 +1240,46 @@ def _sync_reply_defaults() -> dict[str, Any]:
     return {name: params[name].default for name in _SYNC_REPLY_KNOBS}
 
 
+def apply_sync_reply_capture_implication(registry: Registry) -> None:
+    """Make ``reply_from`` imply capturing the partner's ``content-type`` (ADR 0154 D4, owner ruling).
+
+    **Resolves a contradiction in the ADR itself.** ``reply_content_type`` defaults to
+    ``"passthrough"``, and D4 then requires ``"content-type"`` to be in the named outbound's
+    ``capture_response_headers`` — which defaults to ``None`` on all three capable factories, and
+    ``normalize_header_allowlist(None)`` is the empty set. So the ADR's own headline shape,
+    ``Http(reply_from="X")`` + ``Rest(capture_response=True)``, would raise at ``check`` until the
+    operator *also* wrote ``capture_response_headers=["content-type"]``. Asking for a reply to be
+    echoed back verbatim **is** asking for its content type; requiring both is a papercut with no
+    decision behind it.
+
+    Applied as an explicit, **idempotent** normalisation of the resolved graph rather than a hidden
+    runtime fallback, so the implied header appears in ``/metadata`` and ``graph --json`` like any
+    other captured header. An operator reading the outbound's configuration sees what is actually
+    captured — which is the point: an implication nobody can observe is indistinguishable from a bug.
+
+    Only touches outbounds that are the ``reply_from`` target of an inbound using ``passthrough``,
+    and only those whose factory has the setting at all (it exists on 3 of the 8 outbound factories).
+    A capturing outbound with no allow-list is left alone and refused explicitly by
+    :func:`~messagefoundry.pipeline.wiring_runner.check_http_sync_reply`.
+    """
+    targets: set[str] = set()
+    for ic in registry.inbound.values():
+        if ic.spec.type is not ConnectorType.HTTP:
+            continue
+        reply_from = ic.spec.settings.get("reply_from")
+        if reply_from and ic.spec.settings.get("reply_content_type") == "passthrough":
+            targets.add(str(reply_from))
+
+    for name in sorted(targets):
+        oc = registry.outbound.get(name)
+        if oc is None or "capture_response_headers" not in oc.spec.settings:
+            continue  # unknown target, or a factory with no allow-list — both refused elsewhere
+        current = oc.spec.settings.get("capture_response_headers") or []
+        if any(str(h).strip().lower() == "content-type" for h in current):
+            continue  # already asked for — idempotent
+        oc.spec.settings["capture_response_headers"] = [*current, "content-type"]
+
+
 def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
     """Refuse a synchronous-reply configuration that cannot work, at **factory** time (ADR 0154 D4).
 
