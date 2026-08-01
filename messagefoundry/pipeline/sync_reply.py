@@ -78,10 +78,15 @@ class SyncReplyMetrics:
     import ``api/`` (AC-17). The runner owns these and exposes them; the exporter reads them.
     """
 
-    __slots__ = ("connection", "totals", "wait_seconds_sum", "wait_count")
+    __slots__ = ("connection", "totals", "wait_seconds_sum", "wait_count", "live")
 
     def __init__(self, connection: str) -> None:
         self.connection = connection
+        #: Turns currently blocked on THIS inbound. Tracked per connection rather than read off the
+        #: rendezvous, because the rendezvous is shared by every inbound in the runner — publishing
+        #: its total under a ``{connection}`` label would attribute one listener's load to all of
+        #: them, which is worse than no gauge at all for the thing operators size capacity on.
+        self.live = 0
         #: ``{status: count}`` — the SLO series. ``rate(timeout)/rate(total)`` is the proxy API's
         #: error budget, which is exactly why ``degraded`` is a distinct label rather than folded in.
         self.totals: dict[str, int] = {}
@@ -132,7 +137,16 @@ class SyncReplyResolverImpl:
         self._metrics = metrics
 
     async def __call__(self, message_id: str) -> InboundReply:
-        reply = await self._resolve(message_id)
+        if self._metrics is not None:
+            self._metrics.live += 1
+        try:
+            reply = await self._resolve(message_id)
+        finally:
+            # try/finally, not a decrement after the await: a cancelled turn (client hung up, task
+            # torn down) must not leak a permanently-blocked waiter into the gauge an operator sizes
+            # capacity on.
+            if self._metrics is not None:
+                self._metrics.live -= 1
         await self._observe(message_id, reply)
         return reply
 

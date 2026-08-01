@@ -14,6 +14,8 @@ import asyncio
 from dataclasses import dataclass
 from typing import Any
 
+import pytest
+
 from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sync_reply import (
     SyncReplyMetrics,
@@ -334,3 +336,86 @@ def test_the_metric_labels_stay_inside_the_closed_allowlist() -> None:
 
     assert "status" in ALLOWED_LABELS
     assert "outcome" not in ALLOWED_LABELS, "the allowlist was widened — re-check the PHI contract"
+
+
+def test_the_three_series_reach_a_scrape_with_allowlisted_labels() -> None:
+    """AC-18's metric half, asserted on the exposition rather than on the counters.
+
+    The counters incrementing proves nothing an operator can see; this proves the families are
+    actually emitted, named as the ADR specifies, and labelled inside the closed allowlist.
+    """
+    from messagefoundry.api.metrics import _MetricsCollector, _Snapshot
+
+    metrics = SyncReplyMetrics("IB_HTTP")
+    metrics.totals = {"reply": 7, "timeout": 2, "degraded": 1}
+    metrics.wait_seconds_sum, metrics.wait_count, metrics.live = 5.0, 10, 3
+
+    snapshot = _Snapshot(
+        version="test",
+        inbound={},
+        destinations={},
+        latency=[],
+        outbox_by_status={},
+        in_pipeline=0,
+        now=0.0,
+        sync_replies={"IB_HTTP": metrics},
+    )
+    families = {f.name: f for f in _MetricsCollector(snapshot).collect()}
+
+    # prometheus_client strips a `_total` suffix from Metric.name while the EXPOSED sample keeps it,
+    # so assert on the sample names — that is what a scrape actually shows.
+    exposed = {sample.name for f in families.values() for sample in f.samples}
+    assert "messagefoundry_http_sync_replies_total" in exposed
+    assert "messagefoundry_http_sync_reply_wait_seconds" in exposed
+    assert "messagefoundry_http_sync_reply_waiters" in exposed
+
+    total = families["messagefoundry_http_sync_replies"]
+    by_status = {tuple(s.labels.values()): s.value for s in total.samples}
+    assert by_status[("IB_HTTP", "reply")] == 7.0
+    # degraded is its OWN label value, never folded into timeout: rate(timeout)/rate(total) is the
+    # proxy API's error budget, so our failures must not read as the partner failing to answer.
+    assert by_status[("IB_HTTP", "timeout")] == 2.0
+    assert by_status[("IB_HTTP", "degraded")] == 1.0
+
+    assert families["messagefoundry_http_sync_reply_wait_seconds"].samples[0].value == 0.5
+    assert families["messagefoundry_http_sync_reply_waiters"].samples[0].value == 3.0
+
+    # The PHI contract: every label used stays inside the closed allowlist.
+    from tests.test_metrics_exporter import ALLOWED_LABELS
+
+    for family in families.values():
+        for sample in family.samples:
+            assert set(sample.labels) <= ALLOWED_LABELS, f"{family.name} widened the allowlist"
+
+
+def test_an_instance_with_no_sync_reply_inbound_emits_nothing_new() -> None:
+    # Byte-identical scrape for every existing deployment — absent families rather than zeros, so a
+    # constant 0 on every fleet that never uses this cannot become alert noise.
+    from messagefoundry.api.metrics import _MetricsCollector, _Snapshot
+
+    snapshot = _Snapshot(
+        version="test",
+        inbound={},
+        destinations={},
+        latency=[],
+        outbox_by_status={},
+        in_pipeline=0,
+        now=0.0,
+    )
+    names = {f.name for f in _MetricsCollector(snapshot).collect()}
+    assert not any(n.startswith("messagefoundry_http_sync_reply") for n in names)
+
+
+async def test_a_cancelled_turn_does_not_leak_a_live_waiter() -> None:
+    # The gauge operators size capacity on. A client that hangs up mid-wait must not leave a
+    # permanently-blocked waiter behind in it.
+    metrics = SyncReplyMetrics("IB_HTTP")
+    resolver = _resolver(_Store([_flowing()]), metrics=metrics, timeout=30.0)
+
+    task = asyncio.create_task(resolver("m1"))
+    await asyncio.sleep(0.1)
+    assert metrics.live == 1
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert metrics.live == 0, "a cancelled turn leaked a live waiter into the gauge"
