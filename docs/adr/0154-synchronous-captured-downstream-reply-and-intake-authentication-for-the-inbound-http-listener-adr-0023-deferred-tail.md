@@ -1,6 +1,6 @@
 # ADR 0154 — Synchronous captured-downstream-reply and intake authentication for the inbound HTTP listener (the ADR 0023 deferred tail)
 
-- **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5; no code yet. Authorises INCREMENT A ONLY.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. Authorises INCREMENT A ONLY; increment A is BUILT and merged (2026-08-01, `f2ef0ea9`). Increment B remains unauthorised.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
 - **⚠️ What acceptance does and does not authorise.** "Accepted" normally means *build may start*. Here it
   is **scoped**, because rev 4 split the build and that split is part of what was ratified:
@@ -1214,5 +1214,7 @@ the CIDR-aware predicate; the others are left as found.
   not honoured because `asyncio.start_server` is called without `limit=` — are recorded in #98 and remain
   unfiled.
 
-**Nothing in this ADR now awaits an answer.** It is ready for the owner to accept or reject; the status
-line stays **Proposed** because ratification is the owner's, not the author's.
+**Nothing in this ADR now awaits an answer.** It was ready for the owner to accept or reject, and the
+owner ratified it at revision 5 — the status line above records that. (This paragraph previously ended
+"the status line stays **Proposed** because ratification is the owner's, not the author's", which was
+true when it was written at revision 4 and contradicted the header from revision 5 onward.)
