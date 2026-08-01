@@ -4368,7 +4368,11 @@ class RegistryRunner:
                 # NOT placed beside the _wake_lane below, which is where the ADR says to put it: that
                 # call is nested under `if reingress_to is not None`, and a reply_from outbound never
                 # re-ingresses, so a hint there would be unreachable dead code.
-                self._reply_rendezvous.signal(item.message_id, item.destination_name)
+                # destination_name is NULL on ingress/routed rows and set on outbound ones, so it is
+                # non-None everywhere this path runs — but the type says otherwise, and a hint keyed
+                # on None would silently match nothing rather than fail, so the guard is explicit.
+                if item.destination_name is not None:
+                    self._reply_rendezvous.signal(item.message_id, item.destination_name)
                 if reingress_to is not None:
                     # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
                     # (reingress_to), NOT this delivery worker's own OUTBOUND lane.
