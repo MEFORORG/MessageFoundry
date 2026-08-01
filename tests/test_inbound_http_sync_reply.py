@@ -13,11 +13,17 @@ responses, the ``passthrough`` content-type requirement, and the effective ``ord
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import json as _json
+from typing import Any
 
 import pytest
 
+from messagefoundry.config.models import ConnectorType, Source
 from messagefoundry.config.wiring import Http, WiringError
+from messagefoundry.transports.base import InboundReply, ReplyOutcome
+from messagefoundry.transports.http_listener import HttpSource
 
 
 def test_valid_configurations_build() -> None:
@@ -124,3 +130,138 @@ def test_sync_reply_and_intake_auth_compose() -> None:
     )
     assert spec.settings["intake_auth"] == "api_key"
     assert spec.settings["reply_from"] == "OB_PARTNER"
+
+
+# --- the wire: outcome -> HTTP (ADR 0154 D5) -----------------------------------------------------
+#
+# Drives a real listener with an injected resolver, so these assert the actual bytes a caller sees.
+# The resolver itself is unit-tested separately; here the subject is the mapping and the fact that an
+# inbound WITHOUT reply_from still takes the shipped 202 path byte for byte (AC-8).
+
+REPLY_BODY = '{"partner":"ok","mrn":"100"}'
+
+
+async def _serve(reply: InboundReply | None, **settings: Any) -> tuple[int, dict[str, str], bytes]:
+    """POST once to a listener wired with a resolver that returns ``reply``; return the raw answer."""
+    base: dict[str, Any] = {"host": "127.0.0.1", "port": 0}
+    if reply is not None:
+        base["reply_from"] = "OB_PARTNER"
+    base.update(settings)
+    src = HttpSource(Source(type=ConnectorType.HTTP, settings=base))
+
+    async def handler(raw: bytes) -> str | None:
+        return None if settings.get("_decline") else "msg-1"
+
+    if reply is not None:
+
+        async def resolver(message_id: str) -> InboundReply:
+            return reply
+
+        src.sync_reply = resolver
+    await src.start(handler)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", src.sockport)
+        writer.write(b"POST /ingest HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\n{}")
+        await writer.drain()
+        data = await asyncio.wait_for(reader.read(-1), 5.0)
+        writer.close()
+    finally:
+        await src.stop()
+    head, _, body = data.partition(b"\r\n\r\n")
+    lines = head.decode("iso-8859-1").split("\r\n")
+    headers = {}
+    for line in lines[1:]:
+        k, sep, v = line.partition(":")
+        if sep:
+            headers[k.strip().lower()] = v.strip()
+    return int(lines[0].split(" ", 2)[1]), headers, body
+
+
+async def test_an_inbound_without_reply_from_still_gets_the_202() -> None:
+    # AC-8, on the real socket: no reply_from means the shipped receipt path, untouched.
+    status, _, body = await _serve(None)
+    assert status == 202
+    assert _json.loads(body)["status"] == "accepted"
+
+
+async def test_a_captured_reply_is_returned_verbatim_with_its_content_type() -> None:
+    status, headers, body = await _serve(
+        InboundReply(ReplyOutcome.REPLY, body=REPLY_BODY, content_type="application/json")
+    )
+    assert status == 200
+    assert body.decode() == REPLY_BODY  # verbatim — this is the whole feature
+    assert headers["content-type"] == "application/json"
+
+
+async def test_a_rejected_reply_returns_the_partners_body_with_502() -> None:
+    status, _, body = await _serve(
+        InboundReply(ReplyOutcome.REJECTED, body="<Fault>no</Fault>", content_type="text/xml")
+    )
+    assert status == 502
+    assert body == b"<Fault>no</Fault>", "the partner's own answer is the useful thing to return"
+
+
+async def test_an_empty_reply_is_204_with_no_entity_headers() -> None:
+    status, headers, body = await _serve(InboundReply(ReplyOutcome.EMPTY))
+    assert status == 204 and body == b""
+    assert "content-length" not in headers and "content-type" not in headers
+
+    # ... and the escape hatch for toolchains that mishandle a bodyless 204.
+    status, _, _ = await _serve(InboundReply(ReplyOutcome.EMPTY), reply_on_empty="200")
+    assert status == 200
+
+
+async def test_a_timeout_answers_the_configured_status_and_names_the_message() -> None:
+    status, _, body = await _serve(InboundReply(ReplyOutcome.TIMEOUT, waited_ms=30000))
+    assert status == 504
+    payload = _json.loads(body)
+    assert payload["status"] == "timeout"
+    assert payload["message_id"] == "msg-1", "the caller needs the id to reconcile later"
+
+    status, _, _ = await _serve(InboundReply(ReplyOutcome.TIMEOUT), reply_on_timeout="202")
+    assert status == 202
+
+
+async def test_a_shutdown_is_503_with_retry_after_never_504() -> None:
+    # Never a 504 on demotion: the new leader is about to deliver this message, so claiming the
+    # partner timed out would be a lie about a message still in flight.
+    status, headers, body = await _serve(InboundReply(ReplyOutcome.SHUTTING_DOWN))
+    assert status == 503
+    assert headers["retry-after"] == "5"
+    assert _json.loads(body)["status"] == "shutting_down"
+
+
+async def test_the_refusal_bodies_are_fixed_non_phi_json() -> None:
+    for outcome, expected_status, tag in (
+        (ReplyOutcome.FAILED, 502, "delivery_failed"),
+        (ReplyOutcome.PURGED, 502, "reply_purged"),
+        (ReplyOutcome.DEGRADED, 504, "degraded"),
+        (ReplyOutcome.NO_ROUTE, 504, "no_route"),
+    ):
+        status, _, body = await _serve(InboundReply(outcome))
+        assert status == expected_status
+        payload = _json.loads(body)
+        assert payload["status"] == tag
+        assert payload["message_id"] == "msg-1"
+        assert "mrn" not in body.decode(), "a refusal body carried partner data"
+
+
+async def test_a_declined_handler_is_422_on_the_sync_path() -> None:
+    # The shipped 202 path answers "202 without a message_id", which is a lie to a proxy client. A
+    # caller blocked on a reply deserves to be told the submission itself failed. Post-record, so
+    # count-and-log holds: the handler already wrote the message with status ERROR.
+    status, _, body = await _serve(InboundReply(ReplyOutcome.REPLY, body="x"), _decline=True)
+    assert status == 422
+    assert "not accepted" in body.decode()
+
+
+async def test_a_hostile_partner_content_type_cannot_take_the_turn_down() -> None:
+    # The header guard rejects CR/LF. The body is still good, so fall back to our own content type
+    # rather than 500 the caller — a partner controls this value.
+    status, headers, body = await _serve(
+        InboundReply(ReplyOutcome.REPLY, body=REPLY_BODY, content_type="text/plain\r\nX-Evil: 1")
+    )
+    assert status == 200
+    assert body.decode() == REPLY_BODY
+    assert "x-evil" not in headers, "a partner injected a header through Content-Type"
+    assert headers["content-type"] == "application/json"
