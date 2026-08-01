@@ -7333,3 +7333,59 @@ What the repeats support:
 **Related:** #115 (`06fd327d`, the budget fix), `harness/load/report.py` `_reconcile`, `harness/load/connscale/runner.py`, `harness/load/estate/runner.py`, `tests/test_load_runner.py`, `tests/test_harness_reconcile.py`, `messagefoundry/transports/mllp.py:1433`, and the sibling windows-2025 failure `test_coord_lock` (fixed in #109) — a *different* mechanism on the same leg.
 
 **Source:** investigation of the `test_run_load_end_to_end_no_loss` failures on `main` at `9b03057f` and `56f7d240`, 2026-08-01.
+
+---
+
+## 321. Leak gate is blind to the ported-estate site-code and partner-product token class
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **7/10** · Difficulty **3/10** · _fill-in_. The forbidden-content gate exits 0 on content carrying a ported-estate site code and a partner product name; the class was never gated, so the redaction that removed them was not a duplicate of any control.
+
+**Cluster:** Security / Supply chain. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** `scripts/security/scan_forbidden.py` does **not** detect the estate tokens that were sitting in `docs/BACKLOG.md` items #226/#228 until `f3c6d348` removed them — a six-digit ported-estate site code embedded in a feed-module identifier (`IB_FILE_HR_Materials_<site>_MFN.py`, `xform_<site>_to_erp_mfn`) and a partner ECG product name. Measured 2026-08-01 against the **real** token set (`loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1` — the CI-authoritative load, not the synthetic example):
+
+```
+git show HEAD~1:docs/BACKLOG.md > $T/docs/BACKLOG.md
+python scripts/security/scan_forbidden.py --path $T   # -> exit 0, clean
+```
+
+`.md` is **not** in `_SITE_SKIP_SUFFIXES` (`{".lock", ".svg"}`) and `docs/BACKLOG.md` is not in `scan-allowlist.txt`, so the file *was* scanned — the detectors simply do not cover these values. The configured `[site_prefix]` does not match this site code's prefix, and the partner product is absent from `[names]`/`[estate]`.
+
+**Why:** this is the repo's evergreen lesson firing again — *a GREEN gate is evidence only if you proved it can SEE that class.* The gate is a **required merge context**, so a green run reads to a reviewer as "no customer tokens present." Here it was green on content that contained two. Nothing stops the next estate-derived identifier landing the same way, and the migration estate is an active source of them (#226 is an open estate-wide sweep whose examples are drawn from real ported feeds).
+
+Note the item is **not** "the scanner is broken" — it is that the token *source* is incomplete and there is no test proving the detector set covers the classes the project actually leaks. Presence of a source is not sufficiency.
+
+**Proposed:**
+1. Add the real site-code prefix and the partner product name to the private token source (owner-run; the file is git-ignored and never committed), and to the `MEFOR_FORBIDDEN_TOKENS` Actions **and Dependabot** secret stores — both, or every Dependabot PR hard-fails the required check.
+2. Add a **negative** regression test: a fixture line carrying a synthetic value of each class must make the scanner exit 1. Today no test asserts the detectors can see a site code at all, which is why the hole was invisible.
+3. Consider a structural backstop for the estate-identifier *shape* (`[A-Z]{2}_[A-Z]+_[A-Z]+_\d{6}_[A-Z]{3}\.py`) so a NEW site code trips even before anyone adds it to the token list — the same argument #320-adjacent work makes for MRN/SSN/DOB detectors in `anon/leak.py` (ADR 0030 §5's known gap).
+
+**Related:** `scripts/security/scan_forbidden.py`, `scripts/security/scan-tokens.local.txt.example`, `tests/test_scan_forbidden.py`, `messagefoundry/anon/leak.py`, [`docs/SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md), #322.
+
+**Source:** public-repo disclosure audit, 2026-08-01 (commit `f3c6d348`). The tokens were found by reading, not by the gate.
+
+---
+
+## 322. Synthetic leak-gate placeholders can collide with the real gate's own guards
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. Redacting a real token to a `99xxxx` placeholder blocks every commit for any contributor running the synthetic token set, because `99` is that set's own site-code prefix. Caught pre-commit; nothing shipped.
+
+**Cluster:** Security / DX. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+**What:** while redacting the #321 tokens, the first replacement chosen was `990100` — following `scan-tokens.local.txt.example`'s own stated convention (*"a NON-REAL 99xxxx site prefix"*). Under the **real** token set that is clean. Under the **synthetic** set it is a hit:
+
+```
+MEFOR_FORBIDDEN_TOKENS=scripts/security/scan-tokens.local.txt.example \
+  python scripts/security/scan_forbidden.py --path $T
+# -> docs/BACKLOG.md:6951: site code  (x2), exit 1
+```
+
+`scripts/dev/setup-leak-gate.ps1 -Synthetic` is a **documented, supported contributor setup**, and the pre-commit hook passes `--require-tokens` so it blocks *every* commit, not just ones touching that file. A contributor with no access to the real token list would hit an unexplained hard block on an unrelated commit. The final commit uses the non-numeric `SITEA` instead, which cannot collide with any numeric detector.
+
+**Why:** the example file's "use a non-real 99xxxx prefix" guidance is written for the person filling in the **token list**, but it reads as general guidance for *placeholder values in prose* — and those are exactly the values the gate then scans. The convention is self-colliding for its second audience, and nothing warns you.
+
+**Proposed:** state in `scan-tokens.local.txt.example` (and in the redaction guidance) that a placeholder written **into tracked content** must not use any prefix that appears in `[site_prefix]` in *either* the real or the example set — prefer a non-numeric token (`SITEA`, `<site>`). Optionally have the scanner's hit message name the loaded set, so a synthetic-set false positive is self-diagnosing rather than reading as a real leak.
+
+**Related:** `scripts/security/scan-tokens.local.txt.example`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml` (the `--require-tokens` arm), #321.
+
+**Source:** public-repo disclosure audit, 2026-08-01; found by testing the redaction under both token sets before committing `f3c6d348`.
