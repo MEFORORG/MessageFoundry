@@ -561,6 +561,53 @@ class CapturedResponse:
 
 
 @dataclass(frozen=True)
+class ReplyWaitState:
+    """One metadata-only snapshot for a synchronous-reply wait tick (ADR 0154 D3).
+
+    **Metadata only, by construction.** Nothing here is encrypted at rest, so a tick decrypts nothing
+    and reads no body. The reply itself is fetched exactly once, via :meth:`correlate_response`, and
+    only after :attr:`latest_response_seq` proves a row is committed.
+
+    **The message's own status is the first field on purpose.** A routed row carries a NULL
+    ``destination_name`` (only ``handler_name`` is set), so a sibling handler's still-in-flight work
+    is *structurally invisible* to the destination-keyed query behind :attr:`row_states` — which
+    means an empty ``row_states`` does **not** mean "this message was excluded". Concluding that it
+    does is the defect ADR 0154 revision 1 shipped: a ``502`` returned for a message the engine then
+    delivered normally. Consult :attr:`message_is_terminal` before ever interpreting an empty list.
+    """
+
+    #: ``messages.status`` for the awaited message, or ``None`` when the row no longer exists.
+    message_status: str | None
+    #: ``queue.status`` for each **outbound** row of the awaited destination, in no guaranteed order.
+    #: Empty while a sibling handler is still upstream — see the class note.
+    row_states: tuple[str, ...]
+    #: Highest committed ``response_seq`` for this ``(message_id, destination_name)`` with
+    #: ``kind='response'``, or ``None`` when no reply has been captured. An ADR 0021 ``ack_sent`` row
+    #: is excluded, so the inbound ACK we returned can never be mistaken for the partner's reply.
+    latest_response_seq: int | None
+
+    @property
+    def message_is_terminal(self) -> bool:
+        """Whether no reply can still arrive for this message.
+
+        **Defined by EXCLUSION, never by enumeration**, and that is a correctness requirement rather
+        than a style preference. An enumerated terminal list
+        (``UNROUTED``/``FILTERED``/``NOT_DEPLOYED``/``ERROR``) silently omits **``PROCESSED``** — and
+        ``PROCESSED`` is exactly what the finalizer sets when a *sibling* handler delivered
+        successfully while the awaited destination's ``Send`` was declined, filtered out, or never
+        emitted by a code-first Handler. Enumerating therefore hangs that turn for the full
+        ``reply_timeout`` instead of failing fast, and a future :class:`MessageStatus` member would
+        inherit the same bug silently. Exclusion is total against the enum by construction.
+
+        A vanished message row is terminal too: nothing can arrive for a message that is gone.
+        """
+        return self.message_status is None or self.message_status not in (
+            MessageStatus.RECEIVED.value,
+            MessageStatus.ROUTED.value,
+        )
+
+
+@dataclass(frozen=True)
 class ConnectionEvent:
     """One metadata-only connection event (Corepoint-style transport/lifecycle log, #46), as returned
     by ``list_connection_events`` for the ``GET /events`` read surface. Never carries a frame, message
@@ -5781,6 +5828,40 @@ class MessageStore:
         count = int(row["n"]) if row is not None else 0
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
+
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Deliberately **not** built on :meth:`outbox_for`. That is a ``SELECT *`` fed through
+        ``_decode_row``, so it decrypts ``last_error`` and pulls the payload ciphertext on **every
+        tick** — a cost a poll loop cannot carry, and PHI this path has no business touching.
+        Modelled on :meth:`pending_depth` instead: three narrow indexed reads sharing one pooled
+        connection, decoding nothing.
+
+        See :class:`ReplyWaitState` for why the message's own status is returned alongside the row
+        states rather than the rows being trusted alone."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT status FROM messages WHERE id=?", (message_id,))
+            message_row = await cur.fetchone()
+            cur = await db.execute(
+                "SELECT status FROM queue WHERE message_id=? AND stage=? AND destination_name=?",
+                (message_id, Stage.OUTBOUND.value, destination_name),
+            )
+            queue_rows = await cur.fetchall()
+            # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must
+            # never be mistaken for the partner's reply.
+            cur = await db.execute(
+                "SELECT MAX(response_seq) AS seq FROM response"
+                " WHERE message_id=? AND destination_name=? AND kind=?",
+                (message_id, destination_name, "response"),
+            )
+            response_row = await cur.fetchone()
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
 
     # --- recovery / replay ---------------------------------------------------
 

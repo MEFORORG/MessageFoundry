@@ -123,6 +123,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendKeyConflict,
     ResendOutcome,
     ResendSourceAmbiguous,
@@ -4243,6 +4244,34 @@ class PostgresStore:
         count = int(row["n"]) if row is not None else 0
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
+
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        message's own status is returned alongside the destination's row states."""
+        message_row = await self._fetchone("SELECT status FROM messages WHERE id=$1", message_id)
+        queue_rows = await self._fetchall(
+            "SELECT status FROM queue WHERE message_id=$1 AND stage=$2 AND destination_name=$3",
+            message_id,
+            Stage.OUTBOUND.value,
+            destination_name,
+        )
+        # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must never
+        # be mistaken for the partner's reply.
+        response_row = await self._fetchone(
+            "SELECT MAX(response_seq) AS seq FROM response"
+            " WHERE message_id=$1 AND destination_name=$2 AND kind=$3",
+            message_id,
+            destination_name,
+            "response",
+        )
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
 
     # --- recovery / replay ---------------------------------------------------
 

@@ -60,6 +60,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendError,
     ResendKeyConflict,
     ResendOutcome,
@@ -775,6 +776,19 @@ class QueueStore(StoreLifecycle, Protocol):
         of rows still waiting and the enqueue time of the oldest (``None`` when empty). Lane key is
         stage-aware (``destination_name`` outbound, ``channel_id`` ingress). The workers use this to
         raise a ``queue_buildup`` alert when a lane stops draining. Cheap: a single COUNT + MIN."""
+        ...
+
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
+        status, the awaited destination's outbound row states, and the highest committed
+        ``response_seq`` for it.
+
+        The inbound HTTP listener's sync-reply path polls this while a caller is blocked, so it must
+        stay cheap and must decrypt **nothing** — see :class:`ReplyWaitState`, which also documents
+        why the message status is returned alongside the rows rather than the rows being read alone.
+        Returning ``latest_response_seq`` rather than the body is what keeps a tick metadata-only:
+        the reply is fetched once, through :meth:`correlate_response`, after a row is proven
+        committed."""
         ...
 
     async def reset_stale_inflight(
