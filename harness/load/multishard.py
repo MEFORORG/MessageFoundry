@@ -135,7 +135,7 @@ class MultiShardRecord:
     ack_p99_ms: float
 
     # Unconfirmed sends (in-flight at a connection close with no ACK seen). The reconcile excuses
-    # these from the intake bound up to max(total connections, half the run), and never below its
+    # these from the intake bound up to max(total connections, three quarters of the run), and never below its
     # `read >= sent // 2` intake floor; surfaced here so the tolerance width is visible on a PASSING
     # record too. Default 0 for older artifacts.
     timeouts: int = 0
