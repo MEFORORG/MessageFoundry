@@ -81,6 +81,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, ClaimPoolStatus, PoolStatus
 from messagefoundry.store.store import (
+    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
@@ -8503,6 +8504,33 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await self._event(cur, message_id, "viewed", None, actor or "", now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
+        (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await self._event(cur, message_id, event, destination, detail or "", now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()

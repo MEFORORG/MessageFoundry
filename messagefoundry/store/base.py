@@ -1021,6 +1021,31 @@ class QueueStore(StoreLifecycle, Protocol):
     async def events_for(self, message_id: str) -> Sequence[Row]: ...
 
     # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        Lives on this protocol rather than :class:`AuditStore` because ``message_events`` is the
+        per-message **disposition timeline** — queue-domain, the sibling of
+        :meth:`record_connection_event` — not the tamper-evident ``audit_log``. That placement is also
+        what lets ``pipeline/`` reach it through the store it already holds, with no cast.
+
+        Before this there was **no** public message-event writer: ``_event`` is private to each
+        backend and only ever called inside a store-owned transaction, so neither ``pipeline/`` nor
+        ``transports/`` could record a disposition event at all.
+
+        ``event`` is validated against :data:`MESSAGE_EVENT_KINDS` at runtime — the static
+        literal-call-site guard in ``tests/test_phi_logging_inventory.py`` AST-walks for a *constant*
+        first argument and therefore cannot see a kind forwarded through here."""
+        ...
+
     async def record_connection_event(
         self,
         *,

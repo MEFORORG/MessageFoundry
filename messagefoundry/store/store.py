@@ -995,15 +995,27 @@ def not_deployed_detail(destination: str) -> str:
 # be dropped); `dead`/`error`/`failed` are terminal failure dispositions an operator relies on;
 # `not_deployed` is the count-and-log record + NOT_DEPLOYED-disposition signal (see above). A blanket
 # "off" that dropped these would silently discard the compliance-critical trail.
-_AUDIT_FLOOR_EVENTS = frozenset({"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT})
+#: ``reply_timeout`` joins the floor (ADR 0154 D8): it is the one row that explains a customer
+#: complaint — "we called you and got a 504" — and an instance that thinned its logs to "errors" or
+#: "off" would lose exactly the record needed to answer that, on exactly the deployments most likely
+#: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
+#: the floor: it is thinnable like ``delivered``.
+_AUDIT_FLOOR_EVENTS = frozenset(
+    {"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+)
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
 #:
 #: Exported (not private) because ``docs/PHI.md`` §7 row 6 documents this list as the per-message
-#: disposition timeline and ASVS 16.1.1 scores that inventory: the doc named 9 of these 19 while
+#: disposition timeline and ASVS 16.1.1 scores that inventory: the doc once named 9 of these while
 #: reading as exhaustive. ``tests/test_phi_logging_inventory.py`` asserts the doc names every
 #: member and that the set matches the literal ``_event``/``_event_stmt`` call sites, so a new kind
 #: cannot ship undocumented.
+#:
+#: **The literal-call-site check cannot see a kind passed through** :meth:`MessageStore.record_message_event`
+#: — it AST-walks for constant first arguments, and that method forwards a variable. So that method
+#: validates its ``event`` against this set at runtime; the two guards together keep the vocabulary
+#: closed from both directions.
 MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
     {
         "received",
@@ -1025,6 +1037,11 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         "edit_resubmit",
         "viewed",
         NOT_DEPLOYED_EVENT,
+        # ADR 0154 D8 — the synchronous-reply outcome pair. Names, counts and waited_ms only; never a
+        # fragment of the partner's reply body (that is the PHI class this design keeps structurally
+        # out of every log, event and exception).
+        "reply_returned",
+        "reply_timeout",
     }
 )
 
@@ -7242,6 +7259,40 @@ class MessageStore:
         now = time.time() if now is None else now
         async with self._lock:
             await self._event(message_id, "viewed", None, actor or "", now)
+            await self._commit()
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        ``_event`` is private to each backend and is only ever called inside a store-owned
+        transaction, so before this there was no way for ``pipeline/`` or ``transports/`` to record a
+        disposition event at all. This is the public writer; it applies the same ``#63`` verbosity
+        gate and the same ``safe_text`` scrub on ``detail`` as every internal call site.
+
+        **``event`` is validated against** :data:`MESSAGE_EVENT_KINDS` **at runtime**, because the
+        static guard cannot cover this path: ``test_message_event_constant_matches_the_literal_emit_sites``
+        AST-walks for a *constant* first argument, and this method forwards a variable. Without the
+        runtime check a typo'd or undeclared kind would write silently and pass CI.
+
+        ``detail`` carries names, counts and timings only. On the sync-reply path in particular it
+        must never carry a fragment of the partner's reply — that rule is structural in the caller,
+        and ``safe_text`` here is defence in depth, not the control."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._event(message_id, event, destination, detail or "", now)
             await self._commit()
 
     async def record_audit(
