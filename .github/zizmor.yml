@@ -81,3 +81,34 @@ rules:
       # the line count would not re-fire the finding — that is what the test is for. If the line moves,
       # RE-ANCHOR it; do not broaden it to the file.
       - dependabot-lock-resync.yml:76
+
+  archived-uses:
+    ignore:
+      # contributor-assistant/github-action is ARCHIVED upstream (GitHub API `archived: true`; the date
+      # is observed from its last push, 2026-03-23, since `archived_at` is null). v2.6.1 is both the last
+      # tag and the last release, and the pin ca4a40a7d1004f18d9960b404b97e5f30a505a08 equals that tag
+      # exactly — so there is no future patch to bump to. Recorded as an ACCEPTED RESIDUAL, not a false
+      # positive: the finding is true.
+      #
+      # What the SHA pin buys, and what it does not. It closes the TAMPER axis completely — a bundled JS
+      # action's pinned SHA fully determines the bytes that run, and a deleted or re-registered namespace
+      # makes this step FAIL rather than run a stranger's code. It does NOT close the axis this audit is
+      # about: a flaw in the code already at that SHA will never be patched.
+      #
+      # NOT REPLACED, deliberately. `cla` is a REQUIRED status context (.github/required-contexts.txt)
+      # and it is this JOB's own conclusion, so a broken step blocks every contribution.
+      # pull_request_target / issue_comment workflows run only from the DEFAULT branch, so a swap cannot
+      # be exercised on the PR that makes it — it lands on main untested, with approvals at 0 and
+      # auto-merge armed. On a step holding a write token that any GitHub user can trigger by comment,
+      # trading a frozen SHA-pinned bundle for a less-reviewed fork is not self-evidently a security win.
+      #
+      # WHAT WILL FORCE THE DECISION, and it is not this lint: action.yml at this SHA declares
+      # `runs.using: node20`, as does the archived repo's HEAD, so no upstream release can ever
+      # re-declare node24. GitHub removes Node20 in fall 2026. Re-check before then. Full record and the
+      # replacement candidate: docs/adr/0034 (amendment, 2026-08-01).
+      #
+      # Line-anchored on purpose: a file-level entry would silently swallow a SECOND archived action
+      # added here later. Accepted cost is drift — an inserted line re-fires the finding with no change
+      # in risk. Re-anchor; do not broaden. Delete this entry when the action is replaced, or if upstream
+      # un-archives (the audit re-checks that every run).
+      - cla.yml:44
