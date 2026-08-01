@@ -70,11 +70,13 @@ yet implemented — the suffix documents intent today.)
 both built now: the **payload-agnostic ingress** contract ([ADR 0004](adr/0004-payload-agnostic-ingress.md) —
 an inbound's `content_type` selects the HL7 path vs. a `RawMessage` route) *and* the **inbound HTTP
 listener** it needed ([ADR 0023](adr/0023-inbound-http-listener.md) — `Http(...)`, below), so a partner
-can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. What is still
-deferred is the **SOAP-specific** half of `SOAP-IN` — the *synchronous* SOAP-envelope reply
-(block-on-captured-downstream-reply) — plus **request authentication** on the intake socket (API key /
-bearer): the listener's peer controls are the per-connection IP allowlist, TLS/mTLS, and the off-loopback
-exposed gate. Routing on HTTP method/path/headers is likewise deferred (the Handler sees the body).
+can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. **Request
+authentication on the intake socket has since shipped** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+increment A): `intake_auth` — API key, bearer or mTLS subject — now joins the per-connection IP
+allowlist, TLS/mTLS and the off-loopback exposed gate as a peer control. What is still deferred is the
+**SOAP-specific** half of `SOAP-IN` — the *synchronous* SOAP-envelope reply
+(block-on-captured-downstream-reply). Routing on HTTP method/path/headers is likewise deferred (the
+Handler sees the body).
 
 ## Authoring a connection
 
@@ -566,9 +568,7 @@ request didn't fully arrive within `receive_timeout`), `413` (over `max_body_byt
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
 `GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
 
-**Not built (first slice, ADR 0023).** **Request authentication** on the intake socket (API key / bearer /
-per-request token) is shaped but not shipped — the peer controls are the IP allowlist, TLS/mTLS and the
-exposed gate, so an exposed listener belongs behind the reverse proxy that terminates auth. The
+**Not built (first slice, ADR 0023).** The
 **synchronous downstream-reply** (SOAP-envelope block-on-captured-reply) path and **routing metadata**
 (HTTP method / path / headers as Router inputs) are defined follow-ons — a Handler sees the body only. The
 inbound **FHIR facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this
@@ -2382,7 +2382,7 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SFTP** | ✅ | ✅ | ✅ | ✅ | `SFTP-IN/OUT` shipped — `Sftp()`, source + destination, `[sftp]` extra; host-key verification on by default |
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
-| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped; request auth on the intake socket is deferred |
+| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
 | **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body can be **received** via `Http()`, but the *synchronous* SOAP-envelope reply is deferred |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
