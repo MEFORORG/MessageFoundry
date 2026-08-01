@@ -123,6 +123,7 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
@@ -131,6 +132,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneResultKind,
     StageDispatcher,
 )
+from messagefoundry.pipeline.sync_reply import SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
@@ -149,7 +151,12 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
-from messagefoundry.transports.base import ConnectionEventSink, IntakeAuditSink, IntakeRateLimiter
+from messagefoundry.transports.base import (
+    ConnectionEventSink,
+    IntakeAuditSink,
+    IntakeRateLimiter,
+    SyncReplyResolver,
+)
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
@@ -731,6 +738,11 @@ class RegistryRunner:
     ) -> None:
         self.registry = registry
         self.store = store
+        #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
+        #: process by construction (under HA the graph runs on the leader only), so process-local is
+        #: the right scope. It carries no information — every signal is a latency hint and the waiter
+        #: re-reads the store — so a shard that never sees a signal is merely slower, never wrong.
+        self._reply_rendezvous = ReplyRendezvous()
         # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
@@ -1256,6 +1268,40 @@ class RegistryRunner:
                 log.warning("intake auth audit write failed: %s", safe_exc(exc))
 
         return _sink
+
+    def _make_sync_reply_resolver(self, ic: InboundConnection) -> SyncReplyResolver | None:
+        """The per-inbound synchronous-reply resolver (ADR 0154 D2/D3), or ``None``.
+
+        ``None`` unless this inbound declares ``reply_from``, which is what keeps every other
+        connection on the shipped ``202`` path byte for byte (AC-8).
+
+        Also re-runs the cross-registry validation **here**, where ``[delivery]`` is resolved. The
+        offline arm in ``build_check_registry`` skips the effective ``ordering``/``max_attempts``
+        refusals whenever its caller could not supply those defaults, so this is the backstop that
+        makes them unconditional — a graph that would serialise every concurrent caller behind one
+        FIFO lane fails to start rather than degrading silently under load, and ADR 0031 isolates
+        that to this one connection.
+        """
+        if ic.spec.type is not ConnectorType.HTTP or not ic.spec.settings.get("reply_from"):
+            return None
+        check_http_sync_reply(
+            ic,
+            self.registry,
+            delivery=DeliverySettings(
+                ordering=self._ordering_default,
+                # The runner resolves an outbound's retry as `oc.retry or self._delivery_defaults`,
+                # so the inherited max_attempts is that default policy's — not a separate scalar.
+                retry_max_attempts=self._delivery_defaults.max_attempts,
+            ),
+        )
+        settings = ic.spec.settings
+        return SyncReplyResolverImpl(
+            self.store,
+            self._reply_rendezvous,
+            destination=str(settings["reply_from"]),
+            timeout=float(settings.get("reply_timeout") or 30.0),
+            content_type=str(settings.get("reply_content_type") or "passthrough"),
+        )
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
@@ -2102,6 +2148,13 @@ class RegistryRunner:
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
         source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
+        # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
+        # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
+        # reply_from, so every other connection keeps the shipped 202 path byte for byte.
+        source.sync_reply = self._make_sync_reply_resolver(ic)
+        if source.sync_reply is not None:
+            # ADR 0154 D5/AC-10: stop() wakes blocked turns through this BEFORE closing writers.
+            source.reply_drain = self._reply_rendezvous.drain
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic

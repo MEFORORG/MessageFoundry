@@ -407,6 +407,14 @@ class SourceConnector(abc.ABC):
     #: ``transports/`` keeps importing neither ``store/`` nor ``pipeline/`` (AC-17, CI-enforced).
     sync_reply: SyncReplyResolver | None = None
 
+    #: Optional drain hook for blocked synchronous-reply turns (ADR 0154 D5), **injected by the
+    #: runner after build**. ``stop()`` calls it **before** closing client writers, so a blocked turn
+    #: can still answer ``503`` + ``Retry-After`` through a live socket — a write issued after
+    #: ``close()`` is typically discarded with no exception at all, so the answer would simply
+    #: vanish. A plain callable rather than the rendezvous object, so ``transports/`` gains no
+    #: ``pipeline/`` import (AC-17). ``None`` on every inbound without ``reply_from``.
+    reply_drain: Callable[[str], None] | None = None
+
     @abc.abstractmethod
     async def start(
         self, handler: InboundHandler, *, leader_gate: Callable[[], bool] | None = None

@@ -470,6 +470,20 @@ class HttpSource(SourceConnector):
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
+        # ADR 0154 D5 — the PRE-CLOSE drain phase, and its position is the whole point (AC-10).
+        #
+        # Waking blocked waiters must happen BEFORE the writers below are closed. Revision 1 of the
+        # ADR promised both the 503 and the existing close-first ordering; those are mutually
+        # exclusive. A 503 written after close() lands on a dead transport, and post-close asyncio
+        # typically DISCARDS the write with no exception at all — so _write_safely's
+        # `except (TimeoutError, OSError)` never even sees it and the demoted caller gets a bare
+        # connection reset instead of the answer the HA argument depends on.
+        #
+        # Each woken turn resolves `shutting_down` and writes its own 503 + Retry-After through its
+        # still-open writer on the way out, inside the same bounded grace the teardown already has.
+        # No-op when nothing is armed, so a listener with no reply_from is byte-identical.
+        if self.reply_drain is not None:
+            self.reply_drain("shutting_down")
         # Close established clients BEFORE awaiting the server (server.wait_closed() hangs on py3.12.1+
         # waiting for in-flight handlers of a peer holding its connection open). A request mid-handler
         # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
