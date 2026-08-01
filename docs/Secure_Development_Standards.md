@@ -391,7 +391,7 @@ MessageFoundry (MEFOR) is an open-source **HL7 v2.x integration engine** — a c
 | V16 | Security Logging and Error Handling | Yes | Tamper-resistant audit log; fail-closed errors; no PHI/secrets in logs |
 | V17 | WebRTC | **No** | Not applicable — no WebRTC; documented exclusion |
 
-*In scope: 13 chapters active today (V1–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusion: V17.*
+*In scope: 14 chapters active today (V1–V8, V11–V16). V10 (OAuth/OIDC) is now **partly active** — outbound OAuth 2.0 client-credentials / SMART on FHIR are built (ADR 0024); inbound OAuth/OIDC remains N/A. V9 (JWT) is in scope when JWT is introduced — currently N/A. Documented exclusion: V17.*
 
 ### A.4 Interface authentication mechanisms
 
