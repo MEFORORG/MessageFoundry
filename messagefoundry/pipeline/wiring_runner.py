@@ -6198,26 +6198,49 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
             )
 
 
-def _check_smart_token_url_egress(
+# Every settings key naming a SECOND egress host that the HTTP family POSTs **credentials** to — a
+# host distinct from the data ``url`` the caller's own gate already checks. Each one must ride the
+# same ``[egress].allowed_http`` allowlist or it is a fail-open credential-exfiltration hole: the
+# allowlist would gate the data host while the credential leaves for anywhere.
+#
+# ADD A KEY HERE when a new credential-bearing endpoint setting is introduced. That is the whole
+# maintenance contract — both call sites iterate this table, so a new key is gated on both arms at
+# once and cannot repeat the DELTA-04 drift (one arm gated, the other not).
+_CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
+    # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
+    ("smart_token_url", "SMART token endpoint"),
+    # ADR 0126 — the client-credentials grant POSTs ``client_id`` + ``client_secret`` here, either as
+    # form fields or as a Basic header (``transports/http_auth.py`` ``_fetch_token``). Ungated until
+    # 2026-07-31: the scheme was constrained to http(s) and nothing else, so a crafted
+    # ``oauth2_token_url`` exfiltrated the client credentials to any host while ``[egress]
+    # .allowed_http`` gated only the data URL. Found re-scoring ASVS 14.2.3.
+    ("oauth2_token_url", "OAuth2 token endpoint"),
+)
+
+
+def _check_credential_token_url_egress(
     label: str, settings: Mapping[str, Any], allowed_http: list[str]
 ) -> None:
-    """Gate a SMART Backend Services token endpoint (ADR 0024): the connector POSTs the signed
-    ``client_assertion`` there, so a crafted ``smart_token_url`` pointing at an un-allowlisted host
-    would exfiltrate the assertion (a fail-open hole). Shared by the FHIR **outbound** and the
-    **FhirLookup** read arm so the two never drift out of lockstep — DELTA-04 was exactly that drift
-    (the read arm gated only ``url``). Only REST/FHIR/FhirLookup carry the key; an unset value is a
-    no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
-    token_url = str(settings.get("smart_token_url", ""))
-    if token_url and not _http_egress_allowed(token_url, allowed_http):
-        host = urllib.parse.urlsplit(token_url).hostname or ""
-        log.warning(
-            "egress denied: %s SMART token endpoint host %r not in [egress].allowed_http",
-            label,
-            host,
-        )
-        raise WiringError(
-            f"{label}: SMART token endpoint host {host!r} is not in the [egress].allowed_http allowlist"
-        )
+    """Gate every credential-bearing token endpoint on an HTTP-family connection against
+    ``[egress].allowed_http`` — see :data:`_CREDENTIAL_EGRESS_URL_KEYS` for the keys and why each one
+    carries a secret. A crafted token URL pointing at an un-allowlisted host would exfiltrate the
+    credential (a fail-open hole), so this is checked at config load/reload/start alongside the data
+    host. Shared by the FHIR/REST **outbound** and the **FhirLookup** read arm so the two never drift
+    out of lockstep — DELTA-04 was exactly that drift (the read arm gated only ``url``). An unset key
+    is a no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
+    for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
+        token_url = str(settings.get(key, "") or "")
+        if token_url and not _http_egress_allowed(token_url, allowed_http):
+            host = urllib.parse.urlsplit(token_url).hostname or ""
+            log.warning(
+                "egress denied: %s %s host %r not in [egress].allowed_http",
+                label,
+                what,
+                host,
+            )
+            raise WiringError(
+                f"{label}: {what} host {host!r} is not in the [egress].allowed_http allowlist"
+            )
 
 
 def check_fhir_lookup_allowed(
@@ -6246,10 +6269,11 @@ def check_fhir_lookup_allowed(
             raise WiringError(
                 f"FhirLookup {name!r}: host {host!r} is not in the [egress].allowed_http allowlist"
             )
-        # The SMART token endpoint (ADR 0024) is a SECOND egress host on this read arm — gate it with
-        # the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
-        # with_smart_backend()) exfiltrates the signed client_assertion to an unlisted host (DELTA-04).
-        _check_smart_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
+        # Every credential-bearing token endpoint is a SECOND egress host on this read arm — gate
+        # each with the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
+        # with_smart_backend()) exfiltrates the signed client_assertion, and a crafted
+        # oauth2_token_url exfiltrates client_id + client_secret, to an unlisted host (DELTA-04).
+        _check_credential_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
@@ -6629,10 +6653,13 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: {dest.type.value} host {host!r} is not in the "
                 "[egress].allowed_http allowlist"
             )
-        # ADR 0024: the SMART Backend Services token endpoint is a SECOND egress host — the connector
-        # POSTs the signed client_assertion there — so gate it with the same allowlist. Shared helper,
-        # so the FhirLookup read arm in check_fhir_lookup_allowed stays in lockstep (DELTA-04).
-        _check_smart_token_url_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_http)
+        # Credential-bearing token endpoints are SECOND egress hosts — the connector POSTs the signed
+        # client_assertion (ADR 0024) or client_id + client_secret (ADR 0126) there — so gate each
+        # with the same allowlist. Shared helper, so the FhirLookup read arm in
+        # check_fhir_lookup_allowed stays in lockstep (DELTA-04).
+        _check_credential_token_url_egress(
+            f"outbound {dest.name!r}", dest.settings, egress.allowed_http
+        )
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(dest.settings.get("server", ""))
         port = dest.settings.get("port", 1433)
