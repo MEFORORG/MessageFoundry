@@ -6910,13 +6910,13 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 **Cluster:** Migration / DX. **Priority:** P2. **Verdict:** build (per-feed, mechanical). **Severity:** low.
 
-**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → iECG TraceMaster port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
+**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → vendor ECG management system port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
 
 **Why:** The monolith co-mingles three concerns — transport config, routing, and a large pile of transform logic — in one file, which is hard to review, unit-test, and GUI-edit. The engine **already supports** the split (the graph is name-wired and flat-merged across the config dir — zero engine change); this is authoring hygiene plus Corepoint-familiar separation, and it moves connections onto the data surface (ADR 0007) and the transform steps into small, testable helpers.
 
 **Also:** align the IDE Corepoint-import / scaffold path (`ide/`) to **emit** the Hybrid layout so future ports start compliant; and consider a recursive-glob / folder-per-feed loader enhancement if the **flat** config dir gets unwieldy at estate scale (hundreds of feeds → hundreds of flat prefixed files, since `load_config` globs `*.py` non-recursively today).
 
-**Source:** config-convention decision (2026-07-11, Scott Hall); motivated by the `IB_400` EKG/ECG → iECG TraceMaster port review.
+**Source:** config-convention decision (2026-07-11, Scott Hall); motivated by the `IB_400` EKG/ECG → vendor ECG management system port review.
 
 ---
 
@@ -6948,7 +6948,7 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
-**What:** the MessageFoundry sidebar search (the box over the MESSAGEFOUNDRY view) matches **connection** names only. Searching for a **handler / router / transform** name — e.g. `xform_600100_to_erp_mfn` — returns “No matching results” even though that handler exists (it is defined inside `IB_FILE_HR_Materials_600100_MFN.py`, a role-combined feed module whose *filename* is the connection, not the handler). VS Code's own `Ctrl+P` also misses it, because the name is a symbol inside a file, not a filename.
+**What:** the MessageFoundry sidebar search (the box over the MESSAGEFOUNDRY view) matches **connection** names only. Searching for a **handler / router / transform** name — e.g. `xform_SITEA_to_erp_mfn` — returns “No matching results” even though that handler exists (it is defined inside `IB_FILE_HR_Materials_SITEA_MFN.py`, a role-combined feed module whose *filename* is the connection, not the handler). VS Code's own `Ctrl+P` also misses it, because the name is a symbol inside a file, not a filename.
 
 **Why:** operators think in terms of the **transform / message name**, not the feed file it happens to live in. The connection→router→handler wiring is a graph (CLAUDE.md §1), so a user who knows the transform name has no direct path to its definition. It is sharper for the ported migration estate where feeds are still monolithic (see #226): one file holds the connection + router + handler, so the handler name appears nowhere in the tree or the filename.
 
