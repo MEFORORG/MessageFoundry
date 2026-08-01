@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -49,11 +50,34 @@ def repo(tmp_path: Path) -> Path:
 
 
 def acquire(
-    repo: Path, *, name: str = "t", timeout: int = 2, hold_ms: int = 0
+    repo: Path,
+    *,
+    name: str = "t",
+    timeout: int = 2,
+    hold_ms: int = 0,
+    barrier: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Take the lock, optionally hold it, release. Prints ACQUIRED on success."""
+    """Take the lock, optionally hold it, release. Prints ACQUIRED on success.
+
+    ``barrier`` makes concurrency REAL rather than assumed. Without it a claimant races for the lock
+    the moment *its own* ``pwsh`` has booted, and cold-start times vary by far more than any
+    reasonable hold: a straggler that arrives after the winner has already released then wins
+    legitimately, and the caller sees two winners against a lock that never misbehaved. With it, the
+    claimant signals readiness *after* start-up and waits for the go file, so the whole cohort
+    arrives within milliseconds of each other however long any individual process took to start.
+    """
+    gate = ""
+    if barrier is not None:
+        gate = (
+            f"[IO.File]::WriteAllText((Join-Path '{barrier}' \"ready-$PID\"), ''); "
+            f"$bd = (Get-Date).AddSeconds(120); "
+            f"while (-not (Test-Path (Join-Path '{barrier}' 'go'))) {{ "
+            f"if ((Get-Date) -gt $bd) {{ throw 'barrier timeout' }}; "
+            f"Start-Sleep -Milliseconds 10 }}; "
+        )
     script = (
         f". '{LOCK}'; "
+        f"{gate}"
         f"$l = Enter-CoordLock -Name '{name}' -TimeoutSeconds {timeout} -Repo '{repo}'; "
         f"Write-Output 'ACQUIRED'; "
         f"Start-Sleep -Milliseconds {hold_ms}; "
@@ -76,10 +100,36 @@ def test_lock_can_be_taken_and_released(repo: Path) -> None:
     assert "ACQUIRED" in second.stdout, second.stderr
 
 
-def test_only_one_of_eight_concurrent_claimants_wins(repo: Path) -> None:
-    """Eight real processes, one lock, a hold long enough that the overlap is genuine."""
+def test_only_one_of_eight_concurrent_claimants_wins(repo: Path, tmp_path: Path) -> None:
+    """Eight real processes, one lock, all reaching for it at the same instant.
+
+    The barrier is load-bearing, not ceremony. ``ThreadPoolExecutor`` only starts the eight processes
+    together; it says nothing about when each one, after ``pwsh`` start-up, actually reaches
+    ``Enter-CoordLock``. On an idle machine that spread is tens of milliseconds and the test looks
+    fine; on a loaded CI runner cold-starting eight shells it can exceed the 1500 ms hold, and then a
+    straggler finds the lock already released and wins on its own merits. The result is two winners
+    and an accusation against a mutex that did nothing wrong — measured, not theorised: delaying one
+    claimant by 1.9 s reproduces exactly that against the unmodified lock.
+
+    Releasing the cohort only once all eight are parked on the gate also makes the file's headline
+    claim true rather than hopeful: the overlap is now guaranteed, so a lock that did not lock could
+    not pass this by getting lucky with scheduling.
+    """
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+
     with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: acquire(repo, timeout=1, hold_ms=1500), range(8)))
+        claims = [
+            pool.submit(acquire, repo, timeout=1, hold_ms=1500, barrier=barrier) for _ in range(8)
+        ]
+        deadline = time.monotonic() + 120
+        while len(list(barrier.glob("ready-*"))) < 8:
+            assert time.monotonic() < deadline, (
+                f"only {len(list(barrier.glob('ready-*')))} of 8 claimants reached the barrier"
+            )
+            time.sleep(0.02)
+        (barrier / "go").write_text("", encoding="utf-8")
+        results = [c.result() for c in claims]
 
     winners = [r for r in results if "ACQUIRED" in r.stdout]
     assert len(winners) == 1, f"expected exactly 1 winner, got {len(winners)}"

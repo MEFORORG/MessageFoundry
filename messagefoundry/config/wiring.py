@@ -651,6 +651,13 @@ _SECRET_SETTING_KEYS = frozenset(
         # name), so it is intentionally not listed.
         "credential_username",
         "credential_password",
+        # ADR 0154 (D6) — the inbound HTTP listener's intake-auth peer credential and its rotation
+        # partner. Both are env()-only (enforced by the Http() factory) and rotatable, so they are
+        # deliberately NOT in _NON_ROTATABLE_SECRET_SETTING_KEYS: that enrols them in the ASVS 13.3.4
+        # fingerprinter and the 13.1.4 registration gate, which is the point. ``intake_api_key_header``
+        # is a header NAME, not a credential, and is classified non-secret in tests/test_connection_api.
+        "intake_api_key",
+        "intake_api_key_next",
     }
 )
 
@@ -1079,6 +1086,24 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
+    intake_auth: Literal[
+        "none", "api_key", "bearer", "mtls_subject"
+    ] = "none",  # credential a peer must present to POST
+    intake_api_key: EnvRef
+    | None = None,  # the api_key/bearer credential (env() only — never inline)
+    intake_api_key_next: EnvRef
+    | None = None,  # rotation: accepted alongside intake_api_key, so a partner key rotates without an outage
+    intake_api_key_header: str = "x-api-key",  # header carrying the api_key credential (a header NAME, not a secret)
+    intake_client_subjects: Sequence[str]
+    | None = None,  # mtls_subject allow-list, QUALIFIED: "CN:<v>" / "SAN:DNS:<v>"
+    intake_auth_health: Literal[
+        "require", "allow"
+    ] = "require",  # whether GET/HEAD probes need the credential too
+    intake_auth_rate_limit: int
+    | None = 10,  # FAILED intake-auth attempts per minute per peer (0/None disables)
+    intake_auth_rate_limit_global: int
+    | None = 60,  # FAILED intake-auth attempts per minute across all peers
 ) -> ConnectionSpec:
     """An **inbound HTTP/1.1 web-service listener** (ADR 0023) — a connector-owned bound socket that a
     partner ``POST``s a body to (REST / SOAP-body / FHIR / webhook). Source-only: it never delivers. The
@@ -1104,23 +1129,151 @@ def Http(
     identity (``tls_ca_file`` adds opt-in mTLS); ``tls_key_password`` decrypts an encrypted key (supply via
     ``env()``). The runner's exposed-gate refuses a **non-loopback** HTTP listener **without** TLS at start
     (cleartext PHI can't cross an off-loopback socket by accident) — set ``tls=True`` or pass
-    ``serve --allow-insecure-bind`` on a trusted, firewalled segment."""
-    return ConnectionSpec(
-        ConnectorType.HTTP,
-        {
-            "port": port,
-            "encoding": encoding,
-            "max_connections": max_connections,
-            "receive_timeout": receive_timeout,
-            "max_body_bytes": max_body_bytes,
-            "max_header_bytes": max_header_bytes,
-            "tls": tls,
-            "tls_cert_file": tls_cert_file,
-            "tls_key_file": tls_key_file,
-            "tls_key_password": tls_key_password,
-            "tls_ca_file": tls_ca_file,
-        },
-    )
+    ``serve --allow-insecure-bind`` on a trusted, firewalled segment.
+
+    **Intake authentication (ADR 0154 D6).** ``intake_auth`` requires a peer to prove who it is before it
+    may submit a message. It is a sibling of ``source_ip_allowlist`` — a **peer control on this
+    connector** — not admin RBAC: it mints no identity, opens no session, and authorises *submitting*,
+    never *reading*. ``api_key`` reads the credential from ``intake_api_key_header``, ``bearer`` from
+    ``Authorization: Bearer``, and ``mtls_subject`` maps the verified client certificate's subject/SAN
+    against ``intake_client_subjects``. Set ``intake_api_key_next`` to rotate a partner key without an
+    outage: both are accepted while the partner cuts over.
+
+    **TLS is confidentiality; intake auth is authentication.** Enabling one is never an argument for
+    relaxing the other. In particular a bare ``tls`` + ``tls_ca_file`` means "any certificate this CA ever
+    signed", with no subject binding at all — which is why ``mtls_subject`` additionally requires
+    ``intake_client_subjects``.
+
+    Health probes are **inside** the gate by default; ``intake_auth_health="allow"`` exempts ``GET``/
+    ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
+    where" oracle on a PHI intake socket."""
+    settings: dict[str, Any] = {
+        "port": port,
+        "encoding": encoding,
+        "max_connections": max_connections,
+        "receive_timeout": receive_timeout,
+        "max_body_bytes": max_body_bytes,
+        "max_header_bytes": max_header_bytes,
+        "tls": tls,
+        "tls_cert_file": tls_cert_file,
+        "tls_key_file": tls_key_file,
+        "tls_key_password": tls_key_password,
+        "tls_ca_file": tls_ca_file,
+        "intake_auth": intake_auth,
+        "intake_api_key": intake_api_key,
+        "intake_api_key_next": intake_api_key_next,
+        "intake_api_key_header": intake_api_key_header,
+        "intake_client_subjects": list(intake_client_subjects) if intake_client_subjects else None,
+        "intake_auth_health": intake_auth_health,
+        "intake_auth_rate_limit": intake_auth_rate_limit,
+        "intake_auth_rate_limit_global": intake_auth_rate_limit_global,
+    }
+    _validate_intake_auth(settings)
+    return ConnectionSpec(ConnectorType.HTTP, settings)
+
+
+#: The intake-auth modes that carry a shared-secret credential (as opposed to a client certificate).
+_INTAKE_KEY_MODES = ("api_key", "bearer")
+#: Qualified-namespace prefixes an ``intake_client_subjects`` entry may take, mirroring what
+#: :func:`~messagefoundry.credential.cert_name_candidates` actually yields.
+_INTAKE_SUBJECT_PREFIXES = ("CN:", "SAN:")
+
+
+def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
+    """Refuse an intake-auth configuration that cannot work, at **factory** time (ADR 0154 D4).
+
+    Runs with no store and no posture, so it fires identically in ``messagefoundry check``, in dry-run,
+    and through the ``connections.toml`` desugar (which calls this same factory). Every rule here
+    catches a configuration whose failure mode is otherwise silent or total:
+
+    * a mode that needs a credential, with none configured — the listener would refuse 100 % of traffic;
+    * ``mtls_subject`` without ``tls`` + ``tls_ca_file`` — the ``SSLContext`` never requests a client
+      certificate, so ``getpeercert()`` comes back empty and deny-by-default ``403``s everything, with
+      no start-time error to explain it;
+    * ``mtls_subject`` with no subjects — "any certificate this CA ever signed" is not a peer control;
+    * an unqualified subject entry — ``cert_name_candidates`` yields ``"CN:<v>"`` / ``"SAN:DNS:<v>"``, so
+      a bare ``partner.example`` matches nothing and 403s every request from the very partner it names;
+    * a credential configured while ``intake_auth="none"`` — nothing would ever check it, and an
+      operator reading that config would reasonably believe the listener was protected.
+
+    The secret itself must be an ``env()`` reference with no default and no cast, mirroring
+    ``File(credential_password=...)`` (ADR 0132): a fallback credential is a silent credential.
+    """
+    mode = settings["intake_auth"]
+    if mode not in ("none", *_INTAKE_KEY_MODES, "mtls_subject"):
+        raise WiringError(
+            f"Http intake_auth must be one of none/api_key/bearer/mtls_subject — got {mode!r}"
+        )
+    if settings["intake_auth_health"] not in ("require", "allow"):
+        raise WiringError(
+            "Http intake_auth_health must be 'require' or 'allow' — got "
+            f"{settings['intake_auth_health']!r}"
+        )
+
+    for name in ("intake_api_key", "intake_api_key_next"):
+        value = settings[name]
+        if value is None:
+            continue
+        if not isinstance(value, EnvRef):
+            raise WiringError(
+                f"Http {name} must be an env() reference — an intake credential is a secret and is "
+                f"never inline (CLAUDE.md §5); e.g. {name}=env('acme_intake_key')"
+            )
+        if value.default is not _UNSET:
+            raise WiringError(
+                f"Http {name} env() must not carry a default= — a fallback intake credential would "
+                "be a silent credential"
+            )
+        if value.cast is not None:
+            raise WiringError(f"Http {name} env() must not carry a cast= (a credential is text)")
+
+    if mode == "none":
+        configured = [
+            n
+            for n in ("intake_api_key", "intake_api_key_next", "intake_client_subjects")
+            if settings[n]
+        ]
+        if configured:
+            raise WiringError(
+                f"Http sets {', '.join(configured)} but intake_auth='none', so no credential is ever "
+                "checked — set intake_auth, or remove the setting; a control that is configured but "
+                "never consulted reads as protection that does not exist"
+            )
+        return
+
+    if mode in _INTAKE_KEY_MODES:
+        if settings["intake_api_key"] is None:
+            raise WiringError(
+                f"Http intake_auth={mode!r} needs intake_api_key — supply it via env() "
+                "(intake_api_key=env('acme_intake_key')); an unset value is not an env-resolution "
+                "failure, so nothing else would catch it"
+            )
+        if not settings["intake_api_key_header"]:
+            raise WiringError("Http intake_api_key_header must be a non-empty header name")
+        return
+
+    # mtls_subject
+    if not settings["tls"] or not settings["tls_ca_file"]:
+        raise WiringError(
+            "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
+            "SSLContext never requests a client certificate, so getpeercert() is empty and every "
+            "request is refused 403 with no start-time error to explain it"
+        )
+    subjects = settings["intake_client_subjects"]
+    if not subjects:
+        raise WiringError(
+            "Http intake_auth='mtls_subject' needs a non-empty intake_client_subjects — tls_ca_file "
+            "alone means 'any certificate this CA ever signed', which binds no subject and "
+            "authenticates no one in particular"
+        )
+    unqualified = [s for s in subjects if not str(s).startswith(_INTAKE_SUBJECT_PREFIXES)]
+    if unqualified:
+        raise WiringError(
+            f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "
+            "'CN:' / 'SAN:<type>:' prefix. A certificate's names are matched as 'CN:<value>' and "
+            "'SAN:DNS:<value>' so a spoofed commonName cannot collide with a pinned SAN; a bare name "
+            "matches nothing and would 403 every request from the partner it names"
+        )
 
 
 def File(

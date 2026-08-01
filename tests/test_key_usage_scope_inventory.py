@@ -75,6 +75,11 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
     "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
     "not a key and it protects nothing",
+    "Inbound HTTP intake credential comparison": "keyless — SHA-256 digests of both sides compared "
+    "with hmac.compare_digest, which is a constant-time byte comparison and NOT a keyed MAC. The "
+    "digesting exists to make the comparison length-blind, not to authenticate anything. The "
+    "configured secret is an env()-sourced connector setting whose lifecycle is the rotation "
+    "schedule, not engine-held key material",
 }
 
 

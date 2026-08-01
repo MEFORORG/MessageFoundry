@@ -128,6 +128,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
+    # ADR 0154 (D6): the neutral credential leaf both the transports and the API depend on.
+    # `hmac.compare_digest` over fixed-width SHA-256 digests of BOTH sides — the digesting is what
+    # makes the comparison length-blind, so a credential's length cannot leak by timing. Not a
+    # password hash (no KDF, no stored verifier): this compares a presented shared secret against a
+    # configured one that is already in memory from env(). Password storage remains argon2 in
+    # auth/passwords.py.
+    "messagefoundry/credential.py": frozenset({"hashlib", "hmac"}),
     # CONSOLE-3 (ADR 0088: extracted from console/client.py to the Qt-free apiclient library): the
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
