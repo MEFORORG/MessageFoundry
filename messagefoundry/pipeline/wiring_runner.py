@@ -4352,6 +4352,23 @@ class RegistryRunner:
                 )
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                # ADR 0154 D3 — the latency hint, and its POSITION is the correctness argument.
+                #
+                # Strictly after the await returned NORMALLY. Under SQLite group commit
+                # complete_with_response enrols in a shared batch whose future resolves post-commit,
+                # so a signal here is committed-authoritative; in a `finally`, or before the await,
+                # it would fire on a transaction that may have rolled back.
+                #
+                # It is only ever a hint — the woken turn re-reads the store — so both ways it can be
+                # "wrong" are harmless: it can fire for a vanished row that wrote nothing
+                # (complete_with_response returns normally in that case), and it can fail to fire at
+                # all when an engine shard other than the listener's owns this lane. The first costs
+                # one extra read; the second costs latency, never correctness.
+                #
+                # NOT placed beside the _wake_lane below, which is where the ADR says to put it: that
+                # call is nested under `if reingress_to is not None`, and a reply_from outbound never
+                # re-ingresses, so a hint there would be unreachable dead code.
+                self._reply_rendezvous.signal(item.message_id, item.destination_name)
                 if reingress_to is not None:
                     # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
                     # (reingress_to), NOT this delivery worker's own OUTBOUND lane.

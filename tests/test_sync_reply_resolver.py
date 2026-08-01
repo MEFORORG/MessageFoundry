@@ -419,3 +419,34 @@ async def test_a_cancelled_turn_does_not_leak_a_live_waiter() -> None:
     with pytest.raises(asyncio.CancelledError):
         await task
     assert metrics.live == 0, "a cancelled turn leaked a live waiter into the gauge"
+
+
+async def test_the_hint_collapses_the_wait_to_well_under_a_poll_period() -> None:
+    """C12's whole value: the reply is returned on the signal, not on the next scheduled read.
+
+    Asserted as a READ COUNT rather than a wall-clock margin — a timing assertion here would be the
+    kind of load-sensitive test that fails on a slow runner for reasons unrelated to the code.
+    """
+    rv = ReplyRendezvous()
+    store = _Store([_flowing(), _flowing(seq=1)], [_Row()])
+    resolver = _resolver(store, rendezvous=rv, timeout=30.0)
+
+    async def deliver_soon() -> None:
+        await asyncio.sleep(0.05)
+        store._states = [_flowing(seq=1)]  # the capture commits...
+        rv.signal("m1", DEST)  # ... and the hint fires, exactly as the delivery worker does
+
+    await asyncio.gather(resolver("m1"), deliver_soon())
+
+    # Without the hint this would have taken ceil(0.05 / poll_period) reads and returned late; with
+    # it, the waiter wakes on the signal and re-reads once.
+    assert store.state_reads <= 3, f"the hint did not shorten the wait ({store.state_reads} reads)"
+
+
+async def test_a_missing_hint_still_returns_the_reply_just_later() -> None:
+    # The property that makes the hint safe to be wrong, and safe to be absent: an engine shard that
+    # never sees the signal still resolves correctly off the poll. Latency, never correctness.
+    store = _Store([_flowing(), _flowing(), _flowing(seq=1)], [_Row()])
+    reply = await _resolver(store, timeout=30.0)("m1")  # no signal is ever fired
+    assert reply.outcome is ReplyOutcome.REPLY
+    assert reply.body == BODY
