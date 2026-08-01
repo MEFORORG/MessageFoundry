@@ -113,6 +113,29 @@ jobs:
           git fetch --no-tags --depth=200 origin main
           python scripts/hooks/ledger_check.py --ci
 
+      # ALSO DELIBERATELY UNGATED, for exactly the reason the step above is — and it was NOT, which
+      # cost `main`.
+      #
+      # Two guards police docs/BACKLOG.md. The number-space gate above is ungated because "gating it
+      # would skip it on exactly the pull requests it exists to police". The STATUS invariant was
+      # reachable only through pytest, which IS gated on `code == 'true'` — so on a BACKLOG-only PR
+      # (the exact shape it exists to check) it did not run at all.
+      #
+      # On 2026-08-01 that landed a #320 entry whose banner used an emoji the invariant does not
+      # accept. The PR was docs-only, went green in seconds without compiling the suite, merged, and
+      # red `main` for every other session until someone else's PR tripped over it. A 0.6s markdown
+      # parse would have caught it. One hardened guard and one unhardened guard over the same file is
+      # worse than neither, because the hardened one makes it reasonable to assume BACKLOG changes are
+      # covered.
+      #
+      # No install needed, so the step above's "git + stdlib python, costs seconds" property holds:
+      # scripts/docs/backlog_status_check.py imports only argparse/re/sys/pathlib and has its own CLI.
+      # tests/test_backlog_status_check.py imports that SAME module, so there is one implementation and
+      # the unit tests keep covering its edge cases — this only adds the always-on invocation.
+      - name: Backlog status invariant (ungated — see above)
+        if: runner.os == 'Linux'
+        run: python scripts/docs/backlog_status_check.py
+
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
