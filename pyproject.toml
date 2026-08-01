@@ -263,7 +263,7 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 ci-scanners = [
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "zizmor==1.5.2",
+    "zizmor==1.28.0",
 ]
 # The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's
 # output, a floor where nothing does:
