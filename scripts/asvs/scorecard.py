@@ -27,12 +27,27 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final, Literal
 
-Verdict = Literal["pass", "partial", "fail", "na", "unverified"]
+Verdict = Literal["pass", "partial", "fail", "na", "needs-review", "unverified"]
 
 #: The scoring buckets. ``unverified`` is deliberately first-class (ADR 0156 §5): a cell inherited from
 #: an earlier assessment and never re-read against the requirement text is NOT a Pass, and conflating
 #: the two is what let ~219 unchecked verdicts hide inside a headline.
-VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", "na", "unverified"})
+VERDICTS: Final[frozenset[str]] = frozenset(
+    {"pass", "partial", "fail", "na", "needs-review", "unverified"}
+)
+
+#: ASVS 5.0 defines only three verdicts — verified, exception, and non-applicable-with-rationale. The
+#: strings "partially implemented" and "not implemented" appear nowhere in it, and the one prominent
+#: OSS ASVS tool declines to model partial too. Everything here beyond pass/fail/na is OUR extension,
+#: defined in docs/ASVS-ASSESSMENT-METHOD.md §1 — an undefined grade is one two assessors apply
+#: differently, which is exactly how 11.7.1, 3.7.3 and 5.4.3 each changed verdict in a single day.
+LOCAL_EXTENSION_VERDICTS: Final[frozenset[str]] = frozenset(
+    {"partial", "needs-review", "unverified"}
+)
+
+#: A verdict that has actually been reached. `unverified` and `needs-review` are NOT among them:
+#: the first was never examined, the second was examined and left open on purpose.
+DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", "na"})
 
 #: How far from the recorded line the expected token may drift before the anchor is considered broken.
 #: Anchors name a TOKEN rather than a bare line number precisely so that ordinary edits above a cell's
@@ -77,6 +92,7 @@ class Cell:
     posture: str = "single"
     last_verified: str = ""
     verified_at: str = ""
+    reviewed_by: str = ""
     evidence: tuple[Anchor, ...] = ()
     absence: tuple[Absence, ...] = ()
 
@@ -98,6 +114,19 @@ class Findings:
     @property
     def ok(self) -> bool:
         return not self.problems
+
+
+def corpus_digest(path: Path) -> str:
+    """SHA-256 of the corpus file, so the pin is checkable rather than asserted.
+
+    The corpus MUST come from the tagged ``v5.0.0_release`` asset. ``master`` is the bleeding-edge
+    branch and a rolling "latest" release republishes identical filenames, so an unpinned fetch moves
+    versions silently. Our first corpus was fetched from ``master`` and happened to be byte-identical
+    to the release — luck, not method, which is why this is now recorded and verified.
+    """
+    import hashlib
+
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def load_corpus(path: Path) -> dict[str, int]:
@@ -133,6 +162,15 @@ def load_scorecard(path: Path) -> list[Cell]:
             raise ScorecardError(
                 f"cell {raw.get('id')!r}: verdict {verdict!r} not one of {sorted(VERDICTS)}"
             )
+        # ASVS 5.0's assessment chapter is "should" throughout with exactly ONE "must": a
+        # non-applicable requirement must be noted with its reason. So an `na` without a rationale is
+        # not a lax entry — it is the single thing the standard actually requires, omitted.
+        if verdict == "na" and not str(raw.get("residual", "")).strip():
+            raise ScorecardError(
+                f"cell {raw.get('id')!r}: verdict 'na' requires a written rationale in `residual` — "
+                "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
+                "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
+            )
         cells.append(
             Cell(
                 id=str(raw["id"]),
@@ -142,6 +180,7 @@ def load_scorecard(path: Path) -> list[Cell]:
                 posture=str(raw.get("posture", "single")),
                 last_verified=str(raw.get("last_verified", "")),
                 verified_at=str(raw.get("verified_at", "")),
+                reviewed_by=str(raw.get("reviewed_by", "")),
                 evidence=tuple(
                     Anchor(path=str(e["path"]), line=int(e["line"]), expect=str(e["expect"]))
                     for e in raw.get("evidence", [])
@@ -266,9 +305,41 @@ def _sort_key(cell_id: str) -> tuple[int, ...]:
         return (9_999,)
 
 
+def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
+    """The scorecard must declare which ASVS version it scores, and pin the corpus by digest.
+
+    **ASVS requirement IDs are not stable across versions** — bare ``1.2.5`` is *Architecture* in
+    4.0.3 and *Encoding and Sanitization* in 5.0.0 — and OWASP's referencing guidance prefers
+    ``v<version>-<chapter>.<section>.<requirement>``. A document-level version field satisfies that
+    pinning, so a scorecard keyed on bare ids cannot silently re-point when ASVS updates.
+    """
+    problems: list[str] = []
+    data = tomllib.loads(scorecard.read_text(encoding="utf-8"))
+    meta = data.get("scorecard", {})
+
+    if not str(meta.get("asvs_version", "")).strip():
+        problems.append(
+            "pinning: [scorecard].asvs_version is missing — bare requirement ids re-point across "
+            "ASVS versions, so the scorecard must say which version its ids mean"
+        )
+    declared = str(meta.get("corpus_sha256", "")).strip()
+    actual = corpus_digest(corpus)
+    if not declared:
+        problems.append(
+            f"pinning: [scorecard].corpus_sha256 is missing — the corpus digest is {actual}"
+        )
+    elif declared != actual:
+        problems.append(
+            f"pinning: corpus digest mismatch — declared {declared[:16]}…, actual {actual[:16]}…. "
+            "The ASVS corpus changed underneath the scorecard; re-verify before trusting any verdict"
+        )
+    return problems
+
+
 def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
     findings = Findings()
     cells = load_scorecard(scorecard)
+    findings.problems.extend(check_pinning(scorecard, corpus))
     findings.problems.extend(check_completeness(cells, load_corpus(corpus)))
     check_anchors(cells, root, findings)
     check_absences(cells, root, findings)
@@ -276,41 +347,70 @@ def verify(scorecard: Path, corpus: Path, root: Path) -> Findings:
 
 
 def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
-    """The generated entry point. A new session reads this instead of reconstructing state."""
+    """The generated entry point — survey progress FIRST, verdict counts second.
+
+    **Phase 0 of the fix (ADR 0156 / ASSESSMENT-METHOD §4).** A headline count computed over cells
+    that were never examined is not a measurement; it is an average over guesses, and publishing it is
+    what made every subsequent first-look read as a *reversal* rather than as *progress*. On
+    2026-08-01, 76% of that day's verdict changes were cells nobody had ever opened.
+
+    So this leads with how much of the survey is done, and reports `unverified` separately from
+    `pass` — which is also what ASVS asks for: a summary of **every requirement checked**, not
+    exceptions only.
+    """
     n = count(cells)
     total = sum(n.values())
-    verified_pass = sum(1 for c in cells if c.verdict == "pass" and not c.is_inherited)
-    inherited = sum(1 for c in cells if c.verdict == "pass" and c.is_inherited)
+    decided = [c for c in cells if c.verdict in DECIDED_VERDICTS]
+    examined = [c for c in decided if c.last_verified]
+    unexamined = total - len(examined)
+    pct = (100.0 * len(examined) / total) if total else 0.0
+    inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)
+
     lines = [
         "<!-- GENERATED by scripts/asvs/scorecard.py — do not edit. Edit asvs-scorecard.toml. -->",
         "",
         "# ASVS 5.0 L3 — current state",
         "",
-        f"**Anchor commit:** `{anchor_sha}`",
+        f"**Anchor commit:** `{anchor_sha}` · **Method:** `docs/ASVS-ASSESSMENT-METHOD.md`",
         "",
-        "| Verdict | Count |",
-        "|---|---:|",
-        f"| Pass | {n['pass']} |",
-        f"| Partial | {n['partial']} |",
-        f"| Fail | {n['fail']} |",
-        f"| N/A | {n['na']} |",
-        f"| **Unverified** | **{n['unverified']}** |",
-        f"| **Total** | **{total}** |",
+        "## Survey progress",
         "",
-        f"Of the {n['pass']} Passes, **{verified_pass} were verified against the requirement text** and "
-        f"**{inherited} are inherited** — carried from an earlier assessment and never re-read. An "
-        "inherited Pass is not evidence of anything; it is the largest standing exposure in this score.",
+        f"**{len(examined)} of {total} requirements have been read against the ASVS text "
+        f"({pct:.1f}%).** {unexamined} have not.",
         "",
+        "> **There is deliberately no headline score here.** A count over unexamined cells is an",
+        "> average of guesses. Until the baseline sweep completes, the honest number is the one above:",
+        "> how much of the survey is done. Verdict counts below cover **examined cells only** unless",
+        "> stated otherwise.",
+        "",
+        "| State | Count | Meaning |",
+        "|---|---:|---|",
+        f"| Pass | {n['pass']} | verb satisfied by a shipped default or a refusing gate |",
+        f"| Partial | {n['partial']} | control exists but ships off, warns, or covers part of the surface |",
+        f"| Fail | {n['fail']} | no implementing control in any configuration |",
+        f"| N/A | {n['na']} | does not apply on the declared scope, with a written rationale |",
+        f"| Needs review | {n['needs-review']} | examined; verdict contested or blocked on a decision |",
+        f"| **Unverified** | **{n['unverified']}** | **never examined — not a Pass** |",
+        f"| **Total** | **{total}** | |",
+        "",
+    ]
+    if inherited:
+        lines += [
+            f"⚠️ **{inherited} cell(s) carry a decided verdict with no `last_verified` date** — "
+            "inherited from an earlier assessment and never re-read. Treat as unexamined.",
+            "",
+        ]
+    lines += [
         "## Open cells",
         "",
-        "| Cell | L | Verdict | Residual |",
-        "|---|---|---|---|",
+        "| Cell | L | Verdict | Reviewed | Residual |",
+        "|---|---|---|---|---|",
     ]
-    for c in sorted(
-        (c for c in cells if c.verdict in {"partial", "fail"}), key=lambda c: _sort_key(c.id)
-    ):
-        lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {c.residual[:160]} |")
-    return "\n".join(lines) + "\n"
+    open_states = {"partial", "fail", "needs-review"}
+    for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
+        seen = c.last_verified or "—"
+        lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {c.residual[:150]} |")
+    return chr(10).join(lines) + chr(10)
 
 
 def main(argv: list[str] | None = None) -> int:

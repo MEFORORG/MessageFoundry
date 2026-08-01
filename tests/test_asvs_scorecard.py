@@ -26,6 +26,8 @@ from scripts.asvs.scorecard import (
     check_absences,
     check_anchors,
     check_completeness,
+    check_pinning,
+    corpus_digest,
     count,
     load_corpus,
     load_scorecard,
@@ -225,9 +227,14 @@ def test_unknown_verdict_is_refused(tmp_path: Path) -> None:
 def test_verify_end_to_end_clean(tmp_path: Path) -> None:
     (tmp_path / "messagefoundry").mkdir()
     (tmp_path / "messagefoundry" / "m.py").write_text("tls_cert_file = None\n", encoding="utf-8")
+    corpus = _corpus_file(tmp_path)
     sc = _scorecard_file(
         tmp_path,
-        """
+        f"""
+[scorecard]
+asvs_version = "5.0.0"
+corpus_sha256 = "{corpus_digest(corpus)}"
+
 [[cell]]
 id = "1.1.1"
 level = 1
@@ -250,18 +257,78 @@ verdict = "partial"
 residual = "ships off"
 """,
     )
-    findings = verify(sc, _corpus_file(tmp_path), tmp_path)
+    findings = verify(sc, corpus, tmp_path)
     assert findings.ok, findings.problems
 
 
-def test_render_separates_verified_pass_from_inherited_pass() -> None:
+def test_render_leads_with_survey_progress_not_a_headline_score() -> None:
+    """Phase 0: a count over unexamined cells is an average of guesses, so it is not the headline."""
     cells = [
         Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01"),
-        Cell(id="1.1.2", level=2, verdict="pass"),  # inherited: never re-read
-        Cell(id="2.1.1", level=3, verdict="partial", residual="ships off"),
+        Cell(id="1.1.2", level=2, verdict="unverified"),
+        Cell(
+            id="2.1.1", level=3, verdict="partial", residual="ships off", last_verified="2026-08-01"
+        ),
     ]
     out = render_current(cells, anchor_sha="deadbeef")
-    assert "**1 were verified against the requirement text**" in out
-    assert "**1 are inherited**" in out
+    assert (
+        "**2 of 3 requirements have been read against the ASVS text (66.7%).** 1 have not." in out
+    )
+    assert "There is deliberately no headline score here" in out
+    assert "never examined — not a Pass" in out
     assert "deadbeef" in out
-    assert "| 2.1.1 | L3 | **partial** |" in out
+
+
+def test_render_flags_a_decided_verdict_carrying_no_verified_date_as_inherited() -> None:
+    cells = [Cell(id="1.1.1", level=1, verdict="pass")]  # decided, but never dated
+    out = render_current(cells, anchor_sha="x")
+    assert "carry a decided verdict with no `last_verified` date" in out
+
+
+# --- the one MUST in ASVS's assessment chapter ----------------------------------------------------
+
+
+def test_na_without_a_rationale_is_refused(tmp_path: Path) -> None:
+    """Recording the reason for non-applicability is the only 'must' ASVS 5.0 states."""
+    sc = _scorecard_file(tmp_path, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "na"\n')
+    with pytest.raises(ScorecardError, match="requires a written rationale"):
+        load_scorecard(sc)
+
+
+def test_na_with_a_rationale_is_accepted(tmp_path: Path) -> None:
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "na"\nresidual = "no WebRTC surface"\n',
+    )
+    assert load_scorecard(sc)[0].verdict == "na"
+
+
+def test_needs_review_is_a_valid_verdict(tmp_path: Path) -> None:
+    """Parking a contested cell beats forcing a premature verdict — that is what flip-flops."""
+    sc = _scorecard_file(tmp_path, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "needs-review"\n')
+    assert load_scorecard(sc)[0].verdict == "needs-review"
+
+
+# --- pinning: ids re-point across ASVS versions ----------------------------------------------------
+
+
+def test_pinning_requires_a_declared_asvs_version(tmp_path: Path) -> None:
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(tmp_path, f'[scorecard]\ncorpus_sha256 = "{corpus_digest(corpus)}"\n')
+    assert any("asvs_version is missing" in p for p in check_pinning(sc, corpus))
+
+
+def test_pinning_catches_a_corpus_that_changed_underneath_the_scorecard(tmp_path: Path) -> None:
+    """bare 1.2.5 is Architecture in 4.0.3 and Encoding in 5.0.0 — a moved corpus re-points ids."""
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(tmp_path, '[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "0" \n')
+    assert any("corpus digest mismatch" in p for p in check_pinning(sc, corpus))
+
+
+def test_pinning_passes_when_version_and_digest_are_declared(tmp_path: Path) -> None:
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(
+        tmp_path,
+        f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n',
+    )
+    assert check_pinning(sc, corpus) == []
