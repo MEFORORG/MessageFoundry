@@ -7298,7 +7298,7 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 
 ## 320. windows-2025 MLLP ingress is ~10x slower than a healthy runner
 
-> 📋 **Filed 2026-08-01, not started.** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to.
+> 🚧 **Filed 2026-08-01, not started.** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to.
 
 **Type:** CI/runner capacity — not a correctness defect. No message was ever lost in any observed instance.
 
