@@ -51,3 +51,33 @@ rules:
       - dependabot-lock-resync.yml
       - security.yml
       - vuln-metrics.yml
+
+  bot-conditions:
+    ignore:
+      # zizmor flags `github.triggering_actor == 'dependabot[bot]'` in the resync job's `if:`, because an
+      # actor context reflects the LAST actor on the run, not the PR's author. True — and it is why that
+      # expression is the SECOND half of a conjunction and never the control. The control is the FIRST
+      # half, `github.event.pull_request.user.login == 'dependabot[bot]'`: the immutable PR author, and
+      # the exact replacement this audit recommends. A conjunction only NARROWS, so a spoofed actor can
+      # make this job SKIP, never run. zizmor agrees — it treats `And` as non-dominating and reports this
+      # at MEDIUM confidence for that reason.
+      #
+      # Skipping is safe by design: DEP-1 lock/export sync is independently enforced by security.yml's
+      # `pip-audit` job, step "Check the lockfile is in sync with pyproject (DEP-1)", which
+      # `git diff --exit-code`s the re-exports on an unfiltered pull_request trigger and is a REQUIRED
+      # context. The actor half is an operational self-trigger skip: this job's own App-token push fires
+      # a `synchronize` whose triggering actor is mefor-lock-resync[bot], a run that sees no Dependabot
+      # secrets. See the SECURITY MODEL block and the numbered note above that `if:`.
+      #
+      # DO NOT TAKE ZIZMOR'S AUTO-FIX. It is classified SAFE, so a bare `zizmor --fix` applies it
+      # silently: for a `pull_request` trigger it substitutes `github.event.pull_request.user.login`,
+      # collapsing the conjunction into `A && A` and deleting the self-trigger skip. Nothing in CI would
+      # catch that — every test and required check stays green while the skip is gone.
+      #
+      # The premise this suppression rests on — clause 1 present, conjoined, no `||` — is PINNED by
+      # tests/test_dep1_lock_resync_lockstep.py rather than merely asserted here. Line-anchored on
+      # purpose: a file-level entry would also swallow a future actor check added to this file as a SOLE
+      # gate, which is the shape that IS exploitable. Accepted residual: an in-place rewrite that keeps
+      # the line count would not re-fire the finding — that is what the test is for. If the line moves,
+      # RE-ANCHOR it; do not broaden it to the file.
+      - dependabot-lock-resync.yml:76
