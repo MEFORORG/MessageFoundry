@@ -12,12 +12,30 @@ code; this module is the **opt-in** boundary that closes the documented residual
 * ``off`` (default) — :func:`run_sandboxed` calls the Router/Handler **in-process**, byte-identically
   and with **zero** overhead (no subprocess, no marshalling). The isolation seam is invisible.
 * ``subprocess`` — the Router/Handler runs in a **persistent per-inbound worker subprocess**
-  (:mod:`messagefoundry.pipeline._sandbox_worker`). The parent marshals ``(phase, name, payload,
-  run_context)`` over a length-prefixed pickle pipe; the worker looks the function up in **its own**
+  (:mod:`messagefoundry.pipeline._sandbox_worker`). The parent marshals ``(id, phase, name, payload,
+  run_context)`` over a length-prefixed **non-executing** pipe codec
+  (:mod:`messagefoundry.pipeline._sandbox_codec`); the worker looks the function up in **its own**
   freshly-loaded :class:`~messagefoundry.config.wiring.Registry`, re-establishes the run-scoped
-  context providers, runs the function, and returns its raw result. The worker is *long-lived* (one
-  child per inbound), never a per-message fork — a fork per message would destroy the throughput
-  target.
+  context providers (over the ENGINE's code-set tables, which arrive once in the boot frame — the
+  child's own re-read of ``codesets/`` is never authoritative), runs the function, and describes its
+  result back. The worker is *long-lived* (one child per inbound), never a per-message fork — a fork
+  per message would destroy the throughput target.
+
+**Both legs of the pipe are untrusted by contract.** The child runs exactly the code the sandbox
+exists to distrust, and a grandchild it spawns inherits fd 1 (the response pipe) and outlives
+``proc.kill()``. So the wire is **MFW2**, a closed-tag JSON+segment codec whose decode path is
+``json.loads`` plus ``bytes.decode`` and a literal tag match — it cannot name a type, import a module,
+or reach ``__reduce__``. Nothing is pickled in either direction.
+
+**Frames answer requests, never the other way round.** Each dispatch mints a fresh
+:func:`secrets.token_hex` request id and binds the whole ``(id, phase, name)`` triple on the way back,
+and :meth:`SandboxSession.dispatch` treats a frame that is queued *before* a request — or left over
+*after* its answer — as fatal to that worker. Together those close the window in which a pre-staged
+frame could be read as the NEXT dispatch's answer (for ``phase="accepts"``, a routing-verdict flip on a
+message the attacker never saw: no ``ERROR``, no disposition anomaly). What they do **not** do is
+confine one Handler from another *inside* a worker: code running a dispatch is handed that dispatch's
+id, and it could just as easily rebind a sibling in the child's own registry. ``mode=off`` draws no such
+line either — the boundary this seam draws is to the **engine**, not between admin functions.
 
 **What isolation buys (and its honest limits).** The child is a *separate OS process*: even if the
 admin code opens a socket or spins the CPU, it cannot touch the parent's DEK, audit chain, or
@@ -26,43 +44,51 @@ store/crypto). On top of that address-space boundary the child adds defence-in-d
 forbidden-import guard (``socket``/store/crypto), a wall-clock cap enforced by the parent (plus
 POSIX ``RLIMIT_CPU``/``RLIMIT_AS`` when available), and a fail-closed refusal of the live
 ``db_lookup``/``fhir_lookup`` bridges (they re-enter the event loop, which a process boundary
-breaks — forwarding them over IPC is a documented next-phase residual).
+breaks — forwarding them over IPC is a documented next-phase residual). The import guard is
+**defence-in-depth only** — a module imported before it goes up keeps a live reference, so the
+address-space boundary and the codec are the load-bearing controls.
 
 **Fail-closed.** Any isolation denial — a forbidden import/op, a resource cap exceeded, a worker
-crash, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The caller (the
-router/transform worker) routes it to ``ERROR``/dead-letter **post-ACK** via the existing
+crash, a rejected frame, or an unmarshallable payload/run-context — raises :class:`SandboxError`. The
+caller (the router/transform worker) routes it to ``ERROR``/dead-letter **post-ACK** via the existing
 ``_apply_router_internal_error`` / ``_apply_transform_internal_error`` paths — never a NAK, never an
 accept-and-drop, never a crashed connection.
 
-**Engine-side validation stays engine-side.** The worker returns only the *raw* Router/Handler
-return value; the fail-closed handler-name / outbound-name validation (see
-:func:`messagefoundry.pipeline.dryrun.route_only` / ``transform_one``) runs in the parent on that
-result, so a compromised worker cannot smuggle an unknown destination past the graph.
+**Engine-side validation stays engine-side.** The worker describes only the *shape* of the
+Router/Handler return value; the fail-closed handler-name / outbound-name validation (see
+:func:`messagefoundry.pipeline.dryrun.route_only` / ``transform_one``) runs in the parent on the
+rebuilt result, so a compromised worker cannot smuggle an unknown destination past the graph. That
+validation is now genuinely downstream of decoding: the decoder builds nothing but a closed set of
+plain data types before it runs.
 
 **Layering (CLAUDE.md §4).** This is a pure ``pipeline/`` library — no ``api/`` or ``console/``
-imports. It depends only on ``config`` (the :class:`RunContext` shape) and the stdlib.
+imports. It depends only on ``config`` (the :class:`RunContext` shape), its own codec, and the stdlib.
 """
 
 from __future__ import annotations
 
 import enum
 import logging
-import pickle  # nosec B403 — pickle only carries IPC frames between the engine and its own spawned sandbox worker, never external/untrusted input
 import queue
+import secrets
 import struct
 import subprocess
 import sys
 import threading
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
+from messagefoundry.config.code_sets import CodeSet
 from messagefoundry.config.run_context import RunContext
+from messagefoundry.pipeline import _sandbox_codec as codec
+from messagefoundry.pipeline._sandbox_codec import SandboxCodecError, SandboxError
 
 __all__ = [
     "SandboxMode",
     "SandboxError",
+    "SandboxCodecError",
     "SandboxPolicy",
     "SandboxSession",
     "run_sandboxed",
@@ -102,16 +128,9 @@ class SandboxMode(str, enum.Enum):  # noqa: UP042
     SUBPROCESS = "subprocess"  # persistent per-inbound worker child
 
 
-class SandboxError(RuntimeError):
-    """A sandboxed Router/Handler was denied, timed out, crashed, or could not be marshalled.
-
-    Raised only on the ``subprocess`` path (``off`` never raises this). The caller treats it exactly
-    like any other post-ACK router/transform failure: ``ERROR``/dead-letter, no NAK."""
-
-
 @dataclass(frozen=True)
 class SandboxPolicy:
-    """Resolved ``[sandbox]`` policy. Pure data (picklable) so the caps travel to the worker.
+    """Resolved ``[sandbox]`` policy. Pure data so the caps travel to the worker.
 
     ``mode=off`` (default) is the zero-overhead, byte-identical parity mode. ``wall_seconds`` is the
     **authoritative** cap on every platform — the parent kills a worker that overruns it (so a
@@ -128,16 +147,34 @@ class SandboxPolicy:
     forbidden_modules: tuple[str, ...] = DEFAULT_FORBIDDEN_MODULES
 
 
-# --- length-prefixed pickle framing over the worker pipe ---------------------
+# --- length-prefixed framing over the worker pipe ----------------------------
+# The OUTER frame only. The body's schema (and every type that may cross) lives in _sandbox_codec.
 
 _LEN = struct.Struct(">I")
-_MAX_FRAME = 64 * 1024 * 1024  # 64 MiB ceiling — a hostile frame length can't force a huge alloc
+#: 64 MiB ceiling — a hostile frame length can't force a huge alloc. Sourced from the codec so the
+#: outer framing and the body decoder's own header bound are the SAME number by construction.
+_MAX_FRAME: Final = codec.MAX_FRAME
 
 
-def _write_frame(stream: Any, obj: object) -> None:
-    """Pickle ``obj`` and write it length-prefixed. Raises on an unpicklable object (fail-closed) or a
-    broken pipe; the caller maps either to :class:`SandboxError`."""
-    body = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+class _Eof:
+    """The dead-peer sentinel the reader thread enqueues on EOF.
+
+    A parent-PRIVATE singleton with **no wire representation**: the old ``{"__eof__": True}`` frame was
+    structurally indistinguishable from one the child could forge, handing a compromised worker a free
+    kill-and-respawn lever (which also reset its own state)."""
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - diagnostics only
+        return "<sandbox EOF>"
+
+
+_EOF: Final = _Eof()
+
+
+def _write_frame(stream: Any, body: bytes) -> None:
+    """Write one length-prefixed frame body. Raises on an over-cap frame (fail-closed) or a broken
+    pipe; the caller maps either to :class:`SandboxError`."""
     if len(body) > _MAX_FRAME:
         raise SandboxError(f"sandbox frame too large: {len(body)} bytes")
     stream.write(_LEN.pack(len(body)))
@@ -158,21 +195,20 @@ def _read_exact(stream: Any, n: int) -> bytes | None:
     return b"".join(chunks)
 
 
-def _read_frame(stream: Any) -> Any:
-    """Read one length-prefixed pickled frame, or ``None`` on EOF. Sentinel used to signal a dead peer."""
+def _read_frame_bytes(stream: Any) -> bytes | None:
+    """Read one length-prefixed frame **body**, or ``None`` on EOF / a dead peer.
+
+    Deliberately does **no** decoding: on the parent this runs on the daemon reader thread, whose
+    ``except`` catches only ``OSError`` — a rejection raised there would kill the reader silently and
+    the dispatch would HANG to the wall cap instead of failing closed. Decoding happens on the
+    dispatch thread, inside its existing ``try``."""
     header = _read_exact(stream, _LEN.size)
     if header is None:
         return None
     (length,) = _LEN.unpack(header)
     if length > _MAX_FRAME:
         return None  # a corrupt/hostile length — treat as a dead peer
-    body = _read_exact(stream, length)
-    if body is None:
-        return None
-    # `body` is an IPC frame read from a private pipe whose other end is our own
-    # spawned sandbox worker (child) / engine (parent) — never external/untrusted
-    # data — so the pickle-deserialization risk (B301 / semgrep) does not apply here.
-    return pickle.loads(body)  # nosec B301  # nosemgrep: mf-no-insecure-deserialization
+    return _read_exact(stream, length)
 
 
 # --- the persistent worker session (parent side) -----------------------------
@@ -187,10 +223,24 @@ class SandboxSession:
     ``mode=off`` sessions never spawn anything — :meth:`dispatch` isn't called on them (the caller
     branches on :attr:`mode`)."""
 
-    def __init__(self, policy: SandboxPolicy, *, config_dir: str | Path, env: str | None) -> None:
+    def __init__(
+        self,
+        policy: SandboxPolicy,
+        *,
+        config_dir: str | Path,
+        env: str | None,
+        code_sets: Mapping[str, CodeSet] | None = None,
+    ) -> None:
         self.policy = policy
         self._config_dir = str(Path(config_dir))
+        # Kept for the caller's signature (engine.py resolves and passes it), but NOT marshalled: the
+        # worker never read it — `load_config()` takes only a directory — and a dead field on the wire
+        # is a field nobody validates.
         self._env = env
+        # The ENGINE's live code-set tables, sent once per spawn in the boot frame so the child serves
+        # exactly what mode=off would rather than its own re-read of `codesets/` (see
+        # codec.enc_code_sets). `None` = the caller published none, so the child keeps its own load.
+        self._code_sets = code_sets
         self._proc: subprocess.Popen[bytes] | None = None
         self._responses: queue.Queue[Any] = queue.Queue()
         self._lock = threading.Lock()
@@ -225,45 +275,50 @@ class SandboxSession:
         try:
             _write_frame(
                 proc.stdin,
-                {
-                    "config_dir": self._config_dir,
-                    "env": self._env,
-                    "forbidden": list(self.policy.forbidden_modules),
-                    "cpu_seconds": self.policy.cpu_seconds,
-                    "mem_mb": self.policy.mem_mb,
-                },
+                codec.encode_boot(
+                    config_dir=self._config_dir,
+                    forbidden=self.policy.forbidden_modules,
+                    cpu_seconds=self.policy.cpu_seconds,
+                    mem_mb=self.policy.mem_mb,
+                    code_sets=self._code_sets,
+                ),
             )
         except (OSError, SandboxError) as exc:
             self._kill(proc)
             raise SandboxError(f"failed to bootstrap sandbox worker: {exc}") from exc
         try:
-            ready = self._responses.get(timeout=self.policy.startup_seconds)
+            frame = self._responses.get(timeout=self.policy.startup_seconds)
         except queue.Empty:
             self._kill(proc)
             raise SandboxError(
                 f"sandbox worker did not start within {self.policy.startup_seconds}s"
             ) from None
-        if isinstance(ready, dict) and ready.get("__eof__"):
+        if frame is _EOF:
             self._kill(proc)
             raise SandboxError("sandbox worker exited during bootstrap")
-        if not (isinstance(ready, dict) and ready.get("ready")):
+        try:
+            ready, detail = codec.decode_boot_reply(frame)
+        except SandboxError as exc:
             self._kill(proc)
-            detail = ready.get("error") if isinstance(ready, dict) else repr(ready)
+            raise SandboxError(f"sandbox worker bootstrap frame was rejected: {exc}") from exc
+        if not ready:
+            self._kill(proc)
             raise SandboxError(f"sandbox worker bootstrap failed: {detail}")
         self._proc = proc
 
     def _reader_loop(self, stdout: Any, sink: queue.Queue[Any]) -> None:
-        """Drain the child's stdout into ``sink``. Runs on a daemon thread; a fresh queue per spawn
-        means a stale reader's writes are harmlessly ignored."""
+        """Drain the child's stdout into ``sink`` — **framing only**, never decoding (see
+        :func:`_read_frame_bytes`). Runs on a daemon thread; a fresh queue per spawn means a stale
+        reader's writes are harmlessly ignored."""
         try:
             while True:
-                frame = _read_frame(stdout)
-                if frame is None:
-                    sink.put({"__eof__": True})
+                body = _read_frame_bytes(stdout)
+                if body is None:
+                    sink.put(_EOF)
                     return
-                sink.put(frame)
+                sink.put(body)
         except OSError:
-            sink.put({"__eof__": True})
+            sink.put(_EOF)
 
     def _kill(self, proc: subprocess.Popen[bytes] | None) -> None:
         if proc is None:
@@ -285,34 +340,104 @@ class SandboxSession:
             self._closed = True
             self._kill(self._proc)
 
+    def _reject_unsolicited(self, proc: subprocess.Popen[bytes] | None, when: str) -> None:
+        """Drop the worker if anything is pending that no outstanding request asked for.
+
+        The protocol is strictly one request, one frame, so a FRAME queued **before** a dispatch or
+        left over **after** its answer was written by something other than the call we made — a
+        Handler writing straight to fd 1, or a grandchild that inherited it and outlived
+        ``proc.kill()``. Letting such a frame sit in the queue is the whole exploit: the next dispatch
+        would take it as its own answer. It is not an authoring accident either — ``print()`` goes
+        through the text wrapper, not the frame writer — so there is no benign case to preserve. Drop
+        the worker and dead-letter the message in hand.
+
+        :data:`_EOF` is the opposite case and must NOT be treated the same way. It is a parent-private
+        singleton with no wire form (see :class:`_Eof`), so a worker cannot manufacture one — it
+        carries no trust information at all, only "the peer is gone". Dead-lettering on it would fail
+        closed against a signal that proves nothing: a child that crashes in the instant *after*
+        writing a correct, correlation-proven answer would lose a message it had already answered, and
+        a child that died between dispatches would lose the next one instead of respawning
+        transparently. Reap it and let the caller carry on."""
+        try:
+            stray = self._responses.get_nowait()
+        except queue.Empty:
+            return
+        self._kill(proc)
+        if stray is _EOF:
+            return
+        raise SandboxError(
+            f"sandbox worker wrote an unsolicited response frame {when} a dispatch — "
+            "the pipe is not trustworthy"
+        )
+
+    def _live_worker(self) -> subprocess.Popen[bytes]:
+        """The session's worker — spawned or respawned as needed — on a pipe nothing is waiting on.
+
+        The unsolicited check runs **after** the liveness check, not before: a killed worker's queue is
+        discarded wholesale by :meth:`_spawn`, so its leftovers are neither reachable nor evidence
+        about the *new* child. Only a REUSED worker can hand us a leftover, and only there is one worth
+        judging. A leftover EOF reaps it (see :meth:`_reject_unsolicited`), so spawn once more rather
+        than dead-letter this message on a peer that merely died."""
+        if self._proc is None or self._proc.poll() is not None:
+            self._spawn()
+        self._reject_unsolicited(self._proc, "before")
+        if self._proc is None:
+            self._spawn()
+        proc = self._proc
+        assert proc is not None
+        return proc
+
     # -- dispatch -------------------------------------------------------------
 
-    def dispatch(self, phase: str, name: str, payload: object, run_context: RunContext) -> object:
-        """Run ``name`` on ``payload`` in the worker; return its raw result.
+    def dispatch(
+        self,
+        phase: str,
+        name: str,
+        payload: object,
+        run_context: RunContext,
+        *,
+        origin: tuple[str | bytes, str] | None = None,
+    ) -> object:
+        """Run ``name`` on ``payload`` in the worker; return its rebuilt result.
 
         ``phase`` is ``"router"``, ``"transform"``, or ``"accepts"`` (ADR 0084) — for ``"accepts"``,
         ``name`` keys the HANDLER whose predicate is being run and the worker re-establishes the ROUTER
-        run-context phase (a predicate is a router-stage peek). Serialized against concurrent callers. Any
-        isolation fault (crash / timeout / denial / marshalling failure) raises :class:`SandboxError`;
-        a plain, still-alive worker survives a *denied* call so the next message reuses it."""
+        run-context phase (a predicate is a router-stage peek). ``origin`` is the ``(raw,
+        content_type)`` the caller derived ``payload`` from, when it did; the child then rebuilds a
+        byte-faithful object with the identical constructor. Serialized against concurrent callers. Any
+        isolation fault (crash / timeout / denial / codec rejection) raises :class:`SandboxError`;
+        a plain, still-alive worker survives a *denied* call so the next message reuses it. The one
+        thing it does **not** survive is writing a frame nobody asked for
+        (see :meth:`_reject_unsolicited`) — that is a lost worker and a dead-lettered message."""
         with self._lock:
             if self._closed:
                 raise SandboxError("sandbox session is closed")
-            if self._proc is None or self._proc.poll() is not None:
-                self._spawn()
-            proc = self._proc
-            assert proc is not None and proc.stdin is not None
+            proc = self._live_worker()
+            assert proc.stdin is not None
+            # A FRESH unpredictable id per dispatch, not a counter: the worker learns it only when it
+            # reads this request frame, which the check above proves is the first thing it can answer.
+            # A derivable id (a per-spawn nonce plus a sequence) let the code running dispatch N
+            # compute N+1's and pre-stage its answer.
+            request_id = secrets.token_hex(16)
             try:
                 _write_frame(
                     proc.stdin,
-                    {"phase": phase, "name": name, "payload": payload, "run_context": run_context},
+                    codec.encode_request(
+                        request_id=request_id,
+                        phase=phase,
+                        name=name,
+                        payload=payload,
+                        origin=origin,
+                        run_context=run_context,
+                    ),
                 )
-            except (OSError, SandboxError, pickle.PicklingError, TypeError) as exc:
-                # Unpicklable payload/run-context, or a broken pipe: fail closed and reset the worker.
+            except (OSError, SandboxError) as exc:
+                # A payload/run-context outside the closed grammar, or a broken pipe: fail closed and
+                # reset the worker.
                 self._kill(proc)
                 raise SandboxError(f"failed to marshal sandbox {phase} {name!r}: {exc}") from exc
             try:
-                resp = self._responses.get(timeout=self.policy.wall_seconds)
+                frame = self._responses.get(timeout=self.policy.wall_seconds)
             except queue.Empty:
                 # Wall cap exceeded — the authoritative resource bound on every platform. Kill the
                 # runaway child (a busy-loop can't wedge intake) and fail closed.
@@ -320,44 +445,28 @@ class SandboxSession:
                 raise SandboxError(
                     f"sandbox {phase} {name!r} exceeded the {self.policy.wall_seconds}s wall cap"
                 ) from None
-            if isinstance(resp, dict) and resp.get("__eof__"):
+            if frame is _EOF:
                 self._kill(proc)
                 raise SandboxError(f"sandbox worker crashed while running {phase} {name!r}")
-            if not (isinstance(resp, dict) and resp.get("ok")):
-                detail = resp.get("error") if isinstance(resp, dict) else repr(resp)
-                raise SandboxError(f"sandbox denied {phase} {name!r}: {detail}")
-            return resp["result"]
-
-
-def _snapshot_view(view: Any) -> Any:
-    """Coerce one run-scoped view to a picklable point-in-time snapshot for the worker pipe.
-
-    The engine builds ``reference_view``/``state_view`` (and, later, ``response_view``) as live
-    :class:`types.MappingProxyType` windows onto the store's caches
-    (:meth:`Store.reference_view`/:meth:`Store.state_view`) — and a ``mappingproxy`` is **not**
-    picklable, so a live view would fail-closed at marshal time (dead-lettering every message) rather
-    than reach the worker. Snapshot it to a plain ``dict`` (both levels of the ``{name: {key: value}}``
-    reference view), which is exactly the read-only content the router/transform would have seen at
-    this instant in-process — and re-run stability (CLAUDE.md §2) makes a point-in-time copy the
-    contract anyway. Non-mapping / already-picklable views (``None``, a plain ``dict``) pass through
-    unchanged (a plain ``dict`` is still copied so the worker can't observe a later parent mutation)."""
-    if isinstance(view, Mapping):
-        return {k: (dict(v) if isinstance(v, Mapping) else v) for k, v in view.items()}
-    return view
-
-
-def _picklable_run_context(rc: RunContext) -> RunContext:
-    """Return a marshalling-safe copy of ``rc`` with its live store views snapshotted to plain dicts.
-
-    The mapping fields the engine fills from the live store are the only unpicklable members; the
-    scalar fields and ``code_sets`` (a ``{name: CodeSet}`` of ``__slots__`` mappings) already pickle,
-    so they pass through :func:`dataclasses.replace` unchanged."""
-    return replace(
-        rc,
-        reference_view=_snapshot_view(rc.reference_view),
-        state_view=_snapshot_view(rc.state_view),
-        response_view=_snapshot_view(rc.response_view),
-    )
+            try:
+                # Decoding happens HERE, on the dispatch thread, inside this try — not on the daemon
+                # reader thread, where a rejection would be a silent reader death and a wall-cap hang.
+                resp = codec.decode_response(frame, request_id=request_id, phase=phase, name=name)
+            except SandboxError as exc:
+                # A desynchronized or forged frame: the worker's stream can no longer be trusted to
+                # line up with our requests, so drop it and respawn on the next message.
+                self._kill(proc)
+                raise SandboxError(
+                    f"sandbox {phase} {name!r} returned an invalid frame: {exc}"
+                ) from exc
+            # One request, one frame: a second FRAME already queued means the worker is writing frames
+            # nobody asked for, so this answer is not trustworthy either. (A queued EOF is only a dead
+            # peer — it reaps the worker and leaves this proven answer standing.)
+            self._reject_unsolicited(proc, "after")
+            if not resp.ok:
+                verdict = "denied" if resp.kind == "denied" else "failed"
+                raise SandboxError(f"sandbox {verdict} {phase} {name!r}: {resp.error}")
+            return resp.result
 
 
 def run_sandboxed(
@@ -368,16 +477,20 @@ def run_sandboxed(
     name: str,
     run_context: RunContext | None,
     session: SandboxSession | None,
+    origin: tuple[str | bytes, str] | None = None,
 ) -> object:
-    """Run ``fn`` on ``payload`` under the isolation policy of ``session`` and return its raw result.
+    """Run ``fn`` on ``payload`` under the isolation policy of ``session`` and return its result.
 
     With ``session is None`` or ``session.mode is OFF`` this is exactly ``fn(payload)`` — in-process,
-    byte-identical, zero overhead (the parity default). With ``session.mode is SUBPROCESS`` the call
-    is marshalled to the persistent worker via :meth:`SandboxSession.dispatch`, enforcing the
-    forbidden-import / resource caps and raising :class:`SandboxError` on any violation. The live
-    ``RunContext`` is snapshotted to a picklable form first (:func:`_picklable_run_context`) so the
-    store-backed ``MappingProxyType`` views the engine always passes cross the process boundary."""
+    byte-identical, zero overhead (the parity default); nothing above that branch touches ``payload``,
+    ``origin``, or the codec. With ``session.mode is SUBPROCESS`` the call is marshalled to the
+    persistent worker via :meth:`SandboxSession.dispatch`, enforcing the forbidden-import / resource
+    caps and raising :class:`SandboxError` on any violation.
+
+    ``origin`` is the ``(raw, content_type)`` the caller built ``payload`` from — pass it **only** when
+    the caller derived the payload itself, so the child can rebuild it byte-faithfully; ``None`` makes
+    the codec describe the caller's actual object instead."""
     if session is None or session.mode is SandboxMode.OFF:
         return fn(payload)
     rc = run_context if run_context is not None else RunContext()
-    return session.dispatch(phase, name, payload, _picklable_run_context(rc))
+    return session.dispatch(phase, name, payload, rc, origin=origin)

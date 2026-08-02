@@ -7,12 +7,12 @@ bytes, on the shape every transform path funnels through), AC-11 (flag OFF is by
 the caller's reference and a divergent fan-out collapses to last-write, exactly as before), and the
 propagation guards: the run-context provider activates only in the transform phase, all three
 transform-phase ``RunContext`` builders thread the flag (the fused silent-miss backstop), the sandbox
-marshalling carries the scalar, and a snapshotted ``Send.message`` is picklable on both backends.
+marshalling carries the scalar, and a snapshotted ``Send.message`` survives the sandbox IPC codec on
+both backends.
 """
 
 from __future__ import annotations
 
-import pickle
 from pathlib import Path
 
 import pytest
@@ -33,8 +33,15 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.parsing._backend import backend
 from messagefoundry.parsing.message import Message
+from messagefoundry.pipeline._sandbox_codec import (
+    _Blobs,
+    _Reader,
+    dec_result,
+    dec_run_context,
+    enc_result,
+    enc_run_context,
+)
 from messagefoundry.pipeline.dryrun import dry_run, transform_one
-from messagefoundry.pipeline.sandbox import _picklable_run_context
 
 _ADT = (
     "MSH|^~\\&|SENDA|SENDF|RECV|RFAC|20200101||ADT^A01^ADT_A01|MSG1|P|2.5\r"
@@ -174,24 +181,37 @@ def test_all_three_transform_builders_thread_the_flag() -> None:
     assert src.count("snapshot_on_send=self._snapshot_on_send") == 3
 
 
-def test_picklable_run_context_carries_flag() -> None:
-    """AC-4: the sandbox marshalling copy carries the scalar ``snapshot_on_send`` to the child unchanged
-    (no ``sandbox.py`` edit needed — it rides ``dataclasses.replace``)."""
-    assert _picklable_run_context(RunContext(snapshot_on_send=True)).snapshot_on_send is True
-    assert _picklable_run_context(RunContext()).snapshot_on_send is False
+def _rc_round_trip(rc: RunContext) -> RunContext:
+    blobs = _Blobs()
+    return dec_run_context(enc_run_context(rc, blobs), _Reader(blobs.items))
+
+
+def test_marshalled_run_context_carries_flag() -> None:
+    """AC-4: the sandbox marshalling carries the scalar ``snapshot_on_send`` to the child unchanged.
+    Re-pointed at the MFW2 codec — the pickle path it used to assert no longer exists."""
+    assert _rc_round_trip(RunContext(snapshot_on_send=True)).snapshot_on_send is True
+    assert _rc_round_trip(RunContext()).snapshot_on_send is False
 
 
 @pytest.mark.parametrize("builtin", [True, False], ids=["builtin", "python_hl7"])
-def test_snapshotted_send_message_is_picklable(builtin: bool) -> None:
-    """AC-4: a snapshotted ``Send.message`` survives the child→parent pickle round-trip on both backends
-    and still encodes identically (so ``send.message.encode()`` succeeds in the parent)."""
+def test_snapshotted_send_message_survives_the_sandbox_codec(builtin: bool) -> None:
+    """AC-4: a snapshotted ``Send.message`` survives the child→parent marshalling on both backends and
+    still encodes identically (so ``send.message.encode()`` succeeds in the parent).
+
+    Re-pointed from pickle to the MFW2 codec, which is the path the engine actually uses now; leaving
+    it on pickle would have kept asserting a route the engine no longer takes (a false green)."""
     with backend(builtin=builtin):
         msg = Message.parse(_ADT)
         with run_contexts(RunContext(snapshot_on_send=True), phase="transform"):
             send = Send("OB_A", msg)
         assert send.message is not msg
-        restored = pickle.loads(pickle.dumps(send, protocol=pickle.HIGHEST_PROTOCOL))
-        assert restored.message.encode() == msg.encode()
+        blobs = _Blobs()
+        node = enc_result("transform", send, blobs)
+        restored = dec_result("transform", node, _Reader(blobs.items))
+        # The codec carries the ENCODED text, so the parent's Send.message is already the str
+        # dryrun's `send.message if isinstance(..., str) else .encode()` would have produced.
+        assert isinstance(restored, Send)
+        assert restored.message == msg.encode()
 
 
 def test_provider_registered_before_unmapped_capture() -> None:
