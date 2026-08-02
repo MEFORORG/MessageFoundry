@@ -105,6 +105,16 @@ writes when measured.
   — so it is an instruction, and whether a message was actually delivered is recorded by the model in
   `sent/<key>.tsv`, not by the hook. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
 
+> **A control that cannot distinguish "ran and resolved" from "ran and found nothing" is not
+> installed, however it looks.** The hook the one above replaced fired on every prompt, printed its
+> status message, resolved nothing and exited 0 — for weeks. It outlived every other silent-control
+> defect found the same day precisely *because* it printed something: a status message is more
+> convincing than silence. The structural cause is worth naming, because it recurs — every receipt
+> that hook would have written lived **inside** the script the shim failed to find, so every check was
+> strictly downstream of the failure it existed to detect. Looking was not neglected; it was
+> impossible. When adding a control, ask which surface still reports when the control itself fails to
+> load. (Formulation owed to the session that hit four instances of the same class in one day.)
+
 ### Recovery and lifecycle
 
 `rescue.ps1` (move dirty primary work into a worktree), `restore-primary.ps1` (re-attach a detached
