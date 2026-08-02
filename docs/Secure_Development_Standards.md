@@ -100,10 +100,37 @@ asking what happens to someone who acts on the sentence; **none** was caught by 
   console's own search route. The control itself was sound; the stated reason was not, and the next
   person to touch it reasons from the comment. A wrong justification is worse than none.
 
+- **Confirm your instrument answers the question you asked, not one adjacent to it.** The rules above
+  catch prose that is true and misleading; this one catches a claim that is **false when written, while
+  feeling measured**. The rule is the question — ***does my instrument answer the question I asked, or
+  one adjacent to it?*** — and it outlives every example below. **The pairs are dated illustrations, not
+  the rule:** `--is-ancestor` misleads here only because this repository squash-merges, and any of them
+  may stop being true without the question changing at all. On 2026-08-02 four parallel sessions
+  retracted eleven claims in a single night and every one traced to an instrument answering in adjacent
+  terms: `git diff` on a **staged** file (returns
+  *"is there an unstaged delta"*; the question was *"is the tree dirty"*); `merge-base --is-ancestor`
+  (*"is this an ancestor"* vs *"did this work land"* — **squash-merge makes the answer always no**); a
+  hash **inequality** (*"are these different"* vs *"is the installed copy **worse**"*); a session-start
+  **banner** (*"who was live when it printed"* vs *"who is live now"*); `grep -c $'\r$'` over `git diff`
+  output (*"does the diff **render** a CR"* vs *"does the file contain CRLF"* — it reported a
+  byte-perfect file as mangled); `$?` after `cmd | tail` (*"did `tail` succeed"*); the Actions
+  `?filter=latest` view (*"what did the **latest attempt** do"* vs *"what did the suite ever do"*); and a
+  **job** conclusion answering a **step** question, which drops the tightest samples by construction.
+  **Re-reading caught none of the eleven; a check that could fail caught one immediately.** Nor were
+  these facts that expired — "#119 never merged (it died on a CI timeout)" was never true at any instant:
+  that pull request's timeline carries exactly one `closed` event, simultaneous with `merged`. Dating a
+  claim does not protect against this class; only re-deriving it does. So before publishing a measured
+  claim, write down the question and write down what the instrument returns, and check that they are the
+  same sentence.
+
 *Provenance (the evidence is the point):* the completeness-claim and false-premise rules, and the
 governing instruction above, came out of the 2026-07-30 public-documentation audit; the
 state-it-once rule was named by the parallel ASVS review session, which also supplied the
-`harden_kex_groups` and `PHI.md` §5/§7 instances. `CLAUDE.md` §11 carries these as bare one-line
+`harden_kex_groups` and `PHI.md` §5/§7 instances. The instrument rule came out of the 2026-08-02
+parallel-session cluster — four sessions, eleven retractions, none caught by its own author — and was
+named by the repo-security-review session after applying it to its own four and finding four for four;
+the remaining instances were contributed by the ci-margin-correction, announce-hook, sandbox-codec and
+ADR 0154 sessions, each of which had made one. `CLAUDE.md` §11 carries these as bare one-line
 imperatives — deliberately duplicated, because an instruction that short cannot meaningfully drift and
 a pointer nobody follows mid-task changes no behaviour. **This section is the source of record for the
 reasoning, the evidence and the dates.**
