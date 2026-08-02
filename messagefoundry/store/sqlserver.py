@@ -136,6 +136,14 @@ _RELEASE_CHUNK = 500
 # transaction, so the all-or-nothing recovery pass is unchanged.
 _RESET_LANE_CHUNK = 500
 
+# BACKLOG #348 / ADR 0159: how long the quarantine of a cancellation-poisoned pooled connection waits
+# for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
+# the connection is already out of the pool before this wait starts, so expiring it costs nothing but
+# a slower reclaim. It exists because the close runs on a worker thread that may still be occupied by
+# the abandoned statement, which is bounded only by command_timeout (default 30s) — without a cap here
+# an engine.stop()/demotion would block for that long, per lane.
+_DIRTY_CLOSE_TIMEOUT = 5.0
+
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
 # the normal "head is contended, yield" signal, not an error, so it maps to the EMPTY-all fail-closed
@@ -2909,7 +2917,60 @@ class SqlServerStore:
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
-            yield conn
+            try:
+                yield conn
+            except BaseException as exc:
+                # BACKLOG #348 / ADR 0159. Every caller's own handler is `except Exception` (90 of
+                # the 91 _acquire sites), so an ordinary error has ALREADY rolled back by the time it
+                # reaches here — leave that path exactly as it was, connection recycled. A
+                # CancelledError derives from BaseException, so NONE of those handlers ran: the body
+                # is unwinding with its transaction still open and its X locks still held, and
+                # aioodbc's pool does not compensate (`Pool.release()` appends a non-closed
+                # connection straight back onto the free deque — 0.5.0 pool.py:196-205 — and
+                # `_ContextManager.__aexit__` releases identically on the exception path). Quarantine
+                # it so the next borrower can never inherit it.
+                if not isinstance(exc, Exception):
+                    await self._release_dirty(conn)
+                raise
+
+    async def _release_dirty(self, conn: Any) -> None:
+        """Quarantine a pooled connection whose transaction was abandoned by a cancellation, so it
+        can never be lent to another caller (BACKLOG #348, ADR 0159).
+
+        **The load-bearing line is the synchronous one.** aioodbc derives ``Connection.closed`` from
+        ``self._conn`` (0.5.0 connection.py:89-93) and ``Pool.release()`` re-adds a connection to the
+        free deque only ``if not conn.closed`` (pool.py:200-204) — so dropping the handle is a plain
+        attribute write that makes the connection unlendable with **no await in front of it**. That
+        matters: shutdown cancels the lane task and the gather can cancel it AGAIN, so any cleanup
+        that awaits *before* containing the poison is defeated by the second cancellation and
+        silently restores the bug. Ordering here is the guarantee; the close below is only hygiene.
+
+        Closing the raw handle is then best-effort, off the event loop, and time-boxed. pyodbc's
+        ``close()`` rolls back uncommitted work (DBAPI), which is what actually frees the X locks —
+        but it runs on a worker thread that may still hold the abandoned statement, so it is never
+        awaited unbounded on a shutdown/demotion path. On expiry the close finishes detached; the
+        pool has already lost the connection and reopens on demand (``size`` is derived, so the pool
+        simply shrinks). This costs one reconnect per cancelled call — paid only on a path that was
+        previously corrupting the pool.
+        """
+        raw = getattr(conn, "_conn", None)
+        if raw is None:  # already closed/quarantined — nothing lendable to contain
+            return
+        conn._conn = None  # ← MUST stay first, and MUST stay await-free
+        closer = asyncio.ensure_future(asyncio.to_thread(raw.close))
+        try:
+            await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
+        except (TimeoutError, asyncio.CancelledError):
+            # Expired, or a further cancellation landed while we waited. Either way the connection is
+            # already out of the pool; let the close land on its own. Swallowed deliberately — the
+            # caller re-raises the ORIGINAL cancellation, which is the outcome that must propagate.
+            log.debug(
+                "sqlserver: quarantined connection close did not complete within %.1fs; it will"
+                " finish detached (the connection is already out of the pool)",
+                _DIRTY_CLOSE_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
+            log.debug("sqlserver: quarantined connection close failed", exc_info=True)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.

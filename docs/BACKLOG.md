@@ -8423,3 +8423,27 @@ Two worked instances the same day. **#74** went green on 2026-07-30 and sat unme
 **Related:** #339, #342 (sibling fd-1 issue), CLAUDE.md §9 (PHI logging), ADR 0087.
 
 **Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01.
+
+---
+
+## 348. SQL Server: a cancelled store call returns a pooled connection mid-transaction holding X locks
+
+> ✅ **Status CLOSED (filed + fixed 2026-08-02, [ADR 0159](adr/0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md)).** `SqlServerStore`'s write idiom is `except Exception: await conn.rollback(); raise` — used at **90 of the 91** `self._acquire()` sites. `asyncio.CancelledError` derives from `BaseException`, so on a cancellation **no rollback runs**, and aioodbc's `Pool.release()` appends the connection straight back onto the free deque with no rollback, reset or transaction check (0.5.0 `pool.py:196-205`; `_ContextManager.__aexit__` uses the *same* `release` on the exception path). The next borrower inherited an open transaction still holding X locks on `queue` rows. Fixed by quarantining the connection at the `_acquire` chokepoint.
+
+**Cluster:** Store & Reliability. **Priority:** P2. **Verdict:** built. **Severity:** medium (pool integrity + a silent stall), low (likelihood: needs a cancellation to land inside a pooled write).
+
+**Reproduced on a live SQL Server 2022 before the fix**, cancelling each call mid-body and inspecting the server: `release_claimed` **7** X locks on `queue`, `reschedule_claimed` **7**, `mark_done` **9**, `enqueue_ingress` **11** — and `claim_fifo_heads` **0** (the control). The connection was back on the free list (`size=1 freesize=1`), a raw writer got **error 1222**, and a real second `claim_fifo_heads` returned **EMPTY-all**. After the fix: **0** locks, no open-transaction session, writer unblocked, connection dropped from the pool rather than re-lent.
+
+**Why it was invisible.** Under [ADR 0066](adr/0066-pooled-stage-claimers.md) §9 the claim runs `SET LOCK_TIMEOUT 0`, so a blocked claimer raises 1222 and the claim path translates that to a **sanctioned** EMPTY-all yield. The symptom is therefore silence — a lane that quietly claims nothing — not an error anyone would see. `enqueue_ingress` is the pre-ACK ingress commit, the engine's hottest path.
+
+**The path that bites is demotion, not shutdown.** `engine.stop()` closes the store shortly after cancelling, so the poisoned connection dies at teardown. Loss of leadership ([`engine.py:1242-1252`](../messagefoundry/pipeline/engine.py), `_stop_graph`) runs the identical cancel chain but **does not close the store** — the pool stays live and shared with the coordinator/convergence loops, so the connection sits in `_free` and is re-borrowed by unrelated callers.
+
+**Two corrections to the lead that opened this.** (1) It is **not** a two-method asymmetry: an AST census found 90 of 91 `_acquire` bodies share the idiom, and `mark_done`/`enqueue_ingress` were measured leaking identically — a two-method patch would have fixed an arbitrary slice. (2) `claim_fifo_heads` does **not** shield against this; its guard is a `SET LOCK_TIMEOUT` *reset* guard, [ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 states there is **no rollback** on its cancellation path, and `test_adr0114_claim_fold.py::test_ac3_cancellation_at_body_await_no_rollback_guard_runs` freezes that. It ends clean because the guard **commits**.
+
+**Not a data-integrity bug.** At-least-once was never at risk — a cancelled `release_claimed` leaves rows `INFLIGHT` and `reset_stale_inflight` re-pends them, which [`stage_dispatcher.py:491-492`](../messagefoundry/pipeline/stage_dispatcher.py) already declares the intended outcome. What was broken is pool integrity.
+
+**Backend scope: SQL Server only.** Postgres is safe twice over (asyncpg's `Transaction.__aexit__` rolls back on any `BaseException`; its pool also resets under `asyncio.shield`). SQLite shares the code shape but has one writer connection under an `asyncio.Lock` and no pool, so there is no next borrower.
+
+**Related:** ADR 0159, [ADR 0066](adr/0066-pooled-stage-claimers.md) §9, ADR 0114 §2, §1 of this file (the original H-6/H-7/H-8/M-6 concurrency-safety work — M-6 was scoped to `_fetchall`/bootstrap rollback hygiene and never covered the cancellation path).
+
+**Source:** secondary lead from a PR #138 CI diagnosis, 2026-08-02; confirmed by live reproduction rather than by the reasoning in the lead, two of whose premises proved false.
