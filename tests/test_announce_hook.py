@@ -509,6 +509,39 @@ def test_only_unreachable_peers_means_silence(repo: Path, tmp_path: Path) -> Non
     assert "NO_PEERS" in outcomes(sd)
 
 
+def test_a_peers_claim_note_is_surfaced_and_the_worktree_name_is_deprecated(
+    repo: Path, tmp_path: Path
+) -> None:
+    """A worktree name is a creation-time label, not a statement of current work.
+
+    Reported 2026-08-01 by the session it happened to: its worktree is named for a task that session
+    never did, and the name -- the most visible identifier in presence.ps1, overlap.ps1 and this hook's
+    output -- misled two other sessions into guessing what it was building. The claim note is the only
+    field written deliberately to say what a session is doing, so the roster must lead with it.
+    """
+    sd = tmp_path / "mefor-coord" / "announce"
+    claims = tmp_path / "mefor-coord" / "claims"
+    claims.mkdir(parents=True)
+    (claims / "some-key.json").write_text(
+        json.dumps(
+            {"key": "some-key", "note": "REBUILDING THE INGEST PATH", "worktree": PEER["Cwd"]}
+        ),
+        encoding="utf-8",
+    )
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "claim: REBUILDING THE INGEST PATH" in p.stdout
+    assert "IGNORE the worktree name" in p.stdout
+
+
+def test_a_missing_claims_directory_is_harmless(repo: Path, tmp_path: Path) -> None:
+    """Claims are optional: most peers have none, and reading them must never break the announcement."""
+    sd = tmp_path / "state"
+    p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, PEER])
+    assert "[ANNOUNCE YOURSELF" in p.stdout
+    # The roster row form, not the legend line that explains it.
+    assert not [ln for ln in p.stdout.splitlines() if re.match(r"\s+claim: ", ln)]
+
+
 def test_an_unverified_peer_is_flagged_as_a_maybe(repo: Path, tmp_path: Path) -> None:
     sd = tmp_path / "state"
     p = run(repo, tmp_path=tmp_path, state_dir=sd, rows=[SELF_ROW, {**PEER, "State": "UNVERIFIED"}])
