@@ -332,3 +332,27 @@ def test_pinning_passes_when_version_and_digest_are_declared(tmp_path: Path) -> 
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n',
     )
     assert check_pinning(sc, corpus) == []
+
+
+def test_pinning_refuses_an_abbreviated_anchor_sha(tmp_path: Path) -> None:
+    """actions/checkout resolves a short ref as a BRANCH OR TAG name, so an abbreviated anchor fails
+    with "A branch or tag with the name ... could not be found" -- a gate failing for a reason with
+    nothing to do with what it measures. Caught in CI twice before it was refused here."""
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(
+        tmp_path,
+        '[scorecard]\nasvs_version = "5.0.0"\nanchor_commit = "8f01cef8"\n'
+        f'corpus_sha256 = "{corpus_digest(corpus)}"\n',
+    )
+    assert any("must be a FULL 40-character SHA" in p for p in check_pinning(sc, corpus))
+
+
+def test_pinning_accepts_a_full_anchor_sha(tmp_path: Path) -> None:
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(
+        tmp_path,
+        '[scorecard]\nasvs_version = "5.0.0"\n'
+        'anchor_commit = "28d186b5d85b10c8e0ce3fc35adc01b7269bcb28"\n'
+        f'corpus_sha256 = "{corpus_digest(corpus)}"\n',
+    )
+    assert check_pinning(sc, corpus) == []

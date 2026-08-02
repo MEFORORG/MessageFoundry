@@ -328,6 +328,17 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
             "pinning: [scorecard].asvs_version is missing — bare requirement ids re-point across "
             "ASVS versions, so the scorecard must say which version its ids mean"
         )
+    anchor = str(meta.get("anchor_commit", "")).strip()
+    # actions/checkout resolves `ref:` as a BRANCH OR TAG name unless it is a full 40-char hash, so an
+    # abbreviated anchor fails with "A branch or tag with the name ... could not be found" -- a gate
+    # failing for a reason with nothing to do with what it measures. Caught in CI twice; refused here.
+    if anchor and not re.fullmatch(r"[0-9a-f]{40}", anchor):
+        problems.append(
+            f"pinning: [scorecard].anchor_commit {anchor!r} must be a FULL 40-character SHA -- an "
+            "abbreviated hash is not resolvable by actions/checkout, which treats a short ref as a "
+            "branch or tag name"
+        )
+
     declared = str(meta.get("corpus_sha256", "")).strip()
     actual = corpus_digest(corpus)
     if not declared:
