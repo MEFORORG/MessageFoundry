@@ -56,8 +56,8 @@ jobs:
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
     # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
     # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
-    # has its own `timeout-minutes: 13` so a process-level deadlock below pytest fails the step fast;
-    # this job cap is the outermost belt if even that is somehow out-raced.
+    # has its own `timeout-minutes` (matrix `step_timeout`) so a process-level deadlock below pytest
+    # fails the step fast; this job cap is the outermost belt if even that is somehow out-raced.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
@@ -200,7 +200,7 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
         run: mypy --platform win32 messagefoundry
 
-      # Step-level watchdog UNDER the 15-min job cap (#55): the windows-2022 leg intermittently
+      # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
       # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
       # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
       # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
@@ -231,32 +231,47 @@ jobs:
       # went 19:35 -> 26:07 on the same branch. The claim was already false when it was written.
       #
       # Measured by timing the `Tests (pytest)` STEP, which is what step_timeout gates. NOT the job: the
-      # job runs several minutes longer and is capped separately, and three sessions misread job
+      # job runs several minutes longer and is capped separately, and at least three sessions misread job
       # durations as step durations while triaging this (c53f752b's JOB ran 28:41 and PASSED, because
       # job cap 30 vs step cap 26).
       #
-      # POOL: every CI run created on 2026-08-01 (101 runs, enumerated with `gh api --paginate`), each
-      # leg's `Tests (pytest)` step, keeping rows whose STEP concluded success. n is per leg.
+      # POOL: every run of THIS workflow created on 2026-08-01 UTC -- 70 runs. Enumerated with
+      # `gh api --paginate` over a deliberately WIDER window and filtered locally on `created_at`, then
+      # cross-checked against the narrow `?created=` query (same 70 ids, symmetric difference 0). Rows
+      # are each leg's `Tests (pytest)` step, kept when THAT STEP concluded success. n is per leg.
       #
       #   leg              max passing step   n    old cap   old margin
-      #   ubuntu-latest    12:31              57   19:00     1.518x
-      #   windows-2022     21:34              52   26:00     1.206x
-      #   windows-2025     25:51              49   26:00     1.006x   <- NINE SECONDS
+      #   ubuntu-latest    12:31              42   19:00     1.518x
+      #   windows-2022     21:34              39   26:00     1.206x
+      #   windows-2025     25:51              36   26:00     1.006x   <- NINE SECONDS
       #
-      # An earlier revision of this table said 12:27 / 18:39 / 24:35 over "11 passing runs". Every figure
-      # was wrong and each in the safe-looking direction. Two errors produced it, both worth naming
-      # because they are cheap to repeat:
+      # THESE MAXIMA ARE LOWER BOUNDS, BECAUSE THE POOL IS RIGHT-CENSORED. Every run in it predates #131
+      # (28d186b5, landed 2026-08-02T00:35:28Z), so Windows ran under step 26:00 / job 30:00 and ubuntu
+      # under 19:00 / 22:00. A run that wanted longer than its cap was KILLED at the cap and then --
+      # correctly, by the filter above -- dropped for not concluding success. So 25:51 is the largest
+      # step that FIT in 26:00, not the largest the suite wants. Sizing a cap as a multiple of a
+      # censored maximum under-provisions by construction, and that is exactly how "1.06x" read as
+      # survivable right up until #119 died at 26:07.
       #
-      #   * THE POOL WAS A PAGE, NOT A QUESTION. It came from `gh run list --limit 20` -- a default-sized
-      #     listing, not the set of runs that day. 20 of 101. The sample size was set by a tool default
-      #     and then reported as though it had been chosen.
+      # THIS TABLE HAS BEEN WRONG TWICE. #131 published 12:27 / 18:39 / 24:35 over "11 passing runs";
+      # the first correction published the maxima above but over "101 runs" with n = 57 / 52 / 49. The
+      # maxima re-derive exactly; BOTH pool sizes were unreproducible. Three mechanisms produced that,
+      # all cheap to repeat:
+      #
+      #   * THE POOL WAS A PAGE, NOT A QUESTION. #131's came from `gh run list --limit 20` -- a default
+      #     page size, reported as though it had been chosen.
       #   * FILTERING ON *JOB* CONCLUSION DROPS THE TIGHTEST STEPS BY CONSTRUCTION. A step that nearly
       #     exhausts step_timeout is the most likely to push its job into job_timeout, so the job is
-      #     cancelled while the step itself concluded success. Five such rows exist on 2026-08-01, and
-      #     they include the maximum. Measure the step; filter on the step.
+      #     cancelled while the step itself concluded success. Re-running this pool with a job-conclusion
+      #     filter reproduces #131's 24:35 exactly; the step-conclusion filter gives 25:51. Measure the
+      #     step; filter on the step. Two such rows exist on 2026-08-01 and one of them is the maximum.
+      #   * A COUNT NOBODY RE-DERIVED. Neither "101 runs" nor n = 57 / 52 / 49 is reproducible under any
+      #     pool definition tried. A table whose own point is "state your pool and your n" has to carry
+      #     an n the next reader can recompute -- that column is how they would tell it had rotted.
       #
-      # Only the windows-2025 row was ever a maximum; ubuntu's 12:27 and windows-2022's 18:39 were that
-      # same run's other two legs, quoted as if each were its leg's worst case.
+      # Only the windows-2025 row was ever a maximum; #131's ubuntu 12:27 was that same run's ubuntu leg,
+      # quoted as if it were that leg's worst case. Its 18:39 was not even that: that run's windows-2022
+      # step is 18:29, and 18:39 belongs to a different run entirely.
       #
       # State the MEASURED value, its POOL, its n and its DATE -- never a bare multiple. A multiple gives
       # the next reader no way to tell when it has rotted; a multiple without its pool cannot even be
@@ -269,10 +284,12 @@ jobs:
       # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
       # that runner was fast enough that time.
       #
-      # 36:00 is 1.393x over the 25:51 maximum -- comfortably above the 5:26 spread the same pool shows
-      # (20:41 .. 26:07 on windows-2025, identical code), which is the criterion that matters: HEADROOM
-      # MUST EXCEED OBSERVED SPREAD, not some multiple of a single point. A ratio against one run says
-      # nothing about a distribution, and #119 died from the distribution, not from its own duration.
+      # 36:00 is 1.393x over the 25:51 maximum and -- the criterion that actually matters -- it clears
+      # the 9:55 spread the pool shows on that leg (15:56 .. 25:51): HEADROOM MUST EXCEED OBSERVED
+      # SPREAD, not some multiple of a single point. A ratio against one run says nothing about a
+      # distribution, and #119 died from the distribution, not from its own duration. An earlier revision
+      # quoted a narrower "5:26 spread ... identical code" (20:41 .. 26:07); neither endpoint could be
+      # re-derived from this pool, and the honest wider number is the one that supports the decision.
       # Both Windows legs take the same number: windows-2022 is the faster, so sizing on windows-2025
       # only leaves it more room, and one value is one thing to re-derive.
       #
@@ -291,19 +308,29 @@ jobs:
       # durations never sum); it happens when the first step PASSES near its budget.
       #
       # job_timeout is therefore sized to hold BOTH gated steps plus setup -- not step_timeout plus a
-      # constant, which is what the previous +4 relationship was. Web-console is stable (max 3:27 on
-      # windows-2025, 1:58 on ubuntu) while `Tests` swings 19:50-25:51, so the sum is dominated by a
-      # budget the step cap already bounds and an addend the job cap must absorb on its own:
+      # constant, which is what the previous +4 relationship was. Each addend below is that addend's
+      # MEASURED MAXIMUM over the same pool. An earlier revision used 0:41 for setup, which is the
+      # MEDIAN and not the maximum, and web-console figures (1:58 / 3:27) that are each only the
+      # third-highest on their leg -- an addend sized at a typical value cannot bound a worst case:
       #
-      #   leg       step + web-console(max) + overhead   old job   new job
-      #   ubuntu    19:00 + 1:58 + 0:41 = 21:39          22:00 -> +21s      26:00 -> +4:21 (1.20x)
-      #   W22/W25   36:00 + 3:27 + 0:41 = 40:08          40:00 -> -8s       46:00 -> +5:52 (1.15x)
+      #   leg       step_timeout + web-console(max) + setup(max)   old job         new job
+      #   ubuntu    19:00 + 2:00 + 1:20 = 22:20                    22:00 -> -0:20  26:00 -> +3:40 (1.16x)
+      #   W22/W25   36:00 + 3:33 + 1:04 = 40:37                    40:00 -> -0:37  46:00 -> +5:23 (1.13x)
       #
-      # ALL THREE legs were inside a minute of their job cap and windows was already NEGATIVE -- the
-      # +4 convention had been carried through two cap changes without anyone summing what it had to
-      # cover. The structural fix is to stop the two steps sharing a budget (a 3:27 suite has no
-      # business holding 36:00) and is filed as BACKLOG #344; this sizing makes the invariant hold
-      # until someone does it. Re-derive it if either suite's duration moves.
+      # BOTH rows were already NEGATIVE -- ubuntu as well as Windows, which the previous revision had
+      # the wrong way round -- because the +4 convention was carried through two cap changes without
+      # anyone summing what it had to cover. Windows is sized on windows-2025, the worse of the pair;
+      # windows-2022 alone comes to 39:42, which was the one row genuinely in the black at +0:18.
+      #
+      # WHAT THIS DOES NOT FIX. The nesting invariant at the top of this note holds for `Tests (pytest)`
+      # on every leg and for `Web console tests (pytest)` on NONE of them: reaching that step already
+      # spends setup plus `Tests`, so its own cap can never fire first -- satisfying it would need
+      # job_timeout past 39:24 on ubuntu and 73:21 on Windows, using the pool's most FAVOURABLE observed
+      # values. A hang in the web-console step therefore still surfaces as an unattributed job-level
+      # kill, which is the very failure the invariant is there to prevent. The structural fix is to stop
+      # the two steps sharing one budget (a 3:33 suite has no business holding 36:00) and is filed as
+      # BACKLOG #344; this sizing only makes the job cap cover the sum. Re-derive it if either suite's
+      # duration moves.
       #
       # This cap is NOT what catches a hung test; pytest_timeout (120s) is, per test. The step cap only
       # catches a whole-process deadlock both in-process watchdogs miss, which is why it can sit well
@@ -312,7 +339,7 @@ jobs:
       #
       # The remaining margin is a SHARED budget across every PR that lands and nothing accounts for it:
       # three PRs each adding a minute of Windows time reproduce #119's death, individually blameless.
-      # A mechanical guard for that is BACKLOG #341; the underlying slowness is #320.
+      # A mechanical guard for that is BACKLOG #344 item 1; the underlying slowness is #320.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
