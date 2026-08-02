@@ -7,6 +7,7 @@ and the model rejects an empty override."""
 from __future__ import annotations
 
 import asyncio
+import ssl
 from typing import Any
 
 import pytest
@@ -128,7 +129,7 @@ def test_email_transport_uses_override_recipients(monkeypatch: pytest.MonkeyPatc
         def __exit__(self, *a: object) -> None:
             return None
 
-        def starttls(self) -> None:
+        def starttls(self, context: ssl.SSLContext | None = None) -> None:
             pass
 
         def send_message(self, msg: Any) -> None:

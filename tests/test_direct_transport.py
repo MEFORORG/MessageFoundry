@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import datetime
 import smtplib
+import ssl
 from email.message import EmailMessage
 from pathlib import Path
 from typing import Any
@@ -158,12 +159,18 @@ class _FakeSMTP:
     instances: list[_FakeSMTP] = []
 
     def __init__(
-        self, host: str, port: int, timeout: float = 0.0, fail_at: str | None = None
+        self,
+        host: str,
+        port: int,
+        timeout: float = 0.0,
+        fail_at: str | None = None,
+        context: ssl.SSLContext | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.fail_at = fail_at
+        self.tls_context = context  # #323 — see test_email_destination._FakeSMTP
         self.started_tls = False
         self.logged_in: tuple[str, str] | None = None
         self.sent: list[EmailMessage] = []
@@ -179,9 +186,10 @@ class _FakeSMTP:
     def __exit__(self, *exc: Any) -> None:
         return None
 
-    def starttls(self) -> None:
+    def starttls(self, context: ssl.SSLContext | None = None) -> None:
         if self.fail_at == "starttls":
             raise smtplib.SMTPException("STARTTLS not supported")
+        self.tls_context = context
         self.started_tls = True
 
     def ehlo_or_helo_if_needed(self) -> None:
@@ -208,8 +216,10 @@ def _install_fake(
 ) -> type[_FakeSMTP]:
     _FakeSMTP.instances = []
 
-    def factory(host: str, port: int, timeout: float = 0.0) -> _FakeSMTP:
-        return _FakeSMTP(host, port, timeout, fail_at=fail_at)
+    def factory(
+        host: str, port: int, timeout: float = 0.0, context: ssl.SSLContext | None = None
+    ) -> _FakeSMTP:
+        return _FakeSMTP(host, port, timeout, fail_at=fail_at, context=context)
 
     monkeypatch.setattr(direct_mod.smtplib, "SMTP", factory)
     monkeypatch.setattr(direct_mod.smtplib, "SMTP_SSL", factory)
