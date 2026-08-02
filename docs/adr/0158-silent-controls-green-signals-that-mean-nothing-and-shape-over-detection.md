@@ -68,17 +68,19 @@ sentence that the Windows legs were "unchanged because 26 min against the same s
 headroom." Nothing produced that number and nothing re-derived it. On 2026-08-01 PR #119's
 `windows-2025` `Tests (pytest)` step was killed at **26:07** against the 26:00 step cap (run
 30717229521 attempt 1, `2026-08-01T20:34:42Z` -> `21:00:49Z`, step conclusion failure);
-[`ci.yml`](../../.github/workflows/ci.yml):229 records that no test failed on that run. Attempt 2, on
-the same commit against the same cap, ran **22:25** and succeeded. Same code, same ceiling, two
+[`ci.yml`](../../.github/workflows/ci.yml) records, in the comment beside that cap,
+"ZERO tests failing" on that run. Attempt 2, on the same commit against the same cap,
+ran **22:25** and succeeded. Same code, same ceiling, two
 outcomes. 28d186b5 (#131) replaced the claim with a measured table and raised both Windows legs from
 `job_timeout: 30 / step_timeout: 26` to `40 / 36`.
 *found by: a peer session (transcript-only for the discovery; the artifacts are in-tree).*
 
 **The correction was itself wrong in at least four ways, and each is the same defect recurring.**
 
-- *Retraction 1 -- the pool size.* [`ci.yml`](../../.github/workflows/ci.yml):233 states the figures
-  were "Measured over the 11 PASSING windows-2025 runs on 2026-08-01" (restated at
-  `docs/BACKLOG.md`:8294 as "over 11 runs"). Three independent re-measurements against the GitHub API
+- *Retraction 1 -- the pool size.* [`ci.yml`](../../.github/workflows/ci.yml)'s margin table, as written
+  on 2026-08-01, stated the figures were
+  "Measured over the 11 PASSING windows-2025 runs on 2026-08-01"
+  (restated in `docs/BACKLOG.md` as "over 11 runs"). Three independent re-measurements against the GitHub API
   returned 35, 36 and 38 depending on the predicate applied; none is near 11, and none of the three
   could reconstruct a filter yielding 11. The comment states no filter. **[unverified]** hypothesis,
   recorded but not relied on: a default `gh run list` page is 20 rows, so the sample may have been
@@ -92,8 +94,8 @@ outcomes. 28d186b5 (#131) replaced the claim with a measured table and raised bo
   killed at 30:13 by the 30-minute *job* cap during a later step (`Web console tests (pytest)`,
   cancelled `00:30:14Z`; every sibling job in that run concluded success and the next `main` run was
   created after the cancel, which rules out a cancel-in-progress). Consequence for the new cap:
-  36:00 over 25:51 is **1.39x**, not the **1.46x** at
-  [`ci.yml`](../../.github/workflows/ci.yml):254.
+  36:00 over 25:51 is **1.39x**, not the **1.46x** that
+  [`ci.yml`](../../.github/workflows/ci.yml) claimed when this was written.
   *found by: two independent verifiers, independently; cause established by an adversarial reviewer.*
 - *Retraction 3 -- the table rows.* Two of the three rows in that margin table are single-run values,
   not maxima over any pool. The ubuntu maximum passing step was 12:31, not the tabled 12:27 (which is
@@ -164,7 +166,7 @@ been killed" is a counterfactual about a run that never faced them.
   unconstrained install (`freethread-smoke.yml`:90) says so deliberately -- a reader grepping the
   phrase will "find" instances that are not instances.
   *found by: an independent verifier, who also bounded the blast radius.*
-- `docs/BACKLOG.md`:5264 states, as the reason an item is an anti-feature, that the engine "uses
+- `docs/BACKLOG.md` stated, as the reason an item is an anti-feature, that the engine "uses
   STARTTLS with a verifying context by design". Two lines earlier the same item accurately says it
   "calls starttls() with the default SSL context". The code calls `smtp.starttls()` with no context
   argument ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py):382-384). The same bare
@@ -177,17 +179,17 @@ been killed" is a counterfactual about a run that never faced them.
   interpreter (Python 3.14.6), `smtplib.SMTP.starttls` resolves a `None` context via
   `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context`: `verify_mode`
   CERT_NONE, `check_hostname` False. The sink encrypts and authenticates nothing. **A retraction is
-  already filed -- and the false sentence was still there:** BACKLOG #323 says at `docs/BACKLOG.md`:7462
-  that #139's rationale "is **false** and should be retracted there", and :5264 still said it. A
-  retraction is not done until the original sentence changes. *Update (2026-08-02, after this ADR was
-  committed): 093db339 (#132) changed the source sentence. On `main` the clause survives only inside
-  its own "CORRECTED 2026-08-01" block at :5270 and as a quotation at :7476 -- so the interval this
+  already filed -- and the false sentence was still there:** BACKLOG #323 in `docs/BACKLOG.md` says
+  that #139's rationale "is **false** and should be retracted there", and the anti-feature item still
+  said it. A retraction is not done until the original sentence changes. *Update (2026-08-02, after
+  this ADR was committed): 093db339 (#132) changed the source sentence. On `main` the clause survives
+  only inside its own "CORRECTED 2026-08-01" block and as a quotation under #323 -- so the interval this
   instance records is closed, and the rule it produced is unaffected.* (Naming correction: `EmailAlertSink` is
   not a symbol in this codebase; it occurs only in BACKLOG prose.)
   *found by: a peer session, filed against another item as BACKLOG #323 -- the one instance in this
   record whose cross-author provenance is documented in the repository itself.*
-- `docs/BACKLOG.md` #344, whose remedy 4 (:8304) says to prefer "a measured ratio with a date over
-  round multiples", proposes at remedy 1 (:8301) -- three lines above -- a gate that fails "below
+- `docs/BACKLOG.md` #344, whose remedy 4 says to prefer "a measured ratio with a date over
+  round multiples", proposes at remedy 1 -- three lines above -- a gate that fails "below
   ~1.3x": a bare multiple, with no measurement, pool or date. *Retraction 5:* an earlier statement of
   this instance quoted the figure as "1.45x". That string appears **nowhere in the repository**.
   *found by: an independent verifier, who retracted the figure while confirming the pattern.*
@@ -196,7 +198,7 @@ been killed" is a counterfactual about a run that never faced them.
   injected `ManualClock` (:182). The file already documents the split deliberately (`_settle`,
   :349-351: park/sweep timing is the ManualClock's job), so the defect is not the wrong clock: it is
   a **fixed real-time bound over unbounded runner latency**, stated independently of the work it
-  bounds. Filed as BACKLOG #344 instance 2 (:8296) and still open.
+  bounds. Filed as BACKLOG #344 instance 2 and still open.
   *found by: an independent verifier.*
 
 ### Class 2, as it actually occurred
@@ -239,7 +241,7 @@ been killed" is a counterfactual about a run that never faced them.
   quoted from that comment, not independently re-derived. *Retraction 6:* this is **false in the
   present tense**. 7ebb2ffa, merged as 2a6649fb (#121) on 2026-08-01, added
   `ci/locks/ci-scanners.lock` to the filter (`zizmor.yml`:23). The residual, still live:
-  `pyproject.toml`:266 -- where the pin actually lives -- is still outside the filter; only the
+  `pyproject.toml`'s `[dependency-groups].ci-scanners` -- where the pin actually lives -- is still outside the filter; only the
   exported lock closes the gap.
   *found by: a peer session; retracted in the present tense by an independent verifier; the
   merge status of #66 corrected by an adversarial reviewer.*
@@ -432,7 +434,7 @@ recorded above: three are covered by a test that runs in a required CI leg; two 
 skip in CI; one (zizmor's paths filter) by a workflow change with a named live residual; and the
 remainder are corrected prose or still open. Anyone editing those comments can reintroduce the same
 claim tomorrow, and at least two instances left a residual (`pyproject.toml` is still outside
-zizmor's filter; the false `docs/BACKLOG.md`:5264 rationale stood with its retraction filed elsewhere
+zizmor's filter; the false `docs/BACKLOG.md` rationale stood with its retraction filed elsewhere
 until 093db339 (#132) changed the sentence itself, the day after this was written). The
 coordination-layer signal split is the clearest case where the wrong statement became
 structurally harder to make, and even it is a corrected emission rather than an unrepresentable one.
@@ -459,8 +461,8 @@ credits "the session that hit four instances of the same class in one day": four
       over the cap-kill (26:07, a failed step in no success pool) it is 9:53 and does not.
 - [ ] Correct or drop the table rows now known to be single-run values or job-filtered maxima
       (`24:35` and its `1.46x`, ubuntu `12:27`, windows-2022 `18:39`).
-- [ ] Apply the retraction already filed at `docs/BACKLOG.md`:7462 (BACKLOG #323) to the false
-      sentence at `docs/BACKLOG.md`:5264, and decide separately whether the bare `starttls()` calls
+- [ ] Apply the retraction already filed in `docs/BACKLOG.md` under BACKLOG #323 to the false
+      sentence in the anti-feature item it names, and decide separately whether the bare `starttls()` calls
       get a verifying context.
 - [ ] Replace BACKLOG #344 remedy 1's bare "~1.3x" threshold with a measured, dated ratio before that
       gate is built, and decide whether rule 6 (step-versus-job) becomes part of it.
