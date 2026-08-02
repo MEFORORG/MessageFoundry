@@ -1785,6 +1785,9 @@ def Email(
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
+    tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
+    tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
@@ -1793,9 +1796,18 @@ def Email(
     text); this delivers it as a plain-text SMTP message to ``host:port`` from ``sender`` to
     ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
     submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
-    SMTP ``AUTH`` (over TLS only — a cleartext-credential config is refused). Disabling TLS
-    (``use_tls=False``) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud
-    warning), like LDAPS / SQL Server / MLLP. The egress host is gated by ``[egress].allowed_smtp``. Put
+    SMTP ``AUTH`` (over a **verified** TLS session only — a cleartext- or unverified-credential config
+    is refused). Disabling TLS (``use_tls=False``) is MITM-able and refused unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning), like LDAPS / SQL Server / MLLP.
+
+    **The server certificate is verified** (``tls_verify=True``, #323) — chain, hostname and strict RFC
+    5280 flags, anchored to the OS roots, a per-connection ``tls_ca_file``, or the instance-wide
+    ``[tls].internal_ca_file`` (ADR 0093). ``smtplib``'s own default context verifies **nothing**
+    (``CERT_NONE``/``check_hostname=False``), so before #323 ``use_tls=True`` bought encryption without
+    authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
+    ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
+    instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
+    The egress host is gated by ``[egress].allowed_smtp``. Put
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
@@ -1810,6 +1822,9 @@ def Email(
             "username": username,
             "password": password,
             "use_tls": use_tls,
+            "tls_verify": tls_verify,
+            "tls_ca_file": tls_ca_file,
+            "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
         },
@@ -1836,6 +1851,9 @@ def Direct(
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
+    tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
+    tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
@@ -1844,7 +1862,14 @@ def Direct(
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
     (which must chain to ``trust_anchor``), and submits the S/MIME message to ``host:port`` over
-    STARTTLS. All cert/key material is loaded + validated at construction (fail loud). The egress host
+    STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+
+    **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
+    verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
+    is the CA the **partner's S/MIME certificate** must chain to (message-layer), while ``tls_ca_file``
+    is the CA the **SMTP relay's TLS certificate** must chain to (transport-layer). The S/MIME body
+    protects the clinical payload either way, but the SMTP session still carries envelope metadata and
+    any ``AUTH`` credential, which is why the transport hop is verified too. The egress host
     is gated by ``[egress].allowed_direct``. Put secrets in ``env()`` (``signing_key_password``,
     ``username``/``password``), never inline. Delivery is at-least-once, so a retry re-sends — a Direct
     mailbox has no idempotency key, so a rare duplicate is possible and accepted (a duplicate beats a
@@ -1865,6 +1890,9 @@ def Direct(
             "username": username,
             "password": password,
             "use_tls": use_tls,
+            "tls_verify": tls_verify,
+            "tls_ca_file": tls_ca_file,
+            "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
         },
