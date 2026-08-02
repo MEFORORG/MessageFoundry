@@ -25,10 +25,12 @@ and the per-connection flag inherits it; see ``docs/PHI.md`` §7). The DoS guard
 headers + body), and ``max_body_bytes`` (the ``MLLPDecoder`` frame cap's HTTP twin — a
 ``Content-Length`` / read ceiling).
 
-**First slice (ADR 0023 D3).** Only the cheap, correct ``202``-respond-with-receipt path is built. A
-synchronous downstream-reply (the SOAP-envelope ``block-on-captured-downstream-reply`` seam) is a
-defined ADR 0013 follow-on and is **not** built here. ``GET``/``HEAD`` are answered with a static,
-non-PHI health response **without** an ingress row; any other method is ``405``.
+**Two response modes.** The default is the cheap, correct ``202``-respond-with-receipt path (ADR 0023
+D3). An inbound naming ``reply_from`` instead **blocks** the HTTP turn until the named outbound's reply
+has been captured *and committed*, then returns it as the body (ADR 0154 increment B, via the ADR 0013
+capture seam) — see :func:`~messagefoundry.config.wiring.Http` for the settings and their check-time
+refusals. ``GET``/``HEAD`` are answered with a static, non-PHI health response **without** an ingress
+row; any other method is ``405``.
 """
 
 from __future__ import annotations

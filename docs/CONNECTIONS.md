@@ -70,11 +70,15 @@ yet implemented — the suffix documents intent today.)
 both built now: the **payload-agnostic ingress** contract ([ADR 0004](adr/0004-payload-agnostic-ingress.md) —
 an inbound's `content_type` selects the HL7 path vs. a `RawMessage` route) *and* the **inbound HTTP
 listener** it needed ([ADR 0023](adr/0023-inbound-http-listener.md) — `Http(...)`, below), so a partner
-can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. What is still
-deferred is the **SOAP-specific** half of `SOAP-IN` — the *synchronous* SOAP-envelope reply
-(block-on-captured-downstream-reply) — plus **request authentication** on the intake socket (API key /
-bearer): the listener's peer controls are the per-connection IP allowlist, TLS/mTLS, and the off-loopback
-exposed gate. Routing on HTTP method/path/headers is likewise deferred (the Handler sees the body).
+can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. **Request
+authentication on the intake socket has since shipped** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+increment A): `intake_auth` — API key, bearer or mTLS subject — now joins the per-connection IP
+allowlist, TLS/mTLS and the off-loopback exposed gate as a peer control. The **SOAP-specific** half of
+`SOAP-IN` — the *synchronous* envelope reply — shipped with increment B (`reply_from`: the HTTP turn
+blocks on the named outbound's captured, committed reply). Routing on HTTP method/path/headers remains
+deferred (the Handler sees the body). For this listener's current state, settings and remaining gaps,
+[`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023) below is the single authority —
+this note is a pointer, not a second copy of that status.
 
 ## Authoring a connection
 
@@ -537,6 +541,12 @@ routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler 
 | `intake_auth_health` | `"require"` | whether `GET`/`HEAD` health probes must authenticate too. **`"allow"` is a real exemption**: it hands anyone who can reach the socket an unauthenticated "is MessageFoundry up, and where" oracle. Set it only when a load-balancer check cannot carry the credential. |
 | `intake_auth_rate_limit` | `10` | **failed** intake-auth attempts per minute per peer, then `429` + `Retry-After`. A *successful* authentication never consumes budget, so this bounds guessing without capping throughput. `None`/`0` disables. |
 | `intake_auth_rate_limit_global` | `60` | **failed** attempts per minute across all peers. Consulted only for peers with no successful authentication in the window, so one attacker cannot `429` an authenticated partner. `None`/`0` disables. |
+| `reply_from` | — | **presence is the mode switch** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D4): names the outbound whose **captured** reply becomes this request's HTTP body, turning the listener from fire-and-forget into a **proxy**. See *Synchronous captured-downstream reply* below. One knob, not two — a separate `sync_reply: bool` would admit a half-configured "mode on, no target" state that could only fail at runtime. |
+| `reply_timeout` | `30.0` | seconds the HTTP turn may block waiting for that reply. Must be **positive** — an unbounded or zero budget is not a timeout. Expiry answers `reply_on_timeout` and **leaves the message flowing**; the engine does not cancel it. |
+| `reply_on_timeout` | `"504"` | what to answer when `reply_timeout` expires: `504` (the partner did not answer in time) or `202` (demote to the ordinary receipt path). |
+| `reply_content_type` | `"passthrough"` | `passthrough` echoes the partner's **own** captured `content-type`; a literal MIME type (must contain `/`) pins it instead. |
+| `reply_on_empty` | `"204"` | answer for a captured but *deliberately empty* partner reply — `204` or `200`. An empty reply is distinguished from a missing one, never conflated. |
+| `reply_write_timeout` | `30.0` | seconds to drain the (partner-sized) response body back to the caller. Must be **positive**. |
 
 > **TLS is confidentiality; intake auth is authentication — neither argues the other away.** A bare
 > `tls` + `tls_ca_file` means *"any certificate this CA ever signed"*, with **no subject binding at
@@ -566,14 +576,29 @@ request didn't fully arrive within `receive_timeout`), `413` (over `max_body_byt
 `max_connections` — the connection is accepted, then refused and closed at the application layer).
 `GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
 
-**Not built (first slice, ADR 0023).** **Request authentication** on the intake socket (API key / bearer /
-per-request token) is shaped but not shipped — the peer controls are the IP allowlist, TLS/mTLS and the
-exposed gate, so an exposed listener belongs behind the reverse proxy that terminates auth. The
-**synchronous downstream-reply** (SOAP-envelope block-on-captured-reply) path and **routing metadata**
-(HTTP method / path / headers as Router inputs) are defined follow-ons — a Handler sees the body only. The
-inbound **FHIR facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this
-listener, each its own build. `POST /connections/{name}/test` reports `supported=false` — a bound listener
-has nothing external to probe.
+**Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
+the HTTP turn **block** until the named outbound's reply has been captured **and committed to the store**,
+then returns that reply as the response body — a proxy API rather than a receipt. The **committed row is
+the sole authority** for the returned bytes: every in-process signal is only a latency hint and the waiter
+re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
+and any race between the capturing worker and the reader. A reply is therefore returned only once it is
+durable and replayable. An inbound **without** `reply_from` keeps the `202`-on-receipt path above byte for
+byte.
+
+Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
+deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
+an outbound not capturing the content type; and — because either would make N concurrent callers queue
+behind one lane and let a single stuck message time out every caller — an effective `ordering` of **FIFO**
+or a **finite `max_attempts`** on the named outbound. Setting any `reply_*` knob **without** `reply_from`
+is refused at the factory, since the path is off and the knob would never be read.
+
+**Not built.** **Routing metadata** (HTTP method / path / headers as Router inputs) is a defined follow-on
+— a Handler sees the body only. **`capture_error_responses` is the headline gap:** a partner `4xx`
+dead-letters and the caller receives a fixed-JSON `502`, **not** the partner's own status and body, so a
+proxy API built on `reply_from` is currently correct only when the partner *succeeds*. The inbound **FHIR
+facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this listener, each its own
+build. `POST /connections/{name}/test` reports `supported=false` — a bound listener has nothing external to
+probe.
 
 ```python
 from messagefoundry import ContentType, Http, env, inbound, router
@@ -2382,8 +2407,8 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **SFTP** | ✅ | ✅ | ✅ | ✅ | `SFTP-IN/OUT` shipped — `Sftp()`, source + destination, `[sftp]` extra; host-key verification on by default |
 | **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
 | **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
-| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped; request auth on the intake socket is deferred |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body can be **received** via `Http()`, but the *synchronous* SOAP-envelope reply is deferred |
+| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** body is not relayed (`capture_error_responses`), so the reply path is correct only when the partner succeeds |
 | **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
 | **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |
@@ -2404,9 +2429,9 @@ against: the **Timer** clock-driven source (`Timer()`, ADR 0011) and — folded 
 
 - **Tier 1 — table stakes (all three have these): now shipped, bar one.** Raw TCP, HTTP/REST (**both**
   directions), `SOAP-OUT`, Database (`DB-IN` + `DB-OUT`), SFTP, FTP/FTPS, UNC/SMB, and the **FHIR** client
-  all ship. What is left on this tier: **S3 / cloud blob**, and the two inbound facades — `SOAP-IN`'s
-  *synchronous* envelope reply and `FHIR-IN` (both consumers of the shipped `Http()` listener, not new
-  substrate).
+  all ship — as does `SOAP-IN`'s *synchronous* envelope reply (ADR 0154 `reply_from`), bar the
+  partner-error relay noted in its row above. What is left on this tier: **S3 / cloud blob**, and the
+  `FHIR-IN` inbound facade (a consumer of the shipped `Http()` listener, not new substrate).
 - **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and the **Email reader** (POP3/IMAP) are the open
   ones — SMTP *send* shipped (ADR 0029). **DICOM is full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus
   the `DICOM-OUT` C-STORE SCU/C-ECHO and the `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the
