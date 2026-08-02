@@ -2775,6 +2775,16 @@ class AlertsSettings(_Section):
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
+    # #323 layer 3: whether that STARTTLS hop VERIFIES the relay's certificate. True (the default) builds
+    # an explicit verifying context via tls_policy.build_smtp_tls_context; before #323 there was no
+    # context at all and smtplib's fallback verified NOTHING (CERT_NONE, check_hostname=False), so the
+    # hop was encrypted but unauthenticated. FALSE is an audited loosening: it is named by
+    # security_loosenings() and REFUSED at the serve gate on an enforcing PHI instance unless
+    # [security].allow_unverified_alert_smtp_tls is also set. Only meaningful when email_use_tls=true.
+    email_tls_verify: bool = True
+    # PEM bundle of trust anchors for that hop. None (the default) = the [tls] internal-CA policy if one
+    # is configured, else the OS trust store. A path, not a secret — same status as [tls].internal_ca_file.
+    email_tls_ca_file: str | None = None
     email_username: str | None = None
     email_password: str | None = None  # secret — supply via MEFOR_ALERTS_EMAIL_PASSWORD
     # Connector SecretProvider reference (ADR 0019 §5, BACKLOG #196). When set AND [secrets].provider is
@@ -3573,6 +3583,21 @@ class SecuritySettings(_Section):
     # enforcement=warn keeps it a warning even when this is set. Not a loosening (it tightens).
     require_memory_encryption_declaration: bool = False
 
+    # ── Outbound alert email (data in transit) ───────────────────────
+    # #323 layer 3: the SECOND acknowledgment required to run the alerts / security-event SMTP hop with
+    # certificate verification OFF ([alerts].email_tls_verify=false) on an ENFORCING PHI instance.
+    # AN ACKNOWLEDGMENT SWITCH, NOT THE CLAMP — and the difference is the whole reason this cell shipped
+    # separately from the EMAIL/DIRECT connectors. Those are built inside build_check_registry's
+    # `active_hop_posture` scope, so they read the CLAMPED weakened_tls_escape_permitted_here() and an
+    # enforcing PHI hop can never be relaxed. The alerts notifier is constructed in the API lifespan,
+    # OUTSIDE that scope (measured: the contextvar is stamped only in pipeline/wiring_runner.py), where
+    # current_hop_posture() is None and the clamp degrades to the UNCLAMPED escape — i.e. the connectors'
+    # mechanism would silently provide no refusal at all here. So the refusal is keyed on this explicit
+    # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
+    # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
+    # names it, so the opt-out is never silent.
+    allow_unverified_alert_smtp_tls: bool = False
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -3971,6 +3996,7 @@ def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
     auth: AuthSettings,
+    alerts: AlertsSettings,
     cleartext_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
@@ -3980,7 +4006,8 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[auth].ad_session_recheck_seconds``, and the per-connection ``cleartext_accepted``. It is NOT yet
+    ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
+    layer 3), and the per-connection ``cleartext_accepted``. It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -4137,6 +4164,39 @@ def security_loosenings(
                 "ad_session_recheck_seconds",
                 "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
                 "live engine sessions until they expire on their own",
+            )
+        )
+    # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
+    # acknowledgment of it are different facts and an operator can hold either without the other. A hop
+    # with verification off under enforcement=warn needs no acknowledgment to run, so keying the report
+    # on the switch alone would leave the actual weakening invisible — which is the failure mode this
+    # registry exists to prevent. Reported at every call site (unlike cleartext_accepted, this is
+    # settings-scoped, so `security show` and a graphless GET /security/posture see it completely).
+    if alerts.email_smtp_host and alerts.email_from:
+        if not alerts.email_use_tls:
+            out.append(
+                (
+                    "email_use_tls",
+                    "the [alerts] SMTP hop is CLEARTEXT — operator alert bodies, every per-user "
+                    "security-event email (lockout, password/roles change) and the SMTP login "
+                    "credential cross it unencrypted and readable by anything on the path",
+                )
+            )
+        elif not alerts.email_tls_verify:
+            out.append(
+                (
+                    "email_tls_verify",
+                    "the [alerts] SMTP hop is encrypted but UNAUTHENTICATED — it accepts any "
+                    "certificate, so an on-path attacker presenting one reads the alert bodies, the "
+                    "per-user security-event email and the SMTP login credential",
+                )
+            )
+    if sec.allow_unverified_alert_smtp_tls:
+        out.append(
+            (
+                "allow_unverified_alert_smtp_tls",
+                "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
+                "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
     # --- the one CONNECTION-scoped deviation (ADR 0153 decision 2). It is not a [security] switch, but
