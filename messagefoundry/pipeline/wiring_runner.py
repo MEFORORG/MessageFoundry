@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
@@ -444,6 +444,34 @@ _BIND_CONFLICT_ERRNOS = frozenset({errno.EADDRINUSE, errno.EADDRNOTAVAIL, errno.
 _PREFIX_STAGES = frozenset({Stage.INGRESS, Stage.ROUTED})
 
 
+class TeardownReason(StrEnum):
+    """Why :meth:`RegistryRunner._teardown_unsafe` is running (ADR 0157 C6).
+
+    SHUTDOWN — the historical single path (process stop, a failed start's unwind). Statement-for-
+    statement unchanged, and the ONLY value single-node SQLite can reach: the only DEMOTE caller is
+    ``Engine._stop_graph``, reachable only from ``_reconcile_graph``, which runs only under
+    ``is_clustered()`` — and ``[cluster].enabled`` is rejected on SQLite at config load.
+    DEMOTE — loss of leadership, racing a lease this node no longer holds. Dispatchers drain
+    cooperatively BEFORE any hard cancel, and both phases are bounded. An inbound that cannot stop
+    inside the budget is ABANDONED — not awaited, and not cancelled."""
+
+    SHUTDOWN = "shutdown"
+    DEMOTE = "demote"
+
+
+#: Share of the demotion budget given to the cooperative quiesce phase. Larger than the source
+#: share because quiesce overrun is the only one that can STRAND: a hard-cancelled serializer
+#: leaves rows INFLIGHT, whereas an abandoned listener is duplicate-direction.
+_DEMOTE_QUIESCE_SHARE = 0.7
+#: Used only if a caller passes no budget. Equals the stock 10/20/30 derivation; unreachable single-node.
+_DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
+#: How long start() waits for a PRIOR demotion's abandoned stops before cancelling them. Sized to
+#: 2x the client-shutdown grace because MLLP/TCP/X12/HTTP each consume that grace TWICE, serially,
+#: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
+#: settle, taking the ADR 0031 rebind-failure branch instead.
+_PENDING_STOP_SETTLE_SECONDS = 10.0
+
+
 def _peek_for_loopback(
     ic: InboundConnection, body: str
 ) -> tuple[str | None, str | None, str | None, bool]:
@@ -850,6 +878,10 @@ class RegistryRunner:
         # against this map when a connector is built (a missing key fails loud — see resolve_env_settings).
         self._env_values: dict[str, Any] = dict(env_values or {})
         self._sources: dict[str, SourceConnector] = {}
+        # ADR 0157 Inc 4: inbound stop() tasks a DEMOTE abandoned when they overran the budget. Always
+        # EMPTY unless a demotion abandoned one, which is why every consumer sits behind a falsy-list
+        # guard and single-node never touches this list.
+        self._pending_source_stops: list[asyncio.Task[None]] = []
         self._destinations: dict[str, DestinationConnector] = {}
         # One delivery worker per outbound connection, addressable by name so a reload can
         # gracefully stop/swap a single connection's worker without touching its siblings.
@@ -2382,6 +2414,15 @@ class RegistryRunner:
         async with self._reload_lock:
             if self._running:
                 return
+            if self._sources or self._workers or self._destinations or self._dispatchers:
+                # ADR 0157 D7: a prior teardown raised or was cancelled from outside, so _running is
+                # False (the finally) but the built state survives. Building on top of it would leave
+                # orphaned listeners bound — and _start_inbound_unsafe's `if name in self._sources:
+                # return` would silently skip EVERY rebind — plus two dispatchers per stage claiming one
+                # lane, the per-lane FIFO hazard the single-consumer invariant exists to close.
+                # Idempotent, and structurally unreachable after a clean stop, so single-node never
+                # enters it.
+                await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
@@ -2477,7 +2518,9 @@ class RegistryRunner:
                 # is isolated above) must not leave half the graph wired with _running still False:
                 # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
-                await self._teardown_unsafe()
+                # Explicitly SHUTDOWN (ADR 0157): a partial start is not a demotion — there is no lease
+                # being handed over, so there is nothing to bound and no reason to abandon a listener.
+                await self._teardown_unsafe(TeardownReason.SHUTDOWN)
                 raise
             self._running = True
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
@@ -2549,17 +2592,214 @@ class RegistryRunner:
             self._sandbox_sessions[name] = session
         return session
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        *,
+        reason: TeardownReason = TeardownReason.SHUTDOWN,
+        budget_seconds: float | None = None,
+    ) -> None:
+        """Stop the graph. ``reason`` is keyword-only with a SHUTDOWN default, so all ~170 existing
+        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged and
+        behave identically (ADR 0157 C6)."""
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
             had_state = self._running or bool(self._sources or self._workers or self._destinations)
-            await self._teardown_unsafe()
+            await self._teardown_unsafe(reason, budget_seconds=budget_seconds)
+            if reason is TeardownReason.SHUTDOWN and self._pending_source_stops:
+                # Never orphan a task at loop close. Under DEMOTE we deliberately leave them running —
+                # settling them is start()'s job, at the next promotion.
+                await self._settle_pending_source_stops()
             if had_state:
-                log.info("wiring stopped")
+                log.info("wiring stopped")  # UNCHANGED string on the SHUTDOWN path
 
-    async def _teardown_unsafe(self) -> None:
+    async def _stop_sources_demote(self, budget: float) -> None:
+        """DEMOTE-only bounded, CONCURRENT source stop (ADR 0157 Inc 4 / D6). NEVER raises.
+
+        ONE phase-level deadline over ALL tasks — not a per-source timeout under a semaphore, which
+        would cost ``ceil(N/C) x budget`` (~63s at the 1,500-connection target against an ~8s margin).
+
+        ``asyncio.wait`` is the primitive, NOT ``wait_for``: it never cancels its awaitables, so
+        "abandon, do not cancel" is a property of the call itself rather than of one ``asyncio.shield``
+        token a later edit can silently drop.
+
+        Tasks are created eagerly, outside any gate. The four ``asyncio.start_server`` sources
+        (MLLP/TCP/X12/HTTP) call ``server.close()`` in their SYNCHRONOUS prologue, so accept stops on
+        the first loop pass after task creation — before this ``wait``'s timeout can fire, even at
+        budget 0.0 — and the expensive part is only the client drain. Note the precise claim:
+        ``create_task`` merely SCHEDULES, so nothing runs until we suspend on the ``wait`` below; do not
+        insert anything between them.
+
+        Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
+        ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
+        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+
+        The bound is applied HERE, at the call site — never by editing a transport constant, which would
+        make ``transports/`` know about clustering (the one-way dependency rule).
+        """
+        # A PREVIOUS demotion's stops have had a whole leadership term; cancel them rather than
+        # accumulating a generation per flap. Generation-scoped, so no arbitrary count cap is needed.
+        for stale in self._pending_source_stops:
+            stale.cancel()
+        self._pending_source_stops = []
+        sources = list(self._sources.items())  # snapshot BEFORE the first await
+        if not sources:
+            return
+        tasks = [asyncio.create_task(src.stop(), name=f"demote-stop:{n}") for n, src in sources]
+        _done, still = await asyncio.wait(tasks, timeout=max(0.0, budget))
+        for task in _done:
+            if not task.cancelled() and task.exception() is not None:
+                log.warning("demotion: an inbound stop() failed: %s", task.exception())
+        if still:
+            self._pending_source_stops = list(still)
+            for task in still:
+                task.add_done_callback(self._reap_pending_stop)
+            log.warning(
+                "demotion: %d inbound listener(s) did not stop within %.2fs and were ABANDONED "
+                "(their listening sockets are already closed; the client drain finishes in the "
+                "background and is settled at the next promotion). The node is NOT quiescent — a "
+                "message mid-handler still finishes its commit and its ACK, which count-and-log "
+                "requires; the successor drains the body.",
+                len(still),
+                budget,
+            )
+
+    async def _quiesce_workers_demote(self, budget: float) -> None:
+        """per_lane parity for the pooled quiesce (ADR 0157 Inc 5). NEVER raises.
+
+        These loops are ``while not self._stop.is_set()`` and ``_stop`` was set at the top of teardown,
+        so they exit on their own once the CURRENT claimed prefix resolves. ``asyncio.wait`` never
+        cancels and never raises on timeout; the existing cancel + gather below remains the fallback.
+
+        No-op in pooled mode: all FOUR dicts are empty there, because ``_ensure_inbound_workers``
+        returns early under ``pooled`` and ``_spawn_worker`` is a documented pooled no-op.
+
+        MUST run ABOVE the source phase, or per_lane workers keep issuing post-demotion terminal writes
+        for the whole source phase.
+        """
+        live = [
+            task
+            for task in (
+                *self._workers.values(),
+                *self._router_workers.values(),
+                *self._transform_workers.values(),
+                *self._response_workers.values(),
+            )
+            if not task.done()
+        ]
+        if live:
+            await asyncio.wait(live, timeout=max(0.0, budget))
+
+    async def _quiesce_dispatchers_demote(self, budget: float) -> None:
+        """DEMOTE-only cooperative dispatcher stop (ADR 0157 Inc 5). NEVER raises. No-op in per_lane.
+
+        ``d.stop()`` cancels the lane serializers, and a cancelled serializer leaves its claimed prefix
+        INFLIGHT BY DESIGN. On Postgres that is latency; on SQL Server there is no periodic in-flight
+        recovery at all. So on the one path we KNOW is handing over, drain first: a serializer allowed
+        to reach its terminal transition leaves ZERO rows INFLIGHT — its tail is ``release_claimed``'d,
+        its faulting head ``reschedule_claimed``'d, and a claimed OUTBOUND head that has not sent hits
+        the pre-send bail and re-pends un-errored.
+
+        ``stop()`` still runs unconditionally afterwards: it is BOTH the state-clearing path AND the
+        hard-cancel fallback, so there is exactly ONE dispatcher teardown to keep correct, not two.
+        """
+        if not self._dispatchers:
+            return
+        dispatchers = list(self._dispatchers.values())  # held across an await
+        drained = await asyncio.gather(
+            *(d.quiesce(budget) for d in dispatchers), return_exceptions=True
+        )
+        if any(result is not True for result in drained):
+            log.warning(
+                "demotion: %d of %d stage dispatcher(s) did not drain within %.2fs — hard "
+                "cancelling. Their claimed rows stay INFLIGHT: bounded on Postgres by "
+                "reclaim_expired_leases, but on SQL Server recovered ONLY by the successor's "
+                "on-promotion reset_stale_inflight — so if no node takes over, they strand.",
+                sum(1 for result in drained if result is not True),
+                len(dispatchers),
+                budget,
+            )
+        await asyncio.gather(*(d.stop() for d in dispatchers), return_exceptions=True)
+        self._dispatchers.clear()
+
+    def _reap_pending_stop(self, task: asyncio.Task[None]) -> None:
+        """Retrieve an abandoned stop's exception, else asyncio logs 'never retrieved' at GC."""
+        if task in self._pending_source_stops:
+            self._pending_source_stops.remove(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.warning(
+                "demotion: an abandoned inbound stop() ended with an error: %s", task.exception()
+            )
+
+    async def _settle_pending_source_stops(self) -> None:
+        """Join a prior demotion's abandoned stops, BOUNDED — and the bound is mandatory.
+
+        This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
+        start/stop/restart and every ``/connections`` handler also take. An unbounded join would
+        therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
+        File/Database ``stop()`` runs (those gather with no cancel and no timeout).
+
+        On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
+        operator-recoverable), whereas refusing to re-promote strands the whole graph — and
+        strand-direction is forbidden.
+        """
+        pending = [task for task in self._pending_source_stops if not task.done()]
+        self._pending_source_stops = []
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=_PENDING_STOP_SETTLE_SECONDS)
+        for task in still:
+            task.cancel()
+        if still:
+            await asyncio.gather(*still, return_exceptions=True)
+            log.warning(
+                "%d abandoned inbound stop(s) did not finish within %.1fs and were cancelled; a "
+                "rebind of those ports may fail (isolated per connection, ADR 0031)",
+                len(still),
+                _PENDING_STOP_SETTLE_SECONDS,
+            )
+
+    async def _teardown_unsafe(
+        self,
+        reason: TeardownReason = TeardownReason.SHUTDOWN,
+        *,
+        budget_seconds: float | None = None,
+    ) -> None:
         """Tear down all sources/workers/destinations and mark stopped. Lock-free (callers hold
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
-        reached _running, so a half-started runner (review M-8) and a double stop() are both safe."""
+        reached _running, so a half-started runner (review M-8) and a double stop() are both safe.
+
+        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases only; every other phase, and
+        their order, is shared. Under SHUTDOWN the executed statements are today's, verbatim.
+
+        **THE INVARIANT: ``self._running = False`` must execute on every path.**
+        ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
+        that returns or raises without clearing it makes this node **un-re-promotable, silently, with no
+        exception**. Two mechanisms enforce it: every DEMOTE bound is absorbed at its own call site (a
+        timeout CONTINUES the sequence rather than unwinding it — unwinding would skip the worker
+        cancel, the destination aclose and every ``.clear()``), and the ``finally`` below.
+
+        The ``finally`` is a BACKSTOP, **not** a licence to wrap this coroutine in ``wait_for`` from
+        OUTSIDE: a cancelled teardown still leaves ``_sources`` populated, which is why ``start()``
+        re-runs teardown on residual state and ``_reconcile_graph`` carries a ``has_residual_state``
+        branch (ADR 0157 D7).
+        """
+        demote = reason is TeardownReason.DEMOTE
+        budget = (
+            max(
+                0.0,
+                budget_seconds if budget_seconds is not None else _DEMOTE_BUDGET_FALLBACK_SECONDS,
+            )
+            if demote
+            else 0.0
+        )
+        try:
+            await self._teardown_body(demote, budget)
+        finally:
+            self._running = False
+
+    async def _teardown_body(self, demote: bool, budget: float) -> None:
+        """The teardown sequence itself. Split out ONLY so the ``finally`` above contains no await —
+        an external cancel therefore cannot interrupt the one statement that must always run."""
         self._stop.set()
         # #147 (ADR 0095): cancel the active-window scheduler tasks FIRST so no schedule tick calls
         # start/stop_inbound/outbound while the rest of teardown runs (a task blocked awaiting the reload
@@ -2576,19 +2816,32 @@ class RegistryRunner:
         # here would notify_work() dispatchers we are about to stop.
         if self._claim_mode != "pooled":
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
-        for source in self._sources.values():
-            await source.stop()
-        # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
-        # listener can no longer mark_ready an already-cleared dispatcher — NOT right after _stop.set().
-        # The shared _stop already broke their loops; d.stop() cancels each claimer/sweep/lane task +
-        # timer and clears its state, then we drop the dict. A cancelled serializer leaves its claimed
-        # rows INFLIGHT for reset_stale_inflight (crash-safety) — never released. Empty in per_lane mode,
-        # so this is a no-op there and the per_lane worker cancel/gather below is unchanged.
-        if self._dispatchers:
-            await asyncio.gather(
-                *(d.stop() for d in self._dispatchers.values()), return_exceptions=True
-            )
-            self._dispatchers.clear()
+        if demote:
+            # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
+            # split-brain-relevant action, so its budget must start NOW rather than after the source
+            # phase. A listener staying up for those milliseconds is CORRECT under count-and-log (its
+            # ACKed message is durable at the ingress stage, PENDING and never INFLIGHT, and the
+            # successor drains it), and a listener wake into an already-cleared dispatcher is a verified
+            # no-op (_wake_lane returns on `is None`) — which is what D3 exists to guarantee, and what
+            # makes the inversion safe.
+            await self._quiesce_workers_demote(budget * _DEMOTE_QUIESCE_SHARE)
+            await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
+            await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
+        else:
+            for source in self._sources.values():
+                await source.stop()
+            # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
+            # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
+            # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
+            # claimer/sweep/lane task + timer and clears its state, then we drop the dict. A cancelled
+            # serializer leaves its claimed rows INFLIGHT for reset_stale_inflight (crash-safety) —
+            # never released. Empty in per_lane mode, so this is a no-op there and the per_lane worker
+            # cancel/gather below is unchanged.
+            if self._dispatchers:
+                await asyncio.gather(
+                    *(d.stop() for d in self._dispatchers.values()), return_exceptions=True
+                )
+                self._dispatchers.clear()
         inbound_tasks = (
             *self._router_workers.values(),
             *self._transform_workers.values(),
@@ -2689,7 +2942,8 @@ class RegistryRunner:
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
-        self._running = False
+        # NOTE: `self._running = False` is NOT here — it moved into _teardown_unsafe's `finally`
+        # (ADR 0157 D7) so a raised or cancelled teardown still leaves this node re-promotable.
 
     # --- outbound worker management ------------------------------------------
 

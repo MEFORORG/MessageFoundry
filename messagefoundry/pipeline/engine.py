@@ -15,7 +15,7 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol, runtime_checkable
 
 from messagefoundry.config.models import (
     AckAfter,
@@ -52,7 +52,11 @@ from messagefoundry.config.wiring import (
 )
 from messagefoundry.pipeline.alerts import AlertSink
 from messagefoundry.pipeline.cert_expiry import CertExpiryRunner, MonitoredCert, certs_from_registry
-from messagefoundry.pipeline.cluster import ClusterCoordinator, NullCoordinator
+from messagefoundry.pipeline.cluster import (
+    ClusterCoordinator,
+    NullCoordinator,
+    demote_stop_budget,
+)
 from messagefoundry.pipeline.config_convergence import ConfigConvergenceRunner
 from messagefoundry.pipeline.dr import DrCoordinator
 from messagefoundry.pipeline.dr_backup import BackupRunner
@@ -72,6 +76,7 @@ from messagefoundry.pipeline.state_convergence import StateConvergenceRunner
 from messagefoundry.pipeline.update_check import UpdateCheckResult, UpdateCheckRunner
 from messagefoundry.pipeline.wiring_runner import (
     RegistryRunner,
+    TeardownReason,
     check_pt_backend_supported,
     check_reference_backend_supported,
 )
@@ -102,6 +107,24 @@ class ConfigReloadDenied(Exception):
 def _within(path: Path, root: Path) -> bool:
     """True if ``path`` is ``root`` itself or nested under it (both already resolved)."""
     return path == root or root in path.parents
+
+
+@runtime_checkable
+class _SupportsDemoteHook(Protocol):
+    """The OPTIONAL demotion edge-trigger capability (ADR 0157 Inc 5).
+
+    Deliberately NOT part of :class:`ClusterCoordinator`: that Protocol is ``@runtime_checkable`` and a
+    standalone test stand-in isinstance-checks against it, so widening it is a multi-site enumeration —
+    the exact defect class this avoids. A coordinator without the hook simply keeps the poll-only path,
+    which is correct, just up to one ``_graph_reconcile_interval`` slower.
+
+    Note what the compile-time Protocol guard in ``cluster_sqlserver.py`` can and cannot do: it asserts
+    that coordinator is assignable to ``ClusterCoordinator``, which does NOT include this hook — so
+    omitting the SQL Server twin would still type-check. The only real backstops are the tests that pin
+    both shipped coordinators against this Protocol and fire both edges.
+    """
+
+    def set_on_demote(self, callback: Callable[[], None] | None) -> None: ...
 
 
 class Engine:
@@ -383,6 +406,9 @@ class Engine:
         # processing; the poll interval is bounded (at start()) to keep that stop prompt.
         self._graph_supervisor: asyncio.Task[None] | None = None
         self._graph_stop = asyncio.Event()
+        # ADR 0157 Inc 5: set by the coordinator's demotion edge so the supervisor reconciles at
+        # once instead of waiting out a whole poll interval. _graph_stop stays the loop-exit latch.
+        self._graph_wake = asyncio.Event()
         self._graph_lock = asyncio.Lock()
         self._graph_reconcile_interval = 1.0
         # Serializes ALL console→connections.toml writes (#131/#136 review): the read-modify-write of the
@@ -1127,6 +1153,19 @@ class Engine:
             # Stay comfortably inside the (ttl - fence) margin and never slower than ~1s.
             self._graph_reconcile_interval = max(0.1, min(1.0, (ttl - fence) / 3.0))
             self._graph_stop.clear()
+            self._graph_wake.clear()
+            # ADR 0157 Inc 5: register the demotion edge-trigger if this coordinator supports it.
+            # An isinstance gate rather than hasattr, and a test pins that BOTH shipped coordinators
+            # satisfy the Protocol — otherwise the capability degrades to the poll path SILENTLY,
+            # which is the defect class the ADR itself criticises elsewhere.
+            if isinstance(self._coordinator, _SupportsDemoteHook):
+                self._coordinator.set_on_demote(self._on_demote_edge)
+            else:
+                log.info(
+                    "engine: coordinator has no demotion edge-trigger; graph teardown follows the "
+                    "%.2fs poll instead",
+                    self._graph_reconcile_interval,
+                )
             # Reconcile ONCE synchronously before the loop: if this node is already the leader (it
             # acquired the lease on coordinator.start()'s first tick, or in tests a stand-in reports
             # leader immediately), the graph comes up during start() rather than a poll-interval later.
@@ -1239,12 +1278,33 @@ class Engine:
             await asyncio.gather(self._warm_pool_task, return_exceptions=True)
         self._warm_pool_task = asyncio.create_task(self.store.warm_pool(), name="store-pool-warm")
 
+    def _on_demote_edge(self) -> None:
+        """Coordinator demotion edge (ADR 0157 Inc 5). Synchronous, never-raise, PURE IN-MEMORY.
+
+        It deliberately does NOT set the runner's ``_stop``: that would halt every dispatcher while
+        ``_running`` is still True, and a promote -> demote -> re-promote flap would then leave
+        ``_reconcile_graph``'s bring-up branch facing a graph whose workers had already exited. Halting
+        egress at the fence edge is already the pre-send bail's job.
+        """
+        try:
+            self._graph_wake.set()
+        except Exception:  # pragma: no cover - defensive; must never break the coordinator's fence
+            log.warning("engine: demotion edge wake failed", exc_info=True)
+
     async def _stop_graph(self) -> None:
         """Tear the graph down on loss of leadership: stop the listeners + workers so a demoted node
         stops binding/processing. The reference-sync loop and the self-gated maintenance/convergence
         loops keep running (a follower still converges its caches), so only the runner is stopped."""
         if self._registry_runner is not None:
-            await self._registry_runner.stop()
+            # ADR 0157 C6: demotion is BOUNDED — the source and dispatcher phases only. Phases after
+            # them (connector aclose, executor shutdown, sandbox close) remain unbounded; they run
+            # after the graph has stopped so they cannot extend the split-brain window, but do NOT
+            # describe this as 'the demotion teardown is bounded'.
+            budget, _headroom = demote_stop_budget(
+                lease_ttl_seconds=self._cluster_settings.leader_lease_ttl_seconds,
+                fence_timeout_seconds=self._cluster_settings.leader_fence_timeout_seconds,
+            )
+            await self._registry_runner.stop(reason=TeardownReason.DEMOTE, budget_seconds=budget)
         # ADR 0157 C4 — do NOT clear the held epoch here.
         #
         # The store OMITS the guard string ENTIRELY when the epoch is None, so `set_leader_epoch(None)`
@@ -1308,6 +1368,9 @@ class Engine:
         leases independently prevent concurrent double-processing of a given row). Clustered only;
         cooperatively stopped via ``_graph_stop`` (the loop wakes on it and exits between reconciles)."""
         while not self._graph_stop.is_set():
+            # Consume the edge BEFORE reconciling, not after: a fence landing DURING a slow reconcile
+            # must wake the NEXT pass rather than being swallowed by a clear() that runs after it.
+            self._graph_wake.clear()
             try:
                 await self._reconcile_graph()
             except asyncio.CancelledError:
@@ -1315,8 +1378,10 @@ class Engine:
             except Exception:
                 log.exception("engine graph supervisor reconcile failed; will retry")
             try:  # noqa: SIM105
+                # Wake on the demotion edge OR the poll interval. Engine.stop() sets both latches, so a
+                # shutdown exits here cooperatively instead of being cancelled by its own timeout.
                 await asyncio.wait_for(
-                    self._graph_stop.wait(), timeout=self._graph_reconcile_interval
+                    self._graph_wake.wait(), timeout=self._graph_reconcile_interval
                 )
             except TimeoutError:
                 pass
@@ -1754,6 +1819,10 @@ class Engine:
         # graph itself is then stopped by the registry_runner.stop() below, as before.
         if self._graph_supervisor is not None:
             self._graph_stop.set()
+            # Paired with _graph_stop: the loop now waits on _graph_wake, so without this the
+            # supervisor would sit out its poll interval and be CANCELLED by the wait_for below
+            # rather than exiting cooperatively.
+            self._graph_wake.set()
             supervisor = self._graph_supervisor
             self._graph_supervisor = None
             try:
@@ -1799,6 +1868,10 @@ class Engine:
         # Deregister cluster membership after the runner has quiesced but before the store closes (the
         # coordinator marks its node left over the same pool). stop() is idempotent and safe even if
         # start() raised (then there's just nothing to cancel). NullCoordinator is a no-op.
+        # ADR 0157 Inc 5: drop the edge-trigger BEFORE stopping the coordinator, so a clean
+        # step-down cannot fire a wake into a supervisor that is already gone.
+        if isinstance(self._coordinator, _SupportsDemoteHook):
+            self._coordinator.set_on_demote(None)
         await self._coordinator.stop()
         # Cancel the background pool warm-up if still running (best-effort; the store is about to close).
         # It releases any connections it holds in its own finally, but at shutdown the pool closes anyway.

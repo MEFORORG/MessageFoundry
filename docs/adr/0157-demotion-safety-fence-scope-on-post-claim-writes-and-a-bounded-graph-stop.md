@@ -1,10 +1,26 @@
 # ADR 0157 — Demotion safety: fence scope on post-claim writes, and a bounded graph stop
 
-**Status:** Proposed **Date:** 2026-08-01
+**Status:** Accepted **Date:** 2026-08-01 **Implemented:** 2026-08-02 (Inc 1, 4, 5)
 
-> Proposed only. Nothing here is built. The two questions that need an owner decision are stated in
-> **Decision** as C1 (do post-claim writes carry a precondition, and which ones) and C6 (does demotion
-> get an enforced deadline, and what happens to an inbound that cannot meet it).
+> **Increments 1, 4 and 5 are BUILT.** C1 (terminal writes only, fail-open) and C6 (yes, bounded,
+> abandon-don't-await) were decided by the owner. Inc 0, 2 and 3 are **not** built — and Inc 2's
+> premise is wrong as written; see the Increments section.
+>
+> Three clauses were corrected during implementation, each because the drafted version was
+> **strand-direction** — the one outcome the at-least-once invariant forbids:
+>
+> - **C3** said a fenced terminal write should roll back and leave the row INFLIGHT for recovery. On
+>   SQL Server there is no periodic in-flight recovery at all, so that is an unbounded strand produced
+>   by the fence itself. Corrected: roll back, then re-pend via unguarded `release_claimed` (D1).
+> - **C4** said "delete the `set_leader_epoch(None)` clear". Alone that is a silent total halt once C5
+>   lands: `_reconcile_graph` had only two branches, so `is_leader() and running` matched neither,
+>   forever, holding a stale epoch — a live leader claiming nothing, with no exception and no alert.
+>   Corrected: delete the clear **and** re-stamp on every reconcile pass while leader (D2).
+> - **The cross-backend safety claim for C4 was false.** It read "SQL Server's claim guard already
+>   exists ... so a demoted SS node claims nothing". `claim_ready` on SQL Server carries **no** epoch
+>   guard, so a demoted SS node retaining a stale epoch still claims and drains every UNORDERED lane,
+>   and resolves those rows unfenced. Retaining the epoch is still strictly better than clearing it —
+>   but only the three FIFO claim paths are covered there until Inc 3.
 
 ---
 
@@ -292,14 +308,26 @@ the fence baseline from it rather than after the round trip; config-load warning
 with a defaults change or rely on the clamp alone.
 *Test:* slow-renew fixture asserting the detection margin stays positive.
 
-**Inc 1 — Postgres: fence every claim path + every terminal resolve.** `_EPOCH_GUARD_CLAIM` onto
-`claim_ready`; `_EPOCH_GUARD_RESOLVE` onto the four resolves, the batch forms, and the RESPONSE-stage
-re-ingress dead-letters. Drop `set_leader_epoch(None)` from `_stop_graph` (C4). Add an **additional**
-own-owner promotion-recovery statement — do **not** widen `owner IS DISTINCT FROM`, which would re-open
-engine-shard theft (ADR 0073). No DDL: `leader_lease.leader_epoch` already exists and back-fills
-additively.
-*Tests:* GAP 1 below; a **structural** test enumerating every `UPDATE queue SET status` site and asserting
-each is guarded or in a reviewed allowlist.
+**Inc 1 — Postgres: fence every claim path + every terminal resolve. BUILT.** `_EPOCH_GUARD_CLAIM`
+onto `claim_ready`; `_EPOCH_GUARD_RESOLVE` onto the eight terminal resolves (`dead_letter_now`,
+`mark_done`, `mark_batch_done`, `complete_with_response`, `ingress_handoff`'s two DEAD branches,
+`mark_failed`, `mark_batch_failed`, `dead_letter_batch`). A rejected resolve rolls back **whole** and
+re-pends (D1). `set_leader_epoch(None)` removed from `_stop_graph` (C4), with the D2 re-stamp. No DDL.
+
+**Dropped from Inc 1 (D10):** the additional own-owner promotion-recovery statement. It must be
+lease-expiry-bounded to be safe, and every claim stamps `lease_until = now + lease_ttl_seconds`, so in
+the promote -> demote -> re-promote-in-one-process case it is a no-op exactly when it would be needed;
+once the lease *has* expired the owner-blind sweep already covers it. Deferred, not silently skipped.
+
+*Tests, as built:* 13 runtime tests against a real Postgres + 8 **structural** tests enumerating every
+`UPDATE queue ... SET status` site with a written reason for each unguarded one. The structural gate
+parses the AST rather than slicing source, because `claim_fifo_heads` splits its claim across two
+adjacent literals with a comment between them and a line-oriented regex cannot see it.
+
+> **A gate is evidence only once it has been shown to fail.** The first version of that structural test
+> keyed on whether a method *mentioned* `_EPOCH_GUARD_CLAIM`. Deleting `{epoch_guard}` from
+> `claim_fifo_heads`' SQL — the exact regression it exists to catch — left the mention intact and the
+> gate stayed **green**. It now keys on the emitted SQL, and the mutation is confirmed red.
 
 **Inc 2 — SQL Server: periodic in-flight recovery. Blocking for Inc 3, not for Inc 1.** A leader-gated,
 age-based sweep (`status='inflight' AND updated_at < @cutoff`) reached through a **new** capability, not
@@ -314,12 +342,29 @@ coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rol
 (`except Exception: await conn.rollback()` does **not** catch `CancelledError`). If it commits, say so
 rather than claiming a proof.
 
-**Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only).** The enum lands **here**:
-`_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change single-node SQLite
-shutdown, which the parity constraint forbids. Snapshot `list(self._sources.values())` (the live-dict
-iteration across awaits is a latent `RuntimeError`), gather under a semaphore, wrap each `source.stop()`
-in `wait_for` **at the call site** — not by editing transport constants, which would make `transports/`
-know about clustering and violate the one-way dependency rule (§4).
+> ⚠️ **Inc 2 is MIS-SPECIFIED above; do not build it as written.** It proposes an owner-blind, age-based
+> periodic sweep. The verified defect is narrower — there is no recovery at **graph re-start**, because
+> `RegistryRunner.reload()` is a quiesce-and-swap that calls no recovery — and the right fix is a scoped
+> reset there. An age sweep on SQL Server has **no populated `owner` column** to discriminate with, so it
+> would re-pend rows a live leader is actively working. Re-scope before building.
+
+**Inc 4 — `TeardownReason` + bounded, concurrent source stop (DEMOTE only). BUILT.** The enum lands
+**here**: `_teardown_unsafe` is the single shutdown path, so bounding it unguarded would change
+single-node SQLite shutdown, which the parity constraint forbids. Snapshot `list(self._sources.items())`
+before the first await. The bound is applied **at the call site** — never by editing transport constants,
+which would make `transports/` know about clustering and violate the one-way dependency rule (§4).
+
+**Corrected from the draft (D6): one phase-level `asyncio.wait`, NOT a semaphore with a per-source
+`wait_for`.** The semaphore form costs `ceil(N/C) x budget` — ~63s at the 1,500-connection target
+against an ~8s margin. `asyncio.wait` also never cancels its awaitables, so "abandon, don't cancel" is a
+property of the primitive rather than of an `asyncio.shield` token a later edit can silently drop.
+
+**Abandonment is socket-safe, and only socket-safe.** The four `asyncio.start_server` sources
+(MLLP/TCP/X12/HTTP) call `server.close()` in their synchronous prologue. **DICOM does not** — it releases
+its port inside `await to_thread(server.shutdown)`, so an abandoned DICOM stop can still hold the port at
+re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and parks on that
+Event, so an abandoned one finishes at most its single in-flight scan. State this per connector; do not
+write "every source".
 *Tests:* N parked sources → wall clock is max(), not sum(); a re-promotion after an abandoned stop cannot
 double-bind; SHUTDOWN remains byte-identical.
 
@@ -328,8 +373,16 @@ block above the source loop and split `d.stop()` into a cooperative `quiesce()` 
 serializers reach a terminal transition and leave zero rows INFLIGHT) with a hard-cancel fallback. Add a
 sync, never-raise `on_demote` hook fired from `_check_fence` — safe because it is pure in-memory, so
 `.cancel()`/`Event.set()` preserve its no-DB-I/O property.
-*Tests:* **the `_running` regression test** (after a deadline-expired teardown the node can still
-re-promote); both orderings asserted in one test so they cannot drift.
+*Tests, as built:* 21 non-env-gated tests. The `_running` regression (a raised or cancelled teardown
+still leaves the node re-promotable, via a `finally` containing no `await`); abandon-not-cancel;
+max-not-sum at **N = 200**, because a semaphore of 8 or 64 is structurally incapable of showing the
+defect at small N; both demotion edges on both coordinators; and a parity sentinel proving single-node
+reaches no DEMOTE-only statement.
+
+**The `cluster_sqlserver.py` compile-time Protocol guard cannot backstop the hook.** It asserts only
+assignability to `ClusterCoordinator`, which deliberately does not carry `set_on_demote` (widening that
+`@runtime_checkable` Protocol breaks a standalone test stand-in — S3). Omitting the SQL Server twin would
+type-check clean. The tests are the only real backstop, so they pin both coordinators explicitly.
 
 ---
 
