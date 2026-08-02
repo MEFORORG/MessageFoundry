@@ -230,19 +230,37 @@ jobs:
       # code under test: #74 landed tests/test_worktree_prune_merged.py (1,506 lines) and windows-2025
       # went 19:35 -> 26:07 on the same branch. The claim was already false when it was written.
       #
-      # Measured over the 11 PASSING windows-2025 runs on 2026-08-01, timing the `Tests (pytest)` STEP,
-      # which is what step_timeout gates. NOT the job: the job is ~3 min longer and capped separately,
-      # and two sessions misread job durations as step durations while triaging this (c53f752b's JOB ran
-      # 28:41 and PASSED, because job cap 30 vs step cap 26).
+      # Measured by timing the `Tests (pytest)` STEP, which is what step_timeout gates. NOT the job: the
+      # job runs several minutes longer and is capped separately, and three sessions misread job
+      # durations as step durations while triaging this (c53f752b's JOB ran 28:41 and PASSED, because
+      # job cap 30 vs step cap 26).
       #
-      #   leg              max passing step   old cap   old margin
-      #   ubuntu-latest    12:27              19:00     1.53x
-      #   windows-2022     18:39              26:00     1.39x
-      #   windows-2025     24:35              26:00     1.06x
+      # POOL: every CI run created on 2026-08-01 (101 runs, enumerated with `gh api --paginate`), each
+      # leg's `Tests (pytest)` step, keeping rows whose STEP concluded success. n is per leg.
       #
-      # windows-2025 had already PASSED at 24:35 -- 85 seconds of margin -- before #119 died. The "2x"
-      # figure matched no leg. State the MEASURED value and its DATE, never a round multiple: a bare
-      # multiple gives the next reader no way to tell when it has rotted, which is how this one survived.
+      #   leg              max passing step   n    old cap   old margin
+      #   ubuntu-latest    12:31              57   19:00     1.518x
+      #   windows-2022     21:34              52   26:00     1.206x
+      #   windows-2025     25:51              49   26:00     1.006x   <- NINE SECONDS
+      #
+      # An earlier revision of this table said 12:27 / 18:39 / 24:35 over "11 passing runs". Every figure
+      # was wrong and each in the safe-looking direction. Two errors produced it, both worth naming
+      # because they are cheap to repeat:
+      #
+      #   * THE POOL WAS A PAGE, NOT A QUESTION. It came from `gh run list --limit 20` -- a default-sized
+      #     listing, not the set of runs that day. 20 of 101. The sample size was set by a tool default
+      #     and then reported as though it had been chosen.
+      #   * FILTERING ON *JOB* CONCLUSION DROPS THE TIGHTEST STEPS BY CONSTRUCTION. A step that nearly
+      #     exhausts step_timeout is the most likely to push its job into job_timeout, so the job is
+      #     cancelled while the step itself concluded success. Five such rows exist on 2026-08-01, and
+      #     they include the maximum. Measure the step; filter on the step.
+      #
+      # Only the windows-2025 row was ever a maximum; ubuntu's 12:27 and windows-2022's 18:39 were that
+      # same run's other two legs, quoted as if each were its leg's worst case.
+      #
+      # State the MEASURED value, its POOL, its n and its DATE -- never a bare multiple. A multiple gives
+      # the next reader no way to tell when it has rotted; a multiple without its pool cannot even be
+      # rechecked.
       #
       # PROOF IT WAS THE CAP, NOT THE BRANCH. #119's windows-2025 leg was RE-RUN on the SAME commit
       # against the SAME 26:00 cap: attempt 1 was killed at the cap, attempt 2 concluded SUCCESS. Same
@@ -251,10 +269,41 @@ jobs:
       # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
       # that runner was fast enough that time.
       #
-      # 36:00 is 1.46x over that 24:35 maximum -- the margin ubuntu already runs with. Both Windows legs
-      # take the same number: windows-2022 is the faster of the two, so sizing on windows-2025 only
-      # leaves it more room, and one value is one thing to re-derive. job_timeout moves 30 -> 40 to keep
-      # the nesting invariant above: the step must still expire strictly BEFORE the job.
+      # 36:00 is 1.393x over the 25:51 maximum -- comfortably above the 5:26 spread the same pool shows
+      # (20:41 .. 26:07 on windows-2025, identical code), which is the criterion that matters: HEADROOM
+      # MUST EXCEED OBSERVED SPREAD, not some multiple of a single point. A ratio against one run says
+      # nothing about a distribution, and #119 died from the distribution, not from its own duration.
+      # Both Windows legs take the same number: windows-2022 is the faster, so sizing on windows-2025
+      # only leaves it more room, and one value is one thing to re-derive.
+      #
+      # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
+      # `step_timeout` -- `Tests (pytest)` and `Web console tests (pytest)` -- so the job can contain
+      # 2 x step_timeout of gated work, which job_timeout must cover and step_timeout cannot bound.
+      # Observed for real on run 30724385719 (main @ 8f01cef8, 2026-08-01):
+      #
+      #   Tests (pytest)              00:01:21 -> 00:27:12   25:51   SUCCESS   (9s under the 26:00 cap)
+      #   Web console tests (pytest)  00:27:12 -> 00:30:14           CANCELLED
+      #   JOB                         00:00:06 -> 00:30:19   30:13   CANCELLED  <- job_timeout 30 fired
+      #
+      # A GREEN first step, then an unattributed job-level kill during the second -- exactly the failure
+      # the nesting note above exists to prevent, arriving by the path that note does not consider. It
+      # does NOT happen when a step is killed (that ends the job and skips what follows, so those
+      # durations never sum); it happens when the first step PASSES near its budget.
+      #
+      # job_timeout is therefore sized to hold BOTH gated steps plus setup -- not step_timeout plus a
+      # constant, which is what the previous +4 relationship was. Web-console is stable (max 3:27 on
+      # windows-2025, 1:58 on ubuntu) while `Tests` swings 19:50-25:51, so the sum is dominated by a
+      # budget the step cap already bounds and an addend the job cap must absorb on its own:
+      #
+      #   leg       step + web-console(max) + overhead   old job   new job
+      #   ubuntu    19:00 + 1:58 + 0:41 = 21:39          22:00 -> +21s      26:00 -> +4:21 (1.20x)
+      #   W22/W25   36:00 + 3:27 + 0:41 = 40:08          40:00 -> -8s       46:00 -> +5:52 (1.15x)
+      #
+      # ALL THREE legs were inside a minute of their job cap and windows was already NEGATIVE -- the
+      # +4 convention had been carried through two cap changes without anyone summing what it had to
+      # cover. The structural fix is to stop the two steps sharing a budget (a 3:27 suite has no
+      # business holding 36:00) and is filed as BACKLOG #344; this sizing makes the invariant hold
+      # until someone does it. Re-derive it if either suite's duration moves.
       #
       # This cap is NOT what catches a hung test; pytest_timeout (120s) is, per test. The step cap only
       # catches a whole-process deadlock both in-process watchdogs miss, which is why it can sit well
@@ -421,9 +470,9 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":22,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":40,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":40,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":26,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":46,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":46,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
