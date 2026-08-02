@@ -164,6 +164,21 @@ the next reader does not re-derive the wrong precedent from the same comment.
   with no `Exception` filter), and asyncpg's pool additionally resets under `asyncio.shield`. SQLite shares
   the `except Exception` shape but has a single writer connection under an `asyncio.Lock` and no pool, so
   there is no next-borrower to inherit anything.
+- **A new *source* for a 1222 that was assumed to come only from producer contention** (BACKLOG #344
+  instance 2, found independently and concurrently). That work traced the other end of this same chain:
+  a contended head raises 1222, the store swallows it as a normal EMPTY (the `_is_lock_timeout` branch),
+  and the dispatcher's EMPTY branch goes to phase IDLE with **no timer armed**. It correctly concludes
+  that this is a **test-rig gap, not an engine defect**, because production's periodic sweep re-readies
+  exactly such a lane — the ADR 0070 tests disable that sweep on purpose, which is what makes IDLE
+  terminal *there*. **Nothing in this ADR contradicts that**, and the severity above is deliberately not
+  escalated on the strength of it.
+
+  The connection worth recording is the **duration profile**. That analysis assumes the contention is
+  momentary — a producer holding a head lock in flight. A connection poisoned by this defect holds its
+  `queue` X locks for as long as it sits unclaimed in the pool's free deque, so the 1222 it manufactures
+  can repeat across successive sweep ticks rather than clearing on the next one. Production still
+  recovers, but the mechanism supplies a *persistent* contention source where a momentary one was
+  assumed. Referenced by ledger number, not by SHA — that branch is unpushed and may be rebased.
 - **Private-attribute coupling.** `conn._conn` is aioodbc-internal. This is pre-existing — `_acquire`
   already reaches through it to apply the STORE-3 timeout — and aioodbc is hash-locked at 0.5.0, but a
   version bump must re-check `Pool.release`'s `if not conn.closed` rule.
