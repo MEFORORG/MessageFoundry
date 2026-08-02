@@ -24,8 +24,10 @@
     refuses to look; what they buy is that the collision becomes visible BEFORE the work, not after.
 
     Releasing is manual and claims do NOT expire: an abandoned claim is a stale note, whereas an
-    auto-expiring one silently re-opens the race it exists to prevent. `-List` flags anything older than
-    12h so stale ones are obvious.
+    auto-expiring one silently re-opens the race it exists to prevent. `-List` reports each holder's
+    LIVENESS -- worktree gone, or hours since its last commit -- not the claim's age. Age was the
+    original signal and it was actively misleading: a 21h claim whose holder had committed two minutes
+    earlier was labelled STALE and recommended for release.
 
 .EXAMPLE
     pwsh -NoProfile -File scripts\coord\claim.ps1 -Take 105 -Note "corepoint xml importer"
@@ -90,11 +92,37 @@ function Show-List {
         $c = Get-Content $f.FullName -Raw | ConvertFrom-Json
         $held = ($c.worktree -replace '\\', '/').TrimEnd('/')
         $mine = if ($held -ieq $me) { "  <-- THIS worktree" } else { "" }
+        # LIVENESS, not age. This used to print "[STALE ~Nh -- release it if that session is gone]" once
+        # a claim was 12h old, which measures how long the WORK has run and says nothing about whether
+        # anyone is still doing it. Measured 2026-07-31: a claim reported STALE ~21h whose holder had
+        # committed TWO MINUTES earlier. Releasing on that advice frees the key for a second session to
+        # start building what someone is mid-flight on -- the exact duplicate-build this registry exists
+        # to prevent, arrived at by following the tool's own recommendation. A long claim is the normal
+        # shape of long work; report what the HOLDER is doing and let the operator decide.
         $age = ""
         try {
-            $hrs = ((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
-            if ($hrs -ge 12) { $age = "  [STALE ~$([int]$hrs)h -- release it if that session is gone]" }
-        } catch { }
+            $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
+            if (-not (Test-Path $held)) {
+                # The only state that is genuinely safe to act on without asking anyone.
+                $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]"
+            }
+            else {
+                $ct = & git -C $held log -1 --format=%ct 2>$null
+                if ($ct) {
+                    $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
+                    $age = "  [held ${hrs}h; holder last committed ${quiet}h ago]"
+                    if ($quiet -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
+                }
+                else {
+                    $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]"
+                }
+            }
+        } catch {
+            # Say so. An empty annotation reads as "nothing notable about this claim", which is the same
+            # silent-instrument failure the age signal had: accurate about what it measured, mute about
+            # what it could not. A claim whose liveness could not be determined must not look routine.
+            $age = "  [liveness check FAILED -- treat as unknown, confirm before releasing]"
+        }
         Write-Host ("  {0,-34} {1}" -f $c.key, $c.note)
         Write-Host ("      held by {0} [{1}]{2}{3}" -f $held, $c.branch, $mine, $age)
     }
