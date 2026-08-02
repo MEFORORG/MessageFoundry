@@ -236,6 +236,39 @@ original edit — conflict fixup is exactly when a sweep gets re-run carelessly.
 `316` across `CHANGELOG.md` will happily turn `cp1252` into `cp1316`, in a file nobody re-reads. Scope
 replacements to the anchored forms (`BACKLOG #252`, `## 252.`), never the bare number.
 
+### A branch cut from a pre-squash commit hides a revert behind a clean-looking diff
+
+`main` squash-merges, so a branch's own commits never become ancestors of `main` even after its PR
+lands — their *content* arrives as one new commit. Branch again from one of those commits (a trailing
+commit pushed after the PR merged, say, or an old branch you are rescuing work from) and the new
+branch inherits a merge base from *before* the squash. Everything that landed in between is missing
+from it, and the PR proposes deleting all of it.
+
+Measured 2026-08-02, rescuing an ADR from a commit pushed 1h37m after its own PR had squash-merged:
+the branch differed from `main` by **58 files and 5,726 deletions** and conflicted on five. Its PR
+would have reverted a dozen merged PRs.
+
+**A three-dot diff cannot see this, which is the trap.** `git diff origin/main...HEAD` and GitHub's
+"Files changed" tab both resolve the merge base, and the merge base is exactly what is stale — so the
+diff shows the two files you added and nothing else. Two checks that do see it:
+
+```powershell
+git merge-base --is-ancestor origin/main HEAD   # exit 0 = your branch CONTAINS main
+git diff --stat origin/main HEAD                # two-dot: tree vs tree, no merge base
+```
+
+A non-zero deletion count from the second, on a branch that only adds files, is the signal.
+
+The fix is to **merge `origin/main` into the branch**, not to rebase: the conflicting files are work
+that already landed via the squash, so main's side is authoritative and taking it drops nothing. Then
+re-run both checks — the acceptance test is that the two-dot diff shows only your own change.
+
+Blob-comparing a few files is **not** a substitute, and it is the check most likely to be reached for.
+It was run here and reported all five files identical. That was correct when measured and false twenty
+minutes later, because an in-flight PR touching exactly those five files merged in between. A
+content spot-check answers *"are these equal right now"*, not *"will this merge cleanly"* — and if an
+armed PR is queued against the same files, the first question stops predicting the second.
+
 ## What's isolated vs shared
 
 | Isolated per worktree | Shared across worktrees |
