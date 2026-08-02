@@ -18,6 +18,7 @@ import pytest
 from messagefoundry.__main__ import main
 from messagefoundry.config.ai_policy import DataClass
 from messagefoundry.config.settings import (
+    AlertsSettings,
     AuthSettings,
     SecuritySettings,
     ServiceSettings,
@@ -33,7 +34,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
-    return security_loosenings(sec, StoreSettings(), AuthSettings(), ())
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), ())
 
 
 SAMPLES_CONFIG = Path(__file__).resolve().parents[1] / "samples" / "config"
