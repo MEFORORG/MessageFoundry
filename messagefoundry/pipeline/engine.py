@@ -1078,8 +1078,18 @@ class Engine:
             )
             self._leader_maintenance.start()
         # else (SQL Server active-passive): no per-row leases, so there is no reclaim sweep — failover
-        # recovery is the on-promotion reset_stale_inflight in _start_graph (the old leader self-fenced
-        # before its lease expired, so re-pending its in-flight rows can't steal from a live processor).
+        # recovery is the on-promotion reset_stale_inflight in _start_graph. Do NOT justify that by "the
+        # old leader self-fenced before its lease expired, so it can't steal from a live processor": the
+        # fence only stops the node REPORTING leader, not working (see _check_fence, which flips a bool
+        # and cancels nothing), so the two can overlap. The reset is correct for a different reason — it
+        # errs toward a DUPLICATE, which at-least-once permits, rather than a STRAND, which it forbids.
+        #
+        # Consequence worth knowing: this is SQL Server's ONLY in-flight recovery. reclaim_expired_leases
+        # is defined on the Postgres store alone, and the sweep below is gated on hasattr(), so a row left
+        # INFLIGHT here OUTSIDE a promotion (e.g. the deliberate teardown path in stage_dispatcher, which
+        # leaves a cancelled prefix INFLIGHT for exactly this recovery) has nothing periodic to reclaim it
+        # and is stranded until the next promotion or restart. Postgres bounds the same case at roughly
+        # reclaim_interval + lease_ttl. Tracked in ADR 0157.
         # Config-reload convergence (Track B Step 6) — only in clustered mode (is_clustered()), so
         # single-node / SQLite never spawns it. Seed the applied version to the coordinator's CURRENT
         # shared version BEFORE the loop starts, so a fresh node does not immediately self-reload (it is
@@ -1180,9 +1190,16 @@ class Engine:
             await self._leader_maintenance.recover_on_promotion()
         elif self._coordinator.is_clustered():
             # Active-passive without per-row leases (SQL Server): on promotion, re-pend the prior
-            # leader's in-flight rows. The prior leader self-fenced and its leadership lease EXPIRED
-            # before this node could acquire it, so it has stopped processing — and the graph runs ONLY
-            # on the leader, so there is no live sibling whose rows an unconditional reset could steal.
+            # leader's in-flight rows. Note what justifies this and what does not. The prior leader
+            # self-fenced and its leadership lease expired before this node could acquire — but that
+            # ordering only means it stopped REPORTING itself leader, not that it stopped working: the
+            # margin is short by the renew round trip plus a fence tick, and graph teardown is not
+            # budgeted against the remainder. This reset is also owner-BLIND (WHERE status/stage only),
+            # so unlike the Postgres path it cannot even scope itself to the prior leader's rows.
+            # It is correct anyway, for the same directional reason as recover_inflight_on_promotion:
+            # re-pending a row whose sender is still winding down risks a DUPLICATE (permitted by
+            # at-least-once, absorbed by idempotent outbounds), while not re-pending it risks a STRAND
+            # (forbidden). Erring toward duplication is the invariant-safe direction.
             # (Single-node NullCoordinator is_clustered() is False, so this never runs there; its boot
             # residue was already recovered by the unconditional reset_stale_inflight in start().)
             await self.store.reset_stale_inflight()
