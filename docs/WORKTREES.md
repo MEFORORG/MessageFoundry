@@ -341,7 +341,11 @@ the id rule; the model does the sending.
 banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
 is the only join key, and it must be matched exactly, never by prefix** — every worktree cwd is an
 extension of the primary's, so a prefix match resolves a peer in the primary to an arbitrary worktree
-session. Branch is not a join key either: measured 2026-08-01, the two rosters reported different
+session. (The same trap, same nesting, was live in `overlap.ps1` until 2026-08-02: it *needs* a prefix
+match, since a session may sit in any subdirectory, and it took the **first** hit — so the primary's row
+absorbed whichever nested-worktree session the hash table enumerated first and reported the primary LIVE
+on `main`. Where a prefix match is genuinely required, the rule has to be **longest prefix wins**.)
+Branch is not a join key either: measured 2026-08-01, the two rosters reported different
 branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
 to `send_message` fails silently**, which reads as the peer ignoring you.
 
@@ -395,9 +399,12 @@ it by hand. Three constraints came out of that, recorded here so the next attemp
 them:
 
 - **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
-  sender.** A merge freeze went out with "lift when #119 merges". #119 never merged (it died on an
-  unrelated CI timeout), so five sessions held on a condition that could not arrive, and it took a
-  second round to retract.
+  sender.** A merge freeze went out with "lift when #119 merges". #119 did not merge that day (an
+  unrelated CI timeout), so five sessions held on a condition that had not arrived and it took a second
+  round to retract. It merged the *following* day, 2026-08-02 01:45Z — which sharpens the point rather
+  than softening it: the recipients had no way to evaluate the predicate, so the freeze outlived its
+  own condition in both directions. As of 2026-08-02 a claim note still announcing that freeze was
+  being read by every joining session hours after both it and #133 had merged.
 - **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
   sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
   clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.
