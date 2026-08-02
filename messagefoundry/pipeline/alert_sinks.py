@@ -45,6 +45,7 @@ from messagefoundry.config.settings import (
     EscalationTier,
     insecure_tls_allowed,
 )
+from messagefoundry.config.tls_policy import TrustAnchorPolicy, build_smtp_tls_context
 
 __all__ = [
     "AlertTransport",
@@ -363,15 +364,52 @@ def send_plain_email(
     timeout: float = 30.0,
     allowed_hosts: tuple[str, ...] = (),
     html_body: str | None = None,
+    tls_verify: bool = True,
+    tls_ca_file: str | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> None:
     """Send one email via SMTP (STARTTLS by default). Blocking — call via ``asyncio.to_thread``. Shared
     by :class:`EmailTransport` (ops alerts) and the per-user security-event notifier. An optional
     ``allowed_hosts`` egress allowlist gates the SMTP host. ``body`` (plain text) is ALWAYS the primary
     part; ``html_body`` (#138) adds an HTML **alternative** (``multipart/alternative``) when provided —
-    the message is never HTML-only."""
+    the message is never HTML-only.
+
+    **The STARTTLS hop is VERIFIED (#323, layer 3).** ``smtplib.starttls()`` takes no context by
+    default and falls back to :func:`ssl._create_stdlib_context`, which **is**
+    ``ssl._create_unverified_context`` — measured on CPython 3.14.6: ``verify_mode=CERT_NONE``,
+    ``check_hostname=False``. So this hop was encrypted but **unauthenticated**: an on-path attacker
+    presenting any certificate read the alert body and the SMTP AUTH credential. It now builds an
+    explicit verifying context through the same :func:`~messagefoundry.config.tls_policy.
+    build_smtp_tls_context` factory as the EMAIL and DIRECT connectors (layers 1–2), so all three SMTP
+    cells share one policy.
+
+    ``tls_verify=False`` is the audited escape and is **not** gated here. This cell is built OUTSIDE
+    ``build_check_registry``'s ``active_hop_posture`` scope — measured: the contextvar is stamped only
+    in ``pipeline/wiring_runner.py`` — so the connectors' clamped
+    ``weakened_tls_escape_permitted_here()`` would fall back to the UNCLAMPED escape here and an
+    enforcing PHI instance would get no refusal at all. The refusal is therefore an acknowledgment
+    switch at the **serve gate** (``[security].allow_unverified_alert_smtp_tls``) instead, which is
+    also why layer 3 was deferred out of layers 1–2 rather than folded in.
+
+    There is deliberately **no** ``SMTP_SSL`` arm: this cell has never had one, so
+    ``[alerts].email_smtp_port=465`` (implicit TLS) does not work here and is out of scope — see #323's
+    residual, which states it rather than fixing it silently."""
     allowed = tuple(h.lower() for h in allowed_hosts)
     if allowed and host.lower() not in allowed:
         raise ValueError(f"SMTP host {host!r} is not in the configured allowlist")
+    # Built AFTER the allowlist check, deliberately: tests/test_alerts_test_email.py runs the REAL
+    # function and depends on a disallowed host raising before ANY other work happens.
+    tls_context = (
+        build_smtp_tls_context(
+            host=host,
+            cell="alerts SMTP transport",
+            verify=tls_verify,
+            ca_file=tls_ca_file,
+            trust_anchor_policy=trust_anchor_policy,
+        )
+        if use_tls
+        else None
+    )
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = sender
@@ -381,7 +419,8 @@ def send_plain_email(
         msg.add_alternative(html_body, subtype="html")
     with smtplib.SMTP(host, port, timeout=timeout) as smtp:
         if use_tls:
-            smtp.starttls()
+            # context= is REQUIRED (#323): starttls()'s own default verifies NOTHING.
+            smtp.starttls(context=tls_context)
         if username is not None:
             smtp.login(username, password or "")
         smtp.send_message(msg)
@@ -407,6 +446,9 @@ class EmailTransport:
         subject_template: str | None = None,
         body_template: str | None = None,
         html_template: str | None = None,
+        tls_verify: bool = True,
+        tls_ca_file: str | None = None,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
     ) -> None:
         self.host = host
         self.port = port
@@ -416,6 +458,11 @@ class EmailTransport:
         self.username = username
         self.password = password
         self.timeout = timeout
+        # #323 layer 3: carried as PLAIN DATA, not a pre-built ssl.SSLContext, so this module and
+        # security_notify.py never name `ssl` and the single context factory stays in config/tls_policy.py.
+        self.tls_verify = tls_verify
+        self.tls_ca_file = tls_ca_file
+        self.trust_anchor_policy = trust_anchor_policy
         # Optional egress allowlist (lower-cased) for the SMTP host; empty = any (WP-11c, parity with
         # the webhook allowlist). The alert payload carries no PHI, so this is general egress control.
         self.allowed_hosts = tuple(h.lower() for h in allowed_hosts)
@@ -469,6 +516,9 @@ class EmailTransport:
             timeout=self.timeout,
             allowed_hosts=self.allowed_hosts,
             html_body=html_body,
+            tls_verify=self.tls_verify,
+            tls_ca_file=self.tls_ca_file,
+            trust_anchor_policy=self.trust_anchor_policy,
         )
 
 
@@ -1114,7 +1164,10 @@ def configured_alert_transport_names(alerts: AlertsSettings) -> set[str]:
 
 
 def notifier_from_settings(
-    alerts: AlertsSettings, *, secret_provider: SecretProvider | None = None
+    alerts: AlertsSettings,
+    *,
+    secret_provider: SecretProvider | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> NotifierAlertSink | None:
     """Build a :class:`NotifierAlertSink` from ``[alerts]`` settings, or ``None`` when no transport is
     configured (the caller then leaves the engine on its default logging sink).
@@ -1126,7 +1179,11 @@ def notifier_from_settings(
 
     ``secret_provider`` (ADR 0019 §5) resolves the SMTP password from a ``[secrets].provider`` when
     ``email_password_secret`` is set (fail-closed); ``None``/no reference → the env-sourced
-    ``email_password`` is used, byte-identical to before."""
+    ``email_password`` is used, byte-identical to before.
+
+    ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback to the
+    SMTP hop when ``[alerts].email_tls_ca_file`` names none of its own (#323 layer 3). It only chooses
+    WHICH roots verify the relay — it never turns verification off."""
     smtp_password = resolve_connector_secret(
         secret_provider,
         ref=alerts.email_password_secret,
@@ -1158,6 +1215,11 @@ def notifier_from_settings(
                 subject_template=alerts.email_subject_template,
                 body_template=alerts.email_body_template,
                 html_template=alerts.email_html_template,
+                # #323 layer 3: the STARTTLS hop verifies by default. email_tls_verify=false is the
+                # audited escape, refused at the serve gate unless [security].allow_unverified_alert_smtp_tls.
+                tls_verify=alerts.email_tls_verify,
+                tls_ca_file=alerts.email_tls_ca_file,
+                trust_anchor_policy=trust_anchor_policy,
             )
         )
     # Fail loud at config time if a rule routes to a transport that isn't configured (a typo or a
