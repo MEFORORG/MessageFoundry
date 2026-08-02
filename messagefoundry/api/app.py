@@ -4142,6 +4142,7 @@ def create_app(
             # (or a future one) reports 0 rather than 500ing the stats read.
             committed_txns=getattr(engine.store, "committed_txns", 0),
             body_copies=getattr(engine.store, "body_copies", 0),
+            fenced_writes=getattr(engine.store, "fenced_writes", 0),
         )
 
     @app.get("/metrics")

@@ -167,14 +167,27 @@ class ClusterCoordinator(Protocol):
         imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`
         returns ``None`` — single-node is unfenced (there is no second writer to fence).
 
-        **Scope of the fence — read this before relying on it.** The guard is appended to the claim
-        ``UPDATE`` and to nothing else. It does NOT cover (a) the cross-owner stranded-lease reclaim that
-        runs as the *first* statement of the same claim transaction, which commits even when the guarded
-        claim matches zero rows, or (b) any post-claim disposition write (``mark_done`` / ``mark_failed``
-        / ``dead_letter_now`` / ``complete_with_response``), each of which resolves its row by ``id``
-        alone with no epoch, owner, or status precondition. So a demoted ex-leader that is still inside
-        a send cannot *claim* anything, but can still *write* — including over a row the live leader has
-        already resolved. Do not read this token as a general write fence."""
+        **Scope of the fence — read this before relying on it. It differs BY BACKEND (ADR 0157).**
+
+        On **Postgres**: every claim path is guarded fail-CLOSED (an unvalidatable claim declines, which
+        is free — the row stays PENDING), and every TERMINAL resolve is guarded fail-OPEN with a re-pend
+        fallback (a rejected resolve rolls the whole disposition back and returns the row to PENDING, so
+        the residue is a duplicate rather than a strand). Deliberately UNGUARDED there: writes that
+        return a row to PENDING (``release_claimed`` / ``reschedule_claimed`` — fencing those would turn
+        a permitted duplicate into a forbidden strand), the cross-owner stranded-lease reclaim that runs
+        as the first statement of the same claim transaction, the bring-up dead-letter sweeps, and the
+        operator paths.
+
+        On **SQL Server**: only the three FIFO claim paths carry the guard. ``claim_ready`` and every
+        terminal resolve are still unfenced there (ADR 0157 Inc 3 closes that), so a demoted SQL Server
+        node stops claiming FIFO lanes but can still drain an UNORDERED lane and still write over a row
+        the live leader has resolved.
+
+        The residual case that passes on **both** backends: promote → demote → re-promote *in the same
+        process*. ``leader_epoch`` bumps only on a fresh acquire, so the re-promoted node's held epoch
+        equals the current one and every guard passes. Only a per-claim token would close that.
+
+        Do not read this token as a general write fence."""
         ...
 
     def lease_key(self) -> str | None:

@@ -1245,10 +1245,26 @@ class Engine:
         loops keep running (a follower still converges its caches), so only the runner is stopped."""
         if self._registry_runner is not None:
             await self._registry_runner.stop()
-        # H1: clear the held epoch on demotion so a freshly-demoted node carries no (now-stale) fencing
-        # token if it were to claim before promotion re-pushes the current one. Defensive — the runner is
-        # already stopped, so no claim is in flight — but it keeps set_leader_epoch's lifecycle honest.
-        self.store.set_leader_epoch(None)
+        # ADR 0157 C4 — do NOT clear the held epoch here.
+        #
+        # The store OMITS the guard string ENTIRELY when the epoch is None, so `set_leader_epoch(None)`
+        # means NO FENCE, not "a safe null token". Clearing it on demotion therefore DISARMS the guard at
+        # exactly the moment a superseded ex-leader may still be mid-teardown and mid-write. A RETAINED
+        # stale epoch is what fails closed on every claim and rejects every terminal resolve.
+        #
+        # Safe because _start_graph pushes current_epoch() unconditionally on promotion (:1178) AND
+        # _reconcile_graph re-stamps it on every leader+running pass (below), and no non-graph path
+        # resolves a CLAIMED row — the operator paths are PENDING/DEAD/DONE-scoped.
+        #
+        # Cross-backend, stated precisely because the obvious stronger claim is false: on Postgres every
+        # claim path and every terminal resolve is now fenced. On SQL Server only the three FIFO claim
+        # paths carry a guard — `claim_ready` and every terminal resolve are still UNFENCED there until
+        # ADR 0157 Inc 3 — so retaining the epoch stops a demoted SQL Server node claiming FIFO lanes and
+        # nothing more. That is still strictly better than today (where the clear disarmed even those),
+        # but it is NOT "a demoted SS node claims nothing".
+        #
+        # PINNED INVARIANT, not tidiness: restoring the clear looks like cleanup and silently disarms the
+        # fence. See test_stop_graph_retains_the_leader_epoch.
         log.info("engine graph stopped — this node is now standby")
 
     async def _reconcile_graph(self) -> None:
@@ -1265,7 +1281,24 @@ class Engine:
                 # graph running for a whole extra poll cycle.
                 if not self._coordinator.is_leader():
                     await self._stop_graph()
-            elif not self._coordinator.is_leader() and running:
+            elif self._coordinator.is_leader() and running:
+                # ADR 0157 D2 — RE-STAMP the held epoch. _start_graph is the ONLY other push site, so a
+                # slow bring-up that spans demote -> foreign takeover -> re-acquire lands here with the
+                # store holding a STALE epoch and NEITHER of the other branches ever matching again.
+                # Before C5 that half-worked (claim_ready was unfenced); with C5 it is a live leader that
+                # claims NOTHING, silently, with no exception and no alert. Pure in-memory and
+                # idempotent; bounds staleness to one poll. is_leader() implies current_epoch() is
+                # non-None: _maintain_leadership sets _is_leader True only after _claim_or_renew_lease
+                # refreshed _leader_epoch, with no await in between (cluster.py:935 -> :861).
+                self.store.set_leader_epoch(
+                    self._coordinator.current_epoch(), lease_key=self._coordinator.lease_key()
+                )
+            elif not self._coordinator.is_leader() and (
+                running or self._registry_runner.has_residual_state
+            ):
+                # ADR 0157 D7: `running` alone is not enough once _teardown_unsafe clears _running in a
+                # finally — a raised or cancelled teardown leaves live listeners bound on a standby with
+                # no branch that would ever converge them.
                 await self._stop_graph()
 
     async def _graph_supervisor_loop(self) -> None:

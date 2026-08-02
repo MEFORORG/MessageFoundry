@@ -1092,6 +1092,19 @@ class RegistryRunner:
         return self._running
 
     @property
+    def has_residual_state(self) -> bool:
+        """Anything still built after a teardown that did not complete (ADR 0157 D7).
+
+        Deliberately NOT the same expression as ``stop()``'s ``had_state``, and the two differences are
+        both load-bearing. It omits ``_running`` because this is asked precisely when ``_running`` is
+        already False (the ``finally`` in ``_teardown_unsafe`` clears it on every path, including a raise
+        or an outside cancel). It ADDS ``_dispatchers`` because they are cleared early in teardown, before
+        the destination ``aclose()`` / executor-shutdown awaits — so a cancel landing between those leaves
+        ``_dispatchers`` populated while the other three are not.
+        """
+        return bool(self._sources or self._workers or self._destinations or self._dispatchers)
+
+    @property
     def fusion_active(self) -> bool:
         """Whether ADR 0071 B5 thread-hop fusion is EFFECTIVELY active this run (SQL Server, pooled,
         pools+executors opened OK). False on every other backend/mode and when the flag is off — the
@@ -4032,7 +4045,10 @@ class RegistryRunner:
                     items = [head] if head is not None else []
                 else:
                     # UNORDERED lanes are intentionally NOT lane-owned — concurrent draining across
-                    # nodes is fine, so claim_ready stays unchanged.
+                    # nodes is fine for ORDERING. That is a statement about lane ownership, not about
+                    # who may claim at all: claim_ready is leader-epoch fenced like every other claim
+                    # path (ADR 0157 C5), so a superseded ex-leader draining an unordered lane claims
+                    # nothing.
                     items = await self.store.claim_ready(
                         limit=self.claim_limit, destination_name=name
                     )

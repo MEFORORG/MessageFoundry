@@ -1821,6 +1821,10 @@ class MessageStore:
         # (before the committer below) so its note_commit hook can bump committed_txns from batch start.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQLite never fences a terminal resolve —
+        # set_leader_epoch is a hard no-op here and [cluster].enabled is rejected on SQLite at config
+        # load — so this is a permanent 0 and there is no increment site in this module.
+        self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
         # HKDF-derived HMAC key for the tamper-evident audit chain (#190). None → the chain stays the
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
