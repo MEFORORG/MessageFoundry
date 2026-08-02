@@ -433,3 +433,36 @@ why export sync must be verified with `git diff` and never a raw `diff`. Fixed a
 **Still open, not done:** `quality-advisory.yml`'s `pipx install ruff` fallback installs *unpinned* ruff
 instead of failing closed, and `constraints.lock` is `sed`-scraped for a `ruff==` pin that — unlike
 `packaging==` — has **no PR-time canary test**. Both are recorded here; neither closes a Scorecard alert.
+
+## Amendment — 2026-08-01: zizmor `archived-uses` on the CLA action (accepted residual)
+
+Adopting zizmor 1.28.0 (from 1.5.2) turned on audits the old pin could not run. Four of the five
+findings against the otherwise-unchanged tree were resolved in-tree or as justified non-findings; this
+one is an accepted residual.
+
+* **Finding.** `warning[archived-uses]`, `.github/workflows/cla.yml:44` —
+  `contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1`. Upstream is
+  archived (API `archived: true`, `archived_at: null`; last push 2026-03-23) and v2.6.1 is the final
+  release. The pin equals that tag's commit exactly, so there is no later patch to move to.
+* **Compensating control, and its limit.** The full-SHA pin closes tampering: a bundled JS action's SHA
+  fully determines the bytes that run, and a vanished namespace fails the step rather than running
+  someone else's code. It does not close the unpatched-code axis the audit names.
+* **Why not replaced now.** `cla` is a required status context and is the job's own conclusion, so a
+  broken step blocks every PR. `pull_request_target`/`issue_comment` workflows run only from the default
+  branch, so a replacement cannot be exercised on the PR that makes it — it lands on `main` untested,
+  with `required_approving_review_count: 0` and auto-merge armed.
+* **Hard revisit: before Node20 removal.** `action.yml` at the pin — and at the archived HEAD — declares
+  `runs.using: node20`. An archived repo can never re-declare node24, so GitHub's fall-2026 Node20
+  removal, not this lint, forces fork-or-replace. No firm date is published; treat mid-September 2026 as
+  the planning date and re-check before then.
+* **Contingency, verified 2026-08-01.** There is no canonical successor — the archived README directs
+  users to fork. The best candidate found is `iainmcgin/cla-github-action`, Apache-2.0, not archived,
+  last pushed 2026-06-17, 4 stars, single personal maintainer. Note v3.2.0 is an **annotated** tag whose
+  ref resolves to tag object `07f1588b0cee15f89a489a77704c9d45d39ec0a1`; the commit `uses:` must pin is
+  `0d27e5a16278d4adb6b0c4b92f08ad27b0a21dc8` (dereferenced and confirmed, not assumed). Adoption is
+  gated on at least: accounting for the shipped `dist/index.js` (a built bundle that is not
+  human-reviewable, and a source review does not prove `dist/` was built from it); confirming
+  `signatures/version1/cla.json` stays format-compatible; verifying the inputs `cla.yml` passes still
+  exist with the same semantics; a decision on `require-opener-as-author`, which defaults to true and
+  fails the check; and a rehearsal in a scratch repo. Land in a low-traffic window with a revert
+  prepared.
