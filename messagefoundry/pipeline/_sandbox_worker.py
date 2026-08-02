@@ -3,19 +3,26 @@
 """The sandbox worker child process (ADR 0087, BACKLOG #197).
 
 Launched by :class:`messagefoundry.pipeline.sandbox.SandboxSession` as ``python -m
-messagefoundry.pipeline._sandbox_worker``. It speaks a tiny length-prefixed pickle protocol on
-stdin/stdout (``sandbox._read_frame`` / ``_write_frame``):
+messagefoundry.pipeline._sandbox_worker``. It speaks the length-prefixed **MFW2** codec
+(:mod:`messagefoundry.pipeline._sandbox_codec`) on stdin/stdout — a closed-tag JSON+segment wire whose
+decode path cannot name a type, import a module, or reach ``__reduce__``. Nothing is pickled in either
+direction, in either process.
 
-1. **Bootstrap** — reads one frame ``{config_dir, env, forbidden, cpu_seconds, mem_mb}``, loads the
-   message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir`` (the same loader the
-   engine uses — it executes admin config under the unchanged safe-source gate), applies the POSIX
-   resource caps where available, installs the forbidden-import guard, and replies ``{ready: True}``
-   (or ``{ready: False, error}`` on any failure).
-2. **Serve** — for each subsequent request frame ``{phase, name, payload, run_context}`` it looks the
-   Router/Handler up in *its own* registry, re-establishes the run-scoped context providers for the
-   phase, runs the function on the unpickled payload, and replies ``{ok: True, result}`` — or
-   ``{ok: False, kind, error}`` on a denial (forbidden import, a live ``db_lookup``/``fhir_lookup``,
-   an unpicklable result) or a plain handler error.
+1. **Bootstrap** — reads one ``boot`` frame ``{config_dir, forbidden, cpu_seconds, mem_mb,
+   code_sets}``, loads the message :class:`~messagefoundry.config.wiring.Registry` from ``config_dir``
+   (the same loader the engine uses — it executes admin config under the unchanged safe-source gate),
+   **adopts the engine's code-set tables** from the frame in place of its own re-read of ``codesets/``
+   (when the parent published any — a session constructed without them leaves the child on its own
+   load), applies the POSIX resource caps where available, installs the forbidden-import guard, and
+   replies ``ready`` (or ``bootfail`` on any failure).
+2. **Serve** — for each subsequent ``req`` frame ``{id, phase, name, payload, rc}`` it rebuilds the
+   payload with the engine's own constructor, looks the Router/Handler up in *its own* registry,
+   re-establishes the run-scoped context providers for the phase (substituting the boot-carried code
+   sets, which the per-dispatch frame deliberately does not repeat), runs the function, and
+   **describes** the result back as ``ok`` — or ``fail`` with ``kind`` ``denied`` (forbidden import, a
+   live ``db_lookup``/``fhir_lookup``, an undescribable result) or ``error`` (a plain handler raise).
+   The reply echoes the request's ``id``, ``phase`` and ``name`` so the parent can prove the frame
+   answers the call it made.
 
 stdout is the binary IPC channel — **nothing else may write to it**. Logging and any diagnostics go
 to stderr (inherited by the engine). The engine parent enforces the wall-clock cap and kills a
@@ -26,8 +33,8 @@ from __future__ import annotations
 
 import logging
 import math
-import pickle  # nosec B403 — pickle only carries IPC frames between the engine and its own spawned sandbox worker, never external/untrusted input
 import sys
+from dataclasses import replace
 from typing import Any
 
 # stdout is the IPC channel; keep the root logger on stderr so a stray log line can't corrupt a frame.
@@ -46,7 +53,7 @@ class _ForbiddenImportFinder:
         self._prefixes = prefixes
 
     def find_spec(self, name: str, path: Any = None, target: Any = None) -> None:
-        from messagefoundry.pipeline.sandbox import SandboxError
+        from messagefoundry.pipeline._sandbox_codec import SandboxError
 
         for prefix in self._prefixes:
             if name == prefix or name.startswith(prefix + "."):
@@ -86,18 +93,22 @@ def _install_import_guard(forbidden: tuple[str, ...]) -> None:
     sys.meta_path.insert(0, _ForbiddenImportFinder(forbidden))
 
 
-def _run_one(registry: Any, req: dict[str, Any]) -> dict[str, Any]:
-    """Execute one router/handler request and build the response dict (never raises)."""
+def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str, str]:
+    """Execute one router/handler request; return ``(ok, result, kind, error)``. Never raises."""
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
-    from messagefoundry.config.run_context import RunContext, run_contexts
-    from messagefoundry.pipeline.sandbox import SandboxError
+    from messagefoundry.config.run_context import run_contexts
+    from messagefoundry.pipeline._sandbox_codec import SandboxError
 
-    phase = req.get("phase")
-    name = req.get("name")
-    payload = req.get("payload")
-    rc = req.get("run_context")
-    run_context = rc if isinstance(rc, RunContext) else RunContext()
+    phase = req.phase
+    name = req.name
+    # code_sets never travel per dispatch — the ENGINE's tables arrived once in the boot frame, so
+    # publish those. Falling back to this child's own load only happens when the parent published
+    # none at all (a session constructed without them); using the child's copy when the engine HAS
+    # one would let a `codesets/` edit made without a /config/reload diverge from mode=off.
+    run_context = replace(
+        req.run_context, code_sets=registry.code_sets if code_sets is None else code_sets
+    )
 
     if phase == "router":
         fn = registry.routers.get(name)
@@ -115,50 +126,82 @@ def _run_one(registry: Any, req: dict[str, Any]) -> dict[str, Any]:
         fn = registry.handler_accepts.get(name)
         phase_key = "router"
     else:
-        return {"ok": False, "kind": "error", "error": f"unknown sandbox phase {phase!r}"}
+        return False, None, "error", f"unknown sandbox phase {phase!r}"
     if fn is None:
-        return {"ok": False, "kind": "error", "error": f"no such {phase} {name!r} in registry"}
+        return False, None, "error", f"no such {phase} {name!r} in registry"
 
     try:
         with run_contexts(run_context, phase=phase_key):
-            result = fn(payload)
+            result = fn(req.payload)
         if phase == "accepts":
             # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
-            # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is pickled back: a
+            # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a
             # predicate that returns a truthy NON-bool (a natural shape the parent's ``bool()`` sanctions,
-            # e.g. ``re.search(...)`` -> re.Match) would otherwise be marshalled raw and crash the child on
-            # an unpicklable object — content-dependent, since a non-match returns picklable None. Coercing
-            # to the contract type here makes ``[sandbox].mode`` never change the routing decision (ADR 0087).
+            # e.g. ``re.search(...)`` -> re.Match) would otherwise be rejected by the codec's strict
+            # JSON-bool slot — content-dependent, since a non-match returns None. Coercing to the
+            # contract type here is what lets the parent demand a strict bool, and makes
+            # ``[sandbox].mode`` never change the routing decision (ADR 0087).
             result = bool(result)
     except (DbLookupError, FhirLookupError) as exc:
         # db_lookup/fhir_lookup bridge back onto the engine event loop (run_coroutine_threadsafe),
         # which a subprocess boundary breaks — forbidden + fail-closed for this PR (ADR 0087).
-        return {
-            "ok": False,
-            "kind": "denied",
-            "error": f"{type(exc).__name__}: live db_lookup/fhir_lookup is forbidden inside the "
+        return (
+            False,
+            None,
+            "denied",
+            f"{type(exc).__name__}: live db_lookup/fhir_lookup is forbidden inside the "
             "sandbox (ADR 0087) — run this Handler with [sandbox].mode=off if it needs live enrichment",
-        }
+        )
     except SandboxError as exc:
-        return {"ok": False, "kind": "denied", "error": str(exc)}
+        return False, None, "denied", str(exc)
     except Exception as exc:  # noqa: BLE001 — a handler raise is content, reported not crashed
-        return {"ok": False, "kind": "error", "error": f"{type(exc).__name__}: {exc}"}
-    return {"ok": True, "result": result}
+        return False, None, "error", f"{type(exc).__name__}: {exc}"
+    return True, result, "", ""
+
+
+def _respond(registry: Any, req: Any, code_sets: Any) -> bytes:
+    """Build the response frame for one request. Never raises — an undescribable result is reported."""
+    from messagefoundry.pipeline import _sandbox_codec as codec
+    from messagefoundry.pipeline._sandbox_codec import SandboxError
+
+    ok, result, kind, error = _run_one(registry, req, code_sets)
+    if ok:
+        try:
+            return codec.encode_ok(
+                request_id=req.request_id, phase=req.phase, name=req.name, result=result
+            )
+        except SandboxError as exc:
+            # A result outside the closed grammar (an exotic Send payload, a Handler returning an
+            # object that is not describable) — report it instead of dying so the worker survives for
+            # the next message.
+            return codec.encode_fail(
+                request_id=req.request_id,
+                phase=req.phase,
+                name=req.name,
+                kind="error",
+                error=f"unmarshallable result: {exc}",
+            )
+    return codec.encode_fail(
+        request_id=req.request_id, phase=req.phase, name=req.name, kind=kind, error=error
+    )
 
 
 def main() -> int:
-    from messagefoundry.pipeline.sandbox import SandboxError, _read_frame, _write_frame
+    from messagefoundry.pipeline import _sandbox_codec as codec
+    from messagefoundry.pipeline._sandbox_codec import SandboxError
+    from messagefoundry.pipeline.sandbox import _read_frame_bytes, _write_frame
 
     stdin = sys.stdin.buffer
     stdout = sys.stdout.buffer
 
-    boot = _read_frame(stdin)
-    if not isinstance(boot, dict):
+    frame = _read_frame_bytes(stdin)
+    if frame is None:
         return 0  # parent closed the pipe before bootstrap — nothing to do
     try:
+        boot = codec.decode_boot(frame)
         from messagefoundry.config.wiring import load_config
 
-        registry = load_config(boot["config_dir"])
+        registry = load_config(boot.config_dir)
         # Pre-import every module the serve loop touches BEFORE the guard goes up, so a first-time
         # (transitive) import of an engine helper can't be misread as a forbidden user import. Once
         # cached in sys.modules, a later `import` short-circuits ahead of the meta_path finder.
@@ -166,39 +209,48 @@ def main() -> int:
         import messagefoundry.config.fhir_lookup  # noqa: F401
         import messagefoundry.config.run_context  # noqa: F401
 
-        _apply_resource_caps(float(boot.get("cpu_seconds", 2.0)), boot.get("mem_mb"))
-        _install_import_guard(tuple(boot.get("forbidden", ())))
+        _apply_resource_caps(boot.cpu_seconds, boot.mem_mb)
+        _install_import_guard(boot.forbidden)
     except Exception as exc:  # noqa: BLE001 — report a bootstrap failure, do not crash silently
         try:  # noqa: SIM105
-            _write_frame(stdout, {"ready": False, "error": f"{type(exc).__name__}: {exc}"})
+            _write_frame(stdout, codec.encode_bootfail(f"{type(exc).__name__}: {exc}"))
         except (OSError, SandboxError):
             pass
         return 1
     try:
-        _write_frame(stdout, {"ready": True})
+        _write_frame(stdout, codec.encode_ready())
     except (OSError, SandboxError):
         return 1
 
     while True:
-        req = _read_frame(stdin)
-        if req is None:
+        frame = _read_frame_bytes(stdin)
+        if frame is None:
             return 0  # parent closed the pipe — clean shutdown
-        if not isinstance(req, dict):
-            continue
-        resp = _run_one(registry, req)
+        try:
+            req = codec.decode_request(frame)
+        except SandboxError as exc:
+            # We have no trustworthy correlation id to answer with, so we cannot report this as a
+            # per-message error. Exit: the parent reads EOF, fails THIS message closed (SandboxError →
+            # dead-letter) and respawns a clean child, rather than hanging to the wall cap.
+            log.error("sandbox worker: undecodable request frame (%s)", exc)
+            return 1
+        resp = _respond(registry, req, boot.code_sets)
         try:
             _write_frame(stdout, resp)
-        except (OSError, SandboxError, pickle.PicklingError, TypeError) as exc:
-            # A result that will not pickle (e.g. an exotic Send payload, or a Handler returning an
-            # unpicklable object) — report it instead of dying so the worker survives for the next
-            # message. pickle.dumps raises TypeError/PicklingError on an unmarshallable object; those are
-            # caught here (not just OSError/SandboxError) so the child's own "survives for the next
-            # message" contract actually holds — otherwise an unpicklable result kills the child and the
-            # parent reads EOF, dead-letters this message, and pays a full config-reload respawn next.
+        except (OSError, SandboxError) as exc:
+            # An over-cap response frame (a huge fan-out) raises in _write_frame, not at describe time —
+            # report it instead of dying so the child's "survives for the next message" contract holds,
+            # rather than the parent reading EOF and paying a full config-reload respawn.
             try:
                 _write_frame(
                     stdout,
-                    {"ok": False, "kind": "error", "error": f"unmarshallable result: {exc}"},
+                    codec.encode_fail(
+                        request_id=req.request_id,
+                        phase=req.phase,
+                        name=req.name,
+                        kind="error",
+                        error=f"unmarshallable result: {exc}",
+                    ),
                 )
             except (OSError, SandboxError):
                 return 1

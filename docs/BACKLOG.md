@@ -8360,3 +8360,78 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 **Source:** stuck-CI triage, 2026-08-01. Instance 1 re-measured 2026-08-02 across 36 step-success windows-2025 rows (pool: 70 `ci.yml` runs created 2026-08-01 UTC), by two agents deriving it independently after the first two measurements both reported pools that did not reproduce; instance 2 reported and diagnosed by the HA-construct-recheck session from PR #129's sqlserver leg; instance 3 from the same 2026-08-02 re-measurement.
 
 ---
+## 339. Sandbox IPC codec: parent executed child-chosen code (ADR 0087 MFW2)
+
+> ✅ **SHIPPED 2026-08-01 (ADR 0087 MFW2 amendment, `c0d61b94`).** ADR 0087's `mode=subprocess` boundary was **bypassable**: the worker pickled a Handler's raw return into `{"ok": True, "result": ...}` and the **parent** called `pickle.loads` on it, so a Handler returning an object with a custom `__reduce__` executed arbitrary code in the engine process — the one holding the DEK, the audit chain and every live socket. Proven end-to-end. Both legs now use a **closed-tag, non-executing codec** ([`pipeline/_sandbox_codec.py`](../messagefoundry/pipeline/_sandbox_codec.py)): `json.loads` with no object hooks plus a literal tag dispatch over a closed constructor set, so the decode path cannot name a type, import a module, `getattr` on child data, or reach `__reduce__`. A **restricted unpickler was evaluated and disproved** — a `BUILD` opcode over an allowlisted frozen dataclass yields `Send(to=42, message=[])` with `__post_init__` never running. Adversarial review then found a **second, independent break in the correlation defense the codec introduced**: the request id was a per-spawn nonce + counter, disclosed to the child, and only `(id, phase)` was checked — a Handler could pre-stage a forged frame for the next id and have it consumed as an **unrelated** message's result (silent misdelivery to any registered outbound, no `ERROR`, no disposition anomaly, deterministic). Closed three ways: a fresh `secrets.token_hex(16)` per dispatch, binding of the whole `(id, phase, name)` triple, and an unsolicited-frame check fatal to the worker. `mode=off` stays default and byte-identical. Suppression hygiene: the `nosec B403` and the repo's **only** `nosemgrep` are deleted, not reworded — zero `pickle`/`marshal` remains in `messagefoundry/` or `tee/`.
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** shipped. **Severity:** high (blast radius: full bypass of the isolation boundary), low (likelihood: requires Handler-authoring rights, i.e. an admin — but distrusting admin code is the sandbox's entire purpose).
+
+**Relationship to #197:** #197 shipped the boundary; this fixes the transport that made it bypassable. It does **not** widen ASVS 15.2.5 — it restores the address-space half to what #197 claimed. Confinement is still address-space only.
+
+**Net effect on correctness:** measured against a HEAD baseline on a 41-check `mode=off` vs `mode=subprocess` parity sweep, the codec is a **win** — HEAD had 10 divergences, MFW2 has 3, two of which reproduce identically at HEAD. It also fixes `mode=subprocess` being outright **DOA for ADR 0013 loopback re-ingress** (`CapturedResponse` lived in the forbidden `messagefoundry.store`, so `pickle.loads` killed the child).
+
+**Residuals (stated in ADR 0087, not left implicit):** ~1.2–1.4× marshalling cost on a graph with a large reference table (~162 msg/s per lane at 20k entries — inside the existing ~60 msg/s per-interface end-to-end bound, so not the binding constraint); a compromised worker can still deny its **own** feed via a wrong-guess forged frame or a grandchild on the inherited fd 1 (fail-closed, kill+respawn); a contract-violating **mutating Router** diverges between modes (pre-existing at HEAD, pinned by a test that asserts the inequality on purpose so a future change cannot silently close it without deleting the residual); a Handler's exception reaches the operator wrapped in `SandboxError` (same disposition, `last_error` text only; pre-existing).
+
+**OPEN — owner decisions, deliberately not taken here:**
+
+1. **Erratum / advisory.** The shipped `mode=subprocess` did not deliver the boundary it advertised, for anyone who opted in. Whether that warrants a security advisory or release note is a disclosure call, not an engineering one.
+2. **`docs/adr/README.md:121` still reads "Closes the WP-L3-17 residual (residual-closure)"** while `:175` (ADR 0144) says "15.2.5 stays **Partial**". These contradict, and :175 is the correct position — confinement is address-space only until [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) lands. **The edit was NOT made: a live session (`claude/adr-asvs-scorecard-as-data`) is concurrently rewriting that file's ASVS claims**, and the worktree guard blocked the write rather than risk losing its work. It must be made by whoever lands that branch. The same closure claim appears in **#197's banner above** and was likewise left alone.
+3. **Private-vault doc pass.** `docs/security/THREAT-MODEL.md` 15.1.5 row, `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17, and theme 6 of `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md` all describe the pre-MFW2 boundary. `tests/test_threat_model_doc_drift.py` had **pinned the literal token `pickle`** in that row — which after this change would have *required* the doc to assert a mechanism the code no longer has — so the anchor moved to `_sandbox_codec`. Those 89 drift tests skip in every checkout (the directory is gitignored with zero tracked files), so **CI cannot catch this drift in either direction**; the vault edit is a manual, coupled follow-up.
+
+**Not fixed here, deliberately (each wants its own item):** process-group kill (a grandchild inherits fd 1 and outlives `proc.kill()`); the unframed inherited stderr; and the latent tuple/set-of-`Send`s accept-and-drop, which this codec **preserves on purpose** (it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()` so `_partition` stays the sole filter) rather than changing routing behaviour inside a security fix.
+
+**Related:** #197 (the boundary), ADR 0087 (amended in place — AC-8..AC-15, no new number), ADR 0147 (its broker now explicitly rides this codec's closed grammar), ADR 0104 (AC-4 re-worded off pickle; the copy-on-Send guarantee is strengthened — `Send` carries encoded text, so the parent's rebuild is a provable no-op), ADR 0144 (the static half of the same 15.2.5 defense).
+
+**Source:** evaluation of an unscoped "recheck the pickle sandbox" suggestion, 2026-08-01; defect confirmed by proof-of-concept before any code was written.
+
+---
+
+## 341. Handler returning a tuple or set of Sends delivers nothing, silently
+
+> 🚧 **Status OPEN (filed 2026-08-01).** `_partition` ([pipeline/dryrun.py:112](../messagefoundry/pipeline/dryrun.py)) narrows with `items = result if isinstance(result, list) else [result]`. A **`list`** of `Send`s works; a **tuple** or **set** does not — the container itself becomes the single item, matches none of the three `isinstance` filters, and yields `([], [], [])`. **Verified live:** `_partition((send, send))[0] == []`. The Handler ran, returned deliveries, and **nothing is delivered and nothing errors** — the message finalizes `FILTERED` (every handler ran but delivered nothing), which is indistinguishable from a handler deliberately declining it. That is an **accept-and-drop**, the one thing CLAUDE.md §12 forbids outright.
+
+**Cluster:** Correctness / data loss. **Priority:** P1. **Verdict:** build (small). **Severity:** high (silent PHI non-delivery, no operator signal), medium (likelihood: `return (Send(...), Send(...))` is a natural idiom and a one-character difference from the working form).
+
+**Why it is not merely cosmetic:** the disposition is not `ERROR` and not `UNROUTED` — it is `FILTERED`, a *legitimate* outcome. So the count-and-log invariant is satisfied on paper (the message is counted and logged) while the operator is told the handler chose to drop it. Nothing in the store, the console, or an alert distinguishes this from intent.
+
+**Fix direction (not yet decided):** accept any non-`str` iterable in `_partition`, **or** fail loud on a non-`list` container. Failing loud is probably right — silently accepting a tuple widens the contract, whereas a `ValueError` routes to `ERROR`/dead-letter and tells the author exactly what happened. Whichever is chosen, `SetState`/`SetMeta` must behave identically, and `HandlerFn`'s type hint should be widened or tightened to match so mypy catches it at authoring time.
+
+**Pre-existing, not introduced by #339.** ADR 0087's MFW2 codec **deliberately preserves** this behaviour rather than changing routing semantics inside a security fix: it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()`, so `_partition` stays the sole filter and `mode=off` / `mode=subprocess` agree. Fixing `_partition` fixes both modes at once.
+
+**Related:** #339 (found during its adversarial review), ADR 0005 / ADR 0081 (`SetState` / `SetMeta`), CLAUDE.md §12.
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; confirmed by direct execution of `_partition`.
+
+---
+
+## 342. Sandbox worker kill does not reap a grandchild holding the response pipe
+
+> 🚧 **Status OPEN (filed 2026-08-01).** `SandboxSession._kill` ([pipeline/sandbox.py:323](../messagefoundry/pipeline/sandbox.py)) calls `proc.kill()`, which terminates **only the direct worker child**. Admin-authored Handler code running in that child can spawn a grandchild, which **inherits fd 1 — the response pipe** — and survives the kill. It can then write frames onto a pipe the parent believes belongs to a freshly-spawned worker, and it leaks as an orphan process for the engine's lifetime.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build (small). **Severity:** medium, low (likelihood: requires Handler-authoring rights, i.e. the same admin threat model as #339).
+
+**Bounded by the #339 correlation fix, not closed by it:** a grandchild cannot make the parent accept a *forged answer* — the per-dispatch `secrets.token_hex(16)` id is unguessable and the unsolicited-frame check is fatal to the worker. So the residual is **availability and process hygiene**, not misdelivery: the orphan can force repeated kill+respawn cycles on its own feed (each dead-lettering the message in hand, fail-closed) and accumulate leaked processes.
+
+**Fix direction:** spawn into a job object on Windows (`CREATE_NEW_PROCESS_GROUP` + a kill-on-close job) and a process group on POSIX (`start_new_session=True`, then `killpg`), so the whole tree dies with the worker. Note the platform asymmetry is the same one ADR 0147 already documents for confinement, so the two should be designed together rather than twice.
+
+**Related:** #339, ADR 0087 (residual now stated there), ADR 0147 (OS-level confinement — the natural home for the job-object work), #343 (the sibling fd-2 issue).
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01.
+
+---
+
+## 343. Sandbox child stderr is inherited unframed into the engine log stream
+
+> 🚧 **Status OPEN (filed 2026-08-01).** The worker is spawned with `stderr=None` ([pipeline/sandbox.py:266](../messagefoundry/pipeline/sandbox.py)), so the child's stderr is the **engine's own stderr**, unframed and unattributed. fd 1 is the IPC channel and is strictly framed; fd 2 has no such discipline. Admin-authored Handler code can therefore write arbitrary bytes straight into the engine's log stream — including forged log lines, ANSI control sequences, or content that breaks whatever consumes those logs (NSSM captures stdout/stderr to files; see [docs/SERVICE.md](SERVICE.md)).
+
+**Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (small). **Severity:** medium (log forgery / audit confusion), low (likelihood — same admin threat model).
+
+**Two distinct problems, worth separating when fixed:** (a) **attribution** — a line from a sandboxed Handler is indistinguishable from an engine line, so an operator cannot tell which inbound produced it; (b) **PHI** — a Handler that `print()`s a message body to stderr writes a full payload into the general log at whatever level the operator is running, which CLAUDE.md §9 forbids for INFO and above. (b) is the one that matters for a PHI deployment.
+
+**Fix direction:** capture the child's stderr (`stderr=subprocess.PIPE`) and relay it through the engine's stdlib logger on a reader thread, prefixed with the inbound + worker identity and rate-limited. That also removes the interleaving hazard of two processes writing one fd concurrently.
+
+**Adjacent, same fd-discipline root:** a Handler that `print()`s to **stdout** is a latent landmine in both the pre- and post-#339 code — it lands in the `TextIOWrapper` buffer rather than the `BufferedWriter` the frames use, so it happens not to corrupt a frame today. That is luck, not design, and should be closed with this item (redirect the child's `sys.stdout` to stderr at bootstrap, leaving the raw fd 1 exclusively for frames).
+
+**Related:** #339, #342 (sibling fd-1 issue), CLAUDE.md §9 (PHI logging), ADR 0087.
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01.
