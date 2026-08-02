@@ -209,6 +209,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # shards disagree on a lane's owner). Deterministic placement, not a security control, no secret
     # material involved.
     "messagefoundry/pipeline/sharding.py": frozenset({"hashlib"}),
+    # ADR 0087 (#197) — secrets = a fresh 16-byte token_hex per DISPATCH, carried as that call's
+    # request id and bound on the way back. This IS a security control: a grandchild the sandboxed
+    # Handler spawns inherits fd 1 (the response pipe) and outlives the worker's kill, so a DERIVABLE
+    # id (a per-spawn nonce plus a counter) would let the code running one call pre-stage the answer to
+    # the next — for an `accepts=` predicate, a routing-verdict flip with no ERROR and no disposition
+    # anomaly. Unpredictability is the whole property, hence secrets rather than random.
+    "messagefoundry/pipeline/sandbox.py": frozenset({"secrets"}),
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source

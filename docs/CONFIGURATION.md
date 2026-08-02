@@ -797,8 +797,41 @@ Router/Handler in a **persistent per-inbound worker child** (never a per-message
 forbidden-import guard (socket/store/crypto), the resource caps below, and a **fail-closed** refusal of
 the live `db_lookup`/`fhir_lookup` bridges (they re-enter the event loop — a subprocess boundary breaks
 that; a Handler needing live enrichment runs with `mode=off`). An isolation denial (forbidden op, cap
-overrun, worker crash) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK, never dropped).
+overrun, worker crash, a rejected frame) routes the message to `ERROR`/dead-letter **post-ACK** (no NAK,
+never dropped).
 **Read once at engine start — a `/config/reload` does NOT re-read it (restart to change).**
+
+**The pipe itself is a control, and it is not configurable.** Both directions speak a **non-executing
+frame codec**: a closed tag set decoded with `json.loads` + `bytes.decode` and a literal tag match over a
+fixed handful of types. Nothing is serialized by naming a type, so nothing a worker writes can construct
+an arbitrary object — or run arbitrary code — in the engine. Each dispatch carries a fresh random
+request id that a response must echo along with its phase and handler name, *and* a frame that turns up
+outside a dispatch drops the worker — so a worker cannot pre-stage the answer to a later call. Fixed
+bounds: **64 MiB** per frame and per frame header, **65536** out-of-band segments, and value nesting
+depth **256**; each is a fail-closed rejection, not a truncation. The graph's code-set tables are sent
+by the engine once per worker start, so a sandboxed `code_set(...)` always resolves to the value the
+engine itself is serving — an unreloaded edit to `codesets/` changes nothing until you reload, exactly
+as with `mode=off`.
+
+**What this boundary does NOT cover.** It confines the *address space*, not the machine: a sandboxed
+Router/Handler can still import `os`/`subprocess`/`ctypes`, open files, and spawn processes as the
+service account — the forbidden-import guard is defence-in-depth (a module imported before it is
+installed keeps a live reference), never a compensating control. All of one inbound's Routers/Handlers
+share a single worker, so this does **not** confine one Handler from another — the boundary is between
+admin code and the engine, exactly as `mode=off` shares an address space. A grandchild the Handler
+spawns inherits the response pipe and outlives the worker's kill; the codec plus the request-answer
+binding is what makes that harmless (it can still force a respawn, i.e. dead-letter messages on that
+inbound), not the process teardown. The child's **stderr is inherited by the engine**, so a
+Handler that prints goes into the engine's log unparsed and un-redacted. ADR 0072 Router/Handler
+tracing does not compose with `mode=subprocess` (the sandbox branch precedes the tracer branch), and a
+`mode=subprocess` graph cannot use the ADR-0071 fused thread-hop path (it is hard-disabled).
+
+**Check this before you flip the switch.** Turning the sandbox on is behaviour-neutral for a graph
+whose Routers are pure — which is what the engine requires of them anyway. It is **not** neutral for a
+Router that *mutates* the message it was handed: in-process that mutation is visible to an `accepts=`
+predicate (they share one object), and across the pipe it is not, so such a graph can route
+differently under `mode=subprocess`. Grep your Routers for writes to the message before enabling this
+on a live feed; a Router that only reads is unaffected.
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
