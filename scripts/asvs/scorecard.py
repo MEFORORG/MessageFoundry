@@ -77,10 +77,22 @@ class Absence:
     absence claims survived for weeks. So an absence claim is only admissible with a
     ``positive_control`` that must still match; if the control goes quiet the search has gone blind and
     the claim is void, regardless of what the pattern returns.
+
+    ``mutation`` closes the hole the control does not: it is the realistic REINTRODUCTION this pattern
+    claims to exclude, and the pattern must actually fire on it. A whole chapter of claims was once
+    authored as prose narrations of shell commands — ``"rg -n 'tar.extractall' -> exit 1 (zero hits)"``
+    where the field wanted ``tar\\.extractall\\(``. The field's type is ``str`` and prose is a valid
+    ``str``, so the shape permitted it and only a detector caught it. Requiring the pattern to match a
+    stated reintroduction makes prose *unwritable* rather than merely detectable.
+
+    Do NOT derive ``mutation`` from ``pattern``. A value generated from the thing it validates
+    satisfies the check by construction, which would make this the most authoritative-looking vacuous
+    gate in the file — the same defect class it exists to close, arriving through the fix.
     """
 
     pattern: str
     positive_control: str
+    mutation: str
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,21 @@ def load_scorecard(path: Path) -> list[Cell]:
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
                 "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
             )
+        for a in raw.get("absence", []):
+            if not str(a.get("mutation", "")).strip():
+                raise ScorecardError(
+                    # NO LITERAL CODE EXAMPLE HERE. This module is inside the corpus that absence
+                    # patterns are searched over, so an illustrative call in this string becomes a
+                    # real corpus hit and reads as FALSE. The first draft used one and broke two
+                    # live claims (5.2.5, 5.3.3) the moment they were backfilled: the guidance for
+                    # a check contaminated the check. The Absence docstring carries the example in
+                    # escaped-regex form, which cannot self-match.
+                    f"cell {raw.get('id')!r}: absence claim {a.get('pattern')!r} has no `mutation` — "
+                    "state the realistic reintroduction this pattern excludes, so the pattern can "
+                    "be proved capable of firing. Author it from what the code would look like if "
+                    "the thing came back; do NOT derive it from the pattern, which makes the check "
+                    "vacuous. See the Absence docstring for a worked example"
+                )
         cells.append(
             Cell(
                 id=str(raw["id"]),
@@ -186,7 +213,13 @@ def load_scorecard(path: Path) -> list[Cell]:
                     for e in raw.get("evidence", [])
                 ),
                 absence=tuple(
-                    Absence(pattern=str(a["pattern"]), positive_control=str(a["positive_control"]))
+                    Absence(
+                        pattern=str(a["pattern"]),
+                        positive_control=str(a["positive_control"]),
+                        # No default. A missing mutation must be authored, not inferred — see the
+                        # Absence docstring on why deriving one from the pattern is worse than none.
+                        mutation=str(a["mutation"]),
+                    )
                     for a in raw.get("absence", [])
                 ),
             )
@@ -231,14 +264,45 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
         want = corpus.get(c.id)
         if want is not None and c.level != want:
             problems.append(f"{c.id}: level {c.level} but the corpus says L{want}")
+
+    # A DECIDED verdict with no evidence at all is the conflation this whole tool exists to prevent:
+    # a guess wearing a verdict's clothes. The method is explicit — every non-`unverified` cell carries
+    # at least one anchor — but nothing enforced it, because `check_anchors` iterates the evidence a
+    # cell HAS. A cell with none is not checked and fails nothing; the gate could only ever validate
+    # evidence that existed, never assert that it must. Measured when this landed: 14 of 59 decided
+    # cells carried zero anchors AND zero absence claims, several inherited from the prose lineage
+    # where the verdict was reached but never anchored.
+    unevidenced = sorted(
+        (c.id for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence),
+        key=_sort_key,
+    )
+    if unevidenced:
+        problems.append(
+            f"evidence: {len(unevidenced)} decided cell(s) carry NO anchor and NO absence claim, so "
+            "nothing about them is verified — either anchor them or return them to `unverified`, "
+            f"which is what an unevidenced verdict actually is: {', '.join(unevidenced)}"
+        )
     return problems
 
 
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
-    """Open every evidence anchor and assert its token still resolves.
+    """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
     When the code moves, this reds a test — instead of the sentence rotting in place and the next
     session funding work that is already done.
+
+    **Uniqueness is not pedantry; it is what makes the resolution mean anything.** An ``expect`` that
+    occurs many times in its file resolves from almost anywhere: with ``await conn.rollback()``
+    appearing 101 times in one module, *any* line number in that file lands within ±40 of some
+    occurrence, so the anchor cannot fail and certifies nothing. Two such anchors sat in this scorecard
+    as evidence for weeks.
+
+    It also closes a defect in the REPAIR path rather than the detection path. When code moves, the
+    check correctly reports it — but a re-anchor to the nearest occurrence can silently install a
+    *stale-but-resolving* anchor that passes forever. That happened live: after ADR 0154 landed,
+    ``UPDATE sessions SET revoked_at=`` had two occurrences 19 lines apart — one the keep-N revoke, one
+    a different method entirely — each inside the other's window, so the check would have accepted the
+    wrong one. A repair is exactly where suspicion lapses, because the tool has just proved it works.
     """
     for c in cells:
         for a in c.evidence:
@@ -246,10 +310,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
             lo = max(0, a.line - 1 - ANCHOR_WINDOW)
             hi = min(len(lines), a.line + ANCHOR_WINDOW)
             findings.checked_anchors += 1
+            occurrences = text.count(a.expect)
+            if occurrences > 1:
+                findings.problems.append(
+                    f"{c.id}: {a.path}:{a.line} anchor is AMBIGUOUS — {a.expect!r} occurs "
+                    f"{occurrences} times in the file, so the line number is not load-bearing and a "
+                    "re-anchor cannot be checked. Cite a longer token that appears exactly once"
+                )
+                continue
             if a.expect in "\n".join(lines[lo:hi]):
                 continue
             where = " (found elsewhere in the file)" if a.expect in "\n".join(lines) else ""
@@ -265,6 +338,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
+            # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
+            # narration greps to nothing and is indistinguishable from a true absence.
+            if not re.search(a.pattern, a.mutation):
+                findings.problems.append(
+                    f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
+                    f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
+                )
+                continue
             control = _grep_count(a.positive_control, corpus_files)
             if control == 0:
                 findings.problems.append(
@@ -328,6 +409,17 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
             "pinning: [scorecard].asvs_version is missing — bare requirement ids re-point across "
             "ASVS versions, so the scorecard must say which version its ids mean"
         )
+    anchor = str(meta.get("anchor_commit", "")).strip()
+    # actions/checkout resolves `ref:` as a BRANCH OR TAG name unless it is a full 40-char hash, so an
+    # abbreviated anchor fails with "A branch or tag with the name ... could not be found" -- a gate
+    # failing for a reason with nothing to do with what it measures. Caught in CI twice; refused here.
+    if anchor and not re.fullmatch(r"[0-9a-f]{40}", anchor):
+        problems.append(
+            f"pinning: [scorecard].anchor_commit {anchor!r} must be a FULL 40-character SHA -- an "
+            "abbreviated hash is not resolvable by actions/checkout, which treats a short ref as a "
+            "branch or tag name"
+        )
+
     declared = str(meta.get("corpus_sha256", "")).strip()
     actual = corpus_digest(corpus)
     if not declared:
