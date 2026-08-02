@@ -291,6 +291,29 @@ def test_every_message_event_kind_is_named_in_row_6() -> None:
     )
 
 
+def test_every_audit_floor_event_is_named_as_such_in_row_6() -> None:
+    """The compliance FLOOR — the kinds that survive ``[diagnostics].message_events = "off"``.
+
+    RULE: row 6 states the floor **twice** and both statements were maintained by hand, with nothing
+    checking either against ``_AUDIT_FLOOR_EVENTS``. A kind could join the floor in code and the doc
+    would keep promising a shorter list — the failure mode being an operator who thins their logs
+    believing they know what survives. Row 6 names the floor as the thing that "can never be
+    thinned", so ASVS 16.1.1 scores it.
+
+    Mutation: add a member to ``_AUDIT_FLOOR_EVENTS`` without touching row 6. Red: named below.
+    """
+    from messagefoundry.store.store import _AUDIT_FLOOR_EVENTS
+
+    section = _section_7()
+    row = next(line for line in section.splitlines() if line.startswith("| **6. `message_events`"))
+    missing = sorted(kind for kind in _AUDIT_FLOOR_EVENTS if f"`{kind}`" not in row)
+    assert not missing, (
+        f"docs/PHI.md §7 row 6 does not name these compliance-floor kinds: {missing}. Row 6 promises "
+        "the floor is retained at every verbosity level; a floor member absent from it makes that "
+        "promise incomplete. Note the row states the floor TWICE — update both."
+    )
+
+
 def test_message_event_constant_matches_the_literal_emit_sites() -> None:
     """The constant is trustworthy only while it tracks the code that writes the rows."""
     import ast
