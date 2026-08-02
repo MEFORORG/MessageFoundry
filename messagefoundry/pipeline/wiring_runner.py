@@ -4197,21 +4197,38 @@ class RegistryRunner:
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
         # closes that narrow window: a node that has stopped being leader must not emit egress
-        # as a stale ex-leader. We do NOT drop the row — re-queue it via the existing retry
-        # (mark_failed → PENDING with backoff) so the new leader delivers it (count-and-log,
-        # REL-4). This is a cheap fast-path guard, NOT the authority: the durable backstop is
+        # as a stale ex-leader.
+        #
+        # RELEASE the claim (attempts--, next_attempt_at UNCHANGED, no last_error) rather than
+        # mark_failed: losing leadership is NOT a delivery failure and must not spend a retry.
+        # Under a finite RetryPolicy.max_attempts, mark_failed here re-reads the claim's own
+        # attempts++ and dead-letters on `attempts >= max_attempts` — writing terminal DEAD on a
+        # row that was NEVER SENT. The new leader never sees a DEAD row, so that is a STRAND,
+        # which the count-and-log invariant forbids (duplication is permitted; loss is not).
+        # release_claimed is guarded `status='inflight'`, so it is idempotent if the row already
+        # resolved.
+        #
+        # Then STOP the lane rather than resolving it: a demoted node must stop claiming, and a
+        # release without a stop would hot-spin — release applies no backoff, so the row is
+        # immediately due again — for however long teardown takes, which is not bounded against
+        # the fence-to-expiry margin (ADR 0157 F2). _teardown_unsafe clears the dispatchers and
+        # workers and start() rebuilds them, so promotion re-arms the lane; a STOPPED lane never
+        # outlives the term that stopped it.
+        #
+        # This is a cheap fast-path guard, NOT the authority: the durable backstop is
         # H1's store-checked leader_epoch fence, which rejects a superseded ex-leader's claim
         # at the DB inside the claim transaction even if this in-memory check raced. On the
         # single-node NullCoordinator is_leader() is always True, so this never fires and the
         # delivery path is byte-identical.
         if not self._coordinator.is_leader():
-            retry_until = await self._mark_failed_and_arm(
+            await self.store.release_claimed([item.id])
+            log.warning(
+                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+                "un-errored (no attempt spent) and stopped the lane for the new leader",
                 name,
-                item.id,
-                "leadership lost before send; re-queued for the new leader",
-                retry,
+                1,
             )
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.STOPPED, None
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -4454,11 +4471,19 @@ class RegistryRunner:
             await self._maybe_alert_buildup(name)
             await self._maybe_alert_stall(name)
             return _ItemOutcome.PROCESSED, retry_until
+        # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
+        # stakes are higher here: mark_batch_failed decides ONE disposition from the head's
+        # attempts and applies it to all N, so a finite retry cap dead-letters the whole batch on a
+        # leadership change, un-sent.
         if not self._coordinator.is_leader():
-            retry_until = await self._mark_batch_failed_and_arm(
-                name, ids, "leadership lost before send; re-queued for the new leader", retry
+            await self.store.release_claimed(ids)
+            log.warning(
+                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+                "un-errored (no attempt spent) and stopped the lane for the new leader",
+                name,
+                len(ids),
             )
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.STOPPED, None
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
