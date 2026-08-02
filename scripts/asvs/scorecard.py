@@ -264,6 +264,24 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
         want = corpus.get(c.id)
         if want is not None and c.level != want:
             problems.append(f"{c.id}: level {c.level} but the corpus says L{want}")
+
+    # A DECIDED verdict with no evidence at all is the conflation this whole tool exists to prevent:
+    # a guess wearing a verdict's clothes. The method is explicit — every non-`unverified` cell carries
+    # at least one anchor — but nothing enforced it, because `check_anchors` iterates the evidence a
+    # cell HAS. A cell with none is not checked and fails nothing; the gate could only ever validate
+    # evidence that existed, never assert that it must. Measured when this landed: 14 of 59 decided
+    # cells carried zero anchors AND zero absence claims, several inherited from the prose lineage
+    # where the verdict was reached but never anchored.
+    unevidenced = sorted(
+        (c.id for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence),
+        key=_sort_key,
+    )
+    if unevidenced:
+        problems.append(
+            f"evidence: {len(unevidenced)} decided cell(s) carry NO anchor and NO absence claim, so "
+            "nothing about them is verified — either anchor them or return them to `unverified`, "
+            f"which is what an unevidenced verdict actually is: {', '.join(unevidenced)}"
+        )
     return problems
 
 

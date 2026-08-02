@@ -52,7 +52,23 @@ def _scorecard_file(tmp_path: Path, body: str) -> Path:
 
 
 def _cells(*specs: tuple[str, int, str]) -> list[Cell]:
-    return [Cell(id=i, level=lv, verdict=v) for i, lv, v in specs]  # type: ignore[arg-type]
+    """Fixture cells for the id / level / count checks.
+
+    Decided verdicts carry a placeholder anchor because `check_completeness` now refuses an
+    unevidenced one. These fixtures are about ids and levels, so the anchor keeps them focused rather
+    than tripping a rule they do not test; `check_anchors` is never called on them.
+    """
+    decided = {"pass", "partial", "fail", "na"}
+    return [
+        Cell(
+            id=i,
+            level=lv,
+            verdict=v,  # type: ignore[arg-type]
+            evidence=(Anchor("messagefoundry/m.py", 1, "x"),) if v in decided else (),
+            residual="rationale" if v == "na" else "",
+        )
+        for i, lv, v in specs
+    ]
 
 
 # --- completeness: the check whose absence cost ten cells ---------------------------------------
@@ -322,6 +338,10 @@ id = "2.1.1"
 level = 3
 verdict = "partial"
 residual = "ships off"
+[[cell.evidence]]
+path = "messagefoundry/m.py"
+line = 1
+expect = "tls_cert_file"
 """,
     )
     findings = verify(sc, corpus, tmp_path)
@@ -501,3 +521,37 @@ def test_anchor_holds_when_the_token_is_unique(tmp_path: Path) -> None:
     f = Findings()
     check_anchors(cells, tmp_path, f)
     assert f.ok and f.checked_anchors == 1
+
+
+def test_completeness_catches_a_decided_verdict_with_no_evidence_at_all() -> None:
+    """The gate could only validate evidence that EXISTED, never assert that it must.
+
+    check_anchors iterates the anchors a cell has, so a cell with none is skipped and fails nothing.
+    Measured when this landed: 14 of 59 decided cells carried zero anchors and zero absence claims --
+    verdicts inherited from the prose lineage that were reached but never anchored. That is precisely
+    the guess-wearing-a-verdict conflation this tool exists to prevent.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", evidence=(Anchor("m.py", 1, "x"),)),
+        Cell(id="1.1.2", level=2, verdict="partial"),  # no anchor, no absence
+        Cell(id="2.1.1", level=3, verdict="unverified"),  # unverified needs none
+    ]
+    problems = check_completeness(cells, CORPUS)
+    hit = [p for p in problems if "carry NO anchor" in p]
+    assert len(hit) == 1, problems
+    assert "1.1.2" in hit[0] and "1.1.1" not in hit[0] and "2.1.1" not in hit[0]
+
+
+def test_completeness_accepts_a_decided_cell_evidenced_only_by_an_absence_claim() -> None:
+    """A `fail` is often proved by absence, not presence -- the rule must not demand a presence anchor."""
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", evidence=(Anchor("m.py", 1, "x"),)),
+        Cell(
+            id="1.1.2",
+            level=2,
+            verdict="fail",
+            absence=(Absence("clamd", "ScanRejected", "import clamd"),),
+        ),
+        Cell(id="2.1.1", level=3, verdict="unverified"),
+    ]
+    assert not [p for p in check_completeness(cells, CORPUS) if "carry NO anchor" in p]
