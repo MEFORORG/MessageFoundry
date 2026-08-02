@@ -244,6 +244,13 @@ jobs:
       # figure matched no leg. State the MEASURED value and its DATE, never a round multiple: a bare
       # multiple gives the next reader no way to tell when it has rotted, which is how this one survived.
       #
+      # PROOF IT WAS THE CAP, NOT THE BRANCH. #119's windows-2025 leg was RE-RUN on the SAME commit
+      # against the SAME 26:00 cap: attempt 1 was killed at the cap, attempt 2 concluded SUCCESS. Same
+      # code, same config, same ceiling, two outcomes. The leg was not failing -- it was coin-flipping
+      # against the cap, exactly the state the ubuntu note above names, and the reason "re-run it and
+      # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
+      # that runner was fast enough that time.
+      #
       # 36:00 is 1.46x over that 24:35 maximum -- the margin ubuntu already runs with. Both Windows legs
       # take the same number: windows-2022 is the faster of the two, so sizing on windows-2025 only
       # leaves it more room, and one value is one thing to re-derive. job_timeout moves 30 -> 40 to keep
