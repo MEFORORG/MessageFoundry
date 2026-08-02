@@ -428,12 +428,28 @@ it by hand. Three constraints came out of that, recorded here so the next attemp
 them:
 
 - **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
-  sender.** A merge freeze went out with "lift when #119 merges". #119 did not merge that day (an
-  unrelated CI timeout), so five sessions held on a condition that had not arrived and it took a second
-  round to retract. It merged the *following* day, 2026-08-02 01:45Z — which sharpens the point rather
-  than softening it: the recipients had no way to evaluate the predicate, so the freeze outlived its
-  own condition in both directions. As of 2026-08-02 a claim note still announcing that freeze was
-  being read by every joining session hours after both it and #133 had merged.
+  sender.** A merge freeze went out with "lift when #119 merges", and five sessions held. **#119
+  merged** — 2026-08-02 01:45:00Z, merge commit `002be182`. The failure was never that the condition
+  could not arrive; it was that **the world moved while everyone waited**. `main` advanced four times
+  before it did:
+
+  | | |
+  |---|---|
+  | #74 | 2026-08-01 20:27:03Z |
+  | #120 | 2026-08-01 23:59:43Z |
+  | #131 | 2026-08-02 00:35:29Z |
+  | #130 | 2026-08-02 01:01:35Z |
+
+  So the freeze did not hold `main` still even while it was nominally in force — it held only the
+  sessions honouring it, which is the worst of both. And it outlived its own condition in the other
+  direction too: on 2026-08-02 a claim note still announcing the freeze was read by every joining
+  session hours after #119 had merged. A predicate the recipient cannot evaluate does not expire.
+
+  This bullet said "#119 never merged" for a day, which made it a compensating control resting on a
+  false premise — the failure [`CLAUDE.md`](../CLAUDE.md) §11 names, inside the document arguing for
+  it. Corrected against the API, and the same framing was independently corrected in `ci.yml`
+  (`07b6e55a`) and in BACKLOG #340 by two other sessions; timestamps above are theirs, re-verified
+  here rather than restated.
 - **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
   sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
   clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.
