@@ -407,29 +407,44 @@ def _lane_report(d: StageDispatcher, lane: str) -> str:
     )
 
 
-def _verdict(d: StageDispatcher) -> str:
+def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
     """State which #344 hypothesis this expiry is, so the next reader need not know the theory.
 
-    `empty_claims` is the discriminator (`StageDispatcher.empty_claims`, fed only by the EMPTY branch
-    of `_claim_and_dispatch`): under the ADR 0070 topology a clean run reads (0, 0, 0).
+    `empty_claims` alone is NOT a complete discriminator — it must be read WITH the lane phase.
+    `empty_claims[0] > 0` is biconditional with the T12 stranding only because the other EMPTY
+    consumer (T11, EMPTY-with-dirty) is unreachable under this topology, and `== 0` covers several
+    distinct stuck states that only the phase separates.
     """
-    if d.empty_claims[0] > 0:
+    phase = d.phase(lane) if lane is not None else None
+    pname = getattr(phase, "name", "?")
+    if d.empty_claims[0] > 0 and (phase is None or phase is _LanePhase.IDLE):
         return (
             "VERDICT: a claim came back EMPTY (empty_claims[0] > 0) and T12 dropped the lane to a"
             " TERMINAL IDLE — no timer armed, and these tests disable the sweep that would re-ready"
-            " it. On SQL Server the usual cause is a swallowed lock-timeout (native 1222 under"
-            " SET LOCK_TIMEOUT 0, reported by the store as a normal empty result). BACKLOG #344"
-            " instance 2."
+            " it. Two known routes, both SQL Server, both reported to the dispatcher as an ordinary"
+            " empty result: a swallowed lock-timeout (native 1222 under SET LOCK_TIMEOUT 0, logged"
+            " only at DEBUG) and a READPAST head skip (the batch claim drops the whole lane when its"
+            " rn=1 head is locked — no log line at all). Postgres is NOT structurally immune: its"
+            " claim uses FOR UPDATE SKIP LOCKED, the same head-of-line skip. BACKLOG #344 instance 2."
+        )
+    if d.empty_claims[0] > 0:
+        return (
+            f"VERDICT: an EMPTY claim was recorded (empty_claims[0] > 0) but the lane is {pname},"
+            " not IDLE — so this is NOT the plain #344 instance-2 stranding. Read the phase:"
+            " CLAIMING/PROCESSING means a later claim or serializer is still outstanding; PAUSED"
+            " means the pause branch consumed it."
         )
     return (
         "VERDICT: NO empty claim was recorded (empty_claims[0] == 0), so the claim never returned at"
-        " all — a stalled statement or a lost wakeup. This is NOT the #344 instance-2 stranding and"
-        " must not be papered over with a re-nudge; check the lane/claimer task state below."
+        f" all — a stalled statement or a lost wakeup. The lane is {pname}: CLAIMING = the claim is"
+        " outstanding; PROCESSING = the serializer is hung; READY = the claimer is not picking it up"
+        " (check slots_free and any claim-error backoff). This is NOT the #344 instance-2 stranding"
+        " and must NOT be papered over with a re-nudge."
     )
 
 
-async def _expiry_report(pred: Callable[[], bool] | None = None) -> str:
-    """Everything a reader needs to tell the two #344 hypotheses apart, without a second CI round-trip."""
+async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | None = None) -> str:
+    """Everything a reader needs to tell the #344 hypotheses apart, without a second CI round-trip."""
     lines = ["_wait_until expired."]
     if pred is not None:
         try:
@@ -437,22 +452,28 @@ async def _expiry_report(pred: Callable[[], bool] | None = None) -> str:
         except Exception as exc:  # noqa: BLE001 — a raising predicate must not hide the report
             lines.append(f"  predicate re-read RAISED: {exc!r}")
     for i, d in enumerate(_LIVE_DISPATCHERS):
-        lines.append(f"  {_verdict(d)}")
+        # The verdict needs a lane: use the caller's, else the only one if this dispatcher has one.
+        subject = (
+            lane if lane is not None else (next(iter(d._states)) if len(d._states) == 1 else None)
+        )
+        lines.append(f"  {_verdict(d, subject)}")
         lines.append(
             f"  dispatcher[{i}] stage={d._stage.value}"
             f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
             f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
             f" slots_free={d._slots_free}"
         )
-        lines.extend(_lane_report(d, lane) for lane in d._states)
+        # NB distinct loop names: a bare `for lane in ...` here would REBIND the `lane` parameter and
+        # give the next dispatcher's verdict a stale subject.
+        lines.extend(_lane_report(d, ln) for ln in d._states)
         # The store row is the other half: status + next_attempt_at say whether the head was even
         # claimable. Bounded and swallowed — a diagnostic that hangs or raises would MASK the failure
         # it is meant to explain.
         try:
-            for lane in list(d._states):
-                rows = await asyncio.wait_for(_lane_rows(d._store, lane), timeout=5.0)
+            for ln in list(d._states):  # `ln`, not `lane` — see the rebinding note above
+                rows = await asyncio.wait_for(_lane_rows(d._store, ln), timeout=5.0)
                 lines.append(
-                    f"      {lane} rows="
+                    f"      {ln} rows="
                     + str([(r["status"], r["attempts"], r["next_attempt_at"]) for r in rows])
                 )
         except Exception as exc:  # noqa: BLE001 — a diagnostic must never mask the real failure
@@ -1139,7 +1160,7 @@ async def _wait_lane(
                     f"{lane} stranded in terminal IDLE {used + 1} times — past the"
                     f" {_MAX_SWEEP_STANDINS} allowed sweep stand-in(s). That is a contention"
                     f" regression, not the transient 1222 this stands in for.\n"
-                    + await _expiry_report()
+                    + await _expiry_report(lane=lane)
                 )
             _SWEEP_STANDINS[lane] = used + 1
             # LOUD, but not fatal: surfaced in pytest's warnings summary so the real-world rate of the
@@ -1154,7 +1175,7 @@ async def _wait_lane(
             d.mark_ready(lane, woken=False)
         await asyncio.sleep(0.003)
     want = "/".join(p.name for p in phases)
-    raise _WaitTimeout(f"{lane} never reached {want}\n" + await _expiry_report())
+    raise _WaitTimeout(f"{lane} never reached {want}\n" + await _expiry_report(lane=lane))
 
 
 def _sweep_standins(lane: str) -> int:
