@@ -22,6 +22,16 @@
     session cannot work. That is the opposite of the worktree gate's posture (which protects the
     shared tree and should fail closed), and the difference is intentional.
 
+    FAILS OPEN, BUT NOT SILENTLY. Every one of those error paths used to `exit 0` with no output, which
+    on stdout is byte-for-byte what "checked, nobody else is touching this file" looks like. So a gate
+    that had checked NOTHING was indistinguishable from a gate reporting all-clear, and a session could
+    read the absence of a warning as evidence -- while the guard was inert. An unresolved run now says
+    so via additionalContext. It still allows: the posture is unchanged, only the silence is.
+
+    Rate-limited per reason (`-NoticeCooldownMinutes`), because a persistently broken overlap script
+    would otherwise inject a notice into EVERY Edit and Write. If the throttle state cannot be read or
+    written the notice is emitted anyway -- silence is the defect being fixed, so the fallback is noise.
+
     Wired on Edit|Write|MultiEdit|NotebookEdit. The overlap map is cached, so the common case is a
     cache read, not a git walk across every worktree.
 #>
@@ -31,7 +41,13 @@ param(
     # than re-implementing its rule -- a test that asserts a copy of the rule proves nothing.
     [string]$OverlapScript = (Join-Path $PSScriptRoot "..\coord\overlap.ps1"),
     # Emit the decision and skip reading stdin (tests).
-    [string]$PathOverride
+    [string]$PathOverride,
+    # Where the per-reason "already told them" stamps live. Defaults to the repo's coordination dir.
+    # Parameterised so tests are isolated from the real repo AND from each other -- a throttle sharing
+    # one directory with the suite would make the first test's notice suppress the second's.
+    [string]$StateDir,
+    # How long one unresolved reason stays quiet after being reported.
+    [int]$NoticeCooldownMinutes = 30
 )
 
 # No $ErrorActionPreference = Stop: this gate fails OPEN, and a throw would be a deny-by-crash.
@@ -51,25 +67,113 @@ function Deny([string]$Reason) {
     exit 0
 }
 
+function Write-Unresolved([string]$Slug, [string]$Detail) {
+    # THE GATE DID NOT CHECK. Say so, and allow anyway.
+    #
+    # It must be a JSON hookSpecificOutput.additionalContext payload and never a bare line: this is a
+    # PreToolUse hook whose stdout is PARSED AS A DECISION, so a stray line risks a misparse on every
+    # single Edit and Write -- turning a diagnostic into a worse fault than the one it reports.
+    #
+    # No permissionDecision key: adding one here would convert a broken guard into a blocked session,
+    # which is the fail-open posture inverted.
+    $emit = $true
+    try {
+        $dir = $StateDir
+        if (-not $dir) {
+            $common = (& git rev-parse --path-format=absolute --git-common-dir 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $common) { $dir = Join-Path ([string]$common).Trim() "mefor-coord" }
+        }
+        if ($dir) {
+            # PER WORKTREE, not per repo. The stamp lives in the SHARED git-common-dir, so a single
+            # repo-wide stamp would mean the first session to hit a broken gate silences it for every
+            # other session for the whole cooldown -- and those sessions would read that silence as
+            # "checked, nobody is here", which is precisely the defect this notice exists to remove.
+            # One session's diagnostic must never become another session's false all-clear.
+            $who = "shared"
+            $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $top) {
+                $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-'
+                if (-not $who) { $who = "shared" }
+            }
+            $stamp = Join-Path $dir "gate-unresolved/$who.$Slug.stamp"
+            $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
+            if ($prev) {
+                $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
+                # Bound BOTH ways. A stamp dated in the future (clock skew, a copied tree) would read as
+                # eternally fresh and suppress this notice forever -- the same silence, now self-inflicted.
+                if ($mins -ge 0 -and $mins -lt $NoticeCooldownMinutes) { $emit = $false }
+            }
+            if ($emit) {
+                New-Item -ItemType Directory -Force -Path (Split-Path $stamp) | Out-Null
+                Set-Content -LiteralPath $stamp -Value ((Get-Date).ToString("o")) -Encoding UTF8
+            }
+        }
+    } catch {
+        # Cannot throttle -> report. Silence is the defect being fixed, so the failure mode of the
+        # noise-suppressor must be noise, never quiet.
+        $emit = $true
+    }
+    if ($emit) {
+        $payload = @{
+            hookSpecificOutput = @{
+                hookEventName     = "PreToolUse"
+                additionalContext = "[collision] The collision gate could NOT check this edit ($Slug): $Detail. It allowed the edit without consulting any peer worktree, so an absent collision warning means UNKNOWN here, not clear. Check by hand before assuming nobody else is in this file:  pwsh -NoProfile -File scripts\coord\overlap.ps1"
+            }
+        }
+        [Console]::Out.Write(($payload | ConvertTo-Json -Compress -Depth 6))
+    }
+    exit 0
+}
+
 $target = $PathOverride
 if (-not $target) {
     if (-not [Console]::IsInputRedirected) { exit 0 }
-    try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json } catch { exit 0 }
-    if (-not $hook) { exit 0 }
+    try { $hook = [Console]::In.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop } catch {
+        Write-Unresolved "payload-unreadable" `
+            "the PreToolUse payload on stdin was not readable JSON, so the gate never learned which file this edit targets"
+    }
+    # Parsed, but to nothing. An empty payload or a literal `null` on stdin does not throw, so this
+    # used to be the one unreadable-input path that still exited silently -- the gate had learned no
+    # more than in the case above, and said no more than an all-clear.
+    if (-not $hook) {
+        Write-Unresolved "payload-empty" `
+            "stdin carried no PreToolUse payload, so the gate never learned which file this edit targets"
+    }
     $target = [string]$hook.tool_input.file_path
     # NotebookEdit and some variants name the path differently; absence just means nothing to check.
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
 }
 if (-not $target) { exit 0 }
 
-if (-not (Test-Path -LiteralPath $OverlapScript)) { exit 0 }
+if (-not (Test-Path -LiteralPath $OverlapScript)) {
+    Write-Unresolved "overlap-missing" "no overlap script at $OverlapScript"
+}
 
-$rows = @()
+$raw = $null
+$code = 0
 try {
     $raw = & pwsh -NoProfile -NonInteractive -File $OverlapScript -File $target -Json 2>$null
-    if ($raw) { $rows = @($raw | ConvertFrom-Json) }
-} catch { exit 0 }
-if (-not $rows -or $rows.Count -eq 0) { exit 0 }
+    $code = $LASTEXITCODE
+} catch {
+    Write-Unresolved "overlap-threw" "invoking the overlap script raised: $($_.Exception.Message)"
+}
+if ($code -ne 0) {
+    Write-Unresolved "overlap-failed" "the overlap script exited $code"
+}
+
+# EMPTY OUTPUT IS NOT AN ANSWER. Under -Json a resolved "nobody else is in this file" is the two bytes
+# `[]`; nothing at all is a script that never produced a verdict. Folding those together is precisely
+# how this gate came to report all-clear while checking nothing.
+$text = (@($raw) -join "`n").Trim()
+if (-not $text) {
+    Write-Unresolved "overlap-empty" "the overlap script produced no output at all (a resolved 'nobody else' is '[]', not nothing)"
+}
+
+$rows = @()
+try { $rows = @($text | ConvertFrom-Json -ErrorAction Stop) } catch {
+    Write-Unresolved "overlap-unparseable" "the overlap script's output was not JSON"
+}
+if (-not $rows -or $rows.Count -eq 0) { exit 0 }   # RESOLVED, and nobody else is touching it
 
 $live = @($rows | Where-Object { $_.Live })
 if ($live.Count -eq 0) { exit 0 }   # dormant only: worth knowing, not worth blocking
