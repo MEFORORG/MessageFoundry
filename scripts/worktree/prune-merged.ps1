@@ -623,6 +623,11 @@ function Get-Decision {
         # branches were kept on a run whose summary said 0. 'kept' is now only ever set by a keep.
         BranchOutcome = 'not attempted'
         BranchDetail  = ''
+        # Declared on EVERY candidate, not just removed ones, so the field's absence never has to be
+        # interpreted: an empty array reads as "nothing was stranded here", which is true of a candidate
+        # that was skipped, and a consumer never has to distinguish missing from empty.
+        ClaimsReleased   = @()
+        ClaimsUnreleased = @()
     }
 }
 
@@ -729,6 +734,86 @@ function Read-OrphanLedger {
     catch { return @() }
 }
 
+# --- Coordination claims stranded by a removal (BACKLOG #345) -------------------------------------
+# A work claim (scripts/coord/claim.ps1) is a JSON file under <git-common-dir>/mefor-coord/claims/. It
+# lives beside the SHARED object store, so it OUTLIVES the worktree that took it. Removing a worktree
+# therefore strands its claims, and `claim.ps1 -Take` hard-blocks on any claim file that exists -- so the
+# key becomes unclaimable by every future session until a human happens to run `-Release <key> -Force`.
+# Nothing surfaced that condition and nothing could: the registry has no way to observe that a holder
+# ceased to exist, which is the same "a control that cannot see its own failure" shape as #344.
+#
+# WHY THIS IS NOT AN EXPIRING CLAIM. claim.ps1's docs are right that an auto-expiring claim silently
+# re-opens the race it exists to prevent, and that reasoning is untouched here. This releases on
+# EVIDENCE, not on elapsed time: it runs only from the branch that has already proven the directory is
+# gone AND deregistered, so there is no session left in there to collide with. A claim whose holder is
+# merely quiet is never touched by this.
+$claimsDir = if ($gitCommonDir) { Join-Path $gitCommonDir 'mefor-coord/claims' } else { '' }
+
+# An UNREADABLE claim belongs to the REGISTRY, not to any one worktree -- by definition we could not read
+# whose it is. So it is surveyed ONCE, here, rather than discovered inside the removal loop. Two bugs
+# came out of doing it the other way, and both are the same mistake in different clothes:
+#   * counted once per removed worktree, so one blocked key reported as 2 -- the over-counting the branch
+#     counters in this script were already fixed for once;
+#   * invisible to a dry run, because a dry run never reaches the removal branch. A preview that reports
+#     a tidy registry over an unclaimable key is the same silence this whole feature removes, and it is
+#     the surface an operator checks BEFORE deciding to act.
+# Reading is not mutating, so this is safe on the dry-run path -- the same rule the orphan ledger follows.
+$claimsUnreadable = @{}
+# NEVER LOOKED is not CLEAN. $gitCommonDir is allowed to be empty (`rev-parse` can fail), and the claims
+# directory need not exist at all -- in both cases the survey below does not run, and `unreadable: []`
+# next to `released: 0` reads exactly like a registry that was checked and found tidy. Recorded so a
+# consumer can tell the two apart, per occupancy.ps1's rule that an empty list is not a green light.
+$claimsScanned = [bool]($claimsDir -and (Test-Path -LiteralPath $claimsDir))
+if ($claimsScanned) {
+    foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
+        try { Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop | Out-Null }
+        catch {
+            $claimsUnreadable[(ConvertTo-Norm $f.FullName)] = [pscustomobject]@{
+                file = $f.Name; detail = $_.Exception.Message
+            }
+        }
+    }
+}
+
+function Remove-ClaimsHeldBy {
+    param([string]$Path)
+
+    if (-not $claimsDir -or -not (Test-Path -LiteralPath $claimsDir)) { return @() }
+
+    # THE FALSE POSITIVE IS WORSE THAN THE BUG. Releasing a claim held by a DIFFERENT, living worktree
+    # hands its key to another session and invites the duplicate build the registry exists to stop --
+    # strictly worse than the orphan being fixed. So match on the full normalised path and nothing else:
+    # no leaf name, no prefix, no StartsWith. ConvertTo-Norm is the repo's own normaliser
+    # (forward slashes, no trailing slash, lowercased) and agrees with claim.ps1's writer, which records
+    # `worktree = $repo` from `git rev-parse --path-format=absolute` and compares it back with `-ieq`
+    # over the same slash/trim folding.
+    $target = ConvertTo-Norm $Path
+    if (-not $target) { return @() }
+
+    $released = @()
+    foreach ($f in @(Get-ChildItem -LiteralPath $claimsDir -Filter *.json -File -EA SilentlyContinue | Sort-Object Name)) {
+        try {
+            $c = Get-Content -LiteralPath $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop
+        }
+        catch {
+            # UNREADABLE IS NOT ABSENT. A claim file we cannot parse might name this worktree, so we
+            # cannot say it does not -- and we must not delete it on a guess either. Already surveyed and
+            # reported by the run-level pass above; skipping it here must never become a silent drop.
+            continue
+        }
+        if ((ConvertTo-Norm ([string]$c.worktree)) -ne $target) { continue }
+        try {
+            Remove-Item -LiteralPath $f.FullName -Force -EA Stop
+            $released += [pscustomobject]@{ key = [string]$c.key; outcome = 'released'; detail = [string]$c.note }
+        }
+        catch {
+            # Same rule as the removal itself: report the outcome, never assume the call worked.
+            $released += [pscustomobject]@{ key = [string]$c.key; outcome = 'failed'; detail = $_.Exception.Message }
+        }
+    }
+    return $released
+}
+
 # Still broken RIGHT NOW: on disk, and not registered. An entry that was repaired (re-added) or fully
 # deleted clears itself, so the ledger cannot nag about a state that no longer exists.
 function Get-LiveOrphans([object[]]$Ledger) {
@@ -772,6 +857,7 @@ $priorOrphans = @(Get-LiveOrphans $ledger)
 
 # --- Apply ---------------------------------------------------------------------------------------
 $removed = 0; $failed = 0; $branchesDeleted = 0; $branchesKept = 0; $orphaned = 0
+$claimsReleased = 0; $claimsUnreleased = 0
 $newOrphans = @()
 if (-not $occ.Available) { Set-Exit $EXIT_REFUSED }
 if ($priorOrphans.Count -gt 0) { Set-Exit $EXIT_ORPHANED }
@@ -885,6 +971,30 @@ if ($Apply -and $prunable.Count -gt 0) {
         if ($removeExit -eq 0 -and -not $dirExists -and -not $stillRegistered) {
             $removed++
             $d.Outcome = 'removed'
+            # Only here. This is the branch that has PROVEN the directory is gone and deregistered, so it
+            # is the only place where "no session can still be working in there" is a fact rather than an
+            # assumption -- and, because the whole apply loop is gated on -Apply, a dry run cannot reach
+            # it. Claims are released before the branch is touched so a Remove-BranchSafely failure
+            # cannot leave the claim stranded behind a removal that did happen.
+            $cl = @(Remove-ClaimsHeldBy -Path $d.Path)
+            $d.ClaimsReleased = @($cl | Where-Object { $_.outcome -eq 'released' } | ForEach-Object { $_.key })
+            # Only claims PROVEN to belong to this worktree and still not cleared. An unreadable file is
+            # not here -- we never learned whose it was, so attributing it to this decision would be a
+            # guess dressed as a fact. It is a run-level condition instead.
+            $d.ClaimsUnreleased = @($cl | Where-Object { $_.outcome -eq 'failed' })
+            $claimsReleased += $d.ClaimsReleased.Count
+            $claimsUnreleased += $d.ClaimsUnreleased.Count
+            foreach ($x in $cl) {
+                if ($x.outcome -eq 'released') { Write-Note "  released claim '$($x.key)' (held by this worktree)" 'DarkCyan' }
+                else {
+                    # A claim we could not clear is still an orphan -- the exact condition this exists to
+                    # remove -- so it must be loud, and it must move the exit code. Silence here would
+                    # report a tidy prune over a key that is now permanently blocked.
+                    Set-Exit $EXIT_FAILED
+                    Write-Note "  CLAIM NOT RELEASED '$($x.key)': $($x.detail)" 'Red'
+                    Write-Note "    It is now orphaned. Clear it with: pwsh -NoProfile -File scripts\coord\claim.ps1 -Release '$($x.key)' -Force" 'Red'
+                }
+            }
             $b = Remove-BranchSafely -Decision $d
             $d.BranchOutcome = $b.Outcome
             $d.BranchDetail = $b.Detail
@@ -987,6 +1097,11 @@ if (-not $Json -and $fenceVetoed -gt $fenceVetoedAtDecision) {
 # wrong-cwd case this script now refuses outright.
 if ($namedMisses.Count -gt 0) { Set-Exit $(if ($removed -gt 0) { $EXIT_FAILED } else { $EXIT_REFUSED }) }
 
+# BEFORE the report, not after it. The -Json branch below emits the receipt and EXITS, so an exit-code
+# decision made after it would be reached only on the human path -- the receipt would carry exitCode 0
+# over a key nothing can claim, and a CI consumer reading the JSON would see a clean run.
+if ($claimsUnreadable.Count -gt 0) { Set-Exit $EXIT_FAILED }
+
 # Persist the orphan ledger: what is still broken, plus anything this run broke. Written only under
 # -Apply -- a dry run reports the same state without touching anything.
 $ledgerOut = @()
@@ -1050,6 +1165,21 @@ if ($Json) {
             skipped         = $skipped
             branchesDeleted = $branchesDeleted
             branchesKept    = $branchesKept
+            # Coordination claims cleared because their holder was removed (BACKLOG #345).
+            # `claimsUnreleased` is reported beside it rather than folded in: a claim we could not clear
+            # is still an orphan, and a single "claimsHandled" number would let a partial sweep read as a
+            # complete one -- the same over-claiming the branch counters above were fixed for.
+            claimsReleased   = $claimsReleased
+            claimsUnreleased = $claimsUnreleased
+            claimsUnreadable = $claimsUnreadable.Count
+        }
+        # Listed, not just counted: the operator cannot clear a key whose file we will not name.
+        # `scanned` disambiguates an empty list -- false means the registry was never read, not that it
+        # was read and found clean.
+        claims   = [pscustomobject]@{
+            scanned    = $claimsScanned
+            dir        = $claimsDir
+            unreadable = @($claimsUnreadable.Values)
         }
         exitCode = $exit
     } | ConvertTo-Json -Depth 6 | Write-Output
@@ -1072,6 +1202,26 @@ else {
     $orphanText = if ($orphaned) { " ($orphaned ORPHANED, counted inside failed)" } else { "" }
     Write-Host "Done. removed $removed, failed $failed$orphanText, skipped $skipped of $($decisions.Count) candidate(s)." -ForegroundColor $(if ($exit -eq $EXIT_OK) { 'Green' } else { 'Red' })
     Write-Host "  branches: $branchesDeleted deleted, $branchesKept kept." -ForegroundColor DarkGray
+    # Printed only when there is something to say. A standing "claims: 0 released" on every run trains
+    # the eye to skip the line, which is precisely where the non-zero case needs to be noticed.
+    if ($claimsReleased -gt 0 -or $claimsUnreleased -gt 0) {
+        $claimColour = if ($claimsUnreleased -gt 0) { 'Red' } else { 'DarkGray' }
+        Write-Host "  claims: $claimsReleased released$(if ($claimsUnreleased -gt 0) { ", $claimsUnreleased STILL ORPHANED" })." -ForegroundColor $claimColour
+    }
+}
+
+# Run-level, and OUTSIDE the -Apply summary: an unreadable claim is a property of the registry, not of
+# any removal, so a dry run that finds one must say so too rather than printing a tidy preview over a
+# key nothing can take.
+if ($claimsUnreadable.Count -gt 0) {
+    Write-Host ""
+    Write-Host "$($claimsUnreadable.Count) coordination claim(s) could not be READ, so it is unknown whose they are:" -ForegroundColor Red
+    foreach ($u in $claimsUnreadable.Values) {
+        Write-Host "  $($u.file)  --  $($u.detail)" -ForegroundColor Red
+    }
+    Write-Host "  They were left in place: deleting a claim we cannot attribute could free a key someone" -ForegroundColor Red
+    Write-Host "  is mid-build on. Read them by hand, then clear with claim.ps1 -Release <key> -Force." -ForegroundColor Red
+    Write-Host "  Until then those keys are unclaimable and claim.ps1 -Take will block on them." -ForegroundColor Red
 }
 
 # Orphans from an EARLIER run. Git no longer lists them, so nothing else in this report would.

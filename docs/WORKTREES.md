@@ -161,6 +161,20 @@ directory is broken on disk right now. `3` outranks `2` because damage on disk o
 act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
 spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
 
+**A removal releases the work claims the worktree held.** A claim ([`claim.ps1`](../scripts/coord/claim.ps1))
+lives under `<git-common-dir>/mefor-coord/claims/`, beside the *shared* object store, so it outlives the
+worktree that took it — and `-Take` blocks on any claim file that exists. A prune therefore used to leave
+the key unclaimable by every future session until someone ran `-Release <key> -Force` by hand. Released
+only from the branch that has already proven the directory gone *and* deregistered, so it is evidence
+rather than a timer: a claim whose holder is merely **quiet** is never touched, and a dry run releases
+nothing. The match is full normalised path equality — releasing a *living* worktree's claim would hand
+its key away and cause the duplicate build the registry exists to prevent, which is worse than the orphan
+being cleaned up. Reported as `counts.claimsReleased` and, when one could not be cleared,
+`counts.claimsUnreleased` (the key stays blocked, and the run goes red). An unreadable claim file belongs
+to no worktree — not being able to read it is precisely not knowing whose it is — so it is surveyed once
+per run under `claims.unreadable` and left in place. `claims.scanned` is `false` when there is no claims
+directory to read: an empty `unreadable` list is not a green light. (BACKLOG #345.)
+
 **A branch is never force-deleted on a stale verdict.** `git branch -d` refuses a branch merged only
 into `origin/main` whenever the local `main` lags — which it usually does — so `-D` used to be the
 routine path and git's last protection was overridden every time. Now `-d` is tried first, and `-D`
