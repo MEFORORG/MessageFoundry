@@ -286,7 +286,7 @@ prose still has exactly one banner and still counts as one item. Nothing anywher
 `git merge origin/main` raises the seam once, against the final text. Verify by grepping for strings
 only your latest revision contains — **a structural check tells you the block is complete, not that it
 is the version you meant**, and those are different properties. *Measured 2026-08-02 on `docs/BACKLOG.md`
-EOF appends, independently by two sessions.*
+EOF appends.*
 
 `gh pr update-branch` cannot rescue that class either: it performs the merge server-side, so a
 conflicting merge simply fails and the PR stays `DIRTY`. A local merge, hand resolution and push is
