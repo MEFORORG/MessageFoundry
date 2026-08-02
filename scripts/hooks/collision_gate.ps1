@@ -74,9 +74,34 @@ if (-not $rows -or $rows.Count -eq 0) { exit 0 }
 $live = @($rows | Where-Object { $_.Live })
 if ($live.Count -eq 0) { exit 0 }   # dormant only: worth knowing, not worth blocking
 
+# DENY ONLY ON AN UNCOMMITTED EDIT IN A LIVE WORKTREE. `Files` is the union of what a branch COMMITTED
+# and what is dirty in its tree, so a session that committed a file, went clean and finished still
+# appears here -- and a committed file stays until the branch LANDS. Reported 2026-08-01 with a repro:
+# a session committed a file, confirmed in writing it was done, and the peer it handed off to was still
+# refused. While PRs cannot merge, "until it lands" is indefinite, so the blocked set only ever grows.
+# That is this gate's own stated failure mode -- "a gate that cries wolf gets uninstalled".
+#
+# MatchedDirty is the narrower predicate and it is exactly the question being asked: is someone editing
+# this file NOW. A row lacking the property (a stale overlap cache written before this change) is
+# treated as dirty, so the gate degrades to its previous over-blocking behaviour rather than silently
+# permitting a real collision -- over-block is safe, under-block is a silent collision.
+$editing = @($live | Where-Object { $null -eq $_.PSObject.Properties['MatchedDirty'] -or $_.MatchedDirty })
+if ($editing.Count -eq 0) {
+    # Committed-and-clean in every live worktree: report it, do not block. The peer may well have
+    # already done what you are about to do, which is worth knowing and not worth refusing over.
+    $names = (@($live | ForEach-Object { "$($_.Short) [$($_.Branch)]" }) -join ', ')
+    [Console]::Out.Write((@{
+                hookSpecificOutput = @{
+                    hookEventName     = "PreToolUse"
+                    additionalContext = "[collision] $(Split-Path $target -Leaf) was already CHANGED AND COMMITTED on another live session's branch ($names), whose tree is now clean. Not blocking -- but that work may overlap yours, so check its commits before you duplicate or revert it."
+                }
+            } | ConvertTo-Json -Compress -Depth 6))
+    exit 0
+}
+
 $leaf = Split-Path $target -Leaf
-$lines = @("$leaf is already being changed by another LIVE session -- editing it now means one of you loses work at merge.", "")
-foreach ($r in $live) {
+$lines = @("$leaf has UNCOMMITTED changes in another LIVE session's worktree -- editing it now means one of you loses work at merge.", "")
+foreach ($r in $editing) {
     $lines += "  $($r.Short) ($($r.Surface)) in $($r.Worktree) [$($r.Branch)]"
     foreach ($w in @($r.Work | Select-Object -First 2)) { $lines += "      building: $w" }
 }

@@ -101,9 +101,14 @@ cluster coordinates the parts that must not double-run or interleave:
   accepting new inbound work and initiating new processing. (The hard guarantee against *concurrent
   double-processing of a given row* is the **self-fencing leadership lease** + the leader-gated graph:
   the graph runs only on the leader, and a partitioned/slow old leader self-fences and lets its
-  leadership lease **expire** before a standby can acquire leadership — so by the time a promoted node
-  acts, the old leader has provably stopped. The store's **row leases** are the additional backstop for
-  the *recurring background* reclaim sweep, which only takes rows whose lease has **expired**.) Clients
+  leadership lease **expire** before a standby can acquire leadership. Read that as *the old leader has
+  stopped calling itself leader*, **not** as *the old leader has stopped* — fencing flips an in-memory
+  flag; the listeners and any in-flight sends wind down on their own schedule, which nothing budgets
+  against the fence-to-expiry margin. A promoted node can therefore briefly overlap a predecessor that
+  is still finishing a send. That is bounded to duplicate delivery, which at-least-once permits and
+  idempotent outbounds absorb — it is not a route to losing or stranding a message. The store's **row
+  leases** are the additional backstop for the *recurring background* reclaim sweep, which only takes
+  rows whose lease has **expired**.) Clients
   reconnect to whichever node is currently primary via a **floating VIP / load-balancer health check**
   (see the deployment doc). On promotion the new leader recovers the prior leader's stranded in-flight
   rows immediately — an *owner-scoped, lease-blind* on-promotion recovery (it re-pends only rows owned by
@@ -115,9 +120,13 @@ cluster coordinates the parts that must not double-run or interleave:
   **leader**. The leader renews the lease every `heartbeat_seconds` (to `DB_now + leader_lease_ttl_seconds`,
   measured on the database's own clock, so node clock skew doesn't affect who may hold it); a standby
   acquires only once that lease has **expired**. A leader that cannot renew within
-  `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops acting as leader before the lease
-  can expire and a standby acquire it, so a network-partitioned old leader never double-processes
-  (the split-brain guard). On a clean stop the leader expires its lease so a standby takes over at once.
+  `leader_fence_timeout_seconds` (< the TTL) **self-fences** — it stops *reporting itself* leader before
+  the lease can expire and a standby acquire it (the split-brain guard). Two caveats if you tune these
+  down from the shipped `10 / 20 / 30`: the usable margin is smaller than `ttl - fence`, because the
+  fence baseline is taken after the renew round trip returns while the expiry is stamped on the database
+  clock at statement execution, and detection lands up to one fence tick late; and the config validator
+  checks the *ordering* `heartbeat < fence < ttl` only, never that any margin survives. On a clean stop
+  the leader expires its lease so a standby takes over at once.
 - **Store-checked leader epoch (fencing token).** The self-fence above is *temporal* — it relies on a
   paused/partitioned old leader noticing it has fallen behind and demoting itself before the lease TTL
   elapses. As a **second, durable** backstop the `leader_lease` row also carries a monotonic
@@ -131,7 +140,10 @@ cluster coordinates the parts that must not double-run or interleave:
   nothing. The current leader's held epoch equals the lease epoch, so it claims normally; per-lane FIFO is
   unaffected (the guard only ever *rejects* a stale claim, never reorders a valid one). This is a
   **server-DB-only** safeguard (Postgres / SQL Server); SQLite is a single active node, so its
-  `set_leader_epoch` is a no-op and the claim is byte-identical. The migration that adds the column is
+  `set_leader_epoch` is a no-op and the claim is byte-identical. **Scope:** the guard is attached to the
+  claim and to nothing else — it stops a superseded ex-leader *claiming*, not *writing*. Disposition
+  writes (done / failed / dead-letter) resolve their row by id with no epoch check, so an ex-leader that
+  is still finishing a send can still record that row's outcome. The migration that adds the column is
   additive (`ADD COLUMN IF NOT EXISTS` / a guarded `ALTER`, run under the DDL lock), so an in-place
   upgrade of a live cluster is safe; the column back-fills to `0` and the first fresh acquire after the
   upgrade bumps it to `1`.
@@ -182,9 +194,17 @@ false`, `is_leader: true`, `role: "single-node"`, `config_version: 0`:
 
 ### `GET /cluster/nodes` — all nodes + the derived leader
 
-`leader_node_id` is the single **live** leader; a crashed ex-leader whose row still carries the leader
-flag is filtered out by a freshness check (`last_seen` within `node_timeout_seconds`), so it is never
-reported as the leader.
+`leader_node_id` is the derived leader: among rows still carrying the leader flag, the freshest one
+whose `last_seen` falls within `node_timeout_seconds`. At most one node is ever reported.
+
+**It is not authoritative, and it is clock-sensitive — use `lease_owner` instead when it matters.**
+The freshness test compares the *reading* node's wall clock against a `last_seen` written by the
+*beating* node's wall clock, with an upper bound only. A row stamped by a node whose clock runs ahead
+has a negative age, passes the test, and — being the largest `last_seen` — wins the pick. So a
+crashed ex-leader whose clock ran fast can be reported here as leader while `lease_owner` on the same
+response correctly names the live successor. The lease governs who processes; this field does not.
+Note also that the web console's "cluster has no leader" health check keys off this field being
+absent, so a skew-frozen row can keep it populated and mask a genuinely leaderless cluster.
 
 Two-node cluster:
 
@@ -230,8 +250,9 @@ history, so `started_at`/`last_seen` are `null`; permanently leader, so `lease_e
 A cleanly stopped node leaves a `status: "left"` tombstone (and its leader flag cleared); a crashed
 node's row goes stale (its `last_seen` stops advancing) and the freshness filter stops counting it as
 the leader. `leader_node_id` is always **at most one** node — during a failover window (an old leader's
-flag not yet cleared while the new leader's flag is already set) the freshest still-beating node wins,
-so the array never shows two leaders and never names a dead node.
+flag not yet cleared while the new leader's flag is already set) the freshest still-beating node wins.
+That the winner is the *live* node holds only while node clocks agree; a fast-clocked crashed node can
+win the pick (see `GET /cluster/nodes` above). Never two leaders; not necessarily the right one.
 
 `/cluster/status` is the **per-node authoritative** leadership signal (it reads that node's own
 in-memory lock gate); `/cluster/nodes` derives leadership from the heartbeat flag and so can lag it by
@@ -297,7 +318,10 @@ benchmark, don't assume zero-downtime:
   standby acquires on its next heartbeat — failover is prompt (≈ one `heartbeat_seconds`).
 - **Crash / partition**: the primary's lease **ages out**, so a standby acquires after up to
   `leader_lease_ttl_seconds`. A partitioned old primary **self-fences** within
-  `leader_fence_timeout_seconds` (< the TTL), so it stops processing before the standby takes over.
+  `leader_fence_timeout_seconds` (< the TTL), so it stops *reporting itself* leader before the standby
+  takes over. It does not necessarily stop *working* by then: fencing sets a flag, and tearing the graph
+  down (each inbound stopped in turn, each with its own shutdown grace) is not budgeted against the
+  remaining margin. Expect a brief overlap in which the old primary finishes sends already in flight.
 - During the window, in-flight rows are protected by the **row leases** (a standby reclaims only
   *expired* leases); the new primary runs an owner-scoped recovery **once on promotion** to recover the
   dead primary's in-flight rows promptly (and the ordinary FIFO claim reclaims a stranded lane head, so
@@ -309,13 +333,29 @@ benchmark, don't assume zero-downtime:
 The defaults (`heartbeat_seconds=10`, `leader_fence_timeout_seconds=20`, `leader_lease_ttl_seconds=30`)
 trade a ~30 s crash-failover for ample margin. Lower all three proportionally (keeping
 `heartbeat < fence < ttl`) for faster failover at the cost of less tolerance for a slow DB / GC pause.
+
+**The validator enforces the ordering, not a margin.** `heartbeat < fence < ttl` is checked at config
+load; nothing checks that any usable time survives between the fence firing and the lease expiring. The
+real margin is `ttl - fence` *minus* the renew round trip (the fence baseline is taken after the renew
+returns, while the expiry is stamped on the database clock at statement execution) *minus* up to one
+fence tick of detection lag — and graph teardown then has to fit in what remains. Tightening these
+proportionally keeps the ordering legal while shrinking that budget toward zero, and the failure mode
+is a longer overlap between an old and a new primary, not a config error. Keep headroom on a
+synchronous-commit or cross-AZ database.
+
 Because the **leadership** lease is evaluated on the **database's** clock, node clock skew does not
-affect who may hold leadership; the **row** leases, however, use node wall-clock — see below.
+affect who may hold leadership. At least two other things *are* node-wall-clock and therefore skew-
+sensitive: the **row** leases (see below) and the `nodes.last_seen` heartbeat behind the derived
+`leader_node_id`. Do not read that pairing as exhaustive.
 
 ## Operational assumptions (honor these)
 
-1. **Clock sync (NTP).** Row leases are wall-clock — keep node clocks reasonably synced so a
-   lease expiry isn't mistimed across nodes.
+1. **Clock sync (NTP).** Keep node clocks synced to well within `[store].lease_ttl_seconds`. Row leases
+   are wall-clock, so skew mistimes a lease expiry across nodes. Skew also corrupts the derived
+   `leader_node_id` on `GET /cluster/nodes`, where a fast-clocked node wins the freshness pick even
+   after it dies — and that field is what the console's "cluster has no leader" check keys off, so
+   unchecked skew can mask a leaderless cluster. Leadership itself is unaffected (it is evaluated on the
+   database clock); this is an operability assumption, not a correctness one.
 2. **Identical config on every node.** Each node loads the graph (Connections / Routers / Handlers) from
    its **own** config dir; convergence coordinates the reload *version*, not the files. Deploy the same
    config dir to all nodes.

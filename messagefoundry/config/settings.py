@@ -508,12 +508,19 @@ class StoreSettings(_Section):
     )
     application_name: str = "messagefoundry"
     # Inflight-row lease TTL (seconds) for the multi-node server-DB backends (Track B Step 2). When a
-    # worker claims a row it stamps owner + a lease_expires_at = now + this; a renew timer extends it
-    # while processing, and a leader sweep reclaims only rows whose lease has expired (so a crashed
-    # node's work is recovered without stealing a live sibling's in-flight rows). A shared server-DB
-    # field — harmless to SQL Server / SQLite, which don't lease and ignore it. The lease is wall-clock
-    # across nodes, so the no-theft guarantee assumes clocks are NTP-synced to well within this TTL;
-    # set it comfortably larger than expected clock skew + the renew interval.
+    # worker claims a row it stamps owner + a lease_expires_at = now + this, and a leader sweep reclaims
+    # only rows whose lease has expired (so a crashed node's work is recovered without stealing a live
+    # sibling's in-flight rows). A shared server-DB field — harmless to SQL Server / SQLite, which don't
+    # lease and ignore it. The lease is wall-clock across nodes, so the no-theft guarantee assumes clocks
+    # are NTP-synced to well within this TTL.
+    #
+    # THE ROW LEASE IS STAMPED ONCE AT CLAIM AND IS NEVER RENEWED — there is no renew timer anywhere in
+    # the store (earlier text here and in the sweep's own docstrings claimed one; it did not exist).
+    # So size this against the longest a single row can legitimately stay claimed, not against a renew
+    # interval: it must comfortably exceed the connector's timeout_seconds + any pacing + batch-gather,
+    # plus expected clock skew. Set it too low and the leader's own sweep re-pends rows it is still
+    # processing — the sweep is owner-blind, so "a crashed node's rows" includes this node's own.
+
     lease_ttl_seconds: float = 60.0
 
     # --- Store connection-pool pre-warm (server-DB backends only; no-op on SQLite) ----------
@@ -2896,9 +2903,17 @@ class ClusterSettings(_Section):
     # (clock_timestamp()), so inter-node clock skew is irrelevant to leadership correctness. Must be > 0.
     leader_lease_ttl_seconds: float = 30.0
     # The SELF-FENCE timeout: a leader that has not renewed its lease within this many seconds (its own
-    # monotonic clock, with NO DB I/O so a hung/partitioned DB can't block it) halts its leader work.
-    # MUST be < leader_lease_ttl_seconds so the old leader stops BEFORE the lease can expire and a standby
-    # acquire — the split-brain guard. MUST be > heartbeat_seconds so a single missed renew doesn't fence.
+    # monotonic clock, with NO DB I/O so a hung/partitioned DB can't block it) stops reporting itself
+    # leader. MUST be < leader_lease_ttl_seconds so it does so BEFORE the lease can expire and a standby
+    # acquire. MUST be > heartbeat_seconds so a single missed renew doesn't fence. _fence_ordering below
+    # enforces exactly that ordering — and ONLY the ordering.
+    #
+    # What the ordering does NOT establish, for anyone sizing these down from the defaults: the usable
+    # margin is smaller than (ttl - fence), because the fence baseline is stamped after the renew round
+    # trip returns while the lease expiry is stamped on the DB clock at statement execution, and
+    # detection lands up to one fence tick late. Nor does fencing stop the graph — it flips a boolean;
+    # the listeners and in-flight sends wind down on their own schedule, which nothing budgets against
+    # the remainder. The shipped 10/20/30 leave real slack; tightened values consume it silently.
     leader_fence_timeout_seconds: float = 20.0
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
