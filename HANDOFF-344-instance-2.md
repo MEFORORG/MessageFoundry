@@ -81,13 +81,43 @@ cannot separate them. That is a limit of the instrument, not doubt about the mec
 observations at ~0.4% expect ~0.5 events and exonerate nothing. Only **SQLite's** 0/1,105 is
 structural. Read the symptom as *server-backed store*, not "SQL Server only".
 
+### A THIRD source of the 1222 — and it refines the wording above (BACKLOG #348 / ADR 0159)
+
+Added 2026-08-02 from the #348 session, which reached the same 1222 from the opposite end. **Their
+measurement, my verification of the mechanism in our source:**
+
+`CancelledError` derives from `BaseException`, so the store's `except Exception: await
+conn.rollback()` idiom **never runs its rollback on a cancellation** — and `aioodbc`'s
+`Pool.release()` returns the connection to the free deque with no rollback or reset. Verified here:
+`store/sqlserver.py` has **90** rollback sites guarded by `except Exception` and **zero** using
+`except BaseException` or a `finally`. They measured the consequence on a live container —
+cancelling `release_claimed` left 7 KEY X locks on `queue` (`reschedule_claimed` 7, `mark_done` 9,
+`enqueue_ingress` 11), against 0 for a `claim_fifo_heads` control — after which a real
+`claim_fifo_heads` returned EMPTY-all and a raw writer got 1222.
+
+**Why this matters to the text above:** §1 and the commit message for the fix reason from
+*momentary* contention — a live producer holding a head lock in flight. A connection poisoned this
+way holds its locks **for as long as it sits unclaimed in the pool's free deque**, so the 1222 can
+repeat across successive sweep ticks instead of clearing on the next one. The chain into T12 and the
+terminal IDLE is identical; only the *duration and origin* of the contention differ.
+
+**It does not change this branch's conclusion** — production still recovers via the sweep, so
+"test-rig gap, not an engine defect" stands, and that session explicitly declined to escalate its
+severity on the strength of this finding. But: **if you ever see a 1222 that cannot be attributed to
+a live producer, look here first.** Cross-referenced by ledger number (#348 / ADR 0159), not by SHA,
+because that work is also unpushed.
+
 ---
 
 ## 2. What was changed (4 commits)
 
+> **If you cite one SHA, cite `58f8f134` — that is THE FIX.** `66443098` and the HEAD commit are a
+> banner edit and this note; they touch **no code**. This was already mis-relayed once between
+> sessions (HEAD was circulated as "the fix"), so name the commit, not the tip.
+
 | SHA | What |
 |---|---|
-| `58f8f134` | The fix + ledger: `_wait_until` raises on expiry with a full diagnostic; `_wait_lane` sweep stand-in; #344 instance 2 → RESOLVED |
+| `58f8f134` | **THE FIX** + ledger: `_wait_until` raises on expiry with a full diagnostic; `_wait_lane` sweep stand-in; #344 instance 2 → RESOLVED |
 | `e42f0ae3` | Three corrections from adversarial review (see below) |
 | `7e430e82` | Merge `origin/main` (`dc0da097`, #148's #345/#346) — verified by **content**, both directions |
 | `66443098` | Banner rewritten to land with its body; no instance count |
