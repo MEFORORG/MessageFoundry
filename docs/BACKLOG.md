@@ -8426,36 +8426,50 @@ Two worked instances the same day. **#74** went green on 2026-07-30 and sat unme
 
 ---
 
-## 347. PHI-at-rest tests assert short-substring absence against base64 ciphertext (probabilistic, flakes)
+## 347. A PHI-at-rest assertion that can pass for the wrong reason — short substring vs. random ciphertext
 
-> 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_store_encryption.py:95` asserts `raw.startswith(MARKER_PREFIX) and "DOE" not in raw` against a value encrypted under `make_cipher(generate_key())` — **a fresh random key every run**, so the base64 body is fresh random text every run and the substring clause is a **probabilistic** assertion, not a deterministic one. Base64's alphabet contains `D`, `O` and `E`, so the literal `DOE` occurs by chance. **It fired:** PR #142, CI job `91502517146`, leg `test (windows-2022, py3.14)` — `AssertionError: assert (True and 'DOE' not in 'mfenc:v1:7f...oHUc/t9nnmT9')`. The encryption worked perfectly; the test was wrong.
+> 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_store_encryption.py:95` asserts `raw.startswith(MARKER_PREFIX) and "DOE" not in raw` — three characters of a 76-character body — as the proof that a patient surname is unreadable at rest. **The instrument is wrong in both directions.** It **fails when encryption worked perfectly** (the value is encrypted under `make_cipher(generate_key())`, a fresh random key every run, so the base64 body is fresh random text and base64's alphabet contains `D`, `O` and `E`), and — the half that matters — it would **PASS on a weak encoding that merely happened to avoid those three characters**. A test that can pass for the wrong reason is a false assurance about PHI; one that occasionally fails for the wrong reason is only noise. **The flake is what made someone look; it is not what is wrong.**
 
-**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build (small). **Severity:** medium (a PHI-at-rest gate that can pass for the wrong reason), medium (likelihood: measured below, and it has already fired once).
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build (small). **Severity:** medium (a PHI-at-rest gate that certifies a property it cannot see), medium (likelihood: measured below, and it has already fired).
 
-**The rate, and its caveat.** For a uniform base64 string of length *L*, a given 3-character pattern is expected `(L-2)/64³` times; at the observed ciphertext length (~146 chars for the `ADT` fixture: 12-byte nonce + 76-byte body + 16-byte tag, base64'd) that is **p ≈ 5.5e-4 — about 1 failure in 1,800 runs of this one test, per leg**. Simulation at 200k trials agrees. **The caveat, stated because the number will otherwise be over-trusted:** the simulation used pure base64 over the whole string, while the real value carries a `mfenc:v1:<hex-fingerprint>:` prefix region where `DOE` cannot occur — so the true rate is somewhat *lower*, same order of magnitude. Across three OS legs at this repo's run volume that surfaces every few hundred CI runs as an unreproducible red on an unrelated PR.
+**How it surfaced.** PR #142, CI job `91502517146`, leg `test (windows-2022, py3.14)`: `AssertionError: assert (True and 'DOE' not in 'mfenc:v1:7f...oHUc/t9nnmT9')`.
 
-**Why it matters beyond the flake — the gate lies in both directions.** The intent ("the patient surname is not readable in the stored body") is exactly right and must be preserved. But a short-substring check against base64 is the wrong instrument for it: it **fails when encryption worked**, and — worse — it would **pass on a weak encoding** that merely happened not to contain those three characters. Three characters of a 76-character body is not evidence the body is unreadable. This is the failure mode this repo already tracks: a green gate is evidence only if it can actually see the class it claims to cover.
+**The rate — the per-CI-run figure, not the per-assertion one.** For a uniform base64 string of length *L*, a given *k*-character pattern is expected `(L-k+1)/64^k` times. At the observed ciphertext (~146 chars for the `ADT` fixture: 12-byte nonce + 76-byte body + 16-byte tag, base64'd) a 3-char literal gives **p ≈ 5.5e-4 per assertion per run** — corroborated by a 200k-trial simulation, and independently reproduced by a second session at N=144 windows. But **there are two such assertions** (`:95` and `:303`, both `DOE`) and this repo runs **three OS legs** (`ubuntu` + `windows-2022` + `windows-2025`, one Python version — [`ci.yml`](../.github/workflows/ci.yml)), so what an operator actually experiences is:
 
-**The convention already exists in the same file; the sweep was incomplete.** `test_cipher_round_trip_and_hides_plaintext` (:49–58) was already converted to the deterministic form and carries the rule in a comment — *"NEVER assert short-substring absence ('MSH'/'DOE') — a random base64 body contains any given 3-char run with probability ~len/64³, and that assertion HAS flaked in CI"* — and `test_v2_round_trip_marker_and_decrypt` (:531) cites it. The **call sites were not swept**, so the identical assertion survives at :95 and :303.
+| Scope | Rate |
+| --- | --- |
+| one assertion, one leg | 1 in 1,820 |
+| either assertion, one leg | 1 in 910 |
+| **either assertion, one full CI run (3 legs)** | **1 in 303** |
 
-**Audit of the siblings (asked for at filing; the answer is not "all of them").** Sorted by the measured rate, since the fix priority follows it:
+**Both caveats, because neither number should be handed on bare.** *L* is taken from one measured at-rest value and real strings vary in length; and the `mfenc:v1:<hex-fingerprint>:` prefix region is not base64, so the effective window count is lower and **every figure above is a slight over-estimate**. Same order, not exact. What is not in doubt is the scope correction: 1 in 303 CI runs is an operational cost, where 1 in 1,820 reads as ignorable.
 
-| Site | Literal | Chars | Approx. p per run |
-| --- | --- | --- | --- |
-| `test_store_encryption.py:95` (`test_bodies_encrypted_at_rest`) | `DOE` | 3 | ~5e-4 — **the one that fired** |
-| `test_store_encryption.py:303` (`test_summary_and_metadata_…`) | `DOE` | 3 | ~5e-4 — **same shape, not yet observed** |
-| `test_content_search.py:123` | `JANE` | 4 | ~9e-6 per value, `all()` over several |
-| `test_store_encryption.py:232/233/251`, `:1062`, `test_sqlserver_store.py:1582/1584/1682/1920/2044`, `test_postgres_store.py:2163/2164`, `test_reference_sets.py:170`, `test_transform_state.py:281` | `SECRET…`, `999001`, `WESTWING`, `bad parse`, … | ≥6 | ≤2e-9 — immaterial, but the same *shape* |
+**Confirmed by prediction, not by agreement.** After the failure, PR #142's full re-run came back **25 passed, 0 failed** with `test_bodies_encrypted_at_rest` green. That prediction (P(same collision twice) ≈ 5e-4) was written down *before* the re-run — so a green re-run confirms a chance collision rather than resetting the question. Had it failed twice, the diagnosis would have been falsified and something real would be at fault.
 
-`test_off_by_default_stores_plaintext` (:111) **does not share the shape** — it asserts `_raw_at_rest(db) == ADT`, a deterministic equality against known plaintext, and needs no change. Nor do the many `"DOE" not in …` assertions elsewhere in `tests/` that check *scrubbed plaintext* (`safe_text`, the anonymizer, ACK detail): those run against deterministic output, not random ciphertext, and are correct as written.
+**The convention already exists in the same file; the sweep was incomplete.** `test_cipher_round_trip_and_hides_plaintext` (:49–58) was already converted to the deterministic form and carries the rule in a comment — *"NEVER assert short-substring absence ('MSH'/'DOE') … that assertion HAS flaked in CI"* — and `test_v2_round_trip_marker_and_decrypt` (:531) cites it. The **call sites were never swept**, so the identical assertion survives at :95 and :303.
+
+**The rule, so the next call site has a boundary rather than a precedent:** *a substring assertion against ciphertext is safe iff the token is **≥ 6 characters**, and unsafe below that.* The exponent is the token length, so risk collapses onto the short literals — at 6 chars p ≈ 2e-9 (1 in 477 million), at 8 chars ≈ 5e-13, at 14 chars below any rate that can occur.
+
+**Audit of the siblings — the answer is neither "just one" nor "all of them".**
+
+| Site | Literal | Chars | p per run | Verdict |
+| --- | --- | --- | --- | --- |
+| `test_store_encryption.py:95` (`test_bodies_encrypted_at_rest`) | `DOE` | 3 | 5.5e-4 | **fix — the one that fired** |
+| `test_store_encryption.py:303` (`test_summary_and_metadata_…`) | `DOE` | 3 | 5.5e-4 | **fix — same shape, never observed** |
+| `test_content_search.py:123` | `JANE` | 4 | ~9e-6 | **fix — below the ≥6 rule** |
+| `test_store_encryption.py:232/233/251`, `:303` (`999001`), `:304`, `:1062`; `test_sqlserver_store.py:1582/1584/1682/1920/2044`; `test_postgres_store.py:2163/2164`; `test_reference_sets.py:170`; `test_transform_state.py:281` | `SECRET…`, `999001`, `WESTWING`, `bad parse`, … | ≥6 | ≤2e-9 | **leave alone** |
+
+**Do not rewrite the ≥6 group.** They are the same *pattern* but not a defect at any rate that will ever be observed, and churning a dozen correct assertions makes the diff harder to review for no risk reduction. The pattern-propagation concern is real but is answered by **writing the ≥6 rule into the :49–58 comment**, not by the churn. (Two scopes were counted independently and agree: seven assertions of this shape within `test_store_encryption.py`, ~sixteen repo-wide — different denominators, not a disagreement.)
+
+`test_off_by_default_stores_plaintext` (:111) **does not share the shape** — `_raw_at_rest(db) == ADT`, deterministic equality against known plaintext. Nor do the many `"DOE" not in …` assertions elsewhere in `tests/` that check *scrubbed plaintext* (`safe_text`, the anonymizer, ACK detail): deterministic output, not ciphertext, correct as written.
 
 **Fix direction (maintainer's choice — do NOT simply widen or delete the substring check):**
 1. Assert against the **decoded** ciphertext bytes rather than the base64 text, or
 2. assert the plaintext is **not recoverable** from the stored value (the property actually claimed), or
-3. assert full-plaintext absence — `assert ADT not in raw` — which is deterministic because the fixture contains `|` and `\r`, bytes base64 can never emit. That is the idiom :56 already uses, so it is the cheapest sweep.
+3. assert full-plaintext absence — `assert ADT not in raw` — deterministic because the fixture contains `|` and `\r`, bytes base64 can never emit. That is the idiom :56 already uses, so it is the cheapest change.
 
-Whichever is chosen, the `startswith(MARKER_PREFIX)` half stays, and the ≥6-char sites should be swept for **shape** even though their rate is immaterial — leaving them teaches the wrong pattern to the next call site, which is how :95 and :303 got written.
+The `startswith(MARKER_PREFIX)` half stays in every case.
 
-**Related:** [`tests/test_store_encryption.py`](../tests/test_store_encryption.py):95, :303, :49–58 (the convention comment, already correct); [`tests/test_content_search.py`](../tests/test_content_search.py):123; #344 (fixed wall-clock bounds — the sibling "an individually blameless failure that reads as a broken branch" class, and the same misdiagnosis risk this repo has already hit twice); CLAUDE.md §9 (the PHI-at-rest guarantee the assertion is reaching for).
+**Related:** [`tests/test_store_encryption.py`](../tests/test_store_encryption.py):95, :303, :49–58 (the convention comment, already correct — the natural home for the ≥6 rule); [`tests/test_content_search.py`](../tests/test_content_search.py):123; #344 (the sibling "individually blameless CI red that invites the wrong diagnosis" class — but distinct in kind: #344 is a bound that drifted out of proportion to real work, this was never deterministic at any bound); CLAUDE.md §9 (the PHI-at-rest guarantee the assertion is reaching for); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (reviewing security prose by what a reader would DO with it — the same question, asked of a test instead of a paragraph).
 
-**Source:** PR #142 (BACKLOG #323 layer 3, SMTP TLS), 2026-08-02 — the failure was observed on that PR's CI and deliberately **not** fixed there, because it is unrelated to the SMTP change and widening the PR would have obscured it. Rate measured analytically and by simulation at filing; sibling audit performed at filing against the working tree.
+**Source:** PR #142 (BACKLOG #323 layer 3, SMTP TLS), 2026-08-02 — observed on that PR's CI and deliberately **not** fixed there, because it is unrelated to the SMTP change and widening the PR would have obscured it. Diagnosis, rate and sibling audit produced independently by two sessions and reconciled: the ≥6 rule, the leave-the-rest-alone scoping, the per-CI-run rate correction and the instrument-first framing all come from the review by the session that owns #142.
