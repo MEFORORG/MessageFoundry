@@ -485,6 +485,69 @@ class StageDispatcher:
         self._sweep_task.add_done_callback(functools.partial(self._on_task_done, "sweep"))
         await self._run_sweep_once()  # immediate first sweep (arms due lanes / not-due timers)
 
+    async def quiesce(self, budget: float) -> bool:
+        """COOPERATIVE stop (ADR 0157 Inc 5): stop claiming, let every live serializer reach its
+        terminal transition, CANCEL NOTHING. Returns True iff ``_lane_tasks`` ended empty.
+
+        NEVER raises on timeout — the caller's ``self._running = False`` must stay reachable. The caller
+        ALWAYS follows with :meth:`stop`, which is both the state-clearing path and the hard-cancel
+        fallback, so there is exactly one dispatcher teardown to keep correct rather than two.
+
+        **THE ORDERING THAT MATTERS (ADR 0157 D8): the serializer drain is NOT gated on the claimer and
+        sweep loops exiting.** The demotion fence fires precisely BECAUSE renews failed — i.e. the pool
+        is degraded — i.e. the claimer is parked inside ``claim_fifo_heads`` against
+        ``[store].command_timeout`` (30s by default). A design that waited for the loops first would
+        time out before draining a single serializer, on this increment's dominant trigger. So the loops
+        get a SUB-budget and we drain regardless; a claimer that returns mid-drain still spawns its
+        serializer (correct — those rows ARE claimed) and the re-snapshot loop picks it up.
+
+        The contract is "zero rows INFLIGHT", not "loops exited" — ``stop()`` cancels the loops anyway.
+
+        NOT safe to call standalone: ``_stop`` is the RUNNER's shared Event, so quiescing one dispatcher
+        signals every dispatcher and every per_lane worker in the process.
+        """
+        if not self._running:
+            return True
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + max(0.0, budget)
+        self._stop.set()
+        self._sweep_now.set()
+        for claimer in self._claimers:
+            claimer.event.set()
+        loops = [c.task for c in self._claimers if c.task is not None]
+        if self._sweep_task is not None:
+            loops.append(self._sweep_task)
+        live_loops = [task for task in loops if not task.done()]
+        if live_loops:  # sub-budget only; a timeout here is NOT fatal
+            await asyncio.wait(live_loops, timeout=max(0.0, (deadline - loop.time()) * 0.25))
+        watched: set[asyncio.Task[None]] = set()
+        while True:
+            # RE-SNAPSHOT every pass: _run_lane pops itself out of _lane_tasks on the normal path, and a
+            # claimer that was mid-round-trip may have dispatched one final serializer after we looked.
+            live = [task for task in self._lane_tasks.values() if not task.done()]
+            watched.update(live)
+            if not live:
+                self._reap(watched)
+                return True
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                self._reap(watched)
+                return False
+            await asyncio.wait(live, timeout=remaining)  # never cancels, never raises
+
+    @staticmethod
+    def _reap(tasks: set[asyncio.Task[None]]) -> None:
+        """Retrieve every drained serializer's exception.
+
+        ``_on_lane_task_done`` returns early once ``_stop`` is set, and ``stop()``'s
+        ``gather(return_exceptions=True)`` cannot cover a serializer that already popped itself out of
+        ``_lane_tasks`` — so without this a raised serializer logs "exception was never retrieved" at
+        GC, hiding a real failover-time crash behind a garbage-collection message.
+        """
+        for task in tasks:
+            if task.done() and not task.cancelled():
+                task.exception()
+
     async def stop(self) -> None:
         """Tear down: signal stop, wake every claimer + the sweep, cancel all tasks + timers, gather,
         then clear state POST-gather (never mid-run). Idempotent (mirrors ``_teardown_unsafe``). A
