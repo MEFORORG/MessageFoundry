@@ -77,10 +77,22 @@ class Absence:
     absence claims survived for weeks. So an absence claim is only admissible with a
     ``positive_control`` that must still match; if the control goes quiet the search has gone blind and
     the claim is void, regardless of what the pattern returns.
+
+    ``mutation`` closes the hole the control does not: it is the realistic REINTRODUCTION this pattern
+    claims to exclude, and the pattern must actually fire on it. A whole chapter of claims was once
+    authored as prose narrations of shell commands — ``"rg -n 'tar.extractall' -> exit 1 (zero hits)"``
+    where the field wanted ``tar\\.extractall\\(``. The field's type is ``str`` and prose is a valid
+    ``str``, so the shape permitted it and only a detector caught it. Requiring the pattern to match a
+    stated reintroduction makes prose *unwritable* rather than merely detectable.
+
+    Do NOT derive ``mutation`` from ``pattern``. A value generated from the thing it validates
+    satisfies the check by construction, which would make this the most authoritative-looking vacuous
+    gate in the file — the same defect class it exists to close, arriving through the fix.
     """
 
     pattern: str
     positive_control: str
+    mutation: str
 
 
 @dataclass(frozen=True)
@@ -171,6 +183,15 @@ def load_scorecard(path: Path) -> list[Cell]:
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
                 "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
             )
+        for a in raw.get("absence", []):
+            if not str(a.get("mutation", "")).strip():
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: absence claim {a.get('pattern')!r} has no `mutation` — "
+                    "state the realistic reintroduction this pattern excludes (e.g. "
+                    '`mutation = "tar.extractall(dest)"`) so the pattern can be proved capable of '
+                    "firing. Author it from what the code would look like if the thing came back; "
+                    "do NOT derive it from the pattern, which makes the check vacuous"
+                )
         cells.append(
             Cell(
                 id=str(raw["id"]),
@@ -186,7 +207,13 @@ def load_scorecard(path: Path) -> list[Cell]:
                     for e in raw.get("evidence", [])
                 ),
                 absence=tuple(
-                    Absence(pattern=str(a["pattern"]), positive_control=str(a["positive_control"]))
+                    Absence(
+                        pattern=str(a["pattern"]),
+                        positive_control=str(a["positive_control"]),
+                        # No default. A missing mutation must be authored, not inferred — see the
+                        # Absence docstring on why deriving one from the pattern is worse than none.
+                        mutation=str(a["mutation"]),
+                    )
                     for a in raw.get("absence", [])
                 ),
             )
@@ -265,6 +292,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
+            # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
+            # narration greps to nothing and is indistinguishable from a true absence.
+            if not re.search(a.pattern, a.mutation):
+                findings.problems.append(
+                    f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
+                    f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
+                )
+                continue
             control = _grep_count(a.positive_control, corpus_files)
             if control == 0:
                 findings.problems.append(

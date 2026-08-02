@@ -165,7 +165,10 @@ def test_absence_holds_when_pattern_is_quiet_and_control_speaks(tmp_path: Path) 
     )
     cells = [
         Cell(
-            id="1.1.1", level=1, verdict="fail", absence=(Absence("clamav|clamd", "ScanRejected"),)
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamav|clamd", "ScanRejected", "import clamd"),),
         )
     ]
     f = Findings()
@@ -180,7 +183,12 @@ def test_absence_is_rejected_as_BLIND_when_the_positive_control_matches_nothing(
     (tmp_path / "messagefoundry").mkdir()
     (tmp_path / "messagefoundry" / "m.py").write_text("unrelated\n", encoding="utf-8")
     cells = [
-        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence("clamav", "ScanRejected"),))
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamav", "ScanRejected", "import clamav"),),
+        )
     ]
     f = Findings()
     check_absences(cells, tmp_path, f)
@@ -193,10 +201,69 @@ def test_absence_is_rejected_as_FALSE_when_the_thing_now_exists(tmp_path: Path) 
     (tmp_path / "messagefoundry" / "m.py").write_text(
         "import clamd\nclass ScanRejected: pass\n", encoding="utf-8"
     )
-    cells = [Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence("clamd", "ScanRejected"),))]
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamd", "ScanRejected", "import clamd"),),
+        )
+    ]
     f = Findings()
     check_absences(cells, tmp_path, f)
     assert not f.ok and "FALSE" in f.problems[0]
+
+
+def test_absence_is_rejected_as_INERT_when_the_pattern_is_prose_not_a_pattern(
+    tmp_path: Path,
+) -> None:
+    """The real defect: an entire chapter was authored as narrations of shell commands.
+
+    The field's type is ``str`` and prose is a valid ``str``, so the shape permitted it. Prose greps
+    to nothing, which is indistinguishable from a true absence -- nine claims would have shipped
+    proving nothing. Requiring the pattern to fire on a stated reintroduction makes prose unwritable.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "class ScanRejected: pass\n", encoding="utf-8"
+    )
+    prose = "rg -n 'tar.extractall' messagefoundry/ -> exit 1 (zero hits)"
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence(prose, "ScanRejected", "tar.extractall(dest)"),),
+        )
+    ]
+    f = Findings()
+    check_absences(cells, tmp_path, f)
+    assert not f.ok and "INERT" in f.problems[0]
+
+
+def test_absence_INERT_is_decided_before_the_corpus_is_consulted(tmp_path: Path) -> None:
+    """A live positive control must not launder a pattern that cannot fire.
+
+    BLIND and INERT are different failures: BLIND means the search could not have seen the thing,
+    INERT means the pattern could not have matched it. A prose claim whose control happens to speak
+    would otherwise pass every existing check while measuring nothing.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "class ScanRejected: pass\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("zero hits for pyclamd", "ScanRejected", "import pyclamd"),),
+        )
+    ]
+    f = Findings()
+    check_absences(cells, tmp_path, f)
+    assert not f.ok and "INERT" in f.problems[0]
+    assert not any("BLIND" in p for p in f.problems)
 
 
 # --- fail closed, never skip ----------------------------------------------------------------------
@@ -356,3 +423,15 @@ def test_pinning_accepts_a_full_anchor_sha(tmp_path: Path) -> None:
         f'corpus_sha256 = "{corpus_digest(corpus)}"\n',
     )
     assert check_pinning(sc, corpus) == []
+
+
+def test_load_refuses_an_absence_claim_with_no_mutation(tmp_path: Path) -> None:
+    """Authored, never inferred: a mutation derived from its pattern would pass by construction."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\n'
+        '  [[cell.absence]]\n  pattern = "clamd"\n'
+        '  positive_control = "ScanRejected"\n',
+    )
+    with pytest.raises(ScorecardError, match="has no `mutation`"):
+        load_scorecard(sc)
