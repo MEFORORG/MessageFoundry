@@ -329,6 +329,23 @@ and `prune-merged.ps1` are sibling-only, so the nested population — where ever
 — has creation but no scripted teardown, and `prune-merged.ps1` run from a worktree prints a green
 "No sibling worktrees to consider" and exits 0. A wrong-cwd run reports a clean bill of health.
 
+> **Half fixed, 2026-07-30.** `prune-merged.ps1` now **refuses** from anywhere but the primary (exit 2,
+> naming both paths) instead of reporting a green no-op, and it refuses to remove any sibling that
+> *contains* a nested worktree — a nested checkout is gitignored inside its parent, so the parent reads
+> perfectly clean and `--force` used to delete both, leaving the nested one registered with no
+> directory. A session in a nested tree now vetoes its ancestor too. Still true: the candidate set is
+> sibling-only, so the nested population has no scripted teardown.
+>
+> **Correction, same day.** "The candidate set is sibling-only" was *stated* but not *true*. The set was
+> a bare `<primary>-` **prefix match**, and `<primary>-pins/.claude/worktrees/x` starts with
+> `<primary>-` — so a Claude-managed nested worktree under a **sibling** was a candidate in its own
+> right and was removed, with its branch, while the containment veto above protected only its parent.
+> Nested trees under the **primary** were excluded by the accident that `<primary>/` is not
+> `<primary>-`, which is the only case anyone had tested. Fixed: anything nested inside another
+> registered worktree, or carrying a `.claude/worktrees/` path segment, is excluded from the candidate
+> set and unreachable by `-Name`. The teardown gap itself is unchanged — nested worktrees still have no
+> scripted removal, they are now merely safe from this script.
+
 ### G12 — The gate has never produced a receipt — **FIXED**
 
 `Write-Deny` writes JSON to stdout and exits 0. There is no log, no counter, no audit file. Nothing can
@@ -471,7 +488,7 @@ analysis must be redone.
 | B7 | **Half done** | Rule 4 is opt-in, not retired — preserving the owner's decision while removing the trap where re-installing would activate it. |
 | B10 | **Done** | One allowlist, shared by the gate and the backstop, with the legacy path kept as a fallback so a version-skewed installed copy cannot silently disarm the backstop. `install-selfheal.ps1` gained the `CLAUDECODE` refusal its sibling always had — the *higher*-privilege installer was the unprotected one. |
 | B6 | **Started** | `.worktreeinclude` added, so the leak gate's gitignored token list reaches every worktree Claude Code creates itself (`--worktree`, desktop sessions, `isolation: worktree` subagents) — previously only `new.ps1`'s own worktrees got it, and a fresh first-party worktree could not commit at all. **Not** done: worktree-first as the documented default entry point, and `new.ps1` calling `git worktree lock` while a session is live. |
-| B11 | **Started** | Rule 3d closes the worst of G9: `git worktree remove` / `move` on another session's checkout. **Not** done: the rest of the absent verbs (`rm`, `mv`, `sparse-checkout`, `checkout-index`, `bisect`, `branch -f`, `update-ref`, `read-tree`), `gh pr checkout`, and G11's teardown half — `prune-merged.ps1` is still sibling-only and still prints a green "nothing to consider" when run from the wrong cwd. |
+| B11 | **Started** | Rule 3d closes the worst of G9: `git worktree remove` / `move` on another session's checkout. **Not** done: the rest of the absent verbs (`rm`, `mv`, `sparse-checkout`, `checkout-index`, `bisect`, `branch -f`, `update-ref`, `read-tree`), `gh pr checkout`, and G11's teardown half — `prune-merged.ps1` is still sibling-only. Its wrong-cwd green no-op is **fixed** (2026-07-30): it refuses with exit 2 and names both paths, and it will not `--force`-remove a sibling containing a nested worktree. |
 
 Remaining order: the rest of B6, the rest of B11, then the B1/B3/B4 remainders.
 

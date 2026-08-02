@@ -55,6 +55,127 @@ scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracke
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
 
+## Prune the finished ones — `prune-merged.ps1`
+
+Worktrees pile up. [`prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) sweeps the finished
+`<repo>-<name>` siblings. Run it from the **primary** (it refuses loudly anywhere else):
+
+```powershell
+scripts\worktree\prune-merged.ps1                   # dry run: the decision table, no action
+scripts\worktree\prune-merged.ps1 -Apply            # remove the ones that pass every check
+scripts\worktree\prune-merged.ps1 -Apply -Name pins # also confirm that one past the activity veto
+scripts\worktree\prune-merged.ps1 -Json             # machine-readable decisions + the fence receipt
+```
+
+### The rule is `merged AND clean AND NOT occupied`
+
+**Clean + merged does not mean unoccupied.** A brand-new worktree has zero commits, so it is an
+ancestor of `origin/main` and perfectly clean from the second it is created — and a session can be
+sitting in it with nothing uncommitted. That is exactly the state that got destroyed once: `git
+worktree remove --force` deleted the `.git` pointer and deregistered the tree, then failed to delete
+the directory, leaving a folder git no longer recognised, so every subsequent git command in that
+session failed. The bias is therefore fixed: **a false SKIP is a minor annoyance, a false PRUNE
+destroys a session.** Anything the script cannot answer confidently, it SKIPs.
+
+Occupancy is checked by two independent signals, and **either one vetoes**:
+
+1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
+   matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
+   pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
+2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
+   git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
+   **not** depend on a recorded cwd.
+
+Both are re-read **immediately before each removal**, not just when the table was built — a gh round
+trip per candidate plus every prior removal is a real window, and it is the window the incident
+description blames.
+
+**Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
+can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
+permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
+unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
+config root with a registry, at least one readable record, **and no record that cannot be placed**.
+That last one matters more than it sounds. Two shapes qualify — a file that will not parse, and one
+that parses but carries no `cwd` — and both used to be dropped by a silent `continue`, appearing in no
+count at all. Neither can be placed in *or* cleared from any candidate, and a file caught
+*half-written* is exactly what a session that launched a second ago looks like. An unavailable fence
+turns every candidate into a SKIP and exits **2**. There is deliberately no override flag.
+
+### The candidate set is siblings only — and "sibling" is not a prefix match
+
+`<primary>-<name>` used to be matched by prefix alone, which silently includes
+`<primary>-pins/.claude/worktrees/x` — a **Claude-managed nested worktree**, the exact place
+`EnterWorktree` relocates a live session into. Nested trees under the *primary* escaped only by the
+accident that `<primary>/` is not `<primary>-`, so the case that was tested was the case that worked.
+Anything living inside another registered worktree, and anything with a `.claude/worktrees/` path
+segment, is now excluded outright and listed as a non-candidate; `-Name` cannot reach them either.
+
+### Why signal 2 is not a nicety
+
+Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of writes come from a
+session sitting in the primary and landing in a sibling by absolute path — and on 2026-07-30, with 5
+live sessions across 9 worktrees, signal 1 vetoed **none** of the four `<primary>-<slug>` siblings,
+including one a session was demonstrably building in. Signal 2 was the only thing standing between
+that session and this script. The run therefore prints how many candidates signal 1 actually vetoed,
+rather than letting "the fence ran" imply "the fence covered it".
+
+What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
+that never registered; and a session that only edits files and runs no git command (invisible to
+signal 2 as well, since it touches none of the metadata files).
+
+Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
+an operator who believes they are fenced when they are not is worse off than one who knows they
+aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
+measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
+explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
+that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
+`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
+`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
+`-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
+while appearing to set it.
+
+### Outcomes, not intentions
+
+The summary counts what actually **happened** — `Done. removed N, failed N, skipped N` — not what the
+script intended (it used to print the count of candidates it planned to remove, which over-reported
+after a failed removal). A removal is only counted once the directory is verified gone *and*
+deregistered. A failed removal is diagnosed on the spot: git deregisters a worktree even when it
+cannot finish deleting the files, so the script reports whether the directory, its `.git` pointer, and
+its registration survived, and prints the recovery recipe for the **orphaned** case — move the
+directory aside, then `git worktree add` it back (neither `worktree repair` nor `worktree add --force`
+recovers it on its own). `git worktree prune` is never run: it deregisters *any* worktree whose
+directory is momentarily missing, including the `.claude/worktrees` ones, and it would finish off the
+destruction a failed removal left half done.
+
+**An orphan outlives the run that made it, so it is remembered.** Once git has deregistered a worktree
+it is no longer in `git worktree list`, so it drops out of the candidate set and the *next* run used to
+print a green all-clear over a directory this script had broken. Orphans are now recorded in
+`<git-common-dir>/prune-merged-orphans.json` and re-reported with the recipe on every later run until
+the directory is gone or re-registered — as is any unregistered `<repo>-*` directory whose `.git`
+pointer still names this repo.
+
+Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
+without destroying anything; `2` **refused** — nothing was attempted because safety could not be
+established (wrong cwd, unavailable fence, a `-Name` that matched nothing); `3` **orphaned** — a
+directory is broken on disk right now. `3` outranks `2` because damage on disk outranks a refusal to
+act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
+spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
+
+**A branch is never force-deleted on a stale verdict.** `git branch -d` refuses a branch merged only
+into `origin/main` whenever the local `main` lags — which it usually does — so `-D` used to be the
+routine path and git's last protection was overridden every time. Now `-d` is tried first, and `-D`
+only after re-verifying *at that moment* that `origin/main..<branch>` is empty. Otherwise the branch is
+**kept** and reported. A stale ref costs nothing; a destroyed commit costs a session.
+
+Tests: [`tests/test_worktree_prune_merged.py`](../tests/test_worktree_prune_merged.py) drives the real
+script against a synthetic repo family. Tests assert the *decision and the reason* rather than survival
+— a script that has lost its primary fence still leaves the directory intact, because the `-Apply`
+re-check catches it, so a survival-only assertion proves nothing — and carry a positive control in the
+same invocation wherever one is possible (a refusal test refuses the whole run by design). The
+`-Apply` re-check itself is driven by a **gh shim on PATH** whose merge probe performs a side effect —
+a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
+race deterministically with no threads and no sleeps.
+
 ## Your PR won't merge — triage before you touch anything
 
 With several sessions merging into one `main`, a PR that was green ten minutes ago routinely stops
