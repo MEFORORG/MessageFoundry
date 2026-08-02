@@ -1,127 +1,48 @@
-# HANDOFF — HA construct re-check / ADR 0157
+# HANDOFF — HA re-check / ADR 0157
 
-Written 2026-08-02 on owner stop-work (weekly usage cap). Branch `claude/ha-recheck-adr0157`.
+Updated 2026-08-02. Supersedes the stop-work handoff written earlier the same day.
 
-## 1. STATE
+**The authoritative status is [ADR 0157](docs/adr/0157-demotion-safety-fence-scope-on-post-claim-writes-and-a-bounded-graph-stop.md) itself** — it carries the decisions, the corrections and the per-increment build state. This file holds only what does not belong in an ADR: what is left, and the traps that cost time.
+
+## 1. State
 
 | | |
 |---|---|
-| Branch | `claude/ha-recheck-adr0157` (follow-up branch; its predecessor merged as #129) |
-| PR | **[#139](https://github.com/MEFORORG/MessageFoundry/pull/139)** — OPEN, all commits pushed |
-| Uncommitted | none |
-| Claim | `ha-recheck` (this worktree) |
+| ADR 0157 | **Accepted.** Increments **1, 4, 5 built**; 0, 2, 3 not built |
+| PR | [#139](https://github.com/MEFORORG/MessageFoundry/pull/139) |
+| Earlier | #129 merged (`884036f8`) — the doc corrections |
 
-Earlier PR **#129 is MERGED** (`884036f8`, merged by the owner) — the doc corrections are on `main`.
+## 2. What is left
 
-## 2. DONE
+**Inc 0 — make the margin real.** The demotion budget does not subtract the lease-renew round trip, which is bounded only by `[store].command_timeout` (30.0) — *equal* to the stock lease TTL. Until that is clamped, the derived 4.5s budget is nominal, not guaranteed. The floor clamp means a bad margin degrades to *overlap* (duplicates, permitted) rather than hard-cancel-always (INFLIGHT residue, strand-direction on SQL Server), so this is a real gap and not an emergency.
 
-| SHA | What |
-|---|---|
-| `bc9ccd73` | Corrected 5 classes of false split-brain claim in code + docs (in #129, on `main`) |
-| `6c81c65e` | The third false-premise site `bc9ccd73` missed (in #129, on `main`) |
-| `547b088b` | **ADR 0157** — demotion safety, Proposed, + index row (ledger gate passed) |
-| `c20295c0` | **fix(delivery)** — leadership loss dead-lettered an un-sent row (strand) |
-| `850e3f7b` | **ADR 0157 C3/C4 corrections** — both were strand-direction as written |
+**Inc 2 — ⛔ MIS-SPECIFIED IN THE ADR. Do not build it as written.** It proposes an owner-blind, age-based periodic sweep. SQL Server has **no populated `owner` column** to discriminate with, so that sweep would re-pend rows a live leader is actively working. The verified defect is narrower — there is no recovery at **graph re-start**, because `RegistryRunner.reload()` is a quiesce-and-swap that calls no recovery — and the fix is a scoped reset there. Re-scope first.
 
-`c20295c0` is mutation-verified in both directions: revert the body to `mark_failed` → both tests FAIL;
-restore → both PASS.
+**Inc 3 — SQL Server fences.** Blocked on Inc 2. Its own gate: pin empirically, on the live CI leg, whether a coroutine cancelled mid-`execute` leaves an aioodbc transaction committed or rolled back (`except Exception: await conn.rollback()` does **not** catch `CancelledError`).
 
-Gates at last run: `ruff check` clean · `ruff format --check` clean (1020 files) · `mypy` **no issues,
-260 source files** · **125 passed** across dispatcher / pooled-rider / wiring / cluster suites.
+> **A green Postgres run does not license the same edit on `sqlserver.py`.** The two backends' recovery guarantees differ, and that difference is the whole argument for D1.
 
-## 3. IN FLIGHT — nothing half-built in code. One spec ready to apply.
+**Also deferred (D10):** the own-owner promotion-recovery statement. It must be lease-expiry-bounded to be safe, and every claim stamps `lease_until = now + lease_ttl_seconds`, so it is a no-op exactly when it would be needed.
 
-**No partial edits exist.** The store's terminal-write path and the teardown ordering are untouched.
+## 3. Traps that cost real time
 
-**The applyable spec is saved (79 KB):**
-`<session-scratchpad>/ADR-0157-implementation-spec.md`
+- **Local `pytest` SILENTLY SKIPS the Postgres and SQL Server legs.** A green laptop run proves nothing about either backend. There is a `mefor-pg-ci` container (postgres:16) on **port 5433** matching CI's fixtures — use it:
+  ```
+  MEFOR_TEST_POSTGRES=1 MEFOR_STORE_BACKEND=postgres MEFOR_STORE_SERVER=localhost \
+  MEFOR_STORE_PORT=5433 MEFOR_STORE_DATABASE=messagefoundry MEFOR_STORE_USERNAME=postgres \
+  MEFOR_STORE_PASSWORD=mefor MEFOR_STORE_ENCRYPT=false MEFOR_ALLOW_INSECURE_TLS=1
+  ```
+- **A new module-gated suite executes NOWHERE until it is named in a workflow.** `tests/test_serverdb_ci_coverage.py` catches this; it caught this branch. Add the file to the `sqlserver-store` / `postgres-store` job **and** to the `serverdb` change-detection alternation in `ci.yml`.
+- **`leader_lease` is not in `tests/test_postgres_store.py`'s `_TABLES`**, so a row seeded by one test survives into the next. Any test whose premise is "no lease row" must delete it explicitly — `test_epoch_guard_disabled_when_none_is_byte_identical`'s own comment is a false premise for exactly this reason.
+- **`mypy` reports 21 phantom errors** unless the venv has the full extras: `pip install --constraint constraints.lock -e ".[dev,harness,postgres,sqlserver,fhir,dicom,x12,xml,webauthn,sftp,vault,otel]"`.
+- **Pre-commit needs `ruff` on PATH** in the worktree. Activate `.venv` or prepend it. **Never `--no-verify`.**
+- **A full local suite with the Postgres env set produces failures that isolation does not** — the `[postgres]`-parametrized suites share one database and contaminate each other. Before attributing any failure, re-run the same set the same way with your diff reverted. Measuring a different quantity is not a measurement.
 
-It covers Inc 1 (Postgres fences, C1+C5+C4) and Inc 4/5 (bounded demotion, C6). It opens with a
-**five-item STOP list** — read that first. Its line numbers are re-derived from source because
-**the ADR's own line numbers are stale**.
+## 4. The methodological point worth keeping
 
-**Not yet designed:** the SQL Server increment. See §5 — the ADR's premise for it is wrong.
+Two gates written for this work were **blind to the exact class they existed to catch**, and only a deliberate mutation found it:
 
-## 4. BLOCKED ON
+- The structural fence gate keyed on whether a method *mentioned* `_EPOCH_GUARD_CLAIM`. Deleting `{epoch_guard}` from `claim_fifo_heads`' SQL — the precise regression — left the mention intact and the gate stayed **green**. It now keys on the emitted SQL.
+- An earlier session's first version of the `c20295c0` tests asserted a row was `PENDING` with `attempts=0`, which passes against the *pre-fix* code because a seeded row is already in that state.
 
-**Nothing external.** The collision-gate deadlock is cleared: PR #133 merged, and I advanced the
-**primary checkout** (it was 5 commits behind, 0 dirty, pure fast-forward), which is what actually puts
-the fix in force — the hook resolves live from the primary, not from `main`.
-
-Verify before assuming:
-
-```bash
-grep -c MatchedDirty <primary-checkout>/scripts/hooks/collision_gate.ps1
-```
-
-Non-zero = in force. It was **2** when I checked.
-
-**Owner decisions are made** (C1 = terminal writes only, fail-open; C6 = yes, bounded, abandon-don't-
-await). The remaining work is implementation against the corrected ADR.
-
-## 5. RETRACTIONS — things I asserted tonight that were wrong
-
-**These matter more than the wins. Every one was caught by a peer or by a check, never by me noticing.**
-
-1. **My own ADR's C3 was a strand.** I wrote that a fenced terminal write should roll back and leave the
-   row INFLIGHT for recovery. On SQL Server there is **no periodic in-flight recovery at all**, so that
-   is an unbounded strand — the exact outcome the ADR forbids, produced by its own fence.
-   **Corrected in `850e3f7b`:** roll back, then re-pend via unguarded `release_claimed`.
-2. **My own ADR's C4 was a silent total halt.** "Delete the `set_leader_epoch(None)` clear" alone is
-   unsafe once C5 lands: `_reconcile_graph` has only two branches, so `is_leader() and running` matches
-   neither, forever, holding a stale epoch → a live leader claiming nothing, no exception, no alert.
-   **Corrected in `850e3f7b`:** delete the clear **and** re-stamp on every reconcile pass while leader.
-3. **I amplified a wrong CI number.** I reported #133's windows-2025 leg as **28:14** and said the old
-   26:00 cap "would have killed it by 134s", calling it the strongest number of the night.
-   **Wrong — that is the JOB; `step_timeout` gates the STEP, which was 24:51, UNDER the old cap by 69s.**
-   #133 was **not** a second casualty; **#119 remains the only PR that cap killed.** I accepted it
-   because it arrived as "a measurement correcting an estimate", which I treated as strictly improving.
-   It is not: *a measurement is better than an estimate only when it measures the same quantity.*
-4. **I mis-attributed BACKLOG #333** to the ASVS-scorecard session. It is the **Public repo security
-   review** session's, filed in `b4665b10`. Verify attribution from `git log`, not from conversation.
-5. **My merge-priority reasoning was wrong.** I argued #133 should merge before #129 "because it
-   unblocks everyone". It does not unblock anyone *on merge* — the gate resolves from the primary
-   checkout, so merging collects nothing until the primary advances. I had both measurements in hand
-   and built the ordering on the conclusion anyway.
-6. **I overstated a tally.** I said "one unit confusion, four sessions, six retractions". Audited: the
-   job/step unit accounts for **three** of six. Exact form: *three of six from one unit confusion; all
-   six caught by a peer, none by the author.*
-7. **ADR scope drift — measured at 142 of 510 lines (28%)** on a subject allocated to ADR 0158, after I
-   had written the guard against exactly that drift in my own notes. Trimmed to 319 lines.
-8. **Four instrument errors**, three caught before acting:
-   - `Get-FileHash` over a shell-redirected temp file reported DIFFERS for byte-identical files (the
-     redirection re-encodes). `git hash-object` vs `git rev-parse origin/main:<f>` is the like-for-like
-     form. I **nearly refuted a correct peer claim** with this.
-   - A `.git/…` path relative to a **linked worktree** resolves to nothing (`.git` is a *file* there).
-     `alloc.ps1` joins from `--git-common-dir`. I nearly reported a correct ledger as missing.
-   - A regex with `**` on the wrong side of a word reported a surviving correction as absent.
-   - **My first version of the `c20295c0` tests was vacuous** — asserting the row is `PENDING` with
-     `attempts=0` passes against the pre-fix code, because a seeded row is *already* in that state.
-     Only mutation testing caught it. Both tests now wait on a spy (positive signal).
-
-## 6. TRAPS
-
-- **`reset_stale_inflight` is startup/DR-only.** `RegistryRunner.reload()` is a quiesce-and-swap and
-  calls no recovery, so a reload leaves cancelled prefixes INFLIGHT until the next process start.
-  The codebase contradicts itself here: **`wiring_runner.py:1800` is right** ("strands INFLIGHT forever
-  … startup/DR-only"); **`:4718` is wrong** ("recovered … on the next start/reload").
-  ➡️ **Therefore the ADR's SQL Server increment is mis-specified.** It proposes an owner-blind,
-  age-based periodic sweep. The verified defect is narrower — *no recovery at graph re-start* — and the
-  right fix is a scoped reset there. An age sweep on SQL Server has **no `owner` column populated** to
-  discriminate with, so it would re-pend live rows. **Do not build the ADR's version as written.**
-- **Local `pytest` SILENTLY SKIPS the Postgres and SQL Server legs.** 97 skips in my last run. A green
-  local run proves nothing about either backend.
-- **`mypy` reports 21 phantom errors** unless the venv has the full extras. Bootstrap with
-  `pip install --constraint constraints.lock -e ".[dev,harness,postgres,sqlserver,fhir,dicom,x12,xml,webauthn,sftp,vault,otel]"`.
-- **Pre-commit needs `ruff` on PATH** in this worktree, or the ruff hooks fail with "Executable not
-  found". Activate `.venv` or prepend the main checkout's. **Never `--no-verify`.**
-- **The ADR's line numbers are stale.** Use the spec's re-derived ones.
-- **Three parties have touched `wiring_runner.py`** (this fix, PR #136, an ASVS anchor). All far apart,
-  but whoever rebases last should read it rather than trust a clean auto-merge.
-- **`git status` rewrites the index of the repo it inspects** — `overlap.ps1` now uses
-  `--no-optional-locks`. Relevant if you write tooling that walks peer worktrees.
-
-## 7. NEXT STEP
-
-Apply the spec's Inc 1 (Postgres fences) against the **corrected** C3/C4, then Inc 4/5. Re-scope the
-SQL Server increment per §6 before building it. Everything is decided; nothing is ambiguous.
+Both were caught by attacking the control, not by reading it. Build the gate, then try to slip the defect past it.
