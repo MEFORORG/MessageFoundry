@@ -1078,8 +1078,18 @@ class Engine:
             )
             self._leader_maintenance.start()
         # else (SQL Server active-passive): no per-row leases, so there is no reclaim sweep — failover
-        # recovery is the on-promotion reset_stale_inflight in _start_graph (the old leader self-fenced
-        # before its lease expired, so re-pending its in-flight rows can't steal from a live processor).
+        # recovery is the on-promotion reset_stale_inflight in _start_graph. Do NOT justify that by "the
+        # old leader self-fenced before its lease expired, so it can't steal from a live processor": the
+        # fence only stops the node REPORTING leader, not working (see _check_fence, which flips a bool
+        # and cancels nothing), so the two can overlap. The reset is correct for a different reason — it
+        # errs toward a DUPLICATE, which at-least-once permits, rather than a STRAND, which it forbids.
+        #
+        # Consequence worth knowing: this is SQL Server's ONLY in-flight recovery. reclaim_expired_leases
+        # is defined on the Postgres store alone, and the sweep below is gated on hasattr(), so a row left
+        # INFLIGHT here OUTSIDE a promotion (e.g. the deliberate teardown path in stage_dispatcher, which
+        # leaves a cancelled prefix INFLIGHT for exactly this recovery) has nothing periodic to reclaim it
+        # and is stranded until the next promotion or restart. Postgres bounds the same case at roughly
+        # reclaim_interval + lease_ttl. Tracked in ADR 0157.
         # Config-reload convergence (Track B Step 6) — only in clustered mode (is_clustered()), so
         # single-node / SQLite never spawns it. Seed the applied version to the coordinator's CURRENT
         # shared version BEFORE the loop starts, so a fresh node does not immediately self-reload (it is
