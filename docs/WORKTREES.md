@@ -321,6 +321,35 @@ hooks are wired at **user** level by
 [../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1): git cannot
 deliver a project-level hook to a worktree.
 
+**A change to these scripts reaches a session by one of TWO rules, and they are not the same rule.**
+Getting this wrong produces a confident, wrong answer to "can I use it yet", so state which one applies:
+
+| How the script is reached | When your change reaches a session |
+|---|---|
+| **Run by a hook** (`collision_gate.ps1`, and `overlap.ps1` as its callee) | The installed shim resolves the **primary checkout** first, falling back to the calling worktree. So: **when the primary advances** — regardless of what any session's own branch contains |
+| **Run by hand from a worktree** (`claim.ps1`, `overlap.ps1`, `presence.ps1`) | From that session's **own tree**. So: **when that session's branch contains it** — the primary is irrelevant |
+
+Reported 2026-08-02 by a peer session that was told a merged `claim.ps1` improvement was available to
+it, tried it, and got the old behaviour: its branch predated the change. Both halves of the answer were
+individually true and the combination was wrong. Test the property, not the provenance, and test it
+where the script will actually run from:
+
+```powershell
+grep -c <a token from the change> <primary>/scripts/coord/overlap.ps1   # hook-run scripts
+grep -c <a token from the change> ./scripts/coord/claim.ps1             # hand-run scripts
+```
+
+**Asking who holds a file, right now, without changing anything.** The collision gate answers this
+directly, and it is the only command that does — `-PathOverride` makes it skip stdin and print its
+decision:
+
+```powershell
+pwsh -NoProfile -File scripts\hooks\collision_gate.ps1 -PathOverride docs\BACKLOG.md
+```
+
+Empty output means no live session holds it. Documented in-script as a test affordance; surfaced here
+because a session that needed the answer found it by reading the source.
+
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers
