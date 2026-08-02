@@ -82,6 +82,12 @@ LIVE_ROW = {
 }
 DORMANT_ROW = {**LIVE_ROW, "Live": False, "Short": "", "Surface": "", "Worktree": "old-wt"}
 
+# A live session with the file OPEN AND UNSAVED, versus one that committed it and went clean. The gate
+# must separate these: `Files` unions committed-and-unlanded with working-tree, so both look identical
+# through it, and a committed file stays until the branch LANDS.
+EDITING_ROW = {**LIVE_ROW, "Dirty": ["a.py"], "MatchedDirty": True}
+COMMITTED_ROW = {**LIVE_ROW, "Dirty": [], "MatchedDirty": False}
+
 
 def test_denies_when_a_live_session_is_changing_the_file(tmp_path: Path) -> None:
     got = run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]))
@@ -109,6 +115,47 @@ def test_allows_when_only_a_dormant_worktree_touches_the_file(tmp_path: Path) ->
 
 def test_allows_when_nobody_else_touches_the_file(tmp_path: Path) -> None:
     assert run_gate(make_overlap_stub(tmp_path, [])) is None
+
+
+def test_denies_only_on_an_uncommitted_edit_in_a_live_worktree(tmp_path: Path) -> None:
+    got = run_gate(make_overlap_stub(tmp_path, [EDITING_ROW]))
+    assert got is not None, "an unsaved edit in a live worktree must still deny"
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "UNCOMMITTED" in got["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_allows_a_file_another_live_session_committed_and_finished_with(tmp_path: Path) -> None:
+    """THE OVER-BLOCK. Reported 2026-08-01 with a repro: a session committed a file, went clean, and
+    said in writing it was done -- and the peer it handed off to was still refused.
+
+    ``Files`` unions committed-and-unlanded with working-tree, so a committed file keeps blocking until
+    the branch LANDS. While PRs cannot merge that is indefinite, so the blocked set only ever grows and
+    two sessions that coordinated correctly still cannot hand a file over. This gate's own docstring
+    names that failure: a gate that cries wolf gets uninstalled.
+    """
+    got = run_gate(make_overlap_stub(tmp_path, [COMMITTED_ROW]))
+    assert got is not None, "expected context, not silence"
+    out = got["hookSpecificOutput"]
+    assert "permissionDecision" not in out, f"must not block a committed-and-clean file: {out}"
+    ctx = out["additionalContext"]
+    assert "deadbeef" in ctx and "claude/other-work" in ctx, "context must still name the peer"
+
+
+def test_a_row_without_the_dirty_signal_still_denies(tmp_path: Path) -> None:
+    """Fail SAFE across the upgrade. A cached overlap row written before MatchedDirty existed carries
+    no such property; treating it as clean would silently permit a real collision, so it is treated as
+    dirty and the gate degrades to its previous over-blocking behaviour instead.
+    """
+    got = run_gate(make_overlap_stub(tmp_path, [LIVE_ROW]))  # no Dirty/MatchedDirty at all
+    assert got is not None
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_an_editing_peer_still_denies_when_another_peer_merely_committed(tmp_path: Path) -> None:
+    """One finished peer must not mask a peer who is actively typing in the file."""
+    got = run_gate(make_overlap_stub(tmp_path, [COMMITTED_ROW, EDITING_ROW]))
+    assert got is not None
+    assert got["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
 def test_fails_open_when_the_overlap_script_is_missing(tmp_path: Path) -> None:
