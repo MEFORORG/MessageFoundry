@@ -24,6 +24,26 @@ widened the original six-stdlib-module list so *delegated* crypto stops being in
 The walk-set (:data:`WALK_ROOTS`) is byte-identical to ``tests/test_security_static.py``'s
 ``_CRYPTO_ROOTS`` (BACKLOG #283 owns that pin; this gate consumes it).
 
+**Adding a TLS/crypto call site? Read this first — it is cheaper than a red CI leg.** #323's opening
+commit `e4728d7f` failed ``Tests (pytest)`` on all three OS legs by adding ``import ssl`` to
+``transports/{email,direct}.py`` without an entry here; layer 3 then avoided the gate entirely rather
+than feeding it. Four facts, each measured, that are not obvious from the code below:
+
+* **The gate is BIDIRECTIONAL, so "just register the file" is not a free fix.** An unregistered file
+  that imports a trigger fails one way (*undocumented crypto use*); a registered file that STOPS
+  importing it fails the other (*inventory lists ['ssl'] but the file no longer imports it*). A
+  registration is a standing commitment, not a one-time appeasement.
+* **``if TYPE_CHECKING: import ssl`` does NOT hide the import.** Under ``from __future__ import
+  annotations`` the annotation still trips the scanner. There is no cheap way to keep the name and
+  dodge the gate — nor should there be.
+* **The only real escape is not naming the type.** Hold the *inputs* (``tls_verify`` / ``tls_ca_file``
+  / a ``TrustAnchorPolicy``) as plain data and let one inventoried builder produce the context into a
+  **bare local** with no annotation. Then no ``ssl`` name exists in the calling module at all.
+* **For SMTP that builder already exists:** :func:`~messagefoundry.config.tls_policy.build_smtp_tls_context`.
+  All three SMTP cells (EMAIL, DIRECT, the ``[alerts]`` sink) route through it, so exactly one file is
+  registered here and the ``pipeline/`` call sites stay ``ssl``-free. That is centralization, not
+  evasion: one place decides the TLS policy for every SMTP hop in the product.
+
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
