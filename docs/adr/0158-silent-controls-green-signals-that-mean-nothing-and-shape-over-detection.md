@@ -142,7 +142,8 @@ been killed" is a counterfactual about a run that never faced them.
 **Other Class-1 instances found the same day**, each a claim stated independently of its subject:
 
 - [`.github/zizmor.yml`](../../.github/zizmor.yml) said `release.yml` "sets persist-credentials:
-  false on both checkouts". `release.yml` has three, all false. Fixed by 0fdc326e, which dropped the
+  false on both checkouts". `release.yml` has three, all false. Fixed by 0fdc326e, merged as 851c849b
+  (#130) -- the branch SHA is unreachable from `main`, which squash-merges -- which dropped the
   count rather than correcting it -- the right move, because the count was doing no work. Two things
   about attribution: the wrong sentence was in `zizmor.yml` describing `release.yml`, never in
   `release.yml` (sourcing it to `release.yml` would itself be a Class-1 error); and the line numbers
@@ -166,15 +167,20 @@ been killed" is a counterfactual about a run that never faced them.
 - `docs/BACKLOG.md`:5264 states, as the reason an item is an anti-feature, that the engine "uses
   STARTTLS with a verifying context by design". Two lines earlier the same item accurately says it
   "calls starttls() with the default SSL context". The code calls `smtp.starttls()` with no context
-  argument ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py):382-384, and the same
-  bare call at [`transports/email.py`](../../messagefoundry/transports/email.py):216 and
-  [`transports/direct.py`](../../messagefoundry/transports/direct.py):323). On the project's own
+  argument ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py):382-384). The same bare
+  call stood at [`transports/email.py`](../../messagefoundry/transports/email.py) and
+  [`transports/direct.py`](../../messagefoundry/transports/direct.py) when this was written; *update
+  (2026-08-02, after this ADR was committed): 093db339 (#132) gave both an explicit verifying context,
+  leaving the alert sink as the only remaining instance on `main`.* On the project's own
   interpreter (Python 3.14.6), `smtplib.SMTP.starttls` resolves a `None` context via
   `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context`: `verify_mode`
   CERT_NONE, `check_hostname` False. The sink encrypts and authenticates nothing. **A retraction is
-  already filed -- and the false sentence is still there:** BACKLOG #323 says at `docs/BACKLOG.md`:7462
-  that #139's rationale "is **false** and should be retracted there", and :5264 still says it. A
-  retraction is not done until the original sentence changes. (Naming correction: `EmailAlertSink` is
+  already filed -- and the false sentence was still there:** BACKLOG #323 says at `docs/BACKLOG.md`:7462
+  that #139's rationale "is **false** and should be retracted there", and :5264 still said it. A
+  retraction is not done until the original sentence changes. *Update (2026-08-02, after this ADR was
+  committed): 093db339 (#132) changed the source sentence. On `main` the clause survives only inside
+  its own "CORRECTED 2026-08-01" block at :5270 and as a quotation at :7476 -- so the interval this
+  instance records is closed, and the rule it produced is unaffected.* (Naming correction: `EmailAlertSink` is
   not a symbol in this codebase; it occurs only in BACKLOG prose.)
   *found by: a peer session, filed against another item as BACKLOG #323 -- the one instance in this
   record whose cross-author provenance is documented in the repository itself.*
@@ -338,7 +344,8 @@ adopting them closes anything.
 12. **When a comment states a count, verify it in the same commit or drop the count.** 0fdc326e is
     the precedent: the claim was right, the count was a liability, so the count went.
 13. **A retraction is not done until the original sentence changes.** Filing a correction under a
-    different item leaves the false sentence where readers act on it (BACKLOG :5264 today).
+    different item leaves the false sentence where readers act on it (BACKLOG :5264, for the interval
+    between #323 filing the retraction and 093db339 (#132) changing the sentence).
 14. **Any figure that will live in a durable artifact gets re-derived by someone who did not produce
     it.** This is the rule to protect if the others erode; see *Consequences* for the evidence, and
     for the bound on that evidence.
@@ -423,8 +430,9 @@ recorded above: three are covered by a test that runs in a required CI leg; two 
 skip in CI; one (zizmor's paths filter) by a workflow change with a named live residual; and the
 remainder are corrected prose or still open. Anyone editing those comments can reintroduce the same
 claim tomorrow, and at least two instances left a residual (`pyproject.toml` is still outside
-zizmor's filter; the false `docs/BACKLOG.md`:5264 rationale is still there with its retraction filed
-elsewhere). The coordination-layer signal split is the clearest case where the wrong statement became
+zizmor's filter; the false `docs/BACKLOG.md`:5264 rationale stood with its retraction filed elsewhere
+until 093db339 (#132) changed the sentence itself, the day after this was written). The
+coordination-layer signal split is the clearest case where the wrong statement became
 structurally harder to make, and even it is a corrected emission rather than an unrepresentable one.
 Do not read this ADR as evidence the class is closed, and do not read the taxonomy as complete.
 Further: adding rules raises the cost of writing a bound, and a rule that is expensive to follow gets
