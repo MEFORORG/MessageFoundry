@@ -184,6 +184,16 @@ class DirectDestination(DestinationConnector):
             # below — two different escapes in one connector is how the next bug gets written. The
             # change strictly ADDS refusals (ADR 0092 decision 5): an enforcing production-PHI instance
             # can no longer silence a cleartext Direct hop with the blunt process-wide env var.
+            #
+            # THE ESCAPE STILL EXISTS — it is CLAMPED, not removed. Stated because this file now has
+            # NO CALL to `insecure_tls_allowed()` (only these comments mention it), and reading that
+            # as "this connector has no escape" would be a FALSE ABSENCE claim.
+            # MEFOR_ALLOW_INSECURE_TLS still governs this hop: weakened_tls_escape_permitted_here() is
+            # that same env var plus the production-PHI clamp. Any absence claim about the raw call is
+            # scoped to THIS FILE and never repo-wide — `insecure_tls_allowed()` remains live at call
+            # sites in auth/ldap.py, pipeline/alert_sinks.py, transports/{ai_broker,database,mllp}.py
+            # and config/settings.py (docs/DEPLOYMENT.md enumerates the ones the clamp does not yet
+            # cover — see #329). Verified by grep at the time of writing, not assumed.
             if not weakened_tls_escape_permitted_here():
                 raise ValueError(
                     "Direct destination use_tls=false submits over cleartext SMTP; refused unless "
