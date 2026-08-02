@@ -2532,7 +2532,11 @@ class RegistryRunner:
         session = self._sandbox_sessions.get(name)
         if session is None:
             env = self._sandbox_config_source[1] if self._sandbox_config_source else None
-            session = SandboxSession(policy, config_dir=cfg_dir, env=env)
+            # The engine's code-set tables travel once per spawn in the boot frame (not per dispatch),
+            # so the child serves exactly what mode=off would rather than its own re-read of codesets/.
+            session = SandboxSession(
+                policy, config_dir=cfg_dir, env=env, code_sets=self.registry.code_sets
+            )
             self._sandbox_sessions[name] = session
         return session
 

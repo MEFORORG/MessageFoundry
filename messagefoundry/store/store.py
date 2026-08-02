@@ -56,6 +56,11 @@ from uuid import uuid4
 import aiosqlite
 
 from messagefoundry.config.models import RetryPolicy
+
+# The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
+# may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
+# here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
+from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -534,30 +539,6 @@ class ClaimedHeads:
 
     by_lane: dict[str, list[OutboxItem]]
     rearm: frozenset[str]
-
-
-@dataclass(frozen=True)
-class CapturedResponse:
-    """One captured request/response reply (ADR 0013), as returned by ``correlate_response`` for the
-    API/console read surface. ``body``/``detail`` are decrypted here; ``body`` is ``None`` once
-    retention has nulled it (the row is kept, like a purged ``messages.raw``)."""
-
-    message_id: str
-    destination_name: str
-    response_seq: int
-    outcome: str
-    detail: str | None
-    captured_at: float
-    body: str | None
-    # ADR 0021 "Response Sent": 'response' (outbound reply, the default) | 'ack_sent' (inbound ACK we
-    # returned). ack_code/ack_phase are non-PHI disposition metadata, populated only for ack_sent rows.
-    kind: str = "response"
-    ack_code: str | None = None
-    ack_phase: str | None = None
-    # BACKLOG #154 (ADR 0013 amendment): the captured allow-listed HTTP response headers ({} when none /
-    # once retention nulls them). Decrypted + JSON-decoded here; a re-ingressed Handler reads it via
-    # response_get(dest).headers.
-    headers: Mapping[str, str] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
