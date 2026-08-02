@@ -398,7 +398,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#22b Alerts GUI page** | Med | **done** | S | ✅ Endpoint `/alerts/rules` shipped (#415); console Alerts page shipped (**PR #420**, merged 2026-06-20). Operator-parity polish, not a migration-unblocker. |
 | **#33 config-UX audit** | Med | do-next | M | Right timing to audit config sprawl — but value realizes **only if** the spawned follow-ups are funded. Keep bounded to transport/service config (logic stays code-first — never drift toward #26). |
 | **FEATURE-MAP refresh** | Med | do-next → **done** | S | Verified stale (Dead-Letters row); ASVS score synced to 212/0/0/133 (#425). |
-| **#7 inbound HTTP listener (+ SOAP/FHIR-facade tail)** | Med | **done (first slice) / on-trigger (tail)** | XL | ✅ REST body-POST listener shipped `0.2.10` (ADR 0023, PR #624). **Deferred tail (on-trigger):** SOAP sync-reply, intake-auth, routing-metadata, inbound FHIR-server facade (#20) / DICOMweb receiver (#24). |
+| **#7 inbound HTTP listener (+ SOAP/FHIR-facade tail)** | Med | **done (first slice) / on-trigger (tail)** | XL | ✅ REST body-POST listener shipped `0.2.10` (ADR 0023, PR #624). Intake auth (ADR 0154 increment A) and the SOAP sync-reply (`reply_from`, increment B) have since shipped. **Deferred tail (on-trigger):** routing-metadata, inbound FHIR-server facade (#20) / DICOMweb receiver (#24). |
 | **#16 eventlog (0021 half)** | Med | **done** | L | ✅ Shipped `0.2.3` (#541): metadata-only `connection_event` log + "Response Sent" ACK/NAK capture + console Event Log (jointly with #46). **ADR 0020 raw protocol-trace stays dropped** (raw-PHI-at-rest tier nobody named). |
 | **#34 per-connection retention** | Med | **done** | M | ✅ Shipped `0.2.9` (ADR 0027): per-connection `messages_days` / `dead_letter_days` over the global default, across all 3 backends. |
 | **least-priv service-account default** | Med | on-trigger | S | Account + ACLs already built; only the default flip off LocalSystem remains. Ride the next green `windows-service-smoke`. |
@@ -881,8 +881,12 @@ functionally tested; the `ide` build job (PR #133) closes the compile gap, not t
 > inbound HTTP/1.1 listener (`transports/http_listener.py`, `ConnectorType.HTTP`) accepts a partner's body
 > POST, feeds it to payload-agnostic ingress (ADR 0004) as a `RawMessage`, and returns **respond-with-
 > receipt** under ACK-on-receipt — living in `transports/`, not `api/` (the one-way dependency rule holds).
-> **Deferred tail (still open):** the synchronous **SOAP-envelope reply** (block-on-captured-downstream via
-> the ADR 0013 query-response seam), **intake auth**, **routing-metadata**, and the inbound **FHIR-server
+> **Intake auth SHIPPED** (2026-08-01, ADR 0154 increment A, `f2ef0ea9`) and the synchronous
+> **SOAP-envelope reply SHIPPED** (ADR 0154 increment B, `reply_from`, PR #119) — naming
+> `reply_from` blocks the HTTP turn until the named outbound's reply is captured **and committed**,
+> then returns it as the response body. Its `capture_error_responses` gap is open: a partner 4xx
+> still yields a fixed-JSON `502` rather than the partner's own status and body.
+> **Deferred tail (still open):** **routing-metadata**, and the inbound **FHIR-server
 > facade** (#20) / **DICOMweb STOW-RS receiver** (#24). Original deferred-to-v0.3 description kept below for history.
 
 **Type:** feature — a new inbound transport direction (HTTP-listener source). Deferred by design:
