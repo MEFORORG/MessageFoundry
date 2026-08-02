@@ -321,6 +321,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the two ephemeral scan identities it provisions into a store it creates empty in a temp directory
     # and destroys with it. Not a key and never persisted: a checked-in constant would be strictly
     # weaker, and the alternative — an operator-supplied credential — is the optional escape hatch only.
+    # ADR 0156: SHA-256 over the OWASP ASVS corpus FILE, to pin it to the tagged v5.0.0_release
+    # asset. Integrity of a build input, not a security control: no secret, no key, no message
+    # authentication, and nothing user- or PHI-derived is hashed. It exists because the corpus was
+    # originally fetched from `master` (the bleeding-edge branch, where a rolling "latest" release
+    # republishes identical filenames) and happened to match the release by luck — so the digest is
+    # recorded and recomputed rather than assumed. Non-cryptographic alternatives were rejected only
+    # because SHA-256 is already the tree's convention for file pinning.
+    "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 

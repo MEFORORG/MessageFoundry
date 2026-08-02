@@ -1303,6 +1303,10 @@ def _check_build(
             # hop raises here rather than shipping and only refusing at serve.
             posture=hop_posture_from_ai(settings.ai, enforcement=settings.security.enforcement),
             trust_anchor_policy=settings.tls.policy(),
+            # ADR 0154 D4: the EFFECTIVE ordering / max_attempts refusals need the resolved
+            # [delivery] defaults. Without them that arm is skipped rather than guessed, and the
+            # misconfiguration would surface only at serve rather than at commit/CI.
+            delivery=settings.delivery,
         )
     except WiringError as exc:
         return CheckResult("build-check", ok=False, required=True, detail=str(exc))

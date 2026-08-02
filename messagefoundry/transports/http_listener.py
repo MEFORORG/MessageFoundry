@@ -45,6 +45,8 @@ from messagefoundry.credential import client_cert_principal, constant_time_match
 from messagefoundry.redaction import safe_exc
 from messagefoundry.transports.base import (
     InboundHandler,
+    InboundReply,
+    ReplyOutcome,
     SourceConnector,
     peer_ip_allowed,
     register_source,
@@ -205,13 +207,18 @@ def build_response(
     call site.** This function joins the header block with ``\\r\\n``, so it *is* the chokepoint: a
     value carrying CR or LF is a header-injection primitive, and validating in the callers would mean
     each future consumer has to remember. Today every caller passes a literal, so this guards against
-    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``."""
+    a future one — notably the captured-reply path, which echoes a partner's ``Content-Type``.
+
+    **A ``204`` carries no entity headers.** RFC 9110 §15.3.5 forbids a body on a ``204``, and
+    ``Content-Length: 0`` beside it is at best noise and at worst a parser tripwire — some clients
+    treat an entity header on a bodyless status as a framing error. That matters here rather than
+    academically: ``reply_on_empty="204"`` is the default answer for a partner reply that is
+    deliberately empty, so this is ordinary traffic, not an edge case."""
     payload = body.encode("utf-8")
-    headers = [
-        _status_line(status),
-        _validated_header("Content-Type", content_type),
-        f"Content-Length: {len(payload)}",
-    ]
+    headers = [_status_line(status)]
+    if status != 204:
+        headers.append(_validated_header("Content-Type", content_type))
+        headers.append(f"Content-Length: {len(payload)}")
     headers.extend(_validated_header(name, value) for name, value in (extra_headers or {}).items())
     headers.extend(("Connection: close", "", ""))
     return "\r\n".join(headers).encode("ascii") + payload
@@ -426,6 +433,14 @@ class HttpSource(SourceConnector):
             {str(x): str(x) for x in subjects} if subjects else {}
         )
         self.intake_auth_health: str = str(s.get("intake_auth_health") or "require")
+        # Synchronous captured-downstream reply (ADR 0154 D4). reply_from's presence is the mode
+        # switch; absent, every path below is byte-identical to the shipped 202 slice (AC-8).
+        self.reply_from: str | None = s.get("reply_from") or None
+        self.reply_timeout: float = float(s.get("reply_timeout") or 30.0)
+        self.reply_on_timeout: str = str(s.get("reply_on_timeout") or "504")
+        self.reply_content_type: str = str(s.get("reply_content_type") or "passthrough")
+        self.reply_on_empty: str = str(s.get("reply_on_empty") or "204")
+        self.reply_write_timeout: float = float(s.get("reply_write_timeout") or 30.0)
         self._server: asyncio.Server | None = None
         self._handler: InboundHandler | None = None
         self._active = 0
@@ -455,6 +470,20 @@ class HttpSource(SourceConnector):
         # Stop accepting NEW connections (this alone does not close established ones).
         if self._server is not None:
             self._server.close()
+        # ADR 0154 D5 — the PRE-CLOSE drain phase, and its position is the whole point (AC-10).
+        #
+        # Waking blocked waiters must happen BEFORE the writers below are closed. Revision 1 of the
+        # ADR promised both the 503 and the existing close-first ordering; those are mutually
+        # exclusive. A 503 written after close() lands on a dead transport, and post-close asyncio
+        # typically DISCARDS the write with no exception at all — so _write_safely's
+        # `except (TimeoutError, OSError)` never even sees it and the demoted caller gets a bare
+        # connection reset instead of the answer the HA argument depends on.
+        #
+        # Each woken turn resolves `shutting_down` and writes its own 503 + Retry-After through its
+        # still-open writer on the way out, inside the same bounded grace the teardown already has.
+        # No-op when nothing is armed, so a listener with no reply_from is byte-identical.
+        if self.reply_drain is not None:
+            self.reply_drain("shutting_down")
         # Close established clients BEFORE awaiting the server (server.wait_closed() hangs on py3.12.1+
         # waiting for in-flight handlers of a peer holding its connection open). A request mid-handler
         # still finishes its commit (the body is durably stored before the 202, so at-least-once holds).
@@ -777,11 +806,100 @@ class HttpSource(SourceConnector):
         # (it becomes the message's ERROR/dead-letter + AlertSink). count-and-log holds: the body is
         # persisted before the response is written.
         message_id = await self._handler(request.body)
+
+        if self.reply_from and self.sync_reply is not None:
+            return await self._respond_with_sync_reply(writer, message_id, peer_host=peer_host)
+
         receipt = {"status": "accepted"}
         if message_id is not None:
             receipt["message_id"] = message_id
         await self._respond(writer, build_response(202, json.dumps(receipt)))
         return False
+
+    async def _respond_with_sync_reply(
+        self, writer: asyncio.StreamWriter, message_id: str | None, *, peer_host: str | None
+    ) -> bool:
+        """Block on the captured downstream reply and answer with it (ADR 0154 D5).
+
+        Reached only when ``reply_from`` is set **and** the runner injected a resolver, so an inbound
+        without it never takes this path — that is what makes AC-8's "unchanged" true rather than
+        aspirational.
+
+        **The HTTP status is never a second disposition channel.** Whatever is returned here, the
+        message stays committed and keeps flowing; its disposition is decided by the finalizer alone.
+        A ``504`` does not cancel a delivery, and a ``200`` does not complete one.
+        """
+        if message_id is None:
+            # The handler declined AFTER recording the message with status ERROR — that write IS the
+            # count-and-log record, so nothing is dropped here. On the 202 path this answers
+            # "202 without a message_id", which is a lie to a proxy client; on the sync path a
+            # caller waiting for a reply deserves to be told the submission itself failed.
+            await self._respond(writer, build_response(422, '{"error":"message was not accepted"}'))
+            return True
+
+        resolver = self.sync_reply
+        assert resolver is not None  # guarded by the caller, as _handler is above
+        reply = await resolver(message_id)
+        status, body, extra = self._reply_to_wire(reply, message_id)
+        # No reply-derived bytes reach the log — only the outcome enum, the destination and timings.
+        logger.debug(
+            "sync reply %s: outcome=%s dest=%s seq=%s waited_ms=%s",
+            message_id,
+            reply.outcome.value,
+            reply.destination,
+            reply.response_seq,
+            reply.waited_ms,
+        )
+        content_type = reply.content_type or "application/json"
+        try:
+            await self._respond(
+                writer,
+                build_response(status, body, content_type=content_type, extra_headers=extra),
+            )
+        except ValueError:
+            # A partner Content-Type that fails the header guard must not take the turn down with
+            # it: the body is still good, so fall back to our own type rather than 500 the caller.
+            await self._respond(writer, build_response(status, body, extra_headers=extra))
+        return False
+
+    def _reply_to_wire(
+        self, reply: InboundReply, message_id: str
+    ) -> tuple[int, str, dict[str, str] | None]:
+        """Map one resolved outcome onto ``(status, body, extra_headers)`` — ADR 0154 D5's table.
+
+        Every row of that table maps to exactly one outcome and every outcome to exactly one row.
+        Refusal and timeout bodies are **fixed, non-PHI JSON**; only ``reply`` and ``rejected`` carry
+        partner bytes, and those are exactly the two the caller asked to be proxied.
+        """
+        outcome = reply.outcome
+        if outcome is ReplyOutcome.REPLY:
+            return 200, reply.body or "", None
+        if outcome is ReplyOutcome.REJECTED:
+            # The partner's own negative answer is the most useful thing we can return.
+            return 502, reply.body or "", None
+        if outcome is ReplyOutcome.EMPTY:
+            return (204, "", None) if self.reply_on_empty == "204" else (200, "", None)
+        if outcome is ReplyOutcome.TIMEOUT:
+            payload = json.dumps({"status": "timeout", "message_id": message_id})
+            return (504 if self.reply_on_timeout == "504" else 202), payload, None
+        if outcome is ReplyOutcome.NO_ROUTE:
+            # Answered IMMEDIATELY with the timeout status rather than after the full budget: the
+            # message is already terminal, so waiting would burn the caller's patience for nothing.
+            payload = json.dumps({"status": "no_route", "message_id": message_id})
+            return (504 if self.reply_on_timeout == "504" else 202), payload, None
+        if outcome is ReplyOutcome.SHUTTING_DOWN:
+            payload = json.dumps({"status": "shutting_down", "message_id": message_id})
+            # Never a 504 on a demotion: the new leader is about to deliver this message, so claiming
+            # the partner timed out would be a lie about a message that is still in flight.
+            return 503, payload, {"Retry-After": "5"}
+        if outcome is ReplyOutcome.PURGED:
+            payload = json.dumps({"status": "reply_purged", "message_id": message_id})
+            return 502, payload, None
+        if outcome is ReplyOutcome.DEGRADED:
+            payload = json.dumps({"status": "degraded", "message_id": message_id})
+            return (504 if self.reply_on_timeout == "504" else 202), payload, None
+        payload = json.dumps({"status": "delivery_failed", "message_id": message_id})
+        return 502, payload, None
 
     async def _respond(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         """Write the success-path response, bounding the drain.
@@ -801,7 +919,23 @@ class HttpSource(SourceConnector):
         (ACK-on-receipt), so a lost 202 costs the sender a retry, never a message.
         """
         writer.write(data)
-        await asyncio.wait_for(writer.drain(), _CLIENT_SHUTDOWN_GRACE)
+        await asyncio.wait_for(writer.drain(), self._drain_budget())
+
+    def _drain_budget(self) -> float:
+        """Seconds allowed to drain a response to the caller.
+
+        ``_CLIENT_SHUTDOWN_GRACE`` for the shipped ``202`` path, which writes a few dozen bytes and
+        was bounded by that constant in increment A. A ``reply_from`` inbound instead uses its own
+        ``reply_write_timeout``, because it now carries a **partner-sized** body to a possibly slow
+        reader and a receipt-sized budget would truncate a legitimate large reply.
+
+        The two are not interchangeable in the other direction either: ``reply_write_timeout``
+        defaults to 30 s against a 5 s shutdown grace, so ``stop()`` clamps this to its own
+        sub-budget rather than letting one drain outlive the entire teardown by 6x.
+        """
+        if self.reply_from and self.reply_write_timeout:
+            return float(self.reply_write_timeout)
+        return _CLIENT_SHUTDOWN_GRACE
 
     async def _write_safely(self, writer: asyncio.StreamWriter, data: bytes) -> None:
         """Best-effort error/refuse response — never raise out of the refuse/close path (the socket may
