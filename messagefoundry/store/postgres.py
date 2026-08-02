@@ -103,6 +103,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, PoolStatus
 from messagefoundry.store.store import (
+    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
@@ -123,6 +124,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendKeyConflict,
     ResendOutcome,
     ResendSourceAmbiguous,
@@ -2669,13 +2671,19 @@ class PostgresStore:
         this lane's stranded head — a crashed/fenced prior leader's claimed rows are still ``inflight``
         under an expired ROW lease, and the PENDING-only head SELECT would skip them and reorder past
         the true head N. So before the head SELECT, this lane's expired-lease ``inflight`` rows are
-        returned to ``pending`` (scoped to ``lease_expires_at < now`` so it never disturbs a live
-        node's actively-processed rows — their leases are kept in the future by the worker's renew
-        timer), restoring head-of-line blocking: the recovered N is reconsidered as the (due) head and
-        blocks the lane until delivered. Without this, after a promotion the new leader would deliver
-        N+1 before N (a per-lane FIFO break across failover). The wall-clock lease shares Track B
-        Step 2's NTP assumption: set ``lease_ttl_seconds`` comfortably above clock skew + the claim
-        cadence."""
+        returned to ``pending`` (scoped to ``lease_expires_at < now``), restoring head-of-line blocking:
+        the recovered N is reconsidered as the (due) head and blocks the lane until delivered. Without
+        this, after a promotion the new leader would deliver N+1 before N (a per-lane FIFO break across
+        failover).
+
+        The ``lease_expires_at < now`` scope is what is meant to keep this off a live node's
+        actively-processed rows. **It is a one-shot claim-time stamp that is never renewed** — there is
+        no renew timer in this store (earlier text here asserted one). A row therefore becomes eligible
+        for this reclaim ``lease_ttl_seconds`` after it was CLAIMED, however long it has legitimately
+        been processing since, so the TTL must exceed the longest legitimate claim-to-terminal-write
+        hold, not merely the claim cadence. The wall-clock lease also shares Track B Step 2's NTP
+        assumption. Note this reclaim statement is NOT covered by the H1 epoch guard appended to the
+        claim below — it is a separate, unguarded statement in the same transaction."""
         now = time.time() if now is None else now
         lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
         lane_col = self._lane_col(stage)  # code-controlled literal
@@ -4244,6 +4252,34 @@ class PostgresStore:
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        message's own status is returned alongside the destination's row states."""
+        message_row = await self._fetchone("SELECT status FROM messages WHERE id=$1", message_id)
+        queue_rows = await self._fetchall(
+            "SELECT status FROM queue WHERE message_id=$1 AND stage=$2 AND destination_name=$3",
+            message_id,
+            Stage.OUTBOUND.value,
+            destination_name,
+        )
+        # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must never
+        # be mistaken for the partner's reply.
+        response_row = await self._fetchone(
+            "SELECT MAX(response_seq) AS seq FROM response"
+            " WHERE message_id=$1 AND destination_name=$2 AND kind=$3",
+            message_id,
+            destination_name,
+            "response",
+        )
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
+
     # --- recovery / replay ---------------------------------------------------
 
     async def reset_stale_inflight(
@@ -4565,9 +4601,17 @@ class PostgresStore:
 
         Clock assumption: the no-theft guarantee is a wall-clock lease — the reclaiming node compares
         its own ``now`` against a ``lease_expires_at`` stamped by the (possibly different) holder node's
-        clock. It holds only when node clocks are synchronized (NTP) to well within ``lease_ttl_seconds``;
-        set the TTL comfortably larger than expected skew + the renew interval so a skewed reclaimer
-        can't beat a live holder's lease."""
+        clock. It holds only when node clocks are synchronized (NTP) to well within ``lease_ttl_seconds``.
+
+        **The lease is stamped once at claim and never renewed** (there is no renew timer in this store,
+        despite what earlier text here claimed), and this sweep is OWNER-BLIND. Together those mean the
+        "live sibling" it must not steal from includes *this node itself*: any row still legitimately
+        claimed ``lease_ttl_seconds`` after it was claimed is eligible, and in active-passive the leader
+        that runs this sweep is the only node holding in-flight rows. Size ``lease_ttl_seconds`` above
+        the longest legitimate claim-to-terminal-write hold (connector ``timeout_seconds`` + pacing +
+        batch-gather) plus expected skew, not merely above skew. A row this sweep intercepts mid-flight
+        keeps the claim's ``attempts`` increment: ``release_claimed``/``reschedule_claimed`` are guarded
+        ``status='inflight'`` and silently no-op once the row is back to ``pending``."""
         now = time.time() if now is None else now
         result = await self._pool.execute(
             "UPDATE queue SET status=$3, owner=NULL, lease_expires_at=NULL,"
@@ -4594,11 +4638,22 @@ class PostgresStore:
         the prior leader's residue. Re-pending the stranded lane HEAD restores per-lane head-of-line
         blocking (no N+1-before-N reorder).
 
-        **Safe ONLY in active-passive** (the wired graph runs on the leader ONLY): the prior leader
-        self-fenced and its LEADERSHIP lease expired on the DB clock before this node could acquire it
-        (``heartbeat < fence < leader_lease_ttl`` is validator-enforced), so there is no live processor
-        whose rows this could steal — the SAME interlock the shipping SQL Server on-promotion
-        ``reset_stale_inflight`` relies on. Returns the number of queue rows re-pended."""
+        **Safe ONLY in active-passive** (the wired graph runs on the leader ONLY) — but be precise about
+        WHY, because the obvious argument is not sound. It is tempting to say the prior leader
+        self-fenced and its leadership lease expired before this node could acquire, so nothing is still
+        processing. ``heartbeat < fence < leader_lease_ttl`` is validator-enforced, but that ordering
+        establishes only that the prior leader stopped **reporting** itself leader; it does not
+        establish that it stopped **working**. The usable margin is short by the renew round trip and up
+        to one fence tick, and graph teardown — sequential source stops, each with its own grace — is
+        not budgeted against what remains. So this write CAN land on rows an ex-leader is still
+        mid-send on.
+
+        The real justification is directional: re-pending a row whose sender is still alive risks a
+        DUPLICATE delivery, which at-least-once explicitly permits and idempotent outbounds absorb;
+        NOT re-pending it risks a row stranded ``inflight`` under a one-shot lease with no owner left to
+        resolve it, which the count-and-log invariant forbids. This errs the way the invariant allows.
+        The shipping SQL Server on-promotion ``reset_stale_inflight`` makes the same trade, less
+        precisely — it is owner-blind where this is owner-scoped. Returns the number of rows re-pended."""
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             result = await conn.execute(
@@ -5478,6 +5533,28 @@ class PostgresStore:
         now = time.time() if now is None else now
         async with self._timed_acquire() as conn, conn.transaction():
             await self._event(conn, message_id, "viewed", None, actor or "", now)
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
+        (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._timed_acquire() as conn, conn.transaction():
+            await self._event(conn, message_id, event, destination, detail or "", now)
 
     async def record_audit(
         self,

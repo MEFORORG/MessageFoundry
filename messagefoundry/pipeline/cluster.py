@@ -114,9 +114,9 @@ class ClusterMember:
     dataclass (no API import) so the coordinator stays free of FastAPI/Pydantic — the API maps it to a
     :class:`~messagefoundry.api.models.ClusterNode` at the boundary. ``is_leader`` is the DERIVED
     leadership: at most one member carries it — the single freshest node whose durable ``nodes.is_leader``
-    heartbeat flag is set AND is fresh (``last_seen`` within ``node_timeout_seconds``) — so a crashed
-    ex-leader's stale flag is never reported as the live leader and a failover window cannot surface two
-    leaders. ``last_seen``/``started_at`` are epoch seconds, ``None`` only on the
+    heartbeat flag is set AND is fresh (``last_seen`` within ``node_timeout_seconds``). At most one
+    leader is reported; that it is the *live* one holds only while node clocks agree (see
+    :meth:`cluster_members`). ``last_seen``/``started_at`` are epoch seconds, ``None`` only on the
     :class:`NullCoordinator` synthetic self-entry (no DB)."""
 
     node_id: str
@@ -162,10 +162,19 @@ class ClusterCoordinator(Protocol):
         superseded ex-leader holds a strictly *older* epoch than the live leader. The engine reads this
         synchronously on promotion and pushes it into the store (:meth:`Store.set_leader_epoch`), where
         the FIFO claim validates ``held_epoch >= leader_lease.leader_epoch`` inside the single claim
-        transaction so a paused/superseded ex-leader's stale claim affects **0 rows** (Kleppmann fencing
-        token; store ↔ coordinator import direction is one-way — the engine pushes, the store never
+        transaction so a paused/superseded ex-leader **claims 0 rows** (Kleppmann fencing token; store ↔
+        coordinator import direction is one-way — the engine pushes, the store never
         imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`
-        returns ``None`` — single-node is unfenced (there is no second writer to fence)."""
+        returns ``None`` — single-node is unfenced (there is no second writer to fence).
+
+        **Scope of the fence — read this before relying on it.** The guard is appended to the claim
+        ``UPDATE`` and to nothing else. It does NOT cover (a) the cross-owner stranded-lease reclaim that
+        runs as the *first* statement of the same claim transaction, which commits even when the guarded
+        claim matches zero rows, or (b) any post-claim disposition write (``mark_done`` / ``mark_failed``
+        / ``dead_letter_now`` / ``complete_with_response``), each of which resolves its row by ``id``
+        alone with no epoch, owner, or status precondition. So a demoted ex-leader that is still inside
+        a send cannot *claim* anything, but can still *write* — including over a row the live leader has
+        already resolved. Do not read this token as a general write fence."""
         ...
 
     def lease_key(self) -> str | None:
@@ -389,8 +398,14 @@ class DbCoordinator:
         # always waits out the full TTL before taking over.
         self._lease_ttl = leader_lease_ttl_seconds
         # The SELF-FENCE timeout: a leader that has not renewed within this many seconds (its own
-        # monotonic clock, no DB I/O) demotes itself. MUST be < the TTL so the old leader stops before
-        # the lease can expire and a standby acquire — the split-brain guard.
+        # monotonic clock, no DB I/O) demotes itself. MUST be < the TTL — but note what that ordering
+        # does and does not buy. It bounds when this node stops *calling itself* leader; it does NOT
+        # bound when this node stops *acting*. Two terms sit outside the validator (settings.py
+        # _fence_ordering, which checks ordering only, never margin): the fence baseline is stamped
+        # AFTER the renew round trip returns while the lease expiry is stamped on the DB clock at
+        # statement execution, so the real margin is short by that round trip; and detection lands up to
+        # one _fence_tick late. Graph teardown is not budgeted against the remainder at all. Treat this
+        # as the split-brain DETECTION bound, not a proof that the old leader has stopped.
         self._fence_timeout = leader_fence_timeout_seconds
         # The fence watchdog polls this often; small relative to the fence timeout so a fence fires
         # promptly (well before the lease TTL). Pure in-memory check — no DB.
@@ -401,8 +416,13 @@ class DbCoordinator:
         self._acquire_delay = acquire_delay_seconds
         self._promotable = promotable
         # Monotonic clock for the fence (injectable for deterministic tests). Distinct from the DB clock
-        # the lease uses: the fence measures a node-local elapsed duration (skew-free by construction),
-        # the lease compares against the DB's own clock_timestamp() (so inter-node skew is irrelevant).
+        # the lease uses: the fence measures a node-local elapsed duration (free of INTER-NODE skew —
+        # that is the property being bought), the lease compares against the DB's own clock_timestamp().
+        # Caveat, because "monotonic" is not the same as "always advancing in real time": this measures
+        # elapsed AWAKE time on platforms whose monotonic source excludes suspend (CLOCK_MONOTONIC on
+        # Linux does; QueryPerformanceCounter on the Windows/NSSM target does not), while the lease it
+        # races runs on the DB clock, which never suspends. Where the two differ, the fence is late by
+        # the suspended interval and the node keeps reporting leader until its next maintenance tick.
         self._monotonic = monotonic
         # Namespace the nodes-DDL advisory lock by schema, exactly as PostgresStore._lock_key does:
         # advisory locks are database-scoped (not schema-scoped), so two deployments sharing one
@@ -563,8 +583,24 @@ class DbCoordinator:
           (largest ``last_seen``) is reported as leader. During a failover window two rows can briefly
           both be fresh-and-flagged — the crashed ex-leader whose ``last_seen`` is frozen at the crash
           instant, and the newly-promoted leader whose ``last_seen`` keeps advancing. Picking the
-          freshest collapses that overlap to the one node that is actually beating (the live leader), so
-          ``/cluster/nodes`` never shows two leaders and never names the dead node as leader.
+          freshest collapses that overlap to a single reported leader.
+
+        **This is a cross-node WALL-CLOCK comparison, and it is one-sided.** ``last_seen`` is stamped by
+        the beating node's ``time.time()`` and compared against the *reading* node's ``time.time()`` with
+        an upper bound only — there is no ``now - last_seen >= 0`` guard — so a row stamped by a node
+        whose clock runs ahead has a NEGATIVE age, trivially passes the freshness test, and (being the
+        largest ``last_seen``) wins the pick. A fast-clocked node therefore wins the derived-leader pick
+        for as long as it is alive, and keeps winning after it hard-crashes until the live successor's
+        advancing ``last_seen`` overtakes the frozen stamp (~the skew), while its row stays *eligible*
+        for skew + ``node_timeout_seconds``.
+
+        Two consequences a reader must not be surprised by. This field can name a DEAD node as leader
+        while the sibling ``lease_owner`` on the same ``/cluster/nodes`` response correctly names the
+        live one — the lease, not this field, is authoritative for who processes. And because the web
+        console raises engine health to ``down``/"cluster has no leader" only when the derived
+        ``leader_node_id`` is ``None``, a skew-frozen row keeps that non-``None`` and can mask a
+        genuinely leaderless cluster for that same interval. Do not gate operational decisions on the
+        derived leader; gate them on the lease.
 
         One DB read, returned ordered by ``node_id`` for a stable listing; off the message hot path
         (operator-driven)."""
@@ -903,8 +939,17 @@ class DbCoordinator:
         """Self-fence watchdog (Workstream A2). Wakes every ``_fence_tick`` and, doing **no DB I/O**,
         demotes this node if it has not confirmed a lease hold within ``_fence_timeout`` (monotonic).
         Because it never awaits the pool, a hung/partitioned DB — which would block the maintenance loop
-        mid-await — cannot stop it from fencing. ``_fence_timeout < lease_ttl`` guarantees a partitioned
-        old leader stops reporting leader BEFORE its lease can expire and a standby acquire it."""
+        mid-await — cannot stop it from fencing.
+
+        ``_fence_timeout < lease_ttl`` is what makes a partitioned old leader stop *reporting* leader
+        before its lease can expire — and that is the whole of it. Two caveats, both load-bearing for
+        anyone deriving a safety argument from this ordering. The margin is smaller than
+        ``lease_ttl - _fence_timeout``: the baseline this compares against is stamped after the renew
+        round trip RETURNS while the lease expiry is stamped on the DB clock at statement execution, and
+        detection lands up to one ``_fence_tick`` late. And demotion here flips a boolean — it cancels
+        no listener, worker, or in-flight send. Nothing budgets graph teardown against the remainder, so
+        **"fenced" does not imply "stopped processing"**; do not use this as a premise for a write that
+        assumes the prior leader is quiescent."""
         while not self._stop.is_set():
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self._fence_tick)

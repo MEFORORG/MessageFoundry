@@ -60,6 +60,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendError,
     ResendKeyConflict,
     ResendOutcome,
@@ -777,6 +778,19 @@ class QueueStore(StoreLifecycle, Protocol):
         raise a ``queue_buildup`` alert when a lane stops draining. Cheap: a single COUNT + MIN."""
         ...
 
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
+        status, the awaited destination's outbound row states, and the highest committed
+        ``response_seq`` for it.
+
+        The inbound HTTP listener's sync-reply path polls this while a caller is blocked, so it must
+        stay cheap and must decrypt **nothing** — see :class:`ReplyWaitState`, which also documents
+        why the message status is returned alongside the rows rather than the rows being read alone.
+        Returning ``latest_response_seq`` rather than the body is what keeps a tick metadata-only:
+        the reply is fetched once, through :meth:`correlate_response`, after a row is proven
+        committed."""
+        ...
+
     async def reset_stale_inflight(
         self,
         now: float | None = None,
@@ -1007,6 +1021,31 @@ class QueueStore(StoreLifecycle, Protocol):
     async def events_for(self, message_id: str) -> Sequence[Row]: ...
 
     # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        Lives on this protocol rather than :class:`AuditStore` because ``message_events`` is the
+        per-message **disposition timeline** — queue-domain, the sibling of
+        :meth:`record_connection_event` — not the tamper-evident ``audit_log``. That placement is also
+        what lets ``pipeline/`` reach it through the store it already holds, with no cast.
+
+        Before this there was **no** public message-event writer: ``_event`` is private to each
+        backend and only ever called inside a store-owned transaction, so neither ``pipeline/`` nor
+        ``transports/`` could record a disposition event at all.
+
+        ``event`` is validated against :data:`MESSAGE_EVENT_KINDS` at runtime — the static
+        literal-call-site guard in ``tests/test_phi_logging_inventory.py`` AST-walks for a *constant*
+        first argument and therefore cannot see a kind forwarded through here."""
+        ...
+
     async def record_connection_event(
         self,
         *,

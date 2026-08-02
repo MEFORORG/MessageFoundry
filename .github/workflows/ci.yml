@@ -129,10 +129,11 @@ jobs:
       #
       # EVERY install below passes `--constraint constraints.lock` — the HASHLESS export of uv.lock, kept
       # in sync by the DEP-1 gate. Without it, `uv pip install -e ".[extras]"` RE-RESOLVES from
-      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 (626
-      # lint errors) and annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY
-      # open PR on the same day. The constraint pins every version to the lock while each job still
-      # installs only ITS OWN extras (so the narrow image-smoke set stays narrow).
+      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 and
+      # annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY open PR on the same
+      # day — see each cap's rationale in pyproject.toml. The constraint pins every version to the lock
+      # while each job still installs only ITS OWN extras (so windows-service-smoke's deliberately
+      # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -212,8 +213,57 @@ jobs:
       #     per-test dump is attributed first; this is the last-resort stack when the thread method is
       #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
       #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
-      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
-      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
+      # The step `timeout-minutes` (matrix `step_timeout`) is the outer backstop, held well under the
+      # job's own cap, so a hang both watchdogs somehow miss still fails the STEP (not the whole job at
+      # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
+      # an uninformative job-level kill with no step attribution.
+      #
+      # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
+      # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
+      # a failure on a run whose last line was "9598 passed, 855 skipped". A watchdog that cannot
+      # separate "deadlocked" from "slow today" stops being a watchdog and becomes a coin flip, so the
+      # ubuntu budget is raised here. Re-check the margin when the suite grows.
+      #
+      # It then happened again on WINDOWS, 2026-08-01, because the sentence that used to close this
+      # paragraph asserted the Windows legs held "~2x headroom" and nobody re-derived it. PR #119 was
+      # killed at 26:07 against the 26:00 cap with ZERO tests failing. What moved was the suite, not the
+      # code under test: #74 landed tests/test_worktree_prune_merged.py (1,506 lines) and windows-2025
+      # went 19:35 -> 26:07 on the same branch. The claim was already false when it was written.
+      #
+      # Measured over the 11 PASSING windows-2025 runs on 2026-08-01, timing the `Tests (pytest)` STEP,
+      # which is what step_timeout gates. NOT the job: the job is ~3 min longer and capped separately,
+      # and two sessions misread job durations as step durations while triaging this (c53f752b's JOB ran
+      # 28:41 and PASSED, because job cap 30 vs step cap 26).
+      #
+      #   leg              max passing step   old cap   old margin
+      #   ubuntu-latest    12:27              19:00     1.53x
+      #   windows-2022     18:39              26:00     1.39x
+      #   windows-2025     24:35              26:00     1.06x
+      #
+      # windows-2025 had already PASSED at 24:35 -- 85 seconds of margin -- before #119 died. The "2x"
+      # figure matched no leg. State the MEASURED value and its DATE, never a round multiple: a bare
+      # multiple gives the next reader no way to tell when it has rotted, which is how this one survived.
+      #
+      # PROOF IT WAS THE CAP, NOT THE BRANCH. #119's windows-2025 leg was RE-RUN on the SAME commit
+      # against the SAME 26:00 cap: attempt 1 was killed at the cap, attempt 2 concluded SUCCESS. Same
+      # code, same config, same ceiling, two outcomes. The leg was not failing -- it was coin-flipping
+      # against the cap, exactly the state the ubuntu note above names, and the reason "re-run it and
+      # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
+      # that runner was fast enough that time.
+      #
+      # 36:00 is 1.46x over that 24:35 maximum -- the margin ubuntu already runs with. Both Windows legs
+      # take the same number: windows-2022 is the faster of the two, so sizing on windows-2025 only
+      # leaves it more room, and one value is one thing to re-derive. job_timeout moves 30 -> 40 to keep
+      # the nesting invariant above: the step must still expire strictly BEFORE the job.
+      #
+      # This cap is NOT what catches a hung test; pytest_timeout (120s) is, per test. The step cap only
+      # catches a whole-process deadlock both in-process watchdogs miss, which is why it can sit well
+      # above a healthy run. Sizing it tight buys no detection and costs false failures on green suites,
+      # twice now.
+      #
+      # The remaining margin is a SHARED budget across every PR that lands and nothing accounts for it:
+      # three PRs each adding a minute of Windows time reproduce #119's death, individually blameless.
+      # A mechanical guard for that is BACKLOG #341; the underlying slowness is #320.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
@@ -288,7 +338,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
@@ -371,9 +421,9 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":15,"step_timeout":13,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":22,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":40,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":40,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else

@@ -128,6 +128,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/config/fingerprint.py": frozenset({"hashlib"}),
     "messagefoundry/config/tls_policy.py": frozenset({"ssl"}),
     "messagefoundry/config/wiring.py": frozenset({"hashlib"}),
+    # ADR 0154 (D6): the neutral credential leaf both the transports and the API depend on.
+    # `hmac.compare_digest` over fixed-width SHA-256 digests of BOTH sides — the digesting is what
+    # makes the comparison length-blind, so a credential's length cannot leak by timing. Not a
+    # password hash (no KDF, no stored verifier): this compares a presented shared secret against a
+    # configured one that is already in memory from env(). Password storage remains argon2 in
+    # auth/passwords.py.
+    "messagefoundry/credential.py": frozenset({"hashlib", "hmac"}),
     # CONSOLE-3 (ADR 0088: extracted from console/client.py to the Qt-free apiclient library): the
     # engine-client verifies the engine API server cert — the OS trust store (truststore.SSLContext,
     # a CRYPTO_LIBRARY_MODULES trigger) by default, or a pinned PEM via --cacert
@@ -221,7 +228,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
     # ADR 0085: DIRECT-HISP outbound S/MIME — cryptography.serialization.pkcs7 SIGN then ENCRYPT of the
     # Handler body + x509 recipient-cert / trust-anchor cross-validation at construction. No new dependency.
-    "messagefoundry/transports/direct.py": frozenset({"cryptography"}),
+    # #323: ssl = the SMTP/HISP relay's TRANSPORT hop, a separate concern from the S/MIME message
+    # layer above. The context is built by tls_policy.build_smtp_tls_context and handed to smtplib,
+    # which otherwise defaults to ssl._create_stdlib_context -- which IS _create_unverified_context
+    # (CERT_NONE / check_hostname=False). CERT_NONE only under the CLAMPED tls_verify=false escape.
+    "messagefoundry/transports/direct.py": frozenset({"cryptography", "ssl"}),
+    # #323: EMAIL outbound STARTTLS (587) / implicit TLS (465). Same factory, same reason as above --
+    # an explicit verifying context anchored to the OS roots, a per-connection tls_ca_file, or
+    # [tls].internal_ca_file (ADR 0093), because smtplib's own default verifies nothing.
+    "messagefoundry/transports/email.py": frozenset({"ssl"}),
     # ADR 0129 (#142): hashlib = sha256 of a source file's identity (name+mtime+size) as a HASHED dedup
     # key for the leave-in-place processed_files ledger — a DERIVED id, never a cleartext filename (which
     # can embed an MRN), never logged. Not a secret/keyed primitive.
@@ -310,6 +325,19 @@ INVENTORY: dict[str, frozenset[str]] = {
     # #14: the tee's stdlib MEFOR engine-API client accepts an optional ssl.SSLContext for authenticated
     # GETs against an https engine (the tee stays stdlib-only; no mTLS / rich-retry client).
     "tee/mefor_api.py": frozenset({"ssl"}),
+    # ADR 0155: the DAST scan target generates a THROWAWAY per-run password (secrets.token_urlsafe) for
+    # the two ephemeral scan identities it provisions into a store it creates empty in a temp directory
+    # and destroys with it. Not a key and never persisted: a checked-in constant would be strictly
+    # weaker, and the alternative — an operator-supplied credential — is the optional escape hatch only.
+    # ADR 0156: SHA-256 over the OWASP ASVS corpus FILE, to pin it to the tagged v5.0.0_release
+    # asset. Integrity of a build input, not a security control: no secret, no key, no message
+    # authentication, and nothing user- or PHI-derived is hashed. It exists because the corpus was
+    # originally fetched from `master` (the bleeding-edge branch, where a rolling "latest" release
+    # republishes identical filenames) and happened to match the release by luck — so the digest is
+    # recorded and recomputed rather than assumed. Non-cryptographic alternatives were rejected only
+    # because SHA-256 is already the tree's convention for file pinning.
+    "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
+    "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 
 

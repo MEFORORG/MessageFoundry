@@ -81,6 +81,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, ClaimPoolStatus, PoolStatus
 from messagefoundry.store.store import (
+    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
@@ -101,6 +102,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendKeyConflict,
     ResendOutcome,
     ResendSourceAmbiguous,
@@ -7644,6 +7646,30 @@ class SqlServerStore:
         oldest = row["m"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        message's own status is returned alongside the destination's row states."""
+        message_row = await self._fetchone("SELECT status FROM messages WHERE id=?", (message_id,))
+        queue_rows = await self._fetchall(
+            "SELECT status FROM queue WHERE message_id=? AND stage=? AND destination_name=?",
+            (message_id, Stage.OUTBOUND.value, destination_name),
+        )
+        # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must never
+        # be mistaken for the partner's reply.
+        response_row = await self._fetchone(
+            "SELECT MAX(response_seq) AS seq FROM response"
+            " WHERE message_id=? AND destination_name=? AND kind=?",
+            (message_id, destination_name, "response"),
+        )
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -8478,6 +8504,33 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await self._event(cur, message_id, "viewed", None, actor or "", now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
+        (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await self._event(cur, message_id, event, destination, detail or "", now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()

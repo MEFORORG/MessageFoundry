@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 
 import pytest
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
 from messagefoundry.api.app import create_app
@@ -40,6 +40,7 @@ from messagefoundry.auth.permissions import (
     Role,
 )
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
+from scripts.security.route_gates import gate_of, route_rows
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -542,64 +543,26 @@ def _table_with_header(block: str, first_cell: str) -> list[list[str]]:
 # --- route walk (derived from the live app, never hardcoded) -----------------------------------------
 
 
-def _gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
-    """``(gate name, permission wire strings, action)`` for a route dependency built by one of the
-    ``require*()`` factories, by reading the closure cells the factory captured. Recurses through the
-    ``base`` cell, because require_paced / require_phi_read / require_step_up* wrap ``require``'s
-    closure. Returns ``None`` for a dependency that is not one of those factories."""
-    closure = getattr(call, "__closure__", None)
-    code = getattr(call, "__code__", None)
-    if closure is None or code is None:
-        return None
-    qualname = getattr(call, "__qualname__", "") or ""
-    name = qualname.split(".")[0]
-    if not name.startswith("require"):
-        return None
-    cells = dict(zip(code.co_freevars, closure, strict=False))
-    perms: tuple[str, ...] = ()
-    action: str | None = None
-    base_info: tuple[str, tuple[str, ...], str | None] | None = None
-    for var, cell in cells.items():
-        try:
-            value = cell.cell_contents
-        except ValueError:  # pragma: no cover - an empty cell cannot occur on a built dependency
-            continue
-        if var == "permissions" and isinstance(value, tuple):
-            perms = tuple(p.value for p in value if isinstance(p, Permission))
-        elif var == "action" and isinstance(value, str):
-            action = value
-        elif var == "base":
-            base_info = _gate_of(value)
-    if not perms and base_info is not None:
-        perms = base_info[1]
-    return (name, perms, action)
+# The walk itself lives in scripts/security/route_gates.py — ONE implementation, shared with the DAST
+# authorization sweep (ADR 0155). It used to be a private copy here, and two copies of a derivation are
+# free to disagree in a way nobody can see: messagefoundry/api/security.py already records a refactor
+# that renamed the gate closure's qualname and made EVERY route read as UNGATED. A guard built on this
+# walk therefore has a failure mode where it keeps passing while measuring nothing, and with the walk
+# duplicated that failure would have had to be found TWICE.
+#
+# ``_gate_of`` keeps its private name because ``_ui_route_rows`` below reads the ``require_ui*``
+# closures with it unchanged.
+_gate_of = gate_of
 
 
 def _route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
     """``(method, path, permissions, gate name)`` for every route object of a default ``create_app()``.
-    ``gate name`` is ``None`` when no ``require*()`` dependency was found."""
-    rows: list[tuple[str, str, tuple[str, ...], str | None]] = []
-    for route in create_app().routes:
-        if isinstance(route, APIRoute):
-            methods = sorted(m for m in (route.methods or set()) if m not in ("HEAD", "OPTIONS"))
-            gate: tuple[str, tuple[str, ...], str | None] | None = None
-            for dep in route.dependant.dependencies:
-                found = _gate_of(dep.call)
-                if found is not None:
-                    gate = found
-                    break
-            for method in methods:
-                rows.append(
-                    (method, route.path, gate[1] if gate else (), gate[0] if gate else None)
-                )
-        elif isinstance(route, APIWebSocketRoute):
-            # The WS route authorizes inside the endpoint body, so read its source for the constant.
-            import inspect
+    ``gate name`` is ``None`` when no ``require*()`` dependency was found.
 
-            source = inspect.getsource(route.endpoint)
-            perms = tuple(p.value for p in Permission if f"Permission.{p.name}" in source)
-            rows.append(("WS", route.path, perms, "authorize_ws"))
-    return rows
+    A thin adapter over the shared :func:`scripts.security.route_gates.route_rows`, which returns
+    ``RouteRow`` dataclasses; the tuple shape is what this module's call sites unpack.
+    """
+    return [(row.method, row.path, row.permissions, row.gate) for row in route_rows()]
 
 
 # =====================================================================================================

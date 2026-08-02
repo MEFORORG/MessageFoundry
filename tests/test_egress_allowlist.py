@@ -192,3 +192,64 @@ async def test_runner_threads_require_structured_into_fhir_executor(tmp_path: Pa
         assert ex_off is not None and ex_off._require_structured is False
     finally:
         await store.close()
+
+
+# --- Credential-bearing token endpoints (ASVS 14.2.3) --------------------------------------------
+# A token URL is a SECOND egress host that receives CREDENTIALS, distinct from the data `url` the
+# host gate checks. `smart_token_url` was gated from the start; `oauth2_token_url` was NOT, until
+# 2026-07-31 — its only validation was the http(s) scheme check in transports/http_auth.py, so a
+# crafted value exfiltrated client_id + client_secret to any host while [egress].allowed_http gated
+# only the data URL.
+
+
+def _rest(url: str, **extra: str) -> Destination:
+    return Destination(name="OB", type=ConnectorType.REST, settings={"url": url, **extra})
+
+
+def test_outbound_denies_unlisted_oauth2_token_url() -> None:
+    """The data host is allowlisted and the token host is not — the credential POST must be refused."""
+    egress = EgressSettings(allowed_http=["api.partner.org"])
+    dest = _rest("https://api.partner.org/v1", oauth2_token_url="https://evil.example/token")
+    with pytest.raises(WiringError, match="OAuth2 token endpoint"):
+        check_egress_allowed(dest, egress)
+
+
+def test_outbound_permits_allowlisted_oauth2_token_url() -> None:
+    egress = EgressSettings(allowed_http=["api.partner.org", "auth.partner.org"])
+    dest = _rest("https://api.partner.org/v1", oauth2_token_url="https://auth.partner.org/token")
+    check_egress_allowed(dest, egress)  # no raise
+
+
+def test_outbound_unset_oauth2_token_url_is_a_no_op() -> None:
+    egress = EgressSettings(allowed_http=["api.partner.org"])
+    check_egress_allowed(_rest("https://api.partner.org/v1"), egress)  # no raise
+
+
+def test_every_credential_token_url_key_is_gated_on_the_outbound_arm() -> None:
+    """Structural guard, not a point check: EVERY key in the credential-URL table must be refused
+    when it points off-allowlist. This is what stops the next credential-bearing endpoint setting
+    from shipping ungated the way `oauth2_token_url` did — add a key to the table and this test
+    fails until the gate actually covers it."""
+    from messagefoundry.pipeline.wiring_runner import _CREDENTIAL_EGRESS_URL_KEYS
+
+    assert _CREDENTIAL_EGRESS_URL_KEYS, "the credential-URL table must not be empty"
+    egress = EgressSettings(allowed_http=["api.partner.org"])
+    for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
+        dest = _rest("https://api.partner.org/v1", **{key: "https://evil.example/token"})
+        with pytest.raises(WiringError, match=what):
+            check_egress_allowed(dest, egress)
+
+
+def test_every_credential_token_url_key_is_gated_on_the_lookup_arm() -> None:
+    """The read arm must stay in lockstep with the outbound arm — DELTA-04 was exactly that drift
+    (the read arm gated only `url`). Same table, both arms, asserted together."""
+    from messagefoundry.pipeline.wiring_runner import (
+        _CREDENTIAL_EGRESS_URL_KEYS,
+        check_fhir_lookup_allowed,
+    )
+
+    egress = EgressSettings(allowed_http=["fhir.example.org"])
+    for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
+        settings = {"url": "https://fhir.example.org/fhir", key: "https://evil.example/token"}
+        with pytest.raises(WiringError, match=what):
+            check_fhir_lookup_allowed("epic", settings, egress)
