@@ -217,6 +217,11 @@ Three things that cost real time here:
   update a `BEHIND` branch. Landing PR A puts PR B `BEHIND`, and B
   sits armed and stalled indefinitely. Someone has to rebase it. If you queue two PRs, expect to rebase
   the second after the first lands.
+  *Measured 2026-08-02, when `allow_update_branch` was `false` on this repo. It was set `true` later
+  that day; whether GitHub then auto-updates an armed `BEHIND` branch when `main` moves is
+  **unverified** — no back-fill has been observed, and GitHub's documentation does not connect the
+  setting to that behaviour. Until someone records one, assume the above and keep a capped
+  `update-branch` loop.*
 - **`BEHIND` and `DIRTY` are easy to confuse and the wrong fix is destructive.** Treating `DIRTY` as
   `BEHIND` means resolving conflicts in a hurry to make a force-push succeed.
 
@@ -272,6 +277,19 @@ git diff --stat origin/main HEAD                # two-dot: tree vs tree, no merg
 ```
 
 A non-zero deletion count from the second, on a branch that only adds files, is the signal.
+
+**The first check is the load-bearing one; the second only confirms it.** Once `--is-ancestor` passes,
+the merge base *is* `origin/main`, so two-dot and three-dot are computing the same thing and cannot
+disagree — a matching diff at that point proves nothing you did not already know. The trap only exists
+in the window where that check fails. Measured on this branch, minutes apart:
+
+| `--is-ancestor` | two-dot | three-dot |
+|---|---|---|
+| fails (stale checkout) | 2 files, 52 insertions, **22 deletions** | 1 file, 50 insertions — deletions **hidden** |
+| passes | 1 file, 50 insertions | 1 file, 50 insertions — identical |
+
+So run `--is-ancestor` first and treat a failure as the finding. Reaching for the diff alone is how the
+trap survives a check: on the branch you are most likely to test, it agrees with itself.
 
 The fix is to **merge `origin/main` into the branch**, not to rebase: the conflicting files are work
 that already landed via the squash, so main's side is authoritative and taking it drops nothing. Then
