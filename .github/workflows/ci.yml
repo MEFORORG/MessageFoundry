@@ -261,7 +261,9 @@ jobs:
       # correctly, by the filter above -- dropped for not concluding success. So 25:51 is the largest
       # step that FIT in 26:00, not the largest the suite wants. Sizing a cap as a multiple of a
       # censored maximum under-provisions by construction, and that is exactly how "1.06x" read as
-      # survivable right up until #119 died at 26:07.
+      # survivable right up until #119's leg was killed at 26:07. (#119 itself merged, 2026-08-02T01:45Z
+      # -- what the cap killed was a run, not the PR. Saying a PR "died" here reads as never-landed and
+      # had already propagated into docs/WORKTREES.md as exactly that claim.)
       #
       # THE CENSORED VALUES ARE VISIBLE IF YOU ASK FOR THEM, AND THEY MATTER. The jobs endpoint defaults
       # to `filter=latest`, which hides a killed attempt behind its passing re-run; `?filter=all` shows
@@ -315,8 +317,8 @@ jobs:
       # for is telling you the margin is thinner than the ratio suggests. RE-DERIVE IF a windows-2025
       # `Tests (pytest)` step is ever seen above 28:00 -- that is the trigger, not a calendar reminder.
       #
-      # A ratio against one run says nothing about a distribution, and #119 died from the distribution,
-      # not from its own duration. Both Windows legs take the same number: windows-2022 is the faster, so
+      # A ratio against one run says nothing about a distribution, and #119's leg was killed by the
+      # distribution, not by its own duration. Both Windows legs take the same number: windows-2022 is the faster, so
       # sizing on windows-2025 only leaves it more room, and one value is one thing to re-derive.
       #
       # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
@@ -382,7 +384,7 @@ jobs:
       # twice now.
       #
       # The remaining margin is a SHARED budget across every PR that lands and nothing accounts for it:
-      # three PRs each adding a minute of Windows time reproduce #119's death, individually blameless.
+      # three PRs each adding a minute of Windows time reproduce #119's kill, individually blameless.
       # A mechanical guard for that is BACKLOG #344 item 1; the underlying slowness is #320.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
