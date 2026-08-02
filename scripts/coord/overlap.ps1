@@ -68,6 +68,13 @@ function ConvertTo-Norm([string]$p) {
     return ($p -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
+# One emitter for every -Json exit, so no path can print nothing. See the note at the -File query below.
+function Write-JsonArray($Rows) {
+    $r = @($Rows)
+    if ($r.Count -eq 0) { Write-Output "[]"; return }
+    Write-Output ($r | ConvertTo-Json -Depth 6 -AsArray)
+}
+
 $gitArgs = @(); if ($Repo) { $gitArgs = @("-C", $Repo) }
 $common = (& git @gitArgs rev-parse --path-format=absolute --git-common-dir 2>$null)
 if ($LASTEXITCODE -ne 0 -or -not $common) {
@@ -127,8 +134,35 @@ function Build-Map {
         $sessionsByCwd[$k] = $e.Record
     }
 
+    $worktrees = @(Get-WorktreeList)
+
+    # ATTRIBUTE A SESSION TO THE MOST SPECIFIC WORKTREE CONTAINING IT, not to the first one that matches.
+    #
+    # Linked worktrees live UNDER the primary checkout (.../MessageFoundry/.claude/worktrees/<name>), so
+    # every linked worktree's path is ALSO a prefix match for the primary's row. The old rule walked the
+    # session table and broke on the first hit, so the primary row was handed whichever linked-worktree
+    # session the hashtable happened to enumerate first -- reporting the primary checkout as LIVE, on a
+    # branch nobody was on, "building" a peer's task list. Hashtable order is not stable, so the wrong
+    # answer was also a different wrong answer each run, which is why it read as noise rather than a bug.
+    #
+    # Longest prefix wins is the only rule that survives nesting: a session in .../worktrees/foo matches
+    # both the primary and foo, and foo is the one it is actually sitting in.
+    $ownerByWorktree = @{}
+    foreach ($k in @($sessionsByCwd.Keys | Sort-Object)) {
+        $best = $null
+        foreach ($w in $worktrees) {
+            $wn = ConvertTo-Norm $w.Path
+            if ($k -eq $wn -or $k.StartsWith("$wn/")) {
+                if ($null -eq $best -or $wn.Length -gt $best.Length) { $best = $wn }
+            }
+        }
+        # Two sessions inside one worktree: first by sorted cwd, so the answer is at least the SAME
+        # answer every run. Reporting one of them is correct -- the row says the worktree is live.
+        if ($best -and -not $ownerByWorktree.ContainsKey($best)) { $ownerByWorktree[$best] = $sessionsByCwd[$k] }
+    }
+
     $rows = @()
-    foreach ($w in (Get-WorktreeList)) {
+    foreach ($w in $worktrees) {
         $norm = ConvertTo-Norm $w.Path
         if ($norm -eq $myRootNorm) { continue }   # not a collision with yourself
         if (-not (Test-Path -LiteralPath $w.Path)) { continue }
@@ -169,11 +203,9 @@ function Build-Map {
         $files += $dirty
         $files = @($files | Where-Object { $_ } | Sort-Object -Unique)
 
-        # A session sitting anywhere INSIDE the worktree owns it, not just one whose cwd is the root.
-        $sess = $null
-        foreach ($k in $sessionsByCwd.Keys) {
-            if ($k -eq $norm -or $k.StartsWith("$norm/")) { $sess = $sessionsByCwd[$k]; break }
-        }
+        # A session sitting anywhere INSIDE the worktree owns it, not just one whose cwd is the root --
+        # resolved above, against every worktree at once, because "inside" is ambiguous when they nest.
+        $sess = $ownerByWorktree[$norm]
         if ($files.Count -eq 0 -and -not $sess) { continue }
 
         $rows += [pscustomobject]@{
@@ -241,7 +273,13 @@ if ($File) {
             $hits += $r
         }
     }
-    if ($Json) { ($hits | ConvertTo-Json -Depth 6 -AsArray) | Write-Output; exit 0 }
+    # ALWAYS EMIT AN ARRAY. `@() | ConvertTo-Json -AsArray` sends ZERO objects down the pipeline, so
+    # ConvertTo-Json never runs and the script prints NOTHING -- despite -AsArray, which only shapes
+    # output that exists. "Nobody else is in this file" therefore looked identical on stdout to "this
+    # script died before it could answer", and a consumer had no way to tell an all-clear from a
+    # failure. (-InputObject is not the fix: with -AsArray it double-wraps to [[]].) Measured
+    # 2026-08-02 against the real script.
+    if ($Json) { (Write-JsonArray $hits); exit 0 }
     foreach ($h in $hits) {
         $state = if ($h.Live) { "LIVE $($h.Surface) session $($h.Short)" } else { "dormant worktree" }
         Write-Host "  $File is also changed by $state in $($h.Worktree) [$($h.Branch)]"
@@ -249,7 +287,7 @@ if ($File) {
     exit 0
 }
 
-if ($Json) { ($map | ConvertTo-Json -Depth 6 -AsArray) | Write-Output; exit 0 }
+if ($Json) { (Write-JsonArray $map); exit 0 }
 
 if (@($map).Count -eq 0) { Write-Host "No other worktree has changes."; exit 0 }
 Write-Host ""

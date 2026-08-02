@@ -162,6 +162,57 @@ def test_an_untouched_file_is_not_reported(
     assert query(primary, tmp_path, "beta.txt") == []
 
 
+def raw_query(primary: Path, tmp_path: Path, path: str) -> str:
+    """The same query, but returning stdout VERBATIM -- ``query`` above maps '' to [] and would hide
+    the very difference under test."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(OVERLAP),
+            "-Repo",
+            str(primary),
+            "-File",
+            path,
+            "-Json",
+            "-Refresh",
+            "-ConfigRoot",
+            str(tmp_path / "no-such-config"),
+            "-TasksDir",
+            str(tmp_path / "no-such-tasks"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}"
+    return proc.stdout.strip()
+
+
+def test_a_json_query_always_emits_an_array(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """AN ANSWER OF "NOBODY" MUST NOT LOOK LIKE NO ANSWER.
+
+    ``@() | ConvertTo-Json -AsArray`` sends zero objects down the pipeline, so ConvertTo-Json never runs
+    and the script printed NOTHING -- ``-AsArray`` only shapes output that exists. On stdout that is
+    byte-for-byte what a script dying before it answers looks like, so no consumer could separate an
+    all-clear from a failure. The collision gate consumes this on every Edit and Write; measured
+    2026-08-02, the gate reported "could not check" on an ordinary edit to an untouched file because of
+    exactly this.
+    """
+    primary, peer = peer_worktree
+    (peer / "alpha.txt").write_text("base\nunsaved\n", encoding="utf-8")
+
+    assert raw_query(primary, tmp_path, "beta.txt") == "[]", "a no-hit query must still answer"
+    hit = raw_query(primary, tmp_path, "alpha.txt")
+    assert hit.startswith("["), f"a hit must be an array too, not a bare object: {hit[:80]}"
+    assert json.loads(hit), "and it must parse with at least one row"
+
+
 def test_overlap_does_not_rewrite_a_peers_git_index(
     peer_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:
