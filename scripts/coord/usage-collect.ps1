@@ -15,11 +15,17 @@
     a checkout, and a repo-scoped copy would be a second truth that goes stale.
 
     WHAT IT CANNOT SEE, STATED HERE SO NOTHING DOWNSTREAM IMPLIES OTHERWISE. The statusLine payload
-    carries `five_hour` and `seven_day` only. The PER-MODEL weekly buckets (the "Weekly / Fable" or
-    Opus/Sonnet bars in Settings > Usage) and the plan tier are NOT in it, and the request to expose
-    them was closed as not-planned. If Opus is being burned hard, the bucket most likely to cut a
-    session off is one this file cannot report. Readers must render that as UNKNOWN, never as 0 or as
-    "fine" -- an absent bucket is not an empty one.
+    carries `five_hour` and `seven_day` only. Absent: the MODEL-SCOPED weekly bucket (the "Weekly /
+    Fable" bar in Settings > Usage) and the plan tier. The request to expose them was closed as
+    not-planned.
+
+    OPUS IS NOT ONE OF THE GAPS, and an earlier draft of this file said it was. Opus and Sonnet have no
+    separate weekly bucket on this plan -- they draw on "All models", which IS the `seven_day` window
+    published here. So for Opus work the coverage is complete, and a warning implying otherwise would
+    make sessions distrust an accurate reading. Only a model with its OWN bar (Fable) is unmeasured.
+    Corrected 2026-08-02 by the account holder against the actual Settings > Usage panel; the wrong
+    version came from reading `seven_day_opus`/`seven_day_sonnet` in an undocumented endpoint's SCHEMA
+    and assuming a field implies an active limit.
 
     NEVER THROWS, NEVER BLOCKS. A statusLine that errors or hangs degrades the session it is decorating,
     so every path is wrapped and the worst case is a bare line of text with no publish. Writes are
@@ -135,10 +141,11 @@ try {
         }
         five_hour     = $five
         seven_day     = $seven
-        # Named explicitly rather than omitted, so a reader cannot mistake "this build never collected it"
-        # for "the account has none".
+        # Named explicitly rather than omitted, so a reader cannot mistake "this build never collected
+        # it" for "the account has none". Opus is deliberately NOT listed: it has no separate weekly
+        # bucket and is covered by seven_day.
         unavailable   = @(
-            "per_model_weekly (Fable/Opus/Sonnet) -- not present in the statusLine payload",
+            "model_scoped_weekly (Fable) -- not present in the statusLine payload",
             "plan_tier -- not present in the statusLine payload"
         )
         source        = "claude-code statusLine rate_limits"

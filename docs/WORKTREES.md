@@ -393,11 +393,16 @@ never publish it itself. `refreshInterval` is set because statusLine updates are
 silent when a session is idle — Anthropic's docs name *"a coordinator waits on background subagents"* as
 exactly the case where that leaves you blind.
 
-**Two of the four Settings > Usage numbers are not available at all.** The payload carries `five_hour`
-and `seven_day` only. The **per-model weekly buckets** (the Fable/Opus/Sonnet bars) and the **plan tier**
-are absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that on every
-run rather than burying it: if Opus is being burned hard across many sessions, the bucket most likely to
-stop you is the one nothing here can see. Two green bars and an invisible third is worse than no tool.
+**Two of the four Settings > Usage numbers are not available.** The payload carries `five_hour` and
+`seven_day` only; the **model-scoped weekly bucket** (the "Weekly / Fable" bar) and the **plan tier** are
+absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that every run.
+
+**Opus is not one of the gaps** — and the first version of this section said it was. Opus and Sonnet have
+**no separate weekly bucket**: they draw on *All models*, which is the `seven_day` window this reads, so
+Opus work is fully covered. That error came from finding `seven_day_opus` / `seven_day_sonnet` in an
+undocumented endpoint's **schema** and assuming a field implies an active limit — it does not. **A false
+blind spot is its own defect**, and a worse one than an omission: a session told its headroom is
+unknowable stops trusting a reading that was accurate. Corrected against the actual panel, 2026-08-02.
 
 ```powershell
 pwsh -NoProfile -File scripts\coord\usage.ps1          # human

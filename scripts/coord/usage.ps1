@@ -18,9 +18,12 @@
       2. REFUSE TO PROJECT ON STALE OR THIN DATA. Below two fresh samples in the current window, or past
          -MaxAgeMinutes, the answer is UNKNOWN. Not an extrapolation, not a last-known value dressed up
          as current.
-      3. NAME WHAT IS NOT MEASURED. The per-model weekly buckets (Fable/Opus/Sonnet) are not in the
-         statusLine payload at all. If Opus is being burned hard, the bucket most likely to stop you is
-         one nothing here can see. That is printed every run, not buried.
+      3. NAME WHAT IS NOT MEASURED -- AND DO NOT OVERSTATE IT EITHER. The model-scoped weekly bucket
+         (the "Weekly / Fable" bar) and the plan tier are not in the statusLine payload. Opus and
+         Sonnet are NOT gaps: they have no separate bucket and draw on "All models", which is the
+         `seven_day` window read here, so Opus work is fully covered. An earlier draft warned about an
+         invisible Opus bucket that does not exist -- a false blind spot is its own failure, because a
+         session told its headroom is unknowable stops trusting a reading that was accurate.
 
     EXIT CODES, so a coordinator can branch without parsing prose:
         0  OK
@@ -204,7 +207,7 @@ $advice = switch ($overall) {
     default { "Normal working. Commit at logical stops as usual." }
 }
 
-$blindSpot = "NOT MEASURED: per-model weekly (Fable/Opus/Sonnet) and plan tier are absent from the statusLine payload. Heavy Opus use across many sessions can exhaust a bucket nothing here can see."
+$blindSpot = "NOT MEASURED: the model-scoped weekly bucket (Fable) and the plan tier are absent from the statusLine payload. Opus and Sonnet are NOT gaps -- they have no separate bucket and count against the 7d all-models window above, so Opus work is fully covered here."
 
 if ($Json) {
     [ordered]@{

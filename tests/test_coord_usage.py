@@ -370,13 +370,30 @@ def test_rate_is_not_computed_across_a_window_reset(tmp_path: Path) -> None:
     assert rate is not None and rate > 0, f"rate must come from the CURRENT window only, got {rate}"
 
 
-def test_the_unmeasured_buckets_are_named_every_run(tmp_path: Path) -> None:
-    """Per-model weekly (Fable/Opus/Sonnet) is not in the statusLine payload at all. A tool that shows
-    two green bars while a third invisible bucket is what actually stops you is worse than no tool."""
+def test_the_unmeasured_bucket_is_named_every_run(tmp_path: Path) -> None:
+    """The model-scoped weekly bucket (the "Weekly / Fable" bar) is not in the statusLine payload."""
     publish(tmp_path, five=10.0, seven=10.0)
     _, d = read(tmp_path)
-    assert "per-model" in d["not_measured"].lower()
-    assert "opus" in d["not_measured"].lower()
+    assert "fable" in d["not_measured"].lower()
+
+
+def test_opus_is_not_claimed_as_a_blind_spot(tmp_path: Path) -> None:
+    """A FALSE blind spot is its own defect, and this one shipped in the first draft.
+
+    Opus and Sonnet have **no separate weekly bucket** — they draw on "All models", which is the
+    ``seven_day`` window this tool reads. So Opus work is fully covered. The first version warned that
+    "heavy Opus use can exhaust a bucket nothing here can see", which is false, and worse than a plain
+    omission: a session told its headroom is unknowable stops trusting a reading that was accurate.
+
+    It came from reading ``seven_day_opus``/``seven_day_sonnet`` in an undocumented endpoint's *schema*
+    and assuming a field implies an active limit. A schema is not a measurement.
+    """
+    publish(tmp_path, five=10.0, seven=10.0)
+    _, d = read(tmp_path)
+    text = d["not_measured"].lower()
+    assert "opus" not in text or "not gaps" in text or "fully covered" in text, (
+        f"Opus must not be presented as unmeasured: {d['not_measured']}"
+    )
 
 
 # ------------------------------------------------------------------------------ installer
