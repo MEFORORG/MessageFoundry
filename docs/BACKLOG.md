@@ -8242,3 +8242,69 @@ Separately: the docstring argues *"the return value is the point"*, but all six 
 **Source:** public-repo disclosure audit, 2026-08-01. Re-verified and re-measured at HEAD on the same date.
 
 ---
+
+## 340. Enable a GitHub merge queue: strict + no queue makes every merge a race that fails silently
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **8/10** · Difficulty **3/10** · _fill-in_. `strict = true` with no merge queue and a ~20-minute suite means a PR must go green *and* have `main` hold still, or it flips to `BEHIND` and stops. Measured this date: **9 open PRs green (0 failing, 0 pending) and none able to merge**, 6 with auto-merge armed that will never fire.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** branch protection on `main` sets `required_status_checks.strict = true` — a PR must be up to date with the base to merge — and the repo has **no merge queue** (`repository.mergeQueue` is null; `allow_auto_merge` is true). The slowest required leg runs ~20–25 minutes. Those three facts compose into a race: a PR is mergeable only in the window between its checks going green and the next thing landing on `main`.
+
+Losing that race is **silent**. Armed auto-merge does *not* update a `BEHIND` branch — it waits on checks that already passed — so the PR sits armed and stalled with no failing check, no notification, and no run in flight. Measured 2026-08-01:
+
+```
+PR     mergeState  failing  pending  auto-merge
+#128   BEHIND      0        0        ARMED
+#125   BEHIND      0        0        ARMED
+#107   BEHIND      0        0        -
+#106   BEHIND      0        0        ARMED
+#101   BEHIND      0        0        ARMED
+#96    BEHIND      0        0        ARMED
+#71    BEHIND      0        0        ARMED
+#60    BEHIND      0        0        -
+```
+
+(Nine at the hand survey; eight when [`check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) ran ~20 minutes later, because #120 had been re-synced in between. The set moves — the condition does not.)
+
+Two worked instances the same day. **#74** went green on 2026-07-30 and sat unmergeable until 2026-08-01, found only by someone hunting "stuck CI" by hand; it took three merges from `main` to land. **#119** was green with 25 passing checks and armed, stalled, was re-synced, and lost the window again. A hand-coordinated merge freeze across five sessions *did* hold `main` still for a full window — and #119 still failed, on an unrelated timeout (#344) — which is the evidence that hand coordination is not the fix.
+
+**Why:** the cost is finished work sitting undelivered while everyone believes it is landing. This is the repo's recurring defect shape — a signal accurate about what it looks at and silent about what it does not ([`Secure_Development_Standards`](Secure_Development_Standards.md) §3) — but the worst variant, because every other instance has *someone waiting on a result*. Here the author already had their full pass and has no reason to look again. It also scales the wrong way: the more sessions working in parallel, the more often `main` moves, so the race gets harder to win exactly as throughput rises.
+
+**Proposed:**
+1. Enable a merge queue on `main` (branch protection → *Require merge queue*), squash method to match the existing history.
+2. Reconcile the required set against it: a queue runs checks on a `gh-readonly-queue/**` ref, so any workflow that must gate the queue needs a `merge_group:` trigger. Every context in [`.github/required-contexts.txt`](../.github/required-contexts.txt) lacking one will never report there — that file's own required-but-absent trap, in a new place.
+3. Decide the interaction with `strict = true`. A queue makes it largely redundant; leaving both on is safe but keeps the re-sync burden for anything bypassing the queue.
+4. Once landed, [`check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) goes quiet on its own. Keep it — it is the detector for this class returning.
+
+**Related:** [`scripts/ci/check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) + [`.github/workflows/stalled-prs.yml`](../.github/workflows/stalled-prs.yml) (built alongside this filing — it reports the condition, it does not remove it); [`.github/required-contexts.txt`](../.github/required-contexts.txt); [`scripts/ci/check_required_workflow_state.py`](../scripts/ci/check_required_workflow_state.py) (sibling: "can this context ever report?" to this one's "can this PR ever merge?"); #344 (the wall-clock bounds that actually killed #119); #320.
+
+**Source:** stuck-CI triage, 2026-08-01. Measured live against `MEFORORG/MessageFoundry` branch protection and the open-PR set that date; independently reached by three parallel sessions from separate evidence.
+
+---
+
+## 344. Fixed wall-clock bounds have drifted out of proportion to the work they bound
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _fill-in_. Hardcoded real-time budgets — a CI `step_timeout`, a test helper's poll deadline — were sized when the work was smaller or the machine faster, and nothing re-derives them. Two confirmed instances; each presents as an unrelated flake.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** a fixed wall-clock bound with no relationship to the work it bounds fails the day the work grows, and it fails as a **timeout with zero assertion failures** — which reads as a broken branch when nothing is broken.
+
+*Instance 1 (fixed 2026-08-01, this filing).* `ci.yml`'s Windows `step_timeout: 26`. windows-2025's max PASSING `Tests (pytest)` step was **24:35** over 11 runs — 1.06x margin — and PR #119 was killed at 26:07 with zero test failures after #74 added a 1,506-line test file. The comment beside the cap asserted "~2x headroom", a figure that matched no leg. Raised to 36:00 (1.46x) with the measurement and its date recorded in place of the multiple.
+
+*Instance 2 (open).* `tests/test_stage_dispatcher.py`'s `_wait_until` (:356) polls `loop.time()` against a hardcoded **8.0s** budget while the dispatcher under test is driven by an injected `ManualClock`. On PR #129 — whose diff is provably AST-identical to main, docstrings only — `test_adr0070_9_content_retry_is_not_an_infra_fault[sqlserver]` failed on that bound alone against a Dockerised SQL Server; every logic assertion in the same loop passed. A real-time deadline gating a virtual-clock system has no principled value.
+
+**Why:** these fail *individually blameless*. The remaining CI margin is a **shared budget nobody accounts for** — three PRs each adding a minute of Windows time reproduce #119's death, with no single PR at fault. And this repo has twice mislabelled such a failure: the two famous "flakes" turned out to be a livelock and a test that was right. A timeout with no failing assertion is the exact signature that invites the wrong diagnosis.
+
+**Proposed:**
+1. **A mechanical margin check** (suggested by the ASVS-scorecard session, whose framing this is): compare each leg's actual `Tests (pytest)` step duration against its configured `step_timeout` and fail below ~1.3x. Computable from data CI already emits. It would have flagged windows-2025 *before* #119 died — it was already at 1.06x and nothing said a word — and unlike the "re-check the margin when the suite grows" instruction in `ci.yml`, it does not depend on anyone remembering. Two traps for whoever builds it: time the **STEP**, not the job (the job is ~3 min longer with its own cap — `c53f752b`'s job ran 28:41 and passed against job cap 30 / step cap 26, and two sessions misread job for step while triaging this); and size against the **max passing** run, not the mean (windows-2025's mean ~21 min looks comfortable, its max passing 24:35 is what bites).
+2. Size the remaining bounds: `grep` hardcoded `timeout=` / deadline floats under `tests/` and judge each against the work it bounds.
+3. Where a virtual clock drives the system under test, the poll deadline should follow that clock, not `loop.time()` — instance 2 is the worked example.
+4. Prefer bounds expressed as a measured ratio with a date over round multiples, per instance 1's post-mortem.
+
+**Related:** [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) §*Tests (pytest)* (instance 1 and its measurement table); `tests/test_stage_dispatcher.py`:356 (instance 2); #320 (windows-2025 slowness — the capacity fact that shrinks every Windows margin); #340 (the other half of this triage); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (prose asserting a margin the numbers do not support — five instances found on 2026-08-01 alone).
+
+**Source:** stuck-CI triage, 2026-08-01. Instance 1 measured across 11 windows-2025 runs; instance 2 reported and diagnosed by the HA-construct-recheck session from PR #129's sqlserver leg.
+
+---

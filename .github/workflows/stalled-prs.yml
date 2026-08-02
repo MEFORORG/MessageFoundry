@@ -1,0 +1,57 @@
+name: Stalled PRs
+
+# A pull request can be finished, green, armed to merge -- and unable to merge, forever, silently.
+#
+# THE DEFECT THIS EXISTS FOR — measured on this repo, 2026-08-01: NINE open pull requests with zero
+# failing checks and zero pending checks, not one of which could merge. Six had auto-merge ARMED, which
+# will never fire. PR #74 had been in that state since 2026-07-30 and was found only because somebody
+# went looking for "stuck CI" by hand.
+#
+# THE MECHANISM. Branch protection sets `required_status_checks.strict = true` and there is no merge
+# queue, so a PR that goes green must finish while `main` holds still. When anything else lands first it
+# flips to BEHIND and stops. Armed auto-merge does NOT update a BEHIND branch — it waits on checks that
+# already passed. Nothing re-syncs it and nothing reports it.
+#
+# WHY NO EXISTING SIGNAL CATCHES IT. Every other signal is a check OUTCOME, and no check has failed —
+# that is the whole problem. `nightly-notice.yml` watches CI runs and there is no failing run to watch.
+# The author's last signal was a full pass, so they have no reason to look. A green dashboard and a
+# wedged repository are indistinguishable unless something asks "can this still merge at all?".
+#
+# SCHEDULED, not per-PR, deliberately: the stall arrives when a DIFFERENT pull request merges, so the
+# affected PR has no run in flight to hang a check on. It becomes true while the repo is idle.
+#
+# ADVISORY BY PLACEMENT — this must never become a required context. It reports on OTHER pull requests,
+# so a stall on #71 would block #128, which is both wrong and a way to wedge the repo with the very
+# tool meant to unwedge it. See .github/required-contexts.txt for the required-but-absent trap.
+#
+# This does NOT fix the race; only a merge queue does. It converts a SILENT failure into a LOUD one,
+# which is the part that let #74 sit for days. If a merge queue is enabled, this goes quiet on its own.
+on:
+  schedule:
+    # 07:05 UTC — just after `Required workflow state`, so the two merge-health checks report together.
+    - cron: "5 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stalled:
+    name: open PRs can still reach a merge
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read # list PRs + their merge state; no write scope anywhere
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      # No pip install: the script is stdlib-only and shells out to `gh`, which is preinstalled on the
+      # runner. Nothing here parses the repo, so there is no PyYAML dependency to pin.
+      - name: Report pull requests that are green but cannot merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/ci/check_stalled_prs.py --repo "$GITHUB_REPOSITORY"
