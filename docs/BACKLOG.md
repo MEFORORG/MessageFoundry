@@ -8591,3 +8591,19 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 **Related:** #350 (found in the same module during this work), #351 (same defect class — an environmental assumption asserted as fact), #347 and ADR 0158 (an assertion that passes for a reason unrelated to the property it tests).
 
 **Source:** the windows-2022 leg of an unrelated PR's CI run, 2026-08-02. A prior handoff attributed it to "the OS handing 65500 to any process opening an outbound socket during a 21-minute **parallel** run" — **refuted twice over**: a port held as another socket's ESTABLISHED **source** port is measurably *not* connectable (that conflates *in use* with *in LISTEN*), and there is no `pytest-xdist` (`addopts` is `--timeout=60 --timeout-method=thread`), so pytest runs **serially** and there is no parallelism for a race to occur in. Its dynamic-range premise survives and is what enables the real mechanism: **the right fact for the wrong reason.**
+
+## 350. _TimeoutSysLogHandler never forwards timeout to the stdlib ctor, leaving the startup connect unbounded
+
+> ✅ **Status CLOSED (filed + fixed 2026-08-02).** `_TimeoutSysLogHandler.__init__` captured `timeout=` into `self._sock_timeout` and called `super().__init__(*args, **kwargs)` **without it**, so `self.timeout` stayed `None`. In stdlib `handlers.py` the inet branch runs `if self.timeout: sock.settimeout(self.timeout)` **before** `sock.connect(sa)` — that is the only thing bounding the **startup** connect. The subclass's own `settimeout` runs in `createSocket` *after* `super().createSocket()` has already returned, so it can bound later sends and reconnects but never the initial connect.
+
+**Cluster:** Observability & Ops. **Priority:** P3. **Verdict:** built. **Severity:** low (needs a collector host that DROPS rather than refuses), low (likelihood).
+
+**Why it matters.** `_FORWARD_TCP_TIMEOUT = 5.0` existed precisely so a stalled collector could not block the calling thread — the asyncio event loop — yet the one connect made during engine startup ran under the OS default instead. This contradicted the class's own docstring (*"pins a socket timeout on its socket … so a runtime send to a stalled TCP collector can't block the calling thread indefinitely"*) and `_build_syslog_handler`'s. A collector host that silently **drops** SYNs rather than refusing them would stall engine start; under pytest it would hang to the 60s watchdog.
+
+**Confirmed by source, not by symptom.** `logging.handlers.SysLogHandler.__init__` in CPython 3.14.6 is `(self, address=('localhost', 514), facility=1, socktype=None, timeout=None)` — the parameter has been accepted all along and was simply never passed.
+
+**Implementation note.** The timeout is routed through `kwargs` rather than passed explicitly: `timeout` is also `SysLogHandler`'s **4th positional** parameter, so `super().__init__(*args, timeout=…)` is a possible double-bind that **mypy strict rejects outright** (caught by the checker, not by review). Every construction site is keyword-only, so this is equivalent at runtime.
+
+**Related:** #349 (same module; this was found while fixing that).
+
+**Source:** adversarial review of #349, 2026-08-02 — an incidental finding, not the thing being looked for.
