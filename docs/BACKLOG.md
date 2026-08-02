@@ -8607,3 +8607,17 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 **Related:** #349 (same module; this was found while fixing that).
 
 **Source:** adversarial review of #349, 2026-08-02 — an incidental finding, not the thing being looked for.
+
+## 351. SQL Server failover test asserts on a 0.35s wall-clock margin across a real DB round-trip
+
+> 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_cluster_failover_sqlserver.py::test_preferred_delay0_wins_expired_lease_race_over_delayed_node` sleeps `_TTL + 0.15` so the lease is expired by ~0.15s, then requires a node carrying a **0.5s** acquire handicap to be rejected. Correctness therefore rests on **less than 0.35s of wall clock** elapsing between the sleep and `dr._maintain_leadership()` — across a real SQL Server round-trip, on a shared CI runner. Observed failing as `assert dr.is_leader() is False → assert True is False`.
+
+**Cluster:** Testing & CI. **Priority:** P3. **Verdict:** triage — **do not "fix" by widening the margin until the question below is answered.** **Severity:** medium (a red that reads as the PR's own defect), unknown (likelihood: one observation).
+
+**The discriminating evidence.** On the **same commit**, the `sql server (store + connector) 2022` leg PASSED while `2025` FAILED. A genuinely broken delay predicate would fail on both — that logic is backend-version independent. The job log also states `Command failed with exit 1 (not a native crash) — not retrying`, so this is **not** the pyodbc 3.14 segfault and its retry mitigation is not involved. Across the last 12 runs it was the **only** sql-server-leg failure, and a sibling PR on the same `main` passed both legs — so it is **not** repo-wide either.
+
+**⚠️ What this does NOT establish.** It does not exonerate the PR it fired on. That PR (BACKLOG #348 / ADR 0159) adds work at the `_acquire` chokepoint — **the exact connection path this test round-trips through** — so it may be the *trigger* without being *wrong*: it spent latency the test had no headroom for. **Distinguishing "marginal test tipped by added latency" from "real regression in the delay predicate" needs that change's author**, and is why this is filed rather than patched. Widening the margin before answering it would convert a visible question into a silent one.
+
+**Related:** #349 (same defect class: an environmental assumption asserted as fact), #347, ADR 0158.
+
+**Source:** CI on an unrelated PR, 2026-08-02, observed while driving the merge queue.
