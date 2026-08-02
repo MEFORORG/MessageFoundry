@@ -34,7 +34,8 @@
 #>
 [CmdletBinding()]
 param(
-    # Claim this key for THIS worktree. Idempotent: re-taking your own claim just refreshes the note.
+    # Claim this key for THIS worktree. Idempotent: re-taking a key you already hold refreshes its note
+    # and branch in place (never dropping the claim), rather than failing.
     [string]$Take,
     # Release a claim this worktree holds.
     [string]$Release,
@@ -60,6 +61,16 @@ function ConvertTo-KeyFile([string]$Key) {
     $safe = ($Key.Trim().ToLowerInvariant() -replace '[^a-z0-9._-]+', '-').Trim('-')
     if (-not $safe) { throw "Key '$Key' reduces to nothing usable -- pick something with letters or digits." }
     $safe
+}
+
+# ConvertFrom-Json SILENTLY COERCES an ISO-8601 string into a [datetime], so `[string]$c.claimed` does
+# not give you back what was written -- it gives the local short form ("08/01/2026 23:17:46"), losing
+# the sub-second precision and the UTC offset. Writing that back would quietly downgrade the stamp on
+# every refresh, and it would still parse, so nothing would ever complain. Round-trip it instead.
+function ConvertTo-Stamp($Value) {
+    if ($Value -is [datetime]) { return $Value.ToString("o") }
+    if ($Value -is [datetimeoffset]) { return $Value.ToString("o") }
+    return [string]$Value
 }
 
 function Get-Mine([string]$Path) {
@@ -126,8 +137,45 @@ try {
 } catch [System.IO.IOException] {
     $info = Get-Mine $file
     if ($info.IsMine) {
-        # Re-taking your own claim is a no-op, not an error: a session should be able to re-assert freely.
+        # Re-taking your own claim is not an error: a session should be able to re-assert freely. It was
+        # also, until now, not a REFRESH -- despite the -Take parameter documenting one. A new -Note was
+        # accepted, reported as success, and silently discarded.
+        #
+        # That is worse than an outright failure, because the note is the one field written deliberately
+        # to say what a session is doing, and announce-session.ps1 broadcasts it to every session that
+        # joins the repo, telling them to prefer it over the worktree name. Measured 2026-08-02: the
+        # 'announce-hook' claim still read "NO PR OPENED -- honouring the #119 merge freeze" to every
+        # joining session hours after both #133 and #119 had merged. A stale note broadcast as current
+        # intent is a coordination fault, not a cosmetic one -- and the documented workaround (-Release
+        # then -Take) drops the claim in between, re-opening the race the claim exists to close.
+        if ($Note) {
+            $updated = [ordered]@{
+                key      = [string]$info.Claim.key
+                note     = $Note
+                # Refresh the branch too: a worktree can have switched branches since the claim was made,
+                # and a claim naming a branch nobody is on is another confidently-wrong coordination fact.
+                branch   = $branch
+                worktree = [string]$info.Claim.worktree
+                # `claimed` is the identity of the claim and never moves; `refreshed` is what tells a
+                # reader how old the NOTE is, which is the question a stale note makes urgent.
+                claimed   = ConvertTo-Stamp $info.Claim.claimed
+                refreshed = (Get-Date).ToString("o")
+            } | ConvertTo-Json -Compress
+            # Write-then-rename, not a truncating in-place write. A torn claim file does not fail loudly:
+            # scripts/hooks/claim_check.py swallows a parse error into "not claimed", which would disable
+            # the enforced gate for that key -- so a crash mid-write must leave the OLD file intact.
+            $tmp = "$file.$PID.tmp"
+            # UTF8 WITHOUT a BOM, for that same reader: a BOM makes json.loads raise.
+            [System.IO.File]::WriteAllBytes($tmp, [System.Text.Encoding]::UTF8.GetBytes($updated))
+            Move-Item -LiteralPath $tmp -Destination $file -Force
+            Write-Host ""
+            Write-Host "REFRESHED '$Take' (held since $($info.Claim.claimed))." -ForegroundColor Green
+            Write-Host "  note : $Note"
+            exit 0
+        }
         Write-Host "You already hold '$Take' (claimed $($info.Claim.claimed))." -ForegroundColor Green
+        Write-Host "  note : $($info.Claim.note)"
+        Write-Host "  (pass -Note to update it -- it is what other sessions are shown.)"
         exit 0
     }
     Write-Host ""
