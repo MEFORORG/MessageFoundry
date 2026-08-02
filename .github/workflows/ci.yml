@@ -304,7 +304,7 @@ jobs:
       # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
       # that runner was fast enough that time.
       #
-      # 36:00 is 1.393x over the 25:51 that fit under the old cap, and 1.365x over 26:23, the largest
+      # 36:00 is 1.393x over the 25:51 that fit under the old cap, and 1.364x over 26:23, the largest
       # windows-2025 execution actually observed. Use the second number: a ratio against a censored
       # maximum flatters itself.
       #
@@ -312,7 +312,7 @@ jobs:
       # must exceed observed spread". Against real values that rule FAILS here: headroom is 36:00 - 26:23
       # = 9:37, and the windows-2025 spread is 26:23 - 15:56 = 10:27. It would need roughly 37:00 to hold.
       # 36:00 is kept anyway, and the reason is stated rather than dressed up: this cap exists to catch a
-      # whole-process DEADLOCK, not slowness (see the paragraph below), so 1.365x over the worst observed
+      # whole-process DEADLOCK, not slowness (see the paragraph below), so 1.364x over the worst observed
       # run is ample for its actual job, and #131 already set this value. What the spread rule is good
       # for is telling you the margin is thinner than the ratio suggests. RE-DERIVE IF a windows-2025
       # `Tests (pytest)` step is ever seen above 28:00 -- that is the trigger, not a calendar reminder.
