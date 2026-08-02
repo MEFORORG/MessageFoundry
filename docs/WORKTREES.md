@@ -288,9 +288,11 @@ only your latest revision contains — **a structural check tells you the block 
 is the version you meant**, and those are different properties. *Measured 2026-08-02 on `docs/BACKLOG.md`
 EOF appends.*
 
-`gh pr update-branch` cannot rescue that class either: it performs the merge server-side, so a
-conflicting merge simply fails and the PR stays `DIRTY`. A local merge, hand resolution and push is
-the only route — the table above says as much for `DIRTY`, and this is why the button does not help.
+Do not expect `gh pr update-branch` to rescue that class. Its documented default is to update **by
+merging the base into the PR branch**, server-side, and the endpoint accepts no resolution — so there
+is nothing it can do with a conflicting merge. Resolve locally and push, as the `DIRTY` row above
+already says. *(GitHub does not document that endpoint's behaviour on conflict; this follows from the
+documented mechanism, not from a measurement.)*
 
 Blob-comparing a few files is **not** a substitute, and it is the check most likely to be reached for.
 It was run here and reported all five files identical. That was correct when measured and false twenty
