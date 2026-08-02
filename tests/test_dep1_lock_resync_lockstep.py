@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tests._workflow_contexts import load_workflow
+
 _WORKFLOWS = Path(__file__).resolve().parent.parent / ".github" / "workflows"
 _GATE = _WORKFLOWS / "security.yml"
 _RESYNC = _WORKFLOWS / "dependabot-lock-resync.yml"
@@ -97,4 +99,23 @@ def test_constraints_lock_is_in_the_set() -> None:
     assert "constraints.lock" in _exports(_RESYNC), (
         "dependabot-lock-resync.yml stopped re-exporting constraints.lock — every Dependabot uv PR "
         "will be red with no bot-reachable path to green (see this module's docstring)"
+    )
+
+
+def test_the_resync_gate_keeps_its_immutable_author_conjunct() -> None:
+    """The zizmor ``bot-conditions`` suppression is sound only while clause 1 is present.
+
+    zizmor flags ``github.triggering_actor`` in this job's ``if:``. That is safe ONLY because it is
+    conjoined with the immutable PR-author check: a conjunction can only narrow, so a spoofed actor
+    makes the job skip, never run. Drop clause 1 -- or turn the ``&&`` into ``||`` -- and the residual
+    actor check becomes a SOLE gate, the exploitable shape. ``.github/zizmor.yml``'s bot-conditions
+    entry asserts that shape is absent; this is what makes the assertion true rather than asserted.
+    """
+    condition = load_workflow("dependabot-lock-resync.yml")["jobs"]["resync"]["if"]
+    assert "github.event.pull_request.user.login == 'dependabot[bot]'" in condition, (
+        "the immutable author gate is gone; the zizmor bot-conditions suppression is now unsound"
+    )
+    assert "&&" in condition, "the author gate must CONJOIN the actor check, not replace it"
+    assert "||" not in condition, (
+        "a disjunction lets the spoofable actor check alone open the job — the dominating shape"
     )

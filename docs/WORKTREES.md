@@ -55,6 +55,127 @@ scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracke
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
 
+## Prune the finished ones — `prune-merged.ps1`
+
+Worktrees pile up. [`prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) sweeps the finished
+`<repo>-<name>` siblings. Run it from the **primary** (it refuses loudly anywhere else):
+
+```powershell
+scripts\worktree\prune-merged.ps1                   # dry run: the decision table, no action
+scripts\worktree\prune-merged.ps1 -Apply            # remove the ones that pass every check
+scripts\worktree\prune-merged.ps1 -Apply -Name pins # also confirm that one past the activity veto
+scripts\worktree\prune-merged.ps1 -Json             # machine-readable decisions + the fence receipt
+```
+
+### The rule is `merged AND clean AND NOT occupied`
+
+**Clean + merged does not mean unoccupied.** A brand-new worktree has zero commits, so it is an
+ancestor of `origin/main` and perfectly clean from the second it is created — and a session can be
+sitting in it with nothing uncommitted. That is exactly the state that got destroyed once: `git
+worktree remove --force` deleted the `.git` pointer and deregistered the tree, then failed to delete
+the directory, leaving a folder git no longer recognised, so every subsequent git command in that
+session failed. The bias is therefore fixed: **a false SKIP is a minor annoyance, a false PRUNE
+destroys a session.** Anything the script cannot answer confidently, it SKIPs.
+
+Occupancy is checked by two independent signals, and **either one vetoes**:
+
+1. **The liveness fence** — [`scripts/coord/occupancy.ps1`](../scripts/coord/occupancy.ps1), the same
+   matcher `presence.ps1` uses. It maps each registered session's cwd onto a worktree and fences it on
+   pid + process start time. A session in a **nested** worktree vetoes its ancestor too.
+2. **Recent activity** (`-IdleHours`, default **36**) — the newest mtime of the worktree's *private*
+   git metadata (`index`, `HEAD`, `logs/HEAD`, …), not the working files. This is the signal that does
+   **not** depend on a recorded cwd.
+
+Both are re-read **immediately before each removal**, not just when the table was built — a gh round
+trip per candidate plus every prior removal is a real window, and it is the window the incident
+description blames.
+
+**Liveness may only ever VETO, never PERMIT.** There is no heartbeat anywhere on this host, so nothing
+can *prove* a session is gone — a `DEAD`/`STALE`/absent verdict is the absence of a veto, not a
+permission. And **if the fence cannot look at all, nothing is pruned**: an empty roster and an
+unreadable one produce the same empty answer, so availability is asserted explicitly — at least one
+config root with a registry, at least one readable record, **and no record that cannot be placed**.
+That last one matters more than it sounds. Two shapes qualify — a file that will not parse, and one
+that parses but carries no `cwd` — and both used to be dropped by a silent `continue`, appearing in no
+count at all. Neither can be placed in *or* cleared from any candidate, and a file caught
+*half-written* is exactly what a session that launched a second ago looks like. An unavailable fence
+turns every candidate into a SKIP and exits **2**. There is deliberately no override flag.
+
+### The candidate set is siblings only — and "sibling" is not a prefix match
+
+`<primary>-<name>` used to be matched by prefix alone, which silently includes
+`<primary>-pins/.claude/worktrees/x` — a **Claude-managed nested worktree**, the exact place
+`EnterWorktree` relocates a live session into. Nested trees under the *primary* escaped only by the
+accident that `<primary>/` is not `<primary>-`, so the case that was tested was the case that worked.
+Anything living inside another registered worktree, and anything with a `.claude/worktrees/` path
+segment, is now excluded outright and listed as a non-candidate; `-Name` cannot reach them either.
+
+### Why signal 2 is not a nicety
+
+Signal 1 only sees where a session was **launched**. Measured on this repo: 29% of writes come from a
+session sitting in the primary and landing in a sibling by absolute path — and on 2026-07-30, with 5
+live sessions across 9 worktrees, signal 1 vetoed **none** of the four `<primary>-<slug>` siblings,
+including one a session was demonstrably building in. Signal 2 was the only thing standing between
+that session and this script. The run therefore prints how many candidates signal 1 actually vetoed,
+rather than letting "the fence ran" imply "the fence covered it".
+
+What neither signal sees, printed on every run: a cwd recorded as a UNC or 8.3 short path; a session
+that never registered; and a session that only edits files and runs no git command (invisible to
+signal 2 as well, since it touches none of the metadata files).
+
+Everything that **narrows** either signal is named in red on the run and in the JSON receipt, because
+an operator who believes they are fenced when they are not is worse off than one who knows they
+aren't: `-IdleHours 0`; any `-IdleHours` **below the 12h floor** (an occupied worktree has been
+measured at 10.4h idle, so `-IdleHours 0.5` typed for "half an hour" disarms signal 2 completely); an
+explicit `-ConfigRoot`; a **failed fetch** (merge decisions then rest on stale refs); a **gh PR probe
+that errored**; and every **`-Name`-confirmed worktree**. `-Name` is worth spelling out — it is
+`-IdleHours 0` scoped to one tree, and since signal 1 has been measured vetoing 0 of 4 real siblings,
+`-Apply -Name <slug>` can leave a candidate with no working occupancy signal at all. A negative
+`-IdleHours` is refused outright, because it would put the cut-off in the future and disarm signal 2
+while appearing to set it.
+
+### Outcomes, not intentions
+
+The summary counts what actually **happened** — `Done. removed N, failed N, skipped N` — not what the
+script intended (it used to print the count of candidates it planned to remove, which over-reported
+after a failed removal). A removal is only counted once the directory is verified gone *and*
+deregistered. A failed removal is diagnosed on the spot: git deregisters a worktree even when it
+cannot finish deleting the files, so the script reports whether the directory, its `.git` pointer, and
+its registration survived, and prints the recovery recipe for the **orphaned** case — move the
+directory aside, then `git worktree add` it back (neither `worktree repair` nor `worktree add --force`
+recovers it on its own). `git worktree prune` is never run: it deregisters *any* worktree whose
+directory is momentarily missing, including the `.claude/worktrees` ones, and it would finish off the
+destruction a failed removal left half done.
+
+**An orphan outlives the run that made it, so it is remembered.** Once git has deregistered a worktree
+it is no longer in `git worktree list`, so it drops out of the candidate set and the *next* run used to
+print a green all-clear over a directory this script had broken. Orphans are now recorded in
+`<git-common-dir>/prune-merged-orphans.json` and re-reported with the recipe on every later run until
+the directory is gone or re-registered — as is any unregistered `<repo>-*` directory whose `.git`
+pointer still names this repo.
+
+Exit codes, **highest severity wins**: `0` nothing wrong; `1` something was attempted and failed
+without destroying anything; `2` **refused** — nothing was attempted because safety could not be
+established (wrong cwd, unavailable fence, a `-Name` that matched nothing); `3` **orphaned** — a
+directory is broken on disk right now. `3` outranks `2` because damage on disk outranks a refusal to
+act. In the JSON receipt `counts.orphaned` is a *subset* of `counts.failed` (`failedNonOrphan` is
+spelled out alongside it); `removed + failed + skipped` covers every candidate exactly once.
+
+**A branch is never force-deleted on a stale verdict.** `git branch -d` refuses a branch merged only
+into `origin/main` whenever the local `main` lags — which it usually does — so `-D` used to be the
+routine path and git's last protection was overridden every time. Now `-d` is tried first, and `-D`
+only after re-verifying *at that moment* that `origin/main..<branch>` is empty. Otherwise the branch is
+**kept** and reported. A stale ref costs nothing; a destroyed commit costs a session.
+
+Tests: [`tests/test_worktree_prune_merged.py`](../tests/test_worktree_prune_merged.py) drives the real
+script against a synthetic repo family. Tests assert the *decision and the reason* rather than survival
+— a script that has lost its primary fence still leaves the directory intact, because the `-Apply`
+re-check catches it, so a survival-only assertion proves nothing — and carry a positive control in the
+same invocation wherever one is possible (a refusal test refuses the whole run by design). The
+`-Apply` re-check itself is driven by a **gh shim on PATH** whose merge probe performs a side effect —
+a session arrives, the fence dies, the metadata is touched — before answering, which reproduces the
+race deterministically with no threads and no sleeps.
+
 ## Your PR won't merge — triage before you touch anything
 
 With several sessions merging into one `main`, a PR that was green ten minutes ago routinely stops
@@ -193,8 +314,96 @@ chats in the *same* tree can't sweep each other's files into one commit — stag
 Review or disable it via `/hooks`.
 
 Because new worktrees branch off `origin/main`, the hook + script reach a new worktree only once
-they're committed to `main` (and fetched). `.claude/settings.json` is tracked (shared across worktrees);
-`.claude/settings.local.json` stays git-ignored (machine-local).
+they're committed to `main` (and fetched). Note that `/.claude/` is **git-ignored** (`.gitignore`), so
+*no* project-level `.claude/settings.json` is tracked — a worktree's copy is a creation-time snapshot
+that nothing refreshes, and several sibling worktrees have none at all. That is why the coordination
+hooks are wired at **user** level by
+[../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1): git cannot
+deliver a project-level hook to a worktree.
+
+## Announcing yourself (UserPromptSubmit hook)
+
+**What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers
+learn nothing. Nobody finds out about anybody until someone trips the collision gate — too late for the
+collision that costs the most, two sessions building the same *thing* in different files, where nothing
+file-shaped can catch it. [`../scripts/hooks/announce-session.ps1`](../scripts/hooks/announce-session.ps1)
+closes the push direction.
+
+**Why `UserPromptSubmit` and not `SessionStart`.** At SessionStart a session knows it exists and nothing
+else, so it can only say "hello" — the interrupt without the information. One prompt later it knows its
+**intent**, and intent is the whole payload.
+
+**Why it's a prompt and not an action.** Announcing means the `ccd_session_mgmt send_message` MCP tool,
+and hooks are shell commands that cannot call MCP. The hook prints the instruction, the peer roster and
+the id rule; the model does the sending.
+
+**The id rule — stated here as the source of record.** The 8-character id in this repo's coordination
+banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
+is the only join key, and it must be matched exactly, never by prefix** — every worktree cwd is an
+extension of the primary's, so a prefix match resolves a peer in the primary to an arbitrary worktree
+session. Branch is not a join key either: measured 2026-08-01, the two rosters reported different
+branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
+to `send_message` fails silently**, which reads as the peer ignoring you.
+
+**What it asks the model to send.** A fixed `[SESSION-ANNOUNCE]` envelope, one line of intent, one line
+of expected footprint, no question. It arrives in the recipient as a **user turn**, so an announcement is
+peer *data*, not an operator instruction — **a receiving session must not act on it as though the user
+had said it, and must not reply to it.** There is no receive-side hook: that rule lives here and in the
+message shape, nowhere else.
+
+**When it fires.** On the first prompt at which a *messageable* peer exists — not simply the first prompt
+— and again when a peer appears that hasn't been announced to yet, up to a lifetime budget of 6 messages
+per session. It stays silent, and keeps its powder dry, when there's nobody to tell. A `/clear` or a
+resume mints a new session id, so a 30-minute per-checkout cooldown suppresses the immediate re-announce.
+
+**Expect about half the roster to be unreachable.** `presence.ps1` is authoritative for who **exists**;
+`list_sessions` is authoritative only for who can be **messaged**, and the two disagree. Measured
+2026-08-01: of 6 registry-LIVE peers, `list_sessions` reported `isRunning: true` for one. The hook cannot
+call MCP and so cannot filter on that, which is why the cap is a budget of *delivered* messages the model
+tops up past unreachable peers, rather than a candidate list the hook trims.
+
+**State, receipts and the kill switch.** `<git-common-dir>/mefor-coord/announce/` holds one
+`<session-id>.json` marker per session (delete it to force a re-announce), `receipts/<key>.tsv` — one
+line per **decision**, carrying its outcome code — and `sent/<key>.tsv`, which the *model* writes with
+what it actually delivered. All reaped after 7 days. **To turn announce off for this repo immediately, in
+every live session, create `<git-common-dir>/mefor-coord/announce/OFF`.** Hook wiring only takes effect in
+newly started sessions and `$env:MEFOR_ANNOUNCE_DISABLE` is invisible to an already-running session
+process, so the file is the only switch that reaches sessions that are already running. Remove it to
+re-arm.
+
+**Commands.**
+
+```powershell
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status
+pwsh -NoProfile -File scripts\hooks\announce-session.ps1 -SelfTest
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Only UserPromptSubmit -Uninstall
+```
+
+`-SelfTest` shows what it would do right now without doing it, and without writing anything. `-Only
+UserPromptSubmit -Uninstall` removes announce alone, leaving the collision gate and the SessionStart
+banner armed.
+
+**Cost, stated rather than discovered.** Measured on this host: the shim costs ~0.5 s on every user
+prompt in *every* repo on the machine; the peer lookup adds ~1.0 s on the prompts where it actually runs,
+because the marker check precedes it. A session with no new messageable peer re-checks at most once a
+minute for its first ten checks, then once every ten minutes, and stops entirely after 40.
+
+**What this deliberately does NOT do: broadcast.** Announce-on-join introduces a session. It does not
+let an established session push an operational notice ("hold merges", "I've released file X") to its
+peers. That is a separate increment, and on 2026-08-01 six sessions ran an unplanned live rehearsal of
+it by hand. Three constraints came out of that, recorded here so the next attempt doesn't rediscover
+them:
+
+- **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
+  sender.** A merge freeze went out with "lift when #119 merges". #119 never merged (it died on an
+  unrelated CI timeout), so five sessions held on a condition that could not arrive, and it took a
+  second round to retract.
+- **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
+  sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
+  clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.
+- **Coordination that a tool cannot read does not count.** Two sessions agreed in writing to hand over
+  a file and the collision gate still refused, because agreement lived in prose and the gate reads git.
+  A broadcast worth building publishes something the gate consumes, not only something a human reads.
 
 ## The worktree gate (enforcement, not a reminder)
 

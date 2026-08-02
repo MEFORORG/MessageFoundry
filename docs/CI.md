@@ -21,7 +21,7 @@ claims move with it.
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
-| `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered to `.github/**`, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
+| `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
 | `dast.yml` | Authenticated authorization sweep against a live loopback listener in front of a real engine. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
 | `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 
@@ -144,7 +144,7 @@ an unrelated PR without turning the gate red.
   this; `actionlint` does. This used to be an instruction aimed at human memory, which is the wrong
   mechanism for a failure whose symptom is "the PR is stuck" and whose tempting remedy is relaxing
   branch protection. It is now a **pre-commit hook** scoped to `.github/workflows/**`, plus a step in
-  `zizmor.yml` (which is already paths-filtered to `.github/**`). The hook is the load-bearing half —
+  `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
   `zizmor.yml` is not a required check.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic
   `matrix: ${{ fromJSON(...) }}` defeats zizmor's static analysis, which then flags its expansion inside
