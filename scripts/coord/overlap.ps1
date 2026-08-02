@@ -160,8 +160,12 @@ function Build-Map {
             }
             else { $files += $authored }
         }
-        $dirty = @(& git -C $w.Path status --porcelain 2>$null |
+        # --no-optional-locks: a plain `git status` REWRITES the index of the repo it inspects, and this
+        # walks every peer worktree -- so merely asking "what is in flight" would mutate other sessions'
+        # checkouts. Read-only is mandatory for an observer.
+        $dirty = @(& git -C $w.Path --no-optional-locks status --porcelain 2>$null |
             Where-Object { $_.Length -gt 3 } | ForEach-Object { $_.Substring(3).Trim('"') })
+        $dirty = @($dirty | Where-Object { $_ } | Sort-Object -Unique)
         $files += $dirty
         $files = @($files | Where-Object { $_ } | Sort-Object -Unique)
 
@@ -181,6 +185,14 @@ function Build-Map {
             Short     = if ($sess -and $sess.sessionId) { ([string]$sess.sessionId).Substring(0, 8) } else { "" }
             Surface   = if ($sess) { ([string]$sess.entrypoint) -replace '^claude-', '' } else { "" }
             Files     = $files
+            # Files is the UNION of committed-and-unlanded and working-tree. A caller that must
+            # distinguish "someone is typing in this file right now" from "this branch authored it and
+            # is done" cannot do it from Files -- and this script's own contract (see LIVE vs DORMANT
+            # above) tells callers to treat signals differently, which was not honourable until now.
+            # Reported 2026-08-01: a session that had COMMITTED a file, gone clean, and said in writing
+            # it was finished still blocked every other session from that file, because a committed
+            # file stays in Files until the branch lands -- and while PRs cannot merge, that is forever.
+            Dirty     = $dirty
             Work      = @(Get-SessionWork $(if ($sess) { [string]$sess.sessionId } else { "" }) | ForEach-Object { $_.Subject })
         }
     }
@@ -220,7 +232,14 @@ if ($File) {
     $q = ConvertTo-Norm $q
     $hits = @()
     foreach ($r in $map) {
-        if (@($r.Files | ForEach-Object { ConvertTo-Norm $_ }) -contains $q) { $hits += $r }
+        if (@($r.Files | ForEach-Object { ConvertTo-Norm $_ }) -contains $q) {
+            # Tell the caller WHICH signal matched. Without this a consumer sees only "this row
+            # mentions your file" and must treat a finished, committed branch identically to a session
+            # with unsaved edits open in front of it.
+            $r | Add-Member -NotePropertyName MatchedDirty `
+                -NotePropertyValue (@($r.Dirty | ForEach-Object { ConvertTo-Norm $_ }) -contains $q) -Force
+            $hits += $r
+        }
     }
     if ($Json) { ($hits | ConvertTo-Json -Depth 6 -AsArray) | Write-Output; exit 0 }
     foreach ($h in $hits) {
