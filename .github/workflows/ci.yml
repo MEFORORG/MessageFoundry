@@ -307,6 +307,10 @@ jobs:
       # does NOT happen when a step is killed (that ends the job and skips what follows, so those
       # durations never sum); it happens when the first step PASSES near its budget.
       #
+      # READ THAT EXHIBIT FOR ITS MECHANISM, NOT AS A VERDICT ON THE CAP IT REPLACED: it ran under the
+      # retired 26/30 pair and would have passed under #131's 40:00. What condemns 40:00 is the
+      # arithmetic below -- which is arithmetic, not an observed kill; no job has yet hit 40:00.
+      #
       # job_timeout is therefore sized to hold BOTH gated steps plus setup -- not step_timeout plus a
       # constant, which is what the previous +4 relationship was. Each addend below is that addend's
       # MEASURED MAXIMUM over the same pool. An earlier revision used 0:41 for setup, which is the
