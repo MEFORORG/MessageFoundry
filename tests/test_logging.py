@@ -396,12 +396,31 @@ def test_configure_logging_forwarder_text_format_uses_plain_formatter() -> None:
 
 
 def test_configure_logging_tolerates_unreachable_tcp_collector(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     # A down TCP collector must not crash startup: configure_logging warns and runs without it, so the
-    # engine's availability never hinges on the SIEM. Port 65500 is unbound → connect raises OSError.
+    # engine's availability never hinges on the SIEM.
+    #
+    # The refusal is injected at the syscall seam instead of by connecting to a "known-closed" port,
+    # because no port is reliably closed here (BACKLOG #349). SysLogHandler.createSocket issues a BLIND
+    # connect — it never bind()s — so the kernel draws its SOURCE port from the dynamic range that any
+    # hardcoded high port also sits in. When the allocator hands the socket the destination port, TCP
+    # simultaneous open connects it to ITSELF: connect() returns success with nothing listening anywhere
+    # and `installed` is True. That fired once on windows-2022 and read as the PR's own defect.
+    # The contract under test is "an OSError while BUILDING the handler is tolerated" — not "port X is
+    # closed" — so removing the network makes it deterministic instead of merely improbable.
+    from messagefoundry.logging_setup import _TimeoutSysLogHandler
+
+    def _refuse(self: Any) -> None:
+        raise ConnectionRefusedError("collector down")
+
+    # Patch createSocket, NOT socket.create_connection: SysLogHandler uses getaddrinfo + socket() +
+    # sock.connect() and never touches create_connection, so that patch would intercept nothing and
+    # leave the flake shipping. The port below is inert — nothing connects.
+    monkeypatch.setattr(_TimeoutSysLogHandler, "createSocket", _refuse)
     installed = configure_logging(
-        "INFO", forward=SyslogForward(host="127.0.0.1", port=65500, protocol="tcp")
+        "INFO", forward=SyslogForward(host="127.0.0.1", port=514, protocol="tcp")
     )
     assert installed is False  # the forwarder was NOT installed…
     assert len(logging.getLogger().handlers) == 1  # …only stdout remains
@@ -593,13 +612,25 @@ def test_build_syslog_handler_selects_tls_and_wires_context(
 
 
 def test_configure_logging_tolerates_unreachable_tls_collector(
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    # A down TLS collector must be best-effort exactly like TCP: the connect to an unbound port raises
-    # OSError before any handshake, configure_logging warns and runs without the forwarder.
+    # A down TLS collector must be best-effort exactly like TCP: an OSError raised before/at the
+    # handshake leaves configure_logging warning and running without the forwarder.
+    #
+    # Same seam, same reason as the TCP sibling (BACKLOG #349): the old hardcoded 65501 was in the
+    # dynamic range and self-connectable. This one merely *looked* safe — after a self-connect the
+    # client reads back its own ClientHello and dies with ssl.SSLError, an OSError subclass, so the
+    # assertions still passed. It was self-healing by accident, which is not a property to rely on.
+    from messagefoundry.logging_setup import _TlsSysLogHandler
+
+    def _refuse(self: Any) -> None:
+        raise ConnectionRefusedError("collector down")
+
+    monkeypatch.setattr(_TlsSysLogHandler, "createSocket", _refuse)
     installed = configure_logging(
         "INFO",
-        forward=SyslogForward(host="127.0.0.1", port=65501, protocol="tls", tls_verify=False),
+        forward=SyslogForward(host="127.0.0.1", port=6514, protocol="tls", tls_verify=False),
     )
     assert installed is False
     assert len(logging.getLogger().handlers) == 1  # only stdout remains
