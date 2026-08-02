@@ -756,3 +756,21 @@ async def test_body_flood_no_content_length_refused(store: MessageStore) -> None
         assert (await cur.fetchone())["n"] == 0  # oversize body refused before any ingress row
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
+
+
+def test_a_204_carries_no_entity_headers() -> None:
+    # RFC 9110 §15.3.5 forbids a body on a 204, and Content-Length beside it is at best noise and at
+    # worst a parser tripwire. Ordinary traffic rather than an edge case: reply_on_empty="204" is the
+    # default answer for a partner reply that is deliberately empty.
+    out = build_response(204)
+    assert out.startswith(b"HTTP/1.1 204 No Content\r\n")
+    assert b"Content-Type" not in out
+    assert b"Content-Length" not in out
+    assert b"Connection: close\r\n" in out
+    assert out.endswith(b"\r\n\r\n")
+
+    # extra_headers still ride a 204 — Retry-After and friends are not entity headers.
+    assert b"Retry-After: 5\r\n" in build_response(204, extra_headers={"Retry-After": "5"})
+
+    # ... and every other status is unchanged.
+    assert b"Content-Length: 0\r\n" in build_response(200)
