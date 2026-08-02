@@ -26,6 +26,7 @@ import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.config.settings import (
+    AlertsSettings,
     AuthSettings,
     SecuritySettings,
     ServiceSettings,
@@ -53,6 +54,7 @@ def _names(
     sec: SecuritySettings | None = None,
     store: StoreSettings | None = None,
     auth: AuthSettings | None = None,
+    alerts: AlertsSettings | None = None,
     cleartext_hops: tuple[str, ...] = (),
 ) -> list[str]:
     """The loosening SWITCH NAMES for a settings combination (defaults where not overridden)."""
@@ -62,6 +64,7 @@ def _names(
             sec or SecuritySettings(),
             store or StoreSettings(),
             auth or AuthSettings(),
+            alerts or AlertsSettings(),
             cleartext_hops,
         )
     ]
@@ -88,7 +91,9 @@ def test_the_shipped_defaults_are_not_themselves_loosenings() -> None:
 
 def test_aad_bind_off_is_a_named_loosening() -> None:
     named = dict(
-        security_loosenings(SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), ())
+        security_loosenings(
+            SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), AlertsSettings(), ()
+        )
     )
     assert "aad_bind" in named
     # The risk text must say what is actually lost — cell binding, i.e. at-rest INTEGRITY binding — not
@@ -102,7 +107,9 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
     text says so. Reporting it as a live weakness on a keyless dev box would train operators to ignore
     the list — the failure mode a loosening registry can least afford."""
     named = dict(
-        security_loosenings(SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), ())
+        security_loosenings(
+            SecuritySettings(), StoreSettings(aad_bind=False), AuthSettings(), AlertsSettings(), ()
+        )
     )
     assert "no effect without a store key" in named["aad_bind"]
 
@@ -112,7 +119,9 @@ def test_aad_bind_loosening_names_its_no_op_caveat() -> None:
 
 def test_recheck_zero_with_ad_enabled_is_a_named_loosening() -> None:
     auth = _ad(ad_session_recheck_seconds=0)
-    named = dict(security_loosenings(SecuritySettings(), StoreSettings(), auth, ()))
+    named = dict(
+        security_loosenings(SecuritySettings(), StoreSettings(), auth, AlertsSettings(), ())
+    )
     assert "ad_session_recheck_seconds" in named
     assert "revocation" in named["ad_session_recheck_seconds"]
 
@@ -260,7 +269,11 @@ def test_cleartext_accepted_is_a_named_loosening() -> None:
     a second posture by the back door."""
     named = dict(
         security_loosenings(
-            SecuritySettings(), StoreSettings(), AuthSettings(), ("OB_LEGACY", "OB_LAB")
+            SecuritySettings(),
+            StoreSettings(),
+            AuthSettings(),
+            AlertsSettings(),
+            ("OB_LEGACY", "OB_LAB"),
         )
     )
     assert "cleartext_accepted" in named

@@ -247,6 +247,10 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
 
         def starttls(self, context: ssl.SSLContext | None = None) -> None:
             sent["tls"] = True
+            # #323 layer 3: RECORD the context. This fake accepted the kwarg from PR #132 onward but
+            # threw it away, so `sent["tls"] is True` below stayed green for the entire period the hop
+            # was accepting any certificate. "STARTTLS was issued" is not a security assertion.
+            sent["context"] = context
 
         def login(self, user: str, password: str) -> None:
             sent["login"] = (user, password)
@@ -268,6 +272,12 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
     asyncio.run(t.send({"type": "connection_stopped", "connection": "OB_X", "detail": "boom"}))
     assert sent["host"] == "smtp.example"
     assert sent["tls"] is True
+    # #323 layer 3: the hop must AUTHENTICATE the relay, not merely encrypt to it. Without a context
+    # smtplib falls back to ssl._create_stdlib_context, which IS _create_unverified_context
+    # (CERT_NONE / check_hostname=False) — so these two lines are the whole point of the fix.
+    assert sent["context"] is not None
+    assert sent["context"].verify_mode is ssl.CERT_REQUIRED
+    assert sent["context"].check_hostname is True
     assert sent["login"] == ("mf", "secret")
     assert "OB_X" in sent["subject"]
     assert sent["to"] == "ops@example, oncall@example"

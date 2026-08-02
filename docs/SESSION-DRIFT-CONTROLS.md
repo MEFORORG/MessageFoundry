@@ -85,7 +85,12 @@ and the open work claims.
 Frequently forgotten in discussions of "the gate", but it is the same problem class:
 
 - **[`scripts/coord/claim.ps1`](../scripts/coord/claim.ps1)** — atomic exclusive-create of
-  `<git-common-dir>/mefor-coord/claims/<key>.json`. Claims work, not numbers.
+  `<git-common-dir>/mefor-coord/claims/<key>.json`. Claims work, not numbers. `-Take` on a key you
+  already hold **refreshes the note and branch in place**, stamping `refreshed`; until 2026-08-02 it
+  accepted a new `-Note`, reported success and discarded it, so the only way to correct a note was
+  `-Release` then `-Take` — which drops the claim in between and re-opens the race it exists to close.
+  The note is what `announce-session.ps1` broadcasts to every joining session *in preference to the
+  worktree name*, so a note that cannot be corrected is announced as current intent indefinitely.
 - **[`scripts/hooks/claim_check.py`](../scripts/hooks/claim_check.py)** — `commit-msg` gate: a commit whose
   *subject* declares `BACKLOG #N` with a code-touching diff must hold a claim on N **for this worktree**.
   Motivated by a recorded incident: three sessions independently fixed one npm advisory; two PRs were
@@ -114,6 +119,25 @@ writes when measured.
 > strictly downstream of the failure it existed to detect. Looking was not neglected; it was
 > impossible. When adding a control, ask which surface still reports when the control itself fails to
 > load. (Formulation owed to the session that hit four instances of the same class in one day.)
+>
+> **A fifth instance, found 2026-08-02 in the collision gate itself — fixed.** Every fail-open path
+> (`overlap.ps1` missing, throwing, or printing garbage) exited 0 with **empty stdout**, which on this
+> hook's stdout is byte-for-byte identical to *"checked, nobody else is in this file"*. A gate that had
+> consulted nothing reported an all-clear, so its own failure reached the session as reassurance. The
+> sharpest case needed no breakage at all, and the first attempt at the fix walked straight into it:
+> **`overlap.ps1` had no representation for "nobody else"**. `@() | ConvertTo-Json -AsArray` sends zero
+> objects down the pipeline, so ConvertTo-Json never runs and the script printed *nothing* — `-AsArray`
+> only shapes output that already exists. A gate rule of "empty output means the script never answered"
+> therefore fired on an ordinary edit to an untouched file, which is most edits. Caught by running the
+> real pair rather than the test stubs, which used a shape the real script never produced.
+>
+> So the fix is in two places, and the second is the load-bearing one: `overlap.ps1` now always emits a
+> JSON array (`[]` for no hits), and only then can the gate treat silence as a fault. It emits a
+> `hookSpecificOutput.additionalContext` notice naming the reason, rate-limited per reason so a
+> persistent fault cannot narrate itself into every edit, and **fails toward noise** when it cannot
+> write that rate-limit stamp. The posture is unchanged: it still allows. Note the shape of the fix —
+> it is not "check harder", it is *give the two states different bytes*, and you cannot detect a
+> difference the producer never encoded.
 
 ### Recovery and lifecycle
 
@@ -142,9 +166,12 @@ reading the emitted decision — not by reading source alone.
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
 | `session-context.ps1` banner | project | LIVE where the branch carries the file |
-| Announce-on-join (`announce-session.ps1`) | user | **NEW** — the only **push** control; asks, cannot send, and every decision leaves a receipt |
+| Announce-on-join (`announce-session.ps1`) | user | **MERGED, NOT INSTALLED — inert by accident, 2026-08-02.** The only **push** control; asks, cannot send, and every decision leaves a receipt. It has never run. See below |
 | Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
 | Announce missing-script notice | user | **NEW** — the one surface that still reports when the script itself fails to resolve |
+| Collision gate — unresolved notice | user | **NEW** — every fail-open path used to be indistinguishable from an all-clear; it now says which reason, once per 30 min, and still allows |
+| Claim note refresh (`-Take -Note` on a held key) | manual | **NEW** — was a silent discard; refresh is now in place, so correcting a note never drops the claim |
+| Overlap session attribution | manual + gate | **FIXED** — longest-prefix, not first-hit. Linked worktrees are nested under the primary, so the primary's row used to absorb an arbitrary peer's session and report itself LIVE on `main` |
 | Claim / alloc / ledger gates | git hooks | LIVE |
 | `new.ps1` / `remove.ps1` / `prune-merged.ps1` | manual | LIVE, **sibling-layout only** |
 | `tests/test_worktree_gate*.py`, `test_install_gate_wiring.py` | CI + local | Was **85 green, and blind** — every one bound the repo copy; nothing read the installed copy or any live `settings.json`. Now 91 across six files, plus the local-only parity check below |
@@ -152,6 +179,33 @@ reading the emitted decision — not by reading source alone.
 Rule 4 being inert is **deliberate and announced** — the commit that landed it says "ships INERT …
 nothing changes until `install-gate.ps1` is re-run." It is listed as INERT here because a control that
 has never been installed is a source artefact, not an enforcement.
+
+**Announce-on-join is inert too, and that one is an accident.** Measured 2026-08-02, hours after
+[#133](https://github.com/MEFORORG/MessageFoundry/pull/133) merged it to `main`:
+
+| Check | Result |
+|---|---|
+| `mefor-announce` UserPromptSubmit entry in any of the 5 config roots | **absent** |
+| The one UserPromptSubmit entry that *is* installed | `# mefor-web-announce`, resolving `scripts/hooks/announce.ps1` — **a different script in a different repo** |
+| `<git-common-dir>/mefor-coord/announce/` | **does not exist**, so there is not one receipt: it has never executed |
+
+`install-coordination.ps1` was last run before the announce row existed, and merging a hook does not
+install one. The two `mefor-coord` entries it wired then — the SessionStart banner and the collision
+gate — are present, which is exactly why nothing looked wrong.
+
+Two things this costs, both observed rather than predicted. A peer session announced itself **by hand**
+on 2026-08-02 and reported the hook as unavailable because it was "on an unmerged branch"; it had
+merged, so the correct diagnosis was never reached. And the missing-script notice listed below — the
+surface built precisely so this class cannot hide — **cannot fire when the hook is not wired at all**,
+because it lives inside the shim. That is this section's own lesson recurring one level up: the
+detector was still downstream of the failure. Re-arm from a plain terminal, then confirm by receipt
+rather than by reading the settings file:
+
+```powershell
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1
+# then, after one prompt in any session in this repo:
+ls (Join-Path (git rev-parse --path-format=absolute --git-common-dir) 'mefor-coord/announce/receipts')
+```
 
 ---
 

@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -1504,3 +1505,240 @@ def _find_free_pid() -> int:
     proc.wait(timeout=30)
     time.sleep(0.3)
     return proc.pid
+
+
+# --------------------------------------------------------------------------------------------------
+# Coordination claims stranded by a removal (BACKLOG #345)
+#
+# A claim lives beside the SHARED object store, so it outlives the worktree that took it. Removing the
+# worktree used to leave the claim file behind, and `claim.ps1 -Take` hard-blocks on any claim file that
+# exists -- so the key became unclaimable by every future session until a human ran `-Release -Force`.
+#
+# The dangerous direction here is the FALSE POSITIVE, not the miss: releasing a claim held by a
+# different, LIVING worktree hands its key away and invites the duplicate build the registry exists to
+# stop. So the negative test below is the load-bearing one, and it carries a positive control in the
+# same invocation to prove it did not pass by the run doing nothing at all.
+# --------------------------------------------------------------------------------------------------
+
+
+def _claims_dir(fx: Fixture) -> Path:
+    """Where claim.ps1 puts claims: <git-common-dir>/mefor-coord/claims."""
+    common = Path(
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(fx.primary),
+                "rev-parse",
+                "--path-format=absolute",
+                "--git-common-dir",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    )
+    d = common / "mefor-coord" / "claims"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def write_claim(fx: Fixture, key: str, worktree: Path | str, *, note: str = "work") -> Path:
+    """Write a claim exactly as claim.ps1 does: folded filename, UTF-8 with NO BOM.
+
+    The BOM matters -- claim.ps1 comments that the python-side gate reads these with
+    ``encoding="utf-8"`` and a BOM makes ``json.loads`` raise, which would be swallowed into "not
+    claimed" and silently disable the gate. A fixture that wrote one would be testing a file shape the
+    real tool never produces.
+    """
+    safe = re.sub(r"[^a-z0-9._-]+", "-", key.strip().lower()).strip("-")
+    f = _claims_dir(fx) / f"{safe}.json"
+    f.write_bytes(
+        json.dumps(
+            {
+                "key": key,
+                "note": note,
+                "branch": "some-branch",
+                "worktree": str(worktree),
+                "claimed": "2026-08-02T00:00:00.0000000+00:00",
+            }
+        ).encode("utf-8")
+    )
+    return f
+
+
+def test_a_claim_held_by_a_pruned_worktree_is_released(fx: Fixture, sleeper: int) -> None:
+    """The orphan this exists to remove.
+
+    Written with BACKSLASHES, which is what `str(Path)` gives on Windows, while claim.ps1 records the
+    forward-slash form from `git rev-parse --path-format=absolute`. Both must match the same worktree
+    or the release silently does nothing -- a miss that would look exactly like success.
+    """
+    live_record(fx, sleeper, fx.primary)
+    claim = write_claim(fx, "clean-work", fx.sibling("clean"), note="the pruned session's work")
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    d = by_leaf(res, "clean")
+    assert d["Outcome"] == "removed"
+    assert d["ClaimsReleased"] == ["clean-work"]
+    assert d["ClaimsUnreleased"] == []
+    assert not claim.exists(), "the claim file outlived its worktree and now blocks the key forever"
+    assert res["counts"]["claimsReleased"] == 1
+    assert res["counts"]["claimsUnreleased"] == 0
+    assert res["_exit"] == 0
+
+
+def test_a_claim_held_by_a_LIVING_worktree_is_never_released(fx: Fixture, sleeper: int) -> None:
+    """The false positive, which is worse than the bug being fixed.
+
+    `dirty` is never pruned (it has modified files), so its claim must survive a run that removes two
+    OTHER worktrees. Asserting only "the file still exists" would pass against a script that released
+    nothing at all, so this carries `clean`'s release as the positive control in the same invocation.
+    """
+    live_record(fx, sleeper, fx.primary)
+    survivor = write_claim(fx, "dirty-work", fx.sibling("dirty"), note="someone is mid-build")
+    control = write_claim(fx, "clean-work", fx.sibling("clean"))
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    assert by_leaf(res, "dirty")["Decision"] == "SKIP"
+    assert survivor.exists(), "a live session's claim was handed to whoever asks for it next"
+    assert json.loads(survivor.read_text(encoding="utf-8"))["key"] == "dirty-work"
+    # Positive control: the run DID release claims, so the survival above is a decision, not a no-op.
+    assert not control.exists()
+    assert res["counts"]["claimsReleased"] == 1
+
+
+def test_a_claim_naming_a_PREFIX_of_the_pruned_path_is_not_released(
+    fx: Fixture, sleeper: int
+) -> None:
+    """Anti-substring control. `<primary>` is a strict prefix of `<primary>-clean`.
+
+    A `StartsWith` or leaf-name match would release the PRIMARY checkout's claim while pruning a
+    sibling -- and the primary is where the operator is sitting. Full normalised equality is the only
+    match that cannot do this.
+    """
+    live_record(fx, sleeper, fx.primary)
+    primary_claim = write_claim(fx, "primary-work", fx.primary, note="held by the primary checkout")
+    control = write_claim(fx, "clean-work", fx.sibling("clean"))
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    assert primary_claim.exists(), "pruning a sibling released the PRIMARY checkout's claim"
+    assert not control.exists()
+    assert res["counts"]["claimsReleased"] == 1
+
+
+def test_a_dry_run_releases_no_claim(fx: Fixture, sleeper: int) -> None:
+    """A preview that mutates the shared registry is not a preview.
+
+    The anti-vacuity half matters as much as the assertion: `clean` must come back PRUNE, or this
+    passes for free on a run that had no candidates.
+    """
+    live_record(fx, sleeper, fx.primary)
+    claim = write_claim(fx, "clean-work", fx.sibling("clean"))
+
+    res = run(fx, "-IdleHours", "0")  # no -Apply
+
+    assert by_leaf(res, "clean")["Decision"] == "PRUNE", "nothing would have been removed anyway"
+    assert claim.exists()
+    assert res["counts"]["claimsReleased"] == 0
+    assert fx.sibling("clean").exists()
+
+
+def test_an_unreadable_claim_is_reported_not_silently_swept(fx: Fixture, sleeper: int) -> None:
+    """A claim we cannot parse might name this worktree, so we can neither clear it nor ignore it.
+
+    Reporting it is the whole point: a `continue` here would let the receipt describe a clean sweep it
+    never made, leaving a permanently-blocked key that nothing mentions again. It must also move the
+    exit code -- the condition is exactly the orphan this feature removes.
+
+    It is counted ONCE PER RUN, not once per removal. This run removes two worktrees (`clean` and
+    `gone`) and each consults the same claims directory; the first version of this attributed the
+    corrupt file to every removal and reported 2 for one blocked key. An unreadable claim belongs to no
+    worktree by definition -- not being able to read it is exactly not knowing whose it is.
+    """
+    live_record(fx, sleeper, fx.primary)
+    bad = _claims_dir(fx) / "corrupt.json"
+    bad.write_bytes(b"{not json at all")
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    assert res["counts"]["removed"] == 2, "two removals must both have consulted the registry"
+    assert by_leaf(res, "clean")["Outcome"] == "removed", "the run must still have acted"
+    assert res["counts"]["claimsUnreadable"] == 1
+    assert [u["file"] for u in res["claims"]["unreadable"]] == ["corrupt.json"]
+    assert res["claims"]["scanned"] is True
+    # Not attributed to a decision: we never learned whose it was.
+    assert by_leaf(res, "clean")["ClaimsUnreleased"] == []
+    assert by_leaf(res, "gone")["ClaimsUnreleased"] == []
+    assert bad.exists(), "an unparseable claim must not be deleted on a guess"
+    assert res["_exit"] != 0, "a key left permanently blocked is not a successful prune"
+
+
+def test_an_unreadable_claim_reds_a_DRY_RUN_too(fx: Fixture, sleeper: int) -> None:
+    """The receipt is the surface CI reads, and it exits before the human summary is printed.
+
+    An exit-code decision made after the -Json branch would be reached only on the text path, so the
+    receipt would carry exitCode 0 over a key nothing can claim. A dry run finds the same condition
+    because the condition belongs to the registry, not to any removal.
+    """
+    live_record(fx, sleeper, fx.primary)
+    (_claims_dir(fx) / "corrupt.json").write_bytes(b"{not json at all")
+
+    res = run(fx, "-IdleHours", "0")  # no -Apply
+
+    assert by_leaf(res, "clean")["Decision"] == "PRUNE", "anti-vacuity: the run had real candidates"
+    assert res["counts"]["removed"] == 0
+    assert res["counts"]["claimsUnreadable"] == 1
+    assert res["_exit"] != 0, "the JSON receipt reported a clean run over an unclaimable key"
+
+
+def test_the_human_summary_reports_released_claims(fx: Fixture, sleeper: int) -> None:
+    """The text surface is separate from the receipt and can lie on its own."""
+    live_record(fx, sleeper, fx.primary)
+    write_claim(fx, "clean-work", fx.sibling("clean"))
+
+    proc = run_text(fx, "-Apply", "-IdleHours", "0")
+
+    assert "released claim 'clean-work'" in proc.stdout
+    assert "claims: 1 released" in proc.stdout
+
+
+def test_the_summary_stays_silent_when_no_claim_was_involved(fx: Fixture, sleeper: int) -> None:
+    """A standing `claims: 0 released` on every run trains the eye to skip the line."""
+    live_record(fx, sleeper, fx.primary)
+    proc = run_text(fx, "-Apply", "-IdleHours", "0")
+    assert "claims:" not in proc.stdout
+
+
+def test_an_absent_registry_reports_NOT_SCANNED_rather_than_clean(
+    fx: Fixture, sleeper: int
+) -> None:
+    """`unreadable: []` next to `released: 0` reads exactly like a registry checked and found tidy.
+
+    A repo that has never used claim.ps1 has no claims directory at all, so the survey does not run.
+    Without `scanned` there is no field distinguishing "read it, nothing wrong" from "never looked" --
+    the silent-instrument shape this whole item is about, reintroduced in the receipt.
+    """
+    live_record(fx, sleeper, fx.primary)
+    # Deliberately do NOT call _claims_dir(): it creates the directory as a side effect.
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    assert res["counts"]["removed"] == 2, "anti-vacuity: the run really did prune"
+    assert res["claims"]["scanned"] is False
+    assert res["claims"]["unreadable"] == []
+    assert res["counts"]["claimsReleased"] == 0
+    assert res["_exit"] == 0, "an absent registry is not an error, just an unknown"
+
+
+def test_an_empty_registry_reports_SCANNED(fx: Fixture, sleeper: int) -> None:
+    """The other half of the pair -- without it, `scanned` could be hardcoded false and still pass."""
+    live_record(fx, sleeper, fx.primary)
+    _claims_dir(fx)  # exists, but holds nothing
+
+    res = run(fx, "-Apply", "-IdleHours", "0")
+
+    assert res["claims"]["scanned"] is True
+    assert res["claims"]["unreadable"] == []
