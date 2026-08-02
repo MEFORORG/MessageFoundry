@@ -277,6 +277,21 @@ The fix is to **merge `origin/main` into the branch**, not to rebase: the confli
 that already landed via the squash, so main's side is authoritative and taking it drops nothing. Then
 re-run both checks — the acceptance test is that the two-dot diff shows only your own change.
 
+**Prefer merge over rebase generally when your commits all touch one block, for a second and nastier
+reason.** A rebase replays each commit against the new base, so a seam every commit rewrites — an item
+appended at the same EOF point, say — re-raises the same conflict once *per commit*. The hazard is not
+the tedium. A mid-stack resolution can keep an **earlier draft** of the block, and that result has no
+conflict markers, leaves `git status` clean, and passes a structural check: an item that lost half its
+prose still has exactly one banner and still counts as one item. Nothing anywhere reports it. One
+`git merge origin/main` raises the seam once, against the final text. Verify by grepping for strings
+only your latest revision contains — **a structural check tells you the block is complete, not that it
+is the version you meant**, and those are different properties. *Measured 2026-08-02 on `docs/BACKLOG.md`
+EOF appends, independently by two sessions.*
+
+`gh pr update-branch` cannot rescue that class either: it performs the merge server-side, so a
+conflicting merge simply fails and the PR stays `DIRTY`. A local merge, hand resolution and push is
+the only route — the table above says as much for `DIRTY`, and this is why the button does not help.
+
 Blob-comparing a few files is **not** a substitute, and it is the check most likely to be reached for.
 It was run here and reported all five files identical. That was correct when measured and false twenty
 minutes later, because an in-flight PR touching exactly those five files merged in between. A
