@@ -189,6 +189,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # shards disagree on a lane's owner). Deterministic placement, not a security control, no secret
     # material involved.
     "messagefoundry/pipeline/sharding.py": frozenset({"hashlib"}),
+    # ADR 0087 (#197) — secrets = a fresh 16-byte token_hex per DISPATCH, carried as that call's
+    # request id and bound on the way back. This IS a security control: a grandchild the sandboxed
+    # Handler spawns inherits fd 1 (the response pipe) and outlives the worker's kill, so a DERIVABLE
+    # id (a per-spawn nonce plus a counter) would let the code running one call pre-stage the answer to
+    # the next — for an `accepts=` predicate, a routing-verdict flip with no ERROR and no disposition
+    # anomaly. Unpredictability is the whole property, hence secrets rather than random.
+    "messagefoundry/pipeline/sandbox.py": frozenset({"secrets"}),
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
@@ -228,7 +235,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
     # ADR 0085: DIRECT-HISP outbound S/MIME — cryptography.serialization.pkcs7 SIGN then ENCRYPT of the
     # Handler body + x509 recipient-cert / trust-anchor cross-validation at construction. No new dependency.
-    "messagefoundry/transports/direct.py": frozenset({"cryptography"}),
+    # #323: ssl = the SMTP/HISP relay's TRANSPORT hop, a separate concern from the S/MIME message
+    # layer above. The context is built by tls_policy.build_smtp_tls_context and handed to smtplib,
+    # which otherwise defaults to ssl._create_stdlib_context -- which IS _create_unverified_context
+    # (CERT_NONE / check_hostname=False). CERT_NONE only under the CLAMPED tls_verify=false escape.
+    "messagefoundry/transports/direct.py": frozenset({"cryptography", "ssl"}),
+    # #323: EMAIL outbound STARTTLS (587) / implicit TLS (465). Same factory, same reason as above --
+    # an explicit verifying context anchored to the OS roots, a per-connection tls_ca_file, or
+    # [tls].internal_ca_file (ADR 0093), because smtplib's own default verifies nothing.
+    "messagefoundry/transports/email.py": frozenset({"ssl"}),
     # ADR 0129 (#142): hashlib = sha256 of a source file's identity (name+mtime+size) as a HASHED dedup
     # key for the leave-in-place processed_files ledger — a DERIVED id, never a cleartext filename (which
     # can embed an MRN), never logged. Not a secret/keyed primitive.

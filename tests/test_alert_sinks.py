@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import asyncio
+import ssl
 import time
 from typing import Any
 
@@ -244,7 +245,7 @@ def test_email_transport_sends_via_smtp(monkeypatch: pytest.MonkeyPatch) -> None
         def __exit__(self, *a: object) -> None:
             return None
 
-        def starttls(self) -> None:
+        def starttls(self, context: ssl.SSLContext | None = None) -> None:
             sent["tls"] = True
 
         def login(self, user: str, password: str) -> None:

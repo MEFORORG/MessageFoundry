@@ -1,22 +1,28 @@
 # ADR 0154 — Synchronous captured-downstream-reply and intake authentication for the inbound HTTP listener (the ADR 0023 deferred tail)
 
-- **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. Authorises INCREMENT A ONLY; increment A is BUILT and merged (2026-08-01, `f2ef0ea9`). Increment B remains unauthorised.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** **Accepted (2026-07-31) — owner-ratified at revision 5. BOTH increments are now authorised, built and merged: increment A 2026-08-01 (`f2ef0ea9`, PR #109), increment B 2026-08-01 (PR #119). `AC-18` was deliberately deferred and remains outstanding — see the note below.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-07-30 (rev 1–4), 2026-07-31 (rev 5, ratified)
-- **⚠️ What acceptance does and does not authorise.** "Accepted" normally means *build may start*. Here it
-  is **scoped**, because rev 4 split the build and that split is part of what was ratified:
+- **⚠️ What acceptance authorised, and what has since been built.** "Accepted" normally means *build may
+  start*. Here it was **scoped**, because rev 4 split the build and that split is part of what was
+  ratified. **Both halves have since been authorised and built** — the split below is retained as the
+  decision record, not as a live restriction:
   - **Increment A — `intake_auth` + the D7 peer-control gate (D6, D7), plus the three incidental listener
-    defects — is AUTHORISED and may start now.** It closes a live hole: `check_http_tls_exposure` returns
-    early on truthy `tls`, so an off-loopback `Http(tls=True)` listener binds a PHI intake socket with no
-    peer identity requirement, and `tests/test_exposed_with_tls_passes` currently pins that as passing.
-    Acceptance criteria: **AC-11 … AC-16, AC-19**, plus **AC-17**.
-  - **Increment B — the synchronous captured-downstream reply (D1–D5, D8) — is NOT authorised yet.** It
-    remains deferred until a customer exists whose partner semantics can shape it. It carries roughly 70 %
-    of this document's complexity and effectively all of its concurrency risk, and there is no one to
-    serve. Do **not** read this Accepted status as a green light for `reply_from`. Acceptance criteria
-    **AC-1 … AC-10 and AC-18** are specified but dormant.
+    defects.** Authorised at ratification, because it closed a live hole: `check_http_tls_exposure`
+    returned early on truthy `tls`, so an off-loopback `Http(tls=True)` listener bound a PHI intake socket
+    with no peer identity requirement, and `tests/test_exposed_with_tls_passes` pinned that as passing.
+    Acceptance criteria: **AC-11 … AC-16, AC-19**, plus **AC-17**. **BUILT — merged 2026-08-01
+    (`f2ef0ea9`, PR #109).**
+  - **Increment B — the synchronous captured-downstream reply (D1–D5, D8).** Deferred at ratification
+    until a customer existed whose partner semantics could shape it, since it carries roughly 70 % of this
+    document's complexity and effectively all of its concurrency risk. **The owner authorised it on
+    2026-08-01**: the prospect whose proxy-API shape rev 4 was waiting for supplied that partner
+    semantics. Acceptance criteria **AC-1 … AC-10** are met. **BUILT — merged 2026-08-01 (PR
+    #119).**
 
-  Building increment B requires a further owner decision, not merely a reading of this line. The design is
-  ratified; the *schedule* is deliberately partial.
+  **`AC-18` remains outstanding.** The `message_events` observability row for a returned-or-timed-out sync
+  reply was deliberately deferred out of increment B and accepted as a gap, along with the in-process
+  latency hints and `capture_error_responses` (see the open items). The design is ratified and the reply
+  path is built; at least that observability tail is still open.
 - **Revision 5 — every open item resolved, on one principle.** The owner confirmed there are **no deployed
   instances of MessageFoundry**: no production installs, no installed base, nobody to upgrade. That single
   fact settles the six remaining `To resolve on acceptance` items, because every one was a trade between
@@ -278,7 +284,7 @@ hostage to a speculative feature.
 | | Driver | When |
 |---|---|---|
 | **Increment A — intake auth + the peer-control gate** (D6, D7) | A **live defect in shipped code.** `check_http_tls_exposure` returns early on truthy `tls`, so an off-loopback `Http(tls=True)` listener binds a PHI intake socket with no peer identity requirement — and `tests/test_exposed_with_tls_passes` pins that configuration as passing. This is wrong today, in any such deployment, with or without a customer. | **Now.** Independent of the prospect. |
-| **Increment B — the synchronous captured-downstream reply** (D1–D5, D8) | The prospect's proxy-API shape. Roughly 70 % of this document's complexity and effectively all of its concurrency risk: the multi-handler terminality test, the rendezvous, the throughput envelope and the `max_connections` interaction. | **When a customer exists,** so their partner's real error and latency semantics shape it rather than a guess. |
+| **Increment B — the synchronous captured-downstream reply** (D1–D5, D8) | The prospect's proxy-API shape. Roughly 70 % of this document's complexity and effectively all of its concurrency risk: the multi-handler terminality test, the rendezvous, the throughput envelope and the `max_connections` interaction. | **Was:** when a customer exists, so their partner's real error and latency semantics shape it rather than a guess. **BUILT 2026-08-01** (PR #119), once the prospect supplied that shape. |
 
 The acceptance criteria already fall along this seam, so the split costs no renumbering and no design
 change: **AC-11 … AC-16 and AC-19** cover increment A, **AC-1 … AC-10 and AC-18** cover increment B, and
@@ -288,9 +294,12 @@ The one genuine coupling is the `_read_request` → `_read_head`/`_read_body` sp
 **increment A**, because authenticating *before* buffering a 16 MiB body is a requirement of the auth work
 itself, not of the reply work.
 
-Deferring increment B also defers its headline gap — `capture_error_responses` (see the open items). With
-no customer to disappoint, a fixed-JSON `502` on a partner rejection is a documented limitation rather than
-a broken promise, and the knob is better designed against a real partner's error semantics than in advance.
+Increment B shipped **without** its headline gap closed — `capture_error_responses` (see the open items).
+A partner rejection still returns a fixed-JSON `502` rather than the partner's own status and body. Rev 4
+justified that by increment B being deferred; **that justification expired when increment B was built**.
+The gap now rests on an explicit owner decision at authorisation to ship the reply path without it, and it
+is a **live limitation of shipped code** rather than a deferral — a proxy API that is correct only when the
+partner succeeds is not a Corepoint replacement for that feed.
 
 ### D1 — The committed row is the sole authority for the returned bytes; every in-process signal is a latency hint
 
@@ -1114,7 +1123,10 @@ worth its own look, as that asymmetry is a request-smuggling shape).
 **Out of scope / deferred** — **Relaying the partner's error body and status code.** `RestDestination`
 captures only `accepted`/`no_reply`; a partner 4xx raises `NegativeAckError(permanent=True)`, dead-letters,
 and writes **no** `response` row — so a Salesforce validation message cannot reach the caller in increment 1
-(they get a fixed-JSON `502`). **With no committed customer this is a documented limitation rather than a blocker** (rev 4; it would be a serious gap for a live proxy API, and increment B is deferred until one exists): a
+(they get a fixed-JSON `502`). **This is now a live limitation of shipped code.** Rev 4 called it "a
+documented limitation rather than a blocker" *because increment B was itself deferred until a customer
+existed*; that premise expired when increment B was built (PR #119), and the gap was instead
+accepted explicitly by the owner at authorisation. It remains a serious gap for a live proxy API: a
 proxy API that is correct only when the partner succeeds is not a Corepoint replacement for that feed. Full
 parity needs an outbound-side `capture_error_responses` knob plus a typed `DeliveryResponse.status_code` and
 an additive nullable `response.status_code` column, as an ADR 0013 amendment. **ADR 0013 Increment 2
@@ -1182,7 +1194,9 @@ the CIDR-aware predicate; the others are left as found.
 
 - [x] **Sequencing `capture_error_responses`.** ~~Blocking prerequisite, or fast-follow?~~ **rev 4:**
   neither. With no committed customer it is a normal roadmap item, and increment B — where it would land —
-  is itself deferred until a customer exists. Revisit when one does.
+  is itself deferred until a customer exists. Revisit when one does. **Post-build (2026-08-01):** increment
+  B shipped without it, so it is no longer gated on increment B at all — it is the top open follow-on, and
+  the fixed-JSON `502` on a partner rejection that it leaves in place is live in shipped code.
 - [x] **The `reply_wait_state` read — YES, add it.** `outbox_for` is `SELECT *`, decrypts `last_error` on
   every tick, and is scoped to `stage='outbound'` so it structurally cannot see a pending `routed` row —
   the state D3 must distinguish. A metadata-only read on three backends is additive, touches no schema,

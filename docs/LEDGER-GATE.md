@@ -100,7 +100,22 @@ worse than no gate.
 
 `git commit --no-verify` bypasses the hook, and a branch cut from a **stale main** cannot see a collision
 at all — each branch is internally consistent, and the duplicate only exists once *both* have merged. So
-CI re-runs the same rules with `--ci` against a freshly fetched `origin/main`.
+CI re-runs the rules with `--ci` against a freshly fetched `origin/main`.
+
+**It re-runs all of them but one, and the exception is the ownership rule** — `ledger_check.py:196` and
+`:241` both read `not self.ci and not self.owns(...)`, so *"was this number allocated to you"* is
+**enforced locally and never in CI**. It has to be: `owns()` reads the allocation store from
+`<git-common-dir>/mefor-coord/alloc`, a CI runner clones fresh and has none, so the check would return
+False for every ADR and no ADR could ever merge. The consequence is worth stating plainly rather than
+leaving as an inference — **a green CI on an ADR or BACKLOG PR is not evidence that the number was
+allocated to anybody.** What CI *does* still catch, and what actually prevents the ledger corruption
+this gate exists for, is collision-with-base, the missing index row, and duplicate rows.
+
+So the residual after `--no-verify` is narrower than "unprotected" and wider than "backstopped": a
+number belonging to another session's *unmerged* branch can be taken and committed with nothing
+objecting. The corruption surfaces when the second of the two merges — the collision rule blocks it —
+which is late, loud, and recoverable, rather than silent. That is the property the gate was built for;
+allocation discipline itself is on the honour system once the local hook is skipped.
 
 That step is **deliberately ungated** in `.github/workflows/ci.yml`. Every other step in the `test` job is
 conditioned on `code == 'true'`, which is **false for a docs-only PR** — and an ADR-only PR *is* docs-only.
@@ -119,7 +134,8 @@ a pair.
 ## Limits
 
 - **`--no-verify` bypasses the pre-commit hook.** It is a guardrail, not a security boundary. The `--ci`
-  leg is the backstop, and it cannot be bypassed from a branch.
+  leg is the backstop for *collision*, and it cannot be bypassed from a branch — but it does **not**
+  re-check ownership (§3), so that one rule has no backstop at all.
 - **It does not stop two sessions building the same thing** under two different numbers. Duplicated work
   has no file conflict and no number conflict; nothing here sees it.
 - **Numbers leak.** An abandoned branch's number is never reclaimed. Accepted, deliberately.

@@ -44,6 +44,7 @@ from messagefoundry.parsing import (
     summarize,
     validate,
 )
+from messagefoundry.pipeline._sandbox_codec import build_payload
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxSession, run_sandboxed
 from messagefoundry.store import MessageStatus
 
@@ -123,10 +124,13 @@ def _payload(raw: str | bytes, content_type: str) -> Message | RawMessage:
     *mutates* its :class:`Message`, so every consumer must get its own parse (one parse per consumer
     is also cheaper than parse-once-then-deep-copy — python-hl7's parse beats deep-copying its nested
     list tree). A :class:`RawMessage` is read-only, so it is safe to *share* across consumers of the
-    same message (see :func:`_shareable_payload`)."""
-    if content_type == ContentType.HL7V2.value:
-        return Message.parse(raw)
-    return RawMessage(raw if isinstance(raw, str) else raw.decode("utf-8"), content_type)
+    same message (see :func:`_shareable_payload`).
+
+    The construction itself lives in :func:`~messagefoundry.pipeline._sandbox_codec.build_payload` so
+    the sandbox worker child rebuilds the **same** object rather than a look-alike that could drift
+    (the child must not import this module — it would pull ``messagefoundry.store`` into the sandboxed
+    process, which the forbidden-import guard denies)."""
+    return build_payload(raw, content_type)
 
 
 def _shareable_payload(raw: str | bytes, content_type: str) -> Message | RawMessage | None:
@@ -212,6 +216,7 @@ def _accepted(
     tracer: TraceHook | None,
     sandbox: SandboxSession | None,
     run_context: RunContext | None,
+    origin: tuple[str | bytes, str] | None = None,
 ) -> list[str]:
     """Drop the handlers whose ``accepts=`` predicate declines this message (ADR 0084).
 
@@ -254,6 +259,7 @@ def _accepted(
                     name=hname,
                     run_context=run_context,
                     session=sandbox,
+                    origin=origin,
                 )
             )
         elif tracer is not None:
@@ -322,10 +328,19 @@ def route_only(
     handler-name validation below still runs **engine-side** on the returned result.
     """
     route = registry.routers[ic.router]
+    # ADR 0087: only when WE derived the payload from `raw` may the sandbox child rebuild it from
+    # (raw, content_type) — a caller-supplied `payload` (route_message's shared RawMessage; public
+    # API) is described as the object it actually is, never assumed to equal _payload(raw, ct).
+    derived = payload is None
     if payload is None:
         payload = _payload(raw, ic.content_type.value)
+    # Built only on the sandboxed branch (`_accepted` reads it only there too), so `mode=off` keeps
+    # its "not even an allocation" promise rather than paying for a seam it never crosses.
+    origin: tuple[str | bytes, str] | None = None
     raw_result: list[str] | str | None
     if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
+        if derived:
+            origin = (raw, ic.content_type.value)
         raw_result = cast(
             "list[str] | str | None",
             run_sandboxed(
@@ -335,6 +350,7 @@ def route_only(
                 name=ic.router,
                 run_context=run_context,
                 session=sandbox,
+                origin=origin,
             ),
         )
     else:
@@ -354,7 +370,13 @@ def route_only(
     if not registry.handler_accepts:
         return names
     return _accepted(
-        registry, names, payload, tracer=tracer, sandbox=sandbox, run_context=run_context
+        registry,
+        names,
+        payload,
+        tracer=tracer,
+        sandbox=sandbox,
+        run_context=run_context,
+        origin=origin,
     )
 
 
@@ -404,6 +426,8 @@ def transform_one(
     directly. The hook returns the Handler's result unchanged, so the deliveries are byte-identical.
     """
     handle: HandlerFn = registry.handlers[hname]
+    # See route_only: `origin` is passed only when this call derived the payload itself.
+    derived = payload is None
     if payload is None:
         payload = _payload(raw, content_type)
     raw_result: Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None
@@ -417,6 +441,7 @@ def transform_one(
                 name=hname,
                 run_context=run_context,
                 session=sandbox,
+                origin=(raw, content_type) if derived else None,
             ),
         )
     else:
