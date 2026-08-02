@@ -186,11 +186,17 @@ def load_scorecard(path: Path) -> list[Cell]:
         for a in raw.get("absence", []):
             if not str(a.get("mutation", "")).strip():
                 raise ScorecardError(
+                    # NO LITERAL CODE EXAMPLE HERE. This module is inside the corpus that absence
+                    # patterns are searched over, so an illustrative call in this string becomes a
+                    # real corpus hit and reads as FALSE. The first draft used one and broke two
+                    # live claims (5.2.5, 5.3.3) the moment they were backfilled: the guidance for
+                    # a check contaminated the check. The Absence docstring carries the example in
+                    # escaped-regex form, which cannot self-match.
                     f"cell {raw.get('id')!r}: absence claim {a.get('pattern')!r} has no `mutation` — "
-                    "state the realistic reintroduction this pattern excludes (e.g. "
-                    '`mutation = "tar.extractall(dest)"`) so the pattern can be proved capable of '
-                    "firing. Author it from what the code would look like if the thing came back; "
-                    "do NOT derive it from the pattern, which makes the check vacuous"
+                    "state the realistic reintroduction this pattern excludes, so the pattern can "
+                    "be proved capable of firing. Author it from what the code would look like if "
+                    "the thing came back; do NOT derive it from the pattern, which makes the check "
+                    "vacuous. See the Absence docstring for a worked example"
                 )
         cells.append(
             Cell(

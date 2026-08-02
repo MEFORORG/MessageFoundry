@@ -435,3 +435,25 @@ def test_load_refuses_an_absence_claim_with_no_mutation(tmp_path: Path) -> None:
     )
     with pytest.raises(ScorecardError, match="has no `mutation`"):
         load_scorecard(sc)
+
+
+def test_the_module_does_not_contaminate_the_corpus_it_scans() -> None:
+    """scorecard.py lives INSIDE the corpus that absence patterns are searched over.
+
+    A literal code example in this module therefore becomes a real corpus hit. The first draft of
+    the `mutation` guidance carried one, and it broke two live absence claims (5.2.5, 5.3.3) the
+    moment they were backfilled -- the documentation OF a check contaminated the check.
+
+    This is an INSTANCE lock, not a class lock. It pins the one literal that has actually bitten;
+    the general rule -- write examples in escaped-regex form, which cannot self-match -- is stated
+    in the Absence docstring and is not mechanically enforceable.
+    """
+    import scripts.asvs.scorecard as mod
+
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    for literal in (".extractall(", "unpack_archive("):
+        assert literal not in src, (
+            f"scorecard.py contains the literal {literal!r}. This module is inside the scanned "
+            "corpus, so that literal is a corpus hit and will read as FALSE for any absence claim "
+            "excluding it. Write the example in escaped-regex form instead."
+        )
