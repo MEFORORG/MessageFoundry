@@ -335,6 +335,35 @@ hooks are wired at **user** level by
 [../scripts/coord/install-coordination.ps1](../scripts/coord/install-coordination.ps1): git cannot
 deliver a project-level hook to a worktree.
 
+**A change to these scripts reaches a session by one of TWO rules, and they are not the same rule.**
+Getting this wrong produces a confident, wrong answer to "can I use it yet", so state which one applies:
+
+| How the script is reached | When your change reaches a session |
+|---|---|
+| **Run by a hook** (`collision_gate.ps1`, and `overlap.ps1` as its callee) | The installed shim resolves the **primary checkout** first, falling back to the calling worktree. So: **when the primary advances** — regardless of what any session's own branch contains |
+| **Run by hand from a worktree** (`claim.ps1`, `overlap.ps1`, `presence.ps1`) | From that session's **own tree**. So: **when that session's branch contains it** — the primary is irrelevant |
+
+Reported 2026-08-02 by a peer session that was told a merged `claim.ps1` improvement was available to
+it, tried it, and got the old behaviour: its branch predated the change. Both halves of the answer were
+individually true and the combination was wrong. Test the property, not the provenance, and test it
+where the script will actually run from:
+
+```powershell
+grep -c <a token from the change> <primary>/scripts/coord/overlap.ps1   # hook-run scripts
+grep -c <a token from the change> ./scripts/coord/claim.ps1             # hand-run scripts
+```
+
+**Asking who holds a file, right now, without changing anything.** The collision gate answers this
+directly, and it is the only command that does — `-PathOverride` makes it skip stdin and print its
+decision:
+
+```powershell
+pwsh -NoProfile -File scripts\hooks\collision_gate.ps1 -PathOverride docs\BACKLOG.md
+```
+
+Empty output means no live session holds it. Documented in-script as a test affordance; surfaced here
+because a session that needed the answer found it by reading the source.
+
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers
@@ -355,7 +384,11 @@ the id rule; the model does the sending.
 banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
 is the only join key, and it must be matched exactly, never by prefix** — every worktree cwd is an
 extension of the primary's, so a prefix match resolves a peer in the primary to an arbitrary worktree
-session. Branch is not a join key either: measured 2026-08-01, the two rosters reported different
+session. (The same trap, same nesting, was live in `overlap.ps1` until 2026-08-02: it *needs* a prefix
+match, since a session may sit in any subdirectory, and it took the **first** hit — so the primary's row
+absorbed whichever nested-worktree session the hash table enumerated first and reported the primary LIVE
+on `main`. Where a prefix match is genuinely required, the rule has to be **longest prefix wins**.)
+Branch is not a join key either: measured 2026-08-01, the two rosters reported different
 branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
 to `send_message` fails silently**, which reads as the peer ignoring you.
 
@@ -409,9 +442,37 @@ it by hand. Three constraints came out of that, recorded here so the next attemp
 them:
 
 - **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
-  sender.** A merge freeze went out with "lift when #119 merges". #119 never merged (it died on an
-  unrelated CI timeout), so five sessions held on a condition that could not arrive, and it took a
-  second round to retract.
+  sender.** A merge freeze went out with "lift when #119 merges", and five sessions held. **#119
+  merged** — 2026-08-02 01:45:00Z, merge commit `002be182`, **12h15m** after its auto-merge was armed
+  (`auto_squash_enabled` 2026-08-01 13:29:37Z, from the issue timeline — note the event is
+  `auto_squash_enabled`, so a filter on `auto_merge_enabled` finds nothing and the wait looks
+  unmeasurable). The failure was never that the condition could not arrive; it was that **the world
+  moved while everyone waited**. `main` advanced four times before it did:
+
+  | | |
+  |---|---|
+  | #74 | 2026-08-01 20:27:03Z |
+  | #120 | 2026-08-01 23:59:43Z |
+  | #131 | 2026-08-02 00:35:29Z |
+  | #130 | 2026-08-02 01:01:35Z |
+
+  The first of those landed **8m26s** after the claim declaring the freeze was taken (that claim is
+  stamped 2026-08-01 23:51:17Z and is *still on the board*; #120 merged 23:59:43Z). Stated as the claim
+  timestamp rather than "when the freeze was written" deliberately — `claimed` records when the key was
+  taken, and only a `refreshed` stamp would evidence when the note itself was last edited. That field
+  is absent here, which on the code of the day is consistent: there was no way to edit a note in place,
+  so the two coincide unless someone hand-edited the JSON.
+
+  So the freeze did not hold `main` still even while it was nominally in force — it held only the
+  sessions honouring it, which is the worst of both. And it outlived its own condition in the other
+  direction too: on 2026-08-02 that same claim note was still announcing the freeze to every joining
+  session hours after #119 had merged. A predicate the recipient cannot evaluate does not expire.
+
+  This bullet said "#119 never merged" for a day, which made it a compensating control resting on a
+  false premise — the failure [`CLAUDE.md`](../CLAUDE.md) §11 names, inside the document arguing for
+  it. Corrected against the API, and the same framing was independently corrected in `ci.yml`
+  (`07b6e55a`) and in BACKLOG #340 by two other sessions; timestamps above are theirs, re-verified
+  here rather than restated.
 - **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
   sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
   clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.
