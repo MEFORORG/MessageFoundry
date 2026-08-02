@@ -457,3 +457,47 @@ def test_the_module_does_not_contaminate_the_corpus_it_scans() -> None:
             "corpus, so that literal is a corpus hit and will read as FALSE for any absence claim "
             "excluding it. Write the example in escaped-regex form instead."
         )
+
+
+def test_anchor_is_rejected_as_AMBIGUOUS_when_the_token_is_not_unique(tmp_path: Path) -> None:
+    """A token occurring many times resolves from almost anywhere, so it certifies nothing.
+
+    Measured on the real scorecard: 46 of 292 anchors (15%) had a non-unique token, and the worst
+    occurred 101 times in one file -- meaning ANY line number in that file landed within the window.
+    Those were not anchors at risk of going hollow; they were already hollow, and passing.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "await conn.rollback()" + chr(10) + "x = 1" + chr(10) + "await conn.rollback()" + chr(10),
+        encoding="utf-8",
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 1, "await conn.rollback()"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "AMBIGUOUS" in f.problems[0] and "occurs 2 times" in f.problems[0]
+
+
+def test_anchor_holds_when_the_token_is_unique(tmp_path: Path) -> None:
+    """The uniqueness rule must not reject a legitimate anchor -- proved alongside its negative."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "a" + chr(10) + "tls_cert_file = None" + chr(10) + "b" + chr(10), encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 2, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.checked_anchors == 1

@@ -268,10 +268,23 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
 
 
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
-    """Open every evidence anchor and assert its token still resolves.
+    """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
     When the code moves, this reds a test — instead of the sentence rotting in place and the next
     session funding work that is already done.
+
+    **Uniqueness is not pedantry; it is what makes the resolution mean anything.** An ``expect`` that
+    occurs many times in its file resolves from almost anywhere: with ``await conn.rollback()``
+    appearing 101 times in one module, *any* line number in that file lands within ±40 of some
+    occurrence, so the anchor cannot fail and certifies nothing. Two such anchors sat in this scorecard
+    as evidence for weeks.
+
+    It also closes a defect in the REPAIR path rather than the detection path. When code moves, the
+    check correctly reports it — but a re-anchor to the nearest occurrence can silently install a
+    *stale-but-resolving* anchor that passes forever. That happened live: after ADR 0154 landed,
+    ``UPDATE sessions SET revoked_at=`` had two occurrences 19 lines apart — one the keep-N revoke, one
+    a different method entirely — each inside the other's window, so the check would have accepted the
+    wrong one. A repair is exactly where suspicion lapses, because the tool has just proved it works.
     """
     for c in cells:
         for a in c.evidence:
@@ -279,10 +292,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
             lo = max(0, a.line - 1 - ANCHOR_WINDOW)
             hi = min(len(lines), a.line + ANCHOR_WINDOW)
             findings.checked_anchors += 1
+            occurrences = text.count(a.expect)
+            if occurrences > 1:
+                findings.problems.append(
+                    f"{c.id}: {a.path}:{a.line} anchor is AMBIGUOUS — {a.expect!r} occurs "
+                    f"{occurrences} times in the file, so the line number is not load-bearing and a "
+                    "re-anchor cannot be checked. Cite a longer token that appears exactly once"
+                )
+                continue
             if a.expect in "\n".join(lines[lo:hi]):
                 continue
             where = " (found elsewhere in the file)" if a.expect in "\n".join(lines) else ""
