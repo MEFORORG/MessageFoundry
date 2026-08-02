@@ -429,9 +429,11 @@ them:
 
 - **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
   sender.** A merge freeze went out with "lift when #119 merges", and five sessions held. **#119
-  merged** — 2026-08-02 01:45:00Z, merge commit `002be182`. The failure was never that the condition
-  could not arrive; it was that **the world moved while everyone waited**. `main` advanced four times
-  before it did:
+  merged** — 2026-08-02 01:45:00Z, merge commit `002be182`, **12h15m** after its auto-merge was armed
+  (`auto_squash_enabled` 2026-08-01 13:29:37Z, from the issue timeline — note the event is
+  `auto_squash_enabled`, so a filter on `auto_merge_enabled` finds nothing and the wait looks
+  unmeasurable). The failure was never that the condition could not arrive; it was that **the world
+  moved while everyone waited**. `main` advanced four times before it did:
 
   | | |
   |---|---|
@@ -440,9 +442,16 @@ them:
   | #131 | 2026-08-02 00:35:29Z |
   | #130 | 2026-08-02 01:01:35Z |
 
+  The first of those landed **8m26s** after the claim declaring the freeze was taken (that claim is
+  stamped 2026-08-01 23:51:17Z and is *still on the board*; #120 merged 23:59:43Z). Stated as the claim
+  timestamp rather than "when the freeze was written" deliberately — `claimed` records when the key was
+  taken, and only a `refreshed` stamp would evidence when the note itself was last edited. That field
+  is absent here, which on the code of the day is consistent: there was no way to edit a note in place,
+  so the two coincide unless someone hand-edited the JSON.
+
   So the freeze did not hold `main` still even while it was nominally in force — it held only the
   sessions honouring it, which is the worst of both. And it outlived its own condition in the other
-  direction too: on 2026-08-02 a claim note still announcing the freeze was read by every joining
+  direction too: on 2026-08-02 that same claim note was still announcing the freeze to every joining
   session hours after #119 had merged. A predicate the recipient cannot evaluate does not expire.
 
   This bullet said "#119 never merged" for a day, which made it a compensating control resting on a
