@@ -133,6 +133,38 @@ class ClusterMember:
     promotable: bool = True
 
 
+_DEMOTE_BUDGET_FRACTION = 0.5
+_DEMOTE_BUDGET_FLOOR = 1.0
+_DEMOTE_BUDGET_CEILING = 10.0
+
+
+def fence_tick_seconds(fence_timeout_seconds: float) -> float:
+    """The self-fence watchdog tick. Shared by both coordinators AND by the demotion budget below, so
+    the budget and the watchdog it is derived from cannot drift apart."""
+    return max(0.05, min(1.0, fence_timeout_seconds / 5.0))
+
+
+def demote_stop_budget(
+    *, lease_ttl_seconds: float, fence_timeout_seconds: float
+) -> tuple[float, float]:
+    """``(budget, raw_headroom)`` for a bounded demotion teardown (ADR 0157 C6).
+
+    A STATIC duration cap on two phases — NOT a lease-anchored absolute deadline: it reads no DB clock,
+    compares against no ``lease_expires_at``, makes the Windows monotonic clock load-bearing for
+    nothing, and cannot degrade to zero.
+
+    The renew round trip is NOT subtracted, because it is not observable here. It is bounded only by
+    ``[store].command_timeout`` (30.0 by default) — which equals the stock lease TTL — so until that is
+    clamped separately the real margin can be zero and this budget is nominal rather than guaranteed.
+    Say that plainly rather than implying the budget is met.
+    """
+    headroom = lease_ttl_seconds - fence_timeout_seconds - fence_tick_seconds(fence_timeout_seconds)
+    return (
+        max(_DEMOTE_BUDGET_FLOOR, min(_DEMOTE_BUDGET_CEILING, _DEMOTE_BUDGET_FRACTION * headroom)),
+        headroom,
+    )
+
+
 @runtime_checkable
 class ClusterCoordinator(Protocol):
     """The coordination contract every backend (null today, DB-backed later) implements.
@@ -167,14 +199,27 @@ class ClusterCoordinator(Protocol):
         imports the coordinator, ARCH-6). Cheap + synchronous (cached state). :class:`NullCoordinator`
         returns ``None`` — single-node is unfenced (there is no second writer to fence).
 
-        **Scope of the fence — read this before relying on it.** The guard is appended to the claim
-        ``UPDATE`` and to nothing else. It does NOT cover (a) the cross-owner stranded-lease reclaim that
-        runs as the *first* statement of the same claim transaction, which commits even when the guarded
-        claim matches zero rows, or (b) any post-claim disposition write (``mark_done`` / ``mark_failed``
-        / ``dead_letter_now`` / ``complete_with_response``), each of which resolves its row by ``id``
-        alone with no epoch, owner, or status precondition. So a demoted ex-leader that is still inside
-        a send cannot *claim* anything, but can still *write* — including over a row the live leader has
-        already resolved. Do not read this token as a general write fence."""
+        **Scope of the fence — read this before relying on it. It differs BY BACKEND (ADR 0157).**
+
+        On **Postgres**: every claim path is guarded fail-CLOSED (an unvalidatable claim declines, which
+        is free — the row stays PENDING), and every TERMINAL resolve is guarded fail-OPEN with a re-pend
+        fallback (a rejected resolve rolls the whole disposition back and returns the row to PENDING, so
+        the residue is a duplicate rather than a strand). Deliberately UNGUARDED there: writes that
+        return a row to PENDING (``release_claimed`` / ``reschedule_claimed`` — fencing those would turn
+        a permitted duplicate into a forbidden strand), the cross-owner stranded-lease reclaim that runs
+        as the first statement of the same claim transaction, the bring-up dead-letter sweeps, and the
+        operator paths.
+
+        On **SQL Server**: only the three FIFO claim paths carry the guard. ``claim_ready`` and every
+        terminal resolve are still unfenced there (ADR 0157 Inc 3 closes that), so a demoted SQL Server
+        node stops claiming FIFO lanes but can still drain an UNORDERED lane and still write over a row
+        the live leader has resolved.
+
+        The residual case that passes on **both** backends: promote → demote → re-promote *in the same
+        process*. ``leader_epoch`` bumps only on a fresh acquire, so the re-promoted node's held epoch
+        equals the current one and every guard passes. Only a per-claim token would close that.
+
+        Do not read this token as a general write fence."""
         ...
 
     def lease_key(self) -> str | None:
@@ -397,6 +442,11 @@ class DbCoordinator:
         # heartbeat; a standby may acquire only once the lease has expired (per the DB clock), so it
         # always waits out the full TTL before taking over.
         self._lease_ttl = leader_lease_ttl_seconds
+        # ADR 0157 Inc 5: optional demotion edge-trigger. None unless the engine registered
+        # one; deliberately NOT part of the ClusterCoordinator Protocol (that Protocol is
+        # @runtime_checkable and a standalone test stand-in isinstance-checks against it, so
+        # widening it is a multi-site enumeration — the exact defect class this avoids).
+        self._on_demote: Callable[[], None] | None = None
         # The SELF-FENCE timeout: a leader that has not renewed within this many seconds (its own
         # monotonic clock, no DB I/O) demotes itself. MUST be < the TTL — but note what that ordering
         # does and does not buy. It bounds when this node stops *calling itself* leader; it does NOT
@@ -872,6 +922,7 @@ class DbCoordinator:
             self._leader_epoch = None
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
             self._alert_leadership_lost("lease taken or expired")  # #145 (inverse → auto-resolves)
+            self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire OR renew the leadership lease and return whether this node now holds it.
@@ -978,6 +1029,7 @@ class DbCoordinator:
                 self._lease_ttl,
             )
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
+            self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _release_leadership(self) -> None:
         """Best-effort clean release: demote the cached gate first (so a concurrent is_leader() reader
@@ -1018,6 +1070,26 @@ class DbCoordinator:
             )
         except Exception:  # pragma: no cover - defensive; a sink must never break leadership
             log.warning("cluster: leadership_acquired alert failed", exc_info=True)
+
+    def set_on_demote(self, callback: Callable[[], None] | None) -> None:
+        """Register an edge-trigger fired the instant this node stops being leader (ADR 0157 Inc 5).
+
+        The engine uses it to start the graph teardown immediately instead of waiting up to a whole
+        ``_graph_reconcile_interval`` poll. The callback MUST be synchronous, never-raise, and PURE
+        IN-MEMORY: it fires from ``_check_fence``, which runs during a DB partition precisely because
+        renews are failing, so touching the store or the pool there would hang the fence itself.
+        """
+        self._on_demote = callback
+
+    def _fire_on_demote(self) -> None:
+        """Never-raise, never touch the pool. Both properties are load-bearing — see set_on_demote."""
+        callback = self._on_demote
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # pragma: no cover - defensive; a hook must never break demotion
+            log.warning("cluster: on_demote hook failed", exc_info=True)
 
     def _alert_leadership_lost(self, reason: str) -> None:
         """Emit a ``leadership_lost`` inverse (this node is no longer leader) — auto-resolves the open

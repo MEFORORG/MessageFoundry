@@ -1703,6 +1703,10 @@ class SqlServerStore:
         # insert helpers; no new lock, no commit-boundary change. See tests/test_live_cost_counters.py.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQL Server's terminal resolves are NOT yet
+        # epoch-fenced (that is ADR 0157 Inc 3), so this stays 0 on this backend until then. Declared
+        # because Store (base.py) requires it and open_store() returns this class as a Store.
+        self.fenced_writes = 0
 
     async def _commit(self, conn: Any) -> None:
         """Commit a durable **write**-path transaction and count it (A1 live cost counters). A bare async
