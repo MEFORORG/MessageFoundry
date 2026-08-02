@@ -7,6 +7,7 @@ in-process fake SMTP (no real server is ever contacted)."""
 from __future__ import annotations
 
 import smtplib
+import ssl
 from email.message import EmailMessage
 from typing import Any
 
@@ -33,12 +34,22 @@ class _FakeSMTP:
     instances: list[_FakeSMTP] = []
 
     def __init__(
-        self, host: str, port: int, timeout: float = 0.0, fail_at: str | None = None
+        self,
+        host: str,
+        port: int,
+        timeout: float = 0.0,
+        fail_at: str | None = None,
+        context: ssl.SSLContext | None = None,
     ) -> None:
         self.host = host
         self.port = port
         self.timeout = timeout
         self.fail_at = fail_at
+        # #323: the context the connector handed us — on 465 via SMTP_SSL(context=), on 587 via
+        # starttls(context=). Recorded (not ignored) so a test can assert it actually verifies:
+        # smtplib's own default is ssl._create_unverified_context, so "a context was passed" is the
+        # whole point and a fake that silently swallowed it would hide a regression.
+        self.tls_context = context
         self.started_tls = False
         self.logged_in: tuple[str, str] | None = None
         self.sent: list[EmailMessage] = []
@@ -54,9 +65,10 @@ class _FakeSMTP:
     def __exit__(self, *exc: Any) -> None:
         return None
 
-    def starttls(self) -> None:
+    def starttls(self, context: ssl.SSLContext | None = None) -> None:
         if self.fail_at == "starttls":
             raise smtplib.SMTPException("STARTTLS not supported")
+        self.tls_context = context
         self.started_tls = True
 
     def ehlo_or_helo_if_needed(self) -> None:
@@ -83,8 +95,10 @@ def _install_fake(
 ) -> type[_FakeSMTP]:
     _FakeSMTP.instances = []
 
-    def factory(host: str, port: int, timeout: float = 0.0) -> _FakeSMTP:
-        return _FakeSMTP(host, port, timeout, fail_at=fail_at)
+    def factory(
+        host: str, port: int, timeout: float = 0.0, context: ssl.SSLContext | None = None
+    ) -> _FakeSMTP:
+        return _FakeSMTP(host, port, timeout, fail_at=fail_at, context=context)
 
     monkeypatch.setattr(email_mod.smtplib, "SMTP", factory)
     monkeypatch.setattr(email_mod.smtplib, "SMTP_SSL", factory)
@@ -158,13 +172,17 @@ async def test_port_465_uses_implicit_tls_not_starttls(monkeypatch: pytest.Monke
     # On 465 the whole session is wrapped (SMTP_SSL), so no explicit STARTTLS is issued.
     captured: dict[str, str] = {}
 
-    def ssl_factory(host: str, port: int, timeout: float = 0.0) -> _FakeSMTP:
+    def ssl_factory(
+        host: str, port: int, timeout: float = 0.0, context: ssl.SSLContext | None = None
+    ) -> _FakeSMTP:
         captured["which"] = "SMTP_SSL"
-        return _FakeSMTP(host, port, timeout)
+        return _FakeSMTP(host, port, timeout, context=context)
 
-    def plain_factory(host: str, port: int, timeout: float = 0.0) -> _FakeSMTP:
+    def plain_factory(
+        host: str, port: int, timeout: float = 0.0, context: ssl.SSLContext | None = None
+    ) -> _FakeSMTP:
         captured["which"] = "SMTP"
-        return _FakeSMTP(host, port, timeout)
+        return _FakeSMTP(host, port, timeout, context=context)
 
     _FakeSMTP.instances = []
     monkeypatch.setattr(email_mod.smtplib, "SMTP_SSL", ssl_factory)
@@ -450,3 +468,131 @@ def test_email_and_smtp_factories_exported() -> None:
     assert spec.settings["host"] == "smtp.partner.org"
     assert spec.settings["port"] == 587  # STARTTLS submission default
     assert "Email" in mf.__all__ and "SMTP" in mf.__all__
+
+
+# --- #323: the TLS hop actually VERIFIES ------------------------------------------------------------
+#
+# These are the regression fence for #323. Before it, both arms called smtplib with NO context, and
+# smtplib's fallback is ssl._create_stdlib_context — which IS ssl._create_unverified_context
+# (CERT_NONE / check_hostname=False). So `use_tls=True` bought encryption without authentication and
+# every certificate was accepted. Asserting "STARTTLS was issued" (the pre-existing tests) could never
+# catch that: it was issued, over an unverified session. These assert the CONTEXT, which is the only
+# thing that distinguishes the fixed state from the broken one. Run them against the pre-fix connector
+# and they go red on `tls_context is None`.
+
+
+async def test_starttls_gets_a_verifying_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_fake(monkeypatch)
+    await EmailDestination(_dest()).send("body")
+    [smtp] = _FakeSMTP.instances
+    assert smtp.started_tls is True
+    ctx = smtp.tls_context
+    assert ctx is not None, "starttls() was called with no context — smtplib would not verify"
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+    assert ctx.minimum_version is ssl.TLSVersion.TLSv1_2
+
+
+async def test_implicit_tls_465_gets_a_verifying_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The 465 arm builds SMTP_SSL, a different smtplib entry point with its own unverified default.
+    _install_fake(monkeypatch)
+    await EmailDestination(_dest(port=465)).send("body")
+    [smtp] = _FakeSMTP.instances
+    assert smtp.started_tls is False  # implicit TLS — no explicit STARTTLS
+    ctx = smtp.tls_context
+    assert ctx is not None, "SMTP_SSL was constructed with no context — it would not verify"
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    assert ctx.check_hostname is True
+
+
+def test_tls_verify_false_refused_without_escape(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(INSECURE_TLS_ESCAPE_ENV, raising=False)
+    with pytest.raises(ValueError, match="tls_verify=false"):
+        EmailDestination(_dest(tls_verify=False))
+
+
+def test_tls_verify_false_refuses_credentials_even_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # An unverified session is as bad as cleartext for an AUTH exchange: an on-path attacker
+    # presenting any certificate captures it. Mirrors the use_tls=false credential refusal.
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with pytest.raises(ValueError, match="UNVERIFIED"):
+        EmailDestination(_dest(tls_verify=False, username="svc", password="pw"))
+
+
+async def test_tls_verify_false_with_escape_builds_an_unverified_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    _install_fake(monkeypatch)
+    await EmailDestination(_dest(tls_verify=False)).send("body")
+    [smtp] = _FakeSMTP.instances
+    ctx = smtp.tls_context
+    assert ctx is not None  # still a context — just a deliberately non-verifying one
+    assert ctx.verify_mode is ssl.CERT_NONE
+    assert ctx.check_hostname is False
+
+
+def test_tls_verify_false_refused_on_enforcing_phi_even_with_escape(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The clamp (#200, ADR 0092 decision 2): the blunt process-wide escape must NOT silence a
+    # verify-off PHI hop on an enforcing instance. This is why the arm reads
+    # weakened_tls_escape_permitted_here() and not the raw insecure_tls_allowed().
+    monkeypatch.setenv(INSECURE_TLS_ESCAPE_ENV, "1")
+    with (
+        active_hop_posture(HopPosture(enforcing=True, is_phi=True)),
+        pytest.raises(ValueError, match="tls_verify=false"),
+    ):
+        EmailDestination(_dest(tls_verify=False))
+
+
+async def test_tls_ca_file_pins_that_ca_only(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # A per-connection CA wins verbatim, and pins to ONLY that CA — no system bundle (ADR 0093
+    # precedence #1). This is the supported route for a private-CA relay, and the reason
+    # tls_verify=false should almost never be needed.
+    import datetime
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Test Relay CA")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=3650))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .sign(key, hashes.SHA256())
+    )
+    ca = tmp_path / "relay-ca.pem"
+    ca.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+
+    _install_fake(monkeypatch)
+    await EmailDestination(_dest(tls_ca_file=str(ca))).send("body")
+    [smtp] = _FakeSMTP.instances
+    ctx = smtp.tls_context
+    assert ctx is not None
+    assert ctx.verify_mode is ssl.CERT_REQUIRED
+    loaded = ctx.get_ca_certs()
+    assert len(loaded) == 1, (
+        "a per-connection CA must pin to ONLY that CA, not augment system roots"
+    )
+    assert dict(x[0] for x in loaded[0]["subject"])["commonName"] == "Test Relay CA"
+
+
+def test_tls_ca_file_that_does_not_exist_fails_loudly(tmp_path: Any) -> None:
+    # Silently falling back to system roots on an unreadable CA would be the worst outcome: the
+    # operator believes they pinned, and did not.
+    with pytest.raises((FileNotFoundError, ssl.SSLError, OSError)):
+        EmailDestination(_dest(tls_ca_file=str(tmp_path / "nope.pem")))
