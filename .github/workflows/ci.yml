@@ -54,8 +54,9 @@ jobs:
     # runner label set; the per-repo matrix is built in `changes`.
     runs-on: ${{ matrix.hosted }}
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
-    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
-    # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
+    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (matrix
+    # `pytest_timeout`, 60s ubuntu / 120s Windows -- the step passes `--timeout=`, which overrides the
+    # pyproject addopts value) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
     # has its own `timeout-minutes` (matrix `step_timeout`) so a process-level deadlock below pytest
     # fails the step fast; this job cap is the outermost belt if even that is somehow out-raced.
     timeout-minutes: ${{ matrix.job_timeout }}
@@ -205,11 +206,13 @@ jobs:
       # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
       # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
       #   * `--timeout-method=thread` (the ONLY method on Windows — SIGALRM is POSIX-only) dumps ALL
-      #     thread stacks at the per-test cap (60s, set in pyproject addopts), naming the stuck frame.
-      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=90` is the belt that fires even when the
+      #     thread stacks at the per-test cap (matrix `pytest_timeout`, 120s on these Windows legs),
+      #     naming the stuck frame.
+      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=` (matrix `fault_timeout`) is the belt that fires even when the
       #     thread-timer CANNOT interrupt a main-thread C-level wait (a Proactor overlapped op /
       #     blocking accept / subprocess.wait): pytest's faulthandler plugin arms a separate watchdog
-      #     thread that dumps the NATIVE stack of every thread at 90s (> the 60s pytest-timeout, so the
+      #     thread that dumps the NATIVE stack of every thread at `fault_timeout` (150s here, 90s on
+      #     ubuntu -- always set ABOVE that leg's `pytest_timeout`, so the
       #     per-test dump is attributed first; this is the last-resort stack when the thread method is
       #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
       #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
@@ -217,6 +220,13 @@ jobs:
       # job's own cap, so a hang both watchdogs somehow miss still fails the STEP (not the whole job at
       # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
       # an uninformative job-level kill with no step attribution.
+      #
+      # THAT GUARANTEE COVERS THE FIRST GATED STEP ONLY, and saying otherwise would be a control resting
+      # on a false premise. `Web console tests (pytest)` carries the SAME `step_timeout` but runs after
+      # `Tests (pytest)`, so reaching it has already spent setup + `Tests`; its own cap cannot fire first
+      # at any job_timeout worth setting (it would take ~39 min on ubuntu, ~73 min on Windows). A hang
+      # THERE is still an unattributed job-level kill. Measured under `Tests (pytest)` below; the
+      # structural fix is BACKLOG #344 proposal 5.
       #
       # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
       # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
@@ -253,6 +263,14 @@ jobs:
       # censored maximum under-provisions by construction, and that is exactly how "1.06x" read as
       # survivable right up until #119 died at 26:07.
       #
+      # THE CENSORED VALUES ARE VISIBLE IF YOU ASK FOR THEM, AND THEY MATTER. The jobs endpoint defaults
+      # to `filter=latest`, which hides a killed attempt behind its passing re-run; `?filter=all` shows
+      # both. #119's 26:07 is in this very pool that way (run 30717229521 attempt 1, `8c407fb5`, step
+      # conclusion FAILURE) beside its 22:25 attempt-2 success -- a 3:42 spread on identical code, and
+      # the first day AFTER the raise produced 26:23 TWICE, both concluding SUCCESS (runs 30728793103
+      # and 30731407003). So the population really does exceed the old 26:00 cap: the largest windows-2025
+      # `Tests (pytest)` execution observed to date is 26:23, not 25:51.
+      #
       # THIS TABLE HAS BEEN WRONG TWICE. #131 published 12:27 / 18:39 / 24:35 over "11 passing runs";
       # the first correction published the maxima above but over "101 runs" with n = 57 / 52 / 49. The
       # maxima re-derive exactly; BOTH pool sizes were unreproducible. Three mechanisms produced that,
@@ -284,18 +302,28 @@ jobs:
       # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
       # that runner was fast enough that time.
       #
-      # 36:00 is 1.393x over the 25:51 maximum and -- the criterion that actually matters -- it clears
-      # the 9:55 spread the pool shows on that leg (15:56 .. 25:51): HEADROOM MUST EXCEED OBSERVED
-      # SPREAD, not some multiple of a single point. A ratio against one run says nothing about a
-      # distribution, and #119 died from the distribution, not from its own duration. An earlier revision
-      # quoted a narrower "5:26 spread ... identical code" (20:41 .. 26:07); neither endpoint could be
-      # re-derived from this pool, and the honest wider number is the one that supports the decision.
-      # Both Windows legs take the same number: windows-2022 is the faster, so sizing on windows-2025
-      # only leaves it more room, and one value is one thing to re-derive.
+      # 36:00 is 1.393x over the 25:51 that fit under the old cap, and 1.365x over 26:23, the largest
+      # windows-2025 execution actually observed. Use the second number: a ratio against a censored
+      # maximum flatters itself.
+      #
+      # BE HONEST ABOUT THE SPREAD RULE -- 36:00 DOES NOT MEET IT. An earlier revision argued "headroom
+      # must exceed observed spread". Against real values that rule FAILS here: headroom is 36:00 - 26:23
+      # = 9:37, and the windows-2025 spread is 26:23 - 15:56 = 10:27. It would need roughly 37:00 to hold.
+      # 36:00 is kept anyway, and the reason is stated rather than dressed up: this cap exists to catch a
+      # whole-process DEADLOCK, not slowness (see the paragraph below), so 1.365x over the worst observed
+      # run is ample for its actual job, and #131 already set this value. What the spread rule is good
+      # for is telling you the margin is thinner than the ratio suggests. RE-DERIVE IF a windows-2025
+      # `Tests (pytest)` step is ever seen above 28:00 -- that is the trigger, not a calendar reminder.
+      #
+      # A ratio against one run says nothing about a distribution, and #119 died from the distribution,
+      # not from its own duration. Both Windows legs take the same number: windows-2022 is the faster, so
+      # sizing on windows-2025 only leaves it more room, and one value is one thing to re-derive.
       #
       # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
       # `step_timeout` -- `Tests (pytest)` and `Web console tests (pytest)` -- so the job can contain
-      # 2 x step_timeout of gated work, which job_timeout must cover and step_timeout cannot bound.
+      # 2 x step_timeout of gated work that step_timeout cannot bound. Note the caps here do NOT cover
+      # that worst case and are not sized to (2 x 19 = 38 > 26 on ubuntu, 2 x 36 = 72 > 46 on Windows);
+      # they are sized against the OBSERVED sum, which is a weaker guarantee. See the closing paragraph.
       # Observed for real on run 30724385719 (main @ 8f01cef8, 2026-08-01):
       #
       #   Tests (pytest)              00:01:21 -> 00:27:12   25:51   SUCCESS   (9s under the 26:00 cap)
@@ -311,30 +339,42 @@ jobs:
       # retired 26/30 pair and would have passed under #131's 40:00. What condemns 40:00 is the
       # arithmetic below -- which is arithmetic, not an observed kill; no job has yet hit 40:00.
       #
-      # job_timeout is therefore sized to hold BOTH gated steps plus setup -- not step_timeout plus a
-      # constant, which is what the previous +4 relationship was. Each addend below is that addend's
-      # MEASURED MAXIMUM over the same pool. An earlier revision used 0:41 for setup, which is the
-      # MEDIAN and not the maximum, and web-console figures (1:58 / 3:27) that are each only the
-      # third-highest on their leg -- an addend sized at a typical value cannot bound a worst case:
+      # job_timeout is therefore sized against BOTH gated steps plus setup, rather than as step_timeout
+      # plus a constant. Each addend below is that addend's MEASURED MAXIMUM over the same pool, taken
+      # over rows where `Tests` concluded success -- NOT over rows where both steps did, which silently
+      # drops the very run that motivates this whole paragraph (its web-console step was cancelled) and
+      # is the same censoring mistake as filtering the step table by job conclusion. Two earlier
+      # revisions used a 0:41 setup (the MEDIAN), web-console values that were each only third-highest
+      # on their leg, and a 1:04 Windows setup that the exhibit above contradicts on its face:
       #
       #   leg       step_timeout + web-console(max) + setup(max)   old job         new job
       #   ubuntu    19:00 + 2:00 + 1:20 = 22:20                    22:00 -> -0:20  26:00 -> +3:40 (1.16x)
-      #   W22/W25   36:00 + 3:33 + 1:04 = 40:37                    40:00 -> -0:37  46:00 -> +5:23 (1.13x)
+      #   W22       36:00 + 2:33 + 1:09 = 39:42                    40:00 -> +0:18  46:00 -> +6:18 (1.16x)
+      #   W25       36:00 + 3:33 + 1:20 = 40:53                    40:00 -> -0:53  46:00 -> +5:07 (1.13x)
       #
-      # BOTH rows were already NEGATIVE -- ubuntu as well as Windows, which the previous revision had
-      # the wrong way round -- because the +4 convention was carried through two cap changes without
-      # anyone summing what it had to cover. Windows is sized on windows-2025, the worse of the pair;
-      # windows-2022 alone comes to 39:42, which was the one row genuinely in the black at +0:18.
+      # ubuntu and windows-2025 were ALREADY NEGATIVE -- ubuntu too, which an earlier revision had the
+      # wrong way round; windows-2022 was the one row genuinely in the black. Windows takes one value,
+      # sized on windows-2025 as the worse of the pair. The `+4` habit that produced 40 was Windows-only
+      # and was carried through two cap changes unchecked (30/26 then 40/36); ubuntu has never been +4 --
+      # it went 15/13 to 22/19, so +2 then +3. Either way the number was derived from the OTHER BOUND
+      # rather than from the work, which is the defect, not the particular constant.
       #
       # WHAT THIS DOES NOT FIX. The nesting invariant at the top of this note holds for `Tests (pytest)`
       # on every leg and for `Web console tests (pytest)` on NONE of them: reaching that step already
-      # spends setup plus `Tests`, so its own cap can never fire first -- satisfying it would need
-      # job_timeout past 39:24 on ubuntu and 73:21 on Windows, using the pool's most FAVOURABLE observed
-      # values. A hang in the web-console step therefore still surfaces as an unattributed job-level
-      # kill, which is the very failure the invariant is there to prevent. The structural fix is to stop
+      # spends setup plus `Tests`, so its own cap can never fire first. Guaranteeing it would need
+      # job_timeout above setup + 2 x step_timeout -- about 39:20 on ubuntu and 73:20 on Windows at the
+      # measured setup maxima above, i.e. far beyond anything worth setting. A hang in the web-console
+      # step therefore still surfaces as an unattributed job-level kill, which is the very failure the
+      # invariant is there to prevent. The structural fix is to stop
       # the two steps sharing one budget (a 3:33 suite has no business holding 36:00) and is filed as
       # BACKLOG #344; this sizing only makes the job cap cover the sum. Re-derive it if either suite's
       # duration moves.
+      #
+      # AND KNOW WHAT IS NOT CAPPED AT ALL. `test` is the ONLY one of this file's ten jobs carrying any
+      # `timeout-minutes`; the other nine -- `changes`, `ide`, `sqlserver-store`, `postgres-store`,
+      # `load-test`, `load-test-sqlserver`, `windows-service-smoke`, `docker-smoke`, `ci-gate` -- run on
+      # GitHub's 6-HOUR default. That is recorded here so the omission is known rather than assumed
+      # deliberate; sizing them is out of scope for this change and belongs with BACKLOG #344.
       #
       # This cap is NOT what catches a hung test; pytest_timeout (120s) is, per test. The step cap only
       # catches a whole-process deadlock both in-process watchdogs miss, which is why it can sit well
