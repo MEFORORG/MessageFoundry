@@ -1128,8 +1128,8 @@ def Http(
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
-    ingress row). The synchronous downstream-reply (SOAP-envelope) path is a defined ADR 0013 follow-on,
-    not built here.
+    ingress row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches
+    to the synchronous captured-downstream reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
