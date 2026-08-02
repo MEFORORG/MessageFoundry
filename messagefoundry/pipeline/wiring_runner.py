@@ -67,7 +67,7 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.settings import DeliverySettings, EgressSettings, StoreBackend
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
@@ -81,6 +81,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
     resolve_env_settings,
@@ -122,6 +123,7 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
@@ -130,6 +132,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneResultKind,
     StageDispatcher,
 )
+from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
@@ -148,7 +151,12 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
-from messagefoundry.transports.base import ConnectionEventSink, IntakeAuditSink, IntakeRateLimiter
+from messagefoundry.transports.base import (
+    ConnectionEventSink,
+    IntakeAuditSink,
+    IntakeRateLimiter,
+    SyncReplyResolver,
+)
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
@@ -730,6 +738,13 @@ class RegistryRunner:
     ) -> None:
         self.registry = registry
         self.store = store
+        #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
+        #: process by construction (under HA the graph runs on the leader only), so process-local is
+        #: the right scope. It carries no information — every signal is a latency hint and the waiter
+        #: re-reads the store — so a shard that never sees a signal is merely slower, never wrong.
+        self._reply_rendezvous = ReplyRendezvous()
+        #: Per-inbound sync-reply counters, exposed via sync_reply_metrics() (ADR 0154 D8).
+        self._sync_reply_metrics: dict[str, SyncReplyMetrics] = {}
         # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
@@ -1255,6 +1270,53 @@ class RegistryRunner:
                 log.warning("intake auth audit write failed: %s", safe_exc(exc))
 
         return _sink
+
+    def _make_sync_reply_resolver(self, ic: InboundConnection) -> SyncReplyResolver | None:
+        """The per-inbound synchronous-reply resolver (ADR 0154 D2/D3), or ``None``.
+
+        ``None`` unless this inbound declares ``reply_from``, which is what keeps every other
+        connection on the shipped ``202`` path byte for byte (AC-8).
+
+        Also re-runs the cross-registry validation **here**, where ``[delivery]`` is resolved. The
+        offline arm in ``build_check_registry`` skips the effective ``ordering``/``max_attempts``
+        refusals whenever its caller could not supply those defaults, so this is the backstop that
+        makes them unconditional — a graph that would serialise every concurrent caller behind one
+        FIFO lane fails to start rather than degrading silently under load, and ADR 0031 isolates
+        that to this one connection.
+        """
+        if ic.spec.type is not ConnectorType.HTTP or not ic.spec.settings.get("reply_from"):
+            return None
+        check_http_sync_reply(
+            ic,
+            self.registry,
+            delivery=DeliverySettings(
+                ordering=self._ordering_default,
+                # The runner resolves an outbound's retry as `oc.retry or self._delivery_defaults`,
+                # so the inherited max_attempts is that default policy's — not a separate scalar.
+                retry_max_attempts=self._delivery_defaults.max_attempts,
+            ),
+        )
+        settings = ic.spec.settings
+        metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
+        return SyncReplyResolverImpl(
+            self.store,
+            self._reply_rendezvous,
+            destination=str(settings["reply_from"]),
+            timeout=float(settings.get("reply_timeout") or 30.0),
+            content_type=str(settings.get("reply_content_type") or "passthrough"),
+            on_timeout=str(settings.get("reply_on_timeout") or "504"),
+            metrics=metrics,
+        )
+
+    def sync_reply_metrics(self) -> dict[str, SyncReplyMetrics]:
+        """Per-inbound synchronous-reply counters, keyed by connection name (ADR 0154 D8).
+
+        The PUBLIC accessor the metrics exporter reads. api/metrics.py builds every family per scrape
+        from engine.store alone and has no view of the runner, while transports/ may not import api/
+        (AC-17) — so the counters live with the runner that owns the resolvers, and the exporter pulls
+        them through here rather than reaching into a private attribute.
+        """
+        return dict(self._sync_reply_metrics)
 
     def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
         """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
@@ -2101,6 +2163,13 @@ class RegistryRunner:
         # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
         source.on_intake_audit = self._make_intake_audit_sink(ic)
         source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
+        # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
+        # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
+        # reply_from, so every other connection keeps the shipped 202 path byte for byte.
+        source.sync_reply = self._make_sync_reply_resolver(ic)
+        if source.sync_reply is not None:
+            # ADR 0154 D5/AC-10: stop() wakes blocked turns through this BEFORE closing writers.
+            source.reply_drain = self._reply_rendezvous.drain
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
@@ -4283,6 +4352,27 @@ class RegistryRunner:
                 )
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                # ADR 0154 D3 — the latency hint, and its POSITION is the correctness argument.
+                #
+                # Strictly after the await returned NORMALLY. Under SQLite group commit
+                # complete_with_response enrols in a shared batch whose future resolves post-commit,
+                # so a signal here is committed-authoritative; in a `finally`, or before the await,
+                # it would fire on a transaction that may have rolled back.
+                #
+                # It is only ever a hint — the woken turn re-reads the store — so both ways it can be
+                # "wrong" are harmless: it can fire for a vanished row that wrote nothing
+                # (complete_with_response returns normally in that case), and it can fail to fire at
+                # all when an engine shard other than the listener's owns this lane. The first costs
+                # one extra read; the second costs latency, never correctness.
+                #
+                # NOT placed beside the _wake_lane below, which is where the ADR says to put it: that
+                # call is nested under `if reingress_to is not None`, and a reply_from outbound never
+                # re-ingresses, so a hint there would be unreachable dead code.
+                # destination_name is NULL on ingress/routed rows and set on outbound ones, so it is
+                # non-None everywhere this path runs — but the type says otherwise, and a hint keyed
+                # on None would silently match nothing rather than fail, so the guard is explicit.
+                if item.destination_name is not None:
+                    self._reply_rendezvous.signal(item.message_id, item.destination_name)
                 if reingress_to is not None:
                     # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
                     # (reingress_to), NOT this delivery worker's own OUTBOUND lane.
@@ -5877,6 +5967,7 @@ def build_check_registry(
     reserved_bindings: Sequence[tuple[str, str, int]] = (),
     posture: HopPosture | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
     connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
@@ -5914,7 +6005,7 @@ def build_check_registry(
         # so it need not run inside the scope.
         with active_hop_posture(posture):
             _build_check_connectors(
-                registry, inbound_bind_host, env_values, egress, trust_anchor_policy
+                registry, inbound_bind_host, env_values, egress, trust_anchor_policy, delivery
             )
     except WiringError:
         raise
@@ -5928,6 +6019,7 @@ def _build_check_connectors(
     env_values: Mapping[str, Any],
     egress: EgressSettings,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
@@ -5947,11 +6039,17 @@ def _build_check_connectors(
     nothing. The fail-loud guarantee is UNCHANGED for a deployed connection: a missing ``env()`` value on
     one still raises here, which is exactly the promote-time gate ("a graph whose env keys aren't defined
     for the target never goes live")."""
+    # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
+    # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
+    apply_sync_reply_capture_implication(registry)
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
+        # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
+        # responses, and resolve to a lane that can actually serve concurrent callers.
+        check_http_sync_reply(ic, registry, delivery=delivery)
         # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
         # fire at `messagefoundry check`, so without this a config that refuses to start would pass
         # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
@@ -6413,6 +6511,110 @@ def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
         if net.prefixlen < floor:
             return False  # ONE too-wide entry defeats the whole list
     return True
+
+
+def check_http_sync_reply(
+    ic: InboundConnection,
+    registry: Registry,
+    *,
+    delivery: DeliverySettings | None = None,
+) -> None:
+    """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
+
+    These are the facts one ``Http()`` call cannot know, because they are about the *other*
+    connection. Runs with no store, so it fires at ``messagefoundry check`` and in dry-run exactly as
+    at serve.
+
+    The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
+    warnings because together they make the feature's headline use case unserviceable. ``ordering``
+    resolves to **FIFO**, which drains one message at a time and blocks the head on failure — so N
+    concurrent HTTP callers do not get N concurrent downstream calls; they serialise behind a single
+    lane bounded by one partner round-trip, and one transiently-failing head message holds that lane
+    until an operator purges it, timing out **every** concurrent and subsequent caller.
+    ``max_attempts`` resolves to retry-forever, which is not merely incoherent with "the caller gave
+    up 30 seconds ago" — it is a total outage with a config-shaped cause.
+
+    **Both are read as EFFECTIVE values, never declared ones.** ``OutboundConnection.ordering``
+    defaults to ``None`` meaning *inherit*, and ``retry`` defaults to no ``RetryPolicy`` object at
+    all; resolution against ``[delivery]`` happens in the runner. A literal ``ordering == FIFO`` test
+    would therefore pass cleanly for the overwhelmingly common shape — the exact shape this refusal
+    exists to catch. When ``delivery`` is not supplied the caller could not resolve them either, so
+    that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
+    values always exist.
+    """
+    settings = ic.spec.settings
+    reply_from = settings.get("reply_from")
+    if not reply_from:
+        return
+    name, target = ic.name, str(reply_from)
+
+    oc = registry.outbound.get(target)
+    if oc is None:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names unknown outbound {target!r} — a "
+            "synchronous reply can only come from an outbound declared in this graph"
+        )
+    if not oc.deployed:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which is declared "
+            "deployed=False — it will never run, so every HTTP turn could only time out"
+        )
+    if not oc.spec.settings.get("capture_response"):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
+            "capture_response=True — with no captured reply there is nothing to return, and every "
+            "call would block until reply_timeout"
+        )
+
+    # apply_sync_reply_capture_implication has already added content-type for any factory that HAS
+    # the allow-list. One that does not cannot echo a content type at all, so refuse here rather than
+    # let it surface as an AttributeError deep in the capture path.
+    if (
+        settings.get("reply_content_type") == "passthrough"
+        and "capture_response_headers" not in oc.spec.settings
+    ):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_content_type='passthrough' needs {target!r} to "
+            "capture the partner's content-type, but that connector has no "
+            "capture_response_headers setting — pin a literal MIME type on reply_content_type "
+            "instead"
+        )
+
+    if ic.ack_after is AckAfter.DELIVERED:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from cannot be combined with ack_after='delivered' "
+            "— the HTTP turn already blocks on the downstream reply, so deferring the receipt too "
+            "would mean waiting for the same delivery twice"
+        )
+
+    if delivery is None:
+        return  # the caller could not resolve [delivery]; the runner re-checks at start
+
+    if (oc.ordering or delivery.ordering) is OrderingMode.FIFO:
+        declared = oc.ordering.value if oc.ordering else "unset, inheriting [delivery].ordering"
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE ordering is "
+            f"FIFO (declared: {declared}). A FIFO lane drains one message at a time and blocks the "
+            "head on failure, so concurrent HTTP callers serialise behind a single partner "
+            "round-trip and one stuck message times out every caller — set ordering=UNORDERED on "
+            "that outbound"
+        )
+
+    effective_attempts = (
+        oc.retry.max_attempts if oc.retry is not None else delivery.retry_max_attempts
+    )
+    if effective_attempts is None:
+        declared = (
+            "no retry policy, inheriting [delivery].retry_max_attempts"
+            if oc.retry is None
+            else "max_attempts=None"
+        )
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE max_attempts "
+            f"is unset — retry forever (declared: {declared}). Retrying forever is incoherent with a "
+            "caller that gave up seconds ago; set a finite max_attempts so a failed delivery "
+            "dead-letters instead of holding the lane"
+        )
 
 
 def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:

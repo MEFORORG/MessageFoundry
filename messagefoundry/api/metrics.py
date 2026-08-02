@@ -37,6 +37,7 @@ from prometheus_client.core import (
 )
 
 from messagefoundry import __version__
+from messagefoundry.pipeline.sync_reply import SyncReplyMetrics
 from messagefoundry.store.pool_metrics import PoolStatus
 from messagefoundry.store.store import (
     ClaimProcStatus,
@@ -201,6 +202,10 @@ class _Snapshot:
     # is off — the gauges are then ABSENT rather than 0, so a scrape can tell "not requested" from
     # "requested and degraded" (a constant 0 on every SQLite fleet would be pure alert noise).
     claim_proc: ClaimProcStatus | None = None
+    # ADR 0154 D8: per-inbound synchronous-reply counters, read from the runner rather than the
+    # store — they are process-lifetime in-memory counts, not persisted aggregates. Empty on every
+    # instance with no reply_from inbound, so those scrapes are byte-identical.
+    sync_replies: dict[str, SyncReplyMetrics] = field(default_factory=dict)
 
 
 async def gather_snapshot(engine: Engine) -> _Snapshot:
@@ -209,6 +214,10 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
     All ``await``s — and therefore all store I/O — live here; nothing downstream blocks.
     """
     now = time.time()
+    # Engine.registry_runner is a public property; the counters live with the runner that owns the
+    # resolvers because api/metrics.py otherwise builds every family from engine.store alone.
+    runner = engine.registry_runner
+    sync_replies = runner.sync_reply_metrics() if runner is not None else {}
     cm = await engine.store.connection_metrics(
         since=engine.started_at or now, now=now, rate_window=_RATE_WINDOW
     )
@@ -225,6 +234,7 @@ async def gather_snapshot(engine: Engine) -> _Snapshot:
     committed_txns = int(getattr(engine.store, "committed_txns", 0))
     body_copies = int(getattr(engine.store, "body_copies", 0))
     return _Snapshot(
+        sync_replies=sync_replies,
         version=__version__,
         inbound=cm.inbound,
         destinations=cm.destinations,
@@ -310,6 +320,37 @@ class _MetricsCollector:
             received.add_metric([channel_id], float(im.read))
             errored.add_metric([channel_id], float(im.errored))
         yield received
+
+        # ADR 0154 D8 — the synchronous-reply SLO series. Labelled `status`, NOT `outcome`: the label
+        # allowlist above is a PHI contract, and the outcome enum is a fixed non-PHI constant set, so
+        # it rides an existing label rather than widening a deliberately closed one.
+        # rate(timeout)/rate(total) IS the proxy API's error budget, which is why `degraded` is a
+        # distinct label value rather than folded into timeout.
+        if s.sync_replies:
+            replies = CounterMetricFamily(
+                "messagefoundry_http_sync_replies_total",
+                "Synchronous captured-downstream replies resolved, by outcome (process lifetime).",
+                labels=["connection", "status"],
+            )
+            wait = GaugeMetricFamily(
+                "messagefoundry_http_sync_reply_wait_seconds",
+                "Mean time an HTTP turn blocked on a captured downstream reply (process lifetime). "
+                "Answers 'is this approaching reply_timeout?' before the pager does.",
+                labels=["connection"],
+            )
+            waiters = GaugeMetricFamily(
+                "messagefoundry_http_sync_reply_waiters",
+                "HTTP turns currently blocked on a captured downstream reply.",
+                labels=["connection"],
+            )
+            for connection, m in sorted(s.sync_replies.items()):
+                for status, count in sorted(m.totals.items()):
+                    replies.add_metric([connection, status], float(count))
+                wait.add_metric([connection], m.mean_wait_seconds)
+                waiters.add_metric([connection], float(m.live))
+            yield replies
+            yield wait
+            yield waiters
         yield errored
 
         # --- outbound counters + gauges (per connection/destination) ---------
