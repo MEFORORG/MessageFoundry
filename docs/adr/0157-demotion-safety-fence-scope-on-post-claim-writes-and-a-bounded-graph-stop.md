@@ -143,10 +143,25 @@ conjunct would reject it and force a genuine re-send — a duplicate manufacture
 WAN lanes. The epoch does not fire there (same node, same term), so the conjunct would be the only thing
 firing, and firing is worse.
 
-**C3 — A fenced write is all-or-nothing and a no-op to the caller.** Zero rows affected ⇒ roll back the
-enclosing transaction (discarding the `delivered_keys` row, the `message_events` row and the
-`_maybe_finalize_message` call), return via the existing `if row is None: return` shape, bump a
-`fenced_write` counter, log WARNING, fire the AlertSink once.
+**C3 — A fenced write is all-or-nothing, and it RE-PENDS the row. It must not leave it INFLIGHT.**
+Zero rows affected ⇒ roll back the enclosing transaction (discarding the `delivered_keys` row, the
+`message_events` row and the `_maybe_finalize_message` call), **then re-pend the row with an unguarded
+`release_claimed([id])` in a fresh transaction**, bump a `fenced_write` counter, log WARNING.
+
+> **Corrected 2026-08-02, before any implementation.** An earlier revision of this clause ended at
+> "roll back … return via the existing `if row is None: return` shape", leaving the row INFLIGHT for
+> recovery to collect. **That is strand-direction and must not ship.** On Postgres it costs ~90 s of
+> latency via `reclaim_expired_leases`. On SQL Server there is **no periodic in-flight recovery at all**
+> (`grep -c reclaim_expired_leases messagefoundry/store/sqlserver.py` → **0**; the `hasattr` gate in
+> `engine.py` is the sole exclusion), so the row is stranded until the next promotion — precisely the
+> outcome this ADR exists to prevent, produced by its own fence. The re-pend is invariant-legal by C1's
+> own rule: `release_claimed` is a *return-to-PENDING* write, which C1 explicitly forbids fencing, and it
+> is `status='inflight'`-guarded so it is idempotent. It converts the fence's own residue from a possible
+> **strand** into a certain **duplicate**, which is the only direction the invariant permits.
+>
+> Rejected alternative: preferring `release_claimed` over `mark_done` on the demotion path generally.
+> That manufactures a duplicate even when the epoch was **not** bumped — the common self-fence-without-
+> takeover case — where the fail-open guard would correctly have let the write land.
 
 Note honestly *why*: a persisted ledger row would record a **true** fact (`mark_done` is reached only
 after a successful send), and the successor's H2 skip would then resolve the row without re-sending — so
@@ -154,11 +169,28 @@ rollback is not "avoiding a loss". We roll back because a ledger row without a r
 half-applied disposition asserted by a node that is not the authority. **Cost booked: one extra duplicate
 per fenced resolve.**
 
-**C4 — A demoted node retains its stale epoch; it does not clear it.** `_stop_graph` currently calls
-`set_leader_epoch(None)`, reasoning that a demoted node should carry no stale token. **The polarity is
-backwards:** the guard string is omitted entirely when the epoch is `None`, so `None` means *no fence*
-while a stale token fails closed. Delete the clear, correct the comment. Safe because `_start_graph`
-pushes `current_epoch()` unconditionally on every promotion and no API path resolves a queue row.
+**C4 — A demoted node retains its stale epoch; it does not clear it — AND the epoch is re-stamped on
+every reconcile pass while leader.** `_stop_graph` currently calls `set_leader_epoch(None)`, reasoning
+that a demoted node should carry no stale token. **The polarity is backwards:** the guard string is
+omitted entirely when the epoch is `None`, so `None` means *no fence* while a stale token fails closed.
+Delete the clear and correct the comment.
+
+> **Corrected 2026-08-02.** "Delete the clear" **alone is unsafe once C5 lands**, and the failure is
+> silent and total. `set_leader_epoch` has exactly one push site, inside `_start_graph`, and
+> `_reconcile_graph` has only two branches: `is_leader() and not running` → start, and
+> `not is_leader() and running` → stop. If the node demotes and re-acquires with a bumped epoch *during*
+> a slow `_start_graph`, the post-bring-up recheck sees `is_leader()` True, so no stop fires — and
+> thereafter the state `is_leader() and running` matches **neither branch, forever**, with the store
+> still holding the pre-demotion epoch. Today that half-works because `claim_ready` is unfenced. After
+> C5 fences every claim path, it is a live leader that claims **nothing**, silently, with no exception
+> and no alert. The clause therefore requires a second half: **re-stamp `current_epoch()` on every
+> reconcile pass where the node is leader and the graph is running.** That is safe and idempotent —
+> `_is_leader` flips False→True only in `_maintain_leadership`, immediately after the renew refreshed
+> `_leader_epoch`, with no intervening await, so `is_leader()` implies `current_epoch()` is non-`None`.
+>
+> **Also required in the same commit:** `tests/test_cluster_graph_gating.py` asserts the demotion push
+> is `(None, None)`. That assertion encodes the behaviour being reversed and must be inverted here, or
+> the tree goes red on a test that is documenting the old contract.
 
 **C5 — Fence every claim path, including `claim_ready`.** With `claim_ready` open, a demoted node in
 teardown overrun can claim a **fresh** row after the successor bumped the epoch, send it, have its
@@ -172,6 +204,27 @@ DEMOTE}` as a parameter on the same `_teardown_unsafe` body — never a forked f
 path is statement-for-statement today's. Under DEMOTE: bounded, **concurrent** source stop; then a
 cooperative dispatcher `quiesce()` before any hard cancel; edge-triggered from the fence rather than
 waiting on the graph poll.
+
+> **Three constraints added 2026-08-02 from adversarial review; each makes the difference between the
+> increment working and being actively harmful.**
+>
+> 1. **The concurrent stop must be one phase-level `asyncio.wait(tasks, timeout=budget)`, not a
+>    semaphore with a per-source `wait_for`.** A semaphore of width *C* bounds the phase at
+>    `ceil(N/C) × budget`, not `max()` — roughly **63 s at the 1,500-connection target against an ~8 s
+>    margin**, i.e. the fix would not fix it. `asyncio.wait` also never cancels its awaitables, so
+>    *abandon-don't-cancel* becomes a property of the primitive rather than of a flag someone can drop.
+>    Creating all N tasks eagerly is cheap: every socket source closes its listening socket in its
+>    **synchronous prologue**, so accept stops at task-creation time.
+> 2. **`quiesce()` must not gate the lane drain on the claimer/sweep loops exiting.** The fence fires
+>    *because* renews are failing — i.e. the pool is degraded — i.e. the claimer is parked inside a claim
+>    against `[store].command_timeout`. A design that waits for it drains zero serializers on the exact
+>    trigger it was built for.
+> 3. **`self._running = False` must execute on every path** — `try/finally`, with the `finally` doing
+>    *only* that. Do not clear the rest of the state there: a cancelled teardown would orphan live
+>    listeners. Leaving `_running=True` (today's behaviour on a cancelled teardown) wedges re-promotion
+>    permanently; leaving `_running=False` with dirty state makes the rebind path silently skip every
+>    source. Both failure modes need pinned tests, plus a residual-state re-teardown at the top of
+>    `start()` and a third branch in `_reconcile_graph`.
 
 **The constraint stated in the brief does not exist.** `grep -c "D3" docs/adr/0066-*.md` → **0**. "ADR
 0066 D3" appears only as a code comment (`wiring_runner.py:2499`). There is no ratified decision to
