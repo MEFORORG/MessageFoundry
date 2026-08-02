@@ -170,8 +170,10 @@ been killed" is a counterfactual about a run that never faced them.
   argument ([`alert_sinks.py`](../../messagefoundry/pipeline/alert_sinks.py):382-384). The same bare
   call stood at [`transports/email.py`](../../messagefoundry/transports/email.py) and
   [`transports/direct.py`](../../messagefoundry/transports/direct.py) when this was written; *update
-  (2026-08-02, after this ADR was committed): 093db339 (#132) gave both an explicit verifying context,
-  leaving the alert sink as the only remaining instance on `main`.* On the project's own
+  (after this ADR was committed): 093db339 (#132) gave both connectors an explicit verifying context,
+  and the alerts call site is tracked separately as BACKLOG #323 layer 3. This instance is recorded
+  because it is the worked example the taxonomy was derived from, not as a statement of what is
+  outstanding now -- a reader wanting the current state must grep, not cite this.* On the project's own
   interpreter (Python 3.14.6), `smtplib.SMTP.starttls` resolves a `None` context via
   `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context`: `verify_mode`
   CERT_NONE, `check_hostname` False. The sink encrypts and authenticates nothing. **A retraction is
