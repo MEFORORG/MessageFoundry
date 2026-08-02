@@ -33,6 +33,7 @@ from messagefoundry.auth.notifications import (
 )
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AlertsSettings
+from messagefoundry.config.tls_policy import TrustAnchorPolicy
 from messagefoundry.pipeline.alert_sinks import _BackgroundDispatcher, send_plain_email
 
 log = logging.getLogger(__name__)
@@ -104,6 +105,9 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         password: str | None = None,
         timeout: float = 30.0,
         allowed_hosts: tuple[str, ...] = (),
+        tls_verify: bool = True,
+        tls_ca_file: str | None = None,
+        trust_anchor_policy: TrustAnchorPolicy | None = None,
     ) -> None:
         super().__init__()
         self._host = host
@@ -114,6 +118,11 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
         self._password = password
         self._timeout = timeout
         self._allowed_hosts = allowed_hosts
+        # #323 layer 3: the STARTTLS hop that carries a user's security-event mail now VERIFIES the
+        # relay's certificate. Carried as plain data — send_plain_email builds the one context.
+        self._tls_verify = tls_verify
+        self._tls_ca_file = tls_ca_file
+        self._trust_anchor_policy = trust_anchor_policy
 
     async def notify(self, event: SecurityEvent) -> None:
         # No deliverable address (common for local accounts / unset email) → nothing to email; the
@@ -149,11 +158,17 @@ class SecurityEventNotifier(_BackgroundDispatcher[SecurityEvent]):
             password=self._password,
             timeout=self._timeout,
             allowed_hosts=self._allowed_hosts,
+            tls_verify=self._tls_verify,
+            tls_ca_file=self._tls_ca_file,
+            trust_anchor_policy=self._trust_anchor_policy,
         )
 
 
 def security_notifier_from_settings(
-    alerts: AlertsSettings, *, secret_provider: SecretProvider | None = None
+    alerts: AlertsSettings,
+    *,
+    secret_provider: SecretProvider | None = None,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
 ) -> SecurityEventNotifier | None:
     """Build the per-user security notifier from ``[alerts]`` SMTP settings, or ``None`` when no SMTP
     server/sender is configured (then only the ``/me/security-events`` feed records events).
@@ -178,4 +193,7 @@ def security_notifier_from_settings(
         password=smtp_password,
         timeout=alerts.email_timeout,
         allowed_hosts=tuple(alerts.smtp_allowed_hosts),
+        tls_verify=alerts.email_tls_verify,
+        tls_ca_file=alerts.email_tls_ca_file,
+        trust_anchor_policy=trust_anchor_policy,
     )
