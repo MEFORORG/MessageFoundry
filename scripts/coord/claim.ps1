@@ -82,6 +82,38 @@ function Get-Mine([string]$Path) {
     [pscustomobject]@{ Claim = $c; IsMine = ($held -ieq $me) }
 }
 
+# ONE liveness rule, three call sites (BACKLOG #345 Half B).
+#
+# `-List` learned this first, and that was the wrong half to fix alone: -List is where you BROWSE, and
+# `-Take`/`-Release` are where you are STOPPED. Both blocking paths printed the same "held by another
+# worktree" block whether the holder had been deleted, had died, or was committing that minute -- and
+# `-Release` went further and RECOMMENDED `-Force` ("If that session is gone...") on a holder it had
+# never looked at. Advice that cannot distinguish the two cases is advice to guess, and the guess that
+# frees a live session's key causes the duplicate build this whole registry exists to prevent.
+#
+# Reports only what it can PROVE. A vanished directory is a fact and the one state safe to act on
+# unasked. Everything else is 'unknown' or a quiet-hours count -- never "probably fine": a session can
+# be alive and simply not committing, so silence is not evidence of death.
+function Get-HolderLiveness([string]$HeldPath) {
+    try {
+        if (-not (Test-Path -LiteralPath $HeldPath)) {
+            return [pscustomobject]@{ State = 'gone'; QuietHours = $null }
+        }
+        $ct = & git -C $HeldPath log -1 --format=%ct 2>$null
+        if ($ct) {
+            $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
+            return [pscustomobject]@{ State = 'present'; QuietHours = $quiet }
+        }
+        # Present on disk but no commit to date it by -- a brand-new worktree looks exactly like this.
+        return [pscustomobject]@{ State = 'unknown'; QuietHours = $null }
+    }
+    catch {
+        # Say so rather than returning 'gone'. A failed probe that reported death would turn an
+        # unreadable path into a licence to release someone's live claim.
+        return [pscustomobject]@{ State = 'failed'; QuietHours = $null }
+    }
+}
+
 function Show-List {
     $files = @(Get-ChildItem $claims -Filter *.json -EA SilentlyContinue | Sort-Object Name)
     if (-not $files) { Write-Host "No active claims."; return }
@@ -102,20 +134,16 @@ function Show-List {
         $age = ""
         try {
             $hrs = [int]((Get-Date) - [datetime]::Parse($c.claimed)).TotalHours
-            if (-not (Test-Path $held)) {
-                # The only state that is genuinely safe to act on without asking anyone.
-                $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]"
-            }
-            else {
-                $ct = & git -C $held log -1 --format=%ct 2>$null
-                if ($ct) {
-                    $quiet = [int]((Get-Date) - [System.DateTimeOffset]::FromUnixTimeSeconds([long]$ct).LocalDateTime).TotalHours
-                    $age = "  [held ${hrs}h; holder last committed ${quiet}h ago]"
-                    if ($quiet -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
+            # Shared with -Take and -Release, so all three surfaces answer "is the holder there?" the
+            # same way. They used to disagree: this one probed, the other two did not probe at all.
+            $live = Get-HolderLiveness $held
+            switch ($live.State) {
+                'gone'    { $age = "  [HOLDER GONE -- worktree no longer exists; release with -Force]" }
+                'present' {
+                    $age = "  [held ${hrs}h; holder last committed $($live.QuietHours)h ago]"
+                    if ($live.QuietHours -ge 12) { $age += " -- QUIET, confirm with the holder before releasing" }
                 }
-                else {
-                    $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]"
-                }
+                default   { $age = "  [held ${hrs}h; holder liveness UNKNOWN -- confirm before releasing]" }
             }
         } catch {
             # Say so. An empty annotation reads as "nothing notable about this claim", which is the same
@@ -139,8 +167,28 @@ if ($Release) {
         Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
         Write-Host "  since  : $($info.Claim.claimed)"
         Write-Host "  note   : $($info.Claim.note)"
+        # DO NOT recommend -Force without looking. This line used to read "If that session is gone,
+        # re-run with -Force" unconditionally -- an instruction to guess, printed at exactly the moment
+        # the operator is deciding whether to take someone else's key. Now the recommendation is only
+        # made in the one state that can be proven, and the live case says the opposite.
+        $live = Get-HolderLiveness $info.Claim.worktree
         Write-Host ""
-        Write-Host "If that session is gone, re-run with -Force."
+        switch ($live.State) {
+            'gone' {
+                Write-Host "  HOLDER GONE -- that worktree no longer exists on disk." -ForegroundColor Green
+                Write-Host "  Safe to take over:  claim.ps1 -Release $Release -Force"
+            }
+            'present' {
+                Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+                Write-Host "  Do NOT -Force it on the strength of a quiet period: a session can be alive and"
+                Write-Host "  simply not committing. Ask that session first -- releasing a live claim is how two"
+                Write-Host "  sessions end up building the same thing."
+            }
+            default {
+                Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
+                Write-Host "  Confirm with that session before using -Force."
+            }
+        }
         exit 1
     }
     Remove-Item -LiteralPath $file -Force
@@ -250,10 +298,30 @@ try {
     Write-Host "  held by: $($info.Claim.worktree) [$($info.Claim.branch)]"
     Write-Host "  since  : $($info.Claim.claimed)"
     Write-Host "  note   : $($info.Claim.note)"
+    # THE BLOCKING PATH IS WHERE THIS MATTERS MOST. -List is where you browse; this is where a session
+    # is stopped and has to decide between waiting, picking other work, and taking the key. It used to
+    # offer -Force as a flat third option with no way to tell a dead holder from a live one, so the
+    # cheapest way past the gate was also the one that causes the duplicate build it exists to prevent.
+    $live = Get-HolderLiveness $info.Claim.worktree
     Write-Host ""
-    Write-Host "Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop."
-    Write-Host "Coordinate with that session, pick different work, or if it is dead:"
-    Write-Host "    pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take -Force"
+    switch ($live.State) {
+        'gone' {
+            Write-Host "  HOLDER GONE -- that worktree no longer exists on disk, so nobody is building this." -ForegroundColor Green
+            Write-Host "  Take it over with:"
+            Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Release $Take -Force"
+            Write-Host "      pwsh -NoProfile -File scripts\coord\claim.ps1 -Take $Take -Note ""<what>"""
+        }
+        'present' {
+            Write-Host "  HOLDER IS STILL THERE -- that worktree exists and last committed $($live.QuietHours)h ago." -ForegroundColor Red
+            Write-Host "  Do NOT build it in parallel -- that is the duplicate-work this gate exists to stop,"
+            Write-Host "  and do NOT -Force it: quiet is not dead. Coordinate with that session or pick"
+            Write-Host "  different work. Its note above says what it is doing."
+        }
+        default {
+            Write-Host "  HOLDER LIVENESS UNKNOWN -- the worktree exists but could not be dated." -ForegroundColor Yellow
+            Write-Host "  Treat it as live: coordinate with that session before -Force."
+        }
+    }
     exit 1
 }
 try {
