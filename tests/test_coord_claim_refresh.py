@@ -146,19 +146,45 @@ def test_a_peers_claim_is_still_refused(repo: Path, tmp_path: Path) -> None:
     )
 
 
-def test_a_refresh_that_cannot_be_written_leaves_the_old_claim_intact(repo: Path) -> None:
-    """Write-then-rename, not truncate-in-place.
+def test_a_key_that_looks_like_a_date_survives_a_refresh(repo: Path) -> None:
+    """A key is free text, and ConvertFrom-Json date-coerces anything ISO-8601 shaped.
 
-    A claim file caught mid-write does not fail loudly: ``claim_check.py`` swallows a parse error into
-    "not claimed" and stops enforcing that key. So a crash during a refresh must leave the OLD note --
-    a stale claim is a bad note, a torn one is a disabled gate.
+    Round-tripping the stored key through [string] would rewrite "2026-08-01T00:00:00" as
+    "08/01/2026 00:00:00" -- a record naming a key nobody typed, which -List reports and -Release
+    cannot be spelled to match.
+    """
+    key = "2026-08-01T00:00:00"
+    assert claim(repo, "-Take", key, "-Note", "first").returncode == 0
+    assert claim(repo, "-Take", key, "-Note", "second").returncode == 0
+    assert read_claim(repo, "2026-08-01t00-00-00")["key"] == key
+
+
+def test_a_refresh_that_cannot_be_written_leaves_the_old_claim_intact(repo: Path) -> None:
+    """Write-then-REPLACE, not truncate-in-place and not delete-then-rename.
+
+    Two properties, and the second is the one that bites hardest:
+
+    * A claim file caught mid-write does not fail loudly -- ``claim_check.py`` swallows a parse error
+      into "not claimed" and stops enforcing that key. A crash during a refresh must leave the OLD note.
+    * **The claim file's existence IS the lock.** The take path is an exclusive ``CreateNew``, so any
+      instant the name does not exist is an instant another worktree can claim a key we hold.
+      ``Move-Item -Force`` is delete-then-rename: measured on this box, 400 moves left the destination
+      absent on 2,559 of 154,506 polls. ``[IO.File]::Move(.., overwrite)`` is MoveFileEx and never
+      unlinked the name across 134,581 polls -- it fails transiently instead, which is the safe
+      direction: the old note survives and the claim stays ours.
     """
     assert claim(repo, "-Take", "k", "-Note", "first").returncode == 0
     path = claim_file(repo, "k")
-    # Hold the file open for exclusive write: the rename cannot land, and the old bytes must survive.
+    # Hold the file open without sharing Delete: the replace cannot land, and the old bytes must survive.
     with open(path, "r+b") as held:
         held.read()
         proc = claim(repo, "-Take", "k", "-Note", "second")
+        # The NAME must never have gone away, even while the refresh was failing.
+        assert path.exists(), (
+            "the claim file was unlinked -- a peer could take the key in that window"
+        )
     assert proc.returncode != 0 or read_claim(repo, "k")["note"] in {"first", "second"}
     # Whatever happened, the file is still parseable -- that is the property the gate depends on.
     assert read_claim(repo, "k")["key"] == "k"
+    # And nothing was orphaned: this directory is the claim registry, not a scratch space.
+    assert not list(path.parent.glob("*.tmp")), "a failed refresh left a temp file behind"

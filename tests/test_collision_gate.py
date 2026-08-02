@@ -58,6 +58,7 @@ def run_gate(
     file_path: str | None = "a.py",
     state_dir: Path | None = None,
     raw_input: str | None = None,
+    cwd: Path | None = None,
 ) -> dict[str, Any] | None:
     """Invoke the gate exactly as Claude Code does. Returns the emitted object, or None for silence.
 
@@ -80,6 +81,7 @@ def run_gate(
         text=True,
         timeout=180,
         check=False,
+        cwd=None if cwd is None else str(cwd),
     )
     # A hook must never crash the tool call: a non-zero exit is ignored by the harness, which would
     # leave the gate looking installed while permitting everything.
@@ -272,6 +274,38 @@ def test_a_different_reason_is_not_suppressed_by_the_first(tmp_path: Path) -> No
         "param([string]$File,[switch]$Json)\nWrite-Output 'not json'\n", encoding="utf-8"
     )
     assert "overlap-unparseable" in unresolved(run_gate(junk, state_dir=state))
+
+
+def test_the_throttle_does_not_silence_a_different_worktree(tmp_path: Path) -> None:
+    """ONE SESSION'S DIAGNOSTIC MUST NOT BECOME ANOTHER SESSION'S FALSE ALL-CLEAR.
+
+    The stamp lives in the SHARED git-common-dir. Keyed per repo, the first session to hit a broken
+    gate would silence it for every other session for the whole cooldown -- and those sessions read
+    silence as "checked, nobody is here", which is the exact defect the notice exists to remove.
+    """
+    state = tmp_path / "state"
+    missing = tmp_path / "does-not-exist.ps1"
+    a, b = tmp_path / "wt-a", tmp_path / "wt-b"
+    for wt in (a, b):
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q", str(wt)], check=True, capture_output=True)
+
+    assert run_gate(missing, state_dir=state, cwd=a) is not None, "first worktree must be told"
+    assert run_gate(missing, state_dir=state, cwd=b) is not None, "so must the second"
+    assert run_gate(missing, state_dir=state, cwd=a) is None, "but not the same one twice"
+
+
+def test_says_so_when_the_payload_is_empty(tmp_path: Path) -> None:
+    """Empty stdin and a literal `null` do not raise, so this was the one unreadable-input path that
+    still exited silently -- having learned no more than the case above, and said no less than an
+    all-clear."""
+    for payload in ("", "null"):
+        got = run_gate(
+            make_overlap_stub(tmp_path, [LIVE_ROW]),
+            state_dir=tmp_path / f"state-{len(payload)}",
+            raw_input=payload,
+        )
+        assert "payload-empty" in unresolved(got), f"silent on {payload!r}"
 
 
 def test_an_unwritable_throttle_reports_anyway(tmp_path: Path) -> None:

@@ -178,7 +178,12 @@ try {
         # then -Take) drops the claim in between, re-opening the race the claim exists to close.
         if ($Note) {
             $updated = [ordered]@{
-                key      = [string]$info.Claim.key
+                # $Take, not the stored key: ConvertFrom-Json date-coerces any ISO-8601-SHAPED string,
+                # and a key is free text, so a key like "2026-08-01T00:00:00" would come back through
+                # [string] as "08/01/2026 00:00:00" -- a record naming a key nobody typed and -Release
+                # cannot be spelled to match. $Take is the caller's current spelling of the same key,
+                # and it folds to the same filename, which is the real identity.
+                key      = $Take
                 note     = $Note
                 # Refresh the branch too: a worktree can have switched branches since the claim was made,
                 # and a claim naming a branch nobody is on is another confidently-wrong coordination fact.
@@ -189,13 +194,47 @@ try {
                 claimed   = ConvertTo-Stamp $info.Claim.claimed
                 refreshed = (Get-Date).ToString("o")
             } | ConvertTo-Json -Compress
-            # Write-then-rename, not a truncating in-place write. A torn claim file does not fail loudly:
+            # Write-then-replace, not a truncating in-place write. A torn claim file does not fail loudly:
             # scripts/hooks/claim_check.py swallows a parse error into "not claimed", which would disable
             # the enforced gate for that key -- so a crash mid-write must leave the OLD file intact.
             $tmp = "$file.$PID.tmp"
             # UTF8 WITHOUT a BOM, for that same reader: a BOM makes json.loads raise.
             [System.IO.File]::WriteAllBytes($tmp, [System.Text.Encoding]::UTF8.GetBytes($updated))
-            Move-Item -LiteralPath $tmp -Destination $file -Force
+
+            # [IO.File]::Move(.., overwrite) AND NOT `Move-Item -Force`. THE CLAIM FILE'S EXISTENCE *IS*
+            # THE LOCK -- the take path above is an exclusive CreateNew, so any instant in which the name
+            # does not exist is an instant another worktree can claim a key we hold. `Move-Item -Force`
+            # is delete-then-rename and opens exactly that window: measured on this box, 400 moves left
+            # the destination absent on 2,559 of 154,506 polls. The same harness over [IO.File]::Move
+            # with overwrite -- which is MoveFileEx(MOVEFILE_REPLACE_EXISTING), atomic on NTFS -- polled
+            # 134,581 times and never once saw the name missing.
+            #
+            # It can fail transiently instead (a scanner or an editor holding the destination without
+            # FILE_SHARE_DELETE); the same harness saw 13.5% under back-to-back churn, which is nothing
+            # like one refresh per invocation but is cheap to absorb. Failing is the SAFE direction: the
+            # old note survives and the claim stays ours. Losing the lock is not.
+            #
+            # The catch is deliberately UNTYPED. PowerShell wraps an exception thrown by a .NET METHOD in
+            # a MethodInvocationException, so `catch [System.IO.IOException]` around this call never
+            # matches -- the failure escapes to $ErrorActionPreference = "Stop", the cleanup below never
+            # runs, and the temp file is orphaned in the claim registry. (Written typed first; the
+            # orphaned-temp assertion is what caught it.) Every failure here has the same right answer
+            # anyway: leave the old note, keep the claim, say so.
+            $moved = $false
+            foreach ($attempt in 1..5) {
+                try { [System.IO.File]::Move($tmp, $file, $true); $moved = $true; break }
+                catch { Start-Sleep -Milliseconds (20 * $attempt) }
+            }
+            if (-not $moved) {
+                # Never orphan the temp: this directory is the claim registry, and a k.json.<pid>.tmp
+                # nothing ever removes accumulates in it for the life of the repo.
+                Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+                Write-Host ""
+                Write-Host "Could NOT refresh the note on '$Take' -- the file was locked by another process." -ForegroundColor Yellow
+                Write-Host "  Your claim is UNCHANGED and still yours; only the note was not updated."
+                Write-Host "  Retry in a moment. Do NOT -Release: that would drop a claim you still hold."
+                exit 1
+            }
             Write-Host ""
             Write-Host "REFRESHED '$Take' (held since $($info.Claim.claimed))." -ForegroundColor Green
             Write-Host "  note : $Note"

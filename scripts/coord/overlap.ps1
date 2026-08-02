@@ -69,8 +69,14 @@ function ConvertTo-Norm([string]$p) {
 }
 
 # One emitter for every -Json exit, so no path can print nothing. See the note at the -File query below.
+#
+# The null filter is load-bearing, not defensive tidying. `Build-Map` returning no rows yields
+# AutomationNull, which PARAMETER BINDING converts to a real $null on the way in -- and `@($null).Count`
+# is 1, so the zero-rows guard was dead in exactly the case it was written for and the whole-map query
+# emitted `[null]`: a phantom row, strictly worse than the nothing it replaced. Caught by adversarial
+# review after the -File path had been verified by hand; the two call sites do not fail alike.
 function Write-JsonArray($Rows) {
-    $r = @($Rows)
+    $r = @($Rows | Where-Object { $null -ne $_ })
     if ($r.Count -eq 0) { Write-Output "[]"; return }
     Write-Output ($r | ConvertTo-Json -Depth 6 -AsArray)
 }
@@ -131,7 +137,13 @@ function Build-Map {
         # we report a worktree as dormant when its owner is actually around, and dormant still shows.
         if ($l.State -ne "LIVE" -and $l.State -ne "UNVERIFIED") { continue }
         $k = ConvertTo-Norm $e.Record.cwd
-        $sessionsByCwd[$k] = $e.Record
+        # A FENCED session outranks an unfenceable one for the same directory. UNVERIFIED is the shape a
+        # crashed session's record takes once its pid is recycled -- alive, but nothing proves it is the
+        # same run -- so letting one displace a genuinely LIVE record would report a ghost's id and branch
+        # for a worktree somebody is really sitting in. Last-write-wins had no opinion about which it kept.
+        $rank = if ($l.State -eq "LIVE") { 0 } else { 1 }
+        if ($sessionsByCwd.ContainsKey($k) -and $sessionsByCwd[$k].Rank -le $rank) { continue }
+        $sessionsByCwd[$k] = [pscustomobject]@{ Record = $e.Record; Rank = $rank }
     }
 
     $worktrees = @(Get-WorktreeList)
@@ -156,9 +168,12 @@ function Build-Map {
                 if ($null -eq $best -or $wn.Length -gt $best.Length) { $best = $wn }
             }
         }
-        # Two sessions inside one worktree: first by sorted cwd, so the answer is at least the SAME
-        # answer every run. Reporting one of them is correct -- the row says the worktree is live.
-        if ($best -and -not $ownerByWorktree.ContainsKey($best)) { $ownerByWorktree[$best] = $sessionsByCwd[$k] }
+        # Two sessions inside one worktree: the fenced one wins, then first by sorted cwd -- so the
+        # answer is the same every run, and a ghost never displaces a session that is really there.
+        if ($best) {
+            $cur = $ownerByWorktree[$best]
+            if ($null -eq $cur -or $sessionsByCwd[$k].Rank -lt $cur.Rank) { $ownerByWorktree[$best] = $sessionsByCwd[$k] }
+        }
     }
 
     $rows = @()
@@ -205,7 +220,7 @@ function Build-Map {
 
         # A session sitting anywhere INSIDE the worktree owns it, not just one whose cwd is the root --
         # resolved above, against every worktree at once, because "inside" is ambiguous when they nest.
-        $sess = $ownerByWorktree[$norm]
+        $sess = if ($ownerByWorktree.ContainsKey($norm)) { $ownerByWorktree[$norm].Record } else { $null }
         if ($files.Count -eq 0 -and -not $sess) { continue }
 
         $rows += [pscustomobject]@{

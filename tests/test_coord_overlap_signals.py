@@ -192,6 +192,52 @@ def raw_query(primary: Path, tmp_path: Path, path: str) -> str:
     return proc.stdout.strip()
 
 
+def raw_survey(primary: Path, tmp_path: Path) -> str:
+    """The WHOLE-MAP -Json query, verbatim. A different call site from ``raw_query``, and it fails
+    differently: this one is fed ``Build-Map``'s return value, which is AutomationNull when empty."""
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(OVERLAP),
+            "-Repo",
+            str(primary),
+            "-Json",
+            "-Refresh",
+            "-ConfigRoot",
+            str(tmp_path / "no-such-config"),
+            "-TasksDir",
+            str(tmp_path / "no-such-tasks"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+    assert proc.returncode == 0, f"overlap exited {proc.returncode}: {proc.stderr}"
+    return proc.stdout.strip()
+
+
+def test_the_whole_map_json_query_emits_no_phantom_row(
+    peer_worktree: tuple[Path, Path], tmp_path: Path
+) -> None:
+    """A ZERO-ROW ANSWER MUST BE ZERO ROWS, not one null one.
+
+    ``Build-Map`` returns AutomationNull when it has no rows, and parameter binding converts that to a
+    real ``$null`` at the call -- where ``@($null).Count`` is 1, not 0. So a naive "if empty print []"
+    guard is dead in precisely the case it exists for, and the query emits ``[null]``: a phantom row,
+    strictly worse for any consumer that counts or indexes than the nothing it replaced.
+    """
+    primary, _peer = (
+        peer_worktree  # peer worktree exists but is clean, and no session is registered
+    )
+    out = raw_survey(primary, tmp_path)
+    assert out == "[]", f"a no-rows map must be an empty array, not {out!r}"
+    assert json.loads(out) == []
+
+
 def test_a_json_query_always_emits_an_array(
     peer_worktree: tuple[Path, Path], tmp_path: Path
 ) -> None:

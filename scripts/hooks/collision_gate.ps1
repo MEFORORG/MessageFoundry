@@ -84,7 +84,18 @@ function Write-Unresolved([string]$Slug, [string]$Detail) {
             if ($LASTEXITCODE -eq 0 -and $common) { $dir = Join-Path ([string]$common).Trim() "mefor-coord" }
         }
         if ($dir) {
-            $stamp = Join-Path $dir "gate-unresolved/$Slug.stamp"
+            # PER WORKTREE, not per repo. The stamp lives in the SHARED git-common-dir, so a single
+            # repo-wide stamp would mean the first session to hit a broken gate silences it for every
+            # other session for the whole cooldown -- and those sessions would read that silence as
+            # "checked, nobody is here", which is precisely the defect this notice exists to remove.
+            # One session's diagnostic must never become another session's false all-clear.
+            $who = "shared"
+            $top = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+            if ($LASTEXITCODE -eq 0 -and $top) {
+                $who = (Split-Path ([string]$top).Trim() -Leaf) -replace '[^A-Za-z0-9._-]+', '-'
+                if (-not $who) { $who = "shared" }
+            }
+            $stamp = Join-Path $dir "gate-unresolved/$who.$Slug.stamp"
             $prev = Get-Item -LiteralPath $stamp -ErrorAction SilentlyContinue
             if ($prev) {
                 $mins = ((Get-Date) - $prev.LastWriteTime).TotalMinutes
@@ -121,7 +132,13 @@ if (-not $target) {
         Write-Unresolved "payload-unreadable" `
             "the PreToolUse payload on stdin was not readable JSON, so the gate never learned which file this edit targets"
     }
-    if (-not $hook) { exit 0 }
+    # Parsed, but to nothing. An empty payload or a literal `null` on stdin does not throw, so this
+    # used to be the one unreadable-input path that still exited silently -- the gate had learned no
+    # more than in the case above, and said no more than an all-clear.
+    if (-not $hook) {
+        Write-Unresolved "payload-empty" `
+            "stdin carried no PreToolUse payload, so the gate never learned which file this edit targets"
+    }
     $target = [string]$hook.tool_input.file_path
     # NotebookEdit and some variants name the path differently; absence just means nothing to check.
     if (-not $target) { $target = [string]$hook.tool_input.notebook_path }
