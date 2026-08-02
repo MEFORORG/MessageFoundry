@@ -170,13 +170,18 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault
 # Transit. `hvac` is the OFFICIAL HashiCorp Vault Python client (Apache-2.0), named in ADR 0019 §3's
 # provider table. Lazy-imported (store/keyprovider_vault.py), so installs that never select
-# `[store].key_provider=vault` skip it and the base install still pulls ZERO Vault SDK. Floor >=2.3.0:
-# the current 2.x line (Python 3.8+, requests-based); a bare `>=` would silently jump a major on re-lock,
-# so keep the floor pinned to the 2.x series. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
+# `[store].key_provider=vault` skip it and the base install still pulls ZERO Vault SDK. Bounded
+# >=2.3.0,<3: the current 2.x line (Python 3.8+, requests-based). The cap is the half that was missing —
+# the prose already said "a bare `>=` would silently jump a major on re-lock", which is exactly what
+# `hvac>=2.3.0` was, so the intent was documented and unenforced. hvac fronts the store DEK (ADR 0019
+# §3), and CI never installs the [vault] extra, so a major arriving through a re-lock would reach a
+# release without a single test exercising it. Deliberately NOT mirrored by a Dependabot ignore entry:
+# auto-merge already routes majors to manual review, and an ignore would suppress hvac's security track
+# for no gain. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside
 # store/keyprovider_vault.py (a targeted typed local), never a repo-wide ignore.
-vault = ["hvac>=2.3.0"]
+vault = ["hvac>=2.3.0,<3"]
 # The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
 # (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
 # mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an
