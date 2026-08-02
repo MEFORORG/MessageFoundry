@@ -6,6 +6,7 @@ guard on the subject, and the renderer↔allowlist sync invariant."""
 
 from __future__ import annotations
 
+import ssl
 from typing import Any
 
 import pytest
@@ -99,7 +100,7 @@ def _capture_smtp(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         def __exit__(self, *a: object) -> None:
             return None
 
-        def starttls(self) -> None:
+        def starttls(self, context: ssl.SSLContext | None = None) -> None:
             pass
 
         def send_message(self, msg: Any) -> None:

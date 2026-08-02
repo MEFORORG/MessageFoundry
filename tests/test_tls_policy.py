@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import ssl
 import types
@@ -21,6 +22,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     _is_forward_secret,
     active_hop_posture,
+    build_smtp_tls_context,
     current_hop_posture,
     enforce_insecure_hop,
     fips_attestation,
@@ -611,3 +613,138 @@ def test_the_call_site_scan_examined_real_files() -> None:
     assert sites >= 5, (
         f"expected the known TLS context sites, found {sites} — the scan is not landing"
     )
+
+
+# --- #323: build_smtp_tls_context REFUSES an untrusted peer (behavioural, not attribute) ------------
+#
+# The connector tests assert this context's ATTRIBUTES (verify_mode, check_hostname). That is not the
+# same claim as "it refuses a bad certificate", and an attribute check cannot establish it — the whole
+# defect being fixed was a context whose attributes were never inspected by anyone. These drive a REAL
+# TLS handshake against a locally-minted self-signed server so the refusal is OBSERVED. Run against the
+# pre-#323 code path (smtplib's default context) every REFUSED case below returns HANDSHAKE OK, which
+# is precisely the bug.
+#
+# No network: binds 127.0.0.1 on an ephemeral port, and the server thread only completes a handshake
+# and closes — it speaks no SMTP, because the property under test is the TLS layer, not the protocol.
+
+
+@pytest.fixture(scope="module")
+def _tls_peer(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, str]:
+    """A local TLS server with a self-signed 'localhost' cert. Yields (port, ca_pem_path)."""
+    import datetime
+    import socket
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    tmp = tmp_path_factory.mktemp("smtp_tls")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_p, key_p = tmp / "server.pem", tmp / "server.key"
+    cert_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    srv.load_cert_chain(cert_p, key_p)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def _accept_loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return  # listener closed at teardown
+            threading.Thread(target=_handshake, args=(conn,), daemon=True).start()
+
+    def _handshake(conn: socket.socket) -> None:
+        # A client that (correctly) refuses us aborts mid-handshake, so OSError here is the EXPECTED
+        # path for the refusal tests, not an error -- suppress on both legs.
+        with contextlib.suppress(OSError):
+            srv.wrap_socket(conn, server_side=True).close()
+        with contextlib.suppress(OSError):
+            conn.close()
+
+    threading.Thread(target=_accept_loop, daemon=True).start()
+    yield listener.getsockname()[1], str(cert_p)
+    listener.close()
+
+
+def _handshake_result(ctx: ssl.SSLContext, port: int, server_hostname: str) -> str:
+    import socket
+
+    try:
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=10) as sock,
+            ctx.wrap_socket(sock, server_hostname=server_hostname),
+        ):
+            return "ok"
+    except ssl.SSLCertVerificationError:
+        return "refused"
+    except OSError:  # a reset mid-refusal still means the client did not accept the peer
+        return "refused"
+
+
+def test_smtp_context_refuses_an_untrusted_peer(_tls_peer: tuple[int, str]) -> None:
+    """THE regression fence for #323. Pre-fix this returned 'ok' — any certificate was accepted."""
+    port, _ = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination")
+    assert _handshake_result(ctx, port, "localhost") == "refused"
+
+
+def test_smtp_context_accepts_a_peer_signed_by_the_connection_ca(
+    _tls_peer: tuple[int, str],
+) -> None:
+    """tls_ca_file is the supported route for a private-CA relay — it must actually work, or the
+    only remaining escape would be turning verification off."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", ca_file=ca)
+    assert _handshake_result(ctx, port, "localhost") == "ok"
+
+
+def test_smtp_context_enforces_hostname(_tls_peer: tuple[int, str]) -> None:
+    """A trusted chain is not enough: the cert must match the host we meant to reach."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", ca_file=ca)
+    assert _handshake_result(ctx, port, "wrong.example") == "refused"
+
+
+def test_smtp_context_check_hostname_false_relaxes_only_the_name(
+    _tls_peer: tuple[int, str],
+) -> None:
+    """tls_check_hostname=False drops the name check while KEEPING chain validation."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(
+        host="localhost", cell="Email destination", ca_file=ca, check_hostname=False
+    )
+    assert _handshake_result(ctx, port, "wrong.example") == "ok"
+
+
+def test_smtp_context_verify_false_accepts_anything(_tls_peer: tuple[int, str]) -> None:
+    """The escape genuinely disables verification — asserted so nobody 'hardens' it into a
+    silently-broken state where the escape no longer connects and operators cannot tell why."""
+    port, _ = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", verify=False)
+    assert _handshake_result(ctx, port, "localhost") == "ok"
