@@ -267,6 +267,23 @@ prompt in *every* repo on the machine; the peer lookup adds ~1.0 s on the prompt
 because the marker check precedes it. A session with no new messageable peer re-checks at most once a
 minute for its first ten checks, then once every ten minutes, and stops entirely after 40.
 
+**What this deliberately does NOT do: broadcast.** Announce-on-join introduces a session. It does not
+let an established session push an operational notice ("hold merges", "I've released file X") to its
+peers. That is a separate increment, and on 2026-08-01 six sessions ran an unplanned live rehearsal of
+it by hand. Three constraints came out of that, recorded here so the next attempt doesn't rediscover
+them:
+
+- **A broadcast needs an expiry or a predicate the *recipient* can evaluate — never a promise from the
+  sender.** A merge freeze went out with "lift when #119 merges". #119 never merged (it died on an
+  unrelated CI timeout), so five sessions held on a condition that could not arrive, and it took a
+  second round to retract.
+- **"Don't do X" is the wrong primitive when automation already has X armed.** The freeze asked
+  sessions not to merge, while six PRs had auto-merge *armed* and would have landed with nobody
+  clicking anything. The correct ask was an action — "disarm auto-merge" — not restraint.
+- **Coordination that a tool cannot read does not count.** Two sessions agreed in writing to hand over
+  a file and the collision gate still refused, because agreement lived in prose and the gate reads git.
+  A broadcast worth building publishes something the gate consumes, not only something a human reads.
+
 ## The worktree gate (enforcement, not a reminder)
 
 > Full write-up, with the measurements and the backout procedure: [WORKTREE-GATE.md](WORKTREE-GATE.md).
