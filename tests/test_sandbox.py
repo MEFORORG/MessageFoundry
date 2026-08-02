@@ -13,6 +13,7 @@ answer a later dispatch, and the engine's code-set tables — not the child's ow
 from __future__ import annotations
 
 import math
+import queue
 import time
 from pathlib import Path
 from types import MappingProxyType
@@ -570,6 +571,14 @@ def test_a_dead_peer_is_not_treated_as_a_forged_frame(graph: tuple[Registry, str
         assert session._proc is None
 
         # A frame in the very same slot is still fatal, and still named as unsolicited.
+        # Rebind the queue first, for the same reason `_spawn` does: the kill above makes the dead
+        # worker's reader thread hit EOF on a closed stdout and push a `_EOF` of its OWN. On a
+        # fast-teardown platform that lands BEFORE the frame planted here, so `_reject_unsolicited`
+        # — which drains exactly one item — would consume the benign corpse signal and correctly not
+        # raise, failing this assertion for a reason that has nothing to do with the frame. Windows
+        # tears down slowly enough to hide it; Linux does not. Dropping the dead generation's sink
+        # makes the planted frame provably the first item.
+        session._responses = queue.Queue()
         session._responses.put(b"\x00\x00\x00\x02{}")
         with pytest.raises(SandboxError, match="unsolicited"):
             session._reject_unsolicited(session._proc, "after")
