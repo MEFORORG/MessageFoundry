@@ -572,6 +572,7 @@ on the shipped posture.
 | **LDAPS** (`[auth].ad_tls_verify`, default true) | verifying directory bind |
 | **`[logging]` TLS syslog forwarder** (`forward_tls_verify`, default true) | CA-anchored RFC 5425 hop |
 | **Webhook alert sink** and the **AI-broker endpoint** | verifying https openers |
+| **`[alerts]` SMTP sink** and the **per-user security-event notifier** | `email_tls_verify` defaults **true** ([#323](BACKLOG.md)) — one verifying context, two call sites. Deliberately carries **no** `RevocationHopGuard`: it is constructed outside the `active_hop_posture` scope those guards read, so a guard here could not see the instance posture. Its verify-off / cleartext deviations are gated by `[security].allow_unverified_alert_smtp_tls` at the serve gate instead |
 
 For every hop in that table, revocation is exactly what the ASVS row above calls *delegated* — **your
 PKI's or your egress proxy's job, written into your runbook**. The engine will not make you say so, and

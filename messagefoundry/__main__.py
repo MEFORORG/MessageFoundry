@@ -1465,7 +1465,9 @@ def _serve(args: argparse.Namespace) -> int:
     # cleartext-hop list. That is not a silent subset: every ADR 0153 acceptance is reported moments
     # later — per connection, with its reason — by the construction gate's own loud WARN + audit record,
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
-    _loosenings = security_loosenings(settings.security, settings.store, settings.auth, ())
+    _loosenings = security_loosenings(
+        settings.security, settings.store, settings.auth, settings.alerts, ()
+    )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
@@ -2163,6 +2165,70 @@ def _serve(args: argparse.Namespace) -> int:
                     "[auth].notify_security_events to enable it.",
                     file=sys.stderr,
                 )
+
+    # --- #323 layer 3: the alerts / security-event SMTP hop must AUTHENTICATE the relay -------------
+    # The [alerts] SMTP transport carries operator alert bodies and every per-user security-event email
+    # (lockout, password/email/roles change, new-IP admin action) — and the SMTP AUTH password. Before
+    # #323 that hop called starttls() with NO context, so smtplib's fallback (ssl._create_stdlib_context,
+    # which IS _create_unverified_context) accepted ANY certificate: encrypted, unauthenticated, and an
+    # on-path attacker read all of it. The connectors (EMAIL/DIRECT, layers 1-2) key their refusal on the
+    # CLAMPED weakened_tls_escape_permitted_here(), but that mechanism is INERT here — this notifier is
+    # built in the API lifespan, outside build_check_registry's active_hop_posture scope, so
+    # current_hop_posture() is None and the clamp degrades to the unclamped escape. Hence an explicit
+    # acknowledgment switch at this gate instead, in the shape of the keyless-PHI second ack (ADR 0140).
+    #
+    # IT COVERS BOTH UNAUTHENTICATED SHAPES, DELIBERATELY. email_use_tls=false (no TLS at all) is
+    # strictly worse than email_tls_verify=false (TLS that authenticates nothing), and it was previously
+    # ungated. A gate that refused only the second would hand an operator a bypass that lands them on
+    # the WORSE posture — so the condition is "this hop does not authenticate the relay", which is true
+    # of both. Strictly ADDS refusals (ADR 0092 decision 5); byte-identical on the shipped defaults,
+    # which verify.
+    #
+    # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
+    # and the #188 gate above already owns the "no channel at all" case.
+    if (
+        data_class is DataClass.PHI
+        and settings.alerts.email_smtp_host
+        and settings.alerts.email_from
+    ):
+        if not settings.alerts.email_use_tls:
+            hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"
+        elif not settings.alerts.email_tls_verify:
+            hop_desc = "[alerts].email_tls_verify=false (the SMTP hop verifies no certificate)"
+        else:
+            hop_desc = ""
+        if hop_desc:
+            if enforcing and not settings.security.allow_unverified_alert_smtp_tls:
+                print(
+                    f"error: {hop_desc} on a {'production ' if production else ''}PHI instance "
+                    f"({env_name!r}); refusing to start — operator alert bodies, every per-user "
+                    "security-event email, and the SMTP AUTH password would cross a hop that does not "
+                    "authenticate the relay, so an on-path attacker can read them. Remove the override "
+                    "(the default verifies), or point [alerts].email_tls_ca_file / [tls].internal_ca_file "
+                    "at the relay's CA; or set [security].allow_unverified_alert_smtp_tls=true to "
+                    "deliberately accept an unauthenticated alert hop (audited).",
+                    file=sys.stderr,
+                )
+                return 2
+            if enforcing:
+                # Explicitly acknowledged under strict enforcement — a loud WARNING-level AUDIT line
+                # (captured by NSSM stdout/SIEM), then the shared warn posture below. Never silent.
+                logging.getLogger(__name__).warning(
+                    "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
+                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
+                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "(alert-SMTP-TLS verification opt-out override).",
+                    "production " if production else "",
+                    env_name,
+                    hop_desc,
+                )
+            print(
+                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies, "
+                "per-user security-event email and the SMTP AUTH password cross a hop that does not "
+                "authenticate the relay (MITM-able). Remove the override, or trust the relay's CA via "
+                "[alerts].email_tls_ca_file / [tls].internal_ca_file.",
+                file=sys.stderr,
+            )
 
     # --- ADR 0152 rung 2: in-USE PHI protection (ASVS 11.7.1) ------------------------------------
     # Placed LAST in the posture ladder on purpose (extend, never weaken): every more SPECIFIC
@@ -4304,6 +4370,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        AlertsSettings,
         AuthSettings,
         SecuritySettings,
         StoreSettings,
@@ -4319,14 +4386,14 @@ def _security(args: argparse.Namespace) -> int:
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
     _loosenings_partial = False
-    _store, _auth = StoreSettings(), AuthSettings()
+    _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
         # exists and will not resolve is partial.
         try:
             _full = load_settings(config_path=path)
-            _store, _auth = _full.store, _full.auth
+            _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -4339,7 +4406,10 @@ def _security(args: argparse.Namespace) -> int:
         # 0153 per-connection cleartext_accepted declarations — it passes an empty list and declares the
         # gap in `loosenings_scope` below, instead of reporting a settings-only view as if it were the
         # whole posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
-        return [{"switch": s, "risk": r} for s, r in security_loosenings(sec, _store, _auth, ())]
+        return [
+            {"switch": s, "risk": r}
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, ())
+        ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
@@ -4347,7 +4417,7 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]); per-connection cleartext_accepted "
+            "settings only ([security]/[store]/[auth]/[alerts]); per-connection cleartext_accepted "
             "declarations are NOT included — see `messagefoundry check` or GET /security/posture"
         ),
     }

@@ -109,6 +109,11 @@ class SqlServerCoordinator:
         self._heartbeat_seconds = heartbeat_seconds
         self._node_timeout_seconds = node_timeout_seconds
         self._lease_ttl = leader_lease_ttl_seconds
+        # ADR 0157 Inc 5: optional demotion edge-trigger. None unless the engine registered
+        # one; deliberately NOT part of the ClusterCoordinator Protocol (that Protocol is
+        # @runtime_checkable and a standalone test stand-in isinstance-checks against it, so
+        # widening it is a multi-site enumeration — the exact defect class this avoids).
+        self._on_demote: Callable[[], None] | None = None
         self._fence_timeout = leader_fence_timeout_seconds
         # Small relative to the fence timeout so a fence fires promptly (well before the lease TTL).
         self._fence_tick = max(0.05, min(1.0, leader_fence_timeout_seconds / 5.0))
@@ -431,6 +436,7 @@ class SqlServerCoordinator:
             self._leader_epoch = None  # no longer a fenced leader (H1)
             log.info("cluster: node %s lost leadership (lease taken or expired)", self.node_id)
             self._alert_leadership_lost("lease taken or expired")  # #145 (inverse → auto-resolves)
+            self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _claim_or_renew_lease(self) -> bool:
         """Atomically acquire (fresh / expired) or renew (already ours) the single leadership lease, all
@@ -510,6 +516,7 @@ class SqlServerCoordinator:
                 self._lease_ttl,
             )
             self._alert_leadership_lost("self-fenced")  # #145 (inverse → auto-resolves)
+            self._fire_on_demote()  # ADR 0157 Inc 5
 
     async def _release_leadership(self) -> None:
         was_leader = self._is_leader
@@ -541,6 +548,26 @@ class SqlServerCoordinator:
             )
         except Exception:  # pragma: no cover - defensive; a sink must never break leadership
             log.warning("cluster: leadership_acquired alert failed", exc_info=True)
+
+    def set_on_demote(self, callback: Callable[[], None] | None) -> None:
+        """Register an edge-trigger fired the instant this node stops being leader (ADR 0157 Inc 5).
+
+        The engine uses it to start the graph teardown immediately instead of waiting up to a whole
+        ``_graph_reconcile_interval`` poll. The callback MUST be synchronous, never-raise, and PURE
+        IN-MEMORY: it fires from ``_check_fence``, which runs during a DB partition precisely because
+        renews are failing, so touching the store or the pool there would hang the fence itself.
+        """
+        self._on_demote = callback
+
+    def _fire_on_demote(self) -> None:
+        """Never-raise, never touch the pool. Both properties are load-bearing — see set_on_demote."""
+        callback = self._on_demote
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception:  # pragma: no cover - defensive; a hook must never break demotion
+            log.warning("cluster: on_demote hook failed", exc_info=True)
 
     def _alert_leadership_lost(self, reason: str) -> None:
         try:
