@@ -8443,3 +8443,40 @@ Two worked instances the same day. **#74** went green on 2026-07-30 and sat unme
 **Related:** #339 (surfaced it; relocated `CapturedResponse`), ADR 0087 (the boundary), ADR 0013 (the loopback re-ingress that was DOA), #342 / #343 (the other two findings the #339 review filed but did not fix).
 
 **Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; the `CapturedResponse` violation is measured, not hypothetical.
+
+---
+
+## 345. prune-merged.ps1 orphans coordination claims; claim.ps1 cannot see a vanished holder
+
+> 🔢 **Filed 2026-08-02 — Half A BUILT (PR #141), Half B open.** Value **6/10** · Difficulty **3/10** · _fill-in_. Deleting a worktree strands the work-claims it held, and the claim registry has no way to notice. The orphan then blocks that key for every future session, and the tool's own advice cannot distinguish it from a colleague who is mid-build. **The root cause is fixed** — `prune-merged.ps1` now releases the claims of a worktree it has *proven* gone. **Half B is deliberately not built there**; see *Status*.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** two halves of one hole.
+
+*Half A — the orphan is created and nothing cleans it up.* [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) removes worktrees. Across its 1,108 lines there is **no** handling of coordination claims — verified by search, not assumed. A claim is a JSON file at `<git-common-dir>/mefor-coord/claims/<key>.json` carrying the holder's `worktree` path; the file lives beside the *shared* object store, so it outlives the worktree that created it. Prune deletes the directory, the claim file remains, and [`claim.ps1`](../scripts/coord/claim.ps1)'s `-Take` hard-blocks on any existing claim file. The key is then unclaimable until a human happens to run `-Release <key> -Force`. Nothing surfaces the condition; nothing times it out (correctly — see *Non-goal*).
+
+*Half B — the registry cannot see that a holder is gone.* On `main`, `claim.ps1`'s only staleness signal is **age ≥ 12h**, and it is advisory text emitted by `-List` alone. `-Take` — the path an operator actually hits — prints the same "held by another session" block whether the holder is deleted, dead, or actively committing. `-Release` goes further and *advises* `-Force` ("If that session is gone, re-run with `-Force`") without ever checking whether it is gone. PR #106 (branch `claim-liveness`) fixes this for `-List` by testing the holder path and printing `[HOLDER GONE …]`; it deliberately does not touch `-Take` or `-Release`, so the blocking path stays blind after it lands.
+
+**Why:** the claim registry exists so a collision becomes visible *before* the work. An orphaned claim inverts that: it is a permanent false positive that teaches sessions the gate is noise. This is the second defect class named in the 2026-08-01 stuck-CI triage — *a control that cannot observe its own failure*. Ask "if this were broken, what would tell me?" and the answer is the control itself, which is the defect.
+
+The failure is also **self-concealing in the dangerous direction.** Age-staleness and holder-death present identically, so the only remedy on offer is `-Force`, applied on a signal that cannot tell the two apart. PR #106's own filing records a claim reported `STALE ~21h` whose holder had committed **two minutes earlier** — releasing on that advice hands the key to a second session to rebuild what someone is mid-flight on, which is the exact duplicate-build the registry was built to stop.
+
+**Proposed:**
+1. **Release on proven deletion.** When `prune-merged.ps1` *confirms* a worktree is gone, release the claims whose `worktree` matches it, and report each release in the receipt. Match on the holder path using byte-identical normalisation to `claim.ps1`'s writer (backslash→forward, `TrimEnd('/')`, case-insensitive) — a near-miss silently releases nothing, and a too-loose match silently releases **someone else's live claim**, which is strictly worse than the orphan being fixed. Honour the script's dry-run: a preview must release nothing.
+2. **Teach `-Take` and `-Release` the liveness `-List` already knows** (layered on #106, not duplicating it). `-Take` blocked by a vanished holder should say so and name the exact `-Force` command; `-Release` should not recommend `-Force` on a holder it never checked.
+3. **Prove the guard can see the class before trusting it.** Each test fails on purpose first — a released-claim assertion that passes against unpatched code is measuring nothing. Cover at least: claim released on prune; claim held by a *different, living* worktree left alone; dry-run releases nothing; receipt counts honestly.
+
+**Non-goal:** auto-expiring claims. `claim.ps1`'s own docs give the reason — an auto-expiring claim silently re-opens the race it exists to prevent. Releasing on *proven* worktree deletion is a different act: it is evidence, not a timer.
+
+**Status (2026-08-02).**
+
+*Half A — done, PR #141.* `prune-merged.ps1` releases the claims of a worktree it has proven gone, matching on full normalised path equality, and reports them in both the receipt and the summary. Two defects surfaced during the build, each the shape this ledger keeps recording: an unreadable claim was counted once per *removed worktree* rather than once per run (one blocked key reporting as 2), and the survey that found it sat inside the removal branch with its `Set-Exit` *after* the `-Json` block that emits the receipt and exits — so a dry run could not see the condition and the receipt would have carried `exitCode: 0` over an unclaimable key. `claims.scanned` now separates "read the registry, found it clean" from "never looked".
+
+*Half B — open, and blocked on coordination rather than difficulty.* Teaching `-Take`/`-Release` the liveness `-List` now has is a ~20-line change, but `claim.ps1` had three sessions in it at once on 2026-08-02: #106 (the `-List` half, merged), a concurrent session's note-refresh work on the `-Take` self-refresh path, and this item. It was backed out rather than merged into that three-way, because a contended 170-line script is exactly where a semantic conflict lands green. **Whoever picks it up: check `claim.ps1`'s recent history and the live work claims before editing.** The behaviour still wanted — `-Take` blocked by a vanished holder should say so and name the `-Force` command; `-Release` should stop recommending `-Force` on a holder it never checked.
+
+**Related:** [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1); [`scripts/coord/claim.ps1`](../scripts/coord/claim.ps1); [`docs/WORKTREES.md`](WORKTREES.md); PR #106 (`-List` liveness, the half already built); PR #74 (the prune hardening this sits beside — liveness *veto* before deletion, where this is cleanup *after*); #344 (the sibling defect class, *a bound stated independently of the thing it bounds*).
+
+**Source:** zizmor-1280 handoff, 2026-08-02, which reported claim `7` stranded by a prune and filed the mechanism as unbuilt. Half A and Half B were then re-verified against the code directly rather than inherited: the absent claim handling by search over `prune-merged.ps1`, the `-Take`/`-Release` blindness by reading both `main` and `claim-liveness`.
+
+---
