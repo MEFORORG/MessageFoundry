@@ -217,6 +217,11 @@ Three things that cost real time here:
   update a `BEHIND` branch. Landing PR A puts PR B `BEHIND`, and B
   sits armed and stalled indefinitely. Someone has to rebase it. If you queue two PRs, expect to rebase
   the second after the first lands.
+  *Measured 2026-08-02, when `allow_update_branch` was `false` on this repo. It was set `true` later
+  that day; whether GitHub then auto-updates an armed `BEHIND` branch when `main` moves is
+  **unverified** — no back-fill has been observed, and GitHub's documentation does not connect the
+  setting to that behaviour. Until someone records one, assume the above and keep a capped
+  `update-branch` loop.*
 - **`BEHIND` and `DIRTY` are easy to confuse and the wrong fix is destructive.** Treating `DIRTY` as
   `BEHIND` means resolving conflicts in a hurry to make a force-push succeed.
 
@@ -249,6 +254,96 @@ And if your change involved a find-and-replace, **re-verify it after resolving**
 original edit — conflict fixup is exactly when a sweep gets re-run carelessly. A renumber of `252` to
 `316` across `CHANGELOG.md` will happily turn `cp1252` into `cp1316`, in a file nobody re-reads. Scope
 replacements to the anchored forms (`BACKLOG #252`, `## 252.`), never the bare number.
+
+### A branch cut from a pre-squash commit hides its staleness behind a clean-looking diff
+
+`main` squash-merges, so a branch's own commits never become ancestors of `main` even after its PR
+lands — their *content* arrives as one new commit. Branch again from one of those commits (a trailing
+commit pushed after the PR merged, say, or an old branch you are rescuing work from) and the new
+branch inherits a merge base from *before* the squash. Everything that landed in between is missing
+from it.
+
+Measured 2026-08-02, rescuing an ADR from a commit pushed 1h37m after its own PR had squash-merged.
+Merge base `002be182` — **11 squash-merged PRs behind `main`**. A two-dot diff reported **58 files,
+959 insertions and 5,726 deletions**, and `git merge-tree` conflicted on **five** files
+(`docs/SESSION-DRIFT-CONTROLS.md`, `docs/WORKTREES.md`, `scripts/hooks/announce-session.ps1`,
+`tests/test_collision_gate.py`, `tests/test_coord_overlap_signals.py`).
+
+**What that does *not* mean.** The PR did **not** propose deleting `main`'s work, and nothing was
+about to be reverted. A three-way merge keeps `main`'s side of every file the branch never touched,
+so the change actually on offer was **13 files, 2,967 insertions and 19 deletions**. Those 5,726
+deletions are an artefact of *how you asked*, not a change anyone proposed. **The hazard is the five
+conflicts and the chance of resolving one wrongly — not reversion.** That is a smaller claim than
+"this would have reverted a dozen merged PRs", and it is the one the measurements support.
+
+**Two questions, two diffs. Asking one and reading its answer as the other is the trap:**
+
+| Question | What answers it |
+|---|---|
+| *Does merging this revert anything?* | **three-dot** — `git diff origin/main...HEAD` |
+| *Is this branch missing `main`'s work?* | **two-dot** — `git diff origin/main HEAD` — or `git merge-base --is-ancestor` |
+
+**A three-dot diff cannot see staleness, which is the trap.** `git diff origin/main...HEAD` and
+GitHub's "Files changed" tab both resolve the merge base, and the merge base is exactly what is
+stale — so the diff describes your branch against a `main` from 11 PRs ago. On the branch above it
+reported 13 files / 2,967 insertions / 19 deletions: an accurate account of what the PR *adds*, and
+no indication whatever that five files would conflict. Two checks that do see it:
+
+```powershell
+git merge-base --is-ancestor origin/main HEAD   # exit 0 = your branch CONTAINS main
+git diff --stat origin/main HEAD                # two-dot: tree vs tree, no merge base
+```
+
+A non-zero deletion count from the second, on a branch that only adds files, is the signal.
+
+> **This section was wrong when first written, and the way it was wrong is the lesson.** Every number
+> it published was real. It paired a **post-merge** three-dot reading ("the two files you added") with
+> a **pre-merge** two-dot reading (58 files, 5,726 deletions) and presented them as a single
+> comparison — so a diff that never proposed a revert was described as proposing one. Each figure
+> checked out individually; only the *join* between them was false, and the join carried the argument.
+> It survived its author's review, a coordinator's review, an independent verification and a green CI
+> run, because nothing anywhere checks joins. **Before two numbers share a sentence, confirm they
+> describe the same commit at the same moment.**
+
+**The first check is the load-bearing one; the second only confirms it.** Once `--is-ancestor` passes,
+the merge base *is* `origin/main`, so two-dot and three-dot are computing the same thing and cannot
+disagree — a matching diff at that point proves nothing you did not already know. The trap only exists
+in the window where that check fails. Measured on this branch, minutes apart:
+
+| `--is-ancestor` | two-dot | three-dot |
+|---|---|---|
+| fails (stale checkout) | 2 files, 52 insertions, **22 deletions** | 1 file, 50 insertions — deletions **hidden** |
+| passes | 1 file, 50 insertions | 1 file, 50 insertions — identical |
+
+So run `--is-ancestor` first and treat a failure as the finding. Reaching for the diff alone is how the
+trap survives a check: on the branch you are most likely to test, it agrees with itself.
+
+The fix is to **merge `origin/main` into the branch**, not to rebase: the conflicting files are work
+that already landed via the squash, so main's side is authoritative and taking it drops nothing. Then
+re-run both checks — the acceptance test is that the two-dot diff shows only your own change.
+
+**Prefer merge over rebase generally when your commits all touch one block, for a second and nastier
+reason.** A rebase replays each commit against the new base, so a seam every commit rewrites — an item
+appended at the same EOF point, say — re-raises the same conflict once *per commit*. The hazard is not
+the tedium. A mid-stack resolution can keep an **earlier draft** of the block, and that result has no
+conflict markers, leaves `git status` clean, and passes a structural check: an item that lost half its
+prose still has exactly one banner and still counts as one item. Nothing anywhere reports it. One
+`git merge origin/main` raises the seam once, against the final text. Verify by grepping for strings
+only your latest revision contains — **a structural check tells you the block is complete, not that it
+is the version you meant**, and those are different properties. *Measured 2026-08-02 on `docs/BACKLOG.md`
+EOF appends.*
+
+Do not expect `gh pr update-branch` to rescue that class. Its documented default is to update **by
+merging the base into the PR branch**, server-side, and the endpoint accepts no resolution — so there
+is nothing it can do with a conflicting merge. Resolve locally and push, as the `DIRTY` row above
+already says. *(GitHub does not document that endpoint's behaviour on conflict; this follows from the
+documented mechanism, not from a measurement.)*
+
+Blob-comparing a few files is **not** a substitute, and it is the check most likely to be reached for.
+It was run here and reported all five files identical. That was correct when measured and false twenty
+minutes later, because an in-flight PR touching exactly those five files merged in between. A
+content spot-check answers *"are these equal right now"*, not *"will this merge cleanly"* — and if an
+armed PR is queued against the same files, the first question stops predicting the second.
 
 ## What's isolated vs shared
 
