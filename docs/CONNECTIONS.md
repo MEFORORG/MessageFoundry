@@ -20,6 +20,13 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 
 ### Connection‑type codes
 
+The **Built?** column is read off the **connector registry** — the `register_source` /
+`register_destination` calls in [`transports/`](../messagefoundry/transports/) — not maintained by hand.
+**Seventeen** connector types are registered today (`ConnectorType`,
+[config/models.py](../messagefoundry/config/models.py)): MLLP, TCP, HTTP, FILE, REMOTEFILE, X12,
+DATABASE, REST, SOAP, FHIR, DIMSE, DICOMWEB, EMAIL, DIRECT, TIMER, LOOPBACK, PT. Every one of them has a
+settings section under [*Settings*](#settings--whats-supported-today) below.
+
 | Code | Direction | Transport | Mirth equivalent | Built? |
 |------|-----------|-----------|------------------|--------|
 | `IB` | inbound | MLLP listener | MLLP/TCP Listener | ✅ |
@@ -32,33 +39,46 @@ Example: **`IB_ACME_ADT`** = inbound MLLP from ACME carrying ADT. The shipped sa
 | `TCP-OUT` | outbound | raw TCP sender (configurable framing) | TCP Sender | ✅ |
 | `X12-IN` | inbound | raw TCP listener, ISA/IEA-framed X12 EDI | TCP Listener (X12) | ✅ |
 | `X12-OUT` | outbound | raw TCP sender, X12 EDI (verbatim) | TCP Sender (X12) | ✅ |
-| `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ⏳ planned |
-| `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ⏳ planned |
-| `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ⏳ planned † |
+| `SFTP-IN` | inbound | SFTP poll | File Reader (SFTP scheme) | ✅ (`Sftp()`, `[sftp]` extra) |
+| `SFTP-OUT` | outbound | SFTP write | File Writer (SFTP scheme) | ✅ (`Sftp()`, `[sftp]` extra) |
+| `FTP-IN` | inbound | FTP / FTPS poll | File Reader (FTP scheme) | ✅ (`Ftp()`, stdlib) |
+| `FTP-OUT` | outbound | FTP / FTPS write | File Writer (FTP scheme) | ✅ (`Ftp()`, stdlib) |
+| `SOAP-IN` | inbound | SOAP endpoint | Web Service Listener | ~ receive-only † |
 | `SOAP-OUT` | outbound | SOAP client | Web Service Sender | ✅ |
-| `REST-IN` | inbound | HTTP endpoint | HTTP Listener | ⏳ planned † |
+| `REST-IN` | inbound | HTTP endpoint | HTTP Listener | ✅ (`Http()`, ADR 0023) † |
 | `REST-OUT` | outbound | HTTP client | HTTP Sender | ✅ |
-| `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server, exp.) |
-| `DB-OUT` | outbound | DB write | Database Writer | ✅ |
-| `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (ADR 0023) |
+| `DB-IN` | inbound | DB poll | Database Reader | ✅ (SQL Server + generic ODBC) |
+| `DB-OUT` | outbound | DB write | Database Writer | ✅ (SQL Server + generic ODBC) |
+| `FHIR-IN` | inbound | FHIR REST endpoint (server facade) | (FHIR Listener) | ⏳ planned (BACKLOG #20) |
 | `FHIR-OUT` | outbound | FHIR REST client | (FHIR Sender) | ✅ |
 | `DICOM-IN` | inbound | DICOM C-STORE SCP listener | DICOM Listener | ✅ (ADR 0025 Phase 1) |
 | `DICOM-OUT` | outbound | DICOM C-STORE SCU + C-ECHO sender | DICOM Sender | ✅ (ADR 0025 Phase 2) |
 | `DICOMWEB-OUT` | outbound | DICOMweb STOW-RS store/send | (DICOMweb Sender) | ✅ (ADR 0025 Phase 2) |
+| `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ✅ (`Email()`/`SMTP()`, ADR 0029) |
+| `DIRECT-OUT` | outbound | Direct-Project S/MIME over SMTP | — | ✅ (ADR 0085, outbound only) |
+| `TIMER-IN` | inbound | clock-driven source (interval / cron) | — | ✅ (ADR 0011) |
+| `LOOP-IN` · `PT-*` | inbound | internal re-ingress — a captured reply (`Loopback()`) / a pass-through hop (`PassThrough()`) | Channel Reader | ✅ (ADR 0013) |
 | `JMS-IN` / `JMS-OUT` | in/out | JMS queue consumer/producer | JMS Listener/Sender | ⏳ planned |
 | `MAIL-IN` | inbound | POP3/IMAP mailbox poll | Email Reader | ⏳ planned |
-| `SMTP-OUT` | outbound | SMTP email send | SMTP Sender | ⏳ planned |
 
 \* **`IBC`/`OBC`** use the *same* MLLP transport as `IB`/`OB`; the `C` is a **monitoring hint**: for
 these, "waiting for connection" is the *normal, healthy* state (a low‑traffic feed or a persistent
 link that idles), so the Monitor shouldn't flag them. (The Monitor health rule that honors this is not
 yet implemented — the suffix documents intent today.)
 
-† **`REST-IN`** and **`SOAP-IN`** (non-HL7 inbound *sources*). The **payload-agnostic ingress** contract
-is **built** ([ADR 0004](adr/0004-payload-agnostic-ingress.md): an inbound's `content_type` selects the
-HL7 path vs. a `RawMessage` route), so what these rows await is a **source connector** (an HTTP listener)
-on top of it. The first source on that contract — the **`DB-IN`** poll (`DatabasePoll(...)`, below) — is
-**built**; the **`REST-OUT`**, **`DB-OUT`**, and **`SOAP-OUT`** destinations are built (below).
+† **`REST-IN`** and **`SOAP-IN`** (non-HL7 inbound *sources*). The two halves these rows once awaited are
+both built now: the **payload-agnostic ingress** contract ([ADR 0004](adr/0004-payload-agnostic-ingress.md) —
+an inbound's `content_type` selects the HL7 path vs. a `RawMessage` route) *and* the **inbound HTTP
+listener** it needed ([ADR 0023](adr/0023-inbound-http-listener.md) — `Http(...)`, below), so a partner
+can `POST` a JSON / XML / SOAP-envelope / FHIR body today and a Handler un-wraps it. **Request
+authentication on the intake socket has since shipped** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md)
+increment A): `intake_auth` — API key, bearer or mTLS subject — now joins the per-connection IP
+allowlist, TLS/mTLS and the off-loopback exposed gate as a peer control. The **SOAP-specific** half of
+`SOAP-IN` — the *synchronous* envelope reply — shipped with increment B (`reply_from`: the HTTP turn
+blocks on the named outbound's captured, committed reply). Routing on HTTP method/path/headers remains
+deferred (the Handler sees the body). For this listener's current state, settings and remaining gaps,
+[`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023) below is the single authority —
+this note is a pointer, not a second copy of that status.
 
 ## Authoring a connection
 
@@ -117,10 +137,12 @@ transport = "mllp"
   owner = "integration-team"
 ```
 
-- The `transport` maps to the same factory (`MLLP`/`Tcp`/`File`/`Rest`/`Database`/`DatabasePoll`/
-  `Soap`/`Sftp`/`Ftp`) — **the factory is the schema**; an unknown transport/key/router fails loud at
-  load (`messagefoundry check`), exactly like a bad `inbound()` call. A name declared in **both** a
-  `.py` module and `connections.toml` is a hard error (no silent shadowing).
+- The `transport` maps to the same factory — eleven are reachable as data (`mllp`/`tcp`/`http`/`file`/
+  `timer`/`rest`/`database`/`database_poll`/`soap`/`sftp`/`ftp`) and **the factory is the schema**; an
+  unknown transport/key/router fails loud at load (`messagefoundry check`), exactly like a bad
+  `inbound()` call. The remaining connectors (`X12`/`FHIR`/`DICOM`/`DICOMweb`/`Email`/`Direct`/
+  `Loopback`/`PassThrough`) are **code-first only** today — declare them in a `.py` module. A name
+  declared in **both** a `.py` module and `connections.toml` is a hard error (no silent shadowing).
 - **Edit it two ways, same file:** by hand, or via `messagefoundry connection list|upsert|remove`
   (comment/format-preserving, validate-before-persist with rollback) — which is what the **VS Code
   connection editor** shells (the gear on a data-authored connection opens the form; a code-authored
@@ -194,6 +216,49 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 
 ## Settings — what's supported today
 
+> **Read this before you turn TLS on for an *outbound* connection.** The engine performs **no
+> certificate revocation checking** — stdlib `ssl` exposes no OCSP/CRL fetch and the engine deliberately
+> attempts none — so on the **shipped default** (a PHI-classified instance at
+> `[security].enforcement = enforce`) a **verifying** outbound TLS hop to a **non-loopback** host is
+> **refused at construction** (`messagefoundry check` / dry-run / reload / the `serve` pre-flight), not
+> merely warned. **Seven** cells carry that gate: **MLLP-over-TLS, REST, SOAP, FHIR, DICOMweb (https),
+> EMAIL/SMTP, and the PostgreSQL store hop**. On a stock instance that means `MLLP(..., tls=True)`, an
+> `https://` `Rest()`/`Soap()`/`FHIR()`/`DICOMweb()` destination and an `Email()` STARTTLS relay are all
+> refused **once they point off-box** — including the worked examples below, which are written to show
+> the connector, not to pass the posture.
+>
+> **At the shipped default there are exactly two ways across**, and neither is a per-connection setting:
+> keep the hop on **loopback**, or set the process-wide environment variable
+> **`MEFOR_TLS_REVOCATION_ATTESTED=1`** — a *blanket* attestation that a revocation-checking PKI or
+> terminator backs **every** hop in the process, logged at WARNING at each construction. The
+> per-connection `tls_revocation_attested` field the connectors read has **no authoring surface** (no
+> factory parameter, no `connections.toml` key), so do not plan a per-hop revocation posture around it;
+> and routing egress through a revocation-checking proxy does **not** change the decision — the
+> authority has an input for it that no call site sets. Anything else is a *posture change* rather than
+> a fix: `[security].handles_real_patient_data = false` silences the gate instance-wide and
+> `[security].enforcement = warn` downgrades it to a WARN.
+>
+> **The engine's other verifying TLS hops are not gated at all** — the DICOM C-STORE SCU with
+> `tls=true`, FTPS, the `Database(...)` destination / `DatabasePoll(...)` source, the SQL Server store
+> hop, LDAPS — so confirming the refusal on MLLP tells you nothing about those: revocation there is your
+> PKI's job, and `MEFOR_TLS_REVOCATION_ATTESTED` is not consulted for them. Full treatment:
+> [DEPLOYMENT.md §Revocation-guard behavior](DEPLOYMENT.md#revocation-guard-behavior).
+>
+> **And turning TLS *off* is not the way out — that is the opposite refusal, not an escape.** Leaving
+> an off-box outbound cleartext is decided by a **separate** authority
+> ([`config/tls_policy.py`](../messagefoundry/config/tls_policy.py)'s `insecure_hop_disposition`,
+> ADR 0153), which on the shipped default **REFUSES** a non-loopback hop with no TLS and no
+> declaration — measured: `MLLP(host="epic-host", port=6661)` with no `tls` resolves to `REFUSE`; the
+> same hop with `cleartext_accepted=True` resolves to `WARN`; the same hop on `127.0.0.1` to `ALLOW`.
+> **So the plain, TLS-less worked examples throughout this section are refused on a stock instance
+> too**, and for a different reason than the TLS ones — including the two-line `outbound("OB_EPIC_ADT",
+> MLLP(host="epic-host", port=6661))` in *Authoring a connection* above. Every example here is written
+> to show its **connector's** shape; making one *run* off-box means picking a lane deliberately:
+> **verifying TLS** (+ the revocation attestation above), the audited per-connection
+> [**`cleartext_accepted` + `cleartext_reason`**](#declaring-a-cleartext-hop-cleartext_accepted)
+> declaration, or keeping the hop on **loopback**. A lab rig on loopback needs none of this, which is
+> what makes the examples copy-runnable there.
+
 ### MLLP — `MLLP(...)`
 
 | Setting | Dir | Default | Meaning |
@@ -214,9 +279,9 @@ duplicate name (across **any** of these files) and an inbound that binds a route
 | `tls_cert_file` | both | — | **in:** the server-identity cert (required when `tls`). **out:** a client cert for mTLS (optional). PEM path. |
 | `tls_key_file` | both | — | private key for `tls_cert_file`. |
 | `tls_ca_file` | both | — | trust anchor — **in:** verify client certs (opt-in mTLS → require a client cert); **out:** verify the server cert. |
-| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able → refused unless `MEFOR_ALLOW_INSECURE_TLS=1` (loud warning), like LDAPS / SQL Server. |
+| `tls_verify` | out | `true` | verify the server's certificate. `false` is MITM-able and is **refused at construction**. `MEFOR_ALLOW_INSECURE_TLS=1` downgrades that refusal to a loud warning **only where the clamp allows it** (#200, [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2): the escape is inert on an instance that is **both** PHI-classified **and** at `[security].enforcement = enforce`. That is the shipped default, so **on a stock instance the refusal stands with the variable set** — treat the env var as a lab tool, not a deployment option. Nothing else opens this hop: `cleartext_accepted` deliberately does **not** reach a verify-off hop (it has TLS — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted)), and `tls_hop_attested` has no authoring surface. If the partner's certificate has merely lapsed, `tls_allow_expired` below is the narrower lever — read that row before reaching for it. |
 | `tls_check_hostname` | out | `true` | require the server cert to match `host` (SNI + hostname check). |
-| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case (it is **not** MITM-able and, because verification stays on, is **not** refused by the #200 posture gate). Logs a WARN when enabled. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). Applies to every verifying outbound TLS transport (MLLP / FTPS / DICOM-SCU / REST / SOAP / FHIR). |
+| `tls_allow_expired` | out | `false` | **(#129, ADR 0094)** honour a partner **server cert whose validity period has lapsed** (`notAfter` past) while STILL validating the chain + hostname + key-usage — the **granular** alternative to `tls_verify=false` for the narrow expired-cert case. It is genuinely narrower (a wrong-host or untrusted-chain peer is still rejected), but do not book it as "not MITM-able": **expiry is the control that retires a certificate**, so a hop that ignores it will keep authenticating a **compromised key indefinitely** — and on the two connectors with no revocation gate (**DICOM-SCU, FTPS**) nothing else would catch that certificate either. **No posture gate covers this setting at all.** It needs no `MEFOR_ALLOW_INSECURE_TLS`; `[security].enforcement = enforce` does not clamp it; verification stays on, so no #200 cleartext/verify-off refusal keys on it; and it is **absent from `security_loosenings()`**, so `GET /security/posture`, the serve-time loosening warning and `messagefoundry check` will **not** report a connection that has it set. The only disclosure is the WARNING logged at each connector build — so a "two-week bridge" set when a partner's cert lapses has nothing that expires it or surfaces it: record the connection name and a removal date in your own risk register. Relaxes both validity bounds (a not-yet-valid cert is also accepted). `false` (default) = **byte-identical** (an expired cert is rejected as before). It is a factory parameter on **six** outbound connectors only — **MLLP, FTPS (`Ftp(tls=True)`), DICOM C-STORE SCU, REST, SOAP, FHIR** — and is **not** honoured by the engine's other verifying TLS hops, including **`DICOMweb()`** (which reuses the REST client but does not read it), the `Database(...)` destination / `DatabasePoll(...)` source, and the `Email()`/`Direct()` SMTP TLS legs. |
 | `encoding_characters` | out | — (off) | **(Corepoint `-override` parity)** re-encode each outgoing message with a different set of HL7 delimiters (the 5 MSH chars in MSH order — MSH-1 + the 4 MSH-2 chars, e.g. `"#@*!%"`) before framing. Validated at build (exactly 5, all distinct). Unset = payload **byte-identical**. |
 | `hl7_raw_separators` | out | `false` | **(BACKLOG #107) escape-hatch for a partner that cannot decode HL7 escapes:** emit the four reserved **structural** separators as RAW bytes (`\F\ \S\ \R\ \T\` → the message's own field/component/repetition/subcomponent char) instead of their escape sequences. Reserved chars are read from the payload's own MSH; re-serialized via the parsed model, never string-slicing. `false` (default) = payload **byte-identical**. Enabling it can produce **non-conformant** output (a formerly-escaped `^` now reads as a component separator) — that is the point; use only for such a broken partner. Composes after `encoding_characters` (delimiter rewrite first, then raw-separator emit). A non-HL7 payload fails the delivery loud (`DeliveryError`). **HL7v2/MLLP outbound only.** |
 | `verify_ack_control_id` | out | `false` | **(BACKLOG #82)** tighten the *accept* decision: accept a **positive** ACK (MSA-1 AA/CA) only if its MSA-2 (message control id) echoes the sent message's MSH-10 — a reply carrying a different id is a correlation failure (retryable `DeliveryError` → retried per the at-least-once path). Both ids are read **separator-aware** from the message (never hardcoded `\|^~\&`). If the sent MSH-10 is absent/unreadable there is nothing to correlate, so the check is skipped and the message delivers as before. Does not alter a **negative** ACK's handling. `false` (default) = **byte-identical** (no correlation). |
@@ -233,14 +298,22 @@ on for every outbound with `[shadow].simulate_all_egress` (see [CONFIGURATION.md
 simulated lane shows as `simulated` on `GET /connections` and `[SIMULATED]` in the console.
 
 > **TLS** composes with the fail-closed `[egress].allowed_mllp` allowlist (both enforced). A non-loopback
-> MLLP listener should set `tls=true`; loopback test rigs may stay plaintext.
+> MLLP listener **must** set `tls=true` — it is **refused at wiring time** otherwise
+> (`check_mllp_tls_exposure` raises before the engine starts, so it surfaces at `messagefoundry check` /
+> dry-run as well as at `serve`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but
+> the flag is **clamped**: on a PHI-classified instance under the default `[security].enforcement =
+> enforce` the bind is refused *even with it*, exactly as for the HTTP / raw-TCP / X12 / DICOM listener
+> gates. Loopback test rigs
+> may stay plaintext. On the **outbound** side, `tls=true` is subject to the revocation gate described at
+> the top of this section.
 
 **Operability (optional, validated at wiring time — caught in dry-run / `messagefoundry check`):**
 `metadata` — a free-form table of operator labels (owner / runbook / environment) on **either**
-direction, surfaced by the API and never used for routing. On an **MLLP/TCP inbound** only:
-`bind_address` overrides the service `[inbound].bind_host` for that one listener, and
+direction, surfaced by the API and never used for routing. On a **listen source** only (MLLP, TCP, X12,
+HTTP, DICOM): `bind_address` overrides the service `[inbound].bind_host` for that one listener, and
 `source_ip_allowlist` restricts it to the listed peer IPs / CIDR networks — fail-closed when set; omit
-or leave empty for no restriction.
+or leave empty for no restriction. Both are a wiring error on a poll or internal source (File, DB,
+RemoteFile, Timer, Loopback, PassThrough — none of them binds an interface).
 
 > **Inbound bind interface (service-level, with a per-connection override).** Inbound MLLP/TCP
 > listeners take **only a port** — passing a `host` is a wiring error. Every inbound binds to the
@@ -273,8 +346,10 @@ Two read/diagnostic endpoints back the console's connection view (auth + per-cha
 - **`POST /connections/{name}/test`** (`connections:test`) — a **reachability probe** that builds a
   *fresh* connector (never the live one), honors the `[egress]` allowlist fail-closed, and **sends no
   real message** — a socket connect (MLLP/TCP/X12), `SELECT 1` (Database), an HTTP `HEAD` (REST/SOAP),
-  a directory-writability check (File), or an SFTP/FTP connect (RemoteFile). It is **audited**. The
-  result is `{supported, success, detail}`: a listen source (MLLP/TCP/X12) or a Timer reports
+  a `GET {base}/metadata` (FHIR) or `OPTIONS` (DICOMweb), a **C-ECHO** (DICOM SCU), connect/EHLO/NOOP
+  with no `MAIL FROM`/`DATA` (Email, Direct), a directory-writability check (File), or an SFTP/FTP
+  connect (RemoteFile). It is **audited**. The result is `{supported, success, detail}`: a listen source
+  (MLLP/TCP/X12/HTTP/DICOM SCP), a Timer, or an internal `Loopback()`/`PassThrough()` inbound reports
   `supported=false` (nothing external to probe), and a `401/403` from an HTTP endpoint is a *failure*
   (bad credentials), not a pass. A probe never sends data, but a File/RemoteFile probe may create the
   target directory, exactly as a real delivery would.
@@ -391,7 +466,7 @@ when each interchange is wrapped in a fixed sentinel (STX/ETX, VT/FS). The paylo
 > [capability matrix](CONFIGURATION.md#per-backend-capability-matrix).
 
 ```python
-from messagefoundry import X12, ContentType, inbound, outbound
+from messagefoundry import X12, ContentType, Loopback, inbound, outbound
 
 # Receive bare ISA…IEA interchanges over TCP; route opaquely as a RawMessage.
 inbound("X12-IN_PARTNER_270", X12(port=2710), router="partner_x12_router",
@@ -430,9 +505,117 @@ example, and `messagefoundry.parsing.x12` for the codec a Router/Handler uses.
 - **Egress allowlist.** An `X12(...)` destination shares `[egress].allowed_tcp` (host or host:port);
   an inbound `X12(...)` is a local listener and is not connect-gated.
 - **Deferred follow-ups:** **TA1** classification on a *capturing outbound* is built (ADR 0016); an
-  *inbound* TA1/997/999 **generator**, outbound **999/997** functional-ack classification, and strict
-  implementation-guide validation are **not** built (a Router can branch on `X12Peek`'s `ST01`/`GS08`
-  today).
+  *inbound* TA1/997/999 **generator** and outbound **999/997** functional-ack classification are **not**
+  built (a Router can branch on `X12Peek`'s `ST01`/`GS08` today). Strict **implementation-guide**
+  validation *is* built as an on-demand library — `messagefoundry.parsing.x12.validate` behind the
+  `[x12]` extra (pyx12's bundled HIPAA IG maps, BACKLOG #32) — and its walk emits a conforming **999**
+  (005010) / **997** (004010) as a by-product a Handler may return; it is never run by the connector.
+
+### HTTP web-service listener — `Http(...)` (inbound only, ADR 0023)
+
+An **inbound HTTP/1.1 listener** — a connector-owned bound socket a partner `POST`s a body to (REST, a
+SOAP envelope, FHIR, a webhook). **Source only**: it never delivers, and it lives in `transports/`, not
+`api/` — the engine's FastAPI app stays the admin/RBAC surface and `transports/` must never import `api/`,
+so intake is a registry connector owning its own `asyncio` socket. Stdlib only
+(`asyncio.start_server`) — no second web framework. Pair it with `inbound(..., content_type=...)`
+([ADR 0004](adr/0004-payload-agnostic-ingress.md)): the default `hl7v2` runs the HL7 peek/validate path and
+routes a `Message`; `json`/`xml`/`text`/`fhir` route a `RawMessage` the Handler parses on demand.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `port` | — (required) | bind port. **Takes no host** — the listen interface is the service-level `[inbound].bind_host` (or a per-connection `bind_address`), exactly as MLLP/TCP/X12. |
+| `encoding` | `utf-8` | charset the POSTed body is decoded with (non-binary content types) |
+| `max_connections` | `256` | cap on concurrent clients (connection-flood guard). `None`/`0` = unlimited. |
+| `receive_timeout` | `60.0` | bound the **whole-request** read — request line + headers + body (slowloris guard); over budget answers a synchronous `408`. `None`/`0` = no timeout. |
+| `max_body_bytes` | `16 MiB` | the MLLP frame cap's HTTP twin — an over-declared `Content-Length` (or a read past the cap) is refused `413` **before the body is buffered whole** (OOM guard). `None`/`0` = unlimited. |
+| `max_header_bytes` | `64 KiB` | cap the request line + headers (header-flood guard). A falsy value falls back to the 64 KiB default — this one cap can't be switched off. |
+| `tls` | `false` | serve **HTTPS** (TLS 1.2+, the same per-connection inbound TLS builder MLLP uses). |
+| `tls_cert_file` / `tls_key_file` | — | the server-identity cert + its private key (required when `tls`). A PEM **path** (a plain string — unlike `DICOM()`, these two are not typed for `env()`). |
+| `tls_key_password` | — | passphrase for an **encrypted** `tls_key_file` — a **secret**, supply via `env()`. |
+| `tls_ca_file` | — | trust anchor — opt-in **mTLS** (require + verify a client certificate). |
+| `intake_auth` | `"none"` | **peer credential required to submit a message** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D6): `none` \| `api_key` \| `bearer` \| `mtls_subject`. A sibling of `source_ip_allowlist` — it authorises *submitting*, never *reading*; it mints no identity and opens no session. A missing or wrong credential is refused `401` **before any request body byte is read**, so it costs an anonymous peer nothing to be turned away. |
+| `intake_api_key` | — | the credential for `api_key`/`bearer` — a **secret**, `env()` only (a literal, a `default=` or a `cast=` is refused at the factory). |
+| `intake_api_key_next` | — | rotation slot, accepted **alongside** `intake_api_key` so a partner key rotates with no outage: set it, have the partner cut over, promote it, then clear it. Leaving it set keeps a retired credential live. |
+| `intake_api_key_header` | `"x-api-key"` | which header carries the `api_key` credential. A header **name**, not a secret. |
+| `intake_client_subjects` | — | `mtls_subject` allow-list, entries **qualified**: `"CN:partner.example"` / `"SAN:DNS:partner.example"`. Qualifying the namespace is what stops a spoofed commonName colliding with a pinned SAN; a bare `partner.example` is refused at the factory rather than silently matching nothing. |
+| `intake_auth_health` | `"require"` | whether `GET`/`HEAD` health probes must authenticate too. **`"allow"` is a real exemption**: it hands anyone who can reach the socket an unauthenticated "is MessageFoundry up, and where" oracle. Set it only when a load-balancer check cannot carry the credential. |
+| `intake_auth_rate_limit` | `10` | **failed** intake-auth attempts per minute per peer, then `429` + `Retry-After`. A *successful* authentication never consumes budget, so this bounds guessing without capping throughput. `None`/`0` disables. |
+| `intake_auth_rate_limit_global` | `60` | **failed** attempts per minute across all peers. Consulted only for peers with no successful authentication in the window, so one attacker cannot `429` an authenticated partner. `None`/`0` disables. |
+| `reply_from` | — | **presence is the mode switch** ([ADR 0154](adr/0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md) D4): names the outbound whose **captured** reply becomes this request's HTTP body, turning the listener from fire-and-forget into a **proxy**. See *Synchronous captured-downstream reply* below. One knob, not two — a separate `sync_reply: bool` would admit a half-configured "mode on, no target" state that could only fail at runtime. |
+| `reply_timeout` | `30.0` | seconds the HTTP turn may block waiting for that reply. Must be **positive** — an unbounded or zero budget is not a timeout. Expiry answers `reply_on_timeout` and **leaves the message flowing**; the engine does not cancel it. |
+| `reply_on_timeout` | `"504"` | what to answer when `reply_timeout` expires: `504` (the partner did not answer in time) or `202` (demote to the ordinary receipt path). |
+| `reply_content_type` | `"passthrough"` | `passthrough` echoes the partner's **own** captured `content-type`; a literal MIME type (must contain `/`) pins it instead. |
+| `reply_on_empty` | `"204"` | answer for a captured but *deliberately empty* partner reply — `204` or `200`. An empty reply is distinguished from a missing one, never conflated. |
+| `reply_write_timeout` | `30.0` | seconds to drain the (partner-sized) response body back to the caller. Must be **positive**. |
+
+> **TLS is confidentiality; intake auth is authentication — neither argues the other away.** A bare
+> `tls` + `tls_ca_file` means *"any certificate this CA ever signed"*, with **no subject binding at
+> all**, which is why `mtls_subject` additionally requires `intake_client_subjects`. Enabling
+> `intake_auth` is likewise never a reason to relax `check_http_tls_exposure`. A **non-loopback** HTTP
+> listener with no *effective* peer control — no sufficiently narrow `source_ip_allowlist`, no
+> `intake_auth`, and no `mtls_subject` binding — is refused at start under an enforcing PHI posture
+> and warned about otherwise, independently of the TLS gate and **without** consulting
+> `--allow-insecure-bind`: a cleartext escape hatch does not get to waive authentication. Loopback
+> binds are unaffected.
+
+Plus on `inbound(...)`: `router`, `content_type`, `bind_address`, `source_ip_allowlist`, `metadata`,
+`capture_connection_errors`, and the per-connection overrides further below. A **non-loopback** HTTP
+listener without `tls=true` is **refused at start** (`check_http_tls_exposure`, the same generalized
+bind-guard MLLP/TCP/DICOM use). `serve --allow-insecure-bind` downgrades that refusal to a warning —
+but the flag is **clamped**: on a PHI-classified instance under the default `[security].enforcement =
+enforce` the bind is refused *even with it*. Treat the flag as a lab tool, not a deployment option.
+
+**Respond-with-receipt (ACK-on-receipt).** A `POST`/`PUT`/`PATCH` body is committed to the ingress stage
+and answered **`202 Accepted`** carrying the engine `message_id` the instant it is durably committed — the
+HTTP twin of MLLP's AA-on-receipt. A post-ingress routing/transform/delivery failure happens *after* the
+`202` and is **not** reflected in the HTTP status; it surfaces as the message's `ERROR`/dead-letter
+disposition + the AlertSink, exactly as a post-ACK MLLP failure does. A **pre-ingress** refusal answers
+synchronously and emits an ADR 0021 `connection_event`: `403` (not in `source_ip_allowlist`), `408` (the
+request didn't fully arrive within `receive_timeout`), `413` (over `max_body_bytes` **or**
+`max_header_bytes`), `400` (malformed request line / header, a bad or duplicated framing header), `503` (at
+`max_connections` — the connection is accepted, then refused and closed at the application layer).
+`GET`/`HEAD` are static, non-PHI health probes and write **no** ingress row; any other method is `405`.
+
+**Synchronous captured-downstream reply (`reply_from`, ADR 0154 increment B).** Naming `reply_from` makes
+the HTTP turn **block** until the named outbound's reply has been captured **and committed to the store**,
+then returns that reply as the response body — a proxy API rather than a receipt. The **committed row is
+the sole authority** for the returned bytes: every in-process signal is only a latency hint and the waiter
+re-reads the store, which is what keeps this correct under engine sharding, HA failover, every claim mode,
+and any race between the capturing worker and the reader. A reply is therefore returned only once it is
+durable and replayable. An inbound **without** `reply_from` keeps the `202`-on-receipt path above byte for
+byte.
+
+Refused at **check time** (`messagefoundry check`) rather than at runtime: a `reply_from` naming no
+deployed outbound; an outbound that does not capture responses; `reply_content_type="passthrough"` against
+an outbound not capturing the content type; and — because either would make N concurrent callers queue
+behind one lane and let a single stuck message time out every caller — an effective `ordering` of **FIFO**
+or a **finite `max_attempts`** on the named outbound. Setting any `reply_*` knob **without** `reply_from`
+is refused at the factory, since the path is off and the knob would never be read.
+
+**Not built.** **Routing metadata** (HTTP method / path / headers as Router inputs) is a defined follow-on
+— a Handler sees the body only. **`capture_error_responses` is the headline gap:** a partner `4xx`
+dead-letters and the caller receives a fixed-JSON `502`, **not** the partner's own status and body, so a
+proxy API built on `reply_from` is currently correct only when the partner *succeeds*. The inbound **FHIR
+facade** (BACKLOG #20) and **DICOMweb STOW-RS receiver** (#24) are consumers of this listener, each its own
+build. `POST /connections/{name}/test` reports `supported=false` — a bound listener has nothing external to
+probe.
+
+```python
+from messagefoundry import ContentType, Http, env, inbound, router
+
+# Receive JSON orders over HTTPS; route them opaquely as a RawMessage.
+inbound("REST-IN_ACME_ORDERS",
+        Http(port=8088, tls=True,
+             tls_cert_file="/etc/mefor/http.crt", tls_key_file="/etc/mefor/http.key",
+             tls_key_password=env("http_tls_key_password")),   # only if the key is encrypted
+        router="acme_orders_router", content_type=ContentType.JSON,
+        source_ip_allowlist=["10.0.0.0/8"])
+
+
+@router("acme_orders_router")
+def route(msg):
+    return ["acme_orders"] if msg.json().get("kind") == "order" else []   # else UNROUTED
+```
 
 ### File — `File(...)`
 
@@ -500,7 +683,8 @@ inbound(
 another system owns, a source may **leave** each file untouched instead of moving/deleting it. To avoid
 re-ingesting the same file every poll, the engine keeps a durable **processed-file dedup ledger** (the
 store's `processed_files` table, all three backends) keyed on a **hash** of the file's identity — the
-file's **path relative to the watch root** (the full remote path for SFTP/FTP) + mtime/size — **never a
+file's **path relative to the watch root** + mtime + size locally, or the **full remote path** + size for
+SFTP/FTP (a remote listing carries no reliable mtime, so size is the change signal) — **never a
 cleartext path** (a filename/path can embed an MRN), and never logged. Folding the *path* (not just the
 basename) in keeps two same-named files in different `recursive` subdirs distinct, so both are ingested.
 A file is recorded **after** its message(s) emit successfully, with the **file** (not each split message)
@@ -521,10 +705,18 @@ for operator diagnostic logs; and the **attachment download** route (GET
 that serves a detached document back out. The **directory source's** handling of an untrusted drop
 directory is fixed policy (the HTTP uploaded-logs surface has its own policy block below):
 
-- **Permitted type — HL7 v2 text only.** Files are selected by the `pattern` glob (default `*.hl7`), and
-  every candidate is **content-sniffed** before its bytes reach the pipeline: it must begin with an HL7
-  header segment (`MSH`/`FHS`/`BHS`, after an optional UTF-8 BOM / MLLP start byte / leading whitespace).
-  A binary or non-HL7 file carrying a `.hl7` name is rejected on **content, not extension** (ASVS 5.2.2).
+- **Permitted type — the inbound's declared `content_type` (default `hl7v2`).** Files are selected by
+  the `pattern` glob (default `*.hl7`), and every candidate is **content-sniffed against that declared
+  type** before its bytes reach the pipeline: an `hl7v2` drop (the default, and how an inbound that
+  declares nothing is treated) must begin with an HL7 header segment (`MSH`/`FHS`/`BHS`, after an
+  optional UTF-8 BOM / MLLP start byte / leading whitespace), and each other structured type must lead
+  with its own format signature. A file whose content **contradicts** its declaration — a PDF on a
+  `json` inbound, a headerless body on an `hl7v2` one — is rejected on **content, not extension**
+  (ASVS 5.2.2). It is a declared-type **conformance** check, not an HL7-only gate: an inbound declaring
+  a non-HL7 `content_type` bypasses HL7 handling entirely and its exact bytes reach the
+  content_type-aware pipeline (ADR 0004). The two declarations that carry no reliable leading signature
+  — `binary` (opaque bytes) and `text` (arbitrary) — are accepted **unchecked** by explicit policy; the
+  pipeline codec/parser stays the real validator that records `ERROR`.
 - **Maximum size.** `max_file_bytes` (default **16 MiB**, matching the MLLP frame cap). An oversize file
   is rejected by a `stat()` **before** it is read into memory (OOM / DoS guard); `None`/`0` disables it.
 - **Decompression is off by default; opt-in single-stream gzip is bomb-guarded** (ADR 0123). With no
@@ -534,12 +726,13 @@ directory is fixed policy (the HTTP uploaded-logs surface has its own policy blo
   *decompressed* size — a decompression-bomb guard the compressed-only `max_file_bytes` cap cannot
   provide (ASVS 5.2.3). A corrupt or over-ceiling archive is **quarantined to `.error`, never
   accept-and-dropped**, and the decompressed body is never logged. Multi-entry zip stays Handler-composed.
-- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize or non-HL7 file
-  is **moved to the `.error` subdirectory** (preserved for the operator) and logged. A
-  *textual-but-non-conformant* HL7 file still flows through and is recorded as an `ERROR`-status message
-  by the parser (raw preserved in the store). A **transient** read failure (file locked / mid-write) or
-  an **infrastructure** failure (store unavailable) **leaves the file in place to retry** next scan —
-  never an accept-and-drop. Use `min_age_seconds` to skip files still being written.
+- **Malicious / malformed-file behavior — quarantine, never a silent drop.** An oversize file, or one
+  whose content contradicts its declared type, is **moved to the `.error` subdirectory** (preserved for
+  the operator) and logged. A *textual-but-non-conformant* HL7 file still flows through and is recorded
+  as an `ERROR`-status message by the parser (raw preserved in the store). A **transient** read failure
+  (file locked / mid-write) or an **infrastructure** failure (store unavailable) **leaves the file in
+  place to retry** next scan — never an accept-and-drop. Use `min_age_seconds` to skip files still being
+  written.
 - **Traversal-safe output naming.** The destination resolves `{HL7-path}` placeholders to a **single safe
   filename** (path separators / unsafe chars stripped, leading dots removed, `.`/`..`/reserved device
   names fall back), so an attacker-controlled field can't write outside the target dir or shadow
@@ -621,12 +814,102 @@ to `application/octet-stream` on any non-clean value **and** on any **browser-ac
 scripts/forms disabled), re-asserted on the `/ui` delegate from **outside** the console's own CSP writers
 so a browser-active representation can never execute in the application origin.
 
+### Remote file — `Sftp(...)` / `Ftp(...)`
+
+**One** connector type (`REMOTEFILE`) with two factories, each **source *and* destination** — the `File(...)`
+poll/write shape against a remote server, selected by an internal `protocol` setting:
+
+- **`Sftp(...)`** — SSH file transfer over **paramiko**, behind the **`[sftp]` extra**
+  (`pip install 'messagefoundry[sftp]'`, lazily imported so an install that never uses SFTP skips it).
+  **Host-key verification is ON by default** (the system host keys plus an optional extra `known_hosts`,
+  paramiko `RejectPolicy`); an unknown key is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` is set (and
+  loudly logged when it is). **This one cell reads the raw escape and is *not* clamped** — unlike the
+  `tls_verify` / `encrypt` cells elsewhere in this document, the variable still works here on a
+  production-PHI enforcing instance, so it is the SFTP setting to audit for rather than assume inert.
+- **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
+  (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
+  certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).
+  Plain FTP is cleartext, so supplying a `username`/`password` over it is **refused** (the credential
+  itself would cross in the clear) — use FTPS or `Sftp(...)`; an *anonymous* plain-FTP hop is governed by
+  the [`cleartext_accepted`](#declaring-a-cleartext-hop-cleartext_accepted) declaration below.
+
+| Setting | Dir | Default | Meaning |
+|---------|-----|---------|---------|
+| `host` | both | — (required) | the remote server — the `[egress].allowed_remote` key. Use `env()` for a DEV/PROD-specific host. |
+| `port` | both | `22` (`Sftp`) / `21` (`Ftp`) | server port |
+| `remote_dir` | both | — (required) | remote directory to poll / upload into |
+| `username` | both | — (unset) | login user (unset = anonymous, FTP only) |
+| `password` | both | — (unset) | login password — a **secret**, via `env()`. Refused over plain `ftp`. |
+| `private_key` | both | — | **`Sftp` only** — PEM private-key text or a path; a **secret**, via `env()` |
+| `key_password` | both | — | **`Sftp` only** — passphrase for an encrypted `private_key`; a **secret**, via `env()` |
+| `known_hosts` | both | — | **`Sftp` only** — an *additional* `known_hosts` file (the system host keys are always loaded) |
+| `tls` | both | `false` | **`Ftp` only** — `true` selects **FTPS** (explicit TLS); `false` is plain FTP |
+| `tls_allow_expired` | both | `false` | **`Ftp` only** — honour an FTPS server cert whose validity period has lapsed while still verifying chain + hostname (#129, ADR 0094). Same contract, and the same unreported risk, as the [MLLP `tls_allow_expired` row](#mllp--mllp): **no posture gate, no escape variable and no loosening register covers it**, so nothing but the per-build WARNING records that it is set — and the FTPS hop has **no revocation gate either**, so an expired *and* revoked partner certificate crosses here with nothing refusing it. Put the connection name and a removal date in your own risk register |
+| `pattern` | in | `*.hl7` | filename glob to pick up |
+| `poll_seconds` | in | `5.0` | poll interval |
+| `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
+| `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
+| `max_file_bytes` | in | `16 MiB` | move a file larger than this to `error_subdir` instead of retrieving it (OOM guard). `None`/`0` = unlimited. |
+| `validate_directory` | in | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time |
+| `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
+| `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
+| `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
+| `encoding` | out | `utf-8` | charset the payload is encoded with before upload (the **source** hands the retrieved bytes to the pipeline and never uses it) |
+
+- **Atomic publish.** An upload writes an unguessable temp `.part` name then **renames**, so a poller on
+  the far side never sees a partial file; a failed rename removes the temp before the delivery is
+  classified (transient → retry, permanent → dead-letter).
+- **Mostly the same file policy as `File(...)`.** A remote source is one of the *directory sources* the
+  [file handling & quarantine policy](#file-handling--quarantine-policy-asvs-511) above governs — the
+  content-type-aware magic-byte sniff (a drop whose leading bytes contradict its declared `content_type` is
+  quarantined before its bytes reach the pipeline), `max_file_bytes`, `.error` quarantine (never a silent
+  drop), and the fail-closed pre-ingest `set_scan_hook` AV/ICAP seam all apply. **Three File-source
+  behaviours do *not* carry over:** the HL7 **batch split** (a multi-message `MSH`/`FHS`/`BHS` file is one
+  hand-off here, not N), opt-in gzip `decompress` (ADR 0123, local `File(...)` only), and
+  `min_age_seconds` (above).
+- **Leader-gated.** The remote directory is a *shared* external resource, so in a cluster only the leader
+  lists, downloads, or moves its files — otherwise two nodes would double-ingest the drop.
+- **No timeout knob.** Neither factory exposes one — the 30 s value is a hard-coded module fallback in
+  `transports/remotefile.py`, handed to `paramiko.SSHClient.connect(timeout=…)` (the **TCP connect only**;
+  the SFTP channel read/write is unbounded) and to `ftplib.FTP_TLS/FTP(timeout=…)` (the **whole socket**).
+  See [Table B](#table-b--per-service-resource-strategy-asvs-1313).
+- **Egress allowlist.** `[egress].allowed_remote` gates the host in **both** directions — a poll dials out
+  too, so the allowlist guards against polling an arbitrary server. Fail-closed once configured.
+- **At-least-once.** An upload may re-send, and a poll may re-emit a file that was handled but not yet
+  marked, so **downstream consumers must tolerate duplicates.**
+- **A client per operation.** No pooled or held session: each poll and each delivery opens, uses, and
+  closes its own client in a `finally`, mirroring the MLLP destination's fresh-connection-per-delivery.
+
+```python
+from messagefoundry import Ftp, Sftp, env, inbound, outbound
+
+# Poll a partner's SFTP drop directory, leaving their files in place (read-only share).
+inbound(
+    "SFTP-IN_ACME_ADT",
+    Sftp(host=env("acme_sftp_host"), remote_dir="/outbound/adt", pattern="*.hl7",
+         username=env("acme_sftp_user"), private_key=env("acme_sftp_key"),
+         after_read="leave", poll_seconds=30.0, validate_directory=True),
+    router="acme_adt_router",
+)
+# Publish results back over FTPS (explicit TLS; verifying by default).
+outbound(
+    "FTP-OUT_ACME_ORU",
+    Ftp(host=env("acme_ftp_host"), tls=True, remote_dir="/inbound/oru",
+        username=env("acme_ftp_user"), password=env("acme_ftp_password")),
+)
+# In messagefoundry.toml (the SERVICE settings file — NOT the --config dir, which only ever reads
+# *.py, connections.toml and codesets/):
+#   [egress]
+#   allowed_remote = ["acme-sftp.example.org", "acme-ftp.example.org"]
+```
+
 ### REST — `Rest(...)`
 
 An **outbound** HTTP(S) client ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)). The
 Handler produces the request body (JSON, XML, an HL7-in-FHIR document — whatever the endpoint expects);
-the connector delivers it. There is **no REST source yet** — a non-HL7 *inbound* awaits the
-payload-agnostic ingress decided in ADR 0003.
+the connector delivers it. `Rest(...)` is **outbound only** — the inbound side is its own connector,
+[`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023) (ADR 0023), not a direction on this
+one.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -637,7 +920,8 @@ payload-agnostic ingress decided in ADR 0003.
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — supply via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification; `false` (dev only) requires `MEFOR_ALLOW_INSECURE_TLS` |
+| `verify_tls` | `true` | TLS cert verification. `false` is MITM-able and is **refused at construction** for a non-loopback host. `MEFOR_ALLOW_INSECURE_TLS` relaxes it to a loud warning **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is therefore **inert on the shipped default**, where the refusal stands with the variable set. `cleartext_accepted` does **not** reach this hop (it has TLS — it is encrypted-but-unauthenticated, not cleartext), and `tls_hop_attested` has no authoring surface. A **loopback** URL is allowed unchanged, which is what makes this usable in a lab |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert while chain + hostname stay verified — the narrow alternative to `verify_tls=false`. Same contract and the same reporting gap as the [MLLP row](#mllp--mllp): **no posture gate, no escape variable, and `security_loosenings()` never reports it** |
 | `encoding` | `utf-8` | request-body charset |
 
 **Delivery semantics.** A **2xx** is delivered. **5xx / 408 / 429 / connection / DNS / TLS / timeout**
@@ -690,8 +974,8 @@ The Handler produces a **JSON-object** body; the connector binds its keys to the
 | `auth` | `sql` | `sql` · `integrated` (Windows) · `entra` (ActiveDirectoryDefault) — **SQL Server preset only** |
 | `username` / `password` | — | SQL-auth credentials (`password` is a **secret** — via `env()`) |
 | `port` | `1433` | server port |
-| `encrypt` | `true` | TLS to the DB; `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
-| `trust_server_certificate` | `false` | accept an untrusted cert (dev only; needs the escape) |
+| `encrypt` | `true` | TLS to the DB (**SQL Server preset only** — see the generic-ODBC note below). `false` is a weakened hop and is **refused at construction**; `MEFOR_ALLOW_INSECURE_TLS` relaxes it **only while `[security].enforcement` is not `enforce`** — the escape is **clamped** (#200, ADR 0092 decision 2) and is **inert on the shipped default** |
+| `trust_server_certificate` | `false` | accept an untrusted cert. Same weakened-hop cell as `encrypt=false` — **refused**, with the same **clamped** escape that does nothing on a stock instance. Import the DB CA instead (below) |
 | `connect_timeout` | `15` | connection timeout (s) |
 | `app_name` | `messagefoundry` | ODBC `APP` name |
 | `pool_max` | `5` | max pooled connections |
@@ -703,7 +987,10 @@ deadlock, timeout — SQLSTATE class `08`/`40` or `HYTxx`) → `DeliveryError`, 
 
 **Security.** Values are bound as **parameters** (never string-interpolated into SQL); the connection
 string brace-quotes every value (no connection-string injection); TLS is **on by default** and a
-weakened posture is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set; the outbound server is gated by the
+weakened posture (`encrypt=false` / `trust_server_certificate=true`, `dialect="sqlserver"` only) is
+**refused at construction** — `MEFOR_ALLOW_INSECURE_TLS` is **clamped** and cannot relax it while
+`[security].enforcement = enforce`, which is the shipped default, so on a stock instance there is **no
+env-var route to a weakened DB hop**: fix the trust instead (below). The outbound server is gated by the
 fail-closed `[egress].allowed_db` allowlist (WP-11c). A `:name` placeholder must not appear inside a
 quoted string literal in `statement` — bind dynamic strings as parameters. To validate a private /
 internal DB CA with `trust_server_certificate` left **false**, import that CA into the Windows
@@ -814,7 +1101,10 @@ pipeline must tolerate duplicates**. A handler failure (e.g. the store is briefl
 **unmarked** so it retries — never marked-and-dropped. A poll error is **logged, not fatal** — a bad
 `poll_statement` or a dropped connection never kills the poller; it retries next interval.
 
-**Security.** TLS is **on by default** (weakening needs `MEFOR_ALLOW_INSECURE_TLS`); the connection
+**Security.** TLS is **on by default**; weakening it (`encrypt=false` / `trust_server_certificate=true`)
+is **refused at construction** through the same cell as the `Database(...)` destination, and the
+`MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the
+shipped default). The connection
 string brace-quotes every value; secrets go through `env()`. The polled `server` is gated by the same
 fail-closed `[egress].allowed_db` allowlist as the destination — although the source pulls data *in*, it
 still dials out to a host, so the allowlist guards against polling an arbitrary server.
@@ -844,8 +1134,11 @@ inbound(
 An **outbound** SOAP web-service client ([ADR 0003](adr/0003-non-hl7-transports-database-rest-soap.md)) —
 a thin layer over the REST connector's HTTP client (same no-redirect, `http`/`https`-only opener and the
 `[egress].allowed_http` host gate). The Handler produces the **full SOAP envelope** (XML); this adds the
-SOAP `Content-Type` (+ a `SOAPAction` header for 1.1) and POSTs it. There is **no SOAP source yet** (a
-Web Service Listener awaits the payload-agnostic ingress of ADR 0003).
+SOAP `Content-Type` (+ a `SOAPAction` header for 1.1) and POSTs it. There is **no SOAP source connector**:
+a partner's SOAP envelope is *received* by [`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023)
+and un-wrapped in a Handler (`parsing/xml` has the hardened XPath model), but the *synchronous* SOAP-envelope
+reply — a Web Service Listener that blocks on a captured downstream reply — is a defined ADR 0023 / ADR 0013
+follow-on and is **not** built.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -856,7 +1149,8 @@ Web Service Listener awaits the payload-agnostic ingress of ADR 0003).
 | `bearer_token` | — | `Authorization: Bearer …` (a **secret** — via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification; `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
+| `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate, no escape variable, and it is never reported by `security_loosenings()`** — see the [MLLP row](#mllp--mllp) |
 | `encoding` | `utf-8` | envelope charset |
 
 **Fault & delivery semantics.** The response is inspected for a SOAP `Fault` (which can arrive as an HTTP
@@ -900,8 +1194,13 @@ wrapping an HL7 payload) — **not** the full envelope. The transport builds the
 | `ws_timestamp_ttl_seconds` | `300` | the `Created`→`Expires` window |
 
 **Operational notes (read before going live):**
-- **Populate `[egress].allowed_http`.** The host gate is fail-closed only **once configured** — an empty
-  allowlist gates nothing. A WS-\* mTLS destination carries PHI, so set its host in `[egress].allowed_http`.
+- **Populate `[egress].allowed_http`.** A WS-\* mTLS destination carries PHI, so its host must be listed
+  — and on a **PHI** instance (every built-in env name by default,
+  [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) leaving it
+  empty does **not** mean "unrestricted". With no `[egress]` allowlist at all, `serve` refuses to start;
+  with any other list set, it flips `[security].block_unlisted_outbound` on and an empty `allowed_http`
+  then refuses *every* HTTP destination. Empty-means-unrestricted survives only on a synthetic instance.
+  See [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress) for the full behaviour table.
 - **`ws_timestamp_ttl_seconds` must be ≥ the worst-case retry backoff.** The timestamp is re-stamped on
   each `send()`, but a held FIFO lane plus a short TTL can fail the peer's `Expires` check.
 - **Idempotency footgun.** An at-least-once **re-send mints a fresh `<wsa:MessageID>`** (correct WS-\*
@@ -1000,11 +1299,27 @@ report, plain text); this connector delivers it to `host:port` from `sender` to 
 | `subject` | str / `env()` | `""` | Static subject (a per-message subject is a Phase-2 follow-up). |
 | `username` | str / `env()` / None | `None` | SMTP `AUTH` user — put the secret in `env()`. |
 | `password` | str / `env()` / None | `None` | SMTP `AUTH` password — `env()` only. AUTH is sent **over TLS only**; a cleartext-credential config is refused. |
-| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated: it needs an explicit opt-in (`MEFOR_ALLOW_INSECURE_TLS` read through the **clamped** check, the connection's `tls_hop_attested`, or its `cleartext_accepted` declaration), **and** the hop itself goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback and attested hops ALLOW, a `cleartext_accepted` hop WARNs + audits, a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
+| `use_tls` | bool | `True` | STARTTLS by default. `False` puts the message **body** (PHI) on the wire in the clear, so it is doubly gated. **The opt-in** is one of exactly two things you can actually set: `MEFOR_ALLOW_INSECURE_TLS` (process-global — it weakens *every* connector in the process, and it is read through the **clamped** check, so it cannot relax an enforcing production-PHI hop), or this connection's `cleartext_accepted = true` with its mandatory `cleartext_reason` (per-hop, audited — see [Declaring a cleartext hop](#declaring-a-cleartext-hop-cleartext_accepted), and prefer it). **And** the hop then goes through the shared authority (#200, ADR 0092 as amended by ADR 0153): loopback ALLOWs, a `cleartext_accepted` hop **WARNs + audits** (never a silent allow), a non-enforcing instance WARNs, everything else REFUSES — **no data label relaxes it**. The engine also honours a connection-level `tls_hop_attested` on this gate, but **no factory keyword and no `connections.toml` key sets it**, so it is not a route you can take — see the note in that section. SMTP AUTH over cleartext stays refused OUTRIGHT, by any route. Matches the raw-TCP / X12 / plaintext-DICOM / anonymous-FTP cleartext egress paths. |
 | `timeout_seconds` | float | `30.0` | |
 | `encoding` | str | `"utf-8"` | |
 
-The egress host is **gated by `[egress].allowed_smtp`** (deny-by-default — add the host or it is refused).
+The egress host is **gated by `[egress].allowed_smtp`** — add the host or the destination is refused at
+config load/reload. On a **PHI** instance (every built-in env name by default,
+[ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md)) an **empty**
+`allowed_smtp` does **not** mean "unrestricted": with no counted `[egress]` allowlist `serve` refuses to
+start, and with one set it flips `[security].block_unlisted_outbound` on, so an empty
+`allowed_smtp` refuses *every* SMTP destination. Empty-means-unrestricted survives only on a synthetic
+instance — see [CONFIGURATION.md `[egress]`](CONFIGURATION.md#egress). (The key is
+`[security].block_unlisted_outbound`; `[egress].deny_by_default` moved there under ADR 0118 and is
+**rejected at config load**.)
+
+⚠️ **`allowed_smtp` is one of the two lists that does *not* count as "egress is restricted".** The
+open-egress startup gate reads only `allowed_mllp`/`allowed_tcp`/`allowed_http`/`allowed_db`/
+`allowed_remote`/`allowed_file_dirs`, so a PHI instance whose **only** declared egress is this `Email()`
+relay populates `allowed_smtp`, declares its one destination — and still **exits 2** with *"outbound
+egress is UNRESTRICTED … refusing to start"*. A mail-only deployment must set
+**`[security].block_unlisted_outbound = true`**; that is the arm of the gate it can actually satisfy.
+The same is true of `allowed_direct` for a Direct-only instance.
 Delivery is **at-least-once**: a retry re-sends the email, and since a mailbox has no idempotency key a rare
 duplicate is possible and **accepted by design** (a duplicate beats a drop). `test_connection` does
 connect/EHLO/NOOP only (reachability — it never sends `MAIL FROM`/`DATA`).
@@ -1025,7 +1340,84 @@ outbound(
         password=env("SMTP_PASS"),  # AUTH over STARTTLS
     ),
 )
-# In config dir TOML: [egress] allowed_smtp = ["smtp.example.org"]
+# In messagefoundry.toml (the SERVICE settings file, or --service-config — an [egress] table dropped
+# in the --config dir is never read):
+#   [egress]
+#   allowed_smtp = ["smtp.example.org"]
+# ...and note allowed_smtp alone does NOT satisfy the open-egress startup gate on a PHI instance —
+# see CONFIGURATION.md §[egress].
+```
+
+### Direct Project — `Direct(...)` (S/MIME over SMTP, outbound send, ADR 0085)
+
+An **outbound destination only** — the Direct Project's trusted-correspondent lane. The Handler produces the
+clinical **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this connector **SIGNs**
+it with the sender's key + cert (authenticity + integrity), **ENCRYPTs** the signed blob to the partner's
+`recipient_cert` (confidentiality — sign-then-encrypt, so the signature is itself confidential), and submits
+the S/MIME message to `host:port` over STARTTLS SMTP. PHI is therefore protected **end-to-end**, independent
+of the transport TLS. Crypto is core `cryptography` (`serialization.pkcs7`) and SMTP is stdlib `smtplib` —
+**no new dependency, no extra**.
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `host` | — (required) | the SMTP / HISP relay host (the `[egress].allowed_direct` key; use `env()`) |
+| `sender` | — (required) | the Direct `From:` address |
+| `recipients` | — (required) | the Direct `To:` address(es) — a list or a single string |
+| `signing_cert` | — (required) | path to the sender's PEM/DER signing **certificate** |
+| `signing_key` | — (required) | path to the sender's PEM/DER signing **private key** |
+| `signing_key_password` | — | passphrase for an encrypted `signing_key` — a **secret**, via `env()` |
+| `recipient_cert` | — (required) | path to the partner's PEM/DER **encryption** certificate (the encryption target) |
+| `trust_anchor` | — (required) | path to the PEM/DER CA the `recipient_cert` must chain to |
+| `port` | `587` | `587` = STARTTLS submission; `465` = implicit TLS (`SMTP_SSL`) |
+| `subject` | `""` | static `Subject` |
+| `username` / `password` | — | optional SMTP `AUTH` credentials (secrets — via `env()`) |
+| `use_tls` | `true` | STARTTLS by default. `false` is refused unless `MEFOR_ALLOW_INSECURE_TLS` is set, and SMTP `AUTH` over cleartext is **refused outright**. ⚠️ **This is not the same posture as `Email(...)` — the shipped enforcing default does not close it.** `Direct()` consults the **raw** escape variable directly: it does **not** route through the shared cleartext-hop authority, so `[security].enforcement = enforce` does **not** clamp it and `cleartext_accepted` / `cleartext_reason` on the outbound are **not consulted** (declaring them changes nothing here). With the variable set, a cleartext-SMTP Direct hop crosses on a production-PHI enforcing instance. The S/MIME body stays signed + encrypted either way — but the SMTP envelope (sender, recipients, subject) does not. |
+| `timeout_seconds` | `30.0` | passed to the `smtplib` constructor (covers connect and each command) |
+| `encoding` | `utf-8` | charset the body is encoded with before signing |
+
+**Fail-loud at construction.** Every piece of crypto material is loaded and cross-checked when the connector
+is built — so `messagefoundry check` / dry-run / start catches it, never the first message: a malformed
+key/cert, a `signing_key` whose public half **does not match** `signing_cert`, and a `recipient_cert` **not
+issued by** any supplied `trust_anchor` (PHI is never encrypted to a certificate from an untrusted issuer).
+The trust check is deliberately **one level** (the recipient cert chains directly to a supplied anchor, or is
+a self-signed correspondent cert pinned as its own anchor) — full multi-level path building is deferred. No
+hostname/SAN match is done: a Direct address is an email, not a TLS SNI. Errors name the *setting* only,
+never the material or a cert subject (which can identify a patient's provider).
+
+**Delivery semantics.** Egress is gated by **`[egress].allowed_direct`** — kept separate from
+`allowed_smtp` so a Direct HISP relay can be permitted without opening the general mail relay. Both an SMTP
+failure and an S/MIME **encode** failure raise `DeliveryError`, so the lane **retries** per its
+`RetryPolicy`. Delivery is **at-least-once** and a Direct mailbox has no idempotency key, so a rare duplicate
+is possible and **accepted by design** (a duplicate beats a drop), exactly as with `Email(...)`.
+`test_connection` does connect / STARTTLS / EHLO / optional login / NOOP — never `MAIL FROM` or `DATA`.
+
+**Scope (ADR 0085 PR1) — outbound only.** An **inbound** Direct mail source (IMAP/POP + S/MIME
+decrypt/verify), **MDN** disposition notifications, **DNS CERT / LDAP** certificate discovery, per-recipient
+certificate maps, IHE **XDR/XDM**, and the Direct IG's CMS signed attributes (`signingTime`,
+`ESSCertIDv2`) are all deferred later phases and **not** built.
+
+```python
+from messagefoundry import Direct, env, outbound
+
+outbound(
+    "DIRECT-OUT_REFERRAL",
+    Direct(
+        host=env("hisp_host"),
+        sender="clinic@direct.example.org",
+        recipients=["intake@direct.partner.example"],
+        signing_cert=env("direct_signing_cert"),
+        signing_key=env("direct_signing_key"),
+        signing_key_password=env("direct_signing_key_pw"),  # a SECRET — always via env()
+        recipient_cert=env("direct_partner_cert"),
+        trust_anchor=env("direct_trust_anchor"),
+        subject="Referral",
+    ),
+)
+# In messagefoundry.toml (the SERVICE settings file, or --service-config — not the --config dir):
+#   [egress]
+#   allowed_direct = ["hisp.example.org"]
+# allowed_direct alone does NOT satisfy the open-egress startup gate either: a Direct-only PHI
+# instance also needs [security].block_unlisted_outbound = true — see CONFIGURATION.md §[egress].
 ```
 
 ### FHIR — `FHIR(...)`
@@ -1037,9 +1429,11 @@ host gate) — it is **not** a wrapper around `Rest(...)`. The Handler produces 
 sets the `application/fhir+json` media type (Content-Type + Accept) and POSTs/PUTs it per the configured
 interaction. The pure `messagefoundry.parsing.fhir` codec — `FhirPeek` to route (cheap, no `[fhir]` extra),
 `FhirResource` to validate/transform (the `[fhir]` extra) — is called **on demand in Routers/Handlers**,
-never pushed through the pipeline. There is **no FHIR source yet** (the inbound FHIR server facade is gated
-on a future ADR 0023); `content_type="fhir"` routes a FHIR body received over any source (File, a `Loopback`
-re-ingress) as a `RawMessage`.
+never pushed through the pipeline. There is **no FHIR source connector**: the inbound FHIR **server facade**
+(a `/fhir` endpoint with resource-type routing and a CapabilityStatement) is still deferred — BACKLOG #20,
+now a *consumer* of the shipped [`Http(...)`](#http-web-service-listener--http-inbound-only-adr-0023)
+listener rather than blocked on it. Meanwhile `content_type="fhir"` routes a FHIR body received over **any**
+source (`Http()`, File, a `Loopback` re-ingress) as a `RawMessage`.
 
 | Setting | Default | Meaning |
 |---------|---------|---------|
@@ -1053,7 +1447,8 @@ re-ingress) as a `RawMessage`.
 | `bearer_token` | — | `Authorization: Bearer …` (SMART/OAuth — a **secret**, via `env()`) |
 | `basic_user` / `basic_password` | — | HTTP Basic auth (secrets — via `env()`) |
 | `timeout_seconds` | `30` | per-request timeout |
-| `verify_tls` | `true` | TLS cert verification; `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
+| `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default) |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** server cert with chain + hostname still verified. **No posture gate, no escape variable, and it is never reported by `security_loosenings()`** — see the [MLLP row](#mllp--mllp) |
 | `encoding` | `utf-8` | body charset |
 | `capture_response` | `false` | capture the server reply (assigned resource / `OperationOutcome`) as a response artifact (ADR 0013) |
 | `reingress_to` | — | route the captured reply into this `Loopback` inbound (implies capture) |
@@ -1182,9 +1577,27 @@ MWL, Query/Retrieve (C-FIND/C-MOVE/C-GET), and pixel-data handling.
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted `tls_key_file` (`env()`-sourced, mirroring MLLP's `MEFOR_*_TLS_KEY_PASSWORD`). An encrypted key supplied with **no/wrong** passphrase **fails fast** at startup/`check` rather than hanging on an interactive TTY prompt (there is no TTY under an NSSM service account / in a container). |
 | `tls_ca_file` | — | opt-in **mTLS**: require + verify a calling peer's client certificate |
 
-The **bind interface** is the service-level `[inbound].bind_host` and the **peer-IP gate** is `[inbound].source_ip_allowlist` (the same inbound settings MLLP/TCP use) — not `DICOM()` arguments. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` or `serve --allow-insecure-bind` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
+The **bind interface** is the service-level `[inbound].bind_host` (or a per-connection `bind_address`) and the **peer-IP gate** is the per-connection **`source_ip_allowlist`** — both are set on the `inbound(...)` call, not as `DICOM()` arguments. ⚠️ **`source_ip_allowlist` is *not* a key of the `[inbound]` section in `messagefoundry.toml`.** That section carries only `bind_host`, `ack_after` and `stream_inflight_budget_bytes`, and every settings section is pydantic `extra="ignore"` — so writing `source_ip_allowlist` under `[inbound]` in the service TOML is **accepted silently and does nothing**. (Verified: `InboundSettings.model_fields` is exactly those three; a loaded `[inbound].source_ip_allowlist` leaves no attribute behind, while a sibling `bind_host` survives.) `bind_address` is the same story — a per-connection keyword, not a `[inbound]` key. The reachable forms are `inbound("IB_…", DICOM(...), source_ip_allowlist=["10.20.0.0/16"])` and, for the transports available as data, the **top-level** `source_ip_allowlist` key in `connections.toml` (shown in the [`connections.toml` example](#connections-as-data--connectionstoml-adr-0007) above) — `DICOM()` is code-first only, so for a SCP it is the `inbound(...)` keyword. A non-loopback cleartext SCP is **refused at startup** unless `tls=true` (the generalized [cleartext] bind-guard — `check_dimse_tls_exposure`). `serve --allow-insecure-bind` downgrades that refusal to a warning, but the flag is **clamped** exactly as it is for the MLLP/HTTP/TCP listeners: on a PHI-classified instance under the default `[security].enforcement = enforce` the bind is refused *even with it*, so on a stock instance `tls=true` is the only way to bind off-loopback. (`host` / `called_ae_title` / `connect_timeout` on `DICOM()` are for the **Phase-2 outbound SCU** and are unused by the inbound SCP.)
 
-> **Fail-closed peer controls (deny-by-default, ADR 0025 §9).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set at least one peer control — `calling_ae_allowlist`, `[inbound].source_ip_allowlist`, or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **none** of the three set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
+> **Fail-closed peer controls (deny-by-default).** DICOM has no transport authentication on its own, so a **non-loopback** SCP **MUST** set a **verifiable** peer control — either a per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a `[inbound]` service-TOML key, see the ⚠️ above), or **mTLS** (`tls=true` **and** `tls_ca_file`, which makes the SCP require + verify a client cert). With **neither** set, a non-loopback SCP is **refused at construction** (the connection degrades per ADR 0031 startup fault isolation; surfaced under `check`/dry-run). This is the **authentication** analog of the `check_dimse_tls_exposure` cleartext bind-guard above (which is the orthogonal **confidentiality** guard): TLS-without-mTLS encrypts the channel but does **not** authenticate the peer. A **loopback** bind (`127.0.0.1`/`localhost`/`::1`, the common dev/single-box case) is exempt.
+>
+> ⚠️ **`calling_ae_allowlist` does not satisfy this gate on its own (BACKLOG #316).** It used to: the three controls were counted as co-equal. But a Calling AE Title is a string the caller asserts about **itself** in the association request — no key, no signature, nothing to verify — and AE Titles are published in conformance statements and visible in any capture. An SCP whose only control was an AE-title list was reachable by anyone who could route to it and knew one string, while passing a check named "fail-closed peer controls". **Keep it — it is still enforced at association time and is a genuinely useful filter** (it catches a misrouted sender and pins intent). It simply has to be **paired** with `source_ip_allowlist` or mTLS off-loopback.
+>
+> ⚠️ **The construction gate counts controls, so the wrong spelling passes it.** Set
+> `calling_ae_allowlist` (AE titles are attacker-chosen strings on an unauthenticated association —
+> trivially spoofable) plus a `[inbound].source_ip_allowlist` in `messagefoundry.toml` and the SCP
+> builds and runs happily, because the AE list alone satisfies the "at least one" test — while the
+> IP restriction you thought you configured was silently discarded at settings load. The engine's own
+> refusal message names the discarded spelling, so do not take it as the authoring surface. Pass it on
+> the `inbound(...)` call instead.
+>
+> **And there is no read-back to check yourself against on a code-first connection.**
+> `messagefoundry graph --json` prints the *connector spec's* settings (so `calling_ae_allowlist`
+> shows, `source_ip_allowlist` and `bind_address` do not), and `GET /connections/{name}/metadata`
+> renders the same spec view. `messagefoundry connection list --json` **does** echo
+> `source_ip_allowlist` — but only for connections authored in `connections.toml`, which `DICOM()` cannot
+> be. So on a SCP the `inbound(...)` call is both the only place to set it and the only place to
+> audit it: review the call, not a read-out.
 
 ```python
 from messagefoundry import DICOM, ContentType, Message, Send, handler, inbound, router
@@ -1222,8 +1635,12 @@ def handle(msg):
 ```
 
 A **hardened non-loopback** SCP (bound to an imaging VLAN) pairs DICOM-over-TLS for confidentiality with at
-least one peer control for authentication — here both an AE-title allowlist **and** mTLS (secrets are always
-`env()` references, never inline):
+least one peer control for authentication — here an AE-title allowlist, mTLS **and** the peer-IP gate
+(secrets are always `env()` references, never inline). Note where each control lives: the TLS/AE settings
+are `DICOM()` arguments, while **`bind_address` and `source_ip_allowlist` are `inbound(...)` keywords** —
+the whole point of the ⚠️ above. Without a `bind_address` (or a non-loopback `[inbound].bind_host` in
+`messagefoundry.toml`) this listener binds `127.0.0.1` and is not the non-loopback SCP the heading
+describes:
 
 ```python
 from messagefoundry import DICOM, ContentType, env, inbound
@@ -1236,7 +1653,9 @@ inbound("IB_RADIOLOGY_SR",
               tls_key_file=env("DICOM_TLS_KEY"),
               tls_key_password=env("DICOM_TLS_KEY_PASSWORD"),   # if the key is passphrase-encrypted
               tls_ca_file=env("DICOM_MTLS_CA")),                # mTLS: require + verify the peer's client cert
-        router="sr_router", content_type=ContentType.DICOM)
+        router="sr_router", content_type=ContentType.DICOM,
+        bind_address="10.20.4.7",                    # the imaging-VLAN NIC — an inbound() keyword
+        source_ip_allowlist=["10.20.0.0/16"])        # peer-IP gate — an inbound() keyword, NOT [inbound]
 ```
 
 The full worked route (with the outbound MLLP + `env()` wiring) ships at
@@ -1279,7 +1698,8 @@ behind the console's "Test Connection"). Egress is gated by `[egress].allowed_tc
 | `max_object_bytes` | `134217728` (128 MiB) | reject an over-cap object **before** dialing (permanent — no retry) |
 | `timeout_seconds` | `30.0` | ACSE/DIMSE/network timeout |
 | `connect_timeout` | `10.0` | association-request (TCP connect) timeout |
-| `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS** |
+| `tls` / `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `false` / — | **DICOM-over-TLS**: verify the peer's server cert (`tls_ca_file` pins the anchor); `tls_cert_file`/`tls_key_file` opt into **mTLS**. There is **no `tls_verify=false`** on this connector — chain and hostname are always verified. It also carries **no revocation gate** (unlike MLLP/REST/SOAP/FHIR/DICOMweb/EMAIL), so `tls=true` here is *not* refused on a stock instance — and a revoked PACS certificate is your PKI's problem, not the engine's |
+| `tls_allow_expired` | `false` | **(#129, ADR 0094)** tolerate an **expired** PACS certificate with chain + hostname still verified. Combined with the missing revocation gate above, this hop can be pinned to a certificate that is **both expired and revoked** with nothing refusing, warning at posture level, or reporting it — **no posture gate, no escape variable, and `security_loosenings()` never reports it** (see the [MLLP row](#mllp--mllp)) |
 | `tls_key_password` | `None` → unencrypted key | passphrase for a PKCS#8-encrypted mTLS-client `tls_key_file` (`env()`-sourced). Same fail-fast semantics as the inbound SCP (no/wrong passphrase raises at construction, never a TTY hang). |
 
 **Status → retry classification.** C-STORE **Success** (`0x0000`) / a **Warning** (`0xB0xx`, stored with a
@@ -1318,7 +1738,7 @@ handling. It needs **no `[dicom]` extra** (the object is opaque bytes).
 | `bearer_token` / `basic_user` / `basic_password` | — | OAuth bearer or HTTP Basic (put secrets in `env()`) |
 | `headers` | `{}` | static extra headers (no secrets — not `env()`-resolved) |
 | `timeout_seconds` | `30.0` | request timeout |
-| `verify_tls` | `true` | `false` (dev only) needs `MEFOR_ALLOW_INSECURE_TLS` |
+| `verify_tls` | `true` | TLS cert verification — the same posture-keyed cell as [REST](#rest--rest): `false` is **refused at construction** off loopback, and the `MEFOR_ALLOW_INSECURE_TLS` escape is **clamped inert** while `[security].enforcement = enforce` (the shipped default). **`DICOMweb()` has no `tls_allow_expired`** — it reuses the REST client but does not read that setting, so a DICOMweb hop always enforces certificate expiry |
 | `capture_response` | `false` | capture the STOW-RS `dicom+json` response as a reply (ADR 0013) |
 
 **Status classification.** A 2xx whose `dicom+json` body carries a per-instance **FailedSOPSequence**
@@ -1335,6 +1755,46 @@ outbound("OB_DICOMWEB", DICOMweb(url=env("DICOMWEB_BASE"), bearer_token=env("DIC
 @handler("stow_sr")
 def stow(msg):
     return Send("OB_DICOMWEB", msg.encode())   # STOW-RS the carried object bytes
+```
+
+### Timer — `Timer(...)` (clock-driven source, ADR 0011)
+
+An **inbound source that reads no external resource**: it *fires* on a clock and hands an
+operator-configured `body` to the pipeline — the shape behind a heartbeat, a nightly extract trigger, or a
+scheduled query a Handler fans out. **Source-only** (it generates, never delivers).
+
+| Setting | Default | Meaning |
+|---------|---------|---------|
+| `body` | — (required) | the payload emitted **verbatim** on every fire, pre-encoded once at construction so each fire is byte-identical (a re-run stays pure). Declare its format with `inbound(..., content_type=...)`: the default `hl7v2` runs the HL7 peek/validate path; `text`/`json` route a `RawMessage`. |
+| `interval_seconds` | — | fire every N seconds. The heartbeat **starts at t=0** (fires immediately on start, then every interval). Must be `> 0`. |
+| `run_once` | `false` | fire a **single** time, then idle until stop. |
+| `cron_expression` | — | a calendar schedule (ADR 0011 amendment, #160) — a standard **5-field** expression (`minute hour day-of-month month day-of-week`) with `*`, lists, ranges and steps; day-of-week is `0-6`, **Sunday = 0** (`7` also accepted). When *both* day-of-month and day-of-week are restricted, a match on **either** fires (the Vixie OR rule). Unlike the interval heartbeat, cron does **not** fire at t=0 — the first fire is the next scheduled minute. Named months/weekdays are out of scope (numeric only). |
+| `timezone` | — (system-local) | an IANA zone name (e.g. `"America/New_York"`) the cron schedule matches against, DST-aware. **Only** valid together with `cron_expression`. |
+| `encoding` | `utf-8` | charset `body` is encoded with |
+
+Exactly one of `interval_seconds` / `run_once` / `cron_expression`: the three are **mutually exclusive** and
+declaring none is an error, so a mis-scheduled timer fails at `messagefoundry check` — as does an
+unsatisfiable cron expression (e.g. `* * 30 2 *`, caught by a bounded horizon scan at parse) or an unknown
+`timezone`.
+
+- **Leader-gated.** The schedule is a *shared trigger*, so in a cluster **only the leader fires it** —
+  otherwise every node would emit the same message. A follower's loop still ticks, so a node that wins
+  leadership fires on its next tick with no restart; on a single node this is byte-identical to an ungated
+  loop.
+- **At-least-once on the *timing* boundary only.** The body is committed to the ingress stage and frozen
+  there, so downstream re-runs stay pure. A fire whose durable write fails (DB locked, disk full) is
+  **logged and retried on the next tick** — it never kills the source (that would silently stop intake
+  while still reporting `running`), and a `run_once` timer retries until it lands.
+- **Nothing to bind or probe.** A Timer takes no `bind_address`/`source_ip_allowlist`, and
+  `POST /connections/{name}/test` reports `supported=false`.
+
+```python
+from messagefoundry import ContentType, Timer, inbound
+
+# A weekday 08:00 trigger in a named zone; the Handler builds the real work from the fired body.
+inbound("TIMER-IN_NIGHTLY_EXTRACT",
+        Timer(body="EXTRACT", cron_expression="0 8 * * 1-5", timezone="America/New_York"),
+        router="extract_router", content_type=ContentType.TEXT)
 ```
 
 ### Loopback — `Loopback()` + `reingress_to=` (request → response → route, ADR 0013)
@@ -1369,6 +1829,46 @@ inbound("IB-LOOP_PAYER_ELIG", Loopback(), router="route_elig_result", content_ty
 outbound("MLLP-OUT_PAYER_ELIG", MLLP(host=env("payer_host"), port=2575, reingress_to="IB-LOOP_PAYER_ELIG"))
 # a Handler Sends the eligibility query to MLLP-OUT_PAYER_ELIG; its reply re-ingresses into IB-LOOP_PAYER_ELIG.
 ```
+
+### Pass-through — `PassThrough()` (internal 1:N re-ingress, ADR 0013 generalized)
+
+Another **inert internal inbound** — no socket, no poll. A Handler `Send`s its **transformed** message *into*
+a PT inbound (naming it like an outbound) and the engine re-ingresses that body as a **new, independent
+inbound message** on that channel, where the PT inbound's **own** Router decides where it goes next. This is
+the Corepoint `PT_*` pattern: one logical feed fans out across internal connectors and re-routes deeper
+without an external hop. `PassThrough()` takes **no settings** — a PT inbound carries only its `router` and
+`content_type`.
+
+- **Loopback vs. PassThrough.** `Loopback()` is the **1:1 reply** sibling: it is fed by a *capturing
+  outbound*'s `reingress_to=` and its body is the partner's captured answer. `PassThrough()` is the **1:N
+  internal routing** sibling: *any* Handler may target it and the body is the transformed message. Both share
+  the same atomic content-addressed re-ingress shape.
+- **Atomic, idempotent handoff.** The child ingress row is produced in the **same transaction** that consumes
+  the parent's routed row (`transform_handoff`), so a crash/re-run is a no-op, never a double-injection. The
+  handoff never crosses the source/listener seam — the connector deliberately **never invokes its handler**
+  (that would be the bare-`enqueue_ingress` double-injection trap; a unit test pins it).
+- **Loop-bounded.** A PT chain is bounded by `[pipeline].max_correlation_depth` (default 8) exactly like a
+  loopback reply chain: work past the cap dead-letters and the origin is marked `ERROR`.
+- **Like `Loopback()` otherwise.** No `ack_mode` (forced `NONE` — no external peer), no
+  `bind_address`/`source_ip_allowlist` (no socket), and no `strict` validation (no untrusted intake — the body
+  is engine-internal, already-stored state). A **store-backend gate** runs on every config-application path
+  (start, reload, `reload(dry_run=True)`): all three shipped backends (SQLite, Postgres, SQL Server) support
+  PT re-ingress, so it only ever rejects a graph on a backend that doesn't — before any swap or start.
+
+```python
+from messagefoundry import MLLP, PassThrough, Send, handler, inbound
+
+inbound("IB_PT_Entry", MLLP(port=2576), router="pt_entry_router")
+# The internal hop: no socket; fed only by the Send-into-PT handoff below, then re-routed by its own router.
+inbound("PT_Relay", PassThrough(), router="pt_relay_router")
+
+
+@handler("pt_entry_handler")
+def to_passthrough(msg):
+    return Send("PT_Relay", msg)     # → re-ingresses as a NEW message on PT_Relay
+```
+
+A runnable graph ships at [`harness/config/passthrough/graph.py`](../harness/config/passthrough/graph.py).
 
 ## Declaring a cleartext hop (`cleartext_accepted`)
 
@@ -1431,11 +1931,16 @@ to. On every other **outbound** transport (`MLLP()`, `Rest()`, `Soap()`, `FHIR()
 `DICOM()`, `Email()`, `Ftp()`, `FhirLookup()`) the declaration should be read as **naming work to be
 done**, and removed when the peer gains TLS. Adding TLS to raw TCP and X12 is tracked as BACKLOG #311.
 
-Two caveats on that list. `Http()` is an **inbound listener only** — it binds rather than dials, so it
-has no hop to declare; inbound binds are governed by `--allow-insecure-bind` and the four exposed-gates,
-not by this declaration (ADR 0153 decision 2 is Destination-only). And on `Ftp()` the declaration reaches
+Three caveats on that list. `Http()` is an **inbound listener only** — it binds rather than dials, so it
+has no hop to declare; inbound binds are governed by the four exposed-gates and
+`serve --allow-insecure-bind` (itself clamped inert on the shipped enforcing-PHI default), not by this
+declaration (ADR 0153 decision 2 is Destination-only). On `Ftp()` the declaration reaches
 the **anonymous** plain-ftp hop only: a *credentialed* plain-ftp connection is refused outright, because
-the credential itself would cross in the clear.
+the credential itself would cross in the clear. And **`Direct()` is deliberately absent from the list —
+the declaration does not reach it at all.** Its `use_tls=false` cell consults the raw
+`MEFOR_ALLOW_INSECURE_TLS` escape rather than this authority, so setting `cleartext_accepted` on a
+Direct outbound is accepted at load and then never consulted; see the
+[`Direct(...)` `use_tls` row](#direct-project--direct-smime-over-smtp-outbound-send-adr-0085).
 
 **It is never invisible.** A declared hop appears in `messagefoundry check` (a `cleartext-accepted` line
 listing the **whole** accepted set, so a broad rollout is obvious in review), in the connector's
@@ -1456,7 +1961,7 @@ window; `0` = keep this connection's bodies **forever**; `>0` = days.
 
 | Key | Dir | Type | Default | Meaning |
 |-----|-----|------|---------|---------|
-| `messages_days` | in | int | inherit `[retention].messages_days` | past N days, null this **inbound's** received message bodies (keyed on the receiving inbound), keeping the message row — its PHI columns, `metadata` included, are blanked. `0` = keep forever |
+| `messages_days` | in | int | inherit the global body window — set as **`[security].delete_message_bodies_after_days`** (`[retention].messages_days` moved there under ADR 0118 and is **rejected at config load**) | past N days, null this **inbound's** received message bodies (keyed on the receiving inbound), keeping the message row — its PHI columns, `metadata` included, are blanked. `0` = keep forever |
 | `dead_letter_days` | out | int | inherit `[retention].dead_letter_days` | past N days, null the bodies of **this outbound's** dead-lettered rows (keyed on the outbound that dead-lettered them). A dead row stays replayable until its body is purged. `0` = keep forever |
 
 ### Embedded-document pruning ([ADR 0042](adr/0042-embedded-document-pruning.md), #47)
@@ -1644,7 +2149,7 @@ running at the scale pooled unlocks:
 How the engine bounds connections, threads, and retries **per external service**, what happens **when
 a limit is reached**, and how each service's resources are released — the resource-management
 contract a reviewer needs. The two tables below cover **every** hop in the communications inventory
-([security/ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
+([ASVS-L2-PHASE0-CHANGES.md](ASVS-L2-PHASE0-CHANGES.md) §5): Table A is the
 13.1.2/13.2.6 concurrency axis, Table B the 13.1.3 resource-strategy axis. They carry the **same row
 set**, and `tests/test_communications_inventory.py` fails the build if they diverge or if a stated
 default drifts from the constant in the code.
@@ -1673,7 +2178,10 @@ Four facts that are easy to get wrong, stated plainly first:
   (**default 10**, `transports/dicom.py:165`), enforced inside pynetdicom, which **rejects the
   association** rather than accepting it and closing at the application layer. Its idle/response bound
   is `timeout_seconds` (**30 s**) applied to the ACSE/DIMSE/network timers, not `receive_timeout`. A
-  peer failing `[inbound].source_ip_allowlist` is refused with a DIMSE **not-authorized status on an
+  peer failing the per-connection `source_ip_allowlist` (an `inbound(...)` keyword — **not** a
+  `[inbound]` service-TOML key, which is accepted and discarded; see the [SCP peer-control
+  note](#dicom--dicom-inbound-c-store-scp--outbound-c-store-scuc-echo-and-dicomweb-stow-rs-adr-0025))
+  is refused with a DIMSE **not-authorized status on an
   already-established association** (`dicom.py:254-262`) and logged. `transports/dicom.py` has zero
   `_emit_event` call sites, so no ADR 0021 `connection_event` is written for either refusal.
 - **The DATABASE connector's pool acquire is bounded.** `acquire_timeout` (default 30 s, per
@@ -1895,43 +2403,57 @@ Legend: ✅ native · ~ partial / via extension / via another transport · ❌ n
 | **MLLP / LLP** (HL7 lower‑layer over TCP) | ✅ | ✅ | ✅ | ✅ | `IB`/`OB` shipped |
 | **Raw TCP** client/server (configurable framing) | ✅ | ✅ | ✅ | ✅ | `TCP-IN/OUT` shipped |
 | **File / Directory** (local) | ✅ | ✅ | ✅ | ✅ | `FILE-IN/OUT` shipped |
-| **FTP / FTPS** | ✅ | ✅ | ✅ | ❌ | File remote scheme, planned |
-| **SFTP** | ✅ | ✅ | ✅ | ❌ | `SFTP-IN/OUT` planned |
-| **SMB / network share** | ✅ | ✅ | ✅ | ❌ | File remote scheme, planned |
-| **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | File remote scheme, planned |
-| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ~ | `REST-OUT` shipped; `REST-IN` planned |
-| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped; `SOAP-IN` planned |
-| **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server, exp.); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
-| **SMTP** (email send) | ✅ | ✅ | ✅ | ❌ | `SMTP-OUT` planned |
+| **FTP / FTPS** | ✅ | ✅ | ✅ | ✅ | `FTP-IN/OUT` shipped — `Ftp()`, source + destination, stdlib `ftplib` (no extra); `tls=True` = FTPS with verifying TLS |
+| **SFTP** | ✅ | ✅ | ✅ | ✅ | `SFTP-IN/OUT` shipped — `Sftp()`, source + destination, `[sftp]` extra; host-key verification on by default |
+| **SMB / network share** | ✅ | ✅ | ✅ | ✅ | `File()` on a UNC path, with an optional **alternate Windows credential** (`credential_*`, ADR 0132) |
+| **S3 / cloud blob** | ✅ | ~ | ✅ | ❌ | not built — the one remaining remote-file scheme |
+| **HTTP/HTTPS** listener + sender (REST) | ✅ | ✅ | ✅ | ✅ | `REST-OUT` (`Rest()`) + `REST-IN` (`Http()`, ADR 0023) both shipped, incl. **intake authentication** on the listen socket (`intake_auth` — API key / bearer / mTLS subject, ADR 0154) |
+| **SOAP / Web Services** | ✅ | ✅ | ✅ | ~ | `SOAP-OUT` shipped incl. WS-\* mTLS/WS-Security (ADR 0015); a SOAP body is **received** via `Http()`, and the *synchronous* envelope reply shipped with ADR 0154 (`reply_from`). Still `~` for one reason: a partner **error** body is not relayed (`capture_error_responses`), so the reply path is correct only when the partner succeeds |
+| **Database** reader/writer | ✅ (JDBC) | ✅ | ✅ (JDBC) | ✅ (ODBC) | `DB-OUT` + `DB-IN` shipped (SQL Server preset, production — a live aioodbc round-trip runs in CI); `dialect='generic'` reaches any DB with an OS-installed ODBC driver. **No JDBC** — MF is pure Python, no JVM |
+| **SMTP** (email send) | ✅ | ✅ | ✅ | ✅ | `SMTP-OUT` shipped — `Email()`/`SMTP()` (ADR 0029); **plus** `Direct()`, Direct-Project S/MIME over SMTP (ADR 0085), which none of the three ships natively |
 | **Email reader** (POP3/IMAP) | ~ | ~ | ✅ | ❌ | `MAIL-IN` planned |
 | **JMS** (Java messaging) | ✅ | ❌ | ✅ | ❌ | `JMS-IN/OUT` planned |
 | **IBM MQ / MSMQ** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **Kafka / streaming** | ~ | ❌ | ✅ | ❌ | not on roadmap |
 | **DICOM** (imaging) | ✅ | ~ | ✅ | ✅ | `DICOM-IN` C-STORE SCP (Phase 1) + `DICOM-OUT` C-STORE SCU/C-ECHO + `DICOMWEB-OUT` STOW-RS all shipped (ADR 0025); DICOMweb send exceeds both incumbents |
 | **Serial (RS‑232)** + X/Y‑Modem/Kermit + **ASTM E1381/E1394/E1318** | ~ | ❌ | ✅ | ❌ | **declined-by-design (v0.2+)** — legacy/niche lab-instrument connectivity, no feed demand ([BACKLOG.md](BACKLOG.md) #27) |
-| **FHIR** endpoint/client | ✅ | ✅ | ✅ | ❌ | `FHIR-IN/OUT` planned |
-| **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — not a transport |
+| **FHIR** endpoint/client | ✅ | ✅ | ✅ | ~ | `FHIR-OUT` shipped (`FHIR()`, ADR 0022) + SMART Backend Services client auth (ADR 0024); the inbound **server facade** is deferred (BACKLOG #20) |
+| **Internal channel‑to‑channel** | ✅ | ✅ | ✅ | ✅ | the routing graph (wired by name) — plus two first-class internal inbounds: `Loopback()` (a captured reply) and `PassThrough()` (1:N internal re-ingress), ADR 0013 |
 | Printer / command‑line / screen‑scrape | ~ | ❌ | ✅ | ❌ | not on roadmap (niche) |
+
+Two shipped MessageFoundry transports have **no row above** because they have no clean incumbent to grade
+against: the **Timer** clock-driven source (`Timer()`, ADR 0011) and — folded into the SMTP row — the
+**Direct Project** S/MIME-over-SMTP destination (`Direct()`, ADR 0085).
 
 **Priority of the gaps we'll close:**
 
-- **Tier 1 — table stakes (all three have these):** raw TCP, HTTP/REST, SOAP, Database, SFTP, plus
-  File remote schemes (FTP/FTPS/SMB/S3). `SFTP-*`/`SOAP-*`/`REST-*`/`DB-*` are already designed; raw
-  TCP closes the MLLP‑only gap. **FHIR** belongs here too — all three now ship it.
-- **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and Email (SMTP send + POP3/IMAP read). **DICOM
-  is now full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus the `DICOM-OUT` C-STORE SCU/C-ECHO and the
-  `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the DICOMweb send path **exceeds** both incumbents.
+- **Tier 1 — table stakes (all three have these): now shipped, bar one.** Raw TCP, HTTP/REST (**both**
+  directions), `SOAP-OUT`, Database (`DB-IN` + `DB-OUT`), SFTP, FTP/FTPS, UNC/SMB, and the **FHIR** client
+  all ship — as does `SOAP-IN`'s *synchronous* envelope reply (ADR 0154 `reply_from`), bar the
+  partner-error relay noted in its row above. What is left on this tier: **S3 / cloud blob**, and the
+  `FHIR-IN` inbound facade (a consumer of the shipped `Http()` listener, not new substrate).
+- **Tier 2 — present in 2 of 3:** JMS (Mirth + Rhapsody) and the **Email reader** (POP3/IMAP) are the open
+  ones — SMTP *send* shipped (ADR 0029). **DICOM is full-lane** — the `DICOM-IN` C-STORE SCP (Phase 1) plus
+  the `DICOM-OUT` C-STORE SCU/C-ECHO and the `DICOMWEB-OUT` STOW-RS sender (Phase 2, ADR 0025) ship; the
+  DICOMweb send path **exceeds** both incumbents.
 - **Tier 3 — Rhapsody‑only, lower priority:** Kafka/streaming (worth adding for modern credibility),
   IBM MQ/MSMQ, Serial, printer/command‑line.
 
-Each new type needs a `ConnectorType` value, a `transports/` module, and a `wiring.py` factory.
+Each new type needs a `ConnectorType` value, a `transports/` module, a `register_source`/
+`register_destination` call (which is what makes it *built*), and a `wiring.py` factory.
 
 ### Per‑transport feature gaps (not just new types)
 
-- **MLLP:** TLS/SSL, custom start/end frame bytes, keep‑connection‑open/pooling, MLLP v2 (commit) ACK,
-  response‑on‑same‑connection, max buffer size.
-- **File:** cron/time‑of‑day polling (vs. fixed interval), file‑age sorting, batch (line‑per‑message)
-  splitting, remote schemes (FTP/SMB/S3) beyond local.
+- **MLLP — now shipped:** TLS/SSL (`tls`, WP-13b / ADR 0002), keep‑connection‑open/pooling (`persistent`,
+  ADR 0067), max buffer size (`max_frame_bytes`), and enhanced-mode commit ACK codes (CA/CE/CR via
+  `ack_mode="enhanced"`). **Still open:** custom start/end frame bytes on `MLLP()` itself (a non-standard
+  sentinel is `Tcp(framing=None, start=…, end=…)` today), MLLP **release-2 block framing**, and
+  response‑on‑same‑connection (the synchronous downstream reply, an ADR 0013 follow-on).
+- **File — now shipped:** file‑age sorting (`sort="mtime"`), Corepoint-style **batch splitting** (an
+  `MSH`/`FHS`/`BHS` batch file becomes N hand-offs), and the remote schemes — FTP/FTPS (`Ftp()`), SFTP
+  (`Sftp()`), UNC/SMB (`File()` on a UNC path). **Still open:** **S3 / cloud blob**, and a cron
+  *expression* on the File poll itself — a time-of-day / day-of-week **active window** is available per
+  connection via `schedule` (ADR 0095), and cron *firing* via `Timer(cron_expression=…)`.
 - **Monitor:** honor the `IBC`/`OBC` "waiting = healthy" convention in connection health.
 
 ## Standards & formats — parity & roadmap
@@ -1940,17 +2462,21 @@ Formats are **orthogonal to transports**: any format can ride any connector (an 
 C‑CDA over a file, a FHIR bundle over HTTP). This section is the **format/standard** parity story; the
 catalog above is the **transport** one.
 
-**Where MF stands today:** HL7 v2.x is the default, with **X12 EDI**, **FHIR**, and (Phase 1) **DICOM**
-modeled lanes now shipped. [`parsing/`](../messagefoundry/parsing/) is python‑hl7 (tolerant peek, hot
-path) + hl7apy (opt‑in strict) for v2, plus pure codecs for X12 (`parsing/x12`), FHIR (`parsing/fhir`),
-and DICOM headers/SR (`parsing/dicom`); there is still no C‑CDA, NCPDP, or HL7 v3 model in the engine.
-The competitors are format‑agnostic and cover the full clinical catalog.
+**Where MF stands today:** HL7 v2.x is the default, with **X12 EDI**, **FHIR**, **XML/SOAP**, and (Phase 1)
+**DICOM** modeled lanes now shipped. [`parsing/`](../messagefoundry/parsing/) is python‑hl7 (tolerant peek,
+hot path) + hl7apy (opt‑in strict) for v2, plus pure codecs for X12 (`parsing/x12` — tolerant peek/edit
+*and* opt‑in strict implementation‑guide validation via the `[x12]` extra), FHIR (`parsing/fhir`), XML/SOAP
+(`parsing/xml` — hardened‑lxml XPath read/set + XSD + XML‑DSig, the `[xml]` extra), and DICOM headers/SR
+(`parsing/dicom`); there is still no C‑CDA, NCPDP, or HL7 v3 **model** in the engine. The competitors are
+format‑agnostic and cover the full clinical catalog.
 
 A useful split, because it sets the cost:
 
-- **"Free in Python" text formats** — JSON, delimited/CSV, fixed‑width, and *generic* XML are handled
-  **in a Handler today** with the standard library (`json`, `csv`, `xml`/`lxml`); no engine change is
-  needed to read or emit them. They're a documentation + helper‑ergonomics item, not a build.
+- **"Free in Python" text formats** — JSON, delimited/CSV, and fixed‑width are handled **in a Handler
+  today** with the standard library (`json`, `csv`) — `RawMessage` even exposes `.json()` and a
+  DTD‑rejecting `.xml()` accessor — so no engine change is needed to read or emit them. They're a
+  documentation + helper‑ergonomics item, not a build. (*Generic* XML has since graduated to a real
+  modeled lane, `parsing/xml` — see the table.)
 - **"Modeled standards"** — CDA/C‑CDA, FHIR, X12/EDI, NCPDP, DICOM, and HL7 v3 each need a real
   **parse + model + validate lane** parallel to the v2 lane (a document/resource model, a field/path
   façade so transforms stay code‑first, and a standard‑specific validator). Each is its own workstream.
@@ -1960,13 +2486,13 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 | Format / standard | Mirth | Corepoint | Rhapsody | MF today | MF plan |
 |-------------------|:-----:|:---------:|:--------:|:--------:|---------|
 | **HL7 v2.x** | ✅ | ✅ | ✅ | ✅ | shipped (python‑hl7 + hl7apy) |
-| **JSON** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
-| **Delimited / CSV / fixed‑width** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
-| **Generic XML** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now; ship helper |
+| **JSON** | ✅ | ✅ | ✅ | ✅ | `content_type="json"` + `RawMessage.json()`; transforms are stdlib `json` in a Handler |
+| **Delimited / CSV / fixed‑width** | ✅ | ✅ | ✅ | ~ | scriptable in Handler now (stdlib `csv`); ship helper |
+| **Generic XML** | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/xml` (`[xml]` extra): hardened‑lxml `XmlMessage` XPath read/set + XSD strict tier + XML‑DSig, plus the DTD‑rejecting core `RawMessage.xml()` (BACKLOG #31) |
 | **Raw / binary pass‑through** | ✅ | ✅ | ✅ | ✅ | stored/routed as opaque bytes today |
-| **FHIR** (R4/R5, JSON + XML) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 1** |
-| **C‑CDA / CDA / CCD** (HL7 v3 XML doc) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 1** |
-| **X12 / EDI** (270/271, 834, 835, 837…) | ✅ | ✅ | ✅ | ❌ | modeled lane — **Tier 2** |
+| **FHIR** (R4/R5, JSON + XML) | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/fhir` (`[fhir]` extra): `FhirPeek` routing tier + validated `FhirResource` (R4B default / R5 / STU3) + FHIRPath, ADR 0022. **JSON only** — FHIR‑XML is deferred to the hardened‑lxml path |
+| **C‑CDA / CDA / CCD** (HL7 v3 XML doc) | ✅ | ✅ | ✅ | ❌ | no CDA **model** — modeled lane, **Tier 1** (the shipped XML lane is the substrate it would build on) |
+| **X12 / EDI** (270/271, 834, 835, 837…) | ✅ | ✅ | ✅ | ✅ | shipped — `parsing/x12`: dependency‑free tolerant `X12Peek`/`X12Message` (ADR 0012) + opt‑in **strict implementation‑guide** validation over pyx12's HIPAA maps (`[x12]` extra, #32), whose walk also emits a conforming 999/997. No *automatic* TA1/997/999 generation on the wire |
 | **NCPDP** (SCRIPT, Telecom) | ✅ | ~ | ✅ | ❌ | modeled lane — **Tier 2** |
 | **DICOM** object / SR | ✅ | ~ | ✅ | ~ | headers/SR codec shipped (`parsing/dicom`, ADR 0025 Phase 1, pairs w/ `DICOM-IN`); no pixel data |
 | **HL7 v3 messaging** (non‑CDA XML) | ✅ | ✅ | ~ | ❌ | modeled lane — **Tier 3** (low demand) |
@@ -1974,25 +2500,30 @@ Legend: ✅ native · ~ partial / via generic XML/JSON · ❌ none.
 
 **Roadmap priority (modeled standards):**
 
-- **Tier 1 — FHIR and C‑CDA.** The two formats every modern RFP asks for; both are the highest‑value
-  gaps after the connector catalog. FHIR also pairs with the planned `FHIR-*` and `REST-*` transports;
-  C‑CDA most often arrives base64‑embedded in a v2 `MDM^T02`/`ORU` `OBX-5` (which MF already carries as
-  bytes — the lane adds *understanding* it). See the CCD phasing note below.
-- **Tier 2 — X12/EDI and NCPDP.** Eligibility/claims (X12) and pharmacy (NCPDP); needed for payer and
-  e‑prescribing integrations, lower frequency than FHIR/CDA in a pure clinical shop.
+- **Tier 1 — FHIR (shipped) and C‑CDA (open).** The two formats every modern RFP asks for. **FHIR
+  shipped** (ADR 0022) and pairs with the shipped `FHIR-OUT` / `REST-*` transports. **C‑CDA is the open
+  one:** it most often arrives base64‑embedded in a v2 `MDM^T02`/`ORU` `OBX-5` (which MF already carries as
+  bytes — the lane adds *understanding* it), and the shipped `[xml]` lane is the substrate step 2 below
+  now builds on. See the CCD phasing note.
+- **Tier 2 — X12/EDI (shipped) and NCPDP (open).** Eligibility/claims **X12 shipped** — tolerant codec
+  (ADR 0012) plus strict IG validation (#32); pharmacy **NCPDP** is still open, needed for e‑prescribing
+  and lower frequency than FHIR/CDA in a pure clinical shop.
 - **Tier 3 — DICOM object/SR and HL7 v3 messaging.** DICOM (headers/SR, no pixel data) is **shipped
   (ADR 0025 Phase 1)** and pairs with the `DICOM-IN` C-STORE SCP transport; v3 messaging (as distinct
   from CDA) sees little real‑world demand.
 
 **C‑CDA phasing (representative of how a modeled lane lands):**
 1. *Pass‑through (today):* route/store a CCD as opaque bytes — as a file, or base64 in v2 `OBX-5`.
-2. *Read‑only lane:* an XML model + XPath façade + Schematron/XSD validation + an `OBX-5` base64
-   extract — enough to route on and validate.
+2. *Read‑only lane:* an XML model + XPath façade + XSD validation + an `OBX-5` base64 extract — enough
+   to route on and validate. The generic half of this **shipped** with `parsing/xml` (#31); what a CDA
+   lane still adds is the document/section model and its conformance profile.
 3. *Transform:* v2 ↔ C‑CDA helpers (the high‑value, high‑effort part).
 
-**Dependency note.** A modeled lane means a new parser/validator dependency. The DICOM lane ships under
-the `[dicom]` optional extra — `pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4` (pure‑Python, no numpy). Still
-to be *evaluated*, not yet chosen for the unbuilt lanes: `lxml` for XML/CDA and an NCPDP parser. Per the
+**Dependency note.** A modeled lane means a new parser/validator dependency. The shipped lanes each ride an
+optional extra — `[dicom]` (`pydicom>=3.0.2,<4` + `pynetdicom>=3.0.4,<4`, pure‑Python, no numpy), `[fhir]`
+(`fhir.resources` + `fhirpathpy`), `[x12]` (`pyx12`), and `[xml]` (`lxml` + `xmlschema` + `signxml`) — all
+lazily imported, so an install that never touches a lane pays nothing. Still to be *evaluated*, not yet
+chosen: an **NCPDP** parser (the XML/CDA question is settled — `lxml` is in tree under `[xml]`). Per the
 project guardrails, each must be **verified as real and reputable, added to `pyproject.toml`, and
 re‑locked** before use — no ad‑hoc installs. Each modeled lane is a substantial architectural addition,
 so it follows the **plan‑first** rule (a written plan before code).

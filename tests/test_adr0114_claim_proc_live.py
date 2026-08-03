@@ -65,7 +65,7 @@ async def _open(**flag_overrides: Any) -> SqlServerStore:
 async def _clean(store: SqlServerStore) -> None:
     # The canonical live-suite cleanup order (test_claim_fifo_heads._open_sqlserver): children
     # before messages (response FKs it), so no 547 on a shared live DB.
-    for table in ("message_events", "queue", "response", "delivered_keys", "outbox", "messages"):
+    for table in ("message_events", "queue", "response", "delivered_keys", "messages"):
         await store._execute(f"DELETE FROM {table}")  # noqa: S608 - test cleanup, fixed names
 
 
@@ -87,6 +87,33 @@ async def test_open_deploys_procs_and_gate_passes(proc_store: SqlServerStore) ->
             "SELECT OBJECT_DEFINITION(OBJECT_ID(?)) AS body", (f"dbo.{proc}",)
         )
         assert row is not None and row["body"], f"dbo.{proc} not deployed"
+
+
+async def test_a_deployed_proc_can_return_a_null_definition(proc_store: SqlServerStore) -> None:
+    """The premise the gate's missing-vs-unreadable split rests on, and the one thing no offline
+    stub can show: on a real engine ``OBJECT_ID`` and ``OBJECT_DEFINITION`` genuinely disagree — a
+    procedure can be DEPLOYED and its definition still come back NULL.
+
+    Before the gate probed the id it read that NULL as "the proc is missing" and sent the operator
+    to grant ``CREATE PROCEDURE`` — neither the cause nor the cure.
+
+    ``WITH ENCRYPTION`` is used because it needs no security principal, so this leg creates no login
+    or user and impersonates nobody; it drops its own proc. The OTHER cause the reason string names
+    — a principal with ``EXECUTE`` but no ``VIEW DEFINITION`` — produces the byte-identical NULL and
+    is deferred with AC-10's other permission scenarios to a purpose-configured server.
+    """
+    name = "mefor_gate_null_definition_probe"
+    await proc_store._execute(f"CREATE PROCEDURE dbo.{name} WITH ENCRYPTION AS SELECT 1;")  # noqa: S608
+    try:
+        probe = await proc_store._fetchone(
+            "SELECT OBJECT_ID(?) AS oid, OBJECT_DEFINITION(OBJECT_ID(?)) AS body",
+            (f"dbo.{name}", f"dbo.{name}"),
+        )
+        assert probe is not None
+        assert probe["oid"] is not None, "the proc is deployed — this is the PRESENT half"
+        assert probe["body"] is None, "and its definition is unreadable — the NULL half"
+    finally:
+        await proc_store._execute(f"DROP PROCEDURE IF EXISTS dbo.{name};")  # noqa: S608
 
 
 async def test_ac8_trancount_on_exit_equals_entry(proc_store: SqlServerStore) -> None:
@@ -137,6 +164,15 @@ async def test_live_differential_proc_vs_batch(proc_store: SqlServerStore) -> No
 async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) -> None:
     # Hand-edit one proc body out-of-band, then re-open: the gate must degrade loudly (the
     # OBJECT_DEFINITION hash mismatch), and the tampered store must still claim on the batch.
+    #
+    # POSITIVE CONTROL FIRST — this is not optional. Until the head-form fix landed, the gate
+    # rejected EVERY body on every server, so this test's degrade assertions were satisfied by a
+    # gate that had never matched anything: it passed while proving nothing. Pinning "the gate is
+    # green on the untampered proc" in the same test is what makes the degrade below evidence.
+    assert proc_store.claim_proc_effective is True, (
+        "positive control: the gate must ACCEPT the correctly deployed proc, else the tamper"
+        " assertions below are vacuous"
+    )
     await proc_store._execute(
         f"ALTER PROCEDURE dbo.{ss._CLAIM_PROC_CID} @now FLOAT, @stage NVARCHAR(16), @k INT,"
         " @pending NVARCHAR(32), @inflight NVARCHAR(32), @lanes NVARCHAR(MAX),"
@@ -148,7 +184,7 @@ async def test_ac7_tampered_body_degrades_next_open(proc_store: SqlServerStore) 
         try:
             assert tampered.claim_proc_effective is False
             assert tampered.claim_proc_degraded_reason is not None
-            assert "does not match the shipped definition" in tampered.claim_proc_degraded_reason
+            assert "matches no form this build deploys" in tampered.claim_proc_degraded_reason
             # Still claims (batch path — never a lane outage).
             result = await tampered.claim_fifo_heads(Stage.INGRESS.value, ["IB_NONE"])
             assert result.by_lane == {}

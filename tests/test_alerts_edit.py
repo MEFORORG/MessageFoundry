@@ -194,6 +194,20 @@ def test_add_writes_and_round_trips_newly_whitelisted_fields(
     # the writer silently dropped them. Now they must survive a GUI save round-trip through the real
     # engine load path (proving they are no longer stripped before the validate callback runs).
     svc = _svc(tmp_path)
+    # The escalation tier below routes to `email`, and `alert add` now cross-checks a rule's routing
+    # against the transports this instance actually configures (a rule naming an unconfigured transport
+    # refuses the engine at startup, so writing one from the editor is refused here rather than at the
+    # next boot). Seed a real email transport — all THREE of host/from/to — so this test keeps testing
+    # what it is for: that mute/content_label/escalate/schedule survive the save round-trip.
+    svc.write_text(
+        textwrap.dedent("""\
+            [alerts]
+            email_smtp_host = "smtp.example.org"
+            email_from = "alerts@example.org"
+            email_to = ["oncall@example.org"]
+            """),
+        encoding="utf-8",
+    )
     rule = {
         "event_type": "content_match",
         "mute": True,
@@ -215,3 +229,45 @@ def test_add_writes_and_round_trips_newly_whitelisted_fields(
     assert r.content_label == "sepsis"
     assert len(r.escalate) == 1 and r.escalate[0].after_count == 3
     assert r.schedule is not None and len(r.schedule.windows) == 1
+
+
+def test_add_refuses_a_rule_routing_to_an_unconfigured_transport(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The editor must not write a rule that only fails at the NEXT start.
+
+    `notifier_from_settings` refuses a rule routing to an unconfigured transport, but that fires at
+    startup. Before this gate the VS Code "New Alert" command (and `alert add`) happily persisted such
+    a rule, so the operator learned about it when the engine would not come back up. A half-configured
+    [alerts] block is the likely shape: `email` needs host + from + TO, and omitting `email_to` leaves
+    it looking configured while contributing no transport.
+    """
+    svc = _svc(tmp_path)
+    svc.write_text(
+        textwrap.dedent("""\
+            [alerts]
+            email_smtp_host = "smtp.example.org"
+            email_from = "alerts@example.org"
+            """),
+        encoding="utf-8",
+    )
+    rc, out = _add(svc, {"event_type": "connection_stopped", "transports": ["email"]}, capsys)
+    assert rc == 1
+    assert "unconfigured transport(s) ['email']" in out
+    # Rolled back: the refused rule was never persisted.
+    assert load_settings(config_path=svc).alerts.rules == []
+
+
+def test_add_allows_a_rule_that_names_no_transport(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The gate is scoped to rules that ROUTE somewhere.
+
+    A rule naming no transport inherits whatever is configured and is valid on an instance with none,
+    so the ordinary "write the rules first, wire the transport later" flow keeps working — and the
+    from-scratch create path (no settings file yet) must not need one either.
+    """
+    svc = _svc(tmp_path)
+    rc, _ = _add(svc, {"event_type": "connection_stopped", "severity": "critical"}, capsys)
+    assert rc == 0
+    assert len(load_settings(config_path=svc).alerts.rules) == 1

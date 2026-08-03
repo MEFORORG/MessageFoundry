@@ -75,7 +75,20 @@ from typing import Any
 #: so an older console simply ignores it; bumped rather than corrected in place because v14 SHIPPED
 #: (v0.3.2). Under "one shipped posture, loosen only" a subset that reads as the whole posture is the
 #: failure this field exists to prevent, so the console must be able to render the caveat.
-ENGINE_UI_SEAM: int = 15
+#: seam v16: SystemStatus gained the additive `claim_proc` — ADR 0114 AC-7's degraded gauge (whether the
+#: SQL Server stored-procedure claim path passed its startup gate, and the reason string when it did
+#: not), which the status page's store panel renders. Additive with a default and `None` on every
+#: backend without the lever, so an older console simply ignores it; a separate seam rather than a
+#: correction to v15 because v15 is a SecurityPosture change and folding an unrelated DTO into it would
+#: make that note describe a field set it does not cover.
+#: v17 (ASVS 3.7.3): the external-navigation interstitial policy — `organization_domains`,
+#: `external_link_interstitial`, `external_link_allowlist` and `oidc_authorization_host`. Passed as
+#: CONFIG for the same reason `oidc_enabled` is: `create_managed_app` attaches the AuthService inside
+#: the lifespan, long after `mount_ui` has fixed the route table, so a registrar reading it off
+#: `app.state.auth` would register nothing in production while passing every test that constructs the
+#: app with `auth=` directly. Additive with defaults, and the defaults are the STRICT position — an
+#: older or partial caller gets the interstitial on every absolute destination, never none.
+ENGINE_UI_SEAM: int = 17
 
 
 @dataclass(frozen=True, slots=True)
@@ -205,3 +218,17 @@ class UiDeps:
     #: table. A registrar that gated on ``app.state.auth`` would therefore register nothing in
     #: production while passing every test that constructs the app with ``auth=`` directly.
     oidc_enabled: bool = False
+    #: ASVS 3.7.3 (seam v17). Domains that count as INSIDE the organization — the interstitial is
+    #: shown for anything else. Matched on a LABEL boundary by ``messagefoundry_webconsole._external``.
+    #: EMPTY is the STRICT position, not the lax one: every absolute http(s) destination is external.
+    organization_domains: tuple[str, ...] = ()
+    #: Whether to interpose the "you are leaving this site" page at all. On by default; off is a
+    #: posture decision and the serve gate says so.
+    external_link_interstitial: bool = True
+    #: ⚠️ The audited escape — destinations navigated to with NO notification and NO cancel, which is
+    #: exactly what 3.7.3 asks for. Non-empty produces a startup warning naming every entry.
+    external_link_allowlist: tuple[str, ...] = ()
+    #: Host of the configured IdP authorization endpoint, for DISPLAY on the interstitial. Derived
+    #: from settings, never from request input — if the destination came from the request the
+    #: interstitial would itself be an open redirect, which is worse than having no interstitial.
+    oidc_authorization_host: str = ""

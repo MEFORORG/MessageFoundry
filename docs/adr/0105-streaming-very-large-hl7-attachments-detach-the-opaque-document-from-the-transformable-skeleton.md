@@ -526,7 +526,7 @@ permission), and **API + web console only** (the PySide6 desktop console is depr
       runbook-silent). **Disposition (unchanged in substance):** the `_attachment_filename` /
       `_safe_attachment_content_type` controls remain **EFFECTIVE independent of the detach threshold** —
       evaluated per-download over the stored content-address + `content_type`. The runbook gap is now
-      closed: [`OFF-LOOPBACK-DEPLOYMENT.md`](../security/OFF-LOOPBACK-DEPLOYMENT.md) §"Served-attachment
+      closed: `OFF-LOOPBACK-DEPLOYMENT.md` §"Served-attachment
       filename + Content-Type safety on the streaming-detach path" instructs `stream_threshold_bytes` on
       the HL7 inbound, so a Posture-B operator who streams very-large documents exercises the download
       surface → **5.4.1 / 5.4.2 Pass-B**. **Posture A stays Partial (dormant)**: the threshold is **not**

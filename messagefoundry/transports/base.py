@@ -18,6 +18,7 @@ import abc
 import asyncio
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import ClassVar, Protocol
 
 from messagefoundry.config.models import ConnectorType, ContentType, Destination, Source
@@ -33,6 +34,11 @@ from messagefoundry.netaddr import peer_ip_allowed
 __all__ = [
     "InboundHandler",
     "ConnectionEventSink",
+    "IntakeAuditSink",
+    "IntakeRateLimiter",
+    "InboundReply",
+    "ReplyOutcome",
+    "SyncReplyResolver",
     "ProcessedFileLedger",
     "DeliveryError",
     "NegativeAckError",
@@ -60,6 +66,129 @@ InboundHandler = Callable[[bytes], Awaitable[str | None]]
 # default) makes every emit site a no-op (byte-identical when off). Metadata only — never a raw frame
 # or message body; the source passes a ``safe_exc``-scrubbed reason and the store scrubs again (#120).
 ConnectionEventSink = Callable[[str, str | None, str | None], Awaitable[None]]
+
+# A source reports an intake-authentication refusal to this OPTIONAL, store-agnostic sink (ADR 0154
+# D6): ``(action, client, detail)``. The runner injects an adapter that writes a tamper-evident
+# ``audit_log`` row binding the connection; the source knows only the wire-level facts.
+#
+# Why this exists alongside :data:`ConnectionEventSink`, which already carries the same refusal:
+# ``connection_event`` is operator-disableable diagnostics, while ``audit_log`` is a hash chain an
+# operator cannot silently switch off — and an authentication refusal on a PHI intake socket belongs
+# in the record that survives someone turning diagnostics off.
+#
+# **No credential material ever crosses this seam** — not the value, not a prefix, not its length.
+# ``detail`` carries the mode and the outcome only.
+IntakeAuditSink = Callable[[str, str | None, str | None], Awaitable[None]]
+
+
+class IntakeRateLimiter(Protocol):
+    """The failed-attempt budget an intake-authenticating source consults (ADR 0154 D6).
+
+    Injected by the runner as a **synchronous** predicate so ``transports/`` gains no ``auth/`` edge,
+    and synchronous is honest: the underlying sliding window completes without awaiting, so it is
+    atomic on the event loop.
+
+    The three methods exist separately because the budget is charged on **failure only**. Consulting
+    and charging in one call — which is what the shipped ``allow()`` does — would turn a
+    brute-force bound into a per-peer throughput cap, silently refusing an authenticated partner's
+    traffic pre-ingress, where it is not even counted.
+    """
+
+    def check(self, peer: str) -> bool:
+        """Whether ``peer`` may make another attempt. **Read-only** — never records one."""
+        ...
+
+    def charge_failure(self, peer: str) -> None:
+        """Record one FAILED attempt against ``peer``. Called only on the refusal branch."""
+        ...
+
+    def note_success(self, peer: str) -> None:
+        """Record that ``peer`` authenticated successfully within the current window.
+
+        This is what keeps the global arm from denying a legitimate partner (AC-19): a global
+        failed-attempt budget refuses irrespective of key, so without this an attacker generating
+        refusals from any address would exhaust the shared budget and lock out a peer that is
+        authenticating correctly.
+        """
+        ...
+
+
+class ReplyOutcome(str, Enum):  # noqa: UP042 - matches MessageStatus/OutboxStatus house style
+    """How a synchronous-reply wait ended (ADR 0154 D5). One member per row of the outcome table.
+
+    ``degraded`` is deliberately **not** folded into ``timeout``. The SLO series an operator pages on
+    is ``rate(timeout)/rate(total)`` — the proxy API's error budget — so counting our own store
+    errors or a rendezvous refusal as partner timeouts would silently corrupt the one number that is
+    supposed to mean "the partner is not answering".
+    """
+
+    REPLY = "reply"  # the partner replied and we return it verbatim
+    EMPTY = "empty"  # a successful round-trip with a deliberately empty payload
+    REJECTED = "rejected"  # the partner replied negatively; the reply is still returned
+    FAILED = "failed"  # the delivery row went dead/cancelled — no reply exists
+    PURGED = "purged"  # the row exists but retention has already nulled the body
+    NO_ROUTE = "no_route"  # nothing routed to the awaited destination
+    TIMEOUT = "timeout"  # reply_timeout expired with the message still flowing
+    DEGRADED = "degraded"  # OUR fault: a store read raised, or the rendezvous was full
+    SHUTTING_DOWN = "shutting_down"  # the listener stopped mid-wait
+
+
+@dataclass(frozen=True)
+class InboundReply:
+    """The result of one synchronous-reply wait, handed to the listener by the injected resolver.
+
+    **``body`` is PHI**, and the rule around it is structural rather than a redaction promise:
+    reply-derived bytes are never passed to an exception, a log call, a ``connection_event.reason`` or
+    a ``message_events.detail``. The listener may report only :attr:`outcome`, :attr:`destination`,
+    :attr:`response_seq` and :attr:`waited_ms`. That is deliberately stronger than routing it through
+    ``safe_text``, because ``safe_text`` is an **HL7-shaped** redactor — segment runs, ``| ^ ~ &``
+    density, date and capitalised-name runs — while this payload class is JSON/SOAP-XML/FHIR. A
+    Salesforce error body is only *partially* scrubbed by it, so identifiers such as an MRN in a JSON
+    field pass straight through. Partial redaction is not a PHI control.
+
+    :meth:`__repr__` is overridden to omit the body for the same reason: a frozen dataclass's default
+    repr would otherwise put the partner's reply into any log line, traceback or assertion message
+    that happens to interpolate the object — which is exactly the accident the structural rule
+    exists to prevent, and the kind that survives review because nothing looks wrong at the call site.
+
+    ``body`` is ``str`` rather than ``bytes`` deliberately. Every capture path already decodes with
+    ``errors="replace"`` before the store (``rest.py``, ``fhir.py``, ``soap.py``), ``DeliveryResponse.body``
+    is ``str``, and the ``response.body`` column is encrypted TEXT — so non-UTF-8 fidelity is destroyed
+    at capture and a ``bytes`` type here would be false precision, promising a faithfulness the
+    pipeline cannot deliver.
+    """
+
+    outcome: ReplyOutcome
+    #: The partner's reply text. Populated only for ``reply`` and ``rejected``; ``None`` otherwise.
+    body: str | None = None
+    #: The captured ``content-type`` when the inbound echoes it (``reply_content_type="passthrough"``).
+    content_type: str | None = None
+    #: The awaited outbound connection name — non-PHI, safe to log.
+    destination: str | None = None
+    #: ``response_seq`` of the row returned — non-PHI, safe to log.
+    response_seq: int | None = None
+    #: How long the turn blocked, in milliseconds — non-PHI, safe to log.
+    waited_ms: int = 0
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial, but load-bearing for PHI
+        return (
+            f"InboundReply(outcome={self.outcome.value!r}, destination={self.destination!r}, "
+            f"response_seq={self.response_seq!r}, waited_ms={self.waited_ms!r}, "
+            f"body=<{0 if self.body is None else len(self.body)} chars redacted>)"
+        )
+
+
+#: Resolve the synchronous reply for an **already-committed** message (ADR 0154 D2/D3).
+#:
+#: The single argument is the ``message_id`` that ``enqueue_ingress`` returned, and that is how
+#: ACK-on-receipt is enforced **structurally** rather than by convention: the id does not exist until
+#: the body is durably committed to the ingress stage, so the listener cannot begin waiting before the
+#: commit even if it wanted to. There is no shape of this call that observes an uncommitted message.
+#:
+#: Runner-owned, injected after build like every other seam here, so ``transports/`` keeps its
+#: CI-enforced freedom from ``store/`` and ``pipeline/`` imports (AC-17) while still returning bytes
+#: that came out of the store.
+SyncReplyResolver = Callable[[str], Awaitable[InboundReply]]
 
 
 class ProcessedFileLedger(Protocol):
@@ -254,6 +383,37 @@ class SourceConnector(abc.ABC):
     #: falls back to an in-process set. Same runtime-injection shape as :attr:`on_connection_event`;
     #: ``transports/`` stays store-agnostic.
     processed_ledger: ProcessedFileLedger | None = None
+
+    #: Optional intake-authentication audit sink (ADR 0154 D6), **injected by the runner after build**
+    #: — same runtime-injection shape as :attr:`on_connection_event`, and for the same reason: it keeps
+    #: ``transports/`` free of any ``store`` import while still letting a refusal reach the
+    #: tamper-evident ``audit_log``. ``None`` (the default) makes the emit site a no-op, so a direct
+    #: caller or test that never sets it is byte-identical.
+    on_intake_audit: IntakeAuditSink | None = None
+
+    #: Optional intake-auth failed-attempt budget (ADR 0154 D6), **injected by the runner after build**.
+    #: A synchronous predicate, so ``transports/`` gains no ``auth/`` edge. ``None`` (the default)
+    #: disables rate limiting entirely — a direct caller or test is byte-identical, and an operator who
+    #: sets ``intake_auth_rate_limit=None`` gets the same.
+    intake_rate_limiter: IntakeRateLimiter | None = None
+
+    #: Optional synchronous-reply resolver (ADR 0154 D2), **injected by the runner after build** —
+    #: the sixth attribute on this seam, not the "fourth" the ADR calls it (``on_connection_event``,
+    #: ``content_type``, ``processed_ledger``, ``on_intake_audit`` and ``intake_rate_limiter``
+    #: precede it). ``None`` (the default) means this inbound declares no ``reply_from``, so the
+    #: shipped ``202`` path is byte-identical — which is what AC-8 pins.
+    #:
+    #: This is the seam that lets the listener return bytes that came out of the store while
+    #: ``transports/`` keeps importing neither ``store/`` nor ``pipeline/`` (AC-17, CI-enforced).
+    sync_reply: SyncReplyResolver | None = None
+
+    #: Optional drain hook for blocked synchronous-reply turns (ADR 0154 D5), **injected by the
+    #: runner after build**. ``stop()`` calls it **before** closing client writers, so a blocked turn
+    #: can still answer ``503`` + ``Retry-After`` through a live socket — a write issued after
+    #: ``close()`` is typically discarded with no exception at all, so the answer would simply
+    #: vanish. A plain callable rather than the rendezvous object, so ``transports/`` gains no
+    #: ``pipeline/`` import (AC-17). ``None`` on every inbound without ``reply_from``.
+    reply_drain: Callable[[str], None] | None = None
 
     @abc.abstractmethod
     async def start(

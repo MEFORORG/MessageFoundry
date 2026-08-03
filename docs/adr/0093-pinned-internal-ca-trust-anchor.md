@@ -5,7 +5,7 @@
 - **Extends:** [ADR 0083](0083-mtls-client-certificate-identity.md) (mTLS identity),
   [ADR 0092](0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) (posture-keyed
   hop refusal), [ADR 0080](0080-offbox-forwarding-tls-defaults.md) (the `forward_tls_ca_file`
-  pinned-anchor template), [ADR 0018](0018-detached-jws-message-signing.md) (detached JWS)
+  pinned-anchor template), [ADR 0018](0018-per-message-signatures-accepted-risk.md) (detached JWS)
 
 ## Context
 

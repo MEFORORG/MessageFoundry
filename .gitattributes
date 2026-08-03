@@ -3,6 +3,13 @@
 uv.lock text eol=lf
 requirements.lock text eol=lf
 docker/locks/*.lock text eol=lf
+# constraints.lock was MISSING here (`git check-attr text -- constraints.lock` -> unspecified), so under
+# core.autocrlf=true it checks out CRLF — precisely the drift this stanza exists to prevent. Harmless so
+# far only because git's clean filter normalizes before `git diff`, which is also why export sync must be
+# verified with `git diff` and never a raw `diff` (the latter reports a phantom whole-file difference).
+constraints.lock text eol=lf
+# The PEP 735 CI-toolchain exports (ADR 0034 §3) — same DEP-1 diff gate, same LF requirement.
+ci/locks/*.lock text eol=lf
 .mefor-hooks/** text eol=lf
 # Shell scripts are executed on the Linux CI runners; force LF so a contributor's
 # core.autocrlf=true can never commit CRLF (which breaks `#!/usr/bin/env bash\r`).

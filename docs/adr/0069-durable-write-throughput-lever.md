@@ -9,7 +9,7 @@
 
 **Status:** Proposed (2026-07-03)
 **Deciders:** throughput working group
-**Related:** ADR 0066 (pooled stage claimers), ADR 0055 (group-commit / durable-write), ADR 0001 (staged pipeline), ADR 0037 / ADR 0063 (sharding on a unified store), ADR 0053 (free-threading); [`docs/throughput-roadmap.md`](../throughput-roadmap.md), [`docs/throughput-build-plan.md`](../throughput-build-plan.md)
+**Related:** ADR 0066 (pooled stage claimers), ADR 0055 (group-commit / durable-write), ADR 0001 (staged pipeline), ADR 0037 / ADR 0063 (sharding on a unified store), ADR 0053 (free-threading); [`docs/archive/throughput/throughput-roadmap.md`](../archive/throughput/throughput-roadmap.md), [`docs/archive/throughput/throughput-build-plan.md`](../archive/throughput/throughput-build-plan.md)
 
 ---
 
@@ -21,7 +21,7 @@ The campaign labelled that ceiling **"store-write-bound"** (identical at `pool_s
 
 ## The decisive measurement — a commit-storm on the campaign's own store box
 
-Prior work (B8, [`docs/throughput-roadmap.md`](../throughput-roadmap.md)) measured a single-store commit ceiling of **~23,600 commits/s** on an AWS **i4i.2xlarge** local Nitro SSD (durable commit ~170 µs, WRITELOG ~141 µs). That was a *different* run; this ADR did not rely on transferring it. Instead a driver-free commit-storm was run **on the campaign's own store box** — raw ODBC `INSERT`+`COMMIT` loops, one heap table per thread so the transaction log is the only shared resource ([`results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt`](../benchmarks/results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt)):
+Prior work (B8, [`docs/archive/throughput/throughput-roadmap.md`](../archive/throughput/throughput-roadmap.md)) measured a single-store commit ceiling of **~23,600 commits/s** on an AWS **i4i.2xlarge** local Nitro SSD (durable commit ~170 µs, WRITELOG ~141 µs). That was a *different* run; this ADR did not rely on transferring it. Instead a driver-free commit-storm was run **on the campaign's own store box** — raw ODBC `INSERT`+`COMMIT` loops, one heap table per thread so the transaction log is the only shared resource ([`results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt`](../benchmarks/results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt)):
 
 | threads | commits/s | avg log write | dominant wait |
 |---:|---:|---:|---|
@@ -85,5 +85,5 @@ This supersedes two earlier framings: the campaign write-up's **"store-write-bou
 
 - [`docs/benchmarks/results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt`](../benchmarks/results/2026-07-03-adr0066-pooled-atscale/commit_storm.txt) — the decisive commit-storm (~27k commits/s zero-contention ceiling; large store headroom over the ~750/s feed).
 - [`docs/benchmarks/adr0066-pooled-claimer-744.md`](../benchmarks/adr0066-pooled-claimer-744.md) — the at-scale campaign (pool-independence; ~750 commits/s pipeline feed).
-- [`docs/throughput-roadmap.md`](../throughput-roadmap.md) (B8 store ceiling; the serial round-trip diagnosis: ~2.84 ms/round-trip vs ~170 µs fsync) and [`docs/throughput-build-plan.md`](../throughput-build-plan.md) (B1–B3 chain-cut DONE; engine per-message CPU as the current wall; B5/B6).
+- [`docs/archive/throughput/throughput-roadmap.md`](../archive/throughput/throughput-roadmap.md) (B8 store ceiling; the serial round-trip diagnosis: ~2.84 ms/round-trip vs ~170 µs fsync) and [`docs/archive/throughput/throughput-build-plan.md`](../archive/throughput/throughput-build-plan.md) (B1–B3 chain-cut DONE; engine per-message CPU as the current wall; B5/B6).
 - ADR 0055 (group-commit; native-knob rulings), ADR 0066 (pooled claimers), ADR 0001 (staged-pipeline invariants).

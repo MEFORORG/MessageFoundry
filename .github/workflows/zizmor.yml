@@ -1,16 +1,26 @@
 name: zizmor
 
 # GitHub Actions static analysis (Trail of Bits), split out of security.yml so it runs only when the
-# surface it lints actually changes: zizmor reads .github/** (workflows + its config), so a Python /
-# docs / test PR cannot change its result and running it there was pure cost (~1 billed min on every
-# one of ~900 monthly PR/push scans). The daily cron re-runs it against the UNCHANGED tree so a
-# newly-added zizmor rule or newly-flagged action ref still surfaces within ~24h, and
+# surface it lints actually changes. Its result moves with at least two inputs — the .github/** tree
+# it lints, and its own pinned version, which arrives from ci/locks/ci-scanners.lock (see the install
+# step) — so both are in the paths filter, and a PR touching neither was pure cost (~1 billed min on
+# every one of ~900 monthly PR/push scans). The daily cron re-runs it against the UNCHANGED tree so a
+# newly-added zizmor rule, or a newly-flagged action ref from the ONLINE audits that no paths filter
+# can see, still surfaces within ~24h, and
 # workflow_dispatch covers on-demand runs. NOT a branch-protection required check (verified against
 # the live protection rules), so a paths-filtered skip can never wedge a PR or auto-merge.
 on:
   pull_request:
     paths:
       - ".github/**"
+      # zizmor's own VERSION lives OUTSIDE .github/ — pyproject.toml's [dependency-groups].ci-scanners,
+      # hash-pinned through this export, which the install step below reads. A bump PR touching only
+      # those two never ran this gate (PR #66, zizmor 1.5.2 -> 1.28.0: 33 contexts, not one of them
+      # zizmor), so a jump against a deliberately CLEAN baseline was first adjudicated by the 06:00
+      # cron, against main, after merge. Unlike bandit and pip-audit — whose gates sit in security.yml
+      # on an unfiltered pull_request trigger and so DO re-run at the bumped version on the bump PR —
+      # this workflow is the only place the scanner it pins is exercised pre-merge.
+      - "ci/locks/ci-scanners.lock"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:
@@ -36,10 +46,56 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
-      - name: Install zizmor (pinned)
+      - name: Install zizmor (hash-pinned from the CI toolchain lock)
         run: |
-          # Pin deliberately; verify the tag at https://github.com/zizmorcore/zizmor/releases if it 404s.
-          python -m pip install --upgrade pip "zizmor==1.5.2"
+          # HASH-PINNED from the lock (ADR 0034 §3). The version lives in pyproject.toml's
+          # [dependency-groups].ci-scanners with its rationale; bump it there, then re-export.
+          python -m pip install --require-hashes -r ci/locks/ci-scanners.lock
+      # actionlint FIRST: it catches the class zizmor structurally cannot. An invalid `${{ }}` anywhere
+      # in a `run:` body -- comments included -- aborts workflow COMPILATION, so no jobs are created and
+      # every required context silently never appears (the PR looks stuck, not red). zizmor parses the
+      # file it is given and has nothing to say about a file GitHub will refuse to compile.
+      #
+      # Keep the version in step with .pre-commit-config.yaml's actionlint `rev`. This step is the
+      # backstop for `git commit --no-verify`; the pre-commit hook is the load-bearing half, because
+      # this workflow is deliberately NOT a required check (see the header).
+      - name: Lint workflow syntax (actionlint, pinned)
+        run: |
+          # Pin the release; bump deliberately. Verify the tag exists at
+          # https://github.com/rhysd/actionlint/releases if this step 404s. Verified against the
+          # release's own checksum file -- the same posture as the sbomqs download in security.yml,
+          # because a curl|tar of a release asset is dependency intake that no lockfile covers.
+          VER=1.7.12
+          asset="actionlint_${VER}_linux_amd64.tar.gz"
+          base="https://github.com/rhysd/actionlint/releases/download/v${VER}"
+          curl -sSfL "${base}/${asset}" -o "$asset"
+          curl -sSfL "${base}/actionlint_${VER}_checksums.txt" -o actionlint_checksums.txt
+          grep " ${asset}$" actionlint_checksums.txt | sha256sum -c -
+          tar -xzf "$asset" actionlint
+          sudo install -m 0755 actionlint /usr/local/bin/actionlint
+          actionlint --version
+          # `-shellcheck=` DISABLES actionlint's shellcheck integration, deliberately.
+          #
+          # actionlint shells out to shellcheck for every `run:` body IF shellcheck is on PATH. GitHub
+          # runners ship it; a local actionlint binary generally does not. So the same command is a
+          # different linter in the two places -- this step passed locally and failed in CI on ~30
+          # PRE-EXISTING findings in ci.yml and release.yml that have nothing to do with the change that
+          # added it. That asymmetry is the exact defect class this repo keeps hitting: a gate whose
+          # reach depends on its environment.
+          #
+          # Scope is the reason, not the noise. This step exists for the workflow-syntax class in
+          # docs/CI.md -- an invalid GitHub expression interpolation that aborts workflow COMPILATION so
+          # required contexts never appear. Adopting shellcheck's whole ruleset over every `run:` body is
+          # a separate decision, and several of its findings here are it misparsing a GitHub
+          # interpolation inside a shell script (release.yml:392 "'(' is invalid here"). Turning it on
+          # repo-wide belongs in its own PR that also clears or annotates the backlog.
+          #
+          # NB -- do NOT write a literal empty interpolation (dollar-brace-brace) in this comment to
+          # illustrate the point: actionlint parses expressions in `run:` bodies INCLUDING comments, so
+          # the illustration is itself the defect. Writing one here is how this very step first went red.
+          #
+          # Now identical locally and in CI, which is what makes a green here mean something.
+          actionlint -shellcheck=
       - name: Analyze the workflows
         env:
           # Lets zizmor run its online audits (e.g. unpinned / known-problematic action refs).

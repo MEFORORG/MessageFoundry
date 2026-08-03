@@ -64,8 +64,9 @@ Nothing in Wave 1 / Wave 2 builds until its ADR is **Accepted**. See §G for the
 ### Lane 0 — COORD / ADR (pure docs; builds no product code)
 - Author **ADR 0047 / 0049 / 0050**, **finalize ADR 0048** (Proposed → Accepted, add EARS acceptance
   criteria), **amend ADR 0032** (Phase B). Flip `docs/adr/README.md` rows as each is Accepted.
-- **#52 roadmap synthesis:** from [`marketing/corepoint-gap-analysis.md`](../../marketing/corepoint-gap-analysis.md)
-  (local-only), bring the owner the **NEW-candidate gap rows** worth promoting (DR is #60/#61; alert-escalation,
+- **#52 roadmap synthesis:** from `marketing/corepoint-gap-analysis.md`
+  (local-only — see [SECURITY-DOCS-POLICY.md](../SECURITY-DOCS-POLICY.md)), bring the owner the
+  **NEW-candidate gap rows** worth promoting (DR is #60/#61; alert-escalation,
   declarative-modeling, correlation-UX, web-monitor/host-metrics, PKCS#12/cert-inventory, generic OAuth2/Digest/NTLM,
   Oracle/MySQL/ODBC-DSN) and **promote the agreed ones into numbered BACKLOG items** with triggers. Owner decision;
   no code.

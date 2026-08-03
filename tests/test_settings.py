@@ -605,6 +605,63 @@ def test_auth_oidc_refusals_name_the_key(
         load_settings(config_path=cfg, environ=env)
 
 
+@pytest.mark.parametrize(
+    ("secret", "label"),
+    [
+        ("", "an env var exported with NO value"),
+        ("   ", "whitespace only"),
+        ("\t\n", "whitespace only, non-space"),
+    ],
+)
+def test_auth_oidc_empty_client_secret_is_refused(tmp_path: Path, secret: str, label: str) -> None:
+    """An EMPTY client secret must be refused at config load, not just an absent one.
+
+    The guard used to read ``if self.oidc_client_secret is None``, which is not the shape a missing
+    secret usually takes. ``MEFOR_AUTH_OIDC_CLIENT_SECRET=`` in a service wrapper — or an NSSM
+    environment entry with an empty value — yields ``""``, and ``"" is not None``, so federated login
+    started up "configured" with no client secret and failed later at the token exchange as an IdP
+    rejection. Every sibling field in the same validator already used ``if not value``; this one line
+    disagreed.
+
+    Reproduced before the fix: ``""`` and ``"   "`` both loaded successfully with
+    ``oidc_client_secret == ''``. Mutation: restore ``is None``. Red on all three cases.
+    """
+    cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
+    env = dict(_OIDC_ENV) | {"MEFOR_AUTH_OIDC_CLIENT_SECRET": secret}
+    with pytest.raises(ValidationError, match="NON-EMPTY client secret"):
+        load_settings(config_path=cfg, environ=env)
+
+
+def test_auth_oidc_empty_secret_ref_is_refused(tmp_path: Path) -> None:
+    """The same emptiness test must apply to the ``_ref`` alternative, or the fix is half a fix.
+
+    An empty ``oidc_client_secret_ref`` would otherwise satisfy the "one of the two is set" guard while
+    naming no provider entry at all.
+    """
+    cfg = _write(
+        tmp_path / "messagefoundry.toml",
+        _OIDC_AD + _OIDC_BLOCK + 'oidc_client_secret_ref = ""\n',
+    )
+    env = {k: v for k, v in _OIDC_ENV.items() if k != "MEFOR_AUTH_OIDC_CLIENT_SECRET"}
+    with pytest.raises(ValidationError, match="NON-EMPTY client secret"):
+        load_settings(config_path=cfg, environ=env)
+
+
+def test_auth_oidc_a_real_secret_still_loads(tmp_path: Path) -> None:
+    """Positive control for the two refusals above.
+
+    Without it, tightening the emptiness test to something that rejects EVERY secret would leave both
+    refusal tests green — they only assert that a raise happens.
+    """
+    cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
+    s = load_settings(config_path=cfg, environ=dict(_OIDC_ENV))
+    assert s.auth.oidc_client_secret == "client-s3cret"
+    # A secret with meaningful surrounding whitespace is NOT rewritten — stripping is for the
+    # emptiness test only, because an IdP secret can legitimately contain any byte.
+    padded = dict(_OIDC_ENV) | {"MEFOR_AUTH_OIDC_CLIENT_SECRET": " s3cret "}
+    assert load_settings(config_path=cfg, environ=padded).auth.oidc_client_secret == " s3cret "
+
+
 def test_auth_oidc_requires_public_origin(tmp_path: Path) -> None:
     cfg = _write(tmp_path / "messagefoundry.toml", _OIDC_AD + _OIDC_BLOCK)
     env = {k: v for k, v in _OIDC_ENV.items() if k != "MEFOR_SECURITY_WEB_CONSOLE_PUBLIC_ADDRESS"}

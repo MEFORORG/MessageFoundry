@@ -222,12 +222,15 @@ of `ci.yml`:
 
 * It is **not** in `ci.yml`'s `ci-gate` `needs:` list, so it is **not** the required "CI gate"
   context and **cannot** block a PR.
-* Every job step that could fail under an immature `3.14t` is wrapped in `continue-on-error: true`,
-  and the job itself is `continue-on-error: true`, so a red canary reports a red **informational**
-  check, never a failed required one.
-* It must **not** be added to branch protection's required checks (see §"required checks" in memory —
-  the 7 required contexts are the `test` matrix + bandit + pip-audit + cla). **Do not** add this
-  context there.
+* Every job step that could fail under an immature `3.14t` is wrapped in `continue-on-error: true`.
+  The **job** deliberately is not: see the header comment in `freethread-smoke.yml`, which explains
+  that a job allowed to go red is the only way a dead tripwire stays distinguishable from a healthy
+  one. Its triggers already guarantee it cannot block anything, so a red canary reports a red
+  **informational** check, never a failed required one.
+* It must **not** be added to branch protection's required checks. The required set is recorded in
+  `.github/required-contexts.txt` — read it there rather than trusting a copy in prose; the copy that
+  used to live on this line named 7 contexts when the live set was 12. **Do not** add this context
+  there.
 
 What it does (kept minimal — install + import + the fastest pure-Python test subset):
 

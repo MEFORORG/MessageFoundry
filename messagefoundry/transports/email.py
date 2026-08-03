@@ -44,6 +44,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import smtplib
+import ssl
 from collections.abc import Mapping
 from email.message import EmailMessage
 from typing import Any
@@ -53,7 +54,7 @@ from messagefoundry.config.settings import (
     INSECURE_TLS_ESCAPE_ENV,
     weakened_tls_escape_permitted_here,
 )
-from messagefoundry.config.tls_policy import RevocationHopGuard
+from messagefoundry.config.tls_policy import RevocationHopGuard, build_smtp_tls_context
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -108,6 +109,12 @@ class EmailDestination(DestinationConnector):
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
         self.use_tls = bool(s.get("use_tls", True))
+        # #323: server-certificate verification on the TLS hop. Defaults ON — smtplib's own default is
+        # an UNVERIFIED context, so before this the encrypted session was unauthenticated.
+        self.tls_verify = bool(s.get("tls_verify", True))
+        tls_ca_file = s.get("tls_ca_file")
+        self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
+        self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
@@ -169,22 +176,66 @@ class EmailDestination(DestinationConnector):
                 connection=config.name,
             )
             self._hop_guard.enforce_construction()
+        elif not self.tls_verify:
+            # #323 arm 2: TLS is on but verification is off. Refused unless the CLAMPED escape permits
+            # it (#200, ADR 0092 decision 2) — inlined here exactly as the MLLP and FTPS verify-off arms
+            # inline it (remotefile.py:176, mllp.py:547), not routed through a shared helper, because
+            # the sibling cells do it this way and a third spelling is how the next bug gets written.
+            # NOTE the raw insecure_tls_allowed() is deliberately NOT used: the blunt process-wide
+            # escape must not silence a verify-off PHI hop on an enforcing instance.
+            if not weakened_tls_escape_permitted_here():
+                raise ValueError(
+                    "Email destination tls_verify=false disables server-certificate verification on "
+                    f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED, so "
+                    "an on-path attacker presenting any certificate reads the message body (PHI) and "
+                    "any SMTP AUTH credential. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file "
+                    f"for the instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a "
+                    "trusted-network bind (refused on a production-PHI instance even with the escape, "
+                    "#200)."
+                )
+            # Credentials over an unauthenticated channel are refused for the same reason they are
+            # refused over cleartext: an on-path attacker who can present any cert can capture the
+            # AUTH exchange. The use_tls=false arm above states the cleartext half of this rule.
+            if self.username is not None:
+                raise ValueError(
+                    "Email destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
+                    "(tls_verify=false); refused — credentials require a verified TLS session"
+                )
+            # No RevocationHopGuard here: a hop that does not verify the certificate at all has nothing
+            # whose revocation status could matter, and the composition rule forbids two gates deciding
+            # the same hop (docs/DEPLOYMENT.md §"composition"). The refusal above is that hop's gate.
         else:
-            # #201 (ADR 0078 amendment): STARTTLS (587) / implicit-TLS SMTP_SSL (465) verifies the server
-            # cert, but smtplib's default SSL context does NO OCSP/CRL revocation (stdlib ssl has none) —
-            # so a revoked-but-unexpired SMTP-server cert is still accepted. The message body carries PHI
-            # over this verified hop, so refuse an off-loopback production-PHI hop unless revocation is
-            # attested (loopback / synthetic / non-prod / attested byte-identical). Same posture-keyed
-            # RevocationHopGuard as the REST/SOAP/FHIR/DICOMweb https paths; SMTP is a different construction
-            # seam (smtplib, not the urllib/ssl scheme), so it calls the guard directly rather than the
-            # https-scheme-keyed refuse_unrevoked_verified_hop wrapper. Composes with the cleartext refusal
-            # above (that gate keys on use_tls=false; this one only on the verifying use_tls=true path).
+            # #201 (ADR 0078 amendment): the hop now genuinely verifies the server cert (#323 — it did
+            # not before; smtplib's default context is ssl._create_unverified_context), but stdlib ssl
+            # does NO OCSP/CRL revocation, so a revoked-but-unexpired SMTP-server cert is still
+            # accepted. The message body carries PHI over this verified hop, so refuse an off-loopback
+            # production-PHI hop unless revocation is attested (loopback / synthetic / non-prod /
+            # attested byte-identical). Same posture-keyed RevocationHopGuard as the REST/SOAP/FHIR/
+            # DICOMweb https paths; SMTP is a different construction seam (smtplib, not the urllib/ssl
+            # scheme), so it calls the guard directly rather than the https-scheme-keyed
+            # refuse_unrevoked_verified_hop wrapper. Composes with the two refusals above: this arm is
+            # reached only when use_tls=true AND tls_verify=true, which is the guard's documented
+            # precondition (tls_policy.py: "the caller has already built a verifying context") — that
+            # precondition was VIOLATED by this call site before #323.
             RevocationHopGuard.capture(
                 host=self.host,
                 cell="Email destination (verified SMTP TLS, no revocation check)",
                 description="delivers over verified SMTP TLS but performs no certificate revocation checking",
                 attested=config.tls_revocation_attested,
             ).enforce_construction()
+        # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
+        self._tls_context: ssl.SSLContext | None = (
+            build_smtp_tls_context(
+                host=self.host,
+                cell="Email destination",
+                verify=self.tls_verify,
+                ca_file=self.tls_ca_file,
+                check_hostname=self.tls_check_hostname,
+                trust_anchor_policy=config.trust_anchor_policy,
+            )
+            if self.use_tls
+            else None
+        )
 
     async def send(
         self, payload: str, *, metadata: Mapping[str, str] | None = None
@@ -210,10 +261,13 @@ class EmailDestination(DestinationConnector):
         if self.port == 465 and self.use_tls:
             # Port 465 is implicit TLS — the whole session is wrapped from connect, so SMTP_SSL rather
             # than SMTP+STARTTLS (ADR 0029 §D3). The submission port (587) keeps STARTTLS below.
-            return smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout)
+            # context= is REQUIRED (#323): SMTP_SSL's own default is an unverified stdlib context.
+            return smtplib.SMTP_SSL(
+                self.host, self.port, timeout=self.timeout, context=self._tls_context
+            )
         smtp = smtplib.SMTP(self.host, self.port, timeout=self.timeout)
         if self.use_tls:
-            smtp.starttls()
+            smtp.starttls(context=self._tls_context)
         return smtp
 
     def _send(self, payload: str) -> None:

@@ -1,11 +1,38 @@
 # Throughput execution plan — to 45M messages/day across 1,500 connections
 
-**Date:** 2026-07-10 · **Companion to:** [THROUGHPUT-STATUS-2026-07-10.md](THROUGHPUT-STATUS-2026-07-10.md)
+**Date:** 2026-07-10 · **Companion to:** [THROUGHPUT-STATUS-2026-07-10.md](../../benchmarks/THROUGHPUT-STATUS-2026-07-10.md)
 (the audit this plan executes against) · **Method:** synthesised from three independently authored plans
 (risk-first, evidence-first, demo-first), scored by two independent judges. Both judges selected the
 **risk-first** spine — order the work by what could invalidate the whole effort, and fire the cheapest
 potential killer first — and grafted onto it the demo instrument, a smallest-credible-demo, an explicit
 falsifier for the `2H` thesis, a cannot-claim ledger, and a persistence phase. This document is that synthesis.
+
+> ## ⛔ SUPERSEDED IN ONE RESPECT (2026-07-29) — the Phase-F transaction-reduction levers are CLOSED
+>
+> **[ADR 0107](../../adr/0107-phase-4-is-closed-transaction-reduction-is-a-measured-dead-end.md) (2026-07-13) closed
+> Phase 4: transaction reduction is a MEASURED dead end.** A pre-registered falsifier cut committed transactions
+> per message **28.5%** (10.47 → 7.49) and moved sustained throughput **−0.56%** — inside the null band — and its
+> arm E bounded the coupling at an elasticity of **−0.115** (*"No transaction-reduction mechanism — fusion,
+> group-commit, or any other — can close a 5.79× gap"*). It also **supersedes this plan's Phase-4 scope
+> transitively**: [`PLAN-PHASE4-GROUP-COMMIT.md`](PLAN-PHASE4-GROUP-COMMIT.md) took that scope over (its §"Supersedes"
+> line), and ADR 0107 closed it.
+>
+> ⚠️ **ADR 0107's "do not build F2 or F3" uses the Phase-4 plan's labels, NOT this document's §Phase F labels — do
+> not map them across.** Against **this** plan's lever table: **F1 (`accepts=` seam) SHIPPED**
+> ([ADR 0084](../../adr/0084-accepts-router-seam.md), [BACKLOG #213](../../BACKLOG.md)); **F2 (`fifo_claim_batch` flip) is
+> owner-closed default-OFF**, priced at ≤ +4.7% against a +8% bar ([BACKLOG #212](../../BACKLOG.md); shipped
+> `default=1`, [`config/settings.py:301`](../../../messagefoundry/config/settings.py)); **F3 (the pooled tempdb claim
+> rewrite) is ⛔ DECLINED** — but by [ADR 0114](../../adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md)
+> keeping the table variables as load-bearing for per-lane FIFO, **not** by ADR 0107 ([BACKLOG #210](../../BACKLOG.md));
+> **F4 (group-commit) is ⛔ DECLINED** ([BACKLOG #217](../../BACKLOG.md)); **F5's transform-overlap mechanism MERGED**,
+> its commit-collapse residual unbuilt, owner-deferred and ADR-gated ([BACKLOG #214](../../BACKLOG.md)).
+>
+> So **§Phase F is stale as a plan** — every lever it sequences has since shipped, been declined, or been deferred,
+> and none may be re-opened on a throughput case without new measurement contradicting ADR 0107. The rest — the two
+> unmeasured numbers, the annotation scheme, the gate map, the cannot-claim ledger — is **unaffected** and is left
+> exactly as written: it is the record of the reasoning at the time. Measured throughput lives in
+> [`TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md); 45M/day remains a **target**
+> ([ADR 0052](../../adr/0052-enterprise-scale-target.md)), never a demonstrated capability.
 
 Every msg/s, txn/msg, bytes/msg, and CPU figure below traces to the audit. **No number here is new.** Where a
 value is genuinely unknown it is written **UNKNOWN** and never extrapolated — that discipline is the whole

@@ -8,9 +8,11 @@ validator) without crossing the engine's one-way dependency boundaries. Three co
 * :func:`validate_tls_ciphers` — reject an operator ``tls_ciphers`` string that would admit a
   non-forward-secret (non-ECDHE/DHE) key exchange, so a misconfiguration cannot widen the suite below
   policy. Run from the ``[api].tls_ciphers`` settings validator, so a bad value fails loud at load.
-* :func:`harden_kex_groups` — pin the approved ECDHE groups on a built context where the runtime
-  supports it (``SSLContext.set_groups``, Python 3.13+); on older interpreters OpenSSL already leads
-  with these groups, so it is a best-effort no-op rather than a downgrade.
+* :func:`harden_kex_groups` — *attempt* to pin the approved ECDHE groups on a built context, and
+  **report whether it managed to**. ``SSLContext.set_groups`` is a **Python 3.15** API (this said
+  "3.13+" and was wrong), so today it pins nothing on every supported runtime and the contexts inherit
+  OpenSSL's default group list — forward-secret, but wider than policy. See its docstring for the
+  measured accepted set; do not cite the groups as "pinned" while it returns ``None``.
 * :func:`harden_verify_flags` — OR ``ssl.VERIFY_X509_STRICT`` into a verifying context's
   ``verify_flags`` so a presented chain must be RFC 5280-conformant (ASVS 12.1.4 strict path
   validation). Revocation itself is delegated to the org PKI / OCSP-must-staple proxy + OS trust store
@@ -60,6 +62,7 @@ __all__ = [
     "TrustAnchorMode",
     "TrustAnchorPolicy",
     "active_hop_posture",
+    "build_smtp_tls_context",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
     "current_hop_posture",
@@ -109,23 +112,54 @@ def fips_attestation() -> tuple[bool | None, str]:
     return fips_mode, ssl.OPENSSL_VERSION
 
 
-def harden_kex_groups(ctx: ssl.SSLContext) -> None:
-    """Best-effort pin ``ctx`` to :data:`APPROVED_KEX_GROUPS`.
+def harden_kex_groups(ctx: ssl.SSLContext) -> str | None:
+    """Pin ``ctx`` to :data:`APPROVED_KEX_GROUPS`; return the list pinned, or ``None`` if nothing was.
 
-    Uses ``SSLContext.set_groups`` where available (Python 3.13+). On older interpreters there is no
-    public API to pin groups and OpenSSL's defaults already lead with X25519/P-256/P-384, so this is a
-    deliberate no-op rather than a weakening. A runtime that rejects the group list (an unusual OpenSSL
-    build) is logged and left at its secure defaults."""
+    **On every runtime this project currently supports this pins NOTHING and returns ``None``.**
+    ``SSLContext.set_groups`` is a **Python 3.15** addition — typeshed guards it at
+    ``sys.version_info >= (3, 15)``, alongside the ``get_groups`` that will finally make the pin
+    *assertable*. This docstring previously said "Python 3.13+"; that was wrong, and it was repeated
+    into `docs/PHI.md`, `docs/ASVS-L2-PHASE0-CHANGES.md`, ADR 0092 §4(b) and the ASVS scorecard.
+    Measured on this tree: Python 3.14.6 / OpenSSL 3.5.7, ``hasattr(ctx, "set_groups")`` is ``False``,
+    so :data:`APPROVED_KEX_GROUPS` reaches **zero** of this function's six call sites and every built
+    context falls back to OpenSSL's default group list.
+
+    That default *is* forward-secret — which is the property the TLS 1.2+ floor guarantees and the one
+    ASVS 11.6.2's first clause is about — but it is **wider than the approved list**. Measured against
+    the real ``build_api_ssl_context``, at both ``tls_min_version`` 1.2 and 1.3, it also accepts
+    ``ffdhe2048``, ``ffdhe3072`` and ``secp521r1``; it does refuse ``secp224r1`` and ``sect571r1``. So
+    the residual is *wider than policy*, not *weak*. Until this returns non-``None``, do not describe
+    the engine's key-exchange groups as "pinned" anywhere — they are **inherited**.
+
+    The **return value is the point.** A security control that cannot report whether it did anything
+    reports success forever; that is how a call at six sites with zero effect survived three
+    assessments. ``tests/test_tls_policy.py`` asserts the ``None`` *unconditionally*, so the first
+    interpreter that grows the API turns that test red — which is the signal to re-derive this
+    docstring, `docs/PHI.md` §4 and the 11.6.2 row, and to switch the test to ``get_groups()``.
+
+    Two traps for whoever does that work:
+
+    * ``SSLContext.set_ecdh_curve`` *does* exist and genuinely constrains the TLS 1.3
+      ``supported_groups`` (verified: a server pinned to ``prime256v1`` refuses a client pinned to
+      ``secp384r1`` with ``NO_SUITABLE_KEY_SHARE``, while the unpinned control accepts it). It is not a
+      substitute here — it takes exactly ONE OpenSSL curve short name, so it cannot express a
+      preference list, and pinning through it would refuse two of the three approved groups.
+    * ``secp256r1`` is a valid OpenSSL *group-list* alias but **not** a valid EC curve name (that
+      spelling is ``prime256v1``, and ``set_ecdh_curve("secp256r1")`` raises). Both names are correct
+      in their own API. Do not "normalise" the constant.
+    """
     set_groups = getattr(ctx, "set_groups", None)
     if set_groups is None:
-        return
+        return None
     try:
         set_groups(APPROVED_KEX_GROUPS)
-    except (
-        ssl.SSLError,
-        ValueError,
-    ) as exc:  # pragma: no cover - depends on the linked OpenSSL build
+    except (ssl.SSLError, ValueError) as exc:
+        # None, not the list: a pin that RAISED must never read back as a pin that took. (The former
+        # `# pragma: no cover` here is gone — this branch is now driven by a stand-in context in
+        # tests/test_tls_policy.py rather than left to an unusual OpenSSL build to exercise.)
         logger.warning("Could not pin TLS key-exchange groups %r: %s", APPROVED_KEX_GROUPS, exc)
+        return None
+    return APPROVED_KEX_GROUPS
 
 
 def harden_verify_flags(ctx: ssl.SSLContext) -> None:
@@ -886,3 +920,61 @@ def build_verifying_client_context(
         return ctx
     # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
     return ssl.create_default_context(purpose, cafile=anchor.cafile)
+
+
+def build_smtp_tls_context(
+    *,
+    host: str,
+    cell: str,
+    verify: bool = True,
+    ca_file: str | None = None,
+    check_hostname: bool = True,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> ssl.SSLContext:
+    """Build the TLS context for an outbound SMTP hop (#323) — STARTTLS or implicit ``SMTP_SSL``.
+
+    ``smtplib`` accepts no context by default, and its fallback is
+    :func:`ssl._create_stdlib_context`, which **is** ``ssl._create_unverified_context`` — measured on
+    CPython 3.14.6: ``verify_mode=CERT_NONE``, ``check_hostname=False``. So every certificate was
+    accepted and the encrypted session was unauthenticated: an on-path attacker presenting any
+    certificate read the message body (PHI) and the SMTP AUTH credential. This is the SMTP sibling of
+    :func:`~messagefoundry.transports.remotefile._ftps_ssl_context` and the MLLP outbound arm, and is
+    deliberately built here rather than in ``transports/`` because ``pipeline/alert_sinks.py`` is a
+    third caller and a transport must not import ``pipeline/`` (ADR 0029's one-way rule).
+
+    ``verify=False`` is NOT gated here — the caller refuses it against the clamped
+    :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted_here` first, matching how
+    MLLP/FTPS inline that check. This module cannot read it: ``config.settings`` imports *from* here,
+    so the dependency runs one way only.
+
+    ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
+    the connection names no ``ca_file`` of its own. It only chooses WHICH roots verify the peer — it
+    never turns verification off.
+    """
+    if verify:
+        anchor = resolve_trust_anchor(
+            connection_ca_file=ca_file,
+            host=host,
+            policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+        )
+        ctx = build_verifying_client_context(anchor)
+    else:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if verify:
+        ctx.check_hostname = check_hostname
+    else:
+        logger.warning(
+            "%s TLS certificate verification is DISABLED (tls_verify=false) — the SMTP session to %s "
+            "is encrypted but UNAUTHENTICATED and MITM-able; trusted-network dev/test only.",
+            cell,
+            host,
+        )
+        # Order is load-bearing: check_hostname must go False BEFORE verify_mode, or ssl raises.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector=cell)  # assert forward secrecy (ASVS 12.1.2)
+    if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
+        harden_verify_flags(ctx)
+    return ctx

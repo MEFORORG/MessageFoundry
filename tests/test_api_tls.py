@@ -1253,28 +1253,80 @@ def _verifying_client_ctx(ca: Path) -> ssl.SSLContext:
     return ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=str(ca))
 
 
-def test_kex_allow_list_enforced_at_runtime(tmp_path: Path) -> None:
-    # The engine terminates TLS in-process, so it ENFORCES the approved forward-secret KEX groups at
-    # runtime (harden_kex_groups on the built context), not merely as an operator attestation. Prove it:
-    # a client pinned to ONLY a non-approved FFDHE group cannot complete against the pinned server, while
-    # a default client negotiates a forward-secret TLS 1.3 suite.
+#: Key-exchange groups OUTSIDE `APPROVED_KEX_GROUPS` that a client can pin via `set_ecdh_curve`.
+#: `x448` and `X25519MLKEM768` are deliberately absent — they are TLS groups but not EC curve NAMES, so
+#: `set_ecdh_curve` raises on them and this technique cannot measure them.
+_NON_APPROVED_KEX_PROBES = ("ffdhe2048", "ffdhe3072", "secp521r1", "secp224r1", "sect571r1")
+
+#: The approved groups, spelled for `set_ecdh_curve` — `prime256v1`, never `secp256r1` (see
+#: APPROVED_KEX_GROUPS: the group-list alias and the EC curve name differ for exactly this curve).
+_APPROVED_KEX_PROBES = ("X25519", "secp384r1", "prime256v1")
+
+
+def _kex_group_accepted(server_ctx: ssl.SSLContext, ca: Path, group: str) -> bool:
+    """Does ``server_ctx`` complete a handshake with a client offering ONLY ``group``?"""
+    client = _verifying_client_ctx(ca)
+    # A ValueError here is a bug in this test's group table, not a finding — let it raise loudly rather
+    # than degrade into "not accepted", which would silently manufacture the result we want.
+    client.set_ecdh_curve(group)
+    try:
+        return bool(_handshake(server_ctx, client, client_cert=None))
+    except OSError:
+        return False
+
+
+def test_which_kex_groups_the_built_context_actually_accepts(tmp_path: Path) -> None:
+    """MEASURE the built context's key-exchange groups (ASVS 11.6.2).
+
+    This replaces a test that asserted the opposite of the truth and stayed green by skipping. It read:
+    "a client offering ONLY ffdhe2048 ... shares no key-exchange group with the pinned server, so the
+    handshake is refused — runtime enforcement". It reached that assertion only through client-side
+    ``set_groups``, a **Python 3.15** API, so on every interpreter this project runs on it hit
+    ``pytest.skip``. And the claim was false: measured, this context ACCEPTS ffdhe2048, because
+    ``harden_kex_groups`` pins nothing. A skip was concealing a wrong assertion, which is worse than no
+    test — ADR 0092 §4(b) cited it as proof.
+
+    ``set_ecdh_curve`` is the API that does exist, and it genuinely constrains the TLS 1.3
+    ``supported_groups``: verified separately that a server pinned to ``prime256v1`` refuses a client
+    pinned to ``secp384r1`` (``NO_SUITABLE_KEY_SHARE``) while the unpinned control accepts it. One group
+    per handshake is enough to enumerate what the server will take.
+
+    Asserted as INVARIANTS, not as an exact table: the accepted set comes from the linked OpenSSL's
+    default group list and a CI leg may link a different build. What must hold is that *every* approved
+    group gets in (else the server is over-restricted, or the harness is broken, and the second
+    assertion would pass for the wrong reason) and that *some* non-approved group gets in (proving the
+    approved list is not enforced). The measured table is printed on failure either way.
+
+    Mutation: make ``_kex_group_accepted`` return True unconditionally. Red — the "genuinely weak curves
+    stay out" assertions fail, so a probe that cannot distinguish anything is caught.
+    """
     ca, cert, key = _strict_ca_and_leaf(tmp_path)
     server_ctx = build_api_ssl_context(
         ApiSettings(tls_cert_file=str(cert), tls_key_file=str(key), tls_min_version="1.3")
     )
-    # Positive control: a normal client (approved groups) handshakes and negotiates a TLS 1.3 suite.
-    cipher = _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
-    assert cipher and cipher.startswith("TLS_")  # a TLS 1.3 (ECDHE, forward-secret) suite
 
-    # Negative: a client offering ONLY ffdhe2048 (a valid TLS 1.3 group the server does NOT list) shares
-    # no key-exchange group with the pinned server, so the handshake is refused — runtime enforcement.
-    bad_client = _verifying_client_ctx(ca)
-    try:
-        bad_client.set_groups("ffdhe2048")
-    except (AttributeError, ssl.SSLError, ValueError):
-        pytest.skip("runtime does not support set_groups on the client side")
-    with pytest.raises(OSError):
-        _handshake(server_ctx, bad_client, client_cert=None)
+    # Positive control first: a default client must negotiate a forward-secret TLS 1.3 suite at all.
+    cipher = _handshake(server_ctx, _verifying_client_ctx(ca), client_cert=None)
+    assert cipher and cipher.startswith("TLS_")
+
+    approved = {g: _kex_group_accepted(server_ctx, ca, g) for g in _APPROVED_KEX_PROBES}
+    non_approved = {g: _kex_group_accepted(server_ctx, ca, g) for g in _NON_APPROVED_KEX_PROBES}
+    table = f"approved={approved} non_approved={non_approved}"
+
+    assert all(approved.values()), f"the built context refuses an APPROVED group — {table}"
+
+    # The residual of record: the approved list is NOT enforced, because a group outside it gets in.
+    leaked = sorted(g for g, ok in non_approved.items() if ok)
+    assert leaked, (
+        "no non-approved key-exchange group was accepted, so the built context now DOES constrain "
+        "groups to the approved list. That is an improvement, not a test failure — re-score ASVS "
+        f"11.6.2, update docs/PHI.md §4 and the register, then tighten this test. {table}"
+    )
+
+    # ...and the genuinely weak curves stay out, so the residual is "wider than policy", not "insecure".
+    # If either of these fails it is a real finding on that OpenSSL build, not a flake.
+    assert not non_approved["secp224r1"], f"a 112-bit-strength curve was accepted — {table}"
+    assert not non_approved["sect571r1"], f"a binary-field curve was accepted — {table}"
 
 
 def test_real_mutual_tls_handshake_on_built_context(tmp_path: Path) -> None:

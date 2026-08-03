@@ -58,7 +58,16 @@ _HISTORICAL = (
 
 #: Present-tense mirror/private-repo prose. Lines carrying a retrospective marker are excluded: those
 #: are narrating history, which is the distinction this whole module turns on.
-_PROSE = re.compile(r"(?i)(the mirror|public mirror|OSS mirror|private repo|the published mirror)")
+#:
+#: ``private repo`` carries a word boundary: without it the alternative matched INSIDE longer words,
+#: so "a private **repo**rting channel" and a quoted GitHub error about "user-owned private
+#: **repo**sitories" both counted as mirror prose. Two false positives, one of which pushed the
+#: ratchet over its ceiling and failed CI on a documentation-only branch. Verified before changing:
+#: the boundary suppresses exactly those two lines and keeps every genuine "private repo" hit
+#: (~20 of them, across workflows, INSTALL-GUIDE, VERSION-CONTROL, SECURITY and the ADRs).
+_PROSE = re.compile(
+    r"(?i)(the mirror|public mirror|OSS mirror|private repo\b|the published mirror)"
+)
 _RETROSPECTIVE = re.compile(
     r"(?i)\b(was|were|used to|retired|former|previously|until the cutover|no longer|had been|old"
     r"|legacy|pre-cutover)\b"
@@ -68,7 +77,11 @@ _RETROSPECTIVE = re.compile(
 #: 55 hits across 1367 tracked files. Two of those files are being edited on an unpushed branch
 #: (quality-advisory.yml, docs/quality-gates/HANDOFF-mutation-coverage.md), so expect this to fall
 #: again shortly — which is the ratchet working, not drift.
-_PROSE_CEILING = 55
+#:
+#: 2026-07-30: 55 -> 54. Not slack being taken: the ``private repo`` word-boundary fix above removed
+#: two SUBSTRING false positives, so the honest count fell and the ceiling follows it DOWN. Measured
+#: at 54 across 1412 tracked files. The rule is unchanged — this number may fall again, never rise.
+_PROSE_CEILING = 54
 
 
 #: This module, excluded from its own scan. Its taxonomy above necessarily SPELLS every phrase it

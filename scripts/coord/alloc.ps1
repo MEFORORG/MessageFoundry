@@ -81,15 +81,34 @@ function Get-Floor {
             }
         }
     } else {
-        # BACKLOG.md is one big file: read it from origin/main and from this worktree's HEAD + index.
-        $texts = @(
-            (& git show "origin/main:docs/BACKLOG.md" 2>$null) -join "`n"
-            (& git show "HEAD:docs/BACKLOG.md" 2>$null) -join "`n"
-        )
+        # BACKLOG.md is ONE BIG FILE, so the floor needs its CONTENT, not a filename listing -- but it
+        # still needs EVERY ref, exactly like the adr branch above and exactly as this function's own
+        # header comment promises. Reading only origin/main + HEAD is what re-issued #240-#247 on
+        # 2026-07-30 over numbers ADR 0115 and seven amended ADRs already cite: the items holding
+        # those numbers live on refs the published branch does not carry, so they were invisible here
+        # and the allocator handed the numbers out as free. A number that exists on ANY ref is taken.
+        #
+        # Batched deliberately: ~550 refs share ~190 distinct BACKLOG.md blobs, and a `git show` per
+        # ref costs ~34s on Windows (one process each). Two `git cat-file` processes do it in ~3s.
+        $refs = @("origin/main", "HEAD") + @(& git for-each-ref --format='%(refname)' refs/heads refs/remotes)
+        $specs = ($refs | Select-Object -Unique | ForEach-Object { "${_}:docs/BACKLOG.md" })
+
+        $oids = [System.Collections.Generic.HashSet[string]]::new()
+        foreach ($line in ($specs -join "`n" | & git cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+            $p = "$line".Split(' ')
+            if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
+        }
+
+        $rx = [regex]'^#{2,3} (\d+)\.'
+        if ($oids.Count -gt 0) {
+            foreach ($line in (($oids -join "`n") | & git cat-file --batch 2>$null)) {
+                $m = $rx.Match("$line")
+                if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
+            }
+        }
         $wip = Join-Path $repo "docs/BACKLOG.md"
-        if (Test-Path $wip) { $texts += (Get-Content $wip -Raw) }
-        foreach ($t in $texts) {
-            foreach ($m in [regex]::Matches($t, '(?m)^#{2,3} (\d+)\.')) { $seen.Add([int]$m.Groups[1].Value) }
+        if (Test-Path $wip) {
+            foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
         }
     }
 
@@ -97,11 +116,95 @@ function Get-Floor {
         $n = 0
         if ([int]::TryParse($f.BaseName, [ref]$n)) { $seen.Add($n) }
     }
+
+    # HIGH-WATER RATCHET -- the floor may rise but must never fall.
+    #
+    # Every other term above is derived from refs that a routine cleanup can remove. Measured on this
+    # clone: the backlog floor is 314 counting all refs, but only 252 counting `refs/remotes/origin`
+    # and local heads -- the missing 62 live on remote-tracking refs for a remote that `git remote -v`
+    # no longer lists. Drop those and the floor silently reverts to the pre-fix value and the allocator
+    # resumes issuing numbers that are already used, with no error and no signal. That is the exact bug
+    # this function was fixed for, so leaving its correctness dependent on nobody tidying refs is not
+    # good enough: persist the high-water mark and never go below it.
+    #
+    # SAFE:      `git fetch origin --prune` -- prunes only refs/remotes/origin/*, which is not where the
+    #            high numbers live. It is also what you SHOULD run before allocating.
+    # DANGEROUS: `git remote prune <name>` / `git remote remove <name>` for a non-origin remote,
+    #            deleting refs/<vault-ish>/*, or an aggressive `gc` / `reflog expire` that drops
+    #            unreachable objects. Those are what this ratchet defends against.
+    $watermark = Join-Path $alloc ".floor-highwater"
+    $computed = [int](($seen | Measure-Object -Maximum).Maximum)
+    $previous = 0
+    if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
+
+    if ($previous -gt $computed) {
+        Write-Host "NOTE: computed $Kind floor $computed is BELOW the recorded high-water $previous." -ForegroundColor Yellow
+        Write-Host "      Using $previous. Refs that carried the higher numbers are missing from this clone;" -ForegroundColor Yellow
+        Write-Host "      re-fetch them before trusting any number-space reasoning here." -ForegroundColor Yellow
+    }
+    $floor = [Math]::Max($computed, $previous)
+    if ($floor -gt $previous) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
     # Measure-Object hands back a [double]; the 'D4' format specifier is integer-only and throws on one.
-    [int](($seen | Measure-Object -Maximum).Maximum)
+    [int]$floor
 }
 
-$start = (Get-Floor) + 1
+# THE FLOOR IS DEFINED ONCE, IN THE GATE, AND READ HERE.
+#
+# Two integers that must agree is the next place this rots: the allocator would go on emitting numbers
+# the gate refuses, and the tool would be sending people straight into a blocked commit while insisting
+# it had given them a valid number. So parse it out of ledger_check.py rather than restating it, and
+# REFUSE to allocate a backlog number if it cannot be read -- guessing a floor the gate will not honour
+# is the failure this whole partition exists to prevent, reintroduced by its own tooling.
+$gateFile = Join-Path $repo "scripts/hooks/ledger_check.py"
+$PublicBacklogFloor = $null
+if (Test-Path $gateFile) {
+    # The optional `(?::[^=]+)?` tolerates a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000`
+    # is idiomatic in a mypy-strict codebase and would otherwise fail to match -- silently disarming
+    # every backlog allocation as the result of an ordinary tidy-up. tests/test_ledger_check.py pins
+    # this contract so the break lands in CI on whoever edits the constant, not on a session days later.
+    $m = [regex]::Match((Get-Content $gateFile -Raw), '(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)')
+    if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
+}
+
+$observed = Get-Floor
+if ($Kind -eq "backlog") {
+    if ($null -eq $PublicBacklogFloor) {
+        throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
+    }
+
+    # THE RESIDUAL DETECTOR, ON APPROACH RATHER THAN ARRIVAL.
+    #
+    # The partition binds only the PUBLIC side; nothing can stop the maintainer-internal sequence
+    # allocating past the boundary, and CI cannot see it -- a public runner checks out origin only. But
+    # THIS machine can: Get-Floor already swept every ref, internal ones included. So the one place the
+    # breach is observable is here, at allocation time.
+    #
+    # Warning only on ARRIVAL would fire exactly when it is too late -- at that point the next internal
+    # allocation already collides and there is no room to move. A check that fires only on collision has
+    # the same practical value as no check for every moment until the collision. So: warn at 90% of the
+    # boundary, with hundreds of numbers of runway left, and REFUSE at the boundary itself.
+    $warnAt = [int]($PublicBacklogFloor * 0.9)
+    if ($observed -ge $PublicBacklogFloor) {
+        throw @"
+REFUSING TO ALLOCATE. The all-refs backlog maximum ($observed) has reached the public floor ($PublicBacklogFloor).
+The partition assumes the maintainer-internal sequence stays BELOW that boundary, and it no longer does
+-- so the next number this would hand out is not safe to use. Raise PUBLIC_BACKLOG_FLOOR in
+scripts/hooks/ledger_check.py (the allocator reads it from there), and say so in the PR.
+"@
+    }
+    elseif ($observed -ge $warnAt) {
+        Write-Host ""
+        Write-Host "WARNING: the all-refs backlog maximum ($observed) is approaching the public floor ($PublicBacklogFloor)." -ForegroundColor Yellow
+        Write-Host "         Still safe -- but the partition's headroom is running out, and at the boundary" -ForegroundColor Yellow
+        Write-Host "         this script will refuse to allocate. Plan to raise PUBLIC_BACKLOG_FLOOR in" -ForegroundColor Yellow
+        Write-Host "         scripts/hooks/ledger_check.py before that happens, not after." -ForegroundColor Yellow
+        Write-Host ""
+    }
+    $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
+}
+else {
+    $start = $observed + 1
+}
 for ($i = $start; $i -lt $start + 500; $i++) {
     $name = if ($Kind -eq "adr") { "{0:D4}" -f $i } else { "$i" }
     $file = Join-Path $alloc "$name.json"

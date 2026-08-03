@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import ssl
 import types
@@ -21,6 +22,7 @@ from messagefoundry.config.tls_policy import (
     InsecureHopRefused,
     _is_forward_secret,
     active_hop_posture,
+    build_smtp_tls_context,
     current_hop_posture,
     enforce_insecure_hop,
     fips_attestation,
@@ -111,17 +113,87 @@ def test_validate_rejects_non_forward_secret() -> None:
 # --- harden_kex_groups -------------------------------------------------------------------------
 def test_harden_does_not_raise_on_real_context() -> None:
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    harden_kex_groups(ctx)  # no-op pre-3.13, set_groups on 3.13+ — either way must not raise
+    harden_kex_groups(ctx)  # must never raise, whatever the runtime can or cannot pin
 
 
-def test_harden_is_noop_without_set_groups() -> None:
-    # A runtime/object lacking set_groups is handled gracefully (older interpreters).
+def test_the_group_pin_is_inert_on_this_runtime_and_says_so() -> None:
+    """A liveness receipt for ASVS 11.6.2 — written to FAIL on the interpreter upgrade.
+
+    ``SSLContext.set_groups`` is a **Python 3.15** addition, so ``harden_kex_groups`` pins nothing on
+    any interpreter this project runs on and ``APPROVED_KEX_GROUPS`` reaches zero of its six call
+    sites. That was already true; what was missing was any way to NOTICE. The tests that stood here
+    asserted (a) that the call does not raise, (b) that it no-ops on an object without the API, and (c)
+    the contents of a string constant — all three pass identically whether or not a single group is
+    ever pinned. That is how the docstring came to claim "Python 3.13+" and how ADR 0092 §4(b), PHI.md
+    §4 and the ASVS scorecard all came to assert a control that does not execute.
+
+    Asserted **unconditionally** on purpose: an ``if hasattr(ctx, "set_groups")`` branch here would
+    restore exactly the property being removed — a test that cannot fail.
+    """
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    pinned = harden_kex_groups(ctx)
+    assert pinned is None, (
+        f"harden_kex_groups pinned {pinned!r}, so this interpreter HAS a group-list API and the ASVS "
+        f"11.6.2 residual has CHANGED. This is good news, not a bug. Re-derive, in one change: the "
+        f"harden_kex_groups docstring, docs/PHI.md §4, docs/ASVS-L2-PHASE0-CHANGES.md, the ADR 0092 "
+        f"§4(b) amendment and the 11.6.2 register row — then rewrite this test to assert the pin TOOK, "
+        f"via ctx.get_groups(), which lands in the same Python version."
+    )
+    assert not hasattr(ctx, "set_groups"), (
+        "set_groups EXISTS but harden_kex_groups still returned None, so the pin is failing silently — "
+        "worse than being unavailable, because the docs would read as satisfied. See the "
+        "logger.warning path."
+    )
+
+
+def test_harden_reports_none_without_set_groups() -> None:
+    # An object lacking the API must be handled gracefully AND report that nothing was pinned.
     fake = types.SimpleNamespace()
-    harden_kex_groups(fake)  # type: ignore[arg-type]
+    assert harden_kex_groups(fake) is None  # type: ignore[arg-type]
+
+
+def test_harden_reports_the_list_it_pinned_when_the_api_exists() -> None:
+    """The return value must be REAL, not incidentally-``None``.
+
+    ``test_the_group_pin_is_inert_on_this_runtime_and_says_so`` asserts ``is None`` — which a function
+    with no ``return`` statement at all also satisfies. On its own it therefore does NOT prove the
+    reporting works: reverting this helper to its old ``-> None`` signature would leave it green. Drive
+    the pinning path with a stand-in context that *has* ``set_groups`` so both halves of the contract
+    are covered, and assert the group list actually reached it.
+    """
+
+    class _Pinnable:
+        def __init__(self) -> None:
+            self.pinned: list[str] = []
+
+        def set_groups(self, grouplist: str) -> None:
+            self.pinned.append(grouplist)
+
+    ctx = _Pinnable()
+    assert harden_kex_groups(ctx) == APPROVED_KEX_GROUPS  # type: ignore[arg-type]
+    assert ctx.pinned == [APPROVED_KEX_GROUPS], "the group list never reached set_groups"
+
+
+def test_a_pin_that_raises_reports_nothing_pinned() -> None:
+    """An OpenSSL build that REJECTS the group list must report ``None``, not the list.
+
+    This was the shipped bug: the helper logged the warning and then fell off the end, so the caller
+    could not distinguish "pinned" from "tried and failed" — and once the helper started reporting, the
+    failure path returning the list would have been a lie with a warning line next to it.
+    """
+
+    class _Rejecting:
+        def set_groups(self, grouplist: str) -> None:
+            raise ValueError("this OpenSSL build rejects the group list")
+
+    assert harden_kex_groups(_Rejecting()) is None  # type: ignore[arg-type]
 
 
 def test_approved_groups_are_ecdhe_curves() -> None:
     assert APPROVED_KEX_GROUPS.split(":") == ["X25519", "secp384r1", "secp256r1"]
+    # NB `secp256r1` is a valid OpenSSL group-list alias but NOT a valid EC curve name — that spelling
+    # is `prime256v1`, and set_ecdh_curve("secp256r1") raises ValueError. Both are correct in their own
+    # API; do not "normalise" them to one.
 
 
 # --- harden_verify_flags -----------------------------------------------------------------------
@@ -541,3 +613,138 @@ def test_the_call_site_scan_examined_real_files() -> None:
     assert sites >= 5, (
         f"expected the known TLS context sites, found {sites} — the scan is not landing"
     )
+
+
+# --- #323: build_smtp_tls_context REFUSES an untrusted peer (behavioural, not attribute) ------------
+#
+# The connector tests assert this context's ATTRIBUTES (verify_mode, check_hostname). That is not the
+# same claim as "it refuses a bad certificate", and an attribute check cannot establish it — the whole
+# defect being fixed was a context whose attributes were never inspected by anyone. These drive a REAL
+# TLS handshake against a locally-minted self-signed server so the refusal is OBSERVED. Run against the
+# pre-#323 code path (smtplib's default context) every REFUSED case below returns HANDSHAKE OK, which
+# is precisely the bug.
+#
+# No network: binds 127.0.0.1 on an ephemeral port, and the server thread only completes a handshake
+# and closes — it speaks no SMTP, because the property under test is the TLS layer, not the protocol.
+
+
+@pytest.fixture(scope="module")
+def _tls_peer(tmp_path_factory: pytest.TempPathFactory) -> tuple[int, str]:
+    """A local TLS server with a self-signed 'localhost' cert. Yields (port, ca_pem_path)."""
+    import datetime
+    import socket
+    import threading
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from cryptography.x509.oid import NameOID
+
+    tmp = tmp_path_factory.mktemp("smtp_tls")
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "localhost")])
+    now = datetime.datetime.now(datetime.UTC)
+    cert = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - datetime.timedelta(days=1))
+        .not_valid_after(now + datetime.timedelta(days=365))
+        .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+        .sign(key, hashes.SHA256())
+    )
+    cert_p, key_p = tmp / "server.pem", tmp / "server.key"
+    cert_p.write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+    key_p.write_bytes(
+        key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        )
+    )
+
+    srv = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    srv.load_cert_chain(cert_p, key_p)
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+
+    def _accept_loop() -> None:
+        while True:
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return  # listener closed at teardown
+            threading.Thread(target=_handshake, args=(conn,), daemon=True).start()
+
+    def _handshake(conn: socket.socket) -> None:
+        # A client that (correctly) refuses us aborts mid-handshake, so OSError here is the EXPECTED
+        # path for the refusal tests, not an error -- suppress on both legs.
+        with contextlib.suppress(OSError):
+            srv.wrap_socket(conn, server_side=True).close()
+        with contextlib.suppress(OSError):
+            conn.close()
+
+    threading.Thread(target=_accept_loop, daemon=True).start()
+    yield listener.getsockname()[1], str(cert_p)
+    listener.close()
+
+
+def _handshake_result(ctx: ssl.SSLContext, port: int, server_hostname: str) -> str:
+    import socket
+
+    try:
+        with (
+            socket.create_connection(("127.0.0.1", port), timeout=10) as sock,
+            ctx.wrap_socket(sock, server_hostname=server_hostname),
+        ):
+            return "ok"
+    except ssl.SSLCertVerificationError:
+        return "refused"
+    except OSError:  # a reset mid-refusal still means the client did not accept the peer
+        return "refused"
+
+
+def test_smtp_context_refuses_an_untrusted_peer(_tls_peer: tuple[int, str]) -> None:
+    """THE regression fence for #323. Pre-fix this returned 'ok' — any certificate was accepted."""
+    port, _ = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination")
+    assert _handshake_result(ctx, port, "localhost") == "refused"
+
+
+def test_smtp_context_accepts_a_peer_signed_by_the_connection_ca(
+    _tls_peer: tuple[int, str],
+) -> None:
+    """tls_ca_file is the supported route for a private-CA relay — it must actually work, or the
+    only remaining escape would be turning verification off."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", ca_file=ca)
+    assert _handshake_result(ctx, port, "localhost") == "ok"
+
+
+def test_smtp_context_enforces_hostname(_tls_peer: tuple[int, str]) -> None:
+    """A trusted chain is not enough: the cert must match the host we meant to reach."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", ca_file=ca)
+    assert _handshake_result(ctx, port, "wrong.example") == "refused"
+
+
+def test_smtp_context_check_hostname_false_relaxes_only_the_name(
+    _tls_peer: tuple[int, str],
+) -> None:
+    """tls_check_hostname=False drops the name check while KEEPING chain validation."""
+    port, ca = _tls_peer
+    ctx = build_smtp_tls_context(
+        host="localhost", cell="Email destination", ca_file=ca, check_hostname=False
+    )
+    assert _handshake_result(ctx, port, "wrong.example") == "ok"
+
+
+def test_smtp_context_verify_false_accepts_anything(_tls_peer: tuple[int, str]) -> None:
+    """The escape genuinely disables verification — asserted so nobody 'hardens' it into a
+    silently-broken state where the escape no longer connects and operators cannot tell why."""
+    port, _ = _tls_peer
+    ctx = build_smtp_tls_context(host="localhost", cell="Email destination", verify=False)
+    assert _handshake_result(ctx, port, "localhost") == "ok"

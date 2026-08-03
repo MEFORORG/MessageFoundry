@@ -8,7 +8,7 @@
   the `dr_backup` audit row whose `archive` anchor this token cross-checks; the config-only server-DB
   backup is the *decoupled* artifact that makes the residual exist) · [ADR 0041](0041-load-path-attestation-and-change-attribution.md)
   (config fingerprint + audit hash-chain) · [ADR 0019](0019-pluggable-keyprovider-hsm-kms-vault.md) (KeyProvider
-  DEK seam) · [`docs/security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md)
+  DEK seam) · `docs/security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`
   (where this residual is signed off, ASVS-style) · BACKLOG **#223** (this), **#102** (the gate this
   extends), **#60/#61** (backup + DR standby), **#52** (server-DB backup/restore = DBA-delegated) ·
   CLAUDE.md §2 (reliability + count-and-log invariants), §9 (PHI: never log a body; on-prem/no-egress)
@@ -74,7 +74,7 @@ engine-seed build.
 The residual is real, bounded, and now **owned, dated, and scheduled for review** rather than implicit in a
 code comment:
 
-- It is recorded as a residual row in [`ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md)
+- It is recorded as a residual row in `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md`
   (theme *PHI data-plane integrity*), with its compensating controls (attestation + provenance probe, both
   fail-closed) and an explicit **trigger to re-score** ("a stale/partial DBA restore causing a clinical
   data-loss incident, or an adopter contract that mandates engine-verified DR vintage").

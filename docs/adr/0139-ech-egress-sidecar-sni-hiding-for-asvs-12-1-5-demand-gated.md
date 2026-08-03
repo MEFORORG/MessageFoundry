@@ -5,7 +5,7 @@
 
 - **Status:** Accepted (2026-07-20) — **Increment 1 (engine-side routing) built + verified** (see *Implementation status*); the sidecar + live ECH stay demand-gated
 - **Date:** 2026-07-20
-- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (transport security) · [ADR 0093](0093-pinned-internal-ca-trust-anchor.md) §3 (ECH/stdlib gap note) · [ASVS-L3-ASSESSMENT-2026-07-20.md](../security/ASVS-L3-ASSESSMENT-2026-07-20.md) §3 (12.1.5 Fail) · [ASVS-L3-RISK-ACCEPTANCE-REGISTER.md](../security/ASVS-L3-RISK-ACCEPTANCE-REGISTER.md) theme 7 · [solutions research](../security/ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md) · BACKLOG **#272**
+- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (transport security) · [ADR 0093](0093-pinned-internal-ca-trust-anchor.md) §3 (ECH/stdlib gap note) · ASVS-L3-ASSESSMENT-2026-07-20.md §3 (12.1.5 Fail) · ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 7 · solutions research (`ASVS-L3-FAILS-SOLUTIONS-RESEARCH-2026-07-20.md`) · BACKLOG **#272**
 
 ---
 

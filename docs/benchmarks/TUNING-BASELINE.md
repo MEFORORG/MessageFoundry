@@ -107,7 +107,7 @@ Tuning that materially affects throughput. Full reference: [`../CONFIGURATION.md
 > ([ADR 0066](../adr/0066-pooled-stage-claimers.md)).
 
 **Cross-cutting:** intake throughput scales with **per-inbound** parallelism and (future) **multi-process**
-deployment, not by relaxing FIFO order — see [`../THROUGHPUT-IMPROVEMENTS.md`](../THROUGHPUT-IMPROVEMENTS.md).
+deployment, not by relaxing FIFO order — see [`../archive/throughput/THROUGHPUT-IMPROVEMENTS.md`](../archive/throughput/THROUGHPUT-IMPROVEMENTS.md).
 A single strictly-ordered feed is capped at one core in every engine; the order-preserving escape hatch
 is per-key lanes (0.2), not unordered delivery.
 

@@ -5,6 +5,7 @@ input/body caps (API-INPUT)."""
 
 from __future__ import annotations
 
+import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -75,6 +76,54 @@ def test_rate_limiter_global() -> None:
     assert rl.allow("a")
     assert rl.allow("b")
     assert not rl.allow("c")  # global cap hit regardless of key
+
+
+# --- ADR 0154 D6: the read-only peek -----------------------------------------
+
+
+def test_would_allow_never_consumes_budget() -> None:
+    # The whole point (AC-13). Intake auth consults the budget before comparing a credential and
+    # charges it only when the comparison fails; if the consult itself charged, intake_auth_rate_limit
+    # would stop bounding brute force and become a per-peer throughput cap.
+    rl = SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=60)
+    for _ in range(50):
+        assert rl.would_allow("a")
+    # ... and the full per-key budget is still there afterwards.
+    assert rl.allow("a")
+    assert rl.allow("a")
+    assert not rl.allow("a")
+
+
+def test_would_allow_agrees_with_allow() -> None:
+    # They share one predicate; a caller that consults one and charges the other must never see them
+    # disagree at the boundary.
+    rl = SlidingWindowRateLimiter(per_key=2, glob=0, window_seconds=60)
+    assert rl.would_allow("a") and rl.allow("a")
+    assert rl.would_allow("a") and rl.allow("a")
+    assert not rl.would_allow("a")
+    assert not rl.allow("a")
+    assert rl.would_allow("b")  # a different key is unaffected
+
+
+def test_would_allow_reports_the_global_bucket_regardless_of_key() -> None:
+    # Pins the hazard AC-19 exists to handle: the global bucket refuses irrespective of key, so a
+    # global arm consulted for EVERY peer would let one attacker deny an authenticated partner. The
+    # limiter is behaving correctly here — the mitigation belongs in the caller, which must consult
+    # the global arm only for peers with no successful authentication in the window.
+    rl = SlidingWindowRateLimiter(per_key=0, glob=2, window_seconds=60)
+    assert rl.allow("attacker")
+    assert rl.allow("attacker")
+    assert not rl.would_allow("innocent-partner")
+
+
+def test_would_allow_prunes_the_expired_window() -> None:
+    # would_allow is "no append", NOT "side-effect free": it must prune, or it compares against
+    # stale counts and stays closed forever after one burst.
+    rl = SlidingWindowRateLimiter(per_key=1, glob=0, window_seconds=0.05)
+    assert rl.allow("a")
+    assert not rl.would_allow("a")
+    time.sleep(0.08)
+    assert rl.would_allow("a")  # the expired hit aged out of the window
 
 
 async def test_admin_write_limiter_per_actor(engine: Engine) -> None:

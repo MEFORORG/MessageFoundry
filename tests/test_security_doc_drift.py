@@ -27,7 +27,7 @@ import re
 from pathlib import Path
 
 import pytest
-from fastapi.routing import APIRoute, APIWebSocketRoute
+from fastapi.routing import APIRoute
 from pydantic import BaseModel
 
 from messagefoundry.api.app import create_app
@@ -40,6 +40,7 @@ from messagefoundry.auth.permissions import (
     Role,
 )
 from messagefoundry.config.settings import AuthSettings, ServiceSettings
+from scripts.security.route_gates import gate_of, route_rows
 
 _ROOT = Path(__file__).resolve().parent.parent
 _DOC = _ROOT / "docs" / "SECURITY.md"
@@ -429,6 +430,16 @@ _CONTEXTUAL_REVIEWED_NON_INPUTS = frozenset(
         # ALERT — no login, session or authorization outcome turns on it (contrast its sibling
         # `bootstrap_expiry_hours`, which DISABLES the account and is therefore an inventoried input).
         "bootstrap_warn_hours",
+        # ASVS 3.7.3: destinations exempted from the "you are leaving this site" interstitial. It
+        # decides whether the operator is SHOWN A NOTIFICATION before an outbound navigation — not
+        # whether any request is authorized. No login, session, permission or authorization outcome
+        # turns on it, and it is never read on an inbound request path at all.
+        #
+        # ⚠️ It IS a security-relevant setting and it LOWERS security when non-empty, which is why the
+        # serve gate warns and names every entry. That makes it a settings-reference concern, not an
+        # 8.1.3/8.1.4 contextual-input one — the two are different questions and this list is the
+        # place the difference gets recorded rather than assumed.
+        "external_link_allowlist",
     }
 )
 
@@ -542,64 +553,26 @@ def _table_with_header(block: str, first_cell: str) -> list[list[str]]:
 # --- route walk (derived from the live app, never hardcoded) -----------------------------------------
 
 
-def _gate_of(call: object) -> tuple[str, tuple[str, ...], str | None] | None:
-    """``(gate name, permission wire strings, action)`` for a route dependency built by one of the
-    ``require*()`` factories, by reading the closure cells the factory captured. Recurses through the
-    ``base`` cell, because require_paced / require_phi_read / require_step_up* wrap ``require``'s
-    closure. Returns ``None`` for a dependency that is not one of those factories."""
-    closure = getattr(call, "__closure__", None)
-    code = getattr(call, "__code__", None)
-    if closure is None or code is None:
-        return None
-    qualname = getattr(call, "__qualname__", "") or ""
-    name = qualname.split(".")[0]
-    if not name.startswith("require"):
-        return None
-    cells = dict(zip(code.co_freevars, closure, strict=False))
-    perms: tuple[str, ...] = ()
-    action: str | None = None
-    base_info: tuple[str, tuple[str, ...], str | None] | None = None
-    for var, cell in cells.items():
-        try:
-            value = cell.cell_contents
-        except ValueError:  # pragma: no cover - an empty cell cannot occur on a built dependency
-            continue
-        if var == "permissions" and isinstance(value, tuple):
-            perms = tuple(p.value for p in value if isinstance(p, Permission))
-        elif var == "action" and isinstance(value, str):
-            action = value
-        elif var == "base":
-            base_info = _gate_of(value)
-    if not perms and base_info is not None:
-        perms = base_info[1]
-    return (name, perms, action)
+# The walk itself lives in scripts/security/route_gates.py — ONE implementation, shared with the DAST
+# authorization sweep (ADR 0155). It used to be a private copy here, and two copies of a derivation are
+# free to disagree in a way nobody can see: messagefoundry/api/security.py already records a refactor
+# that renamed the gate closure's qualname and made EVERY route read as UNGATED. A guard built on this
+# walk therefore has a failure mode where it keeps passing while measuring nothing, and with the walk
+# duplicated that failure would have had to be found TWICE.
+#
+# ``_gate_of`` keeps its private name because ``_ui_route_rows`` below reads the ``require_ui*``
+# closures with it unchanged.
+_gate_of = gate_of
 
 
 def _route_rows() -> list[tuple[str, str, tuple[str, ...], str | None]]:
     """``(method, path, permissions, gate name)`` for every route object of a default ``create_app()``.
-    ``gate name`` is ``None`` when no ``require*()`` dependency was found."""
-    rows: list[tuple[str, str, tuple[str, ...], str | None]] = []
-    for route in create_app().routes:
-        if isinstance(route, APIRoute):
-            methods = sorted(m for m in (route.methods or set()) if m not in ("HEAD", "OPTIONS"))
-            gate: tuple[str, tuple[str, ...], str | None] | None = None
-            for dep in route.dependant.dependencies:
-                found = _gate_of(dep.call)
-                if found is not None:
-                    gate = found
-                    break
-            for method in methods:
-                rows.append(
-                    (method, route.path, gate[1] if gate else (), gate[0] if gate else None)
-                )
-        elif isinstance(route, APIWebSocketRoute):
-            # The WS route authorizes inside the endpoint body, so read its source for the constant.
-            import inspect
+    ``gate name`` is ``None`` when no ``require*()`` dependency was found.
 
-            source = inspect.getsource(route.endpoint)
-            perms = tuple(p.value for p in Permission if f"Permission.{p.name}" in source)
-            rows.append(("WS", route.path, perms, "authorize_ws"))
-    return rows
+    A thin adapter over the shared :func:`scripts.security.route_gates.route_rows`, which returns
+    ``RouteRow`` dataclasses; the tuple shape is what this module's call sites unpack.
+    """
+    return [(row.method, row.path, row.permissions, row.gate) for row in route_rows()]
 
 
 # =====================================================================================================
@@ -1676,14 +1649,33 @@ def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     ``__main__.py`` records the refuse arm as an unresolved owner fork. Derived by slicing the
     approvals block out of the source and asserting it contains no ``return 2``, so promoting it to a
     refusal later reds the doc.
+
+    The slice is taken by **indentation**, not by "up to the next comment banner". The banner boundary
+    was not reference-invariant: it measured whatever happened to sit between the arm and the next
+    banner, so inserting an unrelated refusal after the arm (the ASVS 12.1.1 TLS-floor probe did
+    exactly this) turned the guard red and blamed the approvals arm for a ``return 2`` that was not in
+    it. A gate whose answer depends on unrelated neighbouring code is not measuring its subject.
     """
     source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
     marker = "if admin_exposed and not settings.approvals.enabled"
-    start = source.index(marker)
-    tail = source[start:]
-    # the arm ends at the next top-level comment banner in the serve ladder
-    end = tail.index("\n    # ---", 1)
-    arm = tail[:end]
+    # Slice from the START OF THE LINE, not from the marker itself: the `if`'s own indentation is what
+    # defines its body, and `source.index` lands past the leading whitespace.
+    start = source.rindex("\n", 0, source.index(marker)) + 1
+    lines = source[start:].splitlines(keepends=True)
+    # The arm is the `if` statement and its own body, which is anything indented deeper than the `if`.
+    body_indent = " " * (len(lines[0]) - len(lines[0].lstrip()) + 1)
+    arm_lines = [lines[0]]
+    for line in lines[1:]:
+        if line.strip() and not line.startswith(body_indent):
+            break
+        arm_lines.append(line)
+    arm = "".join(arm_lines)
+    # Liveness receipt: a boundary bug that produced a 1-line slice would make the assertion below
+    # unfailable, so prove the slice actually captured the arm's body before trusting it.
+    assert "warning:" in arm and len(arm_lines) > 5, (
+        f"the arm slice looks wrong ({len(arm_lines)} lines) — the assertion below would pass "
+        f"vacuously. Slice was:\n{arm}"
+    )
     assert "return 2" not in arm, (
         "the approvals-at-exposure arm now REFUSES to start. Move its row out of the WARN action in "
         "docs/SECURITY.md's Table A (and re-check `_CONTEXT_TABLE_A_ROWS`) in the same change."

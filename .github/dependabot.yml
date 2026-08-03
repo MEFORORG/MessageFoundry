@@ -1,14 +1,23 @@
 # Dependabot: surface vulnerable / outdated dependencies and CI actions as PRs (CI-1 / DEP-1).
-# Until a committed lockfile lands, this is the primary signal for a known-CVE dependency.
+# Dependabot's job here is REMEDIATION — it opens the PR that moves the pin. Detection does not rest
+# on it: security.yml's pip-audit audits the committed locks directly (see the DEP-1 note below).
 version: 2
 updates:
   # Python deps via the native "uv" ecosystem (was "pip"). The uv ecosystem resolves against
   # pyproject.toml + uv.lock and REGENERATES uv.lock IN its PRs (version updates GA 2025-03,
   # security updates GA 2025-12) — the old "pip" ecosystem updated requirements/pyproject but NOT
   # uv.lock. It still does not re-derive the EXPORTED locks (requirements.lock + docker/locks/* +
-  # constraints.lock), which the DEP-1 gate in security.yml byte-diffs;
+  # constraints.lock + ci/locks/* — SIX artifacts), which the DEP-1 gate in security.yml byte-diffs;
   # .github/workflows/dependabot-lock-resync.yml re-exports those on the Dependabot branch so the
   # gate stays green.
+  #
+  # VERIFIED by the weekly run of 2026-07-30 (PR #66, Dependabot commit f066c2b8): this ecosystem DOES
+  # reach PEP 735 `[dependency-groups]` (the hash-pinned CI toolchain, ADR 0034 §3) — it bumped
+  # `zizmor==1.5.2` -> `1.28.0` inside `ci-scanners`, touching pyproject.toml + uv.lock only; that
+  # group's exported lock came from the resync workflow named above, exactly the split described. So
+  # at least `ci-scanners` does not go stale silently (`ci-quality` had no candidate in that run, so it
+  # is unobserved, not disproven), and only on the ROUTINE version track. security.yml's pip-audit
+  # still audits ci/locks/*.lock directly, for the reason recorded at that step.
   - package-ecosystem: "uv"
     directory: "/"
     schedule:
@@ -24,6 +33,31 @@ updates:
       # design), now backstopped by the published-GHSA gate in dependabot-auto-merge.yml (SEC-007 #2).
       default-days: 5
       semver-major-days: 7
+    # Dependabot WIDENS a declared cap instead of respecting it, so a load-bearing upper bound in
+    # pyproject.toml must be restated here as a version range or the cap is decorative. PR #66 rewrote
+    # `annotated-types<0.8` -> `<0.9` (BOTH declaration sites) and `ruff>=0.4,<0.16` -> `<0.17`; the
+    # resync then propagated 0.8.0/0.16.0 into constraints.lock, so ci.yml's `--constraint` pinned CI
+    # *to* the broken versions. `python-deps` groups on `*`, so those two red the WHOLE batch and hold
+    # every benign bump in it hostage. WHY each is capped lives beside the cap in pyproject.toml
+    # (annotated-types in [project.dependencies] and in the [fhir] extra; ruff in [dev]) — do not
+    # restate it here; lift a cap and delete its entry in the SAME PR. ONE entry covers BOTH
+    # annotated-types declarations: `ignore` filters a candidate VERSION by package name within this
+    # manifest, not by declaration site, so a second entry would describe nothing.
+    # TRADE-OFF, accepted: `ignore` suppresses the SECURITY track for the named RANGE as well as the
+    # routine one (`update-types` is the version-only knob and cannot express a range). A 0.7.x /
+    # 0.15.x advisory fix still flows. Detection is untouched — security.yml's REQUIRED
+    # `pip-audit -r requirements.lock` covers both on every PR and on the daily cron, so a withheld fix
+    # reds a merge-blocking gate within ~24h and a human lifts the cap. Note the ceiling is the
+    # pyproject CAP, not this entry: a human would have to lift it either way.
+    # NOT IGNORED, deliberately: the exact `==` pins in `[dependency-groups]`, and no blanket
+    # `versioning-strategy: lockfile-only`. Both would freeze the hash-pinned CI toolchain, which ADR
+    # 0034 §3 wants moving THROUGH this machinery — a pinned toolchain outside it rots into
+    # "pinned, stale, unpatched — worse posture than floating".
+    ignore:
+      - dependency-name: "annotated-types"
+        versions: [">=0.8.0"]
+      - dependency-name: "ruff"
+        versions: [">=0.16.0"]
     groups:
       # Version-update grouping (applies-to defaults to version-updates).
       python-deps:
@@ -38,6 +72,16 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    # The uv/npm blocks' fresh-publish dodge, for the ecosystem where auto-merge actually fires: #75
+    # took two of its five bumps to main under 24h from upstream publish (codeql-action v4.37.4 was 7h
+    # old), and a compromised action runs INSIDE CI with whatever token the job holds. SHA-pinning
+    # stops tag mutation, not a malicious new release — Dependabot just bumps the pin to the new SHA.
+    # Only default-days is honored here (this ecosystem does not support the semver-*-days knobs) and
+    # it ages off the tag's commit date rather than the release date, so treat 5 as approximate.
+    # Security updates bypass cooldown, so an advisory fix is unaffected. Watch codeql-action — a
+    # frequent releaser — for stalls after this lands.
+    cooldown:
+      default-days: 5
     groups:
       # One weekly PR for all action bumps instead of one PR per action (CI cost: every extra PR
       # buys a full required-check pass + a push-to-main run when it auto-merges). Mirrors the

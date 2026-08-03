@@ -16,9 +16,14 @@ orchestration) is where a re-ingressed answer's run publishes a per-message view
 correlation lineage — at which point this accessor resolves a real reply. The view it reads is
 **immutable committed** state, so it is re-run-stable by construction (ADR 0009).
 
-**Layering (information hiding, CLAUDE.md §4).** This config-layer module owns only the active-view
-holder + the accessor + the publish helpers; it does **not** import the store. The runner bridges the
-two by publishing a store-derived view here around each run, so the config layer stays store-free.
+**Layering (information hiding, CLAUDE.md §4).** This config-layer module owns the active-view holder,
+the accessor, the publish helpers, and the :class:`CapturedResponse` *record shape* the view carries;
+it does **not** import the store. The runner bridges the two by publishing a store-derived view here
+around each run, so the config layer stays store-free. The record lives here rather than in
+``store/store.py`` (which re-exports it, so every existing import path keeps working) because a
+sandbox worker child has to rebuild it — and ``messagefoundry.store`` is on the sandbox's
+forbidden-import list, so a store-homed record made ``[sandbox].mode=subprocess`` plus a correlated
+LOOPBACK reply non-functional.
 """
 
 from __future__ import annotations
@@ -26,15 +31,42 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from typing import Any
 
 __all__ = [
+    "CapturedResponse",
     "ResponseView",
     "response_get",
     "set_active",
     "reset",
     "activated",
 ]
+
+
+@dataclass(frozen=True)
+class CapturedResponse:
+    """One captured request/response reply (ADR 0013), as returned by ``correlate_response`` for the
+    API/console read surface. ``body``/``detail`` are decrypted here; ``body`` is ``None`` once
+    retention has nulled it (the row is kept, like a purged ``messages.raw``)."""
+
+    message_id: str
+    destination_name: str
+    response_seq: int
+    outcome: str
+    detail: str | None
+    captured_at: float
+    body: str | None
+    # ADR 0021 "Response Sent": 'response' (outbound reply, the default) | 'ack_sent' (inbound ACK we
+    # returned). ack_code/ack_phase are non-PHI disposition metadata, populated only for ack_sent rows.
+    kind: str = "response"
+    ack_code: str | None = None
+    ack_phase: str | None = None
+    # BACKLOG #154 (ADR 0013 amendment): the captured allow-listed HTTP response headers ({} when none /
+    # once retention nulls them). Decrypted + JSON-decoded here; a re-ingressed Handler reads it via
+    # response_get(dest).headers.
+    headers: Mapping[str, str] = field(default_factory=dict)
+
 
 #: The engine-published read view: a read-only mapping ``{destination_name: latest_reply}`` for the
 #: message in scope (Increment 2 populates it). The value shape is whatever the runner publishes; the

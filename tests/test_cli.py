@@ -1367,16 +1367,46 @@ def test_serve_ui_default_on_public_origin_degrades_json_only(
 # --- #186a secure-by-default data retention (bounded PHI-body windows) ----------------------------
 
 
-def test_serve_refuses_unbounded_messages_retention_in_prod(
+def test_serve_auto_bounds_an_unset_body_window_in_prod(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    # A production PHI instance with the inbound-body window unbounded refuses to start — PHI bodies
-    # would accumulate forever. Egress + SMTP pre-satisfied so only the retention gate decides.
-    rc, _ = _run_secure_serve(
+    """UNSET now DEFAULTS to 30 on the enforce dial rather than refusing (owner ruling 2026-07-30).
+
+    This test previously asserted rc == 2 for exactly this config. The change is deliberate and the
+    trade is real: a production PHI instance with an unset window used to refuse to start, which forced
+    an operator to choose a number; it now starts bounded at 30. What survives is the fail-closed path
+    for an EXPLICIT 0 — see the refusal test below, which is the other half of this pair.
+
+    Mutation: drop the auto-bound block — reds, because rc becomes 2 and the window stays 0.
+    """
+    rc, captured = _run_secure_serve(
         tmp_path,
         monkeypatch,
         "security.block_unlisted_outbound = true\n[retention]\ndead_letter_days = 30\n"
         + _SECURE_ALERTS,
+    )
+    assert rc == 0
+    assert captured["retention_settings"].messages_days == 30  # type: ignore[attr-defined]
+    err = capsys.readouterr().err
+    assert "[security].delete_message_bodies_after_days" in err and "defaulted ON (30 days)" in err
+
+
+def test_serve_refuses_an_explicitly_disabled_body_window_in_prod(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An EXPLICIT 0 still refuses — the fail-closed path the auto-bound narrows but does not remove.
+
+    This is the half of the posture that must not regress: "unbounded by accident" is still prevented,
+    because typing 0 is a deliberate act and is still refused unless the audited opt-out is set.
+
+    Mutation: treat an explicit 0 as unset (drop `model_fields_set`) — reds, because the window is
+    silently defaulted to 30 and rc becomes 0.
+    """
+    rc, _ = _run_secure_serve(
+        tmp_path,
+        monkeypatch,
+        "security.block_unlisted_outbound = true\nsecurity.delete_message_bodies_after_days = 0\n"
+        "[retention]\ndead_letter_days = 30\n" + _SECURE_ALERTS,
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -1393,7 +1423,7 @@ def test_serve_refuses_unbounded_dead_letter_retention_in_prod(
         tmp_path,
         monkeypatch,
         "security.block_unlisted_outbound = true\nsecurity.delete_message_bodies_after_days = 30\n"
-        + _SECURE_ALERTS,
+        "[retention]\ndead_letter_days = 0\n" + _SECURE_ALERTS,
     )
     assert rc == 2
     err = capsys.readouterr().err
@@ -1418,7 +1448,14 @@ def test_serve_retention_auto_bounds_in_staging(
     assert retention.messages_days == 30 and retention.dead_letter_days == 30  # type: ignore[attr-defined]
     err = capsys.readouterr().err
     assert "defaulted ON (30 days)" in err
-    assert "accumulate without bound" not in err  # auto-bounded, no longer merely warns
+    # The AUTO-BOUNDED windows must not appear in the warn-only line — that is what "auto-bound rather
+    # than merely warn" means. This used to assert the phrase was absent ENTIRELY, which worked only
+    # while the classification held nothing but auto-bounded windows; state_max_age_days and
+    # search_preset_days now legitimately warn, so the narrow assertion is the one that keeps testing
+    # the original intent instead of the coincidence.
+    warn_line = next((ln for ln in err.splitlines() if "accumulate without bound" in ln), "")
+    assert "[security].delete_message_bodies_after_days" not in warn_line, warn_line
+    assert "[retention].dead_letter_days" not in warn_line, warn_line
     assert "refusing to start" not in err
 
 

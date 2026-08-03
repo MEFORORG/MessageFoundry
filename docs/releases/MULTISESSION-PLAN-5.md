@@ -19,7 +19,7 @@
 > `Proposed`).
 >
 > **Numbering state.** **Next free ADR file = `0043`** (0042 = embedded-document pruning, used). **But two
-> pre-existing RESERVED ADR rows in [`docs/adr/README.md`](adr/README.md) must be consumed first, not
+> pre-existing RESERVED ADR rows in [`docs/adr/README.md`](../adr/README.md) must be consumed first, not
 > re-numbered:** **`0023`** = Inbound HTTP listener (#7, README line 42, **Reserved**) and **`0029`** =
 > Email/SMTP destination (#23, README line 48, **Reserved** — it "was earmarked 0024 before SMART claimed it").
 > Additionally, **#30 already has an ADR**: **`0026`** (*Off-box egress posture for the MEFOR version

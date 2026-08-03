@@ -2,8 +2,15 @@
 
 **Audience:** contributors and maintainers working on MessageFoundry. This page describes what
 Continuous Integration runs on a pull request, which checks must pass before a change can merge, and a
-few gotchas that have cost real debugging time. Branch protection on `main` is the source of truth for
-which checks are *required* — this page describes the intended layout.
+few gotchas that have cost real debugging time.
+
+Branch protection on `main` is the **server-side** source of truth for which checks are *required*.
+Because that is unreadable from a clone, the set is mirrored in
+[`.github/required-contexts.txt`](../.github/required-contexts.txt) — the checked-in claim that this
+page and every other in-repo statement must agree with, asserted by `tests/test_required_contexts.py`.
+Prose lists are what drift: this page understated the required set by four blocking security gates and
+named the CLA context by the wrong string. Edit the canonical file, and let the test tell you which
+claims move with it.
 
 ## Workflows
 
@@ -14,7 +21,8 @@ which checks are *required* — this page describes the intended layout.
 | `codeql.yml` | GitHub CodeQL analysis (python / javascript-typescript). |
 | `scorecard.yml` | OpenSSF Scorecard analysis. |
 | `cla.yml` | CLA Assistant — records the Contributor License Agreement signature on each PR. |
-| `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens). **Blocking.** |
+| `zizmor.yml` | Lints the workflow files themselves for insecure patterns (template injection, over-broad tokens), and runs `actionlint` on the workflow syntax. Hard-fails, but **not a required check** — it is paths-filtered, so it does not report on a PR that touches no workflow, and requiring it would wedge every such PR. The `actionlint` pre-commit hook is the local half. |
+| `dast.yml` | Authenticated authorization sweep against a live loopback listener in front of a real engine. **Not a required check** — nightly / release-tag / manual dispatch only, with no `pull_request` trigger, so it never reports on a PR and cannot wedge one. It is NOT `continue-on-error`: it goes red on a finding. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md). |
 | `quality-advisory.yml` | Advisory quality measurement — complexity (ruff `C901`), duplication (`jscpd`), diff-coverage (`diff-cover`) and mutation testing (`mutmut`). **Every job is advisory and none is in branch protection.** See below for how each signal reaches a reviewer. |
 
 Several heavier legs (server-DB store tests, load/throughput, service-smoke, DICOM/FHIR breadth) run
@@ -24,7 +32,8 @@ would otherwise wedge the PR — see the gotcha below).
 
 ## Checks required to merge
 
-The stable contexts required on `main` are:
+The stable contexts required on `main` are — mirroring
+[`.github/required-contexts.txt`](../.github/required-contexts.txt), which is the file to edit:
 
 - `CI gate`
 - `test (ubuntu-latest, py3.14)`
@@ -32,12 +41,25 @@ The stable contexts required on `main` are:
 - `test (windows-2025, py3.14)`
 - `bandit (Python SAST)`
 - `pip-audit (dependency vulnerabilities)`
+- `npm-audit (ide dependency vulnerabilities)`
+- `gitleaks (secret scan)`
+- `semgrep (project SAST rules)`
+- `crypto-inventory (ASVS 11.1.3 discovery gate)`
 - `forbidden-content (customer/PHI leak guard)`
-- `CLA Assistant`
+- `a PR that implements BACKLOG #N must update BACKLOG.md`
+- `cla`
 
-CodeQL and Scorecard run on PRs but are **advisory** (not in the required set) — their SARIF upload needs
-`security-events: write`, which fork-PR tokens do not have, so requiring them would block PRs from forks.
-Nightly / path-gated legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
+That last string is the **job key** in `cla.yml`, whose job declares no `name:`. Branch protection
+matches the job name, never the workflow name — so the context is `cla`, not "CLA Assistant". Every
+non-advisory job in `security.yml` is in the set; the two that are not (`sbom`, `trivy`) declare
+`continue-on-error: true`, and `tests/test_security_posture.py` pins which side of that line each one
+is on.
+
+CodeQL is **advisory** (not in the required set) — its SARIF upload needs `security-events: write`,
+which fork-PR tokens do not have, so requiring it would block PRs from forks. Scorecard is advisory for
+the same reason and additionally **does not run on PRs at all** (`scorecard.yml` has no `pull_request`
+trigger — it runs on push-to-main, a schedule, and branch-protection changes). Nightly / path-gated
+legs (service-smoke, load, SQL/Postgres store) are deliberately **not** required.
 
 The `quality-advisory.yml` jobs create **no code-scanning category** and **no _required_ check context** —
 they do report as ordinary advisory checks, and they **must never be added to the required list**. Two
@@ -115,16 +137,27 @@ an unrelated PR without turning the gate red.
 
 ## Gotchas
 
-- **Run `actionlint` on every `ci.yml` edit.** GitHub interpolates `${{ }}` expressions *anywhere* in a
-  `run:` script — comments included — before the shell sees it, so a stray/invalid expression aborts
-  workflow compilation: **no jobs are created**, the run is attributed to a phantom event, and required
-  contexts silently never appear (the PR just looks stuck). `zizmor` does not catch this; `actionlint`
-  does.
+- **`actionlint` runs on every workflow edit — let it.** GitHub interpolates `${{ }}` expressions
+  *anywhere* in a `run:` script — comments included — before the shell sees it, so a stray/invalid
+  expression aborts workflow compilation: **no jobs are created**, the run is attributed to a phantom
+  event, and required contexts silently never appear (the PR just looks stuck). `zizmor` does not catch
+  this; `actionlint` does. This used to be an instruction aimed at human memory, which is the wrong
+  mechanism for a failure whose symptom is "the PR is stuck" and whose tempting remedy is relaxing
+  branch protection. It is now a **pre-commit hook** scoped to `.github/workflows/**`, plus a step in
+  `zizmor.yml` (which is already paths-filtered). The hook is the load-bearing half —
+  `zizmor.yml` is not a required check.
 - **Pass matrix/expression values through `env:`, don't inline them in `run:`.** A dynamic
   `matrix: ${{ fromJSON(...) }}` defeats zizmor's static analysis, which then flags its expansion inside
   `run:` as template injection. The fix is to route the value through `env:` — the remedy endorsed in
   `.github/zizmor.yml` — not to suppress the rule. The same applies to any secret used in a `run:` step:
   write it to a file via an intermediate `env:` var rather than inlining `${{ secrets.* }}`.
+- **The advisory `dast.yml` scan has a merge-blocking half, and it lives somewhere else.**
+  `tests/test_dast_auth_sweep.py` runs inside the existing required `test` legs and drives the *same*
+  shipped sweep, proving its two canaries still detect an injected defect. So a change that **blinds the
+  detector** reds a PR even though the nightly scan itself is advisory: the probe's *ability to fail*
+  gates the merge, the probe *run* does not. `dast.yml` has no `pull_request` arm, so it never reports on
+  a PR — and `nightly-notice.yml` watches only `ci.yml`, so a red DAST nightly surfaces in the Actions
+  tab rather than as an issue. See [ADR 0155](adr/0155-dast-dynamic-security-testing-of-the-running-engine.md).
 - **A SQL-Server test leg can die with a native segfault** (exit 139, in the DB driver). It hits `main`
   too — it is not a regression in your PR. Clear it with `gh run rerun <run-id> --failed`.
 - **`prod` is a fail-closed PHI environment.** `serve --env prod` refuses to start without a store

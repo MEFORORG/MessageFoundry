@@ -395,12 +395,106 @@ per-database property, not a server version; `CREATE OR ALTER` needs 2016 SP1. A
 compat-120 database and under a DDL-denied principal.
 
 **Startup gate (fail-safe to the batch, loudly).** With `fifo_claim_proc` ON, `open()` probes: (a)
-`OBJECT_ID` of **both** procs; (b) a SHA-256 of each deployed body via `OBJECT_DEFINITION()` against the shipped
-DDL text (normalized) — **existence alone cannot catch a hand-edited body**, and the ADR 0064 marker covers only
-in-repo edits, while the proc *is* the claim logic; (c) `compatibility_level ≥ 130`. Any failure → the store
-records `claim_proc_effective = False`, logs a **WARNING naming the reason**, sets a degraded gauge, and runs
-the shipped batch — never a lane outage; the hot path contains **no error-2812 handling**. Out-of-band drift is
-caught at the next open; `DELETE FROM schema_meta` forces a full re-create.
+`OBJECT_ID` of **both** procs; (b) a SHA-256 of each deployed body via `OBJECT_DEFINITION()` against the
+**stored forms** of the shipped DDL text (normalized) — **existence alone cannot catch a hand-edited body**, and
+the ADR 0064 marker covers only in-repo edits, while the proc *is* the claim logic; (c) `compatibility_level ≥
+130`. Any failure → the store records `claim_proc_effective = False`, logs a **WARNING naming the reason**,
+publishes the degraded gauge (see the second amendment below), and runs the shipped batch — never a lane
+outage; the hot path contains **no error-2812 handling**. Out-of-band drift is caught at the next open.
+
+> **AMENDMENT (2026-07-30) — `OBJECT_DEFINITION()` does not return the submitted text, and this gate was
+> inert until it was fixed.**
+>
+> SQL Server does not store a `CREATE OR ALTER` module verbatim: it **deletes the `OR` and `ALTER` keyword
+> tokens and keeps their separators**, so a head submitted as `CREATE OR ALTER PROCEDURE dbo.x` is returned by
+> `OBJECT_DEFINITION()` as `CREATE` + three spaces + `PROCEDURE dbo.x` (character delta exactly 7; everything
+> after the head byte-identical). MEASURED on SQL Server 2022 16.0.4255.1 and 2025 17.0.4055.5, compat
+> 130/160/170, across five deploy paths (fresh `CREATE`, the `OR ALTER` re-apply, a plain batch, inside the
+> shipped guarded `EXEC(N'…')`, and an out-of-band `ALTER PROCEDURE` — which the engine also rewrites, to a
+> single-spaced `CREATE PROCEDURE`). Case is preserved, not folded; `PROC` survives as `CREATE   PROC`.
+>
+> Because the gate as originally implemented hashed the **submitted** text, it **could never pass for a proc
+> deployed by `_claim_proc_ddl`, on any engine that function can deploy to** — sub-lever A degraded to the batch
+> on every open, in every deployment, from the feature shipping until this amendment. The lever was inert, not
+> merely unused. (Scope note: this is a statement about *this* deploy path, not about every conceivable module.)
+>
+> The fix is **shipped-side only**: the gate now compares the deployed hash against a small set of
+> code-controlled constants — the head forms a server may store for a module *this build* deployed
+> (`_CLAIM_PROC_STORED_HEADS`: the measured `rewritten` form, plus the `verbatim` form for a hypothetical
+> non-rewriting engine). `_claim_proc_body()` renders byte-identically, so `_claim_proc_ddl`, `_SCHEMA`,
+> `_schema_hash()` and the golden body pins are untouched: **no re-pin and no forced DDL re-apply on any live
+> database.** The expected map is keyed **per proc**, so the cid body served under the dst name (reachable via
+> `sp_rename`, which does not rewrite `sys.sql_modules.definition`) degrades rather than silently swapping the
+> lane predicate. Head spellings this deploy path cannot emit (`CREATE PROC`, differing case) keep failing the
+> gate: each is affirmative evidence of an out-of-band hand deploy, which is the AC-7 event.
+>
+> The accepted set is exactly two constants over **normalized** text. It is *not* two byte strings —
+> `_normalize_tsql` still applies to the deployed side, so its whitespace collapse remains semantically lossy
+> inside comments and string literals. That is contained by the AC-8 body lint (no quotes, no `--`, no `/*`,
+> ASCII-only), which is now load-bearing rather than defensive.
+>
+> **`DELETE FROM schema_meta` was previously prescribed here as the remedy for a body mismatch. It could not
+> work** — the re-apply submits the same text, the engine rewrites it the same way, and the hash mismatches
+> again — so the advice has been removed from the ADR and from the operator-facing degraded reason.
+
+> **AMENDMENT (2026-07-31) — the degraded gauge now exists, and probe (a) is a real probe again.** Two
+> follow-ups the amendment above deliberately held out of the bug fix.
+>
+> **1. The gauge was aspirational.** AC-7 requires "a WARNING naming the reason **+ degraded gauge**", and this
+> section's compensating-control story assumes an operator can SEE the degraded state. Until this amendment
+> nobody could: `claim_proc_effective` / `claim_proc_degraded_reason` were read by the store's own tests and
+> **nothing else** — no `/stats`, no `/status`, no `/metrics`, no console. The entire operator signal was one
+> WARNING line at `open()`. That is not a missing nicety, it is a load-bearing part of *why the amendment above
+> was needed*: a fleet running the flag degraded on every open, forever, and the only thing that could have
+> told anyone was a log line nobody was watching which named the wrong cause.
+>
+> The gauge is now a store accessor, `claim_proc_status()`, surfaced on three operator surfaces:
+>
+> | surface | carries |
+> |---|---|
+> | `GET /status` → `claim_proc` | `effective`, the human-readable `degraded_reason`, and the matched `head_forms` |
+> | `GET /metrics` | `messagefoundry_store_claim_proc_effective` (0/1) and `messagefoundry_store_claim_proc_head_verbatim` (0/1) |
+> | the console's store panel (`/ui/status`) | active-vs-degraded, plus the reason when degraded / the head forms when green |
+>
+> Three shape decisions, so they are not re-litigated. **`None` when the flag is off**, so "not requested" is a
+> distinct state from "requested and degraded"; the Prometheus series are correspondingly **absent**, not a
+> constant `0` that every SQLite fleet would publish unalertably. **No reason label in the exposition** — the
+> reason is free text embedding a proc name and, on the probe-failure arm, an exception string, so a label
+> would be unbounded cardinality *and* a breach of the exporter's strict `{connection, destination, status,
+> version, le}` allowlist; the string lives on `/status` and the console instead. **It does not feed the
+> console's engine-health heart**: a degrade is a performance lever not paying off, claims keep flowing, and
+> making the nav cry wolf about it would devalue the signal that means the store is actually unwell.
+>
+> `head_forms` (proc name → `rewritten` | `verbatim`) is surfaced for the same reason it is logged: a fleet
+> reporting `verbatim` is a live counterexample to `_CLAIM_PROC_STORED_HEADS`'s compatibility assumption — no
+> engine measured to date stores the `CREATE OR ALTER` head unrewritten — and it was previously visible only
+> at INFO. Observability only: the accept/degrade logic is untouched.
+>
+> **2. A missing `VIEW DEFINITION` grant was reported as a missing proc.** This section has always specified
+> probe (a) as "`OBJECT_ID` of **both** procs", but the implementation folded (a) into (b) and inferred absence
+> from a NULL `OBJECT_DEFINITION`. **MEASURED** (2026-07-31, on the lab SQL Server): a principal holding only
+> `EXECUTE` on the proc gets a non-NULL `OBJECT_ID` and a **NULL** `OBJECT_DEFINITION`; the compat probe still
+> passes. So a deployed, working, correct procedure was reported as *missing*, and the operator was sent to fix
+> a `CREATE PROCEDURE` permission that was neither the cause nor the cure. `WITH ENCRYPTION` produces the
+> identical NULL and the identical misdiagnosis — and because *that* half needs no security principal, it is
+> now a live test leg (`test_a_deployed_proc_can_return_a_null_definition`), which pins on a real server the
+> one thing an offline stub cannot show: that the two functions genuinely disagree. The permission half stays
+> deferred with AC-10's other permission scenarios to a purpose-configured server.
+>
+> This is not a hypothetical posture here: §5's sub-lever B design explicitly serves "a fleet whose DB
+> principal can never hold `CREATE PROCEDURE`" — DBA-provisioned procs plus a least-privilege app principal —
+> which is exactly the deployment shape that hits it. The probe now returns `OBJECT_ID` beside the definition
+> and the two conditions get separate reasons:
+>
+> | condition | reason |
+> |---|---|
+> | `OBJECT_ID` NULL | genuinely absent — guarded DDL skipped, `CREATE PROCEDURE`/ALTER-on-schema denied, or a pre-2016-SP1 engine |
+> | `OBJECT_ID` non-NULL, `OBJECT_DEFINITION` NULL | deployed but unreadable — **`GRANT VIEW DEFINITION`**, or the module is `WITH ENCRYPTION` |
+>
+> Both still **degrade** — the gate hashes the body and cannot pass on one it cannot read — so no accept/reject
+> behaviour changed; only the diagnosis did. The probe SQL is pinned by an exact-match assertion in the
+> offline suite (a typo'd probe must fail loudly rather than silently match), so that pin moved with it and
+> stayed exact.
 
 **Versioning, mixed vintages, downgrade.** Procs are **name-versioned** (`_v1`, `_v2`, …): engine sharding runs
 N processes against ONE unified store (ADR 0037/0063), so a rolling upgrade briefly runs two builds against one
@@ -413,6 +507,9 @@ repeated "schema DDL batch applied" lines mid-rollback knows it is expected. **G
 owns the procs (EXECUTE implicit via ownership); a hardened split-principal deployment must `GRANT EXECUTE` — an
 ops-doc line, not a code path. **Two-copies drift** (batch vs proc bodies) is contained by the content hash +
 the body-definition probe + a lint test diffing the proc DDL's statement sequence against the batch construction.
+(Until the 2026-07-30 amendment the body-definition probe was **not** a real compensating control: it compared
+against text no server could return, so its verdict was constant and a genuine tamper was indistinguishable from
+baseline. The content hash and the DDL-vs-batch lint were carrying that containment alone.)
 
 ### 5. Sub-lever B — stable statement text + a retained prepared claim cursor (the non-DDL fallback lane)
 
@@ -641,10 +738,26 @@ states, including the mismatch and 1222 translations). **Any miss = the flag sta
   injected-row test.
 - **AC-6** — The three flags SHALL be provable no-ops on SQLite and Postgres (neither backend references them).
   → sentinel test (the ADR 0075 precedent).
-- **AC-7** — WHEN `fifo_claim_proc` is ON and a proc is missing, its `OBJECT_DEFINITION` hash mismatches the
-  shipped body, or compat < 130, the store SHALL degrade loudly to the shipped batch (WARNING naming the reason
-  + degraded gauge), never a lane outage; the hot path SHALL contain no error-2812 handling. → startup-gate
-  tests incl. a hand-edited-body leg.
+- **AC-7** — WHEN `fifo_claim_proc` is ON and a proc is missing, is deployed but its definition unreadable
+  (`OBJECT_ID` resolves, `OBJECT_DEFINITION` NULL), its `OBJECT_DEFINITION` hash mismatches every form this
+  build deploys, or compat < 130, the store SHALL degrade loudly to the shipped batch (WARNING naming the
+  reason + degraded gauge), never a lane outage; the hot path SHALL contain no error-2812 handling. → startup-
+  gate tests incl. a hand-edited-body leg and an unreadable-definition leg.
+- **AC-7c** — The degraded gauge SHALL be a surface an operator can READ, not merely an attribute: `/status`
+  (with the reason string), `/metrics` (numeric, label-less, ABSENT rather than 0 when the lever is not
+  requested) and the console store panel SHALL each emit it. → surface-emission tests
+  (`test_adr0114_claim_proc_surfaces.py`), asserting the rendered output, not the property.
+  > Added by the 2026-07-31 amendment. AC-7 as written required a gauge and nothing required anyone to be able
+  > to see it; the two properties existed and were read by the store's own tests alone. A "loud" degrade whose
+  > only audience is a log line is how this lever stayed inert in every deployment for its whole life.
+- **AC-7b** — WHEN `fifo_claim_proc` is ON and both procs are deployed **by this build's own DDL**, the gate
+  SHALL **PASS** and `claim_proc_effective` SHALL be True, verified against a **real SQL Server** (not a stub
+  that echoes the submitted text back as the deployed body). → `test_adr0114_claim_proc_live.py`, plus an
+  offline round-trip whose "deployed" fixture independently models the engine's module rewrite.
+  > Added by the 2026-07-30 amendment. AC-7 as originally written is **one-directional** — it requires the gate
+  > to degrade when the body mismatches, and nothing anywhere required a *correctly deployed* proc to pass. The
+  > shipped defect therefore **satisfied AC-7 literally** while leaving the lever inert, and AC review could not
+  > have caught it. Any future gate-shaped AC needs both directions or it is not a gate.
 - **AC-8** — The proc bodies SHALL contain no `BEGIN/COMMIT/ROLLBACK`, no `TRY/CATCH`, no `SET XACT_ABORT`, and
   no `LOCK_TIMEOUT` reset outside the `@fold_reset` tail; `@@TRANCOUNT` on exit SHALL equal entry. → DDL lint
   test + a trancount probe test.

@@ -54,10 +54,11 @@ jobs:
     # runner label set; the per-repo matrix is built in `changes`.
     runs-on: ${{ matrix.hosted }}
     # Wall-clock backstop: bound each leg so a hung test fails in minutes, not the 6h default. Three
-    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (60s,
-    # pyproject addopts) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
-    # has its own `timeout-minutes: 13` so a process-level deadlock below pytest fails the step fast;
-    # this job cap is the outermost belt if even that is somehow out-raced.
+    # nested watchdogs catch a hang at increasing scope (#55): the pytest-timeout per-test cap (matrix
+    # `pytest_timeout`, 60s ubuntu / 120s Windows -- the step passes `--timeout=`, which overrides the
+    # pyproject addopts value) + the faulthandler belt fire FIRST and name the stuck frame; the pytest STEP
+    # has its own `timeout-minutes` (matrix `step_timeout`) so a process-level deadlock below pytest
+    # fails the step fast; this job cap is the outermost belt if even that is somehow out-raced.
     timeout-minutes: ${{ matrix.job_timeout }}
     strategy:
       fail-fast: false
@@ -113,6 +114,29 @@ jobs:
           git fetch --no-tags --depth=200 origin main
           python scripts/hooks/ledger_check.py --ci
 
+      # ALSO DELIBERATELY UNGATED, for exactly the reason the step above is — and it was NOT, which
+      # cost `main`.
+      #
+      # Two guards police docs/BACKLOG.md. The number-space gate above is ungated because "gating it
+      # would skip it on exactly the pull requests it exists to police". The STATUS invariant was
+      # reachable only through pytest, which IS gated on `code == 'true'` — so on a BACKLOG-only PR
+      # (the exact shape it exists to check) it did not run at all.
+      #
+      # On 2026-08-01 that landed a #320 entry whose banner used an emoji the invariant does not
+      # accept. The PR was docs-only, went green in seconds without compiling the suite, merged, and
+      # red `main` for every other session until someone else's PR tripped over it. A 0.6s markdown
+      # parse would have caught it. One hardened guard and one unhardened guard over the same file is
+      # worse than neither, because the hardened one makes it reasonable to assume BACKLOG changes are
+      # covered.
+      #
+      # No install needed, so the step above's "git + stdlib python, costs seconds" property holds:
+      # scripts/docs/backlog_status_check.py imports only argparse/re/sys/pathlib and has its own CLI.
+      # tests/test_backlog_status_check.py imports that SAME module, so there is one implementation and
+      # the unit tests keep covering its edge cases — this only adds the always-on invocation.
+      - name: Backlog status invariant (ungated — see above)
+        if: runner.os == 'Linux'
+        run: python scripts/docs/backlog_status_check.py
+
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.
       - name: Install Qt offscreen system libraries
@@ -129,10 +153,11 @@ jobs:
       #
       # EVERY install below passes `--constraint constraints.lock` — the HASHLESS export of uv.lock, kept
       # in sync by the DEP-1 gate. Without it, `uv pip install -e ".[extras]"` RE-RESOLVES from
-      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 (626
-      # lint errors) and annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY
-      # open PR on the same day. The constraint pins every version to the lock while each job still
-      # installs only ITS OWN extras (so the narrow image-smoke set stays narrow).
+      # pyproject's `>=` floors and silently adopts whatever upstream published since: ruff 0.16.0 and
+      # annotated-types 0.8.0 (dropped `SLOTS`, broke fhir-core) each reddened EVERY open PR on the same
+      # day — see each cap's rationale in pyproject.toml. The constraint pins every version to the lock
+      # while each job still installs only ITS OWN extras (so windows-service-smoke's deliberately
+      # narrow set stays narrow; the docker-smoke job builds from docker/locks/* and installs nothing).
       - name: Set up uv
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
@@ -199,21 +224,191 @@ jobs:
         if: (needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch') && runner.os == 'Linux'
         run: mypy --platform win32 messagefoundry
 
-      # Step-level watchdog UNDER the 15-min job cap (#55): the windows-2022 leg intermittently
+      # Step-level watchdog UNDER the job cap (#55): the windows-2022 leg intermittently
       # wedges ~25% in (a Windows ProactorEventLoop listener-teardown / socket wait that the shared
       # session event loop can't get past), emits no output for ~12 min, then the JOB cap CANCELS it
       # — a red ✗ with no stack and no named test. Two belts make that fail FAST and NAMED instead:
       #   * `--timeout-method=thread` (the ONLY method on Windows — SIGALRM is POSIX-only) dumps ALL
-      #     thread stacks at the per-test cap (60s, set in pyproject addopts), naming the stuck frame.
-      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=90` is the belt that fires even when the
+      #     thread stacks at the per-test cap (matrix `pytest_timeout`, 120s on these Windows legs),
+      #     naming the stuck frame.
+      #   * PYTHONFAULTHANDLER=1 + `-o faulthandler_timeout=` (matrix `fault_timeout`) is the belt that fires even when the
       #     thread-timer CANNOT interrupt a main-thread C-level wait (a Proactor overlapped op /
       #     blocking accept / subprocess.wait): pytest's faulthandler plugin arms a separate watchdog
-      #     thread that dumps the NATIVE stack of every thread at 90s (> the 60s pytest-timeout, so the
+      #     thread that dumps the NATIVE stack of every thread at `fault_timeout` (150s here, 90s on
+      #     ubuntu -- always set ABOVE that leg's `pytest_timeout`, so the
       #     per-test dump is attributed first; this is the last-resort stack when the thread method is
       #     itself out-raced). NB the plugin exposes this as the `faulthandler_timeout` ini key, not a
       #     `--faulthandler-*` CLI flag, so it is passed with `-o`; it only DUMPS (never kills), safe.
-      # The step `timeout-minutes: 13` is the outer backstop, well under the job's 15-min cap, so a
-      # hang both watchdogs somehow miss still fails the STEP (not the whole job at the silent cap).
+      # The step `timeout-minutes` (matrix `step_timeout`) is the outer backstop, held well under the
+      # job's own cap, so a hang both watchdogs somehow miss still fails the STEP (not the whole job at
+      # the silent cap). Keep the gap: the step must expire BEFORE the job, or the failure surfaces as
+      # an uninformative job-level kill with no step attribution.
+      #
+      # THAT GUARANTEE COVERS THE FIRST GATED STEP ONLY, and saying otherwise would be a control resting
+      # on a false premise. `Web console tests (pytest)` carries the SAME `step_timeout` but runs after
+      # `Tests (pytest)`, so reaching it has already spent setup + `Tests`; its own cap cannot fire first
+      # at any job_timeout worth setting (it would take ~39 min on ubuntu, ~73 min on Windows). A hang
+      # THERE is still an unattributed job-level kill. Measured under `Tests (pytest)` below; the
+      # structural fix is BACKLOG #344 proposal 5.
+      #
+      # It only works while the cap stays clear of a HEALTHY run. On 2026-07-31 the ubuntu leg finished
+      # green in 775s against a 780s cap -- 5s of margin -- and the step was killed anyway, reported as
+      # a failure on a run whose last line was "9598 passed, 855 skipped". A watchdog that cannot
+      # separate "deadlocked" from "slow today" stops being a watchdog and becomes a coin flip, so the
+      # ubuntu budget is raised here. Re-check the margin when the suite grows.
+      #
+      # It then happened again on WINDOWS, 2026-08-01, because the sentence that used to close this
+      # paragraph asserted the Windows legs held "~2x headroom" and nobody re-derived it. PR #119 was
+      # killed at 26:07 against the 26:00 cap with ZERO tests failing. What moved was the suite, not the
+      # code under test: #74 landed tests/test_worktree_prune_merged.py (1,506 lines) and windows-2025
+      # went 19:35 -> 26:07 on the same branch. The claim was already false when it was written.
+      #
+      # Measured by timing the `Tests (pytest)` STEP, which is what step_timeout gates. NOT the job: the
+      # job runs several minutes longer and is capped separately, and at least three sessions misread job
+      # durations as step durations while triaging this (c53f752b's JOB ran 28:41 and PASSED, because
+      # job cap 30 vs step cap 26).
+      #
+      # POOL: every run of THIS workflow created on 2026-08-01 UTC -- 70 runs. Enumerated with
+      # `gh api --paginate` over a deliberately WIDER window and filtered locally on `created_at`, then
+      # cross-checked against the narrow `?created=` query (same 70 ids, symmetric difference 0). Rows
+      # are each leg's `Tests (pytest)` step, kept when THAT STEP concluded success. n is per leg.
+      #
+      #   leg              max passing step   n    old cap   old margin
+      #   ubuntu-latest    12:31              42   19:00     1.518x
+      #   windows-2022     21:34              39   26:00     1.206x
+      #   windows-2025     25:51              36   26:00     1.006x   <- NINE SECONDS
+      #
+      # THESE MAXIMA ARE LOWER BOUNDS, BECAUSE THE POOL IS RIGHT-CENSORED. Every run in it predates #131
+      # (28d186b5, landed 2026-08-02T00:35:28Z), so Windows ran under step 26:00 / job 30:00 and ubuntu
+      # under 19:00 / 22:00. A run that wanted longer than its cap was KILLED at the cap and then --
+      # correctly, by the filter above -- dropped for not concluding success. So 25:51 is the largest
+      # step that FIT in 26:00, not the largest the suite wants. Sizing a cap as a multiple of a
+      # censored maximum under-provisions by construction, and that is exactly how "1.06x" read as
+      # survivable right up until #119's leg was killed at 26:07. (#119 itself merged, 2026-08-02T01:45Z
+      # -- what the cap killed was a run, not the PR. Saying a PR "died" here reads as never-landed and
+      # had already propagated into docs/WORKTREES.md as exactly that claim.)
+      #
+      # THE CENSORED VALUES ARE VISIBLE IF YOU ASK FOR THEM, AND THEY MATTER. The jobs endpoint defaults
+      # to `filter=latest`, which hides a killed attempt behind its passing re-run; `?filter=all` shows
+      # both. #119's 26:07 is in this very pool that way (run 30717229521 attempt 1, `8c407fb5`, step
+      # conclusion FAILURE) beside its 22:25 attempt-2 success -- a 3:42 spread on identical code, and
+      # the first day AFTER the raise produced 26:23 TWICE, both concluding SUCCESS (runs 30728793103
+      # and 30731407003). So the population really does exceed the old 26:00 cap: the largest windows-2025
+      # `Tests (pytest)` execution observed to date is 26:23, not 25:51.
+      #
+      # THIS TABLE HAS BEEN WRONG TWICE. #131 published 12:27 / 18:39 / 24:35 over "11 passing runs";
+      # the first correction published the maxima above but over "101 runs" with n = 57 / 52 / 49. The
+      # maxima re-derive exactly; BOTH pool sizes were unreproducible. Three mechanisms produced that,
+      # all cheap to repeat:
+      #
+      #   * THE POOL WAS A PAGE, NOT A QUESTION. #131's came from `gh run list --limit 20` -- a default
+      #     page size, reported as though it had been chosen.
+      #   * FILTERING ON *JOB* CONCLUSION DROPS THE TIGHTEST STEPS BY CONSTRUCTION. A step that nearly
+      #     exhausts step_timeout is the most likely to push its job into job_timeout, so the job is
+      #     cancelled while the step itself concluded success. Re-running this pool with a job-conclusion
+      #     filter reproduces #131's 24:35 exactly; the step-conclusion filter gives 25:51. Measure the
+      #     step; filter on the step. Two such rows exist on 2026-08-01 and one of them is the maximum.
+      #   * A COUNT NOBODY RE-DERIVED. Neither "101 runs" nor n = 57 / 52 / 49 is reproducible under any
+      #     pool definition tried. A table whose own point is "state your pool and your n" has to carry
+      #     an n the next reader can recompute -- that column is how they would tell it had rotted.
+      #
+      # Only the windows-2025 row was ever a maximum; #131's ubuntu 12:27 was that same run's ubuntu leg,
+      # quoted as if it were that leg's worst case. Its 18:39 was not even that: that run's windows-2022
+      # step is 18:29, and 18:39 belongs to a different run entirely.
+      #
+      # State the MEASURED value, its POOL, its n and its DATE -- never a bare multiple. A multiple gives
+      # the next reader no way to tell when it has rotted; a multiple without its pool cannot even be
+      # rechecked.
+      #
+      # PROOF IT WAS THE CAP, NOT THE BRANCH. #119's windows-2025 leg was RE-RUN on the SAME commit
+      # against the SAME 26:00 cap: attempt 1 was killed at the cap, attempt 2 concluded SUCCESS. Same
+      # code, same config, same ceiling, two outcomes. The leg was not failing -- it was coin-flipping
+      # against the cap, exactly the state the ubuntu note above names, and the reason "re-run it and
+      # see" is not a diagnosis here. A green re-run at 26:00 does not mean the suite fits; it means
+      # that runner was fast enough that time.
+      #
+      # 36:00 is 1.393x over the 25:51 that fit under the old cap, and 1.364x over 26:23, the largest
+      # windows-2025 execution actually observed. Use the second number: a ratio against a censored
+      # maximum flatters itself.
+      #
+      # BE HONEST ABOUT THE SPREAD RULE -- 36:00 DOES NOT MEET IT. An earlier revision argued "headroom
+      # must exceed observed spread". Against real values that rule FAILS here: headroom is 36:00 - 26:23
+      # = 9:37, and the windows-2025 spread is 26:23 - 15:56 = 10:27. It would need roughly 37:00 to hold.
+      # 36:00 is kept anyway, and the reason is stated rather than dressed up: this cap exists to catch a
+      # whole-process DEADLOCK, not slowness (see the paragraph below), so 1.364x over the worst observed
+      # run is ample for its actual job, and #131 already set this value. What the spread rule is good
+      # for is telling you the margin is thinner than the ratio suggests. RE-DERIVE IF a windows-2025
+      # `Tests (pytest)` step is ever seen above 28:00 -- that is the trigger, not a calendar reminder.
+      #
+      # A ratio against one run says nothing about a distribution, and #119's leg was killed by the
+      # distribution, not by its own duration. Both Windows legs take the same number: windows-2022 is the faster, so
+      # sizing on windows-2025 only leaves it more room, and one value is one thing to re-derive.
+      #
+      # THE JOB CAP IS NOT A ROUNDING-UP OF THE STEP CAP, AND IT HAS FIRED. Two steps in this job carry
+      # `step_timeout` -- `Tests (pytest)` and `Web console tests (pytest)` -- so the job can contain
+      # 2 x step_timeout of gated work that step_timeout cannot bound. Note the caps here do NOT cover
+      # that worst case and are not sized to (2 x 19 = 38 > 26 on ubuntu, 2 x 36 = 72 > 46 on Windows);
+      # they are sized against the OBSERVED sum, which is a weaker guarantee. See the closing paragraph.
+      # Observed for real on run 30724385719 (main @ 8f01cef8, 2026-08-01):
+      #
+      #   Tests (pytest)              00:01:21 -> 00:27:12   25:51   SUCCESS   (9s under the 26:00 cap)
+      #   Web console tests (pytest)  00:27:12 -> 00:30:14           CANCELLED
+      #   JOB                         00:00:06 -> 00:30:19   30:13   CANCELLED  <- job_timeout 30 fired
+      #
+      # A GREEN first step, then an unattributed job-level kill during the second -- exactly the failure
+      # the nesting note above exists to prevent, arriving by the path that note does not consider. It
+      # does NOT happen when a step is killed (that ends the job and skips what follows, so those
+      # durations never sum); it happens when the first step PASSES near its budget.
+      #
+      # READ THAT EXHIBIT FOR ITS MECHANISM, NOT AS A VERDICT ON THE CAP IT REPLACED: it ran under the
+      # retired 26/30 pair and would have passed under #131's 40:00. What condemns 40:00 is the
+      # arithmetic below -- which is arithmetic, not an observed kill; no job has yet hit 40:00.
+      #
+      # job_timeout is therefore sized against BOTH gated steps plus setup, rather than as step_timeout
+      # plus a constant. Each addend below is that addend's MEASURED MAXIMUM over the same pool, taken
+      # over rows where `Tests` concluded success -- NOT over rows where both steps did, which silently
+      # drops the very run that motivates this whole paragraph (its web-console step was cancelled) and
+      # is the same censoring mistake as filtering the step table by job conclusion. Two earlier
+      # revisions used a 0:41 setup (the MEDIAN), web-console values that were each only third-highest
+      # on their leg, and a 1:04 Windows setup that the exhibit above contradicts on its face:
+      #
+      #   leg       step_timeout + web-console(max) + setup(max)   old job         new job
+      #   ubuntu    19:00 + 2:00 + 1:20 = 22:20                    22:00 -> -0:20  26:00 -> +3:40 (1.16x)
+      #   W22       36:00 + 2:33 + 1:09 = 39:42                    40:00 -> +0:18  46:00 -> +6:18 (1.16x)
+      #   W25       36:00 + 3:33 + 1:20 = 40:53                    40:00 -> -0:53  46:00 -> +5:07 (1.13x)
+      #
+      # ubuntu and windows-2025 were ALREADY NEGATIVE -- ubuntu too, which an earlier revision had the
+      # wrong way round; windows-2022 was the one row genuinely in the black. Windows takes one value,
+      # sized on windows-2025 as the worse of the pair. The `+4` habit that produced 40 was Windows-only
+      # and was carried through two cap changes unchecked (30/26 then 40/36); ubuntu has never been +4 --
+      # it went 15/13 to 22/19, so +2 then +3. Either way the number was derived from the OTHER BOUND
+      # rather than from the work, which is the defect, not the particular constant.
+      #
+      # WHAT THIS DOES NOT FIX. The nesting invariant at the top of this note holds for `Tests (pytest)`
+      # on every leg and for `Web console tests (pytest)` on NONE of them: reaching that step already
+      # spends setup plus `Tests`, so its own cap can never fire first. Guaranteeing it would need
+      # job_timeout above setup + 2 x step_timeout -- about 39:20 on ubuntu and 73:20 on Windows at the
+      # measured setup maxima above, i.e. far beyond anything worth setting. A hang in the web-console
+      # step therefore still surfaces as an unattributed job-level kill, which is the very failure the
+      # invariant is there to prevent. The structural fix is to stop
+      # the two steps sharing one budget (a 3:33 suite has no business holding 36:00) and is filed as
+      # BACKLOG #344; this sizing only makes the job cap cover the sum. Re-derive it if either suite's
+      # duration moves.
+      #
+      # AND KNOW WHAT IS NOT CAPPED AT ALL. `test` is the ONLY one of this file's ten jobs carrying any
+      # `timeout-minutes`; the other nine -- `changes`, `ide`, `sqlserver-store`, `postgres-store`,
+      # `load-test`, `load-test-sqlserver`, `windows-service-smoke`, `docker-smoke`, `ci-gate` -- run on
+      # GitHub's 6-HOUR default. That is recorded here so the omission is known rather than assumed
+      # deliberate; sizing them is out of scope for this change and belongs with BACKLOG #344.
+      #
+      # This cap is NOT what catches a hung test; pytest_timeout (120s) is, per test. The step cap only
+      # catches a whole-process deadlock both in-process watchdogs miss, which is why it can sit well
+      # above a healthy run. Sizing it tight buys no detection and costs false failures on green suites,
+      # twice now.
+      #
+      # The remaining margin is a SHARED budget across every PR that lands and nothing accounts for it:
+      # three PRs each adding a minute of Windows time reproduce #119's kill, individually blameless.
+      # A mechanical guard for that is BACKLOG #344 item 1; the underlying slowness is #320.
       - name: Tests (pytest)
         if: needs.changes.outputs.code == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
         timeout-minutes: ${{ matrix.step_timeout }}
@@ -288,7 +483,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Node
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: "24"
           cache: npm
@@ -371,9 +566,9 @@ jobs:
           # $GITHUB_REPOSITORY is a built-in runner env var, read here as plain shell (NOT a workflow-
           # expression interpolation into the run body), so it is zizmor-safe and cannot be misparsed as
           # an Actions expression the way a literal double-brace token in a run: block would be.
-          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":15,"step_timeout":13,"pytest_timeout":60,"fault_timeout":90}'
-          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
-          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":30,"step_timeout":26,"pytest_timeout":120,"fault_timeout":150}'
+          U='{"os":"ubuntu-latest","python-version":"3.14","hosted":["ubuntu-latest"],"job_timeout":26,"step_timeout":19,"pytest_timeout":60,"fault_timeout":90}'
+          W22='{"os":"windows-2022","python-version":"3.14","hosted":["windows-2022"],"job_timeout":46,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
+          W25='{"os":"windows-2025","python-version":"3.14","hosted":["windows-2025"],"job_timeout":46,"step_timeout":36,"pytest_timeout":120,"fault_timeout":150}'
           if [ "${GITHUB_REPOSITORY:-}" = "MEFORORG/MessageFoundry" ]; then
             echo "matrix={\"include\":[$U,$W22,$W25]}" >> "$GITHUB_OUTPUT"
           else
@@ -426,12 +621,12 @@ jobs:
           # the ADR 0013/0016 RTE capture/re-ingress case); those suites are MEFOR_TEST_SQLSERVER-gated
           # and run ONLY on the server-DB legs, so a file not matched here edits with NO real SS/PG
           # coverage (it merely skips the gated leg). Keep this in sync with those steps
-          # (docs/throughput-build-plan.md).
+          # (docs/archive/throughput/throughput-build-plan.md).
           # The transports/ + config/wiring arms are the CAPTURE SURFACE: capture_response / reingress_to
           # are declared there (ADR 0013), and SQL Server / Postgres both declare supports_response_capture
           # + supports_pt_reingress True — so a regression in that surface is a SERVER-DB regression and must
           # pull these legs, not just the SQLite suite.
-          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte)|\.github/workflows/ci\.yml)'; then
+          if echo "$changed" | grep -qE '^(messagefoundry/store/|messagefoundry/pipeline/(cluster|wiring_runner|stage_dispatcher)|messagefoundry/config/(settings|wiring)|messagefoundry/transports/(base|database|dicomweb|fhir|http_auth|mllp|rest|soap|tcp|x12)|tests/test_(sqlserver|postgres|cluster|database_connector|database_source|pooled|stage_dispatcher|batch_claim|claim_fifo|inline_fast_path|seq_only_fifo|fifo_index|per_lane_wake|response_capture|reingress|x12_rte|shard_recovery|shard_cert|adr0071|adr0075|adr0114|adr0157|dr_server_seed_gate|dr7_server_config_only_backup|backup_runner_server_db|connscale|load_failover|load_runner)|\.github/workflows/ci\.yml)'; then
             echo "serverdb=true" >> "$GITHUB_OUTPUT"
           else
             echo "serverdb=false" >> "$GITHUB_OUTPUT"
@@ -676,7 +871,14 @@ jobs:
         # reliability-core invariant tests — crash-replay, poison-bound, and the per-lane-FIFO locked-head-
         # BLOCKS (#285) gate — that are MEFOR_TEST_SQLSERVER-gated but live in their OWN files, so the named
         # suites above never picked them up and they ran only on SQLite. Run them here against the real
-        # backend. APPEND each new lever's test file per docs/throughput-build-plan.md.
+        # backend. APPEND each new lever's test file per docs/archive/throughput/throughput-build-plan.md.
+        #
+        # NOT only throughput levers: this step is the catch-all for ANY MEFOR_TEST_SQLSERVER-gated file
+        # the named suites above do not collect. CI runs an explicit file LIST here, not the whole suite,
+        # so a new gated file that nobody appends never runs in CI at all — it just reports as skipped on
+        # the plain legs, which reads identical to passing. `tests/test_sqlserver_legacy_outbox_migration.py`
+        # (ASVS 14.2.7) is here for exactly that reason: it verifies a one-way schema migration that can
+        # only be observed against a real server.
         #
         # RETRY WRAPPER: pyodbc 5.3.0 intermittently segfaults in its C parameter-binding path under
         # py3.14 against the SQL Server 2025 container (upstream mkleehammer/pyodbc#1459, unfixed; 5.3.0
@@ -698,6 +900,7 @@ jobs:
           tests/test_per_lane_wake.py
           tests/test_stage_dispatcher.py
           tests/test_pooled_rider.py
+          tests/test_sqlserver_legacy_outbox_migration.py
 
       - name: Run the RTE capture / re-ingress loop on real SQL Server (ADR 0013/0016)
         env:
@@ -721,6 +924,63 @@ jobs:
         run: >-
           bash scripts/ci/retry-native-crash.sh
           pytest -v tests/test_x12_rte.py
+
+      - name: Run the engine-shard + statement-dispatch suites on real SQL Server
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # Every file here is MEFOR_TEST_SQLSERVER-gated at MODULE level, so before this step they were
+        # collected nowhere and reported nothing — not a pass, not a skip, on any trigger. That covered
+        # engine-shard crash recovery and the shard TLS-cert ladder (ADR 0037 over the ADR 0063 unified
+        # store), the ADR 0071 statement dispatch/fusion wiring, the ADR 0075 batch backend, the ADR 0114
+        # live claim procedure, and the synchronous handoff path. tests/test_serverdb_ci_coverage.py now
+        # fails if a module-gated suite is added without being named here.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v
+          tests/test_shard_recovery_sqlserver.py
+          tests/test_shard_cert_sqlserver.py
+          tests/test_adr0071_dispatch_wiring_sqlserver.py
+          tests/test_adr0071_fused_callables_sqlserver.py
+          tests/test_adr0075_batch_sqlserver.py
+          tests/test_adr0114_claim_proc_live.py
+          tests/test_sqlserver_sync_handoff.py
+          tests/test_database_source_integration.py
+
+      - name: Run the DR seed-gate + backup suites on real SQL Server
+        env:
+          MEFOR_TEST_SQLSERVER: "1"
+          MEFOR_STORE_BACKEND: sqlserver
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "1433"
+          MEFOR_STORE_DATABASE: MessageFoundry
+          MEFOR_STORE_AUTH: sql
+          MEFOR_STORE_USERNAME: sa
+          MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
+          MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+          PYTHONFAULTHANDLER: "1"
+        # ADR 0048/0049 disaster recovery, SQL Server side: the seed gate that must REFUSE to activate a
+        # standby onto a non-empty store, the .mfbak backup runner against a real server DB, and the DR7
+        # config-only backup + DbaDelegatedError path. Module-gated and never executed; a DR control that
+        # has never run is a DR control that has never been proven.
+        # Same pyodbc 5.3.0 + py3.14 native-crash retry as the steps above (upstream pyodbc#1459).
+        run: >-
+          bash scripts/ci/retry-native-crash.sh
+          pytest -v
+          tests/test_dr_server_seed_gate_sqlserver.py
+          tests/test_backup_runner_server_db_sqlserver.py
+          tests/test_dr7_server_config_only_backup_sqlserver.py
 
   # Postgres store backend (Track B): run the gated store suite against a real PostgreSQL service
   # container (Linux, so 1x minutes). Runs NIGHTLY + on-demand (workflow_dispatch — use
@@ -782,7 +1042,7 @@ jobs:
           # dev/test escape is set.
           MEFOR_STORE_ENCRYPT: "false"
           MEFOR_ALLOW_INSECURE_TLS: "1"
-        run: pytest tests/test_postgres_store.py -v
+        run: pytest tests/test_postgres_store.py tests/test_adr0157_postgres_fence.py -v
 
       - name: Run the failover-LOAD test (two nodes, SIGKILL the primary mid-load, against the real DB)
         env:
@@ -815,7 +1075,7 @@ jobs:
           MEFOR_ALLOW_INSECURE_TLS: "1"
         # The throughput levers' MEFOR_TEST_POSTGRES-gated invariants (esp. the FOR-UPDATE no-SKIP-LOCKED
         # locked-head-BLOCKS twin of #285, and the batch FIFO/crash tests) live in their own files. APPEND
-        # each new lever's test file per docs/throughput-build-plan.md.
+        # each new lever's test file per docs/archive/throughput/throughput-build-plan.md.
         run: >-
           pytest -v
           tests/test_inline_fast_path.py
@@ -867,6 +1127,49 @@ jobs:
         # `postgres` param). Postgres declares the same two capability flags True, so the same
         # connector->runner gap existed here.
         run: pytest -v tests/test_x12_rte.py
+
+      - name: Run the failover + engine-shard recovery suites on real Postgres
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # These are MEFOR_TEST_POSTGRES-gated at MODULE level, so until this step existed they were
+        # collected nowhere and reported nothing — not a pass, not a skip. The SQL Server failover twin
+        # (test_cluster_failover_sqlserver.py) has run for some time; its Postgres counterpart never had.
+        # Engine-shard crash recovery (ADR 0037 over the ADR 0063 unified store) was dark on BOTH server
+        # backends. tests/test_serverdb_ci_coverage.py now fails if a module-gated suite is added without
+        # being named here.
+        run: >-
+          pytest -v
+          tests/test_cluster_failover_postgres.py
+          tests/test_shard_recovery_postgres.py
+
+      - name: Run the DR seed-gate + backup suites on real Postgres
+        env:
+          MEFOR_TEST_POSTGRES: "1"
+          MEFOR_STORE_BACKEND: postgres
+          MEFOR_STORE_SERVER: localhost
+          MEFOR_STORE_PORT: "5432"
+          MEFOR_STORE_DATABASE: messagefoundry
+          MEFOR_STORE_USERNAME: postgres
+          MEFOR_STORE_PASSWORD: mefor
+          MEFOR_STORE_ENCRYPT: "false"
+          MEFOR_ALLOW_INSECURE_TLS: "1"
+        # ADR 0048/0049 disaster recovery: the seed gate that must REFUSE to activate a standby onto a
+        # non-empty store, the .mfbak backup runner against a real server DB, and the DR7 config-only
+        # backup + DbaDelegatedError path. All three are module-gated and were never executed against
+        # PostgreSQL; a DR control that has never run is a DR control that has never been proven.
+        run: >-
+          pytest -v
+          tests/test_dr_server_seed_gate_postgres.py
+          tests/test_backup_runner_server_db_postgres.py
+          tests/test_dr7_server_config_only_backup_postgres.py
 
   # Headless load test (Track B / throughput): serve the synthetic high-fan-out load config (auth
   # off, small fan-out) and drive the smoke profile through the real `python -m harness --load` CLI,
@@ -1033,10 +1336,36 @@ jobs:
           MEFOR_STORE_PASSWORD: "Str0ng_P@ssw0rd!"
           MEFOR_STORE_TRUST_SERVER_CERTIFICATE: "true"
           MEFOR_ALLOW_INSECURE_TLS: "1"  # trusted-network escape for the container's self-signed cert
-          # GIVEN 1 (ADR 0148): `dev` now derives PHI, so provision the secure PHI posture (this leg
-          # validates PHI+enforce green, not a synthetic opt-out): bounded PHI-body retention windows +
-          # a locked-down egress allowlisting the loopback sink. The store key is minted at runtime below.
-          # The security-notification gate is skipped because auth is off (no accounts to notify).
+          # DECLARE THE DATA CLASS HONESTLY (ADR 0148 GIVEN 1 + docs/SECURITY-LOOSENING.md
+          # "`handles_real_patient_data = false`"). This leg processes harness-GENERATED synthetic HL7 on
+          # a throwaway service container; asserting PHI was a false declaration about the instance, and
+          # the register names exactly this case as acceptable: "a CI runner ... that only ever processes
+          # synthetic / sample HL7". Since GIVEN 1 the built-in `dev` env derives PHI, so a genuinely
+          # throwaway CI box must now set this EXPLICITLY — it is no longer the `dev` default.
+          #
+          # It is also what makes the leg run at all. This job was RED for four consecutive nights
+          # (2026-07-27..30) on:
+          #     ValueError: SQL Server TLS is weakened (trust_server_certificate=true or encrypt=false)
+          # Under enforcing-PHI the `MEFOR_ALLOW_INSECURE_TLS` escape above is clamped INERT by design
+          # (#200 / ADR 0092 decision 2 — `weakened_tls_escape_permitted`), so a self-signed container
+          # can never be trusted from a PHI instance. The previous comment here said this leg "validates
+          # PHI+enforce green, not a synthetic opt-out" — an intent that is UNREACHABLE with a
+          # `services:` container: GitHub starts it before any step runs, so a cert generated in a step
+          # cannot be mounted into it. Whoever set that provisioned the PHI posture's retention and
+          # egress requirements but not its TLS one.
+          #
+          # WHAT THIS GIVES UP, stated plainly: the leg no longer exercises the PHI+enforce path. Its
+          # actual job is a load/throughput smoke of the SQL Server store, and `sqlserver-store` carries
+          # the functional coverage. Restoring PHI+enforce here needs a REAL certificate — the job moved
+          # off `services:` onto a `docker run` with a generated cert mounted and trusted — which is
+          # worth doing deliberately, not as a side effect of unbreaking a nightly.
+          #
+          # The PHI-shaped provisions below are KEPT even though synthetic does not require them: they
+          # cost nothing and keep the leg measuring a realistic configuration.
+          MEFOR_SECURITY_HANDLES_REAL_PATIENT_DATA: "false"
+          # Bounded PHI-body retention windows + a locked-down egress allowlisting the loopback sink.
+          # The store key is minted at runtime below. The security-notification gate is skipped because
+          # auth is off (no accounts to notify).
           MEFOR_SECURITY_DELETE_MESSAGE_BODIES_AFTER_DAYS: "30"
           MEFOR_RETENTION_DEAD_LETTER_DAYS: "30"
           MEFOR_SECURITY_BLOCK_UNLISTED_OUTBOUND: "true"

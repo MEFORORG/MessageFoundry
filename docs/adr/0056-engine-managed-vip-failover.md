@@ -12,7 +12,8 @@
   **operator/infra responsibility** — MEFOR "designs for the VIP and exposes the health-check/role
   endpoints, but **does not ship a load balancer** — you stand it up (keepalived, HAProxy, F5, a cloud
   NLB, …)" ([DEPLOYMENT.md](../DEPLOYMENT.md) §"High availability"; [CLUSTERING.md](../CLUSTERING.md)
-  §"Client reconnect"; `docs/marketing/ha-failover-research-2026-06-14.md`, a local research note).
+  §"Client reconnect"; `docs/marketing/ha-failover-research-2026-06-14.md`, a local research note that
+  is not published here — see [SECURITY-DOCS-POLICY.md](../SECURITY-DOCS-POLICY.md)).
   This ADR adds an **opt-in** path where the **engine itself** owns the VIP, tied to the leadership
   lease. It does **not** retract the external path — that stays the default and the recommended posture
   for the strictest split-brain guarantee.
@@ -89,6 +90,13 @@ only. The correctness pivots are closed and **must not be re-decided here**:
   unreachable). The load-time invariant `heartbeat_seconds < leader_fence_timeout_seconds <
   leader_lease_ttl_seconds` (defaults 10s/20s/30s; `ClusterSettings._fence_ordering`) **guarantees a
   partitioned old leader stops processing before a standby can acquire** — the split-brain guard.
+
+  > ⚠️ **CORRECTION (2026-08-01).** That ordering guarantees the old leader stops **reporting itself
+  > leader**, not that it stops **processing**. `_check_fence` sets an in-memory flag and cancels
+  > nothing; graph teardown (sequential inbound stops, each with its own shutdown grace) is not budgeted
+  > against the remaining margin, and the margin itself is smaller than `ttl − fence` because the fence
+  > baseline is stamped after the renew round trip returns while the expiry is stamped on the DB clock
+  > at statement execution. The VIP ordering rule below inherits this — see the correction at D4.
 - **Store-checked leader epoch (H1).** A monotonic `leader_epoch` bumped **only on a fresh acquire** is a
   durable second backstop: a superseded ex-leader that resumes after a long pause claims **0 rows** (its
   epoch is stale; the claim `UPDATE` matches nothing). Server-DB-only; a no-op on SQLite.
@@ -231,7 +239,15 @@ is wrong by ~2×. The new ordering rule of this ADR is therefore:
 
 `_fence_ordering` already enforces `fence_timeout < ttl`, so the budget is always positive; operators who
 shrink the timings for faster failover **shrink this budget too** and must keep it larger than the
-worst-case local release latency (below). The new leader additionally waits `release_grace_seconds`
+worst-case local release latency (below).
+
+> ⚠️ **CORRECTION (2026-08-01).** "Always positive" is true of the *nominal* `ttl − fence_timeout` and
+> not of the budget actually available. Two terms are unaccounted: the renew round trip (the fence
+> baseline is taken after the renew returns, the expiry is stamped on the DB clock at statement
+> execution) and up to one `_fence_tick` of detection lag. On the shipped `10/20/30` the remainder is
+> ~8s rather than 10s; proportionally tightened timings shrink it further and `_fence_ordering` will
+> still accept them, because it validates ordering only and never a margin. Size the release budget
+> against the corrected remainder, not against `ttl − fence_timeout`. The new leader additionally waits `release_grace_seconds`
 before its gratuitous ARP, so it does not assert the address while a just-fenced old binding might still
 answer.
 
@@ -369,17 +385,17 @@ no engine/store/config import.
 ### Placement and construction
 
 A new **"High Availability"** page joins the console's left nav after Engine Status (registered in
-[`console/shell.py`](../../messagefoundry/console/shell.py) `_NAV` / `_NAV_ICONS` and built in
+`console/shell.py` `_NAV` / `_NAV_ICONS` and built in
 `_build_pages()`, its `error` signal wired to the shell's `_show_error`). It reuses the
 `refresh()`/`reload()`/`stop()` + `AsyncRunner` + in-flight-guard + snapshot/`_apply` **threading
-shape** of `EngineStatusPage` ([`console/status.py`](../../messagefoundry/console/status.py)).
+shape** of `EngineStatusPage` (`console/status.py`).
 
 > **Construction note (do not copy `EngineStatusPage`'s constructor).** `EngineStatusPage` is built with
 > **only** the read-only `poll_client` and does its few writes (service start/stop) via local UAC, *not*
 > the API. The HA page's failover is a genuine **API write** that needs the **main-thread `client`** (the
 > one carrying the step-up/MFA challenge handlers; `poll_client` from `for_polling()` has **none**). So
 > model the **construction** on `ConnectionsPage`
-> ([`console/connections.py`](../../messagefoundry/console/connections.py)):
+> (`console/connections.py`):
 > `HighAvailabilityPage(client, *, poll_client=poll_client)` — reads off-thread via `poll_client`, the
 > failover write on the main thread via `client`.
 

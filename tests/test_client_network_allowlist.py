@@ -31,6 +31,7 @@ from messagefoundry.api.client_networks import DENIAL_HEADER, DENIAL_MARKER, Cli
 from messagefoundry.auth import Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.settings import (
+    AlertsSettings,
     ApiSettings,
     AuthSettings,
     SecuritySettings,
@@ -49,7 +50,7 @@ def _loosenings(sec: SecuritySettings) -> list[tuple[str, str]]:
     The registry takes all four inputs as REQUIRED arguments deliberately (ADR 0148: one posture, and a
     deviation the registry cannot see is a second posture by the back door). The tests below are about
     the ``[security]`` switches specifically, so the other three are pinned at shipped values here."""
-    return security_loosenings(sec, StoreSettings(), AuthSettings(), ())
+    return security_loosenings(sec, StoreSettings(), AuthSettings(), AlertsSettings(), ())
 
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy

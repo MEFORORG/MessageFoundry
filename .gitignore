@@ -74,6 +74,12 @@ mutmut-results.txt
 c901-head.json
 c901-base.json
 base-tree/
+# DAST scan receipts (ADR 0155). The documented verification commands write these into the repo root,
+# and committed scan output is a class this project does not produce: the receipt carries no body,
+# header or token, but it is still a machine-readable inventory of which routes are ungated and which
+# are unreachable. CI uploads them as artifacts instead.
+dast-auth-receipt.json
+canary-*.json
 
 # Claude Code: settings.json is shared/tracked; settings.local.json is machine-local (never commit)
 .claude/settings.local.json
@@ -81,22 +87,16 @@ base-tree/
 # Local reference notes pointing at machine-specific Claude Code transcript paths — never commit
 TRANSCRIPTS.md
 
-# Local planning/marketing/security working docs — keep out of the repo
+# Local planning/marketing working docs — keep out of the repo
 # (docs/DUAL_LICENSING_PLAN.md is now a committed artifact — see ADR 0017 / #13 licensing)
 /docs/marketing/
-/docs/security/CISO-REVIEW.md
-/docs/security/DEPENDENCY-POSTURE-REVIEW.md
-/docs/security/DEPENDENCY-RESPONSE-PLAN.md
-/docs/security/DEPENDENCY-CUSTOMER-OFFERINGS.md
-/docs/security/DEPENDENCY-RESPONSE-HANDOFF.md
-/docs/security/DEPENDENCY-RESPONSE-A3-HANDOFF.md
-/docs/security/DEPENDENCY-RESPONSE-A4-HANDOFF.md
-# vuln_metrics.py local CSV output (the CI run uploads it as an artifact; not committed)
-/docs/security/metrics/
+# Individual docs/security/* working files (and vuln_metrics.py's local CSV output) were once
+# enumerated here. They are all covered by the blanket /docs/security/ rule further down, so the
+# list was redundant — and enumerating private filenames in a public file discloses the shape of
+# the private set for no gain. Do not re-add per-file entries; extend the blanket rule instead.
 
-# Operator-local load/throughput profiles — tuned to a specific deployment's volume; kept OUT of the
-# OSS repo + public mirror (the plan itself lives on the operator share, WIN2025-LOAD-THROUGHPUT-MATRIX.md).
-# Still usable by name (they sit in PROFILES_DIR) and copy-on to the test box.
+# Operator-local load/throughput profiles — sized for one operator's own environment, not a
+# shipped artifact. Still usable by name (they sit in PROFILES_DIR).
 /harness/load/profiles/hospital-baseline.toml
 /harness/load/profiles/soak-12h.toml
 # Deep-research survey of alternative OSS DB backends for the shared-DB commit-wall — local working
@@ -144,13 +144,17 @@ scripts/security/scan-tokens.local.txt
 /docs/security/
 /docs/reviews/
 /docs/marketing/
-# Deliberately still private, each for a different reason:
-#   docs/security/      — 32 files of posture/risk-register detail; an attacker roadmap.
-#   docs/reviews/       — review findings, same reason.
+# Deliberately still private, each for a different reason. What decides which side a security
+# document lands on is stated publicly in docs/SECURITY-DOCS-POLICY.md — do not restate the
+# reasoning, the inventory or the file count here:
+#   docs/security/      — maintainer-internal working documents; see the policy above.
+#   docs/reviews/       — point-in-time review findings, withheld on the same test.
 #   docs/CI-TOPOLOGY.md — STALE: it documents the retired private-repo/public-mirror split and
 #                         scripts/publish/, which the cutover deleted. Publishing it would actively
 #                         mislead. Rewrite for the post-cutover topology or delete it.
-#   docs/Secure_Development_Standards.md — scans clean, but it was deliberately pulled from the public
-#                         PyPI sdist (#1020); reversing that is an owner call, not a side effect.
+#   (docs/Secure_Development_Standards.md was here. PUBLISHED 2026-07-29 on the owner's call: the
+#    document licenses itself as publishable and adopter-facing, messagefoundry.org already served
+#    it, and 44 citations across the repo — including adr/TEMPLATE.md — pointed at a file that did
+#    not exist. Published from the newest copy, de-branded back to the generic lineage its own
+#    revision history names.)
 /docs/CI-TOPOLOGY.md
-/docs/Secure_Development_Standards.md

@@ -5115,7 +5115,10 @@ async def test_oidc_login_link_tracks_availability(engine: Engine) -> None:
         # BOTH outcomes are 303, so the status alone cannot tell AC-8 compliance from the exact
         # regression this guards. Assert the DESTINATION: the start leg must still reach the IdP
         # while the advisory flag is set, not bounce to ?e=oidc_unavailable.
-        r = await c.get("/ui/oidc/start", follow_redirects=False)
+        # ASVS 3.7.3: flow-minting moved to the POST leg — the GET now renders the "leaving this
+        # site" interstitial and stages nothing. AC-8 is a property of the leg that ATTEMPTS, so
+        # this targets the POST.
+        r = await c.post("/ui/oidc/start", follow_redirects=False)
         assert r.status_code == 303
         assert r.headers["location"].startswith("https://idp.example/authorize?")
 
@@ -5124,7 +5127,14 @@ async def test_oidc_start_redirects_to_the_idp_and_sets_the_flow_cookie(engine: 
     service = _oidc_service(engine)
     await service.initialize()
     async with _oidc_client(engine, service) as c:
-        r = await c.get("/ui/oidc/start", follow_redirects=False)
+        # ASVS 3.7.3: the GET renders the interstitial and mints NOTHING; the 303 + PKCE params +
+        # flow cookie this test is about now belong to the POST leg. Asserted here rather than
+        # retargeted silently, because "the start leg 303s to the IdP" stopped being true of the GET.
+        interstitial = await c.get("/ui/oidc/start", follow_redirects=False)
+        assert interstitial.status_code == 200
+        assert "leaving" in interstitial.text.lower()
+        assert "set-cookie" not in {k.lower() for k in interstitial.headers}
+        r = await c.post("/ui/oidc/start", follow_redirects=False)
         assert r.status_code == 303
         location = r.headers["location"]
         assert location.startswith("https://idp.example/authorize?")
@@ -5242,7 +5252,14 @@ async def test_oidc_full_round_trip_lands_a_session_via_meta_refresh(
     await service.set_ad_group_map([("cn=mf-admins,dc=x", "administrator")], actor="admin")
 
     async with _oidc_client(engine, service) as c:
-        start = await c.get("/ui/oidc/start", follow_redirects=False)
+        # ASVS 3.7.3: a real operator now traverses the interstitial, so the round trip does too --
+        # GET renders "you are leaving this site" and stages nothing, the Continue POST mints the
+        # flow and 303s. Kept as two hops rather than shortcut to the POST: this test's value is that
+        # it walks the path a browser actually walks.
+        leaving = await c.get("/ui/oidc/start", follow_redirects=False)
+        assert leaving.status_code == 200
+        assert "leaving" in leaving.text.lower()
+        start = await c.post("/ui/oidc/start", follow_redirects=False)
         assert start.status_code == 303
         params = dict(parse_qsl(urlsplit(start.headers["location"]).query))
         flow_id = c.cookies.get("mf_oidc_flow")

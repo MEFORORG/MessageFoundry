@@ -488,6 +488,11 @@ class StatsResponse(BaseModel):
     # backend reports 0 (counting is wired on SQLite + SQL Server).
     committed_txns: int = 0
     body_copies: int = 0
+    # ADR 0157 C3: terminal queue resolves rejected by the H1 leader-epoch fence (Postgres only; 0
+    # elsewhere). Non-zero == a superseded ex-leader was stopped mid-write. MUST be declared here:
+    # this model takes Pydantic's default extra='ignore', so an undeclared kwarg is dropped SILENTLY
+    # and /stats would never grow the field.
+    fenced_writes: int = 0
 
 
 class MetricsHistorySample(BaseModel):
@@ -710,6 +715,26 @@ class PoolInfo(BaseModel):
     claim_pool: ClaimPoolInfo | None = None
 
 
+class ClaimProcInfo(BaseModel):
+    """The ADR 0114 sub-lever A (``fifo_claim_proc``) startup-gate verdict — AC-7's **degraded
+    gauge**, surfaced as the additive ``claim_proc`` field on :class:`SystemStatus`.
+
+    ``None`` on every backend without the lever and on SQL Server when the flag is off, so "not
+    requested" reads differently from "requested and degraded". When ``effective`` is False,
+    ``degraded_reason`` says why the store fell back to the shipped ad-hoc batch — claims keep
+    flowing either way, so this is a performance-lever gauge, not a health alarm.
+
+    Metadata only: proc names, a head-form word, and the gate's own reason string — no message
+    content and no PHI."""
+
+    effective: bool  # the gate passed; pooled claims run through the procs
+    degraded_reason: str | None = None  # why it degraded to the batch; None when effective
+    # proc name -> the stored head form the deployed module matched ("rewritten" | "verbatim").
+    # "verbatim" means this server does NOT rewrite CREATE OR ALTER — no engine measured to date
+    # does, so it is worth reporting; it is an engine difference, not a fault.
+    head_forms: dict[str, str] = Field(default_factory=dict)
+
+
 class SystemStatus(BaseModel):
     engine: EngineInfo
     # Engine-wide top-line roll-up KPIs (#93): total messages, combined in+out connection count with
@@ -727,6 +752,10 @@ class SystemStatus(BaseModel):
     # percentiles + size/idle occupancy). Additive + ``None`` on SQLite (no pool) so the existing
     # payload is unchanged on the default backend and an older client deserializes /status unchanged.
     pool: PoolInfo | None = None
+    # ADR 0114 AC-7's degraded gauge: whether the SQL Server proc claim path is effectively active,
+    # and why not when it isn't. Additive + ``None`` on every backend without the lever and whenever
+    # [store].fifo_claim_proc is off, so the default payload is unchanged.
+    claim_proc: ClaimProcInfo | None = None
 
 
 class IntegrityResult(BaseModel):

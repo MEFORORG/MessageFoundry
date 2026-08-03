@@ -2,7 +2,7 @@
 
 - **Status:** Accepted  <!-- built in this PR -->
 - **Date:** 2026-07-10
-- **Related:** [ADR 0002](0002-auth-rbac.md) (WP-14 MFA / step-up) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (browser step-up + the WebAuthn ceremony cache) · [docs/SECURITY.md](../SECURITY.md) · ASVS 7.5.1 / 8.2.4 · BACKLOG #194
+- **Related:** [ADR 0002](0002-phase2-transport-security-and-strong-auth.md) (WP-14 MFA / step-up) · [ADR 0068](0068-browser-webauthn-passkeys-offloopback.md) (browser step-up + the WebAuthn ceremony cache) · [docs/SECURITY.md](../SECURITY.md) · ASVS 7.5.1 / 8.2.4 · BACKLOG #194
 
 ---
 

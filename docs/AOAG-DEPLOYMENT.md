@@ -142,14 +142,14 @@ per-lane msg/s  ≈  1000 / (commit_chain_depth × per-commit round-trip ms)
 ```
 
 The documented anchor works out to ~7 × 2.84 ms ≈ 20 ms/message ≈ **50 msg/s per ordered
-lane** on a LAN-attached SQL Server ([`throughput-roadmap.md`](throughput-roadmap.md)). Three
+lane** on a LAN-attached SQL Server ([`throughput-roadmap.md`](archive/throughput/throughput-roadmap.md)). Three
 distinct ceilings apply, and you should not conflate them:
 
 - **Per ordered lane:** the commit round-trip chain binds (measured; the box sits ~96% idle at
   the single-lane plateau). Every millisecond added to the commit path lands **~7× in every
   message**.
 - **Per engine box (aggregate, many lanes):** engine CPU binds
-  ([`throughput-build-plan.md`](throughput-build-plan.md)).
+  ([`throughput-build-plan.md`](archive/throughput/throughput-build-plan.md)).
 - **Commit-tier IOPS:** headroom on decent hardware (~23,600 commits/s measured on local NVMe —
   11–36× above what the engine drove).
 
@@ -375,10 +375,21 @@ cross-subnet listener:
 > timeout. `[store].connect_timeout` (default 15 s) bounds each attempt, and ODBC 18's default TNIR
 > softens but does not eliminate the penalty. `ApplicationIntent=ReadOnly` exists only on the
 > separate `db_lookup` connector ([`../messagefoundry/transports/database.py`](../messagefoundry/transports/database.py));
-> the store connection has no AG-aware keywords at all. Adding an opt-in `MultiSubnetFailover`
-> setting has been assessed as a small `[store]` plus `connection_string()` change, tracked as
-> [backlog #100](BACKLOG.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2).
-> Until it ships, configure the listener DNS-side as below.
+> the store connection takes exactly one AG-aware keyword, and **it has shipped**:
+> **`[store].multi_subnet_failover`** emits ODBC `MultiSubnetFailover=Yes` so the driver races the
+> subnets instead of serially waiting out each one
+> ([backlog #100](BACKLOG.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2),
+> shipped 2026-07-10; see [`CONFIGURATION.md`](CONFIGURATION.md)). It is **opt-in and defaults to
+> `false`** — a deployment that sets nothing gets nothing. **Turn it on** for any multi-subnet AG.
+>
+> ⚠️ Two reasons it does **not** yet replace the DNS-side configuration below.
+> **(1) It is unit-tested but has never been exercised against a live cross-subnet AG** (#100's own
+> validation is still outstanding — it needs the SQL AG rig), so the keyword is not yet a
+> substitute for a workaround that is known to work. **(2) It covers the STORE connection only** —
+> the separate `db_lookup` connector builds its own connection string and does not emit it, so a
+> deployment that also reaches this listener through the DATABASE connector needs the DNS-side
+> configuration regardless. Set the keyword *and* configure the listener as below; they are
+> additive, and the listener configuration is what you can currently rely on.
 
 **The Microsoft-documented workaround for clients that can't set `MultiSubnetFailover`** makes the
 listener register only the active subnet's IP, with a short DNS TTL:
@@ -397,7 +408,7 @@ Start-ClusterGroup "MEFOR_AG"
 `RegisterAllProvidersIP=0` publishes one A-record (the online IP) instead of every subnet's IP,
 and `HostRecordTTL 300` cuts client DNS caching from the 1,200 s default to 5 minutes. The
 trade-off is that cross-subnet failover client recovery then depends on DNS TTL expiry plus
-cross-site DNS/AD replication. Plan and **drill** the cross-DC connect path (§5.4), and keep DNS
+cross-site DNS/AD replication. Plan and **drill** the cross-DC connect path (§5.3), and keep DNS
 replication to the DR site fast.
 
 ### 4.6 Listener TLS certificate
@@ -439,10 +450,18 @@ two hospital engines and the DR engine. Give each an **identical config dir** an
   (because both hospital engines were unreachable at renewal time), it becomes a **cross-WAN active
   engine**: every one of its ~7 commits/message now crosses the WAN to the AG primary (§3.3), and
   there is **no automatic fail-back** to the hospital once an engine there returns — leadership stays
-  put until you deliberately move it (the §6 *Failback* runbook). Leader-site preference is **not yet
-  built** ([backlog #101](BACKLOG.md#101-leader-site-preference), unbuilt today — exactly like the
-  engine-managed VIP of [ADR 0056](adr/0056-engine-managed-vip-failover.md)). The standing guidance
-  still applies to the heartbeat: *tune the lease timings to your network*.
+  put until you deliberately move it (the §6 *Failback* runbook). **Leader preference IS built** —
+  [backlog #101](BACKLOG.md#101-cluster-leader-preference--non-promotable-standby-p2) shipped
+  2026-07-12 ([ADR 0096](adr/0096-cluster-leader-preference-and-non-promotable-standby.md)): two
+  per-node `[cluster]` knobs, `acquire_delay_seconds` (handicaps take-over of an **expired** lease
+  only — renews are never delayed, so there is no two-leader window) and `promotable = false` (the
+  node never acquires or renews, and a somehow-already-leader node steps down cleanly), surfaced per
+  node in `GET /cluster/nodes`. Defaults `(0.0, true)` are byte-identical to the old behaviour, and
+  at least one promotable node is required. **Setting `promotable = false` on the DR-DC engine is
+  the configured answer to this whole failure mode** — prefer it to relying on the runbook. What is
+  still unbuilt is *automatic* geographic fail-back, exactly like the engine-managed VIP of
+  [ADR 0056](adr/0056-engine-managed-vip-failover.md). The standing guidance still applies to the
+  heartbeat: *tune the lease timings to your network*.
 - **Run the DR engine cold.** So the DR engine cannot silently win the lease during a transient
   hospital-side blip and drag every commit across the WAN, keep its **NSSM service stopped in steady
   state**. It is promoted **with the database** as a site unit — started only as a **gated step in
@@ -588,7 +607,7 @@ Document which pattern you chose; the §6 runbook's sender-repoint step executes
 | Failure | Automatic behavior | Operator action |
 |---|---|---|
 | **Hypervisor host holding the SQL primary dies** | AG fails over automatically to the local sync secondary. Detection is bounded by the 20–30 s default timeouts plus redo drain, and runs longer if you raised the WSFC thresholds (§7.3), so substitute your own numbers. The engine rides the outage per §5.2, likely a self-fence and listener bounce that self-heals. Anti-affinity guarantees the engine and the other replica were elsewhere. | Verify `/cluster/nodes` and AG dashboard; check for stuck in-flight (§5.3) and restart the active engine service if any; restore host → replica rejoins and catches up. |
-| **Hypervisor host holding the active engine dies** | A non-leader acquires the lease after ≤ `leader_lease_ttl_seconds` (30 s) — the **surviving hospital engine or the DR engine, whichever renews first**, since leader-site preference is unbuilt (§5.1); on-promotion recovery re-pends the dead node's in-flight rows (~7 s measured functional failover). VIP/route follows via the TCP health check. Hypervisor HA also restarts the dead VM (minutes, crash-consistent) — it comes back as a non-leader. DB untouched. | **Verify which engine won** (`/cluster/nodes`). With a second hospital engine present, promotion should stay in-hospital — confirm it did. **If the DR engine took the lease while the AG primary is still hospital-local, you now have a cross-WAN active engine** (§5.1/§3.3): execute **engine failback** — clean-restart the DR engine service so a hospital engine re-acquires (§6 *Failback*), then stop the DR engine cold again (§5.1). Confirm the VIP/route followed and dispositions are flowing. |
+| **Hypervisor host holding the active engine dies** | A non-leader acquires the lease after ≤ `leader_lease_ttl_seconds` (30 s) — the **surviving hospital engine or the DR engine, whichever renews first**, unless you have made the DR engine non-promotable (`[cluster].promotable = false`, §5.1); on-promotion recovery re-pends the dead node's in-flight rows (~7 s measured functional failover). VIP/route follows via the TCP health check. Hypervisor HA also restarts the dead VM (minutes, crash-consistent) — it comes back as a non-leader. DB untouched. | **Verify which engine won** (`/cluster/nodes`). With a second hospital engine present, promotion should stay in-hospital — confirm it did. **If the DR engine took the lease while the AG primary is still hospital-local, you now have a cross-WAN active engine** (§5.1/§3.3): execute **engine failback** — clean-restart the DR engine service so a hospital engine re-acquires (§6 *Failback*), then stop the DR engine cold again (§5.1). Confirm the VIP/route followed and dispositions are flowing. |
 | **Planned local AG failover (patching)** | Planned manual failover between R1↔R2, no data loss. Engine sees a short DB outage — §5.2's 10 s case if quick. | Schedule in a quiet window; afterwards check stuck in-flight; drill this quarterly (it doubles as the §5.3 reconnect drill). |
 | **Local sync secondary lost** (host/storage) | After the ~10 s session timeout the primary marks it `NOT SYNCHRONIZING` and keeps committing (`REQUIRED_SYNCHRONIZED_SECONDARIES_TO_COMMIT = 0`). **Running exposed:** no local automatic failover until it's back and resynchronized. | Alert + restore redundancy promptly. If it's *slow* rather than dead, commits are waiting on it (`HADR_SYNC_COMMIT`) — consider flipping it async while remediating. |
 | **Both local DB replicas lost, engines alive** (partial site loss — storage/rack; R1 *and* R2 gone, the hospital engines still up) | No automatic failover: with both sync replicas gone the AG has no synchronized local target, and R3 is async (no auto-failover). Ingress commits fail, so the engines stop ACKing and run their store-error retry loops (§5.2); nothing is accepted-and-dropped. | Do **not** let the engines thrash a half-dead AG. In order: **(1) stop the engine services** (both hospital engines) to quiesce commit retries; **(2) force the AG** to R3 (`FORCE_FAILOVER_ALLOW_DATA_LOSS`, forcing quorum first per §4.3/§6 if quorum was lost); **(3) verify via `/cluster/nodes`** that exactly one engine holds the lease, then start it against the now-DR primary — accepting this is cross-WAN operation (§9). RPO per the §6 forced-failover loss statement. |
@@ -874,7 +893,7 @@ licensed, which is also why this guide never routes reads at the secondaries. Br
 [`DEPLOYMENT.md`](DEPLOYMENT.md) · [`CLOUD-DEPLOYMENT.md`](CLOUD-DEPLOYMENT.md) §2.3 ·
 [`CONFIGURATION.md`](CONFIGURATION.md) · [`SERVICE.md`](SERVICE.md) ·
 [`SYSTEM-REQUIREMENTS.md`](SYSTEM-REQUIREMENTS.md) · [`THROUGHPUT.md`](THROUGHPUT.md) ·
-[`throughput-roadmap.md`](throughput-roadmap.md) ·
+[`throughput-roadmap.md`](archive/throughput/throughput-roadmap.md) ·
 [`benchmarks/step-b-write-amplification.md`](benchmarks/step-b-write-amplification.md) ·
 [`benchmarks/TUNING-BASELINE.md`](benchmarks/TUNING-BASELINE.md) ·
 [`EARLY-ADOPTER-GUIDE.md`](EARLY-ADOPTER-GUIDE.md) §14 · ADRs

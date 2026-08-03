@@ -10,22 +10,105 @@ rules:
       # A CLA assistant REQUIRES pull_request_target to record signatures + comment on fork PRs. This
       # workflow never checks out untrusted PR code, pins the third-party action by SHA, and gates on the
       # immutable comment body / event name — so the usual pull_request_target risk (running attacker
-      # code with a write token) does not apply. See the SECURITY note in cla.yml.
+      # code with a write token) does not apply. The action is pinned at ca4a40a7d100 (v2.6.1); its
+      # archived-upstream status is adjudicated under archived-uses below.
       - cla.yml
+      # A notice that a SCHEDULED run failed can only be written by something observing that run AFTER
+      # it finishes — no other trigger sees another workflow's conclusion, so `workflow_run` is not a
+      # convenience here, it is the only mechanism.
+      #
+      # zizmor's objection to `workflow_run` is the "pwn request" class: it runs from the DEFAULT BRANCH
+      # with a privileged token, so checking out and executing the triggering PR's code would escalate
+      # that PR into a write token. Every precondition for that is absent, and each is pinned by
+      # tests/test_nightly_notice.py rather than merely asserted here:
+      #   * NO checkout, and no third-party actions at all — `test_it_pulls_in_no_third_party_actions`
+      #     fails if a `uses:` ever appears. Nothing from the triggering ref is fetched, let alone run.
+      #     That is a STRONGER claim than cla.yml's above: cla.yml runs a third-party action with a
+      #     write token — SHA-pinned, so it cannot change under us, but still third-party code —
+      #     whereas this job runs no third-party code at all.
+      #   * It only reacts to `workflow_run.event == 'schedule'`
+      #     (`test_it_only_reacts_to_scheduled_runs`), so a PR — including a fork PR — has no path to
+      #     the job at all.
+      #   * Least privilege: file default `contents: read`, `issues: write` on the single job
+      #     (`test_it_is_least_privilege`). It cannot push, tag, or modify code.
+      #   * Every event value is hoisted to `env`, never interpolated into the script body, so an
+      #     attacker-influenceable field (a branch name reaching a run title) cannot break out.
+      # The most its token can do is open, comment on, or close one issue.
+      - nightly-notice.yml
 
   artipacked:
     ignore:
       # artipacked flags a checkout that persists the token's git credential — a risk only if that
-      # credential can leak into an uploaded artifact. The jobs below do not push and never upload the
-      # repo/.git tree, so the persisted credential is inert noise here.
+      # credential can leak into an uploaded artifact. The jobs below never upload the repo/.git tree,
+      # so the persisted credential is inert noise here.
       #
-      # NOT suppressed (fixed at the source instead): release.yml sets persist-credentials: false on both
-      # checkouts because it DOES upload build artifacts. dependabot-lock-resync.yml persists a
+      # NOT suppressed (fixed at the source instead): release.yml's checkouts set persist-credentials:
+      # false, because it DOES upload build artifacts. dependabot-lock-resync.yml persists a
       # narrowly-scoped App token ON PURPOSE to push the resynced locks (documented inline) and is listed
       # here for that reason.
       - benchmark.yml
       - ci.yml
       - dependabot-lock-resync.yml
-      - release-sync-check.yml
       - security.yml
       - vuln-metrics.yml
+
+  bot-conditions:
+    ignore:
+      # zizmor flags `github.triggering_actor == 'dependabot[bot]'` in the resync job's `if:`, because an
+      # actor context reflects the LAST actor on the run, not the PR's author. True — and it is why that
+      # expression is the SECOND half of a conjunction and never the control. The control is the FIRST
+      # half, `github.event.pull_request.user.login == 'dependabot[bot]'`: the immutable PR author, and
+      # the exact replacement this audit recommends. A conjunction only NARROWS, so a spoofed actor can
+      # make this job SKIP, never run. zizmor agrees — it treats `And` as non-dominating and reports this
+      # at MEDIUM confidence for that reason.
+      #
+      # Skipping is safe by design: DEP-1 lock/export sync is independently enforced by security.yml's
+      # `pip-audit` job, step "Check the lockfile is in sync with pyproject (DEP-1)", which
+      # `git diff --exit-code`s the re-exports on an unfiltered pull_request trigger and is a REQUIRED
+      # context. The actor half is an operational self-trigger skip: this job's own App-token push fires
+      # a `synchronize` whose triggering actor is mefor-lock-resync[bot], a run that sees no Dependabot
+      # secrets. See the SECURITY MODEL block and the numbered note above that `if:`.
+      #
+      # DO NOT TAKE ZIZMOR'S AUTO-FIX. It is classified SAFE, so a bare `zizmor --fix` applies it
+      # silently: for a `pull_request` trigger it substitutes `github.event.pull_request.user.login`,
+      # collapsing the conjunction into `A && A` and deleting the self-trigger skip. Nothing in CI would
+      # catch that — every test and required check stays green while the skip is gone.
+      #
+      # The premise this suppression rests on — clause 1 present, conjoined, no `||` — is PINNED by
+      # tests/test_dep1_lock_resync_lockstep.py rather than merely asserted here. Line-anchored on
+      # purpose: a file-level entry would also swallow a future actor check added to this file as a SOLE
+      # gate, which is the shape that IS exploitable. Accepted residual: an in-place rewrite that keeps
+      # the line count would not re-fire the finding — that is what the test is for. If the line moves,
+      # RE-ANCHOR it; do not broaden it to the file.
+      - dependabot-lock-resync.yml:76
+
+  archived-uses:
+    ignore:
+      # contributor-assistant/github-action is ARCHIVED upstream (GitHub API `archived: true`; the date
+      # is observed from its last push, 2026-03-23, since `archived_at` is null). v2.6.1 is both the last
+      # tag and the last release, and the pin ca4a40a7d1004f18d9960b404b97e5f30a505a08 equals that tag
+      # exactly — so there is no future patch to bump to. Recorded as an ACCEPTED RESIDUAL, not a false
+      # positive: the finding is true.
+      #
+      # What the SHA pin buys, and what it does not. It closes the TAMPER axis completely — a bundled JS
+      # action's pinned SHA fully determines the bytes that run, and a deleted or re-registered namespace
+      # makes this step FAIL rather than run a stranger's code. It does NOT close the axis this audit is
+      # about: a flaw in the code already at that SHA will never be patched.
+      #
+      # NOT REPLACED, deliberately. `cla` is a REQUIRED status context (.github/required-contexts.txt)
+      # and it is this JOB's own conclusion, so a broken step blocks every contribution.
+      # pull_request_target / issue_comment workflows run only from the DEFAULT branch, so a swap cannot
+      # be exercised on the PR that makes it — it lands on main untested, with approvals at 0 and
+      # auto-merge armed. On a step holding a write token that any GitHub user can trigger by comment,
+      # trading a frozen SHA-pinned bundle for a less-reviewed fork is not self-evidently a security win.
+      #
+      # WHAT WILL FORCE THE DECISION, and it is not this lint: action.yml at this SHA declares
+      # `runs.using: node20`, as does the archived repo's HEAD, so no upstream release can ever
+      # re-declare node24. GitHub removes Node20 in fall 2026. Re-check before then. Full record and the
+      # replacement candidate: docs/adr/0034 (amendment, 2026-08-01).
+      #
+      # Line-anchored on purpose: a file-level entry would silently swallow a SECOND archived action
+      # added here later. Accepted cost is drift — an inserted line re-fires the finding with no change
+      # in risk. Re-anchor; do not broaden. Delete this entry when the action is replaced, or if upstream
+      # un-archives (the audit re-checks that every run).
+      - cla.yml:44

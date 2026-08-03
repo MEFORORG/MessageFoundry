@@ -43,7 +43,7 @@ could drop/rewrite a config module that executes as the service account on the n
    (`GetNamedSecurityInfoW`, `GetAce`, `ConvertSidToStringSidW`, `OpenProcessToken` +
    `GetTokenInformation`), behind a `sys.platform == "win32"` guard so mypy/lint pass on the Linux CI
    leg (mirrors [`secrets_dpapi.py`](../../messagefoundry/secrets_dpapi.py) and
-   [`console/service_control.py`](../../messagefoundry/console/service_control.py)). This keeps the
+   `console/service_control.py`). This keeps the
    DEP-1 / pip-audit surface flat — **no new runtime dependency**.
 
 3. **Fail OPEN with a loud WARNING on a Win32 API *error*** (not a policy decision). A
@@ -102,6 +102,6 @@ could drop/rewrite a config module that executes as the service account on the n
 - [CLAUDE.md](../../CLAUDE.md) §2 (Windows/NSSM primary deployment, the engine runs least-privilege),
   §9 (PHI guardrails — the service account holds PHI + DB credentials).
 - [`secrets_dpapi.py`](../../messagefoundry/secrets_dpapi.py) /
-  [`console/service_control.py`](../../messagefoundry/console/service_control.py) — the established
+  `console/service_control.py` — the established
   `ctypes`-behind-`sys.platform` Win32 pattern reused here.
 - [docs/SERVICE.md](../SERVICE.md) "Lock down the config directory (CONFIG-2)".
