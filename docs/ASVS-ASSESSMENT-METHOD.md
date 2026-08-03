@@ -146,19 +146,36 @@ for four different reasons, and only one of them means the software got better:
 | A cell was **read for the first time** (`unverified` → anything) | **No** | The survey advanced. A cell moving `unverified` → `pass` is a *discovery*, not an improvement |
 | A **scope boundary was stated** (→ `na`) | **No** | The requirement left the denominator. Identical code, smaller question |
 | A **rule was applied more carefully** (re-grade in either direction) | **No** | The assessment got more accurate. Some of these move *down* |
+| **The standard moved** (a new ASVS release changes requirement text, levels, or the requirement count) | **No** | The denominator changed. Zero code changed and zero assessment work happened — and this is the cause most easily mistaken for the survey advancing |
 
 **The worked example, and it is recent.** On 2026-08-02 the fail count went **3 → 2** when 11.7.1 was
 scoped out under rule 1. **Zero lines of engine code changed.** A reader comparing only the fail counts
 across those two days would conclude a defect was fixed; nothing was. The rationale is on the cell and
 the boundary is in §2, but neither is visible to someone reading a total.
 
-**Two obligations follow, and they are cheap:**
+**⛔ And the converse is true, and worse: a posture movement with NO count movement.** Everything above
+teaches you to interrogate a number that *moved*. The more dangerous class **hides in stillness** — code
+changes, an evidence anchor drifts off the line it was pinned to, and the recorded verdict quietly stops
+describing the code. **The total does not move at all.** Stability reads as "nothing to see."
 
-1. **Never report a bucket total as a trend without naming which of the four causes moved it.** "Fails
-   went from 3 to 2" is not a finding. "One cell was scoped out; no code changed" is.
+This is not hypothetical and it is not cause 4. Cause 4 is a deliberate act — someone re-read a cell and
+graded it better. This is an evidence pointer breaking **on its own**, while every reader sees a total
+that looks fine. Measured on this project on 2026-08-02: **seven anchors across six cells had drifted**,
+and not one bucket total moved. Nobody could have caught it from a number. You catch it **only** if a
+gate is watching, which is the entire reason the drift gate exists (ADR 0156).
+
+**Three obligations follow, and they are cheap:**
+
+1. **Never report a bucket total as a trend without naming which cause moved it.** "Fails went from 3
+   to 2" is not a finding. "One cell was scoped out; no code changed" is.
 2. **When a count improves, state what would have had to happen for it to mean an improvement, and
-   whether that happened.** This is the same discipline as a negative control: a number that can only
-   go one way is not measuring anything.
+   whether that happened.** Same discipline as a negative control: a number that can only go one way is
+   not measuring anything.
+3. **A stable count is not evidence of a stable posture unless the anchors were re-verified in the same
+   pass.** Report the drift check alongside the total, or you are publishing the freshness of the last
+   check rather than of the software. ⚠️ **Always state the pinned ASVS version with any total**, so a
+   denominator change shows up as a version change instead of as progress — the corpus is pinned by
+   digest in `[scorecard]`, and a 5.0.x patch release would move requirement text and counts on its own.
 
 ⚠️ **This cuts against us more often than for us, which is why it is written down.** The survey is
 incomplete, so most future movement will come from cause 2 — cells being read for the first time — and
