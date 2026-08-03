@@ -390,6 +390,57 @@ def test_na_with_a_rationale_is_accepted(tmp_path: Path) -> None:
     assert load_scorecard(sc)[0].verdict == "na"
 
 
+def test_a_closed_cell_whose_verdict_still_matches_its_pin_loads(tmp_path: Path) -> None:
+    """The green half. Without this, the red tests below could pass by refusing every closed cell."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "na"\nresidual = "out of declared scope"\n'
+        'decision_closed = true\ndecision_closed_verdict = "na"\n'
+        'decision_closed_on = "2026-08-02"\ndecision_closed_by = "owner"\n',
+    )
+    assert load_scorecard(sc)[0].verdict == "na"
+
+
+def test_rescoring_a_closed_cell_is_refused(tmp_path: Path) -> None:
+    """The whole point: a survey cannot quietly re-grade a cell the owner closed.
+
+    This was prose before it was a gate, and prose is not what stops a sweep — the cell this rule
+    exists for moved FOUR times in eighteen days, each pass believing it was doing careful work. A
+    rationale they could read was never the thing that stopped them.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "fail"\nresidual = "re-graded by a sweep"\n'
+        'decision_closed = true\ndecision_closed_verdict = "na"\n',
+    )
+    with pytest.raises(ScorecardError, match="CLOSED at"):
+        load_scorecard(sc)
+
+
+def test_a_closure_without_a_pinned_verdict_is_refused(tmp_path: Path) -> None:
+    """A closure with nothing to compare against is a comment, not a control.
+
+    The failure mode it forecloses: someone writes `decision_closed = true`, believes the cell is
+    protected, and the checker has no way to tell a re-score from the original verdict.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "na"\nresidual = "out of declared scope"\n'
+        "decision_closed = true\n",
+    )
+    with pytest.raises(ScorecardError, match="the pin is what makes the closure checkable"):
+        load_scorecard(sc)
+
+
+def test_an_unclosed_cell_is_unaffected_by_the_closure_rule(tmp_path: Path) -> None:
+    """Negative control on the rule's REACH: it must not police cells that never opted in."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\nresidual = "no control"\n',
+    )
+    assert load_scorecard(sc)[0].verdict == "fail"
+
+
 def test_needs_review_is_a_valid_verdict(tmp_path: Path) -> None:
     """Parking a contested cell beats forcing a premature verdict — that is what flip-flops."""
     sc = _scorecard_file(tmp_path, '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "needs-review"\n')

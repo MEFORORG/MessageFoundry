@@ -1550,8 +1550,10 @@ SEV-SNP or Intel TDX host —
 [SYSTEM-REQUIREMENTS.md](SYSTEM-REQUIREMENTS.md#hardware-memory-encryption--required-for-an-asvs-level-3-phi-deployment)
 states the requirement and the (verified) availability picture, which today is **not reachable for a
 Windows guest on on-premises Hyper-V or ESXi**. On a host that does not provide the property, the honest
-configuration is **not** to set this: leave it unset, keep the startup warning, and disclose 11.7.1 as
-**Partial**. Reaching for `[security].enforcement = warn` is the wrong lever — that is the global
+configuration is **not** to set this: leave it unset, keep the startup warning, and assess 11.7.1
+against your own deployment. *(Corrected 2026-08-02: this previously said "disclose 11.7.1 as
+**Partial**" — pre-filling a verdict you had not reached, and one this project no longer holds.)*
+Reaching for `[security].enforcement = warn` is the wrong lever — that is the global
 refuse/warn dial and downgrades every other posture refusal at the same time; nothing about this control
 requires it, because it never refuses unless you opt in via `require_memory_encryption_declaration`. The
 step-by-step is in OFF-LOOPBACK-DEPLOYMENT.md

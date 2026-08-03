@@ -183,6 +183,34 @@ def load_scorecard(path: Path) -> list[Cell]:
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
                 "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
             )
+        # A cell the OWNER has closed is not re-scorable by a survey, sweep or agent. The stop was
+        # written in prose first and prose is not a gate: the reason this cell needed closing at all
+        # is that four different passes each believed they were doing careful work, and a rationale
+        # they could read was never what stopped them. `decision_closed_verdict` pins the verdict as
+        # of the ruling, so a later verdict change is DETECTABLE rather than merely discouraged.
+        #
+        # Deliberately not a warning. The cost of a false stop is one conversation with the owner; the
+        # cost of a silent re-score is a posture document that disagrees with the record and is
+        # discovered months later by a reader — which has already happened here, four times in
+        # eighteen days on the one cell this rule was written for.
+        if raw.get("decision_closed") is True:
+            pinned = str(raw.get("decision_closed_verdict", "")).lower()
+            if not pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `decision_closed = true` without "
+                    "`decision_closed_verdict` — the pin is what makes the closure checkable, so a "
+                    "closure without one is a comment, not a control"
+                )
+            if verdict != pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: verdict is {verdict!r} but this cell is CLOSED at "
+                    f"{pinned!r} (`decision_closed = true`, closed "
+                    f"{raw.get('decision_closed_on', 'date not recorded')} by "
+                    f"{raw.get('decision_closed_by', 'owner')}). Re-scoring a closed cell needs an "
+                    "explicit owner instruction — not a sweep's own judgement. If you hold one, move "
+                    "the pin in the SAME commit and say so in the message; if you do not, revert the "
+                    "verdict. See `decision_reopen_requires` on the cell"
+                )
         for a in raw.get("absence", []):
             if not str(a.get("mutation", "")).strip():
                 raise ScorecardError(
