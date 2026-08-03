@@ -46,6 +46,22 @@ questions this ADR turns on:
 lookups through a parent-held IPC broker and (2) confines the worker at the OS level (default-deny
 egress/filesystem/imports), per platform.** Proposed (design only — no code in this lane).
 
+> **Prerequisite (added 2026-08-01, BACKLOG #339).** This ADR was written while the ADR 0087 pipe still
+> **pickled**, and its Context below therefore understates the residual it was addressing: the pipe had a
+> third limit — the parent called `pickle.loads` on frames the *child* wrote, so a Handler's `__reduce__`
+> executed in the engine parent and the address-space boundary was bypassable outright. That is fixed
+> (a closed-tag, non-executing codec on both legs, `pipeline/_sandbox_codec.py`), which is what makes the
+> two limits below the *remaining* ones rather than the only ones.
+>
+> **This is load-bearing for the broker, not incidental.** The broker's direction of travel is *child
+> requests → parent acts*, which is precisely the direction that must never be able to name a callable.
+> A broker built on the old pickled pipe would have re-opened the hole it is meant to help close. So
+> **the brokered request/response MUST ride the existing closed grammar** — a new frame type in the
+> closed tag set, with the same request/answer binding the codec already enforces (fresh per-dispatch
+> `secrets` id, and the full `(id, phase, name)` triple checked before any payload is interpreted) — and
+> **not** an ad-hoc serializer beside it. "The broker adds a typed IPC protocol surface to secure" under
+> *Negative / risks* composes with this; the dependency is now explicit rather than implied.
+
 - **(1) IPC request-broker for `db_lookup`/`fhir_lookup`.** The trusted **parent** holds the DB/HTTP
   capability. A sandboxed Handler's `db_lookup`/`fhir_lookup` call, instead of bridging to the loop
   in-process, marshals a **typed request** over the existing ADR 0087 length-prefixed pipe; the **parent**

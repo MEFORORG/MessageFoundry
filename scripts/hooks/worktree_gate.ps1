@@ -242,7 +242,7 @@ if (-not $hook) { exit 0 }
 # The allowlist doubles as the kill switch: no file, no entries => nothing is governed.
 # Each root keeps BOTH forms: a casefolded/slash-normalized one to compare against (Windows paths are
 # case-insensitive), and the operator's original spelling to quote back in the deny message -- a message
-# that shouts `c:\users\scott\...` at you looks broken even though the match is correct.
+# that shouts `c:\users\<you>\...` at you looks broken even though the match is correct.
 $roots = @(
     Get-Content -LiteralPath $ReposFile -ErrorAction SilentlyContinue |
         Where-Object { $_ -and -not $_.TrimStart().StartsWith("#") } |

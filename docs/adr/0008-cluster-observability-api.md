@@ -83,6 +83,16 @@ are still fresh, only the one with the largest `last_seen` is reported as leader
   live leader), so `/cluster/nodes` never shows two leaders and `leader_node_id` is never the dead node.
   This is the key correctness property: the derived leader is always a single *live* node.
 
+  > ⚠️ **CORRECTION (2026-08-01).** The "single leader" half holds unconditionally; the "always *live*"
+  > half does not. The freshness test is `(now - last_seen) <= node_timeout_seconds` with no lower
+  > bound, comparing the *reading* node's wall clock against a `last_seen` written by the *beating*
+  > node's wall clock. A row stamped by a node whose clock runs ahead has a negative age, passes, and
+  > — being the largest `last_seen` — wins the tiebreak, including after that node hard-crashes. So the
+  > derived leader can name a dead node while the `lease_owner` field on the same response names the
+  > live one. Treat `leader_node_id` as observability; the lease is authoritative. This also means the
+  > console's "cluster has no leader" check, which keys off `leader_node_id` being absent, can be
+  > masked by a skew-frozen row.
+
 A pre-Step-7 `nodes` table (a cluster upgraded in place) is migrated idempotently under the same DDL
 advisory lock: `ALTER TABLE nodes ADD COLUMN IF NOT EXISTS is_leader ...`. The
 `NullCoordinator` synthesizes a single self-entry (single node, always leader, no DB), so

@@ -187,6 +187,12 @@ def test_no_links_to_superseded_documents() -> None:
         "self-assessment",
         "not a certification",
         "no third-party assessment",
+        # ADR 0155 shipped a SELF-RUN DAST tier. This clause was unpinned until then, so an edit
+        # quietly rewriting it to imply DAST coverage passed CI — and a self-run pass is exactly the
+        # substitute the Secure Build Standards theater table names for signal 10. Pinned by
+        # tests/test_dast_claims.py::test_the_guard_catches_the_rewrite_it_exists_to_prevent, which
+        # proves this entry actually reds the rewrite rather than merely existing.
+        "no independent dynamic (DAST) testing",
     ],
 )
 def test_asvs_row_keeps_its_framing(phrase: str) -> None:

@@ -82,6 +82,11 @@ Full documentation lives on **[messagefoundry.org](https://messagefoundry.org/)*
 [Guides](https://messagefoundry.org/guides/) ·
 [Documents](https://messagefoundry.org/documents.html)
 
+**In this repository:** [`docs/README.md`](https://github.com/MEFORORG/MessageFoundry/blob/main/docs/README.md)
+is the index for the 377 documents under `docs/`. It opens with a six-step **start-here path for a new
+operator**, then splits the rest by audience — operators, developers, security reviewers, maintainers —
+and quarantines the dated planning artifacts so you do not mistake a superseded plan for instructions.
+
 ## Installing & rolling out
 
 **The recommended way to deploy MessageFoundry is to install the published package from

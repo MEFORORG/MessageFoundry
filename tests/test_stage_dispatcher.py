@@ -32,7 +32,8 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from collections.abc import AsyncIterator, Callable
+import warnings
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
@@ -187,6 +188,9 @@ class ManualClock:
     def __init__(self, start: float = 0.0) -> None:
         self.now = start
         self._armed: list[_ManualHandle] = []
+        _LIVE_CLOCKS.append(
+            self
+        )  # so a `_wait_until` expiry can report virtual time (BACKLOG #344)
 
     def time(self) -> float:
         return self.now
@@ -352,16 +356,159 @@ async def _settle(rounds: int = 8) -> None:
         await asyncio.sleep(0.005)
 
 
-async def _wait_until(pred: Callable[[], bool], timeout: float = 8.0) -> bool:
+# --- expiry diagnostics (BACKLOG #344 proposal 6) -------------------------------------------------
+#
+# A bare `assert await _wait_until(...)` reports `assert False` and NOTHING else, so every occurrence
+# gets re-diagnosed from scratch — BACKLOG #344 instance 2 was read as latency for a day on exactly
+# that basis. `_wait_until` therefore RAISES on expiry, carrying the state a reader needs.
+#
+# The dispatcher/clock are not passed in (the predicate is an opaque closure): they register
+# themselves on construction and `_reset_wait_registry` clears them per test, so every call site gets
+# the diagnostic for free with no per-site argument.
+
+_LIVE_DISPATCHERS: list[StageDispatcher] = []
+_LIVE_CLOCKS: list[ManualClock] = []
+
+
+class _WaitTimeout(AssertionError):
+    """A `_wait_until` poll expired. AssertionError so pytest reports it as a test failure, not an
+    error, and so the historical `assert await _wait_until(...)` form reads unchanged."""
+
+
+@pytest.fixture(autouse=True)
+def _reset_wait_registry() -> Iterator[None]:
+    """Scope the diagnostic registries to one test (they are module-level by necessity)."""
+    _LIVE_DISPATCHERS.clear()
+    _LIVE_CLOCKS.clear()
+    _SWEEP_STANDINS.clear()
+    yield
+    _LIVE_DISPATCHERS.clear()
+    _LIVE_CLOCKS.clear()
+    _SWEEP_STANDINS.clear()
+
+
+def _lane_report(d: StageDispatcher, lane: str) -> str:
+    task = d._lane_tasks.get(lane)
+    if task is None:
+        task_state = "none"
+    elif not task.done():
+        task_state = "ALIVE"
+    elif task.cancelled():
+        task_state = "cancelled"
+    else:
+        exc = task.exception()
+        task_state = f"raised {exc!r}" if exc is not None else "finished"
+    return (
+        f"      {lane}: phase={getattr(d.phase(lane), 'name', None)}"
+        f" park_until={d.park_until(lane)} streak={d.infra_error_streak(lane)}"
+        f" dirty={d.is_dirty(lane)} timer_armed={d._timer_deadline.get(lane)}"
+        f" lane_task={task_state}"
+    )
+
+
+def _verdict(d: StageDispatcher, lane: str | None = None) -> str:
+    """State which #344 hypothesis this expiry is, so the next reader need not know the theory.
+
+    `empty_claims` alone is NOT a complete discriminator — it must be read WITH the lane phase.
+    `empty_claims[0] > 0` is biconditional with the T12 stranding only because the other EMPTY
+    consumer (T11, EMPTY-with-dirty) is unreachable under this topology, and `== 0` covers several
+    distinct stuck states that only the phase separates.
+    """
+    phase = d.phase(lane) if lane is not None else None
+    pname = getattr(phase, "name", "?")
+    if d.empty_claims[0] > 0 and (phase is None or phase is _LanePhase.IDLE):
+        return (
+            "VERDICT: a claim came back EMPTY (empty_claims[0] > 0) and T12 dropped the lane to a"
+            " TERMINAL IDLE — no timer armed, and these tests disable the sweep that would re-ready"
+            " it. Two known routes, both SQL Server, both reported to the dispatcher as an ordinary"
+            " empty result: a swallowed lock-timeout (native 1222 under SET LOCK_TIMEOUT 0, logged"
+            " only at DEBUG) and a READPAST head skip (the batch claim drops the whole lane when its"
+            " rn=1 head is locked — no log line at all). Postgres is NOT structurally immune: its"
+            " claim uses FOR UPDATE SKIP LOCKED, the same head-of-line skip. BACKLOG #344 instance 2."
+        )
+    if d.empty_claims[0] > 0:
+        return (
+            f"VERDICT: an EMPTY claim was recorded (empty_claims[0] > 0) but the lane is {pname},"
+            " not IDLE — so this is NOT the plain #344 instance-2 stranding. Read the phase:"
+            " CLAIMING/PROCESSING means a later claim or serializer is still outstanding; PAUSED"
+            " means the pause branch consumed it."
+        )
+    return (
+        "VERDICT: NO empty claim was recorded (empty_claims[0] == 0), so the claim never returned at"
+        f" all — a stalled statement or a lost wakeup. The lane is {pname}: CLAIMING = the claim is"
+        " outstanding; PROCESSING = the serializer is hung; READY = the claimer is not picking it up"
+        " (check slots_free and any claim-error backoff). This is NOT the #344 instance-2 stranding"
+        " and must NOT be papered over with a re-nudge."
+    )
+
+
+async def _expiry_report(pred: Callable[[], bool] | None = None, lane: str | None = None) -> str:
+    """Everything a reader needs to tell the #344 hypotheses apart, without a second CI round-trip."""
+    lines = ["_wait_until expired."]
+    if pred is not None:
+        try:
+            lines.append(f"  predicate re-read after expiry: {pred()!r}")
+        except Exception as exc:  # noqa: BLE001 — a raising predicate must not hide the report
+            lines.append(f"  predicate re-read RAISED: {exc!r}")
+    for i, d in enumerate(_LIVE_DISPATCHERS):
+        # The verdict needs a lane: use the caller's, else the only one if this dispatcher has one.
+        subject = (
+            lane if lane is not None else (next(iter(d._states)) if len(d._states) == 1 else None)
+        )
+        lines.append(f"  {_verdict(d, subject)}")
+        lines.append(
+            f"  dispatcher[{i}] stage={d._stage.value}"
+            f" empty_claims(total,wake_fanout,idle_poll)={d.empty_claims}"
+            f" busy_violations={d.busy_violations} processing_lanes={d.processing_lanes}"
+            f" slots_free={d._slots_free}"
+        )
+        # NB distinct loop names: a bare `for lane in ...` here would REBIND the `lane` parameter and
+        # give the next dispatcher's verdict a stale subject.
+        lines.extend(_lane_report(d, ln) for ln in d._states)
+        # The store row is the other half: status + next_attempt_at say whether the head was even
+        # claimable. Bounded and swallowed — a diagnostic that hangs or raises would MASK the failure
+        # it is meant to explain.
+        try:
+            for ln in list(d._states):  # `ln`, not `lane` — see the rebinding note above
+                rows = await asyncio.wait_for(_lane_rows(d._store, ln), timeout=5.0)
+                lines.append(
+                    f"      {ln} rows="
+                    + str([(r["status"], r["attempts"], r["next_attempt_at"]) for r in rows])
+                )
+        except Exception as exc:  # noqa: BLE001 — a diagnostic must never mask the real failure
+            lines.append(f"      <store read unavailable: {exc!r}>")
+    for i, mc in enumerate(_LIVE_CLOCKS):
+        lines.append(f"  clock[{i}].now={mc.now} armed={[h.fire_at for h in mc.armed]}")
+    return "\n".join(lines)
+
+
+async def _wait_until(
+    pred: Callable[[], bool],
+    timeout: float = 8.0,
+    *,
+    required: bool = True,
+    note: str | None = None,
+) -> bool:
     """Poll ``pred`` (letting async work run) until true or ``timeout``. Robust against aiosqlite thread
-    latency without fixed-iteration flakiness."""
+    latency without fixed-iteration flakiness.
+
+    On expiry this RAISES :class:`_WaitTimeout` with a full dispatcher/store dump (BACKLOG #344
+    proposal 6) instead of returning False — a bare ``assert False`` is what made instance 2 cost a day
+    of re-diagnosis. Pass ``required=False`` for the handful of call sites that legitimately treat a
+    timeout as a value rather than a failure.
+    """
     loop = asyncio.get_running_loop()
     deadline = loop.time() + timeout
     while loop.time() < deadline:
         if pred():
             return True
         await asyncio.sleep(0.003)
-    return pred()
+    if pred():
+        return True
+    if not required:
+        return False
+    report = await _expiry_report(pred)
+    raise _WaitTimeout(f"{note}\n{report}" if note else report)
 
 
 def _make(
@@ -380,7 +527,7 @@ def _make(
     infra_fault_stop_after: int = 10,
     infra_fault_backoff_cap: float = 60.0,
 ) -> StageDispatcher:
-    return StageDispatcher(
+    d = StageDispatcher(
         Stage.INGRESS,
         store,
         process_item=stub,
@@ -398,6 +545,8 @@ def _make(
         infra_fault_stop_after=infra_fault_stop_after,
         infra_fault_backoff_cap=infra_fault_backoff_cap,
     )
+    _LIVE_DISPATCHERS.append(d)  # so a `_wait_until` expiry can dump it (BACKLOG #344 proposal 6)
+    return d
 
 
 def _first_occurrence_order(
@@ -794,7 +943,7 @@ async def test_busy_violation_soak_200_lanes(store: Any) -> None:
             d.notify_work()
             mc.advance(1_000_000.0)
             await d._run_sweep_once()
-            if await _wait_until(_quiescent, timeout=3.0):
+            if await _wait_until(_quiescent, timeout=3.0, required=False):
                 drained = True
                 break
         assert drained, "soak did not reach quiescence"
@@ -967,6 +1116,72 @@ def _always_raise(lane: str, item: OutboxItem) -> str:
     return "RAISE"
 
 
+# How many times a lane may be re-readied by the sweep stand-in below before the test fails outright.
+# 1 covers the observed rate (a swallowed 1222 is a rare, independent event); a lane needing more than
+# that is a contention REGRESSION, not the transient this stands in for — so it must still fail.
+_MAX_SWEEP_STANDINS = 1
+_SWEEP_STANDINS: dict[str, int] = {}
+
+
+async def _wait_lane(
+    d: StageDispatcher, lane: str, *phases: _LanePhase, timeout: float = 8.0
+) -> None:
+    """Wait for ``lane`` to reach any of ``phases``, standing in for the periodic sweep that the ADR
+    0070 tests deliberately disable.
+
+    A claim can come back EMPTY even though the lane's head is PENDING and due: on SQL Server
+    ``claim_fifo_heads`` runs under ``SET LOCK_TIMEOUT 0``, so a momentarily contended head raises
+    native error 1222, which the store CATCHES and reports as a normal empty result
+    ([`store/sqlserver.py`] ``_is_lock_timeout`` branch) — by design, the "never-block" yield. The
+    dispatcher's EMPTY branch then takes T12: ``phase=IDLE`` with **no timer armed**. In production the
+    periodic sweep re-readies exactly that lane; these tests set ``sweep_interval=_HUGE_SWEEP`` with an
+    empty ``lane_provider`` on purpose, so IDLE is TERMINAL here and the lane can never be re-claimed —
+    which is the whole of BACKLOG #344 instance 2 (proven by forcing a real 1222 mid-re-claim).
+
+    So re-ready a stranded lane, but COUNT it and cap it at ``_MAX_SWEEP_STANDINS``: absorbing this
+    silently would hide a genuine contention regression, which is the failure mode the cap exists for.
+
+    When IDLE is itself an expected outcome the stand-in is disabled — a test that WANTS the lane idle
+    must never have it re-readied underneath its assertion.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    idle_is_a_target = _LanePhase.IDLE in phases
+    while loop.time() < deadline:
+        phase = d.phase(lane)
+        if phase in phases:
+            return
+        # TERMINAL IDLE: no timer armed and (in this topology) no sweep to re-arm one.
+        if not idle_is_a_target and phase is _LanePhase.IDLE and lane not in d._timer_deadline:
+            used = _SWEEP_STANDINS.get(lane, 0)
+            if used >= _MAX_SWEEP_STANDINS:
+                raise _WaitTimeout(
+                    f"{lane} stranded in terminal IDLE {used + 1} times — past the"
+                    f" {_MAX_SWEEP_STANDINS} allowed sweep stand-in(s). That is a contention"
+                    f" regression, not the transient 1222 this stands in for.\n"
+                    + await _expiry_report(lane=lane)
+                )
+            _SWEEP_STANDINS[lane] = used + 1
+            # LOUD, but not fatal: surfaced in pytest's warnings summary so the real-world rate of the
+            # swallowed 1222 stays visible (and reviewable) instead of being silently absorbed here.
+            warnings.warn(
+                f"sweep stand-in: {lane} was stranded in terminal IDLE after an EMPTY claim"
+                f" (empty_claims={d.empty_claims}) — re-readied ({used + 1}/{_MAX_SWEEP_STANDINS})."
+                " See BACKLOG #344 instance 2.",
+                stacklevel=2,
+            )
+            # woken=False: a sweep-class readiness, not a producer wake (books EMPTY as idle_poll).
+            d.mark_ready(lane, woken=False)
+        await asyncio.sleep(0.003)
+    want = "/".join(p.name for p in phases)
+    raise _WaitTimeout(f"{lane} never reached {want}\n" + await _expiry_report(lane=lane))
+
+
+def _sweep_standins(lane: str) -> int:
+    """How many times `_wait_park_or_stop` had to stand in for the disabled sweep on ``lane``."""
+    return _SWEEP_STANDINS.get(lane, 0)
+
+
 async def _advance_past_park(d: StageDispatcher, mc: ManualClock, lane: str) -> None:
     """Advance the ManualClock just past ``lane``'s current park deadline so its park timer fires,
     re-claiming the (not-due) faulting head → the next infra fault. Settles the async work after."""
@@ -982,7 +1197,7 @@ async def _drive_infra_faults_until_stop(
     """Drive an always-faulting lane to STOPPED by repeatedly firing its park timer, bounded by
     ``budget`` iterations (a guard against a non-terminating loop if the bound regressed)."""
     for _ in range(budget):
-        assert await _wait_until(lambda: d.phase(lane) in (_LanePhase.PARKED, _LanePhase.STOPPED))
+        await _wait_lane(d, lane, _LanePhase.PARKED, _LanePhase.STOPPED)
         if d.phase(lane) == _LanePhase.STOPPED:
             return
         await _advance_past_park(d, mc, lane)
@@ -1047,7 +1262,7 @@ async def test_adr0070_1_retry_forever_never_stops_alerts_stuck(store: Any) -> N
     try:
         d.mark_ready(lane)
         for _ in range(7):  # well past the horizon
-            assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+            await _wait_lane(d, lane, _LanePhase.PARKED)
             assert d.phase(lane) != _LanePhase.STOPPED  # never terminal
             await _advance_past_park(d, mc, lane)
         # WAIT for the post-advance retry cycle (unpark → claim → re-fault → re-park) to settle back to
@@ -1055,7 +1270,7 @@ async def test_adr0070_1_retry_forever_never_stops_alerts_stuck(store: Any) -> N
         # outlasts _advance_past_park's fixed _settle() and catches the lane mid-cycle in PROCESSING
         # (mirrors test 9's post-loop _wait_until). The invariant under test is unchanged: still PARKED,
         # never STOPPED.
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) >= 7  # streak keeps accruing (drives the backoff)
         assert alert.stopped == []  # never STOPs
         assert len(alert.stuck) == 1  # throttled: emitted ONCE at the horizon crossing
@@ -1080,13 +1295,13 @@ async def test_adr0070_2_transient_infra_fault_self_heals(store: Any) -> None:
     await d.start()
     try:
         d.mark_ready(lane)  # fault 1
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 1
         await _advance_past_park(d, mc, lane)  # fault 2
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 2
         await _advance_past_park(d, mc, lane)  # resolves → clean drain
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        await _wait_lane(d, lane, _LanePhase.IDLE)
         assert d.infra_error_streak(lane) == 0  # streak reset on the resolving pass
         assert alert.stopped == []  # never STOPped
         assert [r.message_id for r in stub.records] == [mid, mid, mid]  # head retried head-first
@@ -1109,15 +1324,15 @@ async def test_adr0070_3_streak_reset_scoping_sharp_edge(store: Any) -> None:
     await d.start()
     try:
         d.mark_ready(lane)  # fault 1
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 1
 
         await _advance_past_park(d, mc, lane)  # park-timer unpark → fault 2
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 2  # ACCRUED across the park-timer unpark (not reset)
 
         await _advance_past_park(d, mc, lane)  # park-timer unpark → fault 3 == threshold → STOP
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.STOPPED)
+        await _wait_lane(d, lane, _LanePhase.STOPPED)
         assert d.infra_error_streak(lane) == 3
 
         d.notify_work()  # STOPPED→READY reload resume — the ONLY reset path for a stopped lane
@@ -1143,11 +1358,11 @@ async def test_adr0070_3b_streak_resets_on_forward_progress(store: Any) -> None:
     await d.start()
     try:
         d.mark_ready(lane)  # round 1: i==0 head fault
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 1  # zero-progress fault accrued
 
         await _advance_past_park(d, mc, lane)  # round 2: head RESOLVES, row1 raises at i==1
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 0  # forward-progress fault RESET the streak
         assert mids[0] in {r.message_id for r in stub.records}
     finally:
@@ -1190,7 +1405,7 @@ async def test_adr0070_4_fifo_head_first_after_stop(store: Any) -> None:
         n_before = len(stub.records)
         d.notify_work()
         await _settle()
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        await _wait_lane(d, lane, _LanePhase.IDLE)
         resumed = [r.message_id for r in stub.records[n_before:]]
         assert resumed == mids  # head first, then the tail — strict FIFO, no overtake
         assert d.busy_violations == 0
@@ -1239,7 +1454,7 @@ async def test_adr0070_6_spin_collapses_to_backoff(store: Any) -> None:
     await d.start()
     try:
         d.mark_ready(lane)  # one infra fault → head re-pended not-due
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         park_until = d.park_until(lane)
         assert park_until is not None and park_until > mc.now  # future deadline
 
@@ -1302,7 +1517,7 @@ async def test_adr0070_7_reload_resumes_idempotently(store: Any) -> None:
         mc.advance((rows[0]["next_attempt_at"] - mc.now) + 1.0)
         d.notify_work()
         await _settle()
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.IDLE)
+        await _wait_lane(d, lane, _LanePhase.IDLE)
         assert mid in {
             r.message_id for r in stub.records
         }  # the SAME preserved head, finally delivered
@@ -1381,13 +1596,13 @@ async def test_adr0070_9_content_retry_is_not_an_infra_fault(store: Any) -> None
     try:
         d.mark_ready(lane)  # content retry 1
         for n in range(6):  # drive 6 content retries — twice past stop_after=3
-            assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+            await _wait_lane(d, lane, _LanePhase.PARKED)
             assert d.infra_error_streak(lane) == 0, (
                 f"content retry accrued the infra streak after retry {n + 1}"
             )
             assert d.phase(lane) != _LanePhase.STOPPED
             await _advance_past_park(d, mc, lane)  # park-timer unpark → next content retry
-        assert await _wait_until(lambda: d.phase(lane) == _LanePhase.PARKED)
+        await _wait_lane(d, lane, _LanePhase.PARKED)
         assert d.infra_error_streak(lane) == 0
         assert d.phase(lane) != _LanePhase.STOPPED
         assert alert.stopped == []  # the infra STOP never fired on message-content poison
@@ -1419,12 +1634,15 @@ async def test_wakeless_backlog_drains_greedily_not_sweep_gated(store: Any) -> N
         sweep_interval=5.0,  # LARGE: sweep-gated draining would need ~n×5s; greedy T13b ignores it
         clock=mc.time,
     )
+    _LIVE_DISPATCHERS.append(d)  # built without _make — register for the #344 expiry dump
     await d.start()  # seed-all-READY (woken=False), NO explicit producer wake
     try:
         # 8s budget << the ~100s a sweep-gated (1 row / 5s) drain would take: only the greedy re-arm passes.
         # (RESOLVED leaves each claimed row INFLIGHT, so the stub records exactly one dispatch per row.)
-        assert await _wait_until(lambda: len(stub.records) >= n, timeout=8.0), (
-            "wake-less backlog did not drain greedily"
+        await _wait_until(
+            lambda: len(stub.records) >= n,
+            timeout=8.0,
+            note="wake-less backlog did not drain greedily",
         )
         assert [
             r.message_id for r in stub.records if r.lane == lane
@@ -1864,7 +2082,7 @@ async def test_pause_resume_soak_busy_violations(store: Any) -> None:
             d.notify_work()
             mc.advance(1_000_000.0)
             await d._run_sweep_once()
-            if await _wait_until(_quiescent, timeout=3.0):
+            if await _wait_until(_quiescent, timeout=3.0, required=False):
                 drained = True
                 break
         assert drained, "pause/resume soak did not reach quiescence"
