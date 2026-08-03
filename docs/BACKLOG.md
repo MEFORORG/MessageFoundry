@@ -8503,6 +8503,34 @@ The three surfaces now share **one** liveness helper, because they had been disa
 
 ---
 
+## 352. Consult on enterprise AV coverage for SFTP- and file-connector ingest from outside the domain (ASVS 5.4.3 premise check)
+
+> 🚧 **Status OPEN (filed 2026-08-02).** ASVS **5.4.3** was recorded `na` on 2026-08-02 on the ground that antivirus scanning is an **enterprise-provided** control. This item exists to *test that premise* against the one ingest path most likely to fall outside it, rather than assume it.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** consult, then decide. **Severity:** medium — the verdict of a closed cell rests on the answer.
+
+**The question, for Gabe (enterprise security):** how does the enterprise scanning stack handle files that MessageFoundry *collects* rather than receives — specifically the **SFTP/FTPS remote-file source** and the **file connector** — when the origin is **outside the organisation's domain**?
+
+The distinction matters because these two paths do not look like the case AV coverage is usually designed around:
+
+- **The engine pulls, the perimeter doesn't see a delivery.** A gateway or mail-path scanner inspects content arriving *at* the enterprise. `RemoteFileSource` reaches *out* to a partner's SFTP/FTPS server and retrieves bytes over an encrypted session, landing them straight in the engine's working area. There is no inbound delivery event for a perimeter scanner to act on.
+- **On-access scanning depends on where the file lands.** If the drop directory is on a host and volume the EDR agent actually watches, on-access scanning may cover it. If it is a network share, a container volume, or a path excluded for performance (integration hosts frequently are), it may not.
+- **The origin is a partner, not the enterprise.** These feeds come from outside the domain by definition, so "internal traffic is trusted" does not apply.
+
+**What we need out of the conversation, stated as answers not opinions:**
+1. Is content retrieved by an outbound-initiated SFTP/FTPS pull scanned at all — and by what, at what point?
+2. Are integration hosts' drop/working directories inside on-access scanning, or excluded?
+3. What happens on detection — quarantine, delete, alert-only — and does MessageFoundry learn about it, or does the file simply vanish underneath a running connector?
+4. Is there an ICAP or equivalent service endpoint the engine *could* call, if we later decide to make scanning a shipped, configurable control?
+
+**Why this is filed rather than assumed.** The `na` on 5.4.3 records its own three exposures, and the load-bearing one is that **the engine ships a scan seam** (`set_scan_hook` / `scan_inbound_file`, fail-closed on both axes when installed) — so unlike full memory encryption, this is a control the product *could* implement. The cell's ground therefore depends on the enterprise actually covering these paths. If the answer to (1) or (2) is "no", the deployment requirement attached to that `na` is not satisfied for this class of feed and the cell should be reopened by the owner.
+
+**Do not** treat this item's existence as reopening 5.4.3. That cell is closed by owner decision; only the owner reopens it, and only with an explicit instruction.
+
+**Related:** the scan seam at [`transports/file.py`](../messagefoundry/transports/file.py) (`set_scan_hook`, `scan_inbound_file`) and its remote sibling in [`transports/remotefile.py`](../messagefoundry/transports/remotefile.py); the deployment requirement recorded with the 5.4.3 ruling.
+
+---
+
 ## 347. A PHI-at-rest assertion that can pass for the wrong reason — short substring vs. random ciphertext
 
 > 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_store_encryption.py:95` asserts `raw.startswith(MARKER_PREFIX) and "DOE" not in raw` — three characters of a 76-character body — as the proof that a patient surname is unreadable at rest. **The instrument is wrong in both directions.** It **fails when encryption worked perfectly** (the value is encrypted under `make_cipher(generate_key())`, a fresh random key every run, so the base64 body is fresh random text and base64's alphabet contains `D`, `O` and `E`), and — the half that matters — it would **PASS on a weak encoding that merely happened to avoid those three characters**. A test that can pass for the wrong reason is a false assurance about PHI; one that occasionally fails for the wrong reason is only noise. **The flake is what made someone look; it is not what is wrong.**
