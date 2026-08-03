@@ -292,7 +292,7 @@ async def _clear_data(store: object) -> None:
     """Empty the message/queue data tables (FK order) so the FIFO claim starts from a known single head."""
     async with store._pool.acquire() as conn:  # type: ignore[attr-defined]
         cur = await conn.cursor()
-        for table in ("queue", "response", "outbox", "messages"):
+        for table in ("queue", "response", "messages"):
             await cur.execute(f"IF OBJECT_ID(N'{table}', N'U') IS NOT NULL DELETE FROM {table}")
         await conn.commit()
 
