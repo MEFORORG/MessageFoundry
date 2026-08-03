@@ -202,13 +202,13 @@
 **Steps.**
 1. Build a row-set generator producing `RowDropContext[]` with: nesting 0–4, kinds `action`/`lookup`/`control`/`send`/`code`/`diagnostic`, control headers with and without bodies, `appended` sends, `collector_init`/`return_collector` scaffold rows, and `suite` ids consistent with the nesting.
 2. Load `ide/media/stepsWebview.js` under jsdom with `window.acquireVsCodeApi` stubbed to a recording double and `document.querySelectorAll('li.row')` backed by a synthetic DOM built from the generated rows.
-3. Extract the mirrored functions from the loaded script's scope (expose them behind a test-only `window.__mfStepsTestExports` hook set inside the existing IIFE — a hook, not a second implementation).
+3. Extract the webview's mirrored functions from the loaded script's scope (expose them behind a test-only `window.__mfStepsTestExports` hook set inside the existing IIFE — a hook, not a second implementation).
 4. For each generated row set, call each mirrored function and its `stepsModel` counterpart with identical inputs and `assert.deepStrictEqual`.
 5. Repeat over all ordered (drag, target) pairs for `canDrop`/`resolveDrop`/`barAnchor`.
 
 **Observation point.** The first `deepStrictEqual` failure, printed with the seed and the failing row set so it reproduces.
 
-**Expected result.** Zero divergences. Because `stepsModel`'s versions are already covered by `steps-edit.test.ts`, parity transitively pins the mirror to verified behaviour. ADR 0108's "model and mirror in agreement" acceptance line becomes a gate rather than a claim.
+**Expected result.** Zero divergences. Because `stepsModel`'s versions are already covered by `steps-edit.test.ts`, parity transitively pins the webview's mirrored functions to verified behaviour. ADR 0108's "model and mirror in agreement" acceptance line becomes a gate rather than a claim.
 
 **Cleanup/rollback.** The `__mfStepsTestExports` hook must be inert outside jsdom — assert in STEPS-06 that it is absent when `acquireVsCodeApi` is the real one, so nothing new is exposed in the shipped webview.
 
@@ -356,7 +356,7 @@
 2. **`jsdom`** as an `ide/` devDependency, with `ide/package-lock.json` re-locked. DEP-1 applies: verify the package, add it to `package.json`, re-lock — never an ad-hoc install.
 3. **A synthetic, PHI-free Steps corpus** (`tests/data/steps_corpus/`) exercising all 27 palette items, all 15 vocabulary verbs, both diagnostics, all three lookups, every ADR 0089 Phase A native form and every Phase C control label. Today `samples/config` yields **zero** action/lookup/diagnostic rows (verified census: 12 code, 12 send, 4 control). Generate the HL7 side with `python -m messagefoundry generate adt --count N` into a git-ignored directory and hand-author the Handler modules; commit the modules, not generator stdout.
 4. **A synthetic `messageSetsDir`** for live-value and field-picker scope tests, plus a sibling `outside/` directory for STEPS-62.
-5. **A `__mfStepsTestExports` hook** inside `ide/media/stepsWebview.js`'s IIFE, inert outside jsdom — the only way to reach the mirrored functions without duplicating them a third time.
+5. **A `__mfStepsTestExports` hook** inside `ide/media/stepsWebview.js`'s IIFE, inert outside jsdom — the only way to reach the webview's mirrored functions without duplicating them a third time.
 6. **`buildDropSlots` exported** from `ide/src/stepsModel.ts:1672`.
 7. **A temp-git-repo fixture helper** for STEPS-67 (with `core.autocrlf=false` and `* -text`).
 8. **A VS Code Marketplace publisher account + signing/attestation identity**, if VSIX publishing is to be gated in `release.yml` (owner decision — Q7).

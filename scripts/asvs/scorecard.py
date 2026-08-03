@@ -46,7 +46,10 @@ LOCAL_EXTENSION_VERDICTS: Final[frozenset[str]] = frozenset(
 )
 
 #: A verdict that has actually been reached. `unverified` and `needs-review` are NOT among them:
-#: the first was never examined, the second was examined and left open on purpose.
+#: the first was never re-verified against the requirement text, the second was and was left open on
+#: purpose. NOTE the first is re-verification DEBT, not unassessed surface -- the earlier lineage did
+#: grade those cells, against the verb as paraphrased in our own scorecards rather than against the
+#: pinned text. "Never examined" overstates it and misdescribes the lineage.
 DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", "na"})
 
 #: A verdict whose cell has been READ against the requirement text. Not the same set as
@@ -497,9 +500,10 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """The generated entry point — survey progress FIRST, verdict counts second.
 
     **Phase 0 of the fix (ADR 0156 / ASSESSMENT-METHOD §4).** A headline count computed over cells
-    that were never examined is not a measurement; it is an average over guesses, and publishing it is
-    what made every subsequent first-look read as a *reversal* rather than as *progress*. On
-    2026-08-01, 76% of that day's verdict changes were cells nobody had ever opened.
+    that were never re-verified against the requirement text is not a measurement; it is an average
+    over verdicts reached from a paraphrase, and publishing it is what made every subsequent
+    re-verification read as a *reversal* rather than as *progress*. On 2026-08-01, 76% of that day's
+    verdict changes were cells whose verdict had never been checked against the pinned text.
 
     So this leads with how much of the survey is done, and reports `unverified` separately from
     `pass` — which is also what ASVS asks for: a summary of **every requirement checked**, not
@@ -524,11 +528,16 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         "",
         "## Survey progress",
         "",
-        f"**{len(examined)} of {total} requirements have been read against the ASVS text "
-        f"({pct:.1f}%).** {unexamined} have not.",
+        f"**{len(examined)} of {total} requirements have been verified against the pinned ASVS "
+        f"requirement text ({pct:.1f}%).** {unexamined} carry a verdict that has not been re-verified "
+        "against it.",
         "",
-        "> **There is deliberately no headline score here.** A count over unexamined cells is an",
-        "> average of guesses. Until the baseline sweep completes, the honest number is the one above:",
+        "> **There is deliberately no headline score here.** A count that folds in cells not yet",
+        "> re-verified is an average over verdicts reached from a paraphrase, not a measurement. Those",
+        "> cells were graded by the earlier lineage — against the requirement verb as restated in our",
+        "> own scorecards, because the ASVS 5.0.0 text was not held until 2026-07-31. That is",
+        "> re-verification debt, not unassessed surface.",
+        "> Until the baseline sweep completes, the honest number is the one above:",
         "> how much of the survey is done. Verdict counts below cover **examined cells only** unless",
         "> stated otherwise.",
         "",
@@ -539,14 +548,16 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
         f"| Fail | {n['fail']} | no implementing control in any configuration |",
         f"| N/A | {n['na']} | does not apply on the declared scope, with a written rationale |",
         f"| Needs review | {n['needs-review']} | examined; verdict contested or blocked on a decision |",
-        f"| **Unverified** | **{n['unverified']}** | **never examined — not a Pass** |",
+        f"| **Unverified** | **{n['unverified']}** | **not re-verified against the requirement text "
+        "— not a Pass** |",
         f"| **Total** | **{total}** | |",
         "",
     ]
     if inherited:
         lines += [
             f"⚠️ **{inherited} cell(s) carry a decided verdict with no `last_verified` date** — "
-            "inherited from an earlier assessment and never re-read. Treat as unexamined.",
+            "inherited from an earlier assessment and never re-verified against the requirement text. "
+            "Treat as not-yet-re-verified.",
             "",
         ]
     lines += [
