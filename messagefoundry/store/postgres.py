@@ -55,7 +55,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -6808,6 +6808,57 @@ class PostgresStore:
             older_than,
         )
         return _rowcount(result)
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # See Store.purge_reference_snapshots for the full contract. ADR 0006 `reference.value` is PL-2
+        # and had no purge path at all before ASVS 14.2.7. Orphan-scoped: a DECLARED set is never
+        # touched however old its synced_at.
+        if not declared:
+            # Positive-signal guard — an empty `declared` reads as "every set is abandoned" and would
+            # wipe the store. Never a legitimate instruction, so it raises rather than deleting.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        rows = await self._pool.fetch(
+            "SELECT name FROM reference_version WHERE synced_at < $1", older_than
+        )
+        candidates = [r["name"] for r in rows if r["name"] not in declared]
+        deleted = 0
+        for name in candidates:
+            # Eligibility RE-ASSERTED inside the delete. `declared` is computed by the caller outside
+            # any store lock, so a config reload can land a fresh patient-keyed snapshot between the
+            # SELECT above and this statement. Postgres has no equivalent of SQLite's process-wide
+            # `self._lock`, so this predicate is the ONLY thing standing between a routine reload and
+            # deleting live data — do not "simplify" it away because the SELECT already filtered.
+            result = await self._pool.execute(
+                "DELETE FROM reference WHERE name = $1"
+                " AND EXISTS (SELECT 1 FROM reference_version v"
+                "             WHERE v.name = $1 AND v.synced_at < $2)",
+                name,
+                older_than,
+            )
+            count = _rowcount(result)
+            if not count:
+                continue  # a concurrent re-sync won the race — leave it alone
+            deleted += count
+            # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a set whose
+            # active version DIFFERS from the one this handle reflects, so leaving the version alone
+            # would let every follower keep serving the purged PHI out of `_reference_cache` until the
+            # process restarts — and deleting the pointer outright is worse, because converge only ever
+            # adds/updates names present in a fresh read and would never notice. Bumping routes the
+            # deletion through the convergence path that already exists.
+            await self._pool.execute(
+                "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                " WHERE name = $1 AND version NOT LIKE 'purged:%'",
+                name,
+            )
+            self._reference_cache.pop(name, None)
+            self._reference_versions.pop(name, None)
+        return deleted
 
     async def purge_dead_letters(
         self,

@@ -63,7 +63,6 @@ async def _clear(store: Any) -> None:
             "queue",
             "response",
             "delivered_keys",
-            "outbox",
             "messages",
         ):
             await cur.execute(f"DELETE FROM {table}")

@@ -60,7 +60,6 @@ async def _open_sqlserver(tmp_path: Path) -> Any:
             "queue",
             "response",
             "delivered_keys",
-            "outbox",
             "messages",
         ):
             await cur.execute(f"DELETE FROM {table}")

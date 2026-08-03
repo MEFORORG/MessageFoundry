@@ -294,7 +294,7 @@ async def _clear_data(store: object) -> None:
             "SELECT tablename FROM pg_tables WHERE schemaname = ANY (current_schemas(false))"
         )
         existing = {r["tablename"] for r in rows}
-        targets = [t for t in ("messages", "queue", "outbox", "response") if t in existing]
+        targets = [t for t in ("messages", "queue", "response") if t in existing]
         if targets:
             await conn.execute(f"TRUNCATE {', '.join(targets)} RESTART IDENTITY CASCADE")
 

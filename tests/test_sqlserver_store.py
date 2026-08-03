@@ -97,7 +97,6 @@ async def store() -> AsyncIterator[object]:
             #                    key-rotation reencrypt scan, and this suite asserts EXACT rotate
             #                    counts (the == 6 / == 2 above), so a preset left behind by one test
             #                    silently miscounts an unrelated one
-            "outbox",
             "messages",
             "sessions",
             "webauthn_credentials",  # ADR 0068: FK to users(id) — must clear before users
@@ -1042,7 +1041,7 @@ async def test_reencrypt_to_active_rotates_all_columns_including_state(store) ->
         try:
             async with rotated._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "state", "response", "queue", "outbox", "messages"):
+                for table in ("message_events", "state", "response", "queue", "messages"):
                     await cur.execute(f"DELETE FROM {table}")
                 await conn.commit()
         finally:
@@ -1837,7 +1836,7 @@ async def test_keyless_open_of_encrypted_state_fails_closed(store) -> None:
         try:
             async with cleanup._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "state", "response", "queue", "outbox", "messages"):
+                for table in ("message_events", "state", "response", "queue", "messages"):
                     await cur.execute(f"DELETE FROM {table}")
                 await conn.commit()
         finally:
@@ -4006,7 +4005,7 @@ async def test_the_BOUNDED_path_survives_a_keyed_reopen(store) -> None:
         try:
             async with cleanup._pool.acquire() as conn:
                 cur = await conn.cursor()
-                for table in ("message_events", "queue", "outbox", "response", "messages"):
+                for table in ("message_events", "queue", "response", "messages"):
                     await cur.execute(f"DELETE FROM {table}")  # FK order: children first
                 await cur.execute("DELETE FROM cipher_meta WHERE key_id = ?", (key_id,))
                 await conn.commit()

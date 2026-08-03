@@ -44,7 +44,15 @@ import shutil
 import stat
 import subprocess
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -8700,6 +8708,66 @@ class MessageStore:
             )
             await self._commit()
             return int(cur.rowcount)
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # ADR 0006 reference snapshots: `value` is PL-2 (PHI.md §2) and until ASVS 14.2.7 had NO purge
+        # path at all — a set dropped from config kept its decryptable rows forever, because the only
+        # thing that ever replaced them was the next sync's build-new-then-flip, which never comes.
+        #
+        # Orphan-scoped: a DECLARED set is never touched however old its synced_at. Scoping it any wider
+        # would delete live data the engine is serving.
+        if not declared:
+            # Positive-signal guard. An empty `declared` reads as "every set is abandoned", so a caller
+            # holding a registry that declares zero reference sets — a subset --config, a per-team
+            # split, a harness redirect aimed at the real DB — would wipe the store. That is never a
+            # legitimate instruction, so it is an error rather than a very destructive no-op.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        async with self._lock:
+            cur = await self._db.execute(
+                "SELECT name FROM reference_version WHERE synced_at < ?", (older_than,)
+            )
+            candidates = [r[0] for r in await cur.fetchall() if r[0] not in declared]
+            deleted = 0
+            for name in candidates:
+                # The eligibility predicate is RE-ASSERTED inside the delete, not read above and
+                # trusted. `declared` is computed by the caller outside this lock, so a config reload
+                # can commit a fresh patient-keyed snapshot between the SELECT and here; without the
+                # EXISTS the purge would delete live rows and the set would go present-but-empty,
+                # returning None from reference(name).get(k) with no error at all.
+                cur = await self._db.execute(
+                    "DELETE FROM reference WHERE name = ?"
+                    " AND EXISTS (SELECT 1 FROM reference_version v"
+                    "             WHERE v.name = ? AND v.synced_at < ?)",
+                    (name, name, older_than),
+                )
+                if not cur.rowcount:
+                    continue  # a concurrent re-sync won the race — leave it alone
+                deleted += int(cur.rowcount)
+                # KEEP the pointer row, but BUMP its version. Deleting the pointer is invisible to
+                # converge_reference_cache (it only adds/updates names present in a fresh read), so a
+                # cluster follower would serve the purged PHI from RAM until restart. Keeping it
+                # unchanged is just as bad: converge only reloads a set whose version DIFFERS, so an
+                # unchanged version means the follower's populated cache is never revisited. Bumping it
+                # makes the deletion propagate through the mechanism that already exists, rather than
+                # bolting a second removal path onto every backend.
+                await self._db.execute(
+                    "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                    " WHERE name = ? AND version NOT LIKE 'purged:%'",
+                    (name,),
+                )
+                # SQLite keeps no per-set version map (it is single-node and the sole writer, which is
+                # why converge_reference_cache is a no-op here) — evicting the read-through cache is
+                # the whole of the local convergence story. The server backends, which DO track
+                # versions, rely on the bumped pointer above.
+                self._reference_cache.pop(name, None)
+            await self._commit()
+            return deleted
 
     async def purge_dead_letters(
         self,
