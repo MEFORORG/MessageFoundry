@@ -10,7 +10,7 @@ Build state at acceptance:
 
 | | |
 |---|---|
-| **Rung 1** — platform read-out, report-only | **Built.** `config/memory_encryption.py`; four `memory_encryption_self_reported_*` / `..._readout_source` fields on `GET /security/posture`, plus the in-body disclaimer `memory_encryption_note` (`ENGINE_UI_SEAM` 12 → 13). |
+| **Rung 1** — platform read-out, report-only | **Built.** `config/memory_encryption.py`; **seven** `memory_encryption*` fields on `GET /security/posture` — three `_self_reported_*`, plus `_readout_source`, `_operator_declared`, `_readout_contradicts_declaration`, and the in-body disclaimer `memory_encryption_note`. *(Corrected 2026-08-02: this row said "four", counting only the read-out fields and omitting the declaration, contradiction and note fields; [`api/models.py`](../../messagefoundry/api/models.py) makes the same 3+1 slip in its own comment. On the seam: `ENGINE_UI_SEAM` moved 12 → 13 for this work — release history, carried correctly in `CHANGELOG.md` — but this row is present-tense "Built.", so read as current state it was wrong; the seam is **16** today.)* |
 | **Rung 2** — operator declaration | **Built.** `[security].memory_encryption_operator_declared` (default `false`); an **exposed PHI** instance without it **warns at every start**, and refuses only when the estate opts in via `[security].require_memory_encryption_declaration` (default `false`) under `enforcement = enforce`. A contradiction is warned + reported as the tri-state `memory_encryption_readout_contradicts_declaration`, never refused. See the *2026-07-22 amendment* below for why the refusal is opt-in and why the field is not called "attested". |
 | **Rung 3** — cryptographic attestation | **Not built.** No quote acquisition, no signature verification, no vendor-chain handling. |
 | **Windows rung 3** | **Recorded infeasible in practice** — see *Windows rung 3 — spike conclusion* below. It is **platform-blocked, not API-blocked**. |
@@ -39,11 +39,18 @@ it because L3 is the stated target for a PHI system, not because the conventiona
 **Memory hygiene is not memory encryption, and OWASP has already ruled on that distinction.** During
 the 4.x→5.0 cull OWASP **deleted** 4.0.3's V8.3.6 (overwrite sensitive memory when no longer needed)
 as *"NOT PRACTICAL"* — and **kept** 11.7.1. So the zeroization/locking family is explicitly not what
-this requirement asks for. We already ship that family and it does not move this cell: `_secure_zero`
-over a `bytearray` via `ctypes.memset` ([`store/crypto.py:163`](../../messagefoundry/store/crypto.py)),
-`VirtualLock`/`mlock` residency ([`:185-199`](../../messagefoundry/store/crypto.py)), DEK zeroization
-after install ([`:314-325`](../../messagefoundry/store/crypto.py)) and plaintext zeroization
-([`:462`](../../messagefoundry/store/crypto.py)) all landed in #198.
+this requirement asks for. We already ship that family and it does not move this cell — all of it in
+[`store/crypto.py`](../../messagefoundry/store/crypto.py): `_secure_zero()` over a `bytearray` via
+`ctypes.memset`, `VirtualLock`/`mlock` residency in `_lock_memory()` / `_unlock_memory()`, DEK
+zeroization after install in `_install_key()`, and plaintext zeroization at the `_secure_zero(pt)`
+calls on the encrypt and decrypt paths. All landed in #198.
+
+*(Anchors corrected 2026-08-02, and the claim is unchanged — only the pointers were wrong. These were
+line citations: `:163`, `:185-199`, `:314-325`, `:462`. Every one had rotted, and the first two had
+come to point at **each other's** code — `:163` at prose inside `cell_aad()`'s docstring, `:185-199` at
+the body of `_secure_zero` rather than the residency helpers. Re-anchored by **symbol**: these render as
+markdown link text over a target carrying no line fragment, so the link always resolves and no link
+checker can catch this class. New line numbers would rot the same way at the next refactor.)*
 
 **CPython can protect keys but not message bodies, and that asymmetry is structural.** A DEK is small,
 short-lived, and we own the buffer — hence the work above. An HL7 message is not: it is `str` end to
