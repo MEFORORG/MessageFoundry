@@ -3629,6 +3629,60 @@ class SecuritySettings(_Section):
     handles_real_patient_data: bool | None = None  # was [ai].data_class = "phi"
     production_instance: bool | None = None  # was [ai].production
 
+    # ── Leaving the organization: the ASVS 3.7.3 interstitial ────────
+    # Domains that count as INSIDE the organization. ASVS 3.7.3 asks for a notification when the user
+    # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
+    # topological — an operator's own AD FS is a different host, a different origin, and squarely
+    # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    #
+    # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
+    # every absolute http(s) destination is treated as external and gets the interstitial. An operator
+    # who configures nothing is warned too often, never too little.
+    organization_domains: list[str] = Field(default_factory=list)
+    # The interstitial itself. On by default (ADR-less: this IS the 3.7.3 control). Turning it off is
+    # a posture decision, not a convenience one, and the serve gate says so.
+    external_link_interstitial: bool = True
+    # ⚠️ THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
+    # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
+    # legitimate high-volume external destinations they do not want to declare as their own domain.
+    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
+    external_link_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="before")
+    @classmethod
+    def _split_domain_list(cls, value: object) -> object:
+        """Accept a comma/whitespace-separated string as well as a list — parity with the other
+        list-valued settings here, so an env-var override does not need TOML array syntax."""
+        if isinstance(value, str):
+            return [part for part in value.replace(",", " ").split() if part]
+        return value
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="after")
+    @classmethod
+    def _check_domains_are_bare_hosts(cls, value: list[str]) -> list[str]:
+        """Reject a URL or a wildcard where a domain belongs.
+
+        ``https://hospital.example/`` and ``*.hospital.example`` both look right and both silently
+        match NOTHING under label-boundary comparison — the operator would believe they had declared
+        an internal domain and get an interstitial on every internal link, or worse, believe they had
+        allowlisted something that is still being warned about. Failing at config load is the only
+        place this is cheap to notice.
+        """
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip().lower().lstrip(".")
+            if not item:
+                continue
+            if "/" in item or ":" in item or "*" in item:
+                raise ValueError(
+                    f"{item!r} must be a bare domain such as 'hospital.example', not a URL, scheme "
+                    "or wildcard — subdomains are matched automatically on a label boundary"
+                )
+            cleaned.append(item)
+        return cleaned
+
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
     def _split_client_networks(cls, v: object) -> object:

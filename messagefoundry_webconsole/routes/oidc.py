@@ -43,6 +43,7 @@ from .._auth import (
     set_oidc_flow_cookie,
     set_session_cookie,
 )
+from .._external import is_allowlisted, is_external, is_idn_disguised
 
 _log = logging.getLogger(__name__)
 
@@ -77,8 +78,69 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     if not deps.oidc_enabled:
         return
 
+    def _interstitial_needed() -> bool:
+        """Does the configured IdP sit outside the organization (ASVS 3.7.3)?
+
+        Decided ENTIRELY from configuration — never from request input. The destination shown to the
+        operator, and the decision to show it at all, both come from ``deps``; a version of this that
+        took the URL from the request would make the interstitial an open redirect, which is strictly
+        worse than not having one.
+        """
+        if not deps.external_link_interstitial:
+            return False
+        host = deps.oidc_authorization_host
+        if not host:
+            # Unknown destination is not a reason to skip the warning.
+            return True
+        url = f"https://{host}/"
+        if is_allowlisted(url, deps.external_link_allowlist):
+            return False
+        return is_external(url, deps.organization_domains)
+
     @app.get("/ui/oidc/start")
+    async def ui_oidc_interstitial(request: Request) -> Response:
+        """ASVS 3.7.3: interpose "you are leaving this site", with a cancel, before the IdP hop.
+
+        **No flow is staged here.** The old GET minted a PKCE flow and redirected in one step; the
+        flow now starts only when the operator confirms. Two things fall out of that: the bounded
+        flow cache cannot be drained by anyone who can cause a GET (it REJECTS when full, so that was
+        a login-DoS lever), and the confirm step is a POST behind the console's same-origin check —
+        which also closes the standing hole where any external page could start a federated sign-in
+        just by linking here.
+
+        When the IdP is INSIDE ``organization_domains`` this page is skipped and the POST leg runs
+        directly, because ASVS asks about destinations outside the application's CONTROL and an
+        operator's own AD FS is not one.
+        """
+        auth = get_auth(request)
+        if auth is None or not auth.oidc_enabled:
+            return RedirectResponse("/ui/login?e=oidc_unavailable", status_code=303)
+        if not _interstitial_needed():
+            return await ui_oidc_start(request)
+        host = deps.oidc_authorization_host or "(not configured)"
+        return HTMLResponse(
+            pages.leaving_site(
+                destination_host=host,
+                continue_action="/ui/oidc/start",
+                idn_disguised=is_idn_disguised(f"https://{host}/"),
+                cancel_href="/ui/login",
+                purpose="Continuing will take you to your organization's sign-in provider.",
+            ),
+            status_code=200,
+        )
+
+    @app.post("/ui/oidc/start")
     async def ui_oidc_start(request: Request) -> Response:
+        """Confirmed: mint the flow and hand the browser to the IdP.
+
+        ⚠️ **The rate-limit branch below must stay INSIDE this decorated handler.**
+        ``tests/test_security_doc_rate_limits.py`` reads the console's throttle shapes by walking the
+        AST of *decorated* route functions and looking for an ``allow_login_attempt`` branch. Hoisting
+        this body into a plain helper — which the first draft of the 3.7.3 split did — leaves the
+        limiter working and makes the gate blind to it, so the documented per-route breach shape
+        silently stops being checked. A control the checker cannot see is the failure mode this
+        codebase keeps rediscovering; the duplication of one ``await`` in the GET leg is cheaper.
+        """
         auth = get_auth(request)
         if auth is None or not auth.oidc_enabled:
             # Disabled: redirect WITHOUT auditing — the sso.py anti-flood carve-out. Note this reads
