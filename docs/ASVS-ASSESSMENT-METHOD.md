@@ -60,7 +60,7 @@ These are the real disputes. They are here so the next assessor reaches the same
 
 | Cell | Verdict | Which rule, and why |
 |---|---|---|
-| **5.4.3** | `fail` | Rule 3. A scan *hook* exists but its only shipped implementation is `_no_scan`, and there is **no configuration key at all** — an operator must **author** the scanner. Supplying a control is not configuring one. |
+| **5.4.3** | `na` | **Rule 1, and it moved for the same reason 11.7.1 did.** Antivirus scanning of inbound content is an **enterprise-provided** control — the deploying organisation's AV/EDR/ICAP stack over the drop directory, the SFTP landing zone and the upload path — so the verb's subject is outside the declared scope of §2. ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one, on the reasoning that *a scan hook exists but its only shipped implementation is `_no_scan` and there is no configuration key at all, so an operator must author the scanner*. **That reasoning is still true of the code** — it simply answers rule 3's question, and rule 1 runs first. ⛔ **This `na` is WEAKER than 11.7.1's and its rationale says so on the cell:** the engine *does* ship a scan seam, so this is a control the product **could** implement, which makes the verdict conditional on the enterprise actually covering those paths. It therefore carries a **deployment requirement**, and a consult to test that premise on outbound-initiated SFTP pulls is filed in the ledger. **CLOSED by owner decision (2026-08-02); do not re-derive it.** |
 | **15.2.5** | `partial` | Rule 5, **not** rule 3. `[sandbox].mode` ships `off`, but `subprocess` mode is real and was verified by executing it. A working control that ships off. |
 | **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
 | **3.7.3** | `fail` | Rule 3. One off-site navigation, a bare 303, no interstitial and no cancel. `oidc_enabled=False` removes the **trigger**, not a control. |
@@ -135,6 +135,24 @@ level was achieved anyway. Any published attestation must say which requirements
 something weaker than "verified at Level 3". Writing `na` in the record and "Level 3 verified" in a
 brochure is the failure mode this section exists to prevent.
 
+### 2.1a ⛔ The pinned corpus cannot settle a question about ASVS's *prose*
+
+**A corpus that cannot express a class of claim cannot refute one.** `[scorecard].corpus_sha256` pins
+the ASVS **requirements** — `req_id`, text, level. It carries **no chapter prose**: no assessment
+guidance, no scoping discussion, no definitions. So a claim about *what the standard says* outside a
+requirement's own text is **structurally uncheckable** against it, and every check will come back clean.
+
+This is not hypothetical. A false statement — *"ASVS reserves non-applicable for functionality-based
+exclusions"* — survived **two independent assessors** and reached a signed-adjacent risk-acceptance
+block, because every one of them verified against the corpus and the corpus had nothing to say. What
+`0x03` actually says is the opposite: it excludes requirements *"where configuration is outside the
+application's responsibility."* One fetch of the chapter settled it; no amount of corpus checking could
+have.
+
+**So: to cite ASVS prose, fetch the chapter at the `v5.0.0` tag and quote it verbatim.** Never
+paraphrase it from memory, from an earlier assessment, or from another agent — and never treat a green
+corpus check as evidence about a claim the corpus cannot represent.
+
 ### 2.2 A count movement is not a posture movement — read the counts accordingly
 
 **The single most misreadable thing this method produces is a change in the bucket totals.** Counts move
@@ -146,19 +164,36 @@ for four different reasons, and only one of them means the software got better:
 | A cell was **read for the first time** (`unverified` → anything) | **No** | The survey advanced. A cell moving `unverified` → `pass` is a *discovery*, not an improvement |
 | A **scope boundary was stated** (→ `na`) | **No** | The requirement left the denominator. Identical code, smaller question |
 | A **rule was applied more carefully** (re-grade in either direction) | **No** | The assessment got more accurate. Some of these move *down* |
+| **The standard moved** (a new ASVS release changes requirement text, levels, or the requirement count) | **No** | The denominator changed. Zero code changed and zero assessment work happened — and this is the cause most easily mistaken for the survey advancing |
 
 **The worked example, and it is recent.** On 2026-08-02 the fail count went **3 → 2** when 11.7.1 was
 scoped out under rule 1. **Zero lines of engine code changed.** A reader comparing only the fail counts
 across those two days would conclude a defect was fixed; nothing was. The rationale is on the cell and
 the boundary is in §2, but neither is visible to someone reading a total.
 
-**Two obligations follow, and they are cheap:**
+**⛔ And the converse is true, and worse: a posture movement with NO count movement.** Everything above
+teaches you to interrogate a number that *moved*. The more dangerous class **hides in stillness** — code
+changes, an evidence anchor drifts off the line it was pinned to, and the recorded verdict quietly stops
+describing the code. **The total does not move at all.** Stability reads as "nothing to see."
 
-1. **Never report a bucket total as a trend without naming which of the four causes moved it.** "Fails
-   went from 3 to 2" is not a finding. "One cell was scoped out; no code changed" is.
+This is not hypothetical and it is not cause 4. Cause 4 is a deliberate act — someone re-read a cell and
+graded it better. This is an evidence pointer breaking **on its own**, while every reader sees a total
+that looks fine. Measured on this project on 2026-08-02: **seven anchors across six cells had drifted**,
+and not one bucket total moved. Nobody could have caught it from a number. You catch it **only** if a
+gate is watching, which is the entire reason the drift gate exists (ADR 0156).
+
+**Three obligations follow, and they are cheap:**
+
+1. **Never report a bucket total as a trend without naming which cause moved it.** "Fails went from 3
+   to 2" is not a finding. "One cell was scoped out; no code changed" is.
 2. **When a count improves, state what would have had to happen for it to mean an improvement, and
-   whether that happened.** This is the same discipline as a negative control: a number that can only
-   go one way is not measuring anything.
+   whether that happened.** Same discipline as a negative control: a number that can only go one way is
+   not measuring anything.
+3. **A stable count is not evidence of a stable posture unless the anchors were re-verified in the same
+   pass.** Report the drift check alongside the total, or you are publishing the freshness of the last
+   check rather than of the software. ⚠️ **Always state the pinned ASVS version with any total**, so a
+   denominator change shows up as a version change instead of as progress — the corpus is pinned by
+   digest in `[scorecard]`, and a 5.0.x patch release would move requirement text and counts on its own.
 
 ⚠️ **This cuts against us more often than for us, which is why it is written down.** The survey is
 incomplete, so most future movement will come from cause 2 — cells being read for the first time — and

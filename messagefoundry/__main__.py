@@ -2237,6 +2237,33 @@ def _serve(args: argparse.Namespace) -> int:
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
     # (and every existing exposed-PHI deployment) reports.
+    # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
+    # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
+    # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
+    # self-inflicted availability failure — the same reasoning as the read-out below.
+    _ext_allow = list(settings.security.external_link_allowlist)
+    if not settings.security.external_link_interstitial:
+        print(
+            "warning: [security].external_link_interstitial=false — the console will navigate "
+            "OFF-SITE with no notification and no cancel. This is the ASVS 3.7.3 control; disabling "
+            "it is a posture decision, not a convenience one.",
+            file=sys.stderr,
+        )
+    elif _ext_allow:
+        # Named individually, never counted. "3 destinations exempted" is the shape of message that
+        # lets an entry nobody intended sit in a list for a year.
+        print(
+            "warning: [security].external_link_allowlist exempts "
+            f"{', '.join(repr(d) for d in _ext_allow)} from the off-site interstitial (ASVS 3.7.3) — "
+            "navigation to these destinations shows no notification and offers no cancel.",
+            file=sys.stderr,
+        )
+    # NOT warned: an empty `organization_domains`. It is the STRICT position (every off-site
+    # destination is interstitialed) and it is the shipped default, so a note here would print on
+    # every stock start — `test_serve_loopback_emits_no_new_stderr` catches exactly that, and it is
+    # right to. Start-time output is for a posture that is WEAKER than the default, not for the
+    # default itself. The guidance that matters — declare your domains rather than reaching for the
+    # allowlist escape — belongs in docs/CONFIGURATION.md, where it is, and not in every boot log.
     #
     # PHI is plaintext in CPython heap while it is being processed — an HL7 body is `str` end to end
     # by design, and every parse/transform step allocates a fresh immutable copy no application code

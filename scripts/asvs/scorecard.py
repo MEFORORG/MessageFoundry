@@ -116,6 +116,13 @@ class Cell:
     last_verified: str = ""
     verified_at: str = ""
     reviewed_by: str = ""
+    #: Owner has closed this cell: it is excluded from surveys, sweeps and rescores, and the loader
+    #: refuses it if the verdict has moved off the pin recorded alongside. Modelled on the Cell rather
+    #: than left as loose TOML so the renderer can surface it — a closure nobody can see is one a pass
+    #: will walk straight past, which is how this cell moved four times in eighteen days.
+    decision_closed: bool = False
+    decision_closed_on: str = ""
+    decision_closed_by: str = ""
     evidence: tuple[Anchor, ...] = ()
     absence: tuple[Absence, ...] = ()
 
@@ -194,6 +201,34 @@ def load_scorecard(path: Path) -> list[Cell]:
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
                 "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
             )
+        # A cell the OWNER has closed is not re-scorable by a survey, sweep or agent. The stop was
+        # written in prose first and prose is not a gate: the reason this cell needed closing at all
+        # is that four different passes each believed they were doing careful work, and a rationale
+        # they could read was never what stopped them. `decision_closed_verdict` pins the verdict as
+        # of the ruling, so a later verdict change is DETECTABLE rather than merely discouraged.
+        #
+        # Deliberately not a warning. The cost of a false stop is one conversation with the owner; the
+        # cost of a silent re-score is a posture document that disagrees with the record and is
+        # discovered months later by a reader — which has already happened here, four times in
+        # eighteen days on the one cell this rule was written for.
+        if raw.get("decision_closed") is True:
+            pinned = str(raw.get("decision_closed_verdict", "")).lower()
+            if not pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `decision_closed = true` without "
+                    "`decision_closed_verdict` — the pin is what makes the closure checkable, so a "
+                    "closure without one is a comment, not a control"
+                )
+            if verdict != pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: verdict is {verdict!r} but this cell is CLOSED at "
+                    f"{pinned!r} (`decision_closed = true`, closed "
+                    f"{raw.get('decision_closed_on', 'date not recorded')} by "
+                    f"{raw.get('decision_closed_by', 'owner')}). Re-scoring a closed cell needs an "
+                    "explicit owner instruction — not a sweep's own judgement. If you hold one, move "
+                    "the pin in the SAME commit and say so in the message; if you do not, revert the "
+                    "verdict. See `decision_reopen_requires` on the cell"
+                )
         for a in raw.get("absence", []):
             if not str(a.get("mutation", "")).strip():
                 raise ScorecardError(
@@ -216,6 +251,9 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verdict=verdict,  # type: ignore[arg-type]
                 residual=str(raw.get("residual", "")),
                 posture=str(raw.get("posture", "single")),
+                decision_closed=raw.get("decision_closed") is True,
+                decision_closed_on=str(raw.get("decision_closed_on", "")),
+                decision_closed_by=str(raw.get("decision_closed_by", "")),
                 last_verified=str(raw.get("last_verified", "")),
                 verified_at=str(raw.get("verified_at", "")),
                 reviewed_by=str(raw.get("reviewed_by", "")),
@@ -521,6 +559,29 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
         seen = c.last_verified or "—"
         lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {c.residual[:150]} |")
+
+    # Closed cells render even though they are not "open", and the reason is a defect this renderer
+    # caused. 11.7.1 was closed by owner decision while it was a `fail`, so its STOP text surfaced
+    # here — then the same ruling moved it to `na`, it dropped out of `open_states`, and the record's
+    # rendered face went silent about the one cell that had just been the subject of a ruling. A
+    # closure that is visible only while the verdict happens to be open is not a closure.
+    closed = sorted((c for c in cells if c.decision_closed), key=lambda c: _sort_key(c.id))
+    if closed:
+        lines += [
+            "",
+            "## Closed by owner decision — do not re-score",
+            "",
+            "These cells are **excluded from surveys, sweeps and rescores**, whatever a pass's own",
+            "instructions say. Re-scoring one needs an explicit owner instruction; the loader refuses",
+            "a closed cell whose verdict has moved off its pin, so this is enforced, not advisory.",
+            "",
+            "| Cell | L | Verdict | Closed | By |",
+            "|---|---|---|---|---|",
+        ]
+        for c in closed:
+            when = c.decision_closed_on or "—"
+            who = c.decision_closed_by or "owner"
+            lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {when} | {who} |")
     return chr(10).join(lines) + chr(10)
 
 

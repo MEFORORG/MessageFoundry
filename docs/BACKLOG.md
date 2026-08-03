@@ -412,7 +412,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#24 DICOM** | **Med–High** | **done (Phases 1 + 2)** | L | **Adopter-driven** — a radiology practice on Corepoint DICOM Gear wants to adopt. ✅ **Phases 1 + 2 SHIPPED** ([ADR 0025](adr/0025-dicom-codec-store-connectors.md) Accepted): pure codec + DIMSE **C-STORE SCP** + code-first SR→HL7 Handler (Phase 1, PR #439); **C-STORE SCU + C-ECHO + DICOMweb STOW-RS** outbound (Phase 2, `rest.py` reuse — no new dep). **MWL/Q-R/inbound-DICOMweb declined/deferred.** Did **not** need #7. |
 | **Meta — v0.3 cut** | Low | **done** | S | ✅ The v0.3-candidate wave was cut as **`0.2.10`** (Plan-5; ADR 0023 inbound-HTTP among others). Next buildable set planned in PLAN-6. |
 | **#30 version-update check** | Low | **done** | M | ✅ Shipped `0.2.10` (ADR 0026, PR #618) — but as a **zero-egress local lock-diff** (no PyPI call), resolving the on-prem tension; the live-egress variant stays off-by-default / deferred. |
-| **ASVS 11.7.1 in-use memory encryption** | Low | **drop (N/A)** | XL | Already scored **N/A** — a hardware/OS/hypervisor capability, unachievable for pure-Python on-prem. |
+| **ASVS 11.7.1 in-use memory encryption** | Low | **drop (N/A)** | XL | **`na` on the record** (closed by owner decision 2026-08-02; do not re-score). ⚠️ The verdict is right but the *reason* here is not: "unachievable for pure-Python on-prem" is **not** the ground. The engine does ship rungs 1–2 — they **report on** the platform property rather than **provide** it. The ground is that the verb names a CPU/firmware/hypervisor property, outside the declared scope of three software artifacts. See `docs/ASVS-ASSESSMENT-METHOD.md` §2. |
 | **#18 git-offering** | Low | **confirm-decline** | M | Buyers already run git/ADO/GHE — a non-problem. Fold conventions into #33; AGPL-compat entanglement. |
 | **#25 JMS** | Low | **confirm-decline** (as named) | M | Java-broker artifact vs the **no-broker identity** (the staged SQLite queue *is* the durability story). Keep only a *generic* AMQP/Kafka on-trigger candidate. |
 | **#26 visual/template authoring** | Low | **confirm-decline** | S | Code-first IS the differentiator (recorded #411). The failure mode is a "guided editor" drifting toward declarative *logic* authoring. |
@@ -426,7 +426,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 **Top strategic calls** *(2026-06-19; updated 2026-06-28)*:
 1. ✅ **v0.2 locked and shipped** through `0.2.10` (#28/#29 evidence published; #22b shipped). The release-close move is done.
 2. **The connector + codec backlog largely shipped, on its triggers** — #7 (first slice) / #23 (SMTP) / #24 / #31 / #32 all landed; #25 stays declined. The discipline held: each shipped against a real adopter/contract or as an additive opt-in, never speculative. The remaining transport tails (#23 IMAP/POP, #7 SOAP-reply) stay demand-gated.
-3. **Treat the ASVS L3 residuals as closed/N-A, not a staffing queue** — #377 + #378 merged; 11.7.1 is N/A; WebAuthn #11 buys zero ASVS movement. The only live security item is the cheap least-priv default flip.
+3. **Treat the ASVS L3 residuals as closed/N-A, not a staffing queue** — #377 + #378 merged; 11.7.1 is N/A (still true, and re-confirmed on the record 2026-08-02 — but on a different ground than this line assumed; see the 11.7.1 row above); WebAuthn #11 buys zero ASVS movement. The only live security item is the cheap least-priv default flip. ⚠️ **Do not read "residuals are closed" as a posture summary** — the survey is incomplete and most cells have never been read against the requirement text, so this line describes a *staffing* judgement, not coverage.
 4. ✅ **The v0.3-candidate set was cut as `0.2.10`** (anchored on ADR 0023 inbound-HTTP). The next buildable set is the actionable **#33** + the **#40** AWS campaigns + owner-decision **#60** — planned in PLAN-6, still ADRs-first and demand-aware. (**#41** shipped as ADR 0047; **#61** as ADR 0048 / #641; **#52** is the parity index → #65–#85; **#39** was built then 🪦 retired 2026-07-01.)
 5. **Re-confirm the #26 visual-authoring decline loudly** — the strategic failure mode is an audit or "guided editor" quietly drifting toward declarative *logic* authoring.
 
@@ -6387,7 +6387,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Build history.** *Partial build (PLAN-9 Wave 1, 2026-07-10 — branch `plan9-secmem`):* best-effort `mlock`/`VirtualLock` + `memset`-zeroize of the unwrapped DEK and the plaintext buffers the code owns landed in `store/crypto.py`; `mfenc:v1` ciphertext byte-identity is preserved and the public cipher seam is unchanged. *Close (2026-07-13):* the partial was verified complete against the full code-owned mutable-buffer surface (DEK + retired keys + `encrypt`/`decrypt` plaintext — no further mutable buffer remains to wipe), a full-path zeroize-verification test was added, and the residual disposition was documented and risk-accepted (see the banner). The residual is a documented *partial* of ASVS 13.3.3, not a technical close: CPython immutable `str`/`bytes` (caller plaintext, the returned marker, cryptography's `decrypt()` output) and cryptography's internal OpenSSL key copy are unreachable to wipe (documented in the module docstring), and **11.7.1** full in-use memory encryption is a host/hypervisor deployment requirement accepted via signed risk-acceptance, not code.
 
-**Closes (ASVS 5.0 L3):** 11.7.1, 11.7.2, 13.3.3 · *(classes 2 and 4)* — **scope addressed, not verdict**: 13.3.3/11.7.1 remain **Fail** and 11.7.2 **Partial** (accepted with a deployment requirement + signed risk-acceptance, see banner), not passing.
+**Closes (ASVS 5.0 L3):** 11.7.1, 11.7.2, 13.3.3 · *(classes 2 and 4)* — **scope addressed, not verdict**: 11.7.2 is **Partial** (accepted with a deployment requirement + signed risk-acceptance, see banner), not passing. ⚠️ **Verdicts corrected 2026-08-02 — do not read the original clause as current.** It said *"13.3.3/11.7.1 remain **Fail**"*. Neither is a Fail on the record: **11.7.1 is `na`** (closed by owner decision, out of declared scope — a CPU/firmware property, not one of the three assessed software artifacts), and **13.3.3 is `unverified`** — never read against the requirement text, which is explicitly **not** a verdict of any kind. The verdict of record is the scorecard, never this ledger; take any current figure from there.
 
 **Scope:** Add zeroization of plaintext PHI and key material after use, and mlock-style anti-swap protection where the platform allows. Decide the disposition of full memory encryption (TME/SGX/SEV, confidential VM) — enforce as a deployment requirement, or accept and document.
 
@@ -8506,6 +8506,65 @@ The three surfaces now share **one** liveness helper, because they had been disa
 **Related:** [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1); [`scripts/coord/claim.ps1`](../scripts/coord/claim.ps1); [`docs/WORKTREES.md`](WORKTREES.md); PR #106 (`-List` liveness, the half already built); PR #74 (the prune hardening this sits beside — liveness *veto* before deletion, where this is cleanup *after*); #344 (the sibling defect class, *a bound stated independently of the thing it bounds*).
 
 **Source:** zizmor-1280 handoff, 2026-08-02, which reported claim `7` stranded by a prune and filed the mechanism as unbuilt. Half A and Half B were then re-verified against the code directly rather than inherited: the absent claim handling by search over `prune-merged.ps1`, the `-Take`/`-Release` blindness by reading both `main` and `claim-liveness`.
+
+---
+
+## 353. Gate the risk-acceptance register against the scorecard: nothing compares its cell lists to the record
+
+> 🚧 **Status OPEN (filed 2026-08-02).** The ASVS risk-acceptance register is **ungated prose**. No CI check has ever compared the cell ids in its signed sign-off blocks against the verdict of record, and a manual cross-check found the lists had drifted substantially with **zero** alarm.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** file now, build on owner green-light. **Severity:** medium-high — the artifact that records *accepted risk* can disagree with the artifact that records *what the risks are*, indefinitely and silently.
+
+**The finding that motivates it.** Asked to fix one sign-off block, a cross-check of **all eight** against `asvs-scorecard.toml` returned **29 entries that are not carried residuals**, in three classes:
+
+| Class | Count | Why it is wrong |
+|---|---:|---|
+| `unverified` | 22 | ⛔ **A signed acceptance of a risk that was never assessed.** The cell has never been read against the ASVS requirement text at any commit. Present in **every one of the eight blocks**. |
+| `na` | 3 | Out of declared scope — there is no residual to carry. |
+| `pass` | 4 | The cell passes — there is no residual to accept. |
+
+⚠️ **Those counts are ONE measurement by ONE session and are not independently confirmed.** They should not be load-bearing for any decision until a second implementation reproduces them — **which is exactly what this gate would be.** Treat the number as the reason to build the check, never as an established fact. *(Caveat raised by the coordinator session, and it is the right one.)*
+
+**What the check is.** Roughly fifteen lines, stdlib only: `tomllib`-load the scorecard, regex the register's sign-off table rows, and for every cell id in every block compare against the record. Fail on `unverified`, `na` or `pass` appearing in an acceptance list. It needs no new dependency and runs in milliseconds.
+
+**Design notes, because a gate written carelessly here would be worse than none:**
+
+- **Print what it scanned.** Block count, row count, ids-per-block. A gate that finds nothing because its regex stopped matching the table is indistinguishable from a clean one — that failure mode has already fired twice on this project.
+- **Prove it can go red before trusting a green.** Plant a known-bad id in a fixture and assert the check rejects it, and plant a clean fixture and assert it passes. Both directions, or the check is measuring nothing.
+- **Do not auto-correct.** The gate must **report**, never rewrite. The cell lists sit inside *signed* acceptances, and silently editing signed content to satisfy a checker is a worse defect than the drift it fixes.
+- **The register lives in the vault**, so this belongs with the existing `asvs-scorecard.yml` workflow rather than in the public engine repo.
+
+**⛔ Not to be built without the owner's go-ahead.** A new security-doc gate can block merges, and that is the owner's decision like any other enforcing control. This item exists so the finding is durable, not to authorise the build.
+
+**Related:** ADR 0156 (scorecard as data — the record this would check against); the §2 banner in the register recording the same finding; and the standing question this does **not** answer, which is the owner's alone: *what the 2026-07-14 signature actually covered*, given 22 of its ids had never been examined on that date either.
+
+---
+
+## 352. Consult on enterprise AV coverage for SFTP- and file-connector ingest from outside the domain (ASVS 5.4.3 premise check)
+
+> 🚧 **Status OPEN (filed 2026-08-02).** ASVS **5.4.3** was recorded `na` on 2026-08-02 on the ground that antivirus scanning is an **enterprise-provided** control. This item exists to *test that premise* against the one ingest path most likely to fall outside it, rather than assume it.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** consult, then decide. **Severity:** medium — the verdict of a closed cell rests on the answer.
+
+**The question, for Gabe (enterprise security):** how does the enterprise scanning stack handle files that MessageFoundry *collects* rather than receives — specifically the **SFTP/FTPS remote-file source** and the **file connector** — when the origin is **outside the organisation's domain**?
+
+The distinction matters because these two paths do not look like the case AV coverage is usually designed around:
+
+- **The engine pulls, the perimeter doesn't see a delivery.** A gateway or mail-path scanner inspects content arriving *at* the enterprise. `RemoteFileSource` reaches *out* to a partner's SFTP/FTPS server and retrieves bytes over an encrypted session, landing them straight in the engine's working area. There is no inbound delivery event for a perimeter scanner to act on.
+- **On-access scanning depends on where the file lands.** If the drop directory is on a host and volume the EDR agent actually watches, on-access scanning may cover it. If it is a network share, a container volume, or a path excluded for performance (integration hosts frequently are), it may not.
+- **The origin is a partner, not the enterprise.** These feeds come from outside the domain by definition, so "internal traffic is trusted" does not apply.
+
+**What we need out of the conversation, stated as answers not opinions:**
+1. Is content retrieved by an outbound-initiated SFTP/FTPS pull scanned at all — and by what, at what point?
+2. Are integration hosts' drop/working directories inside on-access scanning, or excluded?
+3. What happens on detection — quarantine, delete, alert-only — and does MessageFoundry learn about it, or does the file simply vanish underneath a running connector?
+4. Is there an ICAP or equivalent service endpoint the engine *could* call, if we later decide to make scanning a shipped, configurable control?
+
+**Why this is filed rather than assumed.** The `na` on 5.4.3 records its own three exposures, and the load-bearing one is that **the engine ships a scan seam** (`set_scan_hook` / `scan_inbound_file`, fail-closed on both axes when installed) — so unlike full memory encryption, this is a control the product *could* implement. The cell's ground therefore depends on the enterprise actually covering these paths. If the answer to (1) or (2) is "no", the deployment requirement attached to that `na` is not satisfied for this class of feed and the cell should be reopened by the owner.
+
+**Do not** treat this item's existence as reopening 5.4.3. That cell is closed by owner decision; only the owner reopens it, and only with an explicit instruction.
+
+**Related:** the scan seam at [`transports/file.py`](../messagefoundry/transports/file.py) (`set_scan_hook`, `scan_inbound_file`) and its remote sibling in [`transports/remotefile.py`](../messagefoundry/transports/remotefile.py); the deployment requirement recorded with the 5.4.3 ruling.
 
 ---
 

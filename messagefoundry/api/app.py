@@ -1037,6 +1037,9 @@ def create_app(
     # app.state.auth -- create_managed_app attaches the service in the lifespan, AFTER mount_ui
     # has already fixed the route table.
     oidc_enabled: bool = False,
+    # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
+    # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
+    oidc_authorization_endpoint: str = "",
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
     loopback: bool = False,
@@ -4989,9 +4992,34 @@ def create_app(
         # Either source may know: create_managed_app passes the config flag; a caller that
         # constructs with auth= directly (tests, embedders) gets it from the live service.
         ui_oidc_enabled = oidc_enabled or bool(getattr(auth, "oidc_enabled", False))
+        # ASVS 3.7.3 (seam v17). Read off security_settings when present; the fallbacks are the
+        # STRICT position, so a caller that constructs without them gets the interstitial on every
+        # absolute destination rather than silently getting none.
+        _sec = security_settings
+
+        def _oidc_authorization_host(endpoint: str) -> str:
+            """ASCII/punycode host of the configured IdP endpoint, for DISPLAY only.
+
+            Local rather than imported from ``messagefoundry_webconsole._external``: the console is
+            deliberately not imported at module scope here (see the note above ``create_app``). An
+            unparseable endpoint yields ``""``, which the console treats as *unknown destination* and
+            therefore as a reason to SHOW the interstitial, never to skip it.
+            """
+            from urllib.parse import urlsplit
+
+            try:
+                host = (urlsplit(endpoint).hostname or "").strip().lower()
+                return host.encode("idna").decode("ascii").lower() if host else ""
+            except (ValueError, UnicodeError):
+                return ""
+
         deps = UiDeps(
             engine_seam=ENGINE_UI_SEAM,
             oidc_enabled=ui_oidc_enabled,
+            organization_domains=tuple(getattr(_sec, "organization_domains", ()) or ()),
+            external_link_interstitial=bool(getattr(_sec, "external_link_interstitial", True)),
+            external_link_allowlist=tuple(getattr(_sec, "external_link_allowlist", ()) or ()),
+            oidc_authorization_host=_oidc_authorization_host(oidc_authorization_endpoint),
             get_engine=_get_engine,
             get_gate=_get_gate,
             cookie_secure=_cookie_secure,
@@ -5727,6 +5755,9 @@ def create_managed_app(
         ws_allowed_origins=ws_allowed_origins,
         serve_ui=serve_ui,
         oidc_enabled=bool(auth_settings is not None and auth_settings.oidc_enabled),
+        oidc_authorization_endpoint=(
+            (auth_settings.oidc_authorization_endpoint or "") if auth_settings is not None else ""
+        ),
         public_origin=public_origin,
         webauthn_rp_from_request=webauthn_rp_from_request,
         exposure_protected=exposure_protected,
