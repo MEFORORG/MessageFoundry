@@ -11,6 +11,7 @@ what is asserted is the contract git will actually invoke.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -210,22 +211,66 @@ def test_duplicate_index_rows_are_blocked(repo: Path) -> None:
 
 
 def test_a_new_backlog_number_must_be_allocated(repo: Path) -> None:
-    """Two sessions adding '## 227.' land ~1,600 lines apart in one file and BOTH ship."""
-    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
+    """Two sessions adding '## 227.' land ~1,600 lines apart in one file and BOTH ship.
+
+    Uses an ABOVE-FLOOR number deliberately. With a below-floor one this test still goes red, but on
+    the partition rule instead of the ownership rule — passing for the wrong reason and asserting
+    nothing about allocation. The reason is asserted below for the same reason.
+    """
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
     assert code == 1
-    assert "BACKLOG item #2" in out
+    assert "BACKLOG item #1001" in out
+    assert "was not allocated to this worktree" in out, (
+        "must fail on the OWNERSHIP rule; if this now reports the public floor, the test has stopped "
+        f"exercising allocation:\n{out}"
+    )
 
 
 def test_an_allocated_backlog_number_passes(repo: Path) -> None:
+    write(
+        repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 1001. Mine\n\nbody\n"
+    )
+    allocate(repo, "backlog", "1001")
+    git(repo, "add", "docs/BACKLOG.md")
+
+    code, out = run_check(repo)
+    assert code == 0, out
+
+
+def test_a_backlog_number_below_the_public_floor_is_refused(repo: Path) -> None:
+    """The partition: new items live at #1000+, so the overlap with the internal ledger stays closed.
+
+    Allocated to THIS worktree, so ownership is satisfied and the floor is the only thing that can
+    reject it — otherwise the test would pass on the ownership rule and prove nothing.
+    """
     write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
     allocate(repo, "backlog", "2")
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
-    assert code == 0, out
+    assert code == 1
+    assert "below the public floor" in out, out
+
+
+def test_the_public_floor_also_refuses_in_ci_mode(repo: Path) -> None:
+    """The floor is the FIRST backlog rule that can fail in --ci.
+
+    The ownership rule cannot: it reads a per-clone registry and compares a worktree path, and a runner
+    has neither — so `check_backlog()` computed the added-number set and discarded it, leaving the CI
+    ledger step unable to fail on the backlog half at all.
+    """
+    write(repo, "docs/BACKLOG.md", "# Backlog\n\n## 1. First item\n\nbody\n\n## 2. Mine\n\nbody\n")
+    git(repo, "add", "docs/BACKLOG.md")
+    git(repo, "commit", "-m", "add a below-floor item", "--no-verify")
+
+    code, out = run_check(repo, "--ci")
+    assert code == 1, out
+    assert "below the public floor" in out, out
 
 
 def test_editing_backlog_without_adding_a_number_passes(repo: Path) -> None:
@@ -263,13 +308,17 @@ def test_a_utf8_backlog_still_catches_an_unallocated_number(repo: Path) -> None:
     write(
         repo,
         "docs/BACKLOG.md",
-        f"# Backlog\n\n## 1. First item\n\n{NON_ASCII_BODY}\n## 2. Mine — ⚠️ unallocated\n\nbody\n",
+        f"# Backlog\n\n## 1. First item\n\n{NON_ASCII_BODY}\n## 1001. Mine — ⚠️ unallocated\n\nbody\n",
     )
     git(repo, "add", "docs/BACKLOG.md")
 
     code, out = run_check(repo)
     assert code == 1, out
-    assert "BACKLOG item #2" in out
+    assert "BACKLOG item #1001" in out
+    # Above the floor deliberately: a below-floor number would be rejected by the partition rule even
+    # if the UTF-8 read had crashed to empty, so this test would pass while proving nothing about the
+    # decode — the exact false-clean it exists to catch.
+    assert "was not allocated to this worktree" in out, out
 
 
 def test_ci_mode_works_on_a_SHALLOW_clone_with_no_reachable_merge_base(
@@ -517,4 +566,45 @@ def test_the_installer_no_longer_writes_a_pre_commit_hook() -> None:
     # ...and it must still MIGRATE an old standalone install away, or upgrading users stay broken.
     assert "Remove-Item -LiteralPath $preCommit" in src, (
         "the installer must remove a previously-installed standalone ledger hook"
+    )
+
+
+_ALLOC = Path(__file__).resolve().parents[1] / "scripts" / "coord" / "alloc.ps1"
+
+# Kept deliberately identical to the pattern in scripts/coord/alloc.ps1 — the point of this test is to
+# fail the moment the two drift. A duplicated regex that is TESTED is not the same hazard as a
+# duplicated value that is not: this one fails loudly on drift, which is the property being bought.
+_FLOOR_RE = re.compile(r"(?m)^PUBLIC_BACKLOG_FLOOR\s*(?::[^=]+)?=\s*(\d+)")
+
+
+def test_the_public_floor_is_parseable_by_the_allocator() -> None:
+    """`alloc.ps1` PARSES the floor out of this gate so the value is defined exactly once.
+
+    That coupling is to SOURCE TEXT, which is a weaker contract than an import, so it is pinned here.
+    Without this test the break is silent and lands on the wrong person: whoever reformats the constant
+    gets a green CI, and an unrelated session hits "refusing to allocate" days later — where the
+    tempting repair is to hardcode the floor back into alloc.ps1, re-creating the two-copies drift the
+    single source exists to remove.
+
+    The realistic break is a type annotation. `PUBLIC_BACKLOG_FLOOR: Final[int] = 1000` is idiomatic in
+    a mypy-strict codebase and is tolerated; splitting, computing or renaming the value is not.
+    """
+    matches = _FLOOR_RE.findall(CHECK.read_text(encoding="utf-8"))
+    assert len(matches) == 1, (
+        "scripts/coord/alloc.ps1 parses PUBLIC_BACKLOG_FLOOR out of ledger_check.py and expects exactly "
+        f"one match; found {len(matches)}. Keep the name and the literal on one line."
+    )
+    assert int(matches[0]) > 0
+
+
+def test_the_allocator_still_parses_the_floor_the_same_way() -> None:
+    """The allocator's own regex must accept the constant as written — not merely a similar one."""
+    alloc_src = _ALLOC.read_text(encoding="utf-8")
+    assert "PUBLIC_BACKLOG_FLOOR" in alloc_src, (
+        "alloc.ps1 no longer reads the floor from the gate — the value is defined twice again"
+    )
+    # The annotation-tolerant form; if alloc.ps1 reverts to the naive `\s*=\s*` it breaks on Final[int].
+    assert r"(?::[^=]+)?" in alloc_src, (
+        "alloc.ps1's floor regex must tolerate a type annotation "
+        "(PUBLIC_BACKLOG_FLOOR: Final[int] = 1000), or an ordinary tidy-up silently disarms allocation"
     )
