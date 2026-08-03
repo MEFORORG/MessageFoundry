@@ -135,6 +135,37 @@ level was achieved anyway. Any published attestation must say which requirements
 something weaker than "verified at Level 3". Writing `na` in the record and "Level 3 verified" in a
 brochure is the failure mode this section exists to prevent.
 
+### 2.2 A count movement is not a posture movement — read the counts accordingly
+
+**The single most misreadable thing this method produces is a change in the bucket totals.** Counts move
+for four different reasons, and only one of them means the software got better:
+
+| The count moved because… | Did the posture improve? | What actually happened |
+|---|---|---|
+| A control was **built or turned on by default** | **Yes** | The verb is now satisfied by shipped code |
+| A cell was **read for the first time** (`unverified` → anything) | **No** | The survey advanced. A cell moving `unverified` → `pass` is a *discovery*, not an improvement |
+| A **scope boundary was stated** (→ `na`) | **No** | The requirement left the denominator. Identical code, smaller question |
+| A **rule was applied more carefully** (re-grade in either direction) | **No** | The assessment got more accurate. Some of these move *down* |
+
+**The worked example, and it is recent.** On 2026-08-02 the fail count went **3 → 2** when 11.7.1 was
+scoped out under rule 1. **Zero lines of engine code changed.** A reader comparing only the fail counts
+across those two days would conclude a defect was fixed; nothing was. The rationale is on the cell and
+the boundary is in §2, but neither is visible to someone reading a total.
+
+**Two obligations follow, and they are cheap:**
+
+1. **Never report a bucket total as a trend without naming which of the four causes moved it.** "Fails
+   went from 3 to 2" is not a finding. "One cell was scoped out; no code changed" is.
+2. **When a count improves, state what would have had to happen for it to mean an improvement, and
+   whether that happened.** This is the same discipline as a negative control: a number that can only
+   go one way is not measuring anything.
+
+⚠️ **This cuts against us more often than for us, which is why it is written down.** The survey is
+incomplete, so most future movement will come from cause 2 — cells being read for the first time — and
+the aggregate will get *worse* before it gets better as `unverified` cells resolve into real verdicts.
+**That is the survey working, not a regression**, and it should be reported as such rather than
+defended against.
+
 **The configuration assessed** — one posture, not a matrix:
 
 > On-premises single hospital · private network, never internet-facing · SQL Server store · operator
