@@ -508,12 +508,19 @@ class StoreSettings(_Section):
     )
     application_name: str = "messagefoundry"
     # Inflight-row lease TTL (seconds) for the multi-node server-DB backends (Track B Step 2). When a
-    # worker claims a row it stamps owner + a lease_expires_at = now + this; a renew timer extends it
-    # while processing, and a leader sweep reclaims only rows whose lease has expired (so a crashed
-    # node's work is recovered without stealing a live sibling's in-flight rows). A shared server-DB
-    # field — harmless to SQL Server / SQLite, which don't lease and ignore it. The lease is wall-clock
-    # across nodes, so the no-theft guarantee assumes clocks are NTP-synced to well within this TTL;
-    # set it comfortably larger than expected clock skew + the renew interval.
+    # worker claims a row it stamps owner + a lease_expires_at = now + this, and a leader sweep reclaims
+    # only rows whose lease has expired (so a crashed node's work is recovered without stealing a live
+    # sibling's in-flight rows). A shared server-DB field — harmless to SQL Server / SQLite, which don't
+    # lease and ignore it. The lease is wall-clock across nodes, so the no-theft guarantee assumes clocks
+    # are NTP-synced to well within this TTL.
+    #
+    # THE ROW LEASE IS STAMPED ONCE AT CLAIM AND IS NEVER RENEWED — there is no renew timer anywhere in
+    # the store (earlier text here and in the sweep's own docstrings claimed one; it did not exist).
+    # So size this against the longest a single row can legitimately stay claimed, not against a renew
+    # interval: it must comfortably exceed the connector's timeout_seconds + any pacing + batch-gather,
+    # plus expected clock skew. Set it too low and the leader's own sweep re-pends rows it is still
+    # processing — the sweep is owner-blind, so "a crashed node's rows" includes this node's own.
+
     lease_ttl_seconds: float = 60.0
 
     # --- Store connection-pool pre-warm (server-DB backends only; no-op on SQLite) ----------
@@ -2768,6 +2775,16 @@ class AlertsSettings(_Section):
     email_from: str | None = None
     email_to: list[str] = []
     email_use_tls: bool = True  # STARTTLS
+    # #323 layer 3: whether that STARTTLS hop VERIFIES the relay's certificate. True (the default) builds
+    # an explicit verifying context via tls_policy.build_smtp_tls_context; before #323 there was no
+    # context at all and smtplib's fallback verified NOTHING (CERT_NONE, check_hostname=False), so the
+    # hop was encrypted but unauthenticated. FALSE is an audited loosening: it is named by
+    # security_loosenings() and REFUSED at the serve gate on an enforcing PHI instance unless
+    # [security].allow_unverified_alert_smtp_tls is also set. Only meaningful when email_use_tls=true.
+    email_tls_verify: bool = True
+    # PEM bundle of trust anchors for that hop. None (the default) = the [tls] internal-CA policy if one
+    # is configured, else the OS trust store. A path, not a secret — same status as [tls].internal_ca_file.
+    email_tls_ca_file: str | None = None
     email_username: str | None = None
     email_password: str | None = None  # secret — supply via MEFOR_ALERTS_EMAIL_PASSWORD
     # Connector SecretProvider reference (ADR 0019 §5, BACKLOG #196). When set AND [secrets].provider is
@@ -2896,9 +2913,17 @@ class ClusterSettings(_Section):
     # (clock_timestamp()), so inter-node clock skew is irrelevant to leadership correctness. Must be > 0.
     leader_lease_ttl_seconds: float = 30.0
     # The SELF-FENCE timeout: a leader that has not renewed its lease within this many seconds (its own
-    # monotonic clock, with NO DB I/O so a hung/partitioned DB can't block it) halts its leader work.
-    # MUST be < leader_lease_ttl_seconds so the old leader stops BEFORE the lease can expire and a standby
-    # acquire — the split-brain guard. MUST be > heartbeat_seconds so a single missed renew doesn't fence.
+    # monotonic clock, with NO DB I/O so a hung/partitioned DB can't block it) stops reporting itself
+    # leader. MUST be < leader_lease_ttl_seconds so it does so BEFORE the lease can expire and a standby
+    # acquire. MUST be > heartbeat_seconds so a single missed renew doesn't fence. _fence_ordering below
+    # enforces exactly that ordering — and ONLY the ordering.
+    #
+    # What the ordering does NOT establish, for anyone sizing these down from the defaults: the usable
+    # margin is smaller than (ttl - fence), because the fence baseline is stamped after the renew round
+    # trip returns while the lease expiry is stamped on the DB clock at statement execution, and
+    # detection lands up to one fence tick late. Nor does fencing stop the graph — it flips a boolean;
+    # the listeners and in-flight sends wind down on their own schedule, which nothing budgets against
+    # the remainder. The shipped 10/20/30 leave real slack; tightened values consume it silently.
     leader_fence_timeout_seconds: float = 20.0
     # Leader-PREFERENCE handicap (ADR 0096). Seconds this node waits — MEASURED AGAINST THE LEASE-EXPIRY
     # TIME on the DB clock — before it may claim an EXPIRED leadership lease. 0.0 (default) = no handicap
@@ -3558,6 +3583,21 @@ class SecuritySettings(_Section):
     # enforcement=warn keeps it a warning even when this is set. Not a loosening (it tightens).
     require_memory_encryption_declaration: bool = False
 
+    # ── Outbound alert email (data in transit) ───────────────────────
+    # #323 layer 3: the SECOND acknowledgment required to run the alerts / security-event SMTP hop with
+    # certificate verification OFF ([alerts].email_tls_verify=false) on an ENFORCING PHI instance.
+    # AN ACKNOWLEDGMENT SWITCH, NOT THE CLAMP — and the difference is the whole reason this cell shipped
+    # separately from the EMAIL/DIRECT connectors. Those are built inside build_check_registry's
+    # `active_hop_posture` scope, so they read the CLAMPED weakened_tls_escape_permitted_here() and an
+    # enforcing PHI hop can never be relaxed. The alerts notifier is constructed in the API lifespan,
+    # OUTSIDE that scope (measured: the contextvar is stamped only in pipeline/wiring_runner.py), where
+    # current_hop_posture() is None and the clamp degrades to the UNCLAMPED escape — i.e. the connectors'
+    # mechanism would silently provide no refusal at all here. So the refusal is keyed on this explicit
+    # switch at the serve gate instead, in the shape of allow_unencrypted_phi_under_strict_enforcement.
+    # Default FALSE and byte-identical when unset. Setting it TRUE is a LOOSENING: security_loosenings()
+    # names it, so the opt-out is never silent.
+    allow_unverified_alert_smtp_tls: bool = False
+
     # ── Sign-in & identity ───────────────────────────────────────────
     require_sign_in: bool = True  # authenticate every request
     require_mfa: bool = True  # second factor, enforced as an ACCESS gate (ASVS 6.3.3)
@@ -3588,6 +3628,60 @@ class SecuritySettings(_Section):
     # production instance, not the raw default; a stock dev/staging/prod instance needs no value here.
     handles_real_patient_data: bool | None = None  # was [ai].data_class = "phi"
     production_instance: bool | None = None  # was [ai].production
+
+    # ── Leaving the organization: the ASVS 3.7.3 interstitial ────────
+    # Domains that count as INSIDE the organization. ASVS 3.7.3 asks for a notification when the user
+    # is sent somewhere "outside the application's CONTROL", and control is organisational rather than
+    # topological — an operator's own AD FS is a different host, a different origin, and squarely
+    # theirs. Matched on a LABEL boundary, so "hospital.example" covers "adfs.hospital.example" and
+    # NOT "evilhospital.example"; a bare endswith would admit the lookalike.
+    #
+    # EMPTY (the default) is deliberately the strict position, not the lax one: with nothing declared,
+    # every absolute http(s) destination is treated as external and gets the interstitial. An operator
+    # who configures nothing is warned too often, never too little.
+    organization_domains: list[str] = Field(default_factory=list)
+    # The interstitial itself. On by default (ADR-less: this IS the 3.7.3 control). Turning it off is
+    # a posture decision, not a convenience one, and the serve gate says so.
+    external_link_interstitial: bool = True
+    # ⚠️ THE AUDITED ESCAPE, and it LOWERS SECURITY. Destinations here are navigated to with no
+    # notification and no cancel — precisely what 3.7.3 asks for. It exists because operators have
+    # legitimate high-volume external destinations they do not want to declare as their own domain.
+    # Same label-boundary matching. Non-empty produces a startup warning naming every entry; the
+    # method's rule is that a signed relaxation is never a Pass, so this is the delta, not the default.
+    external_link_allowlist: list[str] = Field(default_factory=list)
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="before")
+    @classmethod
+    def _split_domain_list(cls, value: object) -> object:
+        """Accept a comma/whitespace-separated string as well as a list — parity with the other
+        list-valued settings here, so an env-var override does not need TOML array syntax."""
+        if isinstance(value, str):
+            return [part for part in value.replace(",", " ").split() if part]
+        return value
+
+    @field_validator("organization_domains", "external_link_allowlist", mode="after")
+    @classmethod
+    def _check_domains_are_bare_hosts(cls, value: list[str]) -> list[str]:
+        """Reject a URL or a wildcard where a domain belongs.
+
+        ``https://hospital.example/`` and ``*.hospital.example`` both look right and both silently
+        match NOTHING under label-boundary comparison — the operator would believe they had declared
+        an internal domain and get an interstitial on every internal link, or worse, believe they had
+        allowlisted something that is still being warned about. Failing at config load is the only
+        place this is cheap to notice.
+        """
+        cleaned: list[str] = []
+        for raw in value:
+            item = raw.strip().lower().lstrip(".")
+            if not item:
+                continue
+            if "/" in item or ":" in item or "*" in item:
+                raise ValueError(
+                    f"{item!r} must be a bare domain such as 'hospital.example', not a URL, scheme "
+                    "or wildcard — subdomains are matched automatically on a label boundary"
+                )
+            cleaned.append(item)
+        return cleaned
 
     @field_validator("allowed_client_networks", mode="before")
     @classmethod
@@ -3956,6 +4050,7 @@ def security_loosenings(
     sec: SecuritySettings,
     store: StoreSettings,
     auth: AuthSettings,
+    alerts: AlertsSettings,
     cleartext_hops: Sequence[str],
 ) -> list[tuple[str, str]]:
     """The ``[security]`` switches at their INSECURE value, plus the enumerated deviations outside that
@@ -3965,7 +4060,8 @@ def security_loosenings(
     ``[security]`` switch — pinned by a completeness floor in ``tests/test_security_posture_defaults.py``
     that iterates ``SecuritySettings.model_fields`` and fails on an unreported, unexempted one — plus an
     ENUMERATED set of deviations that live elsewhere: ``[store].aad_bind``,
-    ``[auth].ad_session_recheck_seconds``, and the per-connection ``cleartext_accepted``. It is NOT yet
+    ``[auth].ad_session_recheck_seconds``, ``[alerts].email_use_tls``/``email_tls_verify`` (#323
+    layer 3), and the per-connection ``cleartext_accepted``. It is NOT yet
     an exhaustive registry of every security-relevant switch in every section; ``[store]``/``[auth]``
     carry others (``encrypt``, ``trust_server_certificate``, ``enabled``, ``require_mfa``,
     ``ad_tls_verify``, ``ad_allow_insecure_ldap``, ``oidc_require_mfa_claim``,
@@ -4031,6 +4127,29 @@ def security_loosenings(
                 "require_encryption_for_remote",
                 "off-machine access is permitted WITHOUT TLS — bearer tokens and PHI would cross the network "
                 "in cleartext (still refused on a production-PHI bind)",
+            )
+        )
+    if not sec.external_link_interstitial:
+        out.append(
+            (
+                "external_link_interstitial",
+                "the console navigates OFF-SITE with no notification and no cancel — an operator can be "
+                "sent to a third-party site (including an identity provider) with no chance to stop it "
+                "(ASVS 3.7.3)",
+            )
+        )
+    if sec.external_link_allowlist:
+        # Reported even though the switch is a LIST rather than a bool, because the completeness floor
+        # only pins bools and an exempted list would be an unreported loosening by omission. Entries
+        # are named individually: a count would say "3 destinations are exempt" without saying which,
+        # which is the shape that lets an entry nobody intended survive a posture review.
+        out.append(
+            (
+                "external_link_allowlist",
+                "these destinations are exempt from the off-site interstitial and are navigated to "
+                "with no notification and no cancel: "
+                + ", ".join(sec.external_link_allowlist)
+                + " (ASVS 3.7.3)",
             )
         )
     if not sec.require_sign_in:
@@ -4122,6 +4241,39 @@ def security_loosenings(
                 "ad_session_recheck_seconds",
                 "directory revocation does NOT propagate — an AD account disabled or deleted keeps its "
                 "live engine sessions until they expire on their own",
+            )
+        )
+    # --- the [alerts] SMTP hop (#323 layer 3). Two SEPARATE entries, deliberately: the deviation and the
+    # acknowledgment of it are different facts and an operator can hold either without the other. A hop
+    # with verification off under enforcement=warn needs no acknowledgment to run, so keying the report
+    # on the switch alone would leave the actual weakening invisible — which is the failure mode this
+    # registry exists to prevent. Reported at every call site (unlike cleartext_accepted, this is
+    # settings-scoped, so `security show` and a graphless GET /security/posture see it completely).
+    if alerts.email_smtp_host and alerts.email_from:
+        if not alerts.email_use_tls:
+            out.append(
+                (
+                    "email_use_tls",
+                    "the [alerts] SMTP hop is CLEARTEXT — operator alert bodies, every per-user "
+                    "security-event email (lockout, password/roles change) and the SMTP login "
+                    "credential cross it unencrypted and readable by anything on the path",
+                )
+            )
+        elif not alerts.email_tls_verify:
+            out.append(
+                (
+                    "email_tls_verify",
+                    "the [alerts] SMTP hop is encrypted but UNAUTHENTICATED — it accepts any "
+                    "certificate, so an on-path attacker presenting one reads the alert bodies, the "
+                    "per-user security-event email and the SMTP login credential",
+                )
+            )
+    if sec.allow_unverified_alert_smtp_tls:
+        out.append(
+            (
+                "allow_unverified_alert_smtp_tls",
+                "an unauthenticated [alerts] SMTP hop is permitted to start an enforcing PHI instance "
+                "— the serve gate that would otherwise refuse it is acknowledged away",
             )
         )
     # --- the one CONNECTION-scoped deviation (ADR 0153 decision 2). It is not a [security] switch, but

@@ -592,8 +592,24 @@ def _reconcile(
     # zero-loss run (14 stranded of 90 against a budget of 4) and red the required windows-2025 leg.
     #
     # So bound it as a FRACTION of the run, floored by the caller's connection count for tiny runs:
-    # at most half the sends may be excused. Observed teardown stranding is ~16%, so half is ~3x the
-    # worst seen — wide enough to stop flaking, far from vacuous. A dead ACK path (`timeouts == sent`)
+    # at most THREE QUARTERS of the sends may be excused.
+    #
+    # THAT FRACTION WAS HALF, AND HALF WAS THE BUG. It was sized when the worst teardown stranding on
+    # record was 14/90 (~16%), making half "~3x the worst seen". windows-2025 has since produced
+    # 46/90 (~51%) on a run that lost NOTHING — 104 written, 104 received at the sink, backlog drained
+    # in 4.7s of a 30s bound — and failed `main` at 9b03057f by ONE message over the budget of 45.
+    # A threshold sitting on top of the healthy distribution's centre is a coin flip, not a detector
+    # (same defect as the ubuntu step cap in #104: 775s against a 780s bound).
+    #
+    # Three quarters is chosen, not rounded up to: it is ~1.5x the worst healthy value now on record
+    # (51%) while a dead ACK path strands ~100% and still blows it by a wide margin. It also makes
+    # this budget AGREE with the sibling detector in tests/test_load_runner.py, which requires
+    # `acked >= sent // 4` — i.e. tolerates up to 75% stranding. Those two encode the same tolerance
+    # and previously contradicted each other: the test was tuned for "~half is healthy" while this
+    # budget failed at half + 1, so the tuning never applied to the path that actually fired.
+    # Re-check this fraction if observed stranding climbs again; record the observation here.
+    #
+    # A dead ACK path (`timeouts == sent`)
     # blows that cap and fails loudly — but ONLY while the connection-count floor does not dominate:
     # once `unconfirmed_budget >= sent` the max() forgives even a 100%-dead ACK path, and the intake
     # floor below cannot catch that one either, because its signature is a HIGH read with no ACKs.
@@ -611,8 +627,13 @@ def _reconcile(
     #
     # Hence the guarantee is enforced SEPARATELY below, as an intake floor the excusal cannot lower.
     unconfirmed = counters.timeouts
-    budget = max(unconfirmed_budget, sent // 2)
+    budget = max(unconfirmed_budget, 3 * sent // 4)
     over_budget = unconfirmed > budget
+    # Deliberately all-or-nothing, NOT clamped to the budget: past the budget this is a systemic
+    # fault, and a flood masking a real shortfall must report the whole shortfall rather than excuse
+    # the first `budget` of it (tests/test_harness_reconcile.py pins that — "with the flood masking a
+    # real shortfall, nothing is excused: the loss is reported too"). The cliff that produces is only
+    # reachable once `over_budget` is already true, i.e. once the run has failed anyway.
     excused = 0 if over_budget else unconfirmed
     read_short = sent - excused - read
     # The anti-vacuity guarantee, enforced independently of the excusal AND of `tolerance` — the
@@ -646,7 +667,7 @@ def _reconcile(
     if over_budget:
         parts.append(
             f"{unconfirmed} unconfirmed sends exceed the stranding budget "
-            f"({budget} = max(connections, half the run)) — systemic no-ACK fault "
+            f"({budget} = max(connections, three quarters of the run)) — systemic no-ACK fault "
             f"(possible accepted-and-dropped); nothing excused"
         )
     elif unconfirmed > 0 and read < sent:

@@ -232,6 +232,10 @@ _NOT_A_SECRET: dict[str, str] = {
     # ADR 0132 (#111) — the File alt-credential AD domain name (e.g. 'CORP'), not a secret. The paired
     # credential_username + credential_password ARE redacted (in _SECRET_SETTING_KEYS).
     "credential_domain": "an AD domain name (e.g. 'CORP'), not a secret",
+    # ADR 0154 (D6) — which header the intake credential arrives in, e.g. 'x-api-key'. The header NAME
+    # is topology an operator agrees with a partner, not the credential itself; the paired
+    # intake_api_key + intake_api_key_next ARE redacted (both in _SECRET_SETTING_KEYS).
+    "intake_api_key_header": "the header name an intake credential arrives in, not the credential",
 }
 
 #: Names that look like a credential. Deliberately broad — a false positive costs one line in

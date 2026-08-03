@@ -30,12 +30,16 @@ from messagefoundry.pipeline.wiring_runner import (
     check_http_tls_exposure,
 )
 from messagefoundry.store.store import MessageStatus, MessageStore, Stage
+from messagefoundry.transports import http_listener as http_mod
 from messagefoundry.transports.base import build_source
 from messagefoundry.transports.http_listener import (
     DEFAULT_MAX_BODY_BYTES,
     HttpRequestError,
     HttpSource,
+    _read_body,
+    _read_head,
     _read_request,
+    _status_line,
     build_response,
 )
 
@@ -456,12 +460,177 @@ async def test_read_request_allows_single_content_length_get() -> None:
     assert req.method == "GET" and req.body == b""
 
 
+async def test_read_head_returns_before_the_body_arrives() -> None:
+    # The point of the ADR 0154 D6 split, and the only way AC-11's "before any request body byte is
+    # read" is satisfiable. This head DECLARES a 1 MiB body and never sends a byte of it; if
+    # _read_head waited on the body — as the combined _read_request does — this would hang until the
+    # timeout instead of handing back a request whose credentials can be checked.
+    reader = asyncio.StreamReader()
+    reader.feed_data(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 1048576\r\n\r\n")
+    head = await asyncio.wait_for(_read_head(reader, max_header_bytes=8192), 2.0)
+    assert head.method == "POST"
+    assert head.body == b""
+
+
+async def test_read_head_then_read_body_reassembles_the_request() -> None:
+    # The halves compose losslessly: the head read must not consume or discard the body.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: 5\r\n\r\nHELLO")
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert head.body == b""
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b"HELLO"
+
+
+async def test_read_body_keeps_the_get_before_chunked_ordering() -> None:
+    # Pins a quirk the split could silently "fix": the GET/HEAD short-circuit runs BEFORE the chunked
+    # refusal, so a GET carrying Transfer-Encoding: chunked is accepted with an empty body. Hoisting
+    # the refusal into the head phase would look like hardening and would change shipped behaviour.
+    reader = await _reader_from(
+        b"GET /health HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n"
+    )
+    head = await _read_head(reader, max_header_bytes=8192)
+    assert await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES) == b""
+
+    # ... while a POST carrying it is still refused, in the body phase.
+    reader = await _reader_from(b"POST / HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
+    head = await _read_head(reader, max_header_bytes=8192)
+    with pytest.raises(HttpRequestError) as excinfo:
+        await _read_body(reader, head, max_body_bytes=DEFAULT_MAX_BODY_BYTES)
+    assert excinfo.value.status == 400
+
+
 def test_build_response_shape() -> None:
     out = build_response(202, '{"ok":1}')
     assert out.startswith(b"HTTP/1.1 202 Accepted\r\n")
     assert b"Content-Length: 8\r\n" in out
     assert b"Connection: close\r\n" in out
     assert out.endswith(b'{"ok":1}')
+
+
+def test_build_response_carries_extra_headers() -> None:
+    # What lets a 401 carry WWW-Authenticate and a 429 carry Retry-After (ADR 0154 D6 wire shapes).
+    out = build_response(
+        401,
+        '{"error":"unauthorized"}',
+        extra_headers={"WWW-Authenticate": "Bearer", "Retry-After": "60"},
+    )
+    assert out.startswith(b"HTTP/1.1 401 Unauthorized\r\n")
+    assert b"WWW-Authenticate: Bearer\r\n" in out
+    assert b"Retry-After: 60\r\n" in out
+    assert b"Connection: close\r\n" in out
+
+
+def test_build_response_rejects_header_injection_rather_than_stripping_it() -> None:
+    # AC-9: REJECT, do not sanitise. _strip_header_control_chars removes offending characters, which
+    # would silently reshape a partner's Content-Type into something they never sent.
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\r\nX-Injected: 1")
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", extra_headers={"Retry-After": "60\r\nX-Injected: 1"})
+    with pytest.raises(ValueError, match="header name"):
+        build_response(200, "{}", extra_headers={"X-Bad\r\nInjected": "1"})
+    with pytest.raises(ValueError, match="header name"):
+        build_response(200, "{}", extra_headers={"X Bad": "1"})  # space is not a tchar
+
+    # The specific trap the guard is written against: a $-anchored re.match ACCEPTS a trailing
+    # newline, so a lone LF at the end must be rejected too — not just an embedded CRLF.
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\n")
+    with pytest.raises(ValueError, match="header value"):
+        build_response(200, "{}", content_type="text/plain\r")
+
+    # A rejected value must not leak into the error text: on the capture path it is partner
+    # controlled and potentially PHI. The header NAME is enough to diagnose.
+    with pytest.raises(ValueError) as excinfo:
+        build_response(200, "{}", extra_headers={"X-Reply-Type": "application/json\r\nMRN: 100"})
+    assert "100" not in str(excinfo.value)
+    assert "X-Reply-Type" in str(excinfo.value)
+
+
+def test_status_line_reason_phrases() -> None:
+    # The at-capacity refusal (_on_client) has always emitted 503, and _status_line's "OK" default
+    # serialised it as `HTTP/1.1 503 OK` — a success phrase on a failure code. Asserted here rather
+    # than through the flood test because the in-file _http() client parses only the numeric code,
+    # so no end-to-end test in this suite can see a wrong reason phrase.
+    assert _status_line(503) == "HTTP/1.1 503 Service Unavailable"
+
+    for status, reason in (
+        (200, "OK"),
+        (202, "Accepted"),
+        (204, "No Content"),
+        (400, "Bad Request"),
+        (401, "Unauthorized"),
+        (403, "Forbidden"),
+        (405, "Method Not Allowed"),
+        (408, "Request Timeout"),
+        (413, "Payload Too Large"),
+        (422, "Unprocessable Content"),
+        (429, "Too Many Requests"),
+        (500, "Internal Server Error"),
+        (502, "Bad Gateway"),
+        (504, "Gateway Timeout"),
+    ):
+        assert _status_line(status) == f"HTTP/1.1 {status} {reason}"
+
+    # An unmapped code must not inherit a phrase that contradicts it. RFC 9110 §15 allows an empty
+    # reason-phrase; the SP before it is still required, so the line stays well-formed.
+    assert _status_line(599) == "HTTP/1.1 599 "
+
+
+async def test_accepted_socket_disables_nagle(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # asyncio already sets TCP_NODELAY on selector-loop transports, so asserting the option value on
+    # the accepted socket would pass whether or not _on_client calls _set_tcp_nodelay — vacuous. Spy
+    # instead, the same way tests/test_mllp_tcp_nodelay.py proves the outbound dial.
+    calls: list[Any] = []
+    real_set = http_mod._set_tcp_nodelay
+
+    def spy(writer: Any) -> None:
+        calls.append(writer)
+        real_set(writer)  # keep the real effect so the round-trip below is unaffected
+
+    monkeypatch.setattr(http_mod, "_set_tcp_nodelay", spy)
+
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
+    )
+    src = await _start_source(store, ic)
+    try:
+        resp = await _http(src.sockport, body=JSON_BODY.encode("utf-8"))
+    finally:
+        await src.stop()
+    assert resp.status == 202
+    assert calls, "_on_client accepted a connection without disabling Nagle"
+
+
+async def test_respond_drain_is_bounded(
+    store: MessageStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The success-path drain was unbounded, so a peer that stopped reading held its max_connections
+    # slot indefinitely — receive_timeout bounds the READ, nothing bounded the write. _write_safely
+    # already bounded the refuse path; only _respond did not.
+    assert issubclass(TimeoutError, OSError)  # so _on_client's existing OSError arm catches this
+
+    ic = build_inbound_connection(
+        "IB_HTTP", Http(port=0), router="r", content_type=ContentType.JSON
+    )
+    src = await _start_source(store, ic)
+    monkeypatch.setattr(http_mod, "_CLIENT_SHUTDOWN_GRACE", 0.05)
+
+    class _StalledWriter:
+        """A peer that accepts the write but never drains."""
+
+        def write(self, data: bytes) -> None:
+            pass
+
+        async def drain(self) -> None:
+            await asyncio.sleep(30)
+
+    try:
+        with pytest.raises(TimeoutError):
+            await src._respond(_StalledWriter(), b"x")  # type: ignore[arg-type]
+    finally:
+        await src.stop()
 
 
 # --- API-18: bounded functional DoS-guard tests (slow-loris / max_connections / body-flood) ------
@@ -587,3 +756,21 @@ async def test_body_flood_no_content_length_refused(store: MessageStore) -> None
         assert (await cur.fetchone())["n"] == 0  # oversize body refused before any ingress row
     finally:
         await asyncio.wait_for(src.stop(), timeout=8.0)
+
+
+def test_a_204_carries_no_entity_headers() -> None:
+    # RFC 9110 §15.3.5 forbids a body on a 204, and Content-Length beside it is at best noise and at
+    # worst a parser tripwire. Ordinary traffic rather than an edge case: reply_on_empty="204" is the
+    # default answer for a partner reply that is deliberately empty.
+    out = build_response(204)
+    assert out.startswith(b"HTTP/1.1 204 No Content\r\n")
+    assert b"Content-Type" not in out
+    assert b"Content-Length" not in out
+    assert b"Connection: close\r\n" in out
+    assert out.endswith(b"\r\n\r\n")
+
+    # extra_headers still ride a 204 — Retry-After and friends are not entity headers.
+    assert b"Retry-After: 5\r\n" in build_response(204, extra_headers={"Retry-After": "5"})
+
+    # ... and every other status is unchanged.
+    assert b"Content-Length: 0\r\n" in build_response(200)

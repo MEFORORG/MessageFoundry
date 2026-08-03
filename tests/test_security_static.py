@@ -1011,10 +1011,15 @@ def test_xml_import_scanner_sees_indented_imports() -> None:
 #: BACKLOG #282 widens the gate itself to these roots this pin becomes redundant and should be deleted
 #: in favour of the gate's inventory.
 _CRYPTO_SITES_OUTSIDE_THE_PACKAGE = {
+    # ADR 0156: SHA-256 over the ASVS corpus FILE to pin it to the tagged release. No key.
+    "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
     "messagefoundry_webconsole/_security.py": frozenset({"secrets"}),
     "tee/__main__.py": frozenset({"ssl"}),
     "tee/anon/keying.py": frozenset({"hashlib"}),
     "tee/mefor_api.py": frozenset({"ssl"}),
+    # ADR 0155: the DAST scan target mints a throwaway per-run password for the two ephemeral scan
+    # identities it provisions into a temp-directory store it destroys with the run.
+    "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 
 

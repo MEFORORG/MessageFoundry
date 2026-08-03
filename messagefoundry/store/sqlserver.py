@@ -81,6 +81,7 @@ from messagefoundry.store.metadata import (
 )
 from messagefoundry.store.pool_metrics import AcquireWaitHistogram, ClaimPoolStatus, PoolStatus
 from messagefoundry.store.store import (
+    MESSAGE_EVENT_KINDS,
     NOT_DEPLOYED_EVENT,
     REINGRESS_TARGET_PREFIX,
     AlertInstance,
@@ -101,6 +102,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendKeyConflict,
     ResendOutcome,
     ResendSourceAmbiguous,
@@ -133,6 +135,14 @@ _RELEASE_CHUNK = 500
 # pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
 # transaction, so the all-or-nothing recovery pass is unchanged.
 _RESET_LANE_CHUNK = 500
+
+# BACKLOG #348 / ADR 0159: how long the quarantine of a cancellation-poisoned pooled connection waits
+# for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
+# the connection is already out of the pool before this wait starts, so expiring it costs nothing but
+# a slower reclaim. It exists because the close runs on a worker thread that may still be occupied by
+# the abandoned statement, which is bounded only by command_timeout (default 30s) — without a cap here
+# an engine.stop()/demotion would block for that long, per lane.
+_DIRTY_CLOSE_TIMEOUT = 5.0
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
@@ -1693,6 +1703,10 @@ class SqlServerStore:
         # insert helpers; no new lock, no commit-boundary change. See tests/test_live_cost_counters.py.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQL Server's terminal resolves are NOT yet
+        # epoch-fenced (that is ADR 0157 Inc 3), so this stays 0 on this backend until then. Declared
+        # because Store (base.py) requires it and open_store() returns this class as a Store.
+        self.fenced_writes = 0
 
     async def _commit(self, conn: Any) -> None:
         """Commit a durable **write**-path transaction and count it (A1 live cost counters). A bare async
@@ -2907,7 +2921,60 @@ class SqlServerStore:
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
-            yield conn
+            try:
+                yield conn
+            except BaseException as exc:
+                # BACKLOG #348 / ADR 0159. Every caller's own handler is `except Exception` (90 of
+                # the 91 _acquire sites), so an ordinary error has ALREADY rolled back by the time it
+                # reaches here — leave that path exactly as it was, connection recycled. A
+                # CancelledError derives from BaseException, so NONE of those handlers ran: the body
+                # is unwinding with its transaction still open and its X locks still held, and
+                # aioodbc's pool does not compensate (`Pool.release()` appends a non-closed
+                # connection straight back onto the free deque — 0.5.0 pool.py:196-205 — and
+                # `_ContextManager.__aexit__` releases identically on the exception path). Quarantine
+                # it so the next borrower can never inherit it.
+                if not isinstance(exc, Exception):
+                    await self._release_dirty(conn)
+                raise
+
+    async def _release_dirty(self, conn: Any) -> None:
+        """Quarantine a pooled connection whose transaction was abandoned by a cancellation, so it
+        can never be lent to another caller (BACKLOG #348, ADR 0159).
+
+        **The load-bearing line is the synchronous one.** aioodbc derives ``Connection.closed`` from
+        ``self._conn`` (0.5.0 connection.py:89-93) and ``Pool.release()`` re-adds a connection to the
+        free deque only ``if not conn.closed`` (pool.py:200-204) — so dropping the handle is a plain
+        attribute write that makes the connection unlendable with **no await in front of it**. That
+        matters: shutdown cancels the lane task and the gather can cancel it AGAIN, so any cleanup
+        that awaits *before* containing the poison is defeated by the second cancellation and
+        silently restores the bug. Ordering here is the guarantee; the close below is only hygiene.
+
+        Closing the raw handle is then best-effort, off the event loop, and time-boxed. pyodbc's
+        ``close()`` rolls back uncommitted work (DBAPI), which is what actually frees the X locks —
+        but it runs on a worker thread that may still hold the abandoned statement, so it is never
+        awaited unbounded on a shutdown/demotion path. On expiry the close finishes detached; the
+        pool has already lost the connection and reopens on demand (``size`` is derived, so the pool
+        simply shrinks). This costs one reconnect per cancelled call — paid only on a path that was
+        previously corrupting the pool.
+        """
+        raw = getattr(conn, "_conn", None)
+        if raw is None:  # already closed/quarantined — nothing lendable to contain
+            return
+        conn._conn = None  # ← MUST stay first, and MUST stay await-free
+        closer = asyncio.ensure_future(asyncio.to_thread(raw.close))
+        try:
+            await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
+        except (TimeoutError, asyncio.CancelledError):
+            # Expired, or a further cancellation landed while we waited. Either way the connection is
+            # already out of the pool; let the close land on its own. Swallowed deliberately — the
+            # caller re-raises the ORIGINAL cancellation, which is the outcome that must propagate.
+            log.debug(
+                "sqlserver: quarantined connection close did not complete within %.1fs; it will"
+                " finish detached (the connection is already out of the pool)",
+                _DIRTY_CLOSE_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
+            log.debug("sqlserver: quarantined connection close failed", exc_info=True)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -7644,6 +7711,30 @@ class SqlServerStore:
         oldest = row["m"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Three narrow indexed reads, decoding nothing — see :class:`ReplyWaitState` for why the
+        message's own status is returned alongside the destination's row states."""
+        message_row = await self._fetchone("SELECT status FROM messages WHERE id=?", (message_id,))
+        queue_rows = await self._fetchall(
+            "SELECT status FROM queue WHERE message_id=? AND stage=? AND destination_name=?",
+            (message_id, Stage.OUTBOUND.value, destination_name),
+        )
+        # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must never
+        # be mistaken for the partner's reply.
+        response_row = await self._fetchone(
+            "SELECT MAX(response_seq) AS seq FROM response"
+            " WHERE message_id=? AND destination_name=? AND kind=?",
+            (message_id, destination_name, "response"),
+        )
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
+
     async def dead_letter_missing_destinations(
         self, valid_names: set[str], now: float | None = None
     ) -> int:
@@ -8478,6 +8569,33 @@ class SqlServerStore:
         async with self._acquire() as conn, self._cursor(conn) as cur:
             try:
                 await self._event(cur, message_id, "viewed", None, actor or "", now)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        See :meth:`MessageStore.record_message_event` — same contract, same runtime kind validation
+        (the static literal-call-site guard cannot see a forwarded variable), same verbosity gate."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await self._event(cur, message_id, event, destination, detail or "", now)
                 await self._commit(conn)
             except Exception:
                 await conn.rollback()

@@ -1,16 +1,26 @@
 name: zizmor
 
 # GitHub Actions static analysis (Trail of Bits), split out of security.yml so it runs only when the
-# surface it lints actually changes: zizmor reads .github/** (workflows + its config), so a Python /
-# docs / test PR cannot change its result and running it there was pure cost (~1 billed min on every
-# one of ~900 monthly PR/push scans). The daily cron re-runs it against the UNCHANGED tree so a
-# newly-added zizmor rule or newly-flagged action ref still surfaces within ~24h, and
+# surface it lints actually changes. Its result moves with at least two inputs — the .github/** tree
+# it lints, and its own pinned version, which arrives from ci/locks/ci-scanners.lock (see the install
+# step) — so both are in the paths filter, and a PR touching neither was pure cost (~1 billed min on
+# every one of ~900 monthly PR/push scans). The daily cron re-runs it against the UNCHANGED tree so a
+# newly-added zizmor rule, or a newly-flagged action ref from the ONLINE audits that no paths filter
+# can see, still surfaces within ~24h, and
 # workflow_dispatch covers on-demand runs. NOT a branch-protection required check (verified against
 # the live protection rules), so a paths-filtered skip can never wedge a PR or auto-merge.
 on:
   pull_request:
     paths:
       - ".github/**"
+      # zizmor's own VERSION lives OUTSIDE .github/ — pyproject.toml's [dependency-groups].ci-scanners,
+      # hash-pinned through this export, which the install step below reads. A bump PR touching only
+      # those two never ran this gate (PR #66, zizmor 1.5.2 -> 1.28.0: 33 contexts, not one of them
+      # zizmor), so a jump against a deliberately CLEAN baseline was first adjudicated by the 06:00
+      # cron, against main, after merge. Unlike bandit and pip-audit — whose gates sit in security.yml
+      # on an unfiltered pull_request trigger and so DO re-run at the bumped version on the bump PR —
+      # this workflow is the only place the scanner it pins is exercised pre-merge.
+      - "ci/locks/ci-scanners.lock"
   schedule:
     - cron: "0 6 * * *"
   workflow_dispatch:

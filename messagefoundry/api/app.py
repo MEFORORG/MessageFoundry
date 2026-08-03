@@ -1037,6 +1037,9 @@ def create_app(
     # app.state.auth -- create_managed_app attaches the service in the lifespan, AFTER mount_ui
     # has already fixed the route table.
     oidc_enabled: bool = False,
+    # ASVS 3.7.3 (seam v17): the configured IdP authorization endpoint, for the interstitial's
+    # DISPLAY host. Config, never request input — see UiDeps.oidc_authorization_host.
+    oidc_authorization_endpoint: str = "",
     webauthn_rp_from_request: bool = True,
     exposure_protected: bool = False,
     loopback: bool = False,
@@ -1492,6 +1495,10 @@ def create_app(
         # [store]/[auth] carry posture switches too (ADR 0148: one posture, loosen only), so the registry
         # needs them to report a COMPLETE list. Same stash-or-default pattern as `store` above.
         auth_settings = getattr(request.app.state, "auth_settings", None) or AuthSettings()
+        # #323 layer 3: [alerts] carries the SMTP-hop deviation (cleartext / verification off). Same
+        # stash-or-default pattern — settings-scoped, so this route reports it completely even with no
+        # graph loaded, unlike the connection-scoped cleartext_accepted set below.
+        alerts_settings = getattr(request.app.state, "alerts_settings", None) or AlertsSettings()
         # ADR 0153: the ONE connection-scoped deviation. Read LIVE off the running graph (so a reload is
         # reflected) — this route is where an operator learns a cleartext hop is being crossed by
         # declaration, and a stale or absent list would understate the posture. An engine with no
@@ -1514,7 +1521,9 @@ def create_app(
         )
         loosenings = [
             SecurityLoosening(switch=name, risk=risk)
-            for name, risk in security_loosenings(security, store, auth_settings, cleartext_hops)
+            for name, risk in security_loosenings(
+                security, store, auth_settings, alerts_settings, cleartext_hops
+            )
         ]
         synthetic_relaxation = (
             "strict PHI-only controls (at-rest-encryption refusal, deny-by-default egress, bounded "
@@ -2522,6 +2531,18 @@ def create_app(
                 subject_template=alerts.email_subject_template,
                 body_template=alerts.email_body_template,
                 html_template=alerts.email_html_template,
+                # #323 layer 3: the test send MUST use the same TLS posture as a real alert, or this
+                # diagnostic passes against a relay that live alerts would refuse (or vice versa) — a
+                # compensating control resting on a false premise, which is the defect class #323 is
+                # about. Same fields, same source, same factory.
+                tls_verify=alerts.email_tls_verify,
+                tls_ca_file=alerts.email_tls_ca_file,
+                trust_anchor_policy=(
+                    tls_settings.policy()
+                    if (tls_settings := getattr(request.app.state, "tls_settings", None))
+                    is not None
+                    else None
+                ),
             )
             # A fixed synthetic event — carries only a type/severity/connection label + a static detail
             # string; NO message body, NO PHI. The template-value allowlist maps these safely too.
@@ -4142,6 +4163,7 @@ def create_app(
             # (or a future one) reports 0 rather than 500ing the stats read.
             committed_txns=getattr(engine.store, "committed_txns", 0),
             body_copies=getattr(engine.store, "body_copies", 0),
+            fenced_writes=getattr(engine.store, "fenced_writes", 0),
         )
 
     @app.get("/metrics")
@@ -4970,9 +4992,34 @@ def create_app(
         # Either source may know: create_managed_app passes the config flag; a caller that
         # constructs with auth= directly (tests, embedders) gets it from the live service.
         ui_oidc_enabled = oidc_enabled or bool(getattr(auth, "oidc_enabled", False))
+        # ASVS 3.7.3 (seam v17). Read off security_settings when present; the fallbacks are the
+        # STRICT position, so a caller that constructs without them gets the interstitial on every
+        # absolute destination rather than silently getting none.
+        _sec = security_settings
+
+        def _oidc_authorization_host(endpoint: str) -> str:
+            """ASCII/punycode host of the configured IdP endpoint, for DISPLAY only.
+
+            Local rather than imported from ``messagefoundry_webconsole._external``: the console is
+            deliberately not imported at module scope here (see the note above ``create_app``). An
+            unparseable endpoint yields ``""``, which the console treats as *unknown destination* and
+            therefore as a reason to SHOW the interstitial, never to skip it.
+            """
+            from urllib.parse import urlsplit
+
+            try:
+                host = (urlsplit(endpoint).hostname or "").strip().lower()
+                return host.encode("idna").decode("ascii").lower() if host else ""
+            except (ValueError, UnicodeError):
+                return ""
+
         deps = UiDeps(
             engine_seam=ENGINE_UI_SEAM,
             oidc_enabled=ui_oidc_enabled,
+            organization_domains=tuple(getattr(_sec, "organization_domains", ()) or ()),
+            external_link_interstitial=bool(getattr(_sec, "external_link_interstitial", True)),
+            external_link_allowlist=tuple(getattr(_sec, "external_link_allowlist", ()) or ()),
+            oidc_authorization_host=_oidc_authorization_host(oidc_authorization_endpoint),
             get_engine=_get_engine,
             get_gate=_get_gate,
             cookie_secure=_cookie_secure,
@@ -5332,7 +5379,13 @@ def create_managed_app(
             resolve_secret_provider(secrets_settings) if secrets_settings is not None else None
         )
         notifier = (
-            notifier_from_settings(alerts_settings, secret_provider=secret_provider)
+            notifier_from_settings(
+                alerts_settings,
+                secret_provider=secret_provider,
+                # #323 layer 3: the instance [tls] internal-CA policy reaches the alerts SMTP hop too, so
+                # an estate on a private CA needs no per-alert CA path.
+                trust_anchor_policy=tls_settings.policy() if tls_settings else None,
+            )
             if alerts_settings is not None
             else None
         )
@@ -5512,6 +5565,9 @@ def create_managed_app(
         # email_password_secret reference (fail-closed) exactly as notifier_from_settings does. None on
         # the embedded/test path — then only a plain env-sourced email_password can be tested.
         app.state.secret_provider = secret_provider
+        # #323 layer 3: expose the [tls] trust-anchor policy so POST /alerts/test-email builds its
+        # EmailTransport with the SAME anchors as the live notifier. None on the embedded/test path.
+        app.state.tls_settings = tls_settings
         app.state.service_settings = service_settings  # back GET /service/status (L6a)
         app.state.log_dir = log_dir  # back GET /status app-log metering (#50)
         app.state.approval_gate = _build_approval_gate(
@@ -5561,7 +5617,9 @@ def create_managed_app(
             # after the engine in the finally below).
             if auth_settings.notify_security_events and alerts_settings is not None:
                 security_notifier = security_notifier_from_settings(
-                    alerts_settings, secret_provider=secret_provider
+                    alerts_settings,
+                    secret_provider=secret_provider,
+                    trust_anchor_policy=tls_settings.policy() if tls_settings else None,
                 )
                 if security_notifier is not None:
                     security_notifier.start()
@@ -5697,6 +5755,9 @@ def create_managed_app(
         ws_allowed_origins=ws_allowed_origins,
         serve_ui=serve_ui,
         oidc_enabled=bool(auth_settings is not None and auth_settings.oidc_enabled),
+        oidc_authorization_endpoint=(
+            (auth_settings.oidc_authorization_endpoint or "") if auth_settings is not None else ""
+        ),
         public_origin=public_origin,
         webauthn_rp_from_request=webauthn_rp_from_request,
         exposure_protected=exposure_protected,
