@@ -116,8 +116,36 @@ function Get-Floor {
         $n = 0
         if ([int]::TryParse($f.BaseName, [ref]$n)) { $seen.Add($n) }
     }
+
+    # HIGH-WATER RATCHET -- the floor may rise but must never fall.
+    #
+    # Every other term above is derived from refs that a routine cleanup can remove. Measured on this
+    # clone: the backlog floor is 314 counting all refs, but only 252 counting `refs/remotes/origin`
+    # and local heads -- the missing 62 live on remote-tracking refs for a remote that `git remote -v`
+    # no longer lists. Drop those and the floor silently reverts to the pre-fix value and the allocator
+    # resumes issuing numbers that are already used, with no error and no signal. That is the exact bug
+    # this function was fixed for, so leaving its correctness dependent on nobody tidying refs is not
+    # good enough: persist the high-water mark and never go below it.
+    #
+    # SAFE:      `git fetch origin --prune` -- prunes only refs/remotes/origin/*, which is not where the
+    #            high numbers live. It is also what you SHOULD run before allocating.
+    # DANGEROUS: `git remote prune <name>` / `git remote remove <name>` for a non-origin remote,
+    #            deleting refs/<vault-ish>/*, or an aggressive `gc` / `reflog expire` that drops
+    #            unreachable objects. Those are what this ratchet defends against.
+    $watermark = Join-Path $alloc ".floor-highwater"
+    $computed = [int](($seen | Measure-Object -Maximum).Maximum)
+    $previous = 0
+    if (Test-Path $watermark) { [void][int]::TryParse((Get-Content $watermark -Raw).Trim(), [ref]$previous) }
+
+    if ($previous -gt $computed) {
+        Write-Host "NOTE: computed $Kind floor $computed is BELOW the recorded high-water $previous." -ForegroundColor Yellow
+        Write-Host "      Using $previous. Refs that carried the higher numbers are missing from this clone;" -ForegroundColor Yellow
+        Write-Host "      re-fetch them before trusting any number-space reasoning here." -ForegroundColor Yellow
+    }
+    $floor = [Math]::Max($computed, $previous)
+    if ($floor -gt $previous) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
     # Measure-Object hands back a [double]; the 'D4' format specifier is integer-only and throws on one.
-    [int](($seen | Measure-Object -Maximum).Maximum)
+    [int]$floor
 }
 
 $start = (Get-Floor) + 1
