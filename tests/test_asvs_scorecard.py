@@ -432,6 +432,38 @@ def test_a_closure_without_a_pinned_verdict_is_refused(tmp_path: Path) -> None:
         load_scorecard(sc)
 
 
+def test_a_closed_cell_is_rendered_even_when_its_verdict_is_not_an_open_state() -> None:
+    """The regression this exists for: a closure visible only while the verdict is open.
+
+    11.7.1 was closed while it was a `fail`, so its stop text surfaced in the open-cells table — then
+    the same ruling moved it to `na`, it dropped out of `open_states`, and the rendered record went
+    silent about the one cell that had just been ruled on. Closure visibility must not depend on which
+    verdict the cell happens to hold.
+    """
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by="owner",
+            )
+        ],
+        anchor_sha="x",
+    )
+    assert "Closed by owner decision" in out
+    assert "| 11.7.1 | L3 | **na** | 2026-08-02 | owner |" in out
+
+
+def test_the_closed_section_is_absent_when_no_cell_is_closed() -> None:
+    """Negative control on REACH: the heading must not appear for a scorecard with no closures."""
+    out = render_current([Cell(id="1.1.1", level=1, verdict="pass")], anchor_sha="x")
+    assert "Closed by owner decision" not in out
+
+
 def test_an_unclosed_cell_is_unaffected_by_the_closure_rule(tmp_path: Path) -> None:
     """Negative control on the rule's REACH: it must not police cells that never opted in."""
     sc = _scorecard_file(
