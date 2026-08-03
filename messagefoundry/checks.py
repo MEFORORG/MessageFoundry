@@ -47,6 +47,11 @@ heuristic reminder of the "never put PHI in an exception message" convention, ne
 So is ``accepts-candidate`` — an AST scan that flags a ``@handler`` opening with a guard-filter
 (``if <cond>: return []``), a filter that belongs in an ``accepts=`` router-stage predicate (ADR 0084)
 where it costs 0 transactions instead of 2; also advisory (prints, never blocks).
+So is ``alert-smtp-tls`` (#323 layer 3) — it reports whether the ``[alerts]`` SMTP hop AUTHENTICATES the
+relay, naming the trust anchor when it does and the acknowledgment state when it does not. Advisory
+because the **serve gate** is what refuses an unauthenticated alert hop on an enforcing PHI instance;
+this only makes the hop's posture readable in review. It states the secure case out loud rather than
+going quiet, so a passing line is never confused with a check that did not run.
 Exit-code policy lives in the CLI (``__main__._check``): 0 iff no required check failed.
 """
 
@@ -155,6 +160,13 @@ def run_checks(
         # ADR 0153: name every outbound that declares cleartext_accepted, so the accepted set is visible
         # in review rather than discoverable only by reading each connection. Advisory — see the check.
         _check_cleartext_accepted(config_dir),
+        # #323 layer 3: report whether the [alerts] SMTP hop authenticates the relay. The defect this
+        # closes was invisible for exactly as long as nothing reported it. Advisory — see the check.
+        _check_alert_smtp_tls(
+            config_dir,
+            service_config=service_config,
+            suppress_search=suppress_service_toml_search,
+        ),
     ]
     if run_lint:
         results.append(_run_tool("ruff", ["ruff", "check", str(config_dir)]))
@@ -1315,6 +1327,109 @@ def _check_build(
         ok=True,
         required=True,
         detail=f"connectors build against the {env_name or 'default'} posture",
+    )
+
+
+def _check_alert_smtp_tls(
+    config_dir: str | Path,
+    *,
+    service_config: str | Path | None = None,
+    suppress_search: bool = False,
+) -> CheckResult:
+    """Surface whether the ``[alerts]`` SMTP hop **authenticates the relay** (#323 layer 3).
+
+    That hop carries operator alert bodies, every per-user security-event email, and the SMTP AUTH
+    password. Before #323 it issued ``starttls()`` with no context, so it accepted any certificate —
+    encrypted, unauthenticated, and invisible: nothing in the product reported it, which is why the
+    defect survived in three docs that described the hop as verified. This check is the review surface
+    that makes the hop's posture readable without opening the code.
+
+    Advisory (``required=False``) for the same reason as ``cleartext-accepted``: a deliberate,
+    acknowledged deviation is a reasoned choice, not a config error, and the **serve gate** is what
+    refuses it on an enforcing PHI instance. Blocking here would duplicate that refusal at the wrong
+    altitude and punish a synthetic/dev instance where the deviation is legitimate.
+
+    States the SECURE case explicitly rather than going quiet — an absent line is indistinguishable
+    from a check that did not run.
+
+    Service-toml resolution is :func:`_check_posture`'s, verbatim; no ``messagefoundry.toml`` or
+    settings that will not load → SKIP (``validate``/``posture`` report those)."""
+    from pydantic import ValidationError
+
+    from messagefoundry.config.settings import load_settings
+
+    if service_config is not None:
+        toml: Path | None = Path(service_config) if Path(service_config).is_file() else None
+    elif suppress_search:
+        candidate = Path(config_dir) / "messagefoundry.toml"
+        toml = candidate if candidate.is_file() else None
+    else:
+        toml = _find_service_toml(config_dir)
+    if toml is None:
+        return CheckResult(
+            "alert-smtp-tls", ok=True, required=False, skipped=True, detail="no messagefoundry.toml"
+        )
+    try:
+        settings = load_settings(config_path=toml)
+    except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
+        return CheckResult(
+            "alert-smtp-tls",
+            ok=True,
+            required=False,
+            skipped=True,
+            detail=f"settings did not load: {exc}",
+        )
+    alerts = settings.alerts
+    if not (alerts.email_smtp_host and alerts.email_from):
+        return CheckResult(
+            "alert-smtp-tls",
+            ok=True,
+            required=False,
+            detail="no [alerts] SMTP transport configured — no hop to report",
+        )
+    acked = settings.security.allow_unverified_alert_smtp_tls
+    ack_note = (
+        " — acknowledged by [security].allow_unverified_alert_smtp_tls"
+        if acked
+        else " — NOT acknowledged; an enforcing PHI instance will REFUSE to start"
+    )
+    if not alerts.email_use_tls:
+        return CheckResult(
+            "alert-smtp-tls",
+            ok=True,
+            required=False,
+            detail=(
+                f"[alerts].email_use_tls=false — the SMTP hop to {alerts.email_smtp_host} is "
+                f"CLEARTEXT{ack_note}"
+            ),
+        )
+    if not alerts.email_tls_verify:
+        return CheckResult(
+            "alert-smtp-tls",
+            ok=True,
+            required=False,
+            detail=(
+                f"[alerts].email_tls_verify=false — the SMTP hop to {alerts.email_smtp_host} is "
+                f"encrypted but accepts ANY certificate{ack_note}"
+            ),
+        )
+    anchor = (
+        f"[alerts].email_tls_ca_file ({alerts.email_tls_ca_file})"
+        if alerts.email_tls_ca_file
+        else (
+            f"[tls].internal_ca_file ({settings.tls.internal_ca_file})"
+            if settings.tls.internal_ca_file
+            else "the OS trust store"
+        )
+    )
+    return CheckResult(
+        "alert-smtp-tls",
+        ok=True,
+        required=False,
+        detail=(
+            f"the [alerts] SMTP hop to {alerts.email_smtp_host} verifies the relay certificate "
+            f"against {anchor}"
+        ),
     )
 
 
