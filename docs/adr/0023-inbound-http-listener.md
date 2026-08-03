@@ -1,6 +1,6 @@
 # ADR 0023 — Inbound HTTP listener (a connector-owned SOAP/REST web-service source)
 
-- **Status:** Accepted (2026-06-27, built — first slice in 0.2.10; SOAP-reply/auth/routing-metadata deferred)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-06-27, built — first slice in 0.2.10). The deferred tail is now built: intake auth and the SOAP-envelope synchronous reply both shipped via [ADR 0154](0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md), which is the authority on their current state. **Routing-metadata remains deferred.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-06-27
 - **Related:** BACKLOG #7 (inbound web-service listener — this consumes the pre-Reserved README row) ·
   unblocks #20 (inbound FHIR server facade) and #24 (inbound DICOMweb STOW-RS receiver) ·

@@ -10,7 +10,7 @@ Build state at acceptance:
 
 | | |
 |---|---|
-| **Rung 1** — platform read-out, report-only | **Built.** `config/memory_encryption.py`; four `memory_encryption_self_reported_*` / `..._readout_source` fields on `GET /security/posture`, plus the in-body disclaimer `memory_encryption_note` (`ENGINE_UI_SEAM` 12 → 13). |
+| **Rung 1** — platform read-out, report-only | **Built.** `config/memory_encryption.py`; **seven** `memory_encryption*` fields on `GET /security/posture` — three `_self_reported_*`, plus `_readout_source`, `_operator_declared`, `_readout_contradicts_declaration`, and the in-body disclaimer `memory_encryption_note`. *(Corrected 2026-08-02: this row said "four", counting only the read-out fields and omitting the declaration, contradiction and note fields; [`api/models.py`](../../messagefoundry/api/models.py) makes the same 3+1 slip in its own comment. On the seam: `ENGINE_UI_SEAM` moved 12 → 13 for this work — release history, carried correctly in `CHANGELOG.md` — but this row is present-tense "Built.", so read as current state it was wrong; the seam is **16** today.)* |
 | **Rung 2** — operator declaration | **Built.** `[security].memory_encryption_operator_declared` (default `false`); an **exposed PHI** instance without it **warns at every start**, and refuses only when the estate opts in via `[security].require_memory_encryption_declaration` (default `false`) under `enforcement = enforce`. A contradiction is warned + reported as the tri-state `memory_encryption_readout_contradicts_declaration`, never refused. See the *2026-07-22 amendment* below for why the refusal is opt-in and why the field is not called "attested". |
 | **Rung 3** — cryptographic attestation | **Not built.** No quote acquisition, no signature verification, no vendor-chain handling. |
 | **Windows rung 3** | **Recorded infeasible in practice** — see *Windows rung 3 — spike conclusion* below. It is **platform-blocked, not API-blocked**. |
@@ -39,11 +39,18 @@ it because L3 is the stated target for a PHI system, not because the conventiona
 **Memory hygiene is not memory encryption, and OWASP has already ruled on that distinction.** During
 the 4.x→5.0 cull OWASP **deleted** 4.0.3's V8.3.6 (overwrite sensitive memory when no longer needed)
 as *"NOT PRACTICAL"* — and **kept** 11.7.1. So the zeroization/locking family is explicitly not what
-this requirement asks for. We already ship that family and it does not move this cell: `_secure_zero`
-over a `bytearray` via `ctypes.memset` ([`store/crypto.py:163`](../../messagefoundry/store/crypto.py)),
-`VirtualLock`/`mlock` residency ([`:185-199`](../../messagefoundry/store/crypto.py)), DEK zeroization
-after install ([`:314-325`](../../messagefoundry/store/crypto.py)) and plaintext zeroization
-([`:462`](../../messagefoundry/store/crypto.py)) all landed in #198.
+this requirement asks for. We already ship that family and it does not move this cell — all of it in
+[`store/crypto.py`](../../messagefoundry/store/crypto.py): `_secure_zero()` over a `bytearray` via
+`ctypes.memset`, `VirtualLock`/`mlock` residency in `_lock_memory()` / `_unlock_memory()`, DEK
+zeroization after install in `_install_key()`, and plaintext zeroization at the `_secure_zero(pt)`
+calls on the encrypt and decrypt paths. All landed in #198.
+
+*(Anchors corrected 2026-08-02, and the claim is unchanged — only the pointers were wrong. These were
+line citations: `:163`, `:185-199`, `:314-325`, `:462`. Every one had rotted, and the first two had
+come to point at **each other's** code — `:163` at prose inside `cell_aad()`'s docstring, `:185-199` at
+the body of `_secure_zero` rather than the residency helpers. Re-anchored by **symbol**: these render as
+markdown link text over a target carrying no line fragment, so the link always resolves and no link
+checker can catch this class. New line numbers would rot the same way at the next refactor.)*
 
 **CPython can protect keys but not message bodies, and that asymmetry is structural.** A DEK is small,
 short-lived, and we own the buffer — hence the work above. An HL7 message is not: it is `str` end to
@@ -258,6 +265,57 @@ sanction N/A with a recorded rationale, but its enumerated grounds are *absent f
 it". A prior assessment used exactly this rationale and the 2026-07-22 re-score overturned it. The
 argument may still be winnable, but it must survive adversarial review before being signed again, and
 it is strictly weaker than measuring the property.
+
+> ### ⛔ AMENDMENT 2026-08-02 — this option is now ADOPTED, and the paragraph above is why it took four tries
+>
+> **11.7.1 is `na`. Owner ruling, LOCKED as of 2026-08-02.** This paragraph is the strongest attack on
+> that ruling and it is answered here rather than left to be rediscovered — it is the record of one of
+> the four verdict moves, and the one that went the other way.
+>
+> **The paragraph's stated ground is FALSIFIED, and it was my claim too.** *"Its enumerated grounds are
+> absent functionality and external processes acting on the application"* is **not what ASVS says.**
+> Verbatim, `0x03-What-is-the-ASVS.md` at the `v5.0.0` tag:
+>
+> > "Conversely, ASVS generally excludes requirements that are not directly relevant to the application
+> > or **where configuration is outside the application's responsibility**. For example, DNS issues are
+> > typically managed by a separate team or function."
+>
+> That is a **responsibility/environment** exclusion — precisely the category this paragraph asserts the
+> standard does not provide. The error survived because the project's pinned ASVS corpus is
+> **requirements-only** and holds no chapter prose, so nobody checking against it could ever catch a
+> wrong claim about what the standard *says*. It was re-asserted independently by two later assessors,
+> including in a signed-adjacent register block, before being caught by fetching the chapter.
+>
+> **And the adopted ruling does not rest on the ground this paragraph rejects.** It is not *"the control
+> exists but the platform provides it"*. It is **rule 1 against a positively-declared scope**:
+> [`ASVS-ASSESSMENT-METHOD.md`](../ASVS-ASSESSMENT-METHOD.md) §2 declares the assessed subject as three
+> **software artifacts** — engine, web console, IDE extension, assessed as source. *"Full memory
+> encryption is in use"* names a CPU/firmware/hypervisor property, which is not among them, so rule 1
+> fires before rule 3 is reached. The rungs 1–2 objection is answered rather than dodged: that code
+> **reports on and gates against** the platform property; it never **provides** it.
+>
+> **The adversarial review this paragraph demanded has happened.** Two independent multi-agent research
+> runs with 3-vote refutation (25 claims verified, 12 killed in one; 8 confirmed of 25 in the other),
+> plus a second session that attacked the ruling directly and surfaced this very paragraph. What it
+> found: **no attestation on any platform asserts memory encryption as a property** — AWS Nitro carries
+> PCRs and is processor-agnostic hypervisor isolation; SEV-SNP's VCEK-signed measurement is *launch-time*
+> integrity. So *"strictly weaker than measuring the property"* assumed measuring was achievable. **It is
+> not, on any platform, today.**
+>
+> ⚠️ **What this does NOT buy, stated because the temptation is exactly here:** no Level 3 claim. ASVS
+> 4.0's *"may still claim full ASVS compliance"* clause was **dropped** in 5.0, and OWASP retains
+> normative authority over which requirements sit at which level. See
+> [`ASVS-ASSESSMENT-METHOD.md`](../ASVS-ASSESSMENT-METHOD.md) §2.1. The published attestation was
+> narrowed in the same change.
+>
+> **Also honest:** the fail count moved 3 → 2 with **zero engine code changed**. The posture did not
+> improve; the scope got stated (§2.2).
+>
+> **LOCKED.** The scorecard cell carries `decision_closed = true` with a pinned verdict, and
+> `scripts/asvs/scorecard.py` now **refuses to load** a closed cell whose verdict has moved off its pin.
+> Reopening takes an explicit owner instruction — not a sweep's judgement, and not a rediscovery of this
+> paragraph. **"Do nothing and carry the Fail"** below remains recorded, but is no longer the fallback:
+> it answers a question rule 1 says is never reached.
 
 **Rewrite the PHI path to `bytearray`/`memoryview` with explicit wiping.** Rejected. Architectural,
 defeated by CPython's copy semantics in the parse/transform path, and it produces memory *hygiene*

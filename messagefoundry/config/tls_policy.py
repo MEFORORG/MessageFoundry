@@ -62,6 +62,7 @@ __all__ = [
     "TrustAnchorMode",
     "TrustAnchorPolicy",
     "active_hop_posture",
+    "build_smtp_tls_context",
     "build_verifying_client_context",
     "cleartext_acceptance_audit_sink",
     "current_hop_posture",
@@ -919,3 +920,61 @@ def build_verifying_client_context(
         return ctx
     # pinned / per-connection: ONLY this CA (no load_default_certs), matching forward_tls_ca_file.
     return ssl.create_default_context(purpose, cafile=anchor.cafile)
+
+
+def build_smtp_tls_context(
+    *,
+    host: str,
+    cell: str,
+    verify: bool = True,
+    ca_file: str | None = None,
+    check_hostname: bool = True,
+    trust_anchor_policy: TrustAnchorPolicy | None = None,
+) -> ssl.SSLContext:
+    """Build the TLS context for an outbound SMTP hop (#323) — STARTTLS or implicit ``SMTP_SSL``.
+
+    ``smtplib`` accepts no context by default, and its fallback is
+    :func:`ssl._create_stdlib_context`, which **is** ``ssl._create_unverified_context`` — measured on
+    CPython 3.14.6: ``verify_mode=CERT_NONE``, ``check_hostname=False``. So every certificate was
+    accepted and the encrypted session was unauthenticated: an on-path attacker presenting any
+    certificate read the message body (PHI) and the SMTP AUTH credential. This is the SMTP sibling of
+    :func:`~messagefoundry.transports.remotefile._ftps_ssl_context` and the MLLP outbound arm, and is
+    deliberately built here rather than in ``transports/`` because ``pipeline/alert_sinks.py`` is a
+    third caller and a transport must not import ``pipeline/`` (ADR 0029's one-way rule).
+
+    ``verify=False`` is NOT gated here — the caller refuses it against the clamped
+    :func:`~messagefoundry.config.settings.weakened_tls_escape_permitted_here` first, matching how
+    MLLP/FTPS inline that check. This module cannot read it: ``config.settings`` imports *from* here,
+    so the dependency runs one way only.
+
+    ``trust_anchor_policy`` (#190, ADR 0093) supplies the instance ``[tls]`` internal-CA fallback when
+    the connection names no ``ca_file`` of its own. It only chooses WHICH roots verify the peer — it
+    never turns verification off.
+    """
+    if verify:
+        anchor = resolve_trust_anchor(
+            connection_ca_file=ca_file,
+            host=host,
+            policy=trust_anchor_policy if trust_anchor_policy is not None else TrustAnchorPolicy(),
+        )
+        ctx = build_verifying_client_context(anchor)
+    else:
+        ctx = ssl.create_default_context(ssl.Purpose.SERVER_AUTH, cafile=ca_file)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    if verify:
+        ctx.check_hostname = check_hostname
+    else:
+        logger.warning(
+            "%s TLS certificate verification is DISABLED (tls_verify=false) — the SMTP session to %s "
+            "is encrypted but UNAUTHENTICATED and MITM-able; trusted-network dev/test only.",
+            cell,
+            host,
+        )
+        # Order is load-bearing: check_hostname must go False BEFORE verify_mode, or ssl raises.
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    harden_kex_groups(ctx)  # pin approved ECDHE groups where supported (ASVS 11.6.2)
+    harden_cipher_suites(ctx, connector=cell)  # assert forward secrecy (ASVS 12.1.2)
+    if verify:  # nothing to strict-validate on the CERT_NONE path (ASVS 12.1.4)
+        harden_verify_flags(ctx)
+    return ctx

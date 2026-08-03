@@ -58,7 +58,7 @@ async def _open_sqlserver() -> Any:
     store = await SqlServerStore.open(load_settings(environ=os.environ).store)
     async with store._pool.acquire() as conn:
         cur = await conn.cursor()
-        for table in ("message_events", "state", "queue", "response", "outbox", "messages"):
+        for table in ("message_events", "state", "queue", "response", "messages"):
             await cur.execute(f"DELETE FROM {table}")
         await conn.commit()
     return store

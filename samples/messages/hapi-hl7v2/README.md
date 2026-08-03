@@ -12,8 +12,43 @@ test fixtures, for exercising MessageFoundry parsing/routing (e.g. feeding throu
   source linked into the engine — using them to drive tests is unaffected by the license.
   If any file is ever modified, MPL-2.0 requires that file to carry its source notice.
 
-Files are copied **verbatim** (bytes unchanged) from the upstream paths below; the
-`hapi-osgi-test` tree carries byte-identical duplicates of several of these and was skipped.
+All files except `batch_18_messages.txt` are copied **verbatim** (bytes unchanged) from the
+upstream paths below; the `hapi-osgi-test` tree carries byte-identical duplicates of several of
+these and was skipped.
+
+### `batch_18_messages.txt` is MODIFIED — de-identified, not verbatim
+
+> **Source notice (MPL-2.0 §3.3).** This file is a **modified** copy of
+> `hapi-test/.../ca/uhn/hl7v2/util/messages.txt` from
+> https://github.com/hapifhir/hapi-hl7v2 at commit `de1503651040`, licensed MPL-2.0.
+> The modification is de-identification only, described below.
+
+Upstream this file carries patient demographics — names, dates of birth, street addresses,
+telephone numbers, medical-record numbers and valid-format SSNs — whose internal consistency
+(SSN area numbers agreeing with state of residence, real locality phone prefixes, named
+institutions) is not what a placeholder generator produces. Whatever its true provenance,
+shipping it unchanged is incompatible with this project's synthetic-data-only rule
+([`CLAUDE.md`](../../../CLAUDE.md) §9), so every identifier was replaced.
+
+**How.** Scrubbed with the project's own de-identification framework
+([`messagefoundry/anon/`](../../../messagefoundry/anon/), ADR 0030) — the same deterministic,
+salt-keyed surrogate machinery the tee relay and test harness use — over `DEFAULT_RULES` plus a
+rule overlay for the fields this corpus uses that the default map does not cover: `GT1-8/16/17/18`,
+`IN1-4/5/6/7/11/18/44`, `OBR-35`, and the non-standard `DST` segment (`DST-2/7/9/27/35`), which
+mirrors `IN1` at a shifted offset. **No ad-hoc redaction logic was written** (§9: centralize the
+rules, don't reimplement beside the framework). The salt is not recorded — these surrogates are
+final, not reversible, and the file is not intended to be re-derived.
+
+**What was deliberately preserved**, because it is what the corpus is *for* — 18 messages, 133
+lines, every segment in its original order with unchanged field counts, CRLF line endings, the
+`//` and `/* */` comments, `""` null markers, `~~` repetitions, the OBX narrative text, the
+`ORU`/`BAR`/`ACK`/`ORM`/`QRY` mix and the HL7 2.1–2.4 version spread. Both unusual MSH-2 encoding
+sequences survive intact, including the 3-character `MSH|^~}|` that no conformant parser accepts
+— it is a tolerant-parsing test case, and the anonymizer (correctly) refuses such a message, so
+MSH-2 was repaired for the scrub and the malformation restored afterward.
+
+Routing/coded fields are untouched, so message type, trigger and version-based routing behave
+exactly as before. Only identifier *values* changed.
 
 ## Manifest
 

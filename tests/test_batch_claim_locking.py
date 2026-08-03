@@ -88,7 +88,6 @@ async def ss_store() -> AsyncIterator[Any]:
             "queue",
             "response",
             "delivered_keys",
-            "outbox",
             "messages",
         ):
             await cur.execute(f"DELETE FROM {table}")

@@ -6,9 +6,12 @@
 once race ``.git/config.lock`` -- reproduced on Windows as "could not lock config file", leaving
 orphaned branches behind. ``new.ps1`` now serializes that call through this lock.
 
-The load-bearing test is ``test_only_one_of_eight_concurrent_claimants_wins``: it launches eight real
-processes at once and asserts exactly one acquires. Anything less than genuine concurrency would pass
-against a lock that does not lock at all -- which is the failure mode this file exists to exclude.
+The load-bearing test is ``test_eight_concurrent_claimants_never_hold_it_at_once``: it launches eight
+real processes at once and asserts that no two are ever inside the critical section together, via a
+CreateNew sentinel taken under the lock. Counting winners instead would test the scheduler -- a
+straggler that arrives after the winner released wins legitimately, which is what made the earlier
+form fail under CI load. Anything less than genuine concurrency would pass against a lock that does
+not lock at all -- which is the failure mode this file exists to exclude.
 The number is not arbitrary: a read-modify-write in this same codebase was measured silently losing 4
 of 8 concurrent PowerShell writes, so eight is the shape already known to break the naive approach.
 """
@@ -18,6 +21,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -49,14 +53,55 @@ def repo(tmp_path: Path) -> Path:
 
 
 def acquire(
-    repo: Path, *, name: str = "t", timeout: int = 2, hold_ms: int = 0
+    repo: Path,
+    *,
+    name: str = "t",
+    timeout: int = 2,
+    hold_ms: int = 0,
+    barrier: Path | None = None,
+    witness: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Take the lock, optionally hold it, release. Prints ACQUIRED on success."""
+    """Take the lock, optionally hold it, release. Prints ACQUIRED on success.
+
+    ``barrier`` makes concurrency REAL rather than assumed. Without it a claimant races for the lock
+    the moment *its own* ``pwsh`` has booted, and cold-start times vary by far more than any
+    reasonable hold: a straggler that arrives after the winner has already released then wins
+    legitimately, and the caller sees two winners against a lock that never misbehaved. With it, the
+    claimant signals readiness *after* start-up and waits for the go file, so pwsh cold-start time is
+    excluded from the race. It does NOT cover Enter-CoordLock's own prologue: the ``git rev-parse``
+    spawn at lock.ps1:47 runs after the gate and before the deadline is set at lock.ps1:56, and under
+    CPU load that alone spread the cohort's deadline start by 645-2134 ms. ``witness`` is what makes
+    the test sound despite that -- see the test below.
+    """
+    gate = ""
+    if barrier is not None:
+        gate = (
+            f"[IO.File]::WriteAllText((Join-Path '{barrier}' \"ready-$PID\"), ''); "
+            f"$bd = (Get-Date).AddSeconds(120); "
+            f"while (-not (Test-Path (Join-Path '{barrier}' 'go'))) {{ "
+            f"if ((Get-Date) -gt $bd) {{ throw 'barrier timeout' }}; "
+            f"Start-Sleep -Milliseconds 10 }}; "
+        )
+    enter = leave = ""
+    if witness is not None:
+        # Asserts the invariant the mutex actually PROMISES -- that two claimants are never inside the
+        # critical section at once -- with no reference to a clock. CreateNew is the same atomic
+        # test-and-set the lock itself uses, so a second simultaneous holder throws. NB: at this
+        # hold/timeout ratio no second LEGITIMATE acquirer exists within a round, so "sentinel already
+        # exists" can only mean overlap; lowering hold_ms re-arms a false positive in this bare catch.
+        enter = (
+            f"try {{ $w = [IO.File]::Open('{witness}', 'CreateNew', 'Write', 'None') }} "
+            f"catch {{ Write-Error 'MUTEX-VIOLATED'; exit 9 }}; "
+        )
+        leave = f"$w.Dispose(); Remove-Item -LiteralPath '{witness}' -Force; "
     script = (
         f". '{LOCK}'; "
+        f"{gate}"
         f"$l = Enter-CoordLock -Name '{name}' -TimeoutSeconds {timeout} -Repo '{repo}'; "
+        f"{enter}"
         f"Write-Output 'ACQUIRED'; "
         f"Start-Sleep -Milliseconds {hold_ms}; "
+        f"{leave}"
         f"Exit-CoordLock $l"
     )
     return subprocess.run(
@@ -76,15 +121,57 @@ def test_lock_can_be_taken_and_released(repo: Path) -> None:
     assert "ACQUIRED" in second.stdout, second.stderr
 
 
-def test_only_one_of_eight_concurrent_claimants_wins(repo: Path) -> None:
-    """Eight real processes, one lock, a hold long enough that the overlap is genuine."""
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        results = list(pool.map(lambda _: acquire(repo, timeout=1, hold_ms=1500), range(8)))
+def test_eight_concurrent_claimants_never_hold_it_at_once(repo: Path, tmp_path: Path) -> None:
+    """Eight real processes, one lock, all reaching for it at the same instant.
 
+    Asserts OCCUPANCY, not winner count. The barrier releases the cohort together, but each process
+    then runs Enter-CoordLock's own prologue (a ``git rev-parse`` spawn, lock.ps1:47) before its deadline
+    is set (lock.ps1:56), and nothing synchronizes that. A winner-count assertion tolerates only
+    (hold - timeout) of that skew; under CPU load the skew was measured at 645-2134 ms, so counting
+    winners tests the scheduler, not the mutex. Measured directly: in five multi-winner rounds the hold
+    intervals were strictly DISJOINT -- the extra winners acquired legitimately, after release.
+
+    The witness sentinel is what makes this sound. hold_ms is sized so that a lock which did not lock
+    would put all eight inside the critical section together and trip it; the margin over the measured
+    skew is (hold - timeout) = 7 s, ~3.3x. Validated both ways per the project's make-it-fail-first
+    rule: with Enter-CoordLock stubbed to a no-op it FAILS 3/3 (7 violations each); against the real
+    lock it PASSES 8/8 at 40 CPU burners -- the exact load at which the old assertion failed 8/12.
+    Cost: the winner now holds for 8 s, so this test's floor wall-time is ~8-9 s on every run.
+    """
+    barrier = tmp_path / "barrier"
+    barrier.mkdir()
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        claims = [
+            pool.submit(
+                acquire,
+                repo,
+                timeout=1,
+                hold_ms=8000,
+                barrier=barrier,
+                witness=tmp_path / "holder.sentinel",
+            )
+            for _ in range(8)
+        ]
+        deadline = time.monotonic() + 120
+        while len(list(barrier.glob("ready-*"))) < 8:
+            assert time.monotonic() < deadline, (
+                f"only {len(list(barrier.glob('ready-*')))} of 8 claimants reached the barrier"
+            )
+            time.sleep(0.02)
+        (barrier / "go").write_text("", encoding="utf-8")
+        results = [c.result() for c in claims]
+
+    violations = [r for r in results if "MUTEX-VIOLATED" in r.stderr]
+    assert not violations, f"{len(violations)} claimants held the lock simultaneously"
     winners = [r for r in results if "ACQUIRED" in r.stdout]
-    assert len(winners) == 1, f"expected exactly 1 winner, got {len(winners)}"
+    assert winners, "nobody acquired -- the lock is wedged"
     # Everyone else must FAIL, not silently proceed. Silent success is the bug.
-    assert all("Timed out" in r.stderr for r in results if "ACQUIRED" not in r.stdout)
+    assert all(
+        "Timed out" in r.stderr
+        for r in results
+        if "ACQUIRED" not in r.stdout and "MUTEX-VIOLATED" not in r.stderr
+    )
 
 
 def test_timeout_refuses_to_steal_and_names_the_holder(repo: Path) -> None:

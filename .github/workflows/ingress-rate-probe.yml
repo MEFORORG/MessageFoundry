@@ -1,0 +1,105 @@
+# Measure the MLLP ingress service rate of each hosted runner SKU (#320).
+#
+# WHY THIS EXISTS. `test_load_runner::test_run_load_end_to_end_no_loss` red the required windows-2025
+# leg twice on `main` (9b03057f, 56f7d240) with byte-identical counters — 90 sent, 44 acked, 46
+# stranded, 52 read — on runs that lost nothing. #115 widened the reconcile's stranding budget so a
+# saturated-but-lossless run stops failing, which fixes the symptom and tells you nothing about the
+# cause. The open question is whether the windows-2025 IMAGE is slow or windows generally is, and a
+# pass/fail test at one fixed rate structurally cannot answer it. This sweeps the rate and reports the
+# stranded fraction on each SKU, side by side.
+#
+# WHAT IT CANNOT ANSWER. Both legs here are GitHub-hosted VMs. If 2025 is slow and 2022 is not, that
+# narrows the cause to the 2025 image — it does NOT convict Windows Server 2025 as a deployment
+# target, because a hosted image can be slow for reasons a deployed server is not (Defender policy,
+# VM disk backing, noisy neighbours). Only the self-hosted WS2025 rig can settle that, and it was
+# unregistered (`actions/runners` → total_count 0) when this was written. See BACKLOG #320.
+#
+# DELIBERATELY workflow_dispatch ONLY, and deliberately NOT a required context. It has no
+# `pull_request` trigger, so it can never report on a PR and can never become the required-but-absent
+# trap; it is listed in `.github/required-contexts.txt` alongside the other advisory workflows. It also
+# ASSERTS NOTHING — the probe exits 0 even when the reconcile fails, because a machine too slow to keep
+# up is the finding, not an error. A number that moves with runner weather must never gate a merge.
+#
+# REPEATS ARE NOT OPTIONAL. A single run proves nothing: one 600/s run on a developer box produced
+# 50.7% stranding and four repeats of the same command produced 0%, the difference being an unrelated
+# test suite running concurrently. Default 3 repeats per rate; read the spread, not any one row.
+name: ingress rate probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      rates:
+        description: "Comma-separated offered rates in msg/s (the CI load smoke offers 60)"
+        default: "60,150,300,600"
+        type: string
+      repeat:
+        description: "Runs per rate. Never conclude from 1 — see the header."
+        default: "3"
+        type: string
+
+# Read-only: this builds nothing, publishes nothing, and touches no secret.
+permissions:
+  contents: read
+
+concurrency:
+  # A rate measurement taken while a second copy of itself is running measures the contention, not the
+  # runner. Queue, never cancel — a half-finished sweep is worse than a late one.
+  group: ingress-rate-probe
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    name: ingress rate (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false # one slow SKU must not cancel the comparison it exists to provide
+      matrix:
+        # ubuntu is the CONTROL, not a deployment target: it is the fastest leg and establishes what
+        # "not saturated" looks like on hosted hardware, so a slow Windows row can be read against it.
+        os: [ubuntu-latest, windows-2022, windows-2025]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+
+      - name: Set up Python 3.14
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+
+      - name: Install project (dev extras only — the probe needs the engine and the harness)
+        run: uv pip install --system --constraint constraints.lock -e ".[dev]"
+
+      - name: Sweep
+        shell: bash
+        env:
+          # Hoisted, never interpolated into the script body (zizmor: template injection).
+          RATES: ${{ inputs.rates }}
+          REPEAT: ${{ inputs.repeat }}
+          OS_LABEL: ${{ matrix.os }}
+        run: |
+          set -uo pipefail   # NOT -e: a probe that cannot start must not lose the rows already taken
+          echo "## ingress rate probe — $OS_LABEL" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| offered | sent | acked | stranded | % | engine_read | reconcile ok |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|---|---|---|---|---|---|---|" >> "$GITHUB_STEP_SUMMARY"
+          IFS=',' read -ra RATE_LIST <<< "$RATES"
+          for rate in "${RATE_LIST[@]}"; do
+            rate="$(echo "$rate" | tr -d '[:space:]')"
+            [ -n "$rate" ] || continue
+            echo "::group::rate ${rate}/s x ${REPEAT}"
+            python -m harness.load.ingress_probe "$rate" --repeat "$REPEAT" 2>&1 | tee /tmp/probe.out
+            echo "::endgroup::"
+            grep '^RESULT' /tmp/probe.out | while read -r line; do
+              # Parse the k=v pairs the probe emits; missing keys render as "?" rather than breaking.
+              eval "$(echo "$line" | tr ' ' '\n' | grep '=' | sed 's/^/P_/')" 2>/dev/null || true
+              echo "| ${P_rate:-?}/s | ${P_sent:-?} | ${P_acked:-?} | ${P_stranded:-?} | ${P_pct:-?}% | ${P_read:-?} | ${P_ok:-?} |" >> "$GITHUB_STEP_SUMMARY"
+              unset P_rate P_sent P_acked P_stranded P_pct P_read P_ok
+            done
+          done
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "_Repeats per rate: ${REPEAT}. Read the spread — a single row is not a measurement (BACKLOG #320)._" >> "$GITHUB_STEP_SUMMARY"

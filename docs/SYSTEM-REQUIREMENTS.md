@@ -47,9 +47,12 @@ only the host can. On a host that does not provide it:
 
 - the engine **still runs** — nothing here is a functional requirement, and every other PHI control
   (at-rest encryption, retention, audit, RBAC, transport) is unaffected;
-- ASVS 11.7.1 is capped at **Partial**, not Pass, and that cap is a **hardware fact about your
-  deployment**, not a gap in the software. Disclose it in your own assessment rather than working
-  around it;
+- ASVS 11.7.1 concerns a **host property**, not a software one — full memory encryption is provided by
+  the CPU, firmware and hypervisor. **Assess and disclose it against your own deployment**, on your own
+  evidence, rather than working around it. *(Corrected 2026-08-02: this previously told you to
+  "disclose 11.7.1 as **Partial**". That was wrong twice over — it put a specific verdict in your
+  assessment that you had not reached, and this project no longer holds that verdict either. What
+  verdict your deployment warrants is yours to determine; nothing here should pre-fill it.)*
 - an **exposed** PHI instance **warns at every start** until the decision is recorded —
   `[security].memory_encryption_operator_declared = true` is the operator's declaration that the host
   provides it. The engine **starts either way**: this is a host property, not a config error, and one no

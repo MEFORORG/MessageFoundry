@@ -5,7 +5,7 @@
 # This is a GOLDEN gate: any diff means the seam contract changed - see the test's failure hint.
 
 ## ENGINE_UI_SEAM
-16
+17
 
 ## dataclass messagefoundry.api._ui_seam.UiDeps
 engine_seam
@@ -16,6 +16,10 @@ default_scan_limit
 core
 admin
 oidc_enabled
+organization_domains
+external_link_interstitial
+external_link_allowlist
+oidc_authorization_host
 
 ## dataclass messagefoundry.api._ui_seam.CoreHandlers
 list_connections
