@@ -364,7 +364,16 @@ The project maintains a current evidence set so any claim is backed:
 - **Per-project applicability profile** (Appendix A and onward).
 - A **claims register** recording each published claim, its wording, and the evidence behind it.
 
-**Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, verified against OWASP ASVS 5.0 Level 3, and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and the ASVS 5.0 Level 3 assessment raises the weight of these claims. **Attestations are published with releases** so adopters can rely on them; each adopter still performs its own deployment risk assessment (§7.3). None of these is a NIST certificate; displayable certificates (SOC 2, ISO 27001, HITRUST) are a separate, organization-level track.
+**Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, **assessed against** OWASP ASVS 5.0 **using Level 3 as the target** — an assessment **in progress**, not a completed verification — and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and of the ASVS assessment raises the weight of these claims.
+
+> **The ASVS wording above changed on 2026-08-02, and the previous wording was wrong.** It read *"verified against OWASP ASVS 5.0 Level 3."* Three facts make that unsupportable, and they are stated here rather than quietly corrected because the claim was **published**:
+> 1. **The survey is incomplete.** A minority of the 345 requirements have been read against the ASVS text at a known commit; the remainder are recorded as *unverified*, which is explicitly **not** a pass. "Verified" asserted a completed verification that had not occurred.
+> 2. **Open requirements exist**, including at Level 2 — so the claim was not rescuable by narrowing it to a lower level.
+> 3. **At least one Level 3 requirement is scoped out** as a hosting-platform property outside the assessed software. Under ASVS 5.0 that does **not** preserve a Level 3 claim: 4.0's "may still claim full ASVS compliance" clause was **dropped** in 5.0, and OWASP retains normative authority over which requirements sit at which level. A Level 3 claim omitting a Level 3 requirement is non-conformant on OWASP's own terms.
+>
+> **No accredited Level 3 pathway exists to appeal to.** OWASP certifies no vendor or software and states that any trust mark claiming ASVS compliance is not officially endorsed by it; the one ASVS-based accreditation scheme accredits testing *firms*, and its published scope is Levels 1–2. So "self-attested" is the only honest register available here, and this section now uses it.
+>
+> Current status is held in the project's private assessment record, which is the count of record; **no figure is restated here**, deliberately, so this page cannot go stale against it. **Attestations are published with releases** so adopters can rely on them; each adopter still performs its own deployment risk assessment (§7.3). None of these is a NIST certificate; displayable certificates (SOC 2, ISO 27001, HITRUST) are a separate, organization-level track.
 
 ---
 
