@@ -8509,6 +8509,37 @@ The three surfaces now share **one** liveness helper, because they had been disa
 
 ---
 
+## 353. Gate the risk-acceptance register against the scorecard: nothing compares its cell lists to the record
+
+> 🚧 **Status OPEN (filed 2026-08-02).** The ASVS risk-acceptance register is **ungated prose**. No CI check has ever compared the cell ids in its signed sign-off blocks against the verdict of record, and a manual cross-check found the lists had drifted substantially with **zero** alarm.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** file now, build on owner green-light. **Severity:** medium-high — the artifact that records *accepted risk* can disagree with the artifact that records *what the risks are*, indefinitely and silently.
+
+**The finding that motivates it.** Asked to fix one sign-off block, a cross-check of **all eight** against `asvs-scorecard.toml` returned **29 entries that are not carried residuals**, in three classes:
+
+| Class | Count | Why it is wrong |
+|---|---:|---|
+| `unverified` | 22 | ⛔ **A signed acceptance of a risk that was never assessed.** The cell has never been read against the ASVS requirement text at any commit. Present in **every one of the eight blocks**. |
+| `na` | 3 | Out of declared scope — there is no residual to carry. |
+| `pass` | 4 | The cell passes — there is no residual to accept. |
+
+⚠️ **Those counts are ONE measurement by ONE session and are not independently confirmed.** They should not be load-bearing for any decision until a second implementation reproduces them — **which is exactly what this gate would be.** Treat the number as the reason to build the check, never as an established fact. *(Caveat raised by the coordinator session, and it is the right one.)*
+
+**What the check is.** Roughly fifteen lines, stdlib only: `tomllib`-load the scorecard, regex the register's sign-off table rows, and for every cell id in every block compare against the record. Fail on `unverified`, `na` or `pass` appearing in an acceptance list. It needs no new dependency and runs in milliseconds.
+
+**Design notes, because a gate written carelessly here would be worse than none:**
+
+- **Print what it scanned.** Block count, row count, ids-per-block. A gate that finds nothing because its regex stopped matching the table is indistinguishable from a clean one — that failure mode has already fired twice on this project.
+- **Prove it can go red before trusting a green.** Plant a known-bad id in a fixture and assert the check rejects it, and plant a clean fixture and assert it passes. Both directions, or the check is measuring nothing.
+- **Do not auto-correct.** The gate must **report**, never rewrite. The cell lists sit inside *signed* acceptances, and silently editing signed content to satisfy a checker is a worse defect than the drift it fixes.
+- **The register lives in the vault**, so this belongs with the existing `asvs-scorecard.yml` workflow rather than in the public engine repo.
+
+**⛔ Not to be built without the owner's go-ahead.** A new security-doc gate can block merges, and that is the owner's decision like any other enforcing control. This item exists so the finding is durable, not to authorise the build.
+
+**Related:** ADR 0156 (scorecard as data — the record this would check against); the §2 banner in the register recording the same finding; and the standing question this does **not** answer, which is the owner's alone: *what the 2026-07-14 signature actually covered*, given 22 of its ids had never been examined on that date either.
+
+---
+
 ## 352. Consult on enterprise AV coverage for SFTP- and file-connector ingest from outside the domain (ASVS 5.4.3 premise check)
 
 > 🚧 **Status OPEN (filed 2026-08-02).** ASVS **5.4.3** was recorded `na` on 2026-08-02 on the ground that antivirus scanning is an **enterprise-provided** control. This item exists to *test that premise* against the one ingest path most likely to fall outside it, rather than assume it.
