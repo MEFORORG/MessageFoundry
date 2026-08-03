@@ -1465,7 +1465,9 @@ def _serve(args: argparse.Namespace) -> int:
     # cleartext-hop list. That is not a silent subset: every ADR 0153 acceptance is reported moments
     # later — per connection, with its reason — by the construction gate's own loud WARN + audit record,
     # and completely by `messagefoundry check` and GET /security/posture, which both have the graph.
-    _loosenings = security_loosenings(settings.security, settings.store, settings.auth, ())
+    _loosenings = security_loosenings(
+        settings.security, settings.store, settings.auth, settings.alerts, ()
+    )
     if _loosenings:
         _seclog = logging.getLogger(__name__)
         _seclog.warning(
@@ -2035,45 +2037,97 @@ def _serve(args: argparse.Namespace) -> int:
         # default threads through to the RetentionRunner (no forbidden-file edit).
         # messages_days moved to [security].delete_message_bodies_after_days (ADR 0118);
         # dead_letter_days stays [retention] plumbing — label each window at its real home.
-        _RETENTION_WINDOW_LABEL = {
-            "messages_days": "[security].delete_message_bodies_after_days",
-            "dead_letter_days": "[retention].dead_letter_days",
-        }
-        if not enforcing and not settings.retention.allow_unbounded_phi:
-            auto_bounded = [
-                field
-                for field in ("messages_days", "dead_letter_days")
-                if field not in settings.retention.model_fields_set
+        # ASVS 14.2.7: the tier list is GENERATED from the classification in
+        # config/retention_classification.py, which a drift test holds equal — in both directions — to
+        # docs/PHI.md §2's Retention column. It used to be a two-element literal here, and the cell
+        # broke once because a new PHI tier landed and nobody widened it. A wider literal with no
+        # binding to the classification is the same defect with more characters.
+        from messagefoundry.config.retention_classification import (
+            MIN_PHI_RETENTION_WINDOWS,
+            PHI_RETENTION_WINDOWS,
+            auto_bounded_windows,
+        )
+        from messagefoundry.config.retention_classification import (
+            unbounded_windows as _unbounded_windows,
+        )
+
+        # A FLOOR, not an emptiness check. `if not PHI_RETENTION_WINDOWS` passes for a one-element
+        # tuple, so a bad merge dropping most entries would leave this gate checking one window while
+        # reporting success — the precise shape of failure this whole change set exists to remove.
+        if len(PHI_RETENTION_WINDOWS) < MIN_PHI_RETENTION_WINDOWS:
+            print(
+                f"error: the PHI retention classification has shrunk to "
+                f"{len(PHI_RETENTION_WINDOWS)} windows (floor {MIN_PHI_RETENTION_WINDOWS}); refusing "
+                "to start rather than gate on a partial classification. This is a build defect, not a "
+                "configuration one — see messagefoundry/config/retention_classification.py.",
+                file=sys.stderr,
+            )
+            return 2
+
+        # AUTO-BOUND. Owner ruling 2026-07-30: the three PHI-BODY windows default to 30 days when
+        # UNSET, on BOTH dials — previously this ran only when `not enforcing`, so on the shipped
+        # `enforce` posture an unset window took the refusal below instead of a default.
+        #
+        # THE SAFETY TRADE IS DELIBERATE AND WORTH STATING: a production PHI instance with an unset
+        # window used to REFUSE TO START, which forced an operator to choose a number. It now starts
+        # with 30. What survives is the fail-closed path for an EXPLICIT 0 — choosing keep-forever is
+        # still refused unless the audited opt-out is set. So "unbounded by accident" is still
+        # prevented; "unbounded by inattention" becomes "30 days by inattention".
+        #
+        # The warn-only windows are NOT auto-bounded, and that is also a ruling rather than an
+        # omission: `purge_state` and `purge_search_presets` key on timestamps that only move on a
+        # WRITE, so silently bounding them deletes live operational data a Handler is still reading.
+        if not settings.retention.allow_unbounded_phi:
+            defaulted = [
+                w
+                for w in auto_bounded_windows()
+                if w.field not in getattr(settings, w.reads_from.strip("[]")).model_fields_set
             ]
-            for field in auto_bounded:
-                setattr(settings.retention, field, 30)
-            if auto_bounded:
-                auto_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in auto_bounded)
+            for window in defaulted:
+                setattr(
+                    getattr(settings, window.reads_from.strip("[]")),
+                    window.field,
+                    window.auto_bound_days,
+                )
+            if defaulted:
                 print(
-                    f"info: {auto_desc} defaulted ON (30 days) for a PHI instance ({env_name!r}) — "
-                    "PHI message bodies are now bounded at rest (secure-by-default, ASVS 14.2.7). Set an "
-                    "explicit [retention] window to override, or [security].allow_keeping_phi_indefinitely=true to "
-                    "retain indefinitely.",
+                    f"info: {', '.join(w.setting for w in defaulted)} defaulted ON (30 days) for a PHI "
+                    f"instance ({env_name!r}) — these PHI tiers are now bounded at rest "
+                    "(secure-by-default, ASVS 14.2.7). Set an explicit window to override, or "
+                    "[security].allow_keeping_phi_indefinitely=true to retain indefinitely.",
                     file=sys.stderr,
                 )
-        unbounded_windows = [
-            field
-            for field, days in (
-                ("messages_days", settings.retention.messages_days),
-                ("dead_letter_days", settings.retention.dead_letter_days),
+
+        # REFUSE / WARN. `unbounded_windows` skips the tiers where 0 does not mean unbounded
+        # (`connection_event_retention_hours` INHERITS the body window; `uploads_retention_days` has a
+        # ge=1 floor so 0 is unrepresentable) and those whose `requires_setting` is unmet — with no
+        # [logging].log_dir there is nothing for the app-log sweep to sweep.
+        still_unbounded = _unbounded_windows(settings)
+        refusable = [w for w in still_unbounded if w.auto_bound_days is not None]
+        warn_only = [w for w in still_unbounded if w.auto_bound_days is None]
+
+        if warn_only:
+            # Classified and warned, never refused. Naming the tier AND its protection level is the
+            # point: an operator who sees "PL-1" knows a full body is involved.
+            print(
+                "warning: these classified PHI tiers have no retention window on a PHI instance "
+                f"({env_name!r}) and will accumulate without bound: "
+                + ", ".join(f"{w.setting} ({w.level})" for w in warn_only)
+                + ". They are deliberately NOT defaulted — each keys on a timestamp that only moves on "
+                "a write, so a silent default would delete data still in use (ASVS 14.2.7).",
+                file=sys.stderr,
             )
-            if days <= 0
-        ]
-        if unbounded_windows:
-            windows_desc = ", ".join(_RETENTION_WINDOW_LABEL[field] for field in unbounded_windows)
+
+        if refusable:
+            windows_desc = ", ".join(w.setting for w in refusable)
             if not settings.retention.allow_unbounded_phi:
                 if enforcing:
                     print(
-                        f"error: no data-retention window is configured for {windows_desc} on a "
-                        f"{'production ' if production else ''}PHI instance ({env_name!r}); refusing to "
-                        "start — PHI message bodies would be retained indefinitely (unbounded PHI at "
-                        "rest, ASVS 14.2.4). Set the window(s) to a positive number of days (e.g. 30) to "
-                        "bound PHI at rest; or, to deliberately retain forever, set "
+                        f"error: a data-retention window is explicitly disabled for {windows_desc} on "
+                        f"a {'production ' if production else ''}PHI instance ({env_name!r}); refusing "
+                        "to start — PHI message bodies would be retained indefinitely (unbounded PHI "
+                        "at rest, ASVS 14.2.4/14.2.7). Set the window(s) to a positive number of days "
+                        "(e.g. 30); or, to deliberately retain forever, set "
                         "[security].allow_keeping_phi_indefinitely=true (audited).",
                         file=sys.stderr,
                     )
@@ -2164,6 +2218,70 @@ def _serve(args: argparse.Namespace) -> int:
                     file=sys.stderr,
                 )
 
+    # --- #323 layer 3: the alerts / security-event SMTP hop must AUTHENTICATE the relay -------------
+    # The [alerts] SMTP transport carries operator alert bodies and every per-user security-event email
+    # (lockout, password/email/roles change, new-IP admin action) — and the SMTP AUTH password. Before
+    # #323 that hop called starttls() with NO context, so smtplib's fallback (ssl._create_stdlib_context,
+    # which IS _create_unverified_context) accepted ANY certificate: encrypted, unauthenticated, and an
+    # on-path attacker read all of it. The connectors (EMAIL/DIRECT, layers 1-2) key their refusal on the
+    # CLAMPED weakened_tls_escape_permitted_here(), but that mechanism is INERT here — this notifier is
+    # built in the API lifespan, outside build_check_registry's active_hop_posture scope, so
+    # current_hop_posture() is None and the clamp degrades to the unclamped escape. Hence an explicit
+    # acknowledgment switch at this gate instead, in the shape of the keyless-PHI second ack (ADR 0140).
+    #
+    # IT COVERS BOTH UNAUTHENTICATED SHAPES, DELIBERATELY. email_use_tls=false (no TLS at all) is
+    # strictly worse than email_tls_verify=false (TLS that authenticates nothing), and it was previously
+    # ungated. A gate that refused only the second would hand an operator a bypass that lands them on
+    # the WORSE posture — so the condition is "this hop does not authenticate the relay", which is true
+    # of both. Strictly ADDS refusals (ADR 0092 decision 5); byte-identical on the shipped defaults,
+    # which verify.
+    #
+    # Gated on a CONFIGURED transport: with no email_smtp_host/email_from there is no hop to protect,
+    # and the #188 gate above already owns the "no channel at all" case.
+    if (
+        data_class is DataClass.PHI
+        and settings.alerts.email_smtp_host
+        and settings.alerts.email_from
+    ):
+        if not settings.alerts.email_use_tls:
+            hop_desc = "[alerts].email_use_tls=false (the SMTP hop is CLEARTEXT)"
+        elif not settings.alerts.email_tls_verify:
+            hop_desc = "[alerts].email_tls_verify=false (the SMTP hop verifies no certificate)"
+        else:
+            hop_desc = ""
+        if hop_desc:
+            if enforcing and not settings.security.allow_unverified_alert_smtp_tls:
+                print(
+                    f"error: {hop_desc} on a {'production ' if production else ''}PHI instance "
+                    f"({env_name!r}); refusing to start — operator alert bodies, every per-user "
+                    "security-event email, and the SMTP AUTH password would cross a hop that does not "
+                    "authenticate the relay, so an on-path attacker can read them. Remove the override "
+                    "(the default verifies), or point [alerts].email_tls_ca_file / [tls].internal_ca_file "
+                    "at the relay's CA; or set [security].allow_unverified_alert_smtp_tls=true to "
+                    "deliberately accept an unauthenticated alert hop (audited).",
+                    file=sys.stderr,
+                )
+                return 2
+            if enforcing:
+                # Explicitly acknowledged under strict enforcement — a loud WARNING-level AUDIT line
+                # (captured by NSSM stdout/SIEM), then the shared warn posture below. Never silent.
+                logging.getLogger(__name__).warning(
+                    "AUDIT: starting a %sPHI instance (environment %r) with %s, permitted because "
+                    "[security].allow_unverified_alert_smtp_tls=true — alert bodies, security-event "
+                    "email and the SMTP AUTH credential cross an UNAUTHENTICATED hop "
+                    "(alert-SMTP-TLS verification opt-out override).",
+                    "production " if production else "",
+                    env_name,
+                    hop_desc,
+                )
+            print(
+                f"warning: {hop_desc} in a PHI-carrying environment ({env_name!r}) — alert bodies, "
+                "per-user security-event email and the SMTP AUTH password cross a hop that does not "
+                "authenticate the relay (MITM-able). Remove the override, or trust the relay's CA via "
+                "[alerts].email_tls_ca_file / [tls].internal_ca_file.",
+                file=sys.stderr,
+            )
+
     # --- ADR 0152 rung 2: in-USE PHI protection (ASVS 11.7.1) ------------------------------------
     # Placed LAST in the posture ladder on purpose (extend, never weaken): every more SPECIFIC
     # refusal — cleartext bind, revocation, Posture-B, /ui exposure, MFA-at-exposure, retention,
@@ -2171,6 +2289,33 @@ def _serve(args: argparse.Namespace) -> int:
     # should be told about the concrete misconfiguration before the platform-property one, and a
     # gate that jumped the queue would silently change which error every existing exposed-PHI test
     # (and every existing exposed-PHI deployment) reports.
+    # ASVS 3.7.3: the "you are leaving this site" interstitial. Two knobs can weaken it, and BOTH are
+    # announced at start rather than discovered in a later assessment. Warn-only by design: neither is
+    # a PHI-safety property and refusing on an operator's deliberate UX decision would be a
+    # self-inflicted availability failure — the same reasoning as the read-out below.
+    _ext_allow = list(settings.security.external_link_allowlist)
+    if not settings.security.external_link_interstitial:
+        print(
+            "warning: [security].external_link_interstitial=false — the console will navigate "
+            "OFF-SITE with no notification and no cancel. This is the ASVS 3.7.3 control; disabling "
+            "it is a posture decision, not a convenience one.",
+            file=sys.stderr,
+        )
+    elif _ext_allow:
+        # Named individually, never counted. "3 destinations exempted" is the shape of message that
+        # lets an entry nobody intended sit in a list for a year.
+        print(
+            "warning: [security].external_link_allowlist exempts "
+            f"{', '.join(repr(d) for d in _ext_allow)} from the off-site interstitial (ASVS 3.7.3) — "
+            "navigation to these destinations shows no notification and offers no cancel.",
+            file=sys.stderr,
+        )
+    # NOT warned: an empty `organization_domains`. It is the STRICT position (every off-site
+    # destination is interstitialed) and it is the shipped default, so a note here would print on
+    # every stock start — `test_serve_loopback_emits_no_new_stderr` catches exactly that, and it is
+    # right to. Start-time output is for a posture that is WEAKER than the default, not for the
+    # default itself. The guidance that matters — declare your domains rather than reaching for the
+    # allowlist escape — belongs in docs/CONFIGURATION.md, where it is, and not in every boot log.
     #
     # PHI is plaintext in CPython heap while it is being processed — an HL7 body is `str` end to end
     # by design, and every parse/transform step allocates a fresh immutable copy no application code
@@ -4304,6 +4449,7 @@ def _security(args: argparse.Namespace) -> int:
 
     from messagefoundry.config import security_edit
     from messagefoundry.config.settings import (
+        AlertsSettings,
         AuthSettings,
         SecuritySettings,
         StoreSettings,
@@ -4319,14 +4465,14 @@ def _security(args: argparse.Namespace) -> int:
     # the shipped defaults and SAY SO via the emitted `loosenings_partial` marker, rather than silently
     # reporting a subset as if it were everything.
     _loosenings_partial = False
-    _store, _auth = StoreSettings(), AuthSettings()
+    _store, _auth, _alerts = StoreSettings(), AuthSettings(), AlertsSettings()
     if Path(path).exists():
         # An ABSENT file is not a degraded read — the shipped defaults ARE the effective posture there,
         # and `security show` is expected to work offline before any config exists. Only a file that
         # exists and will not resolve is partial.
         try:
             _full = load_settings(config_path=path)
-            _store, _auth = _full.store, _full.auth
+            _store, _auth, _alerts = _full.store, _full.auth, _full.alerts
         except (ValidationError, tomllib.TOMLDecodeError, OSError, ValueError):
             # The specific ways a settings file fails to resolve: a schema/cross-field violation,
             # malformed TOML, an unreadable path, and the plain ValueErrors load_settings raises for a
@@ -4339,7 +4485,10 @@ def _security(args: argparse.Namespace) -> int:
         # 0153 per-connection cleartext_accepted declarations — it passes an empty list and declares the
         # gap in `loosenings_scope` below, instead of reporting a settings-only view as if it were the
         # whole posture. `messagefoundry check` and GET /security/posture are the complete surfaces.
-        return [{"switch": s, "risk": r} for s, r in security_loosenings(sec, _store, _auth, ())]
+        return [
+            {"switch": s, "risk": r}
+            for s, r in security_loosenings(sec, _store, _auth, _alerts, ())
+        ]
 
     #: Emitted alongside every loosening list this subcommand prints, so a reader can never mistake a
     #: degraded or settings-only report for a complete one. `partial` means [store]/[auth] could not be
@@ -4347,7 +4496,7 @@ def _security(args: argparse.Namespace) -> int:
     _loosenings_scope = {
         "loosenings_partial": _loosenings_partial,
         "loosenings_scope": (
-            "settings only ([security]/[store]/[auth]); per-connection cleartext_accepted "
+            "settings only ([security]/[store]/[auth]/[alerts]); per-connection cleartext_accepted "
             "declarations are NOT included — see `messagefoundry check` or GET /security/posture"
         ),
     }

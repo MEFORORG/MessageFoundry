@@ -651,6 +651,13 @@ _SECRET_SETTING_KEYS = frozenset(
         # name), so it is intentionally not listed.
         "credential_username",
         "credential_password",
+        # ADR 0154 (D6) — the inbound HTTP listener's intake-auth peer credential and its rotation
+        # partner. Both are env()-only (enforced by the Http() factory) and rotatable, so they are
+        # deliberately NOT in _NON_ROTATABLE_SECRET_SETTING_KEYS: that enrols them in the ASVS 13.3.4
+        # fingerprinter and the 13.1.4 registration gate, which is the point. ``intake_api_key_header``
+        # is a header NAME, not a credential, and is classified non-secret in tests/test_connection_api.
+        "intake_api_key",
+        "intake_api_key_next",
     }
 )
 
@@ -1079,6 +1086,34 @@ def Http(
     | EnvRef
     | None = None,  # passphrase for an ENCRYPTED tls_key_file (put the secret in env())
     tls_ca_file: str | None = None,  # trust anchor — opt-in mTLS (require + verify a client cert)
+    # --- Intake authentication (ADR 0154 D6) — a PEER control on this connector, not admin RBAC ---
+    intake_auth: Literal[
+        "none", "api_key", "bearer", "mtls_subject"
+    ] = "none",  # credential a peer must present to POST
+    intake_api_key: EnvRef
+    | None = None,  # the api_key/bearer credential (env() only — never inline)
+    intake_api_key_next: EnvRef
+    | None = None,  # rotation: accepted alongside intake_api_key, so a partner key rotates without an outage
+    intake_api_key_header: str = "x-api-key",  # header carrying the api_key credential (a header NAME, not a secret)
+    intake_client_subjects: Sequence[str]
+    | None = None,  # mtls_subject allow-list, QUALIFIED: "CN:<v>" / "SAN:DNS:<v>"
+    intake_auth_health: Literal[
+        "require", "allow"
+    ] = "require",  # whether GET/HEAD probes need the credential too
+    intake_auth_rate_limit: int
+    | None = 10,  # FAILED intake-auth attempts per minute per peer (0/None disables)
+    intake_auth_rate_limit_global: int
+    | None = 60,  # FAILED intake-auth attempts per minute across all peers
+    # --- Synchronous captured-downstream reply (ADR 0154 D4) — reply_from's presence is the switch ---
+    reply_from: str
+    | None = None,  # names the outbound whose CAPTURED reply becomes this request's HTTP body
+    reply_timeout: float = 30.0,  # seconds the HTTP turn may block waiting for that reply
+    reply_on_timeout: Literal["504", "202"] = "504",  # what to answer when the wait expires
+    reply_content_type: str = "passthrough",  # "passthrough" (echo the captured one) or a literal MIME
+    reply_on_empty: Literal[
+        "204", "200"
+    ] = "204",  # answer for a captured but deliberately empty reply
+    reply_write_timeout: float = 30.0,  # seconds to drain the (partner-sized) response to the caller
 ) -> ConnectionSpec:
     """An **inbound HTTP/1.1 web-service listener** (ADR 0023) — a connector-owned bound socket that a
     partner ``POST``s a body to (REST / SOAP-body / FHIR / webhook). Source-only: it never delivers. The
@@ -1093,8 +1128,8 @@ def Http(
     happens *after* the ``202`` and is **not** reflected in the HTTP status (it surfaces as the message's
     ``ERROR``/dead-letter + the AlertSink). A pre-ingress refusal (oversize/malformed/allowlist) returns a
     synchronous ``4xx`` + an ADR 0021 ``connection_event``. ``GET``/``HEAD`` are static health probes (no
-    ingress row). The synchronous downstream-reply (SOAP-envelope) path is a defined ADR 0013 follow-on,
-    not built here.
+    ingress row). This is the behaviour of an inbound **without** ``reply_from``; naming it switches
+    to the synchronous captured-downstream reply described below.
 
     **DoS guards** are HTTP twins of MLLP's: ``max_connections`` (flood), ``receive_timeout`` (slow-loris
     — bounds the whole-request read), ``max_body_bytes`` (the frame-cap twin — refused on the declared
@@ -1104,23 +1139,306 @@ def Http(
     identity (``tls_ca_file`` adds opt-in mTLS); ``tls_key_password`` decrypts an encrypted key (supply via
     ``env()``). The runner's exposed-gate refuses a **non-loopback** HTTP listener **without** TLS at start
     (cleartext PHI can't cross an off-loopback socket by accident) — set ``tls=True`` or pass
-    ``serve --allow-insecure-bind`` on a trusted, firewalled segment."""
-    return ConnectionSpec(
-        ConnectorType.HTTP,
-        {
-            "port": port,
-            "encoding": encoding,
-            "max_connections": max_connections,
-            "receive_timeout": receive_timeout,
-            "max_body_bytes": max_body_bytes,
-            "max_header_bytes": max_header_bytes,
-            "tls": tls,
-            "tls_cert_file": tls_cert_file,
-            "tls_key_file": tls_key_file,
-            "tls_key_password": tls_key_password,
-            "tls_ca_file": tls_ca_file,
-        },
-    )
+    ``serve --allow-insecure-bind`` on a trusted, firewalled segment.
+
+    **Intake authentication (ADR 0154 D6).** ``intake_auth`` requires a peer to prove who it is before it
+    may submit a message. It is a sibling of ``source_ip_allowlist`` — a **peer control on this
+    connector** — not admin RBAC: it mints no identity, opens no session, and authorises *submitting*,
+    never *reading*. ``api_key`` reads the credential from ``intake_api_key_header``, ``bearer`` from
+    ``Authorization: Bearer``, and ``mtls_subject`` maps the verified client certificate's subject/SAN
+    against ``intake_client_subjects``. Set ``intake_api_key_next`` to rotate a partner key without an
+    outage: both are accepted while the partner cuts over.
+
+    **TLS is confidentiality; intake auth is authentication.** Enabling one is never an argument for
+    relaxing the other. In particular a bare ``tls`` + ``tls_ca_file`` means "any certificate this CA ever
+    signed", with no subject binding at all — which is why ``mtls_subject`` additionally requires
+    ``intake_client_subjects``.
+
+    Health probes are **inside** the gate by default; ``intake_auth_health="allow"`` exempts ``GET``/
+    ``HEAD`` for a load-balancer check, at the cost of an unauthenticated "is MessageFoundry up, and
+    where" oracle on a PHI intake socket.
+
+    **Synchronous captured-downstream reply (ADR 0154 D4).** Naming ``reply_from`` turns this inbound
+    from fire-and-forget into a **proxy**: the HTTP turn blocks until the named outbound's reply has
+    been captured and **committed**, then returns that reply as the response body. One knob, not two —
+    a separate ``sync_reply: bool`` would admit a half-configured state (mode on, no target) that
+    could only fail at runtime.
+
+    The returned bytes always come from a **committed** ``response`` row, never from an in-flight
+    delivery, so a reply is returned only once it is durable and replayable. ``reply_timeout`` bounds
+    the block and ``reply_write_timeout`` bounds the drain of the (partner-sized) response back to the
+    caller, so a sync-reply turn has three independent clocks with ``receive_timeout`` still bounding
+    the read. A timeout answers ``reply_on_timeout`` and **leaves the message flowing** — the HTTP
+    status is never a second disposition channel, and the finalizer remains the only authority on
+    that.
+
+    ``reply_content_type="passthrough"`` echoes the partner's own captured ``content-type``; a literal
+    MIME type pins it instead. ``reply_on_empty`` chooses how a deliberately empty partner reply is
+    answered — ``204`` is correct, ``200`` is the escape hatch for toolchains that mishandle a
+    bodyless response.
+
+    **The reply body is PHI**: the partner's response, decrypted out of the store. It is returned to
+    the caller and *nowhere else* — never logged, and never placed in an exception, a
+    ``connection_event.reason`` or a ``message_events.detail``.
+
+    An inbound **without** ``reply_from`` keeps the shipped ``202``-on-receipt behaviour byte for
+    byte; every knob above is inert without it, and setting one alone is refused rather than silently
+    ignored."""
+    settings: dict[str, Any] = {
+        "port": port,
+        "encoding": encoding,
+        "max_connections": max_connections,
+        "receive_timeout": receive_timeout,
+        "max_body_bytes": max_body_bytes,
+        "max_header_bytes": max_header_bytes,
+        "tls": tls,
+        "tls_cert_file": tls_cert_file,
+        "tls_key_file": tls_key_file,
+        "tls_key_password": tls_key_password,
+        "tls_ca_file": tls_ca_file,
+        "intake_auth": intake_auth,
+        "intake_api_key": intake_api_key,
+        "intake_api_key_next": intake_api_key_next,
+        "intake_api_key_header": intake_api_key_header,
+        "intake_client_subjects": list(intake_client_subjects) if intake_client_subjects else None,
+        "intake_auth_health": intake_auth_health,
+        "intake_auth_rate_limit": intake_auth_rate_limit,
+        "intake_auth_rate_limit_global": intake_auth_rate_limit_global,
+        "reply_from": reply_from,
+        "reply_timeout": reply_timeout,
+        "reply_on_timeout": reply_on_timeout,
+        "reply_content_type": reply_content_type,
+        "reply_on_empty": reply_on_empty,
+        "reply_write_timeout": reply_write_timeout,
+    }
+    _validate_intake_auth(settings)
+    _validate_sync_reply(settings)
+    return ConnectionSpec(ConnectorType.HTTP, settings)
+
+
+#: The synchronous-reply knobs. Every one is inert without ``reply_from``, so setting any of them
+#: alone is a configuration that silently does nothing — refused, for the same reason a credential
+#: configured with ``intake_auth="none"`` is.
+_SYNC_REPLY_KNOBS = (
+    "reply_timeout",
+    "reply_on_timeout",
+    "reply_content_type",
+    "reply_on_empty",
+    "reply_write_timeout",
+)
+
+
+def _sync_reply_defaults() -> dict[str, Any]:
+    """The knobs' default values, read off :func:`Http`'s own signature.
+
+    Derived rather than duplicated on purpose: a hand-copied table would go stale the first time a
+    default changed, and the failure would be silent — the "configured but never read" refusal below
+    would simply stop firing for that knob, which is the opposite of what a guard should do when it
+    drifts. Cheap: this runs once per ``Http()`` call, and only on the path that is already about to
+    raise or return."""
+    params = inspect.signature(Http).parameters
+    return {name: params[name].default for name in _SYNC_REPLY_KNOBS}
+
+
+def apply_sync_reply_capture_implication(registry: Registry) -> None:
+    """Make ``reply_from`` imply capturing the partner's ``content-type`` (ADR 0154 D4, owner ruling).
+
+    **Resolves a contradiction in the ADR itself.** ``reply_content_type`` defaults to
+    ``"passthrough"``, and D4 then requires ``"content-type"`` to be in the named outbound's
+    ``capture_response_headers`` — which defaults to ``None`` on all three capable factories, and
+    ``normalize_header_allowlist(None)`` is the empty set. So the ADR's own headline shape,
+    ``Http(reply_from="X")`` + ``Rest(capture_response=True)``, would raise at ``check`` until the
+    operator *also* wrote ``capture_response_headers=["content-type"]``. Asking for a reply to be
+    echoed back verbatim **is** asking for its content type; requiring both is a papercut with no
+    decision behind it.
+
+    Applied as an explicit, **idempotent** normalisation of the resolved graph rather than a hidden
+    runtime fallback, so the implied header appears in ``/metadata`` and ``graph --json`` like any
+    other captured header. An operator reading the outbound's configuration sees what is actually
+    captured — which is the point: an implication nobody can observe is indistinguishable from a bug.
+
+    Only touches outbounds that are the ``reply_from`` target of an inbound using ``passthrough``,
+    and only those whose factory has the setting at all (it exists on 3 of the 8 outbound factories).
+    A capturing outbound with no allow-list is left alone and refused explicitly by
+    :func:`~messagefoundry.pipeline.wiring_runner.check_http_sync_reply`.
+    """
+    targets: set[str] = set()
+    for ic in registry.inbound.values():
+        if ic.spec.type is not ConnectorType.HTTP:
+            continue
+        reply_from = ic.spec.settings.get("reply_from")
+        if reply_from and ic.spec.settings.get("reply_content_type") == "passthrough":
+            targets.add(str(reply_from))
+
+    for name in sorted(targets):
+        oc = registry.outbound.get(name)
+        if oc is None or "capture_response_headers" not in oc.spec.settings:
+            continue  # unknown target, or a factory with no allow-list — both refused elsewhere
+        current = oc.spec.settings.get("capture_response_headers") or []
+        if any(str(h).strip().lower() == "content-type" for h in current):
+            continue  # already asked for — idempotent
+        oc.spec.settings["capture_response_headers"] = [*current, "content-type"]
+
+
+def _validate_sync_reply(settings: Mapping[str, Any]) -> None:
+    """Refuse a synchronous-reply configuration that cannot work, at **factory** time (ADR 0154 D4).
+
+    Factory-local checks only — everything decidable from this one ``Http()`` call, with no store, no
+    posture and no registry, so it fires identically in ``messagefoundry check``, in dry-run, and
+    through the ``connections.toml`` desugar.
+
+    The **cross-registry** half lives in ``build_check_registry``: that ``reply_from`` names a
+    deployed outbound, that the outbound captures responses, the ``passthrough`` content-type
+    requirement, and the effective ``ordering``/``max_attempts`` refusals. None of those are knowable
+    from here, and pretending otherwise would mean validating against a registry this function
+    cannot see.
+    """
+    reply_from = settings["reply_from"]
+    if reply_from is not None and not str(reply_from).strip():
+        raise WiringError("Http reply_from must name an outbound connection, not an empty string")
+
+    if reply_from is None:
+        defaults = _sync_reply_defaults()
+        configured = [name for name in _SYNC_REPLY_KNOBS if settings[name] != defaults[name]]
+        if configured:
+            raise WiringError(
+                f"Http sets {', '.join(configured)} but no reply_from, so the synchronous-reply path "
+                "is off and none of them is ever read — name the outbound whose captured reply should "
+                "become the HTTP body, or remove the setting"
+            )
+        return
+
+    for name in ("reply_timeout", "reply_write_timeout"):
+        value = settings[name]
+        if not isinstance(value, int | float) or value <= 0:
+            raise WiringError(
+                f"Http {name} must be a positive number of seconds — got {value!r}. It bounds a "
+                "blocked HTTP turn; an unbounded or zero budget is not a timeout"
+            )
+
+    if settings["reply_on_timeout"] not in ("504", "202"):
+        raise WiringError(
+            f"Http reply_on_timeout must be '504' or '202' — got {settings['reply_on_timeout']!r}"
+        )
+    if settings["reply_on_empty"] not in ("204", "200"):
+        raise WiringError(
+            f"Http reply_on_empty must be '204' or '200' — got {settings['reply_on_empty']!r}"
+        )
+
+    content_type = settings["reply_content_type"]
+    if not content_type or not str(content_type).strip():
+        raise WiringError(
+            "Http reply_content_type must be 'passthrough' or a literal MIME type, not empty"
+        )
+    if content_type != "passthrough" and "/" not in str(content_type):
+        raise WiringError(
+            f"Http reply_content_type must be 'passthrough' or a MIME type — got {content_type!r}, "
+            "which is neither (a MIME type contains a '/', e.g. 'application/json')"
+        )
+
+
+#: The intake-auth modes that carry a shared-secret credential (as opposed to a client certificate).
+_INTAKE_KEY_MODES = ("api_key", "bearer")
+#: Qualified-namespace prefixes an ``intake_client_subjects`` entry may take, mirroring what
+#: :func:`~messagefoundry.credential.cert_name_candidates` actually yields.
+_INTAKE_SUBJECT_PREFIXES = ("CN:", "SAN:")
+
+
+def _validate_intake_auth(settings: Mapping[str, Any]) -> None:
+    """Refuse an intake-auth configuration that cannot work, at **factory** time (ADR 0154 D4).
+
+    Runs with no store and no posture, so it fires identically in ``messagefoundry check``, in dry-run,
+    and through the ``connections.toml`` desugar (which calls this same factory). Every rule here
+    catches a configuration whose failure mode is otherwise silent or total:
+
+    * a mode that needs a credential, with none configured — the listener would refuse 100 % of traffic;
+    * ``mtls_subject`` without ``tls`` + ``tls_ca_file`` — the ``SSLContext`` never requests a client
+      certificate, so ``getpeercert()`` comes back empty and deny-by-default ``403``s everything, with
+      no start-time error to explain it;
+    * ``mtls_subject`` with no subjects — "any certificate this CA ever signed" is not a peer control;
+    * an unqualified subject entry — ``cert_name_candidates`` yields ``"CN:<v>"`` / ``"SAN:DNS:<v>"``, so
+      a bare ``partner.example`` matches nothing and 403s every request from the very partner it names;
+    * a credential configured while ``intake_auth="none"`` — nothing would ever check it, and an
+      operator reading that config would reasonably believe the listener was protected.
+
+    The secret itself must be an ``env()`` reference with no default and no cast, mirroring
+    ``File(credential_password=...)`` (ADR 0132): a fallback credential is a silent credential.
+    """
+    mode = settings["intake_auth"]
+    if mode not in ("none", *_INTAKE_KEY_MODES, "mtls_subject"):
+        raise WiringError(
+            f"Http intake_auth must be one of none/api_key/bearer/mtls_subject — got {mode!r}"
+        )
+    if settings["intake_auth_health"] not in ("require", "allow"):
+        raise WiringError(
+            "Http intake_auth_health must be 'require' or 'allow' — got "
+            f"{settings['intake_auth_health']!r}"
+        )
+
+    for name in ("intake_api_key", "intake_api_key_next"):
+        value = settings[name]
+        if value is None:
+            continue
+        if not isinstance(value, EnvRef):
+            raise WiringError(
+                f"Http {name} must be an env() reference — an intake credential is a secret and is "
+                f"never inline (CLAUDE.md §5); e.g. {name}=env('acme_intake_key')"
+            )
+        if value.default is not _UNSET:
+            raise WiringError(
+                f"Http {name} env() must not carry a default= — a fallback intake credential would "
+                "be a silent credential"
+            )
+        if value.cast is not None:
+            raise WiringError(f"Http {name} env() must not carry a cast= (a credential is text)")
+
+    if mode == "none":
+        configured = [
+            n
+            for n in ("intake_api_key", "intake_api_key_next", "intake_client_subjects")
+            if settings[n]
+        ]
+        if configured:
+            raise WiringError(
+                f"Http sets {', '.join(configured)} but intake_auth='none', so no credential is ever "
+                "checked — set intake_auth, or remove the setting; a control that is configured but "
+                "never consulted reads as protection that does not exist"
+            )
+        return
+
+    if mode in _INTAKE_KEY_MODES:
+        if settings["intake_api_key"] is None:
+            raise WiringError(
+                f"Http intake_auth={mode!r} needs intake_api_key — supply it via env() "
+                "(intake_api_key=env('acme_intake_key')); an unset value is not an env-resolution "
+                "failure, so nothing else would catch it"
+            )
+        if not settings["intake_api_key_header"]:
+            raise WiringError("Http intake_api_key_header must be a non-empty header name")
+        return
+
+    # mtls_subject
+    if not settings["tls"] or not settings["tls_ca_file"]:
+        raise WiringError(
+            "Http intake_auth='mtls_subject' needs tls=True and tls_ca_file — without a CA the "
+            "SSLContext never requests a client certificate, so getpeercert() is empty and every "
+            "request is refused 403 with no start-time error to explain it"
+        )
+    subjects = settings["intake_client_subjects"]
+    if not subjects:
+        raise WiringError(
+            "Http intake_auth='mtls_subject' needs a non-empty intake_client_subjects — tls_ca_file "
+            "alone means 'any certificate this CA ever signed', which binds no subject and "
+            "authenticates no one in particular"
+        )
+    unqualified = [s for s in subjects if not str(s).startswith(_INTAKE_SUBJECT_PREFIXES)]
+    if unqualified:
+        raise WiringError(
+            f"Http intake_client_subjects entries must be qualified — {unqualified} lack a "
+            "'CN:' / 'SAN:<type>:' prefix. A certificate's names are matched as 'CN:<value>' and "
+            "'SAN:DNS:<value>' so a spoofed commonName cannot collide with a pinned SAN; a bare name "
+            "matches nothing and would 403 every request from the partner it names"
+        )
 
 
 def File(
@@ -1137,7 +1455,7 @@ def File(
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on a missing/unusable dir (#114); default defers to run time
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on a missing/unusable dir; default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -1161,9 +1479,10 @@ def File(
     ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
     the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
     another system owns (#142; a HASHED per-file ledger dedups so a left file is ingested once).
-    ``validate_directory`` (inbound, #114) makes a missing/unusable directory **fail startup** (the
-    connection is reported ``failed``) instead of the default deferral to run time; a ``leave`` source
-    validates read-only (a read-only share passes).
+    ``validate_directory`` (**inbound only**, #114) makes a missing/unusable directory **fail startup**
+    (the connection is reported ``failed``) instead of the default deferral to run time; a ``leave``
+    source validates read-only (a read-only share passes). On an **outbound** it raises a
+    :class:`WiringError` at bind — no destination reads it, so accepting it would be a silent no-op.
 
     ``credential_username`` / ``credential_domain`` / ``credential_password`` (ADR 0132, #111) give the
     endpoint an **alternate Windows identity** for a UNC/SMB share, distinct from the engine service
@@ -1467,6 +1786,9 @@ def Email(
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_verify: bool = True,  # verify the server cert (#323); False (dev only) needs the escape
+    tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP server against (not a secret)
+    tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
@@ -1475,9 +1797,18 @@ def Email(
     text); this delivers it as a plain-text SMTP message to ``host:port`` from ``sender`` to
     ``recipients`` with a static ``subject``. STARTTLS by default (``use_tls=True``) on the ``587``
     submission port; port ``465`` is implicit TLS (``SMTP_SSL``). Optional ``username``/``password`` do
-    SMTP ``AUTH`` (over TLS only — a cleartext-credential config is refused). Disabling TLS
-    (``use_tls=False``) is MITM-able and refused unless ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud
-    warning), like LDAPS / SQL Server / MLLP. The egress host is gated by ``[egress].allowed_smtp``. Put
+    SMTP ``AUTH`` (over a **verified** TLS session only — a cleartext- or unverified-credential config
+    is refused). Disabling TLS (``use_tls=False``) is MITM-able and refused unless
+    ``MEFOR_ALLOW_INSECURE_TLS`` is set (loud warning), like LDAPS / SQL Server / MLLP.
+
+    **The server certificate is verified** (``tls_verify=True``, #323) — chain, hostname and strict RFC
+    5280 flags, anchored to the OS roots, a per-connection ``tls_ca_file``, or the instance-wide
+    ``[tls].internal_ca_file`` (ADR 0093). ``smtplib``'s own default context verifies **nothing**
+    (``CERT_NONE``/``check_hostname=False``), so before #323 ``use_tls=True`` bought encryption without
+    authentication. Point ``tls_ca_file`` at your relay's CA PEM for a private-CA server;
+    ``tls_verify=False`` is a trusted-network dev/test escape, refused on an enforcing production-PHI
+    instance even with ``MEFOR_ALLOW_INSECURE_TLS``, and it also refuses SMTP ``AUTH``.
+    The egress host is gated by ``[egress].allowed_smtp``. Put
     secrets in ``env()`` (``username``/``password``), never inline. Delivery is at-least-once, so a retry
     re-sends the email — a mailbox has no idempotency key, so a rare duplicate is possible and accepted
     (a duplicate beats a drop). ADR 0029."""
@@ -1492,6 +1823,9 @@ def Email(
             "username": username,
             "password": password,
             "use_tls": use_tls,
+            "tls_verify": tls_verify,
+            "tls_ca_file": tls_ca_file,
+            "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
         },
@@ -1518,6 +1852,9 @@ def Direct(
     username: str | EnvRef | None = None,  # optional SMTP AUTH user (use env() for the secret)
     password: str | EnvRef | None = None,  # optional SMTP AUTH password (use env() for the secret)
     use_tls: bool = True,  # STARTTLS by default; False (dev only) needs MEFOR_ALLOW_INSECURE_TLS
+    tls_verify: bool = True,  # verify the relay's cert (#323); False (dev only) needs the escape
+    tls_ca_file: str | EnvRef | None = None,  # PEM to verify the SMTP/HISP relay against
+    tls_check_hostname: bool = True,  # match the cert against `host` (leave on)
     timeout_seconds: float = 30.0,
     encoding: str = "utf-8",
 ) -> ConnectionSpec:
@@ -1526,7 +1863,14 @@ def Direct(
     **body** (content-agnostic — an HL7 string, a CDA/XML document, plain text); this **signs** it with
     ``signing_key``/``signing_cert``, **encrypts** the signed blob to the partner's ``recipient_cert``
     (which must chain to ``trust_anchor``), and submits the S/MIME message to ``host:port`` over
-    STARTTLS. All cert/key material is loaded + validated at construction (fail loud). The egress host
+    STARTTLS. All cert/key material is loaded + validated at construction (fail loud).
+
+    **The relay's TLS certificate is verified** (``tls_verify=True``, #323 — ``smtplib``'s own default
+    verifies nothing). Note the two trust settings are unrelated and easy to confuse: ``trust_anchor``
+    is the CA the **partner's S/MIME certificate** must chain to (message-layer), while ``tls_ca_file``
+    is the CA the **SMTP relay's TLS certificate** must chain to (transport-layer). The S/MIME body
+    protects the clinical payload either way, but the SMTP session still carries envelope metadata and
+    any ``AUTH`` credential, which is why the transport hop is verified too. The egress host
     is gated by ``[egress].allowed_direct``. Put secrets in ``env()`` (``signing_key_password``,
     ``username``/``password``), never inline. Delivery is at-least-once, so a retry re-sends — a Direct
     mailbox has no idempotency key, so a rare duplicate is possible and accepted (a duplicate beats a
@@ -1547,6 +1891,9 @@ def Direct(
             "username": username,
             "password": password,
             "use_tls": use_tls,
+            "tls_verify": tls_verify,
+            "tls_ca_file": tls_ca_file,
+            "tls_check_hostname": tls_check_hostname,
             "timeout_seconds": timeout_seconds,
             "encoding": encoding,
         },
@@ -2087,7 +2434,7 @@ def Sftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on an unreachable remote dir
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -2147,7 +2494,7 @@ def Ftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on an unreachable remote dir
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -3435,6 +3782,23 @@ def build_outbound_connection(
         raise WiringError(
             f"outbound connection {name!r}: {kind} outbound requires a host (the downstream peer), "
             f"e.g. {kind.title()}(host=..., port=...)."
+        )
+    if spec.type in (ConnectorType.FILE, ConnectorType.REMOTEFILE) and spec.settings.get(
+        "validate_directory"
+    ):
+        # BACKLOG #114: validate_directory is INBOUND-ONLY. Only SourceConnector carries the
+        # validate_startup hook the runner awaits at bind (pipeline/wiring_runner.py) — no destination
+        # reads the setting, and DestinationConnector has no equivalent hook. Set on an outbound it was
+        # accepted and silently ignored, so an operator asking for fail-fast validation got none and saw
+        # no error. It is caught HERE rather than in File()/Sftp()/Ftp() because those factories serve
+        # BOTH directions and cannot know which one they are — only the bind does. (Same choke-point
+        # reasoning as the capture_response guard below, which spells it out.) Truthy-only, so the
+        # `False` the factories always write into settings keeps building byte-identically.
+        kind = spec.type.value.upper()
+        raise WiringError(
+            f"outbound connection {name!r}: validate_directory is an inbound-only option — an outbound "
+            f"{kind} never reads it, so requesting it here would be a silent no-op. Remove it. "
+            "(Startup validation of an outbound target directory is not implemented; see BACKLOG #114.)"
         )
     _check_metadata(name, metadata)
     # ADR 0013 Increment 2: reingress_to (route this outbound's reply back as a new inbound message)

@@ -27,6 +27,9 @@
     WHAT THE ANSWERS MEAN, AND WHAT THEY LICENSE:
       LIVE        pid resolves and its start time is consistent. Trustworthy.
       UNVERIFIED  pid resolves; the fence could not be evaluated. Treat as possibly-live.
+      UNREADABLE  the record itself cannot be fenced (no pid, or one that is not a number). Treat as
+                  possibly-live: a record being WRITTEN right now is exactly this shape, and a session
+                  that just launched is the last thing that should read as absent.
       STALE       pid resolves but belongs to a different process. The session is gone.
       DEAD        no such pid.
       (Found=$false) no record at all -- it exited cleanly, or was never registered.
@@ -50,17 +53,31 @@ function Get-ClaudeConfigRoots {
 }
 
 # Every registry record, with the root it came from attached.
+#
+# -IncludeUnreadable also returns a row for every file that could NOT be parsed (Record = $null,
+# Unreadable = $true). A caller about to destroy something needs those: a record that is half-written
+# -- i.e. a session that launched a moment ago -- fails to parse, and DROPPING it silently turns an
+# occupied worktree from SKIP into PRUNE while the receipt reports one fewer record than existed.
+# It is off by default so the read-only roster callers keep the shape they already handle.
 function Get-SessionRecords {
     [CmdletBinding()]
-    param([string[]]$ConfigRoot)
+    param([string[]]$ConfigRoot, [switch]$IncludeUnreadable)
     $out = @()
     foreach ($root in (Get-ClaudeConfigRoots -ConfigRoot $ConfigRoot)) {
         foreach ($f in @(Get-ChildItem (Join-Path $root "sessions") -Filter *.json -EA SilentlyContinue)) {
             # A single malformed record must never take down a caller -- one of these runs in a
             # SessionStart hook, where a throw replaces the chat's whole starting context.
-            try { $rec = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { continue }
-            if (-not $rec) { continue }
-            $out += [pscustomobject]@{ Record = $rec; Root = $root; File = $f.FullName }
+            $rec = $null
+            $err = ''
+            try { $rec = Get-Content $f.FullName -Raw -EA Stop | ConvertFrom-Json -EA Stop } catch { $err = $_.Exception.Message }
+            if (-not $rec) {
+                if (-not $err) { $err = 'the file parsed to nothing (empty, or being written right now)' }
+                if ($IncludeUnreadable) {
+                    $out += [pscustomobject]@{ Record = $null; Root = $root; File = $f.FullName; Unreadable = $true; Error = $err }
+                }
+                continue
+            }
+            $out += [pscustomobject]@{ Record = $rec; Root = $root; File = $f.FullName; Unreadable = $false; Error = '' }
         }
     }
     return $out
@@ -75,9 +92,12 @@ function Test-RecordLiveness {
         # Generous: registration follows process start, but a cold start on a loaded box can lag.
         [int]$StartSkewMinutes = 15
     )
-    if (-not $Record) { return @{ State = "DEAD"; Detail = "no record" } }
+    if (-not $Record) { return @{ State = "UNREADABLE"; Detail = "no record to fence" } }
+    # A record with NO pid cannot be fenced, so it is UNREADABLE, not DEAD. It used to report DEAD --
+    # which is not a veto anywhere -- and a registry file caught mid-write has exactly this shape, so a
+    # session that had just launched read as "nobody is there" to a caller about to delete its worktree.
     $procId = [int]$Record.pid
-    if (-not $procId) { return @{ State = "DEAD"; Detail = "no pid in record" } }
+    if (-not $procId) { return @{ State = "UNREADABLE"; Detail = "no pid in record; it cannot be fenced" } }
 
     $proc = Get-Process -Id $procId -EA SilentlyContinue
     if (-not $proc) { return @{ State = "DEAD"; Detail = "pid $procId not running" } }
@@ -124,7 +144,9 @@ function Get-SessionLiveness {
     }
     # More than one match on a prefix: fence them all and report the most-alive, because the caller is
     # about to decide whether it is safe to disturb something.
-    $rank = @{ "LIVE" = 0; "UNVERIFIED" = 1; "STALE" = 2; "DEAD" = 3 }
+    # UNREADABLE ranks with the possibly-live states, not with the gone ones: it means the fence could
+    # not be evaluated, and an unevaluated fence is not a passed fence.
+    $rank = @{ "LIVE" = 0; "UNVERIFIED" = 1; "UNREADABLE" = 2; "STALE" = 3; "DEAD" = 4 }
     $best = $null
     foreach ($h in $hit) {
         $l = Test-RecordLiveness -Record $h.Record -StartSkewMinutes $StartSkewMinutes

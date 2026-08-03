@@ -1,6 +1,6 @@
 # ADR 0023 — Inbound HTTP listener (a connector-owned SOAP/REST web-service source)
 
-- **Status:** Accepted (2026-06-27, built — first slice in 0.2.10; SOAP-reply/auth/routing-metadata deferred)  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
+- **Status:** Accepted (2026-06-27, built — first slice in 0.2.10). The deferred tail is now built: intake auth and the SOAP-envelope synchronous reply both shipped via [ADR 0154](0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md), which is the authority on their current state. **Routing-metadata remains deferred.**  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-06-27
 - **Related:** BACKLOG #7 (inbound web-service listener — this consumes the pre-Reserved README row) ·
   unblocks #20 (inbound FHIR server facade) and #24 (inbound DICOMweb STOW-RS receiver) ·
@@ -11,7 +11,7 @@
   off-loopback "exposed" gate + per-listener TLS this inherits) · [ADR 0013 §"capture + correlate" /
   Increment 1](0013-query-response-orchestration.md) (the **sync-response seam** the SOAP-envelope follow-on
   reuses — NOT 0013 Increment 2 re-ingress) · [ADR 0021](0021-inbound-ack-nak-capture-response-sent.md) (the
-  inbound capture + the OFF-by-default per-inbound `connection_event` plumbing this listener reuses) ·
+  inbound capture + the per-inbound `connection_event` plumbing this listener reuses — note that plumbing is **default-ON, per-inbound opt-OUT** (`capture_connection_errors`); ADR 0021 documented it as OFF-by-default and was corrected) ·
   [CLAUDE.md](../../CLAUDE.md) §2 (ACK-on-receipt + count-and-log + the one-way `transports/ ↛ api/` rule),
   §4 (pluggable connector registry), §8 (payload-agnostic ingress) ·
   [`transports/base.py`](../../messagefoundry/transports/base.py) `register_source`/`SourceConnector`/
@@ -64,7 +64,7 @@ needs ([`transports/mllp.py`](../../messagefoundry/transports/mllp.py)):
   plaintext, byte-identical) — and the runner's **exposed-gate** (`check_mllp_tls_exposure`,
   [`pipeline/wiring_runner.py`](../../messagefoundry/pipeline/wiring_runner.py)) refuses a non-loopback bind
   without TLS at start (ADR 0002 §0).
-- the OFF-by-default **`connection_event`** sink (#46, ADR 0021 §7): the runner injects
+- the **default-ON, per-inbound opt-OUT** **`connection_event`** sink (#46, ADR 0021 §7): the runner injects
   `source.on_connection_event` *after* build via `_make_connection_event_sink(ic)`; the source calls it on
   accept/refuse/close (`_emit_event`, **fail-soft** — a capture hiccup never drops a client) and
   `transports/` stays store-agnostic (an injected coroutine, never a `store/` import).
@@ -92,7 +92,7 @@ modelled on `MLLPSource`, registered in the connector registry — that decodes 
 the ingress stage via the existing `InboundHandler`, and (first slice) returns a `202`-style
 respond-with-receipt; the synchronous downstream-reply (SOAP-envelope) response is a defined follow-on
 reusing the ADR 0013 capture seam.** The socket lives in `transports/`, never `api/`; it inherits the ADR
-0004 ingress, the ADR 0002 TLS/exposed-gate, the ingress IP allowlist, and the ADR 0021 OFF-by-default
+0004 ingress, the ADR 0002 TLS/exposed-gate, the ingress IP allowlist, and the ADR 0021 default-ON
 `connection_event` plumbing.
 
 ### D1 — A new listen source in `transports/`, registered like every other connector (NOT a route in `api/`)
@@ -186,9 +186,9 @@ The listener adds **no new security mechanism** — it inherits four:
    or its WP-15 reverse proxy (ADR 0002). This is a **per-inbound `settings` concern** (the secret from
    `env()`/`MEFOR_*`, never the TOML — ADR 0003 §1), shaped here as a follow-on knob, not the first slice
    (a loopback-bound webhook needs none).
-4. **The OFF-by-default `connection_event` log (ADR 0021 §7).** A pre-ingress HTTP failure (allowlist refuse,
+4. **The default-ON (per-inbound opt-OUT) `connection_event` log (ADR 0021 §7).** A pre-ingress HTTP failure (allowlist refuse,
    oversize body, malformed request, TLS-accept where a seam exists) emits a metadata-only `connection_event`
-   via the injected `on_connection_event` sink — the **same** OFF-by-default per-inbound
+   via the injected `on_connection_event` sink — the **same** default-ON, opt-OUT per-inbound
    `capture_connection_errors` plumbing, reusing `_make_connection_event_sink(ic)` and the fail-soft
    `_emit_event` pattern, with **no `store/` import in `transports/`**. The `kind` enum gains HTTP-shaped
    values (e.g. `frame_oversize` → an oversize body, `framing_error` → a malformed request) — scrubbed
@@ -220,30 +220,30 @@ The listener adds **no new security mechanism** — it inherits four:
 - **AC-1** — WHEN a peer POSTs a body to a bound inbound HTTP listener, THE SYSTEM SHALL decode it and hand it
   to the inbound's `InboundHandler` so it is committed to the **ingress** stage exactly as an MLLP message is
   (count-and-log: the received body is persisted before the HTTP response).
-  → `tests/test_http_source.py::test_post_body_enqueues_ingress`
+  → `tests/test_inbound_http_source.py::test_post_body_enqueues_ingress`
 - **AC-2** — WHEN the body is durably committed, THE SYSTEM SHALL return a `202`-style respond-with-receipt
   carrying the engine `message_id`, BEFORE any routing/transform/delivery runs.
-  → `tests/test_http_source.py::test_respond_with_receipt_on_ingress`
+  → `tests/test_inbound_http_source.py::test_respond_with_receipt_on_ingress`
 - **AC-3** — IF a routing/transform/delivery failure occurs AFTER the `202`, THEN THE SYSTEM SHALL NOT alter
   the already-returned HTTP status; the failure surfaces only as the message's `ERROR`/dead-letter disposition
   + AlertSink (the MLLP post-ACK semantics).
-  → `tests/test_http_source.py::test_post_ingress_failure_does_not_change_http_status`
+  → `tests/test_inbound_http_source.py::test_post_ingress_failure_does_not_change_http_status`
 - **AC-4** — WHERE an inbound HTTP listener binds off-loopback without TLS, THE SYSTEM SHALL refuse at start
   (the `check_http_tls_exposure` exposed-gate, ADR 0002 §0), isolating that connection (ADR 0031) without
   crashing the engine.
-  → `tests/test_http_source.py::test_exposed_without_tls_refused`
+  → `tests/test_inbound_http_source.py::test_exposed_without_tls_refused`
 - **AC-5** — WHERE `source_ip_allowlist` is set, WHEN a peer not on the list connects, THE SYSTEM SHALL refuse
   it fail-closed and (when `capture_connection_errors`) emit a metadata-only `connection_event`.
-  → `tests/test_http_source.py::test_ip_allowlist_refuse_and_connection_event`
+  → `tests/test_inbound_http_source.py::test_ip_allowlist_refuse_and_connection_event`
 - **AC-6** — WHEN the inbound declares `content_type=json`/`xml`/`text`, THE SYSTEM SHALL deliver a
   `RawMessage` to the Router/Handler; WHEN `hl7v2`, a `Message` (ADR 0004 — HTTP is just a carrier).
-  → `tests/test_http_source.py::test_content_type_selects_payload_object`
+  → `tests/test_inbound_http_source.py::test_content_type_selects_payload_object`
 - **AC-7** — WHEN the listener is stopped, THE SYSTEM SHALL close the listener, actively close established
   client connections, and bound `wait_closed()` (the `MLLPSource` #55 teardown discipline), without hanging.
-  → `tests/test_http_source.py::test_stop_is_bounded`
+  → `tests/test_inbound_http_source.py::test_stop_is_bounded`
 - **AC-8** — THE SYSTEM SHALL add **no** `api/` import to `transports/` and resolve the listener through
   `build_source` with no `pipeline/` special-casing (the one-way registry rule).
-  → `tests/test_architecture_layers.py::test_transports_does_not_import_api`
+  → `tests/test_dependency_boundaries.py::test_engine_packages_never_import_api_console_or_gui`
 
 ## Options considered
 
@@ -275,7 +275,7 @@ The listener adds **no new security mechanism** — it inherits four:
 **Positive** — Unblocks three queued items (#7 web-service listener, #20 inbound FHIR facade, #24 inbound
 DICOMweb STOW-RS) on **one** substrate, built and reviewed as a single connector. It is a faithful `MLLPSource`
 sibling, so it inherits the runner's supervision, per-connection IP allowlist, ADR 0002 TLS + exposed-gate,
-ADR 0031 fault isolation, and the ADR 0021 OFF-by-default `connection_event` log **for free** — and rides the
+ADR 0031 fault isolation, and the ADR 0021 default-ON `connection_event` log **for free** — and rides the
 ADR 0004 ingress, so the HL7 hot path and the disposition/count-and-log machinery are untouched. The hard
 response tension is **settled, not re-litigated**: respond-with-receipt mirrors the engine's existing
 ACK-on-receipt posture (cheap, correct, low-blast-radius), and the SOAP-reply path is a bounded, pre-scoped
@@ -313,14 +313,21 @@ on the intake socket** (API key / mTLS / bearer) is shaped but the first loopbac
   MLLP's synchronous AR/AE NAK.
 - [ ] **`check_http_tls_exposure`.** Confirm the exposed-gate sibling refuses a non-loopback HTTP listener
   without TLS at start (ADR 0002 §0), keyed off the same "exposed" predicate as MLLP/TCP.
-- [ ] **Request-auth model.** Decide the intake-socket auth (API key / mTLS client cert / bearer) and that its
+- [x] **Request-auth model.** Decide the intake-socket auth (API key / mTLS client cert / bearer) and that its
   secret rides `env()`/`MEFOR_*` (never the TOML), terminated at the listener or the WP-15 proxy — and whether
   any of it ships in the first slice or is a follow-on.
+  (Decided in [ADR 0154 §D6/§D7](0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md):
+  `intake_auth = none|api_key|bearer|mtls_subject`, default `none`, the secret `env()`-only at the factory —
+  a follow-on, not this ADR's first slice.)
 - [ ] **`connection_event` `kind` additions.** Confirm the HTTP-shaped pre-ingress `kind` values (oversize
   body, malformed request, allowlist refuse) added to the ADR 0021 §7 enum, scrubbed metadata only.
-- [ ] **SOAP follow-on gating.** Confirm the captured-reply (block-on-downstream) path is authorized
+- [x] **SOAP follow-on gating.** Confirm the captured-reply (block-on-downstream) path is authorized
   separately, reuses the ADR 0013 Increment-1 `response`/`DeliveryResponse` seam (NOT Increment 2 re-ingress),
   and bounds the HTTP block with a per-inbound timeout so a slow downstream can't pin a worker.
+  (Decided in [ADR 0154 §D1/§D3/§D4](0154-synchronous-captured-downstream-reply-and-intake-authentication-for-the-inbound-http-listener-adr-0023-deferred-tail.md):
+  the separate authorization; it returns only bytes from a **committed** ADR 0013 Increment-1 `response` row
+  via `correlate_response` — explicitly not Increment 2 re-ingress — bounded by the per-inbound
+  `reply_timeout` (default `30.0`).)
 - [ ] **Stdlib HTTP server choice.** Confirm a stdlib `asyncio` HTTP/1.1 reader (no new web-framework
   dependency) is sufficient for the body-POST + SOAP cases, with the malformed/oversize/slow-loris hardening
   the `MLLPDecoder` cap has an HTTP analog of.

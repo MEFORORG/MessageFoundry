@@ -196,3 +196,15 @@ surfacing and the `connection_stopped` alert. Reload stays fail-fast for the res
 check only runs at bind, so a below-threshold / not-deployed / auto-start-off connection is unaffected.
 The equivalent outbound (FileDestination) is out of scope here — it already `mkdir`s on write and has
 the on-demand `POST /connections/{name}/test` probe.
+
+**Follow-on (2026-08-03, BACKLOG #114) — the outbound rejects the option rather than ignoring it.**
+Because `File()`/`Sftp()`/`Ftp()` are single factories serving both directions, the option above could
+be *written* onto an outbound, where nothing reads it — accepted and silently ignored. That is now a
+**`WiringError` at bind** in `build_outbound_connection`, the one choke point both the code-first
+`outbound()` and the `connections.toml` loader (ADR 0007) pass through. Truthy-only, so the `False`
+the factories always write is unaffected and every outbound authored today builds byte-identically.
+The outbound *validation hook* itself (`DestinationConnector.validate_startup`) remains **out of
+scope** and deferred — note that the "on-demand test probe" workaround cited above is **inbound-only
+in effect**: `FileDestination.test_connection` → `_probe_dir_writable` and
+`RemoteFileDestination.test_connection` → `ensure_dir` both **create** the target directory, so on an
+outbound no shipped mechanism can distinguish "the directory exists" from "I just made it."

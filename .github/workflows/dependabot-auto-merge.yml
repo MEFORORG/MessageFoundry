@@ -12,6 +12,12 @@ name: Dependabot auto-merge
 #   - MINOR updates of DEV-only dependencies
 # OUT OF SCOPE (left for human review, surfaced same-day by the daily security cron + alerts):
 #   - MINOR/MAJOR updates of runtime deps, and ALL MAJOR updates
+#   NOTE the uv ecosystem is review-by-default in practice, not by exception: `python-deps` is
+#   `patterns: ["*"]`, so one weekly batch carries everything, and (a) a grouped update-type is the
+#   MAX across the batch (fetch-metadata's UPDATE_TYPES_PRIORITY) — one minor demotes every patch
+#   riding with it — while (b) the deny-list below names at least eight of this project's directly
+#   declared runtime deps and denies the WHOLE group on any hit. #66 was denied on `fastapi`.
+#   Auto-merge does fire for github-actions (#75, all-patch batch) and npm (#64).
 #
 # Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`
 # (routine updates age before a PR opens); SECURITY updates bypass cooldown by design, so a real
@@ -100,9 +106,8 @@ jobs:
       - name: Verify a published advisory backs the security track
         id: ghsa
         env:
-          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
           DEP_GROUP: ${{ steps.meta.outputs.dependency-group }}
-          PREV_VERSION: ${{ steps.meta.outputs.previous-version }}
+          DEPS_JSON: ${{ steps.meta.outputs.updated-dependencies-json }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -u
@@ -124,14 +129,34 @@ jobs:
           # Require at least one matching published (non-withdrawn) advisory for EVERY named dep at
           # the previous version. Query the global advisories endpoint (ecosystem pip — Python
           # advisories are pip-keyed). Fail closed on any error.
+          # fetch-metadata's scalar `previous-version` is ONE dependency's even on a grouped PR (#66:
+          # five deps, previous-version=0.7.0 — annotated-types'). Keying every name to it asks about
+          # versions the PR does not touch, and because most advisory ranges are open at the bottom, a
+          # low first-dep version makes almost every other name match: false confirmation in the
+          # PERMISSIVE direction (measured against the live endpoint at @0.7.0: aiohttp 30, pillow 29,
+          # urllib3 9, requests 6). `updated-dependencies-json` carries a per-dependency prevVersion.
+          pairs="$(printf '%s' "$DEPS_JSON" | jq -r '.[] | [.dependencyName, .prevVersion] | @tsv' 2>/dev/null || echo "ERR")"
+          if [ "$pairs" = "ERR" ] || [ -z "$pairs" ]; then
+            echo "::warning::no per-dependency metadata — failing closed (manual review)."
+            echo "advisory_ok=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           advisory_ok=true
-          IFS=',' read -ra names <<< "$DEP_NAMES"
-          for raw in "${names[@]}"; do
+          while IFS="$(printf '\t')" read -r raw prev; do
             name="$(echo "$raw" | tr '[:upper:]' '[:lower:]' | xargs)"
-            [ -z "$name" ] && continue
+            if [ -z "$name" ]; then continue; fi
+            # A non-first dependency can carry an EMPTY prevVersion — update_metadata.ts:101 falls back
+            # to '' for index > 0 when the PR body yields no "from" version. Unknown previous version
+            # means the advisory question cannot be asked, so DENY; skipping it would wave the dep
+            # through on a gate whose whole contract is to fail closed.
+            if [ -z "$prev" ]; then
+              echo "::warning::no previous version for '$name' — failing closed (manual review)."
+              advisory_ok=false
+              break
+            fi
             count="$(gh api -X GET /advisories \
               -f ecosystem=pip \
-              -f affects="${name}@${PREV_VERSION}" \
+              -f affects="${name}@${prev}" \
               --jq '[.[] | select(.withdrawn_at == null)] | length' 2>/dev/null || echo "ERR")"
             if [ "$count" = "ERR" ] || [ -z "$count" ]; then
               echo "::warning::advisory lookup failed for '$name' — failing closed (manual review)."
@@ -139,12 +164,12 @@ jobs:
               break
             fi
             if [ "$count" -lt 1 ]; then
-              echo "::warning::no published advisory covers '${name}@${PREV_VERSION}' — failing closed (manual review)."
+              echo "::warning::no published advisory covers '${name}@${prev}' — failing closed (manual review)."
               advisory_ok=false
               break
             fi
-            echo "::notice::published advisory confirmed for '${name}@${PREV_VERSION}'."
-          done
+            echo "::notice::published advisory confirmed for '${name}@${prev}'."
+          done <<< "$pairs"
           echo "advisory_ok=$advisory_ok" >> "$GITHUB_OUTPUT"
 
       - name: Enable auto-merge for in-scope updates

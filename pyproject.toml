@@ -48,9 +48,13 @@ dependencies = [
     "hl7>=0.4.5",           # python-hl7: fast, tolerant parsing for routing
     "pydantic>=2.6",        # channel config models / validation
     # CONSTRAINT PIN (transitive, via pydantic/fhir-core): annotated-types 0.8.0 dropped `SLOTS`,
-    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. CI installs with a
-    # FRESH resolve (uv pip install -e ".[dev,...]"), so it ignores the lock's annotated-types==0.7.0.
-    # Drop this cap once fhir-core supports 0.8.x, or once CI installs from the hashed lock.
+    # which fhir-core/fhir.resources import — every FHIR test ImportErrors on it. The cap bounds the
+    # RESOLVER, the only place it CAN be bounded: `uv lock` would otherwise choose 0.8.0 and every
+    # downstream artifact inherits it (uv.lock -> constraints.lock -> ci.yml's `--constraint`), which
+    # is exactly how PR #66 went red. It also binds every resolve CI does not constrain — an end user's
+    # `pip install messagefoundry[fhir]`, the local dev venv behind pre-commit, the dispatch-only
+    # workflow legs. Drop it once fhir-core ships a 0.8-compatible release — NOT once CI installs from
+    # the hashed lock; the lock carries whatever the resolver already chose.
     "annotated-types<0.8",
     "aiosqlite>=0.20",      # async SQLite for the message store/queue
     "fastapi>=0.137.1",     # localhost engine API
@@ -118,8 +122,10 @@ otel = ["opentelemetry-sdk>=1.20", "opentelemetry-exporter-otlp>=1.20"]
 # optional lxml extra and is deferred (JSON-only MVP) — never bare-parsed (ADR 0022 §6, Options #5).
 # annotated-types is CAPPED <0.8: fhir-core (dragged in by fhir.resources) imports the `SLOTS`
 # constant that annotated-types 0.8.0 REMOVED, so any fhir.resources parse dies with
-# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". It is a transitive dep, so the cap
-# lives here rather than in [project.dependencies] (pydantic, the other consumer, is fine on 0.8).
+# "ImportError: cannot import name 'SLOTS' from 'annotated_types'". Declared BOTH here and in
+# [project.dependencies]: this copy documents the consumer, the base copy is what bounds a plain
+# `pip install messagefoundry`. One Dependabot ignore entry covers both (it matches by package name,
+# not declaration site) — lift the ignore and both caps together.
 # Drop the bound once fhir-core ships a 0.8-compatible release.
 fhir = ["fhir.resources>=7.1.0", "fhirpathpy>=2.2.0", "annotated-types<0.8"]
 # DICOM (DIMSE C-STORE SCP/SCU) connectors + codec for parsing/dicom/ (ADR 0025, BACKLOG #24). Lazy-imported,
@@ -151,7 +157,7 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # (CVE-2026-26209, fixed in cbor2 5.9.0); <4 because the 2.x/3.x cbor2 ranges are disjoint and a bare
 # >= spec silently jumps majors on re-lock. Deliberate fallback line if 3.x regresses: 2.8.0
 # (cbor2>=5.6.5,<6 — a re-lock, never a bare >=2.8 spec). Net-new transitives (dep-vet 2026-07-03):
-# pyOpenSSL>=26.3.0 (maintenance-mode upstream; hard-caps cryptography<50 — kept OUT of core so
+# pyOpenSSL>=26.3.0 (maintenance-mode upstream; hard-caps cryptography<51 — kept OUT of core so
 # repo-wide cryptography upgrades stay uncoupled), cbor2>=6.1.2 (parses untrusted browser CBOR — its
 # advisory stream is WebAuthn-relevant supply chain; never let this floor drift down), and
 # pyasn1-modules>=0.4.2. pyasn1 rides in via ldap3 (0.6.3 was the CVE-2026-30922 decoder-DoS fix); the
@@ -164,13 +170,18 @@ webauthn = ["webauthn>=3.0.0,<4"]
 # HashiCorp Vault KeyProvider (ADR 0019 §3, BACKLOG #196): envelope-decrypt the store DEK via Vault
 # Transit. `hvac` is the OFFICIAL HashiCorp Vault Python client (Apache-2.0), named in ADR 0019 §3's
 # provider table. Lazy-imported (store/keyprovider_vault.py), so installs that never select
-# `[store].key_provider=vault` skip it and the base install still pulls ZERO Vault SDK. Floor >=2.3.0:
-# the current 2.x line (Python 3.8+, requests-based); a bare `>=` would silently jump a major on re-lock,
-# so keep the floor pinned to the 2.x series. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
+# `[store].key_provider=vault` skip it and the base install still pulls ZERO Vault SDK. Bounded
+# >=2.3.0,<3: the current 2.x line (Python 3.8+, requests-based). The cap is the half that was missing —
+# the prose already said "a bare `>=` would silently jump a major on re-lock", which is exactly what
+# `hvac>=2.3.0` was, so the intent was documented and unenforced. hvac fronts the store DEK (ADR 0019
+# §3), and CI never installs the [vault] extra, so a major arriving through a re-lock would reach a
+# release without a single test exercising it. Deliberately NOT mirrored by a Dependabot ignore entry:
+# auto-merge already routes majors to manual review, and an ignore would suppress hvac's security track
+# for no gain. Net-new transitives (dep-vet 2026-07-10): requests + urllib3
 # (both ubiquitous, mature; the lock resolves urllib3>=2.7.0 — CVE-2025-50181/50182 SSRF-redirect fixes)
 # plus charset-normalizer/idna/certifi. hvac ships NO type stubs — mypy-strict containment lives inside
 # store/keyprovider_vault.py (a targeted typed local), never a repo-wide ignore.
-vault = ["hvac>=2.3.0"]
+vault = ["hvac>=2.3.0,<3"]
 # The browser ops console ([api].serve_ui, ADR 0065) is a separately-versioned second wheel
 # (messagefoundry-webconsole, in packaging/messagefoundry-webconsole/) mounted same-origin in-process via
 # mount_ui. It is deliberately NOT declared as a [webconsole] extra yet: the wheel isn't published to an
@@ -182,10 +193,11 @@ dev = [
     "pytest-asyncio>=0.26",  # >=0.26 adds asyncio_default_test_loop_scope (BACKLOG #17 shared-loop fix)
     "pytest-timeout>=2.3",  # per-test watchdog: a hung test dumps stacks + fails fast in 60s, never wedges the leg
     "pytest-rerunfailures>=16.0",  # in-run auto-retry for the known harness-monitor timing flake: a single flake occurrence self-heals instead of reding the whole matrix + blocking auto-merge
-    # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag ~525
-    # findings in existing code. CI installs with a FRESH resolve (uv pip install -e ".[dev,...]"), so an
-    # unbounded ">=" silently adopts a new major lint baseline and reds every PR. Lift the cap in a
-    # deliberate PR that also clears the new findings.
+    # Pinned BELOW 0.16: ruff 0.16.0 turned on stricter defaults (RUF022/RUF100/BLE001) that flag
+    # hundreds of findings in existing code — at least ~870 on PR #66's ubuntu leg (whole-repo scope,
+    # 2026-08-01). An unbounded ">=" lets `uv lock` adopt that new baseline, and it flows out through
+    # uv.lock -> constraints.lock -> ci.yml's `--constraint`, plus every unconstrained resolve. Lift the
+    # cap in a deliberate PR that also clears the new findings.
     "ruff>=0.4,<0.16",
     "mypy>=1.10",
     # httpx (the ASGI test client for the API + harness/load polling) is now a BASE dependency, so it
@@ -256,7 +268,7 @@ messagefoundry-tray = "messagefoundry.tray.__main__:main"
 ci-scanners = [
     "bandit==1.9.4",
     "pip-audit==2.10.1",
-    "zizmor==1.5.2",
+    "zizmor==1.28.0",
 ]
 # The ADVISORY measurement tools (quality-advisory.yml). Exact where something PARSES the tool's
 # output, a floor where nothing does:

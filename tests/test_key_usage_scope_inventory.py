@@ -63,6 +63,8 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "WebAuthn credentials": "COSE PUBLIC keys supplied by the authenticator; the engine holds no "
     "private half and the row already says they are verification material, not a secret",
     "Config fingerprint": "a keyless content hash for change attribution",
+    "ASVS corpus pin": "a keyless content hash over a build input (the OWASP ASVS corpus file), "
+    "not a key, a secret, or a message authenticator",
     "Engine wheel attestation": "a keyless digest over the installed distribution, verified against "
     "a recorded value; no key is involved on either side",
     "AD transport": "a TLS hop whose key material is the OS/directory trust store, not engine-held",
@@ -72,6 +74,14 @@ _NOT_KEY_MATERIAL: dict[str, str] = {
     "the Cert tooling row)",
     "Tray → engine TLS": "a tokenless local TLS probe; no engine-held key",
     "Engine-shard lane ownership": "a coordination record, not cryptographic material",
+    "DAST scan-target credential": "a throwaway CSPRNG password for two ephemeral scan identities, "
+    "stored only as an argon2id hash in a temp-directory store the scan destroys; a credential is "
+    "not a key and it protects nothing",
+    "Inbound HTTP intake credential comparison": "keyless — SHA-256 digests of both sides compared "
+    "with hmac.compare_digest, which is a constant-time byte comparison and NOT a keyed MAC. The "
+    "digesting exists to make the comparison length-blind, not to authenticate anything. The "
+    "configured secret is an env()-sourced connector setting whose lifecycle is the rotation "
+    "schedule, not engine-held key material",
 }
 
 

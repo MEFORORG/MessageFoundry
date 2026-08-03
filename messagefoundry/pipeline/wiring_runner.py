@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import errno
 import functools
+import ipaddress
 import json
 import logging
 import time
@@ -34,10 +35,11 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from enum import Enum
+from enum import Enum, StrEnum
 from pathlib import Path
 from typing import Any, Protocol, cast
 
+from messagefoundry.auth.ratelimit import SlidingWindowRateLimiter
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.db_lookup import activated as db_lookup_activated
 from messagefoundry.config.fhir_lookup import (
@@ -65,11 +67,13 @@ from messagefoundry.config.models import (
     StallThreshold,
 )
 from messagefoundry.config.run_context import RunContext, run_contexts
-from messagefoundry.config.settings import EgressSettings, StoreBackend
+from messagefoundry.config.settings import DeliverySettings, EgressSettings, StoreBackend
 from messagefoundry.config.tls_policy import (
     HopPosture,
     TrustAnchorPolicy,
     active_hop_posture,
+    current_hop_posture,
+    is_loopback_hop_host,
 )
 from messagefoundry.config.wiring import (
     InboundConnection,
@@ -77,6 +81,7 @@ from messagefoundry.config.wiring import (
     PortConflictError,
     Registry,
     WiringError,
+    apply_sync_reply_capture_implication,
     bindings_overlap,
     inbound_binding_conflicts,
     resolve_env_settings,
@@ -118,6 +123,7 @@ from messagefoundry.pipeline.phase_timing import (
     DeliveryPhaseTiming,
     delivery_phase_timing_enabled,
 )
+from messagefoundry.pipeline.reply_wait import ReplyRendezvous
 from messagefoundry.pipeline.sandbox import SandboxMode, SandboxPolicy, SandboxSession
 from messagefoundry.pipeline.saturation import SaturationDetector
 from messagefoundry.pipeline.sharding import owner_shard_of_destination
@@ -126,6 +132,7 @@ from messagefoundry.pipeline.stage_dispatcher import (
     LaneResultKind,
     StageDispatcher,
 )
+from messagefoundry.pipeline.sync_reply import SyncReplyMetrics, SyncReplyResolverImpl
 from messagefoundry.redaction import safe_exc, safe_text
 from messagefoundry.store import (
     MessageStatus,
@@ -134,7 +141,7 @@ from messagefoundry.store import (
     Stage,
     StreamingAttachmentsUnsupported,
 )
-from messagefoundry.store.base import pool_over_provisioned_warning
+from messagefoundry.store.base import AuditStore, pool_over_provisioned_warning
 from messagefoundry.store.metadata import user_metadata
 from messagefoundry.transports import (
     DeliveryError,
@@ -144,7 +151,12 @@ from messagefoundry.transports import (
     build_destination,
     build_source,
 )
-from messagefoundry.transports.base import ConnectionEventSink
+from messagefoundry.transports.base import (
+    ConnectionEventSink,
+    IntakeAuditSink,
+    IntakeRateLimiter,
+    SyncReplyResolver,
+)
 from messagefoundry.transports.database import DatabaseLookupExecutor
 from messagefoundry.transports.fhir import FhirLookupExecutor
 from messagefoundry.transports.mllp import build_ack
@@ -158,6 +170,75 @@ log = logging.getLogger(__name__)
 # so a stable read-only share never churns the store.
 PROCESSED_FILE_LEDGER_TTL_SECONDS = 30 * 24 * 3600  # 30 days
 PROCESSED_FILE_LEDGER_KEEP_MAX = 100_000
+
+
+#: Peers whose successful authentication we remember, to exempt them from the GLOBAL failed-attempt
+#: arm (AC-19). Bounded so a churn of distinct source addresses cannot grow it without limit.
+_INTAKE_SUCCESS_KEEP_MAX = 10_000
+
+
+class _IntakeRateLimiter:
+    """Runner-side failed-attempt budget for an intake-authenticating source (ADR 0154 D6).
+
+    Two windows, deliberately:
+
+    * **per-peer** — bounds one address guessing a credential;
+    * **global** — bounds aggregate refusal volume, which matters because every refusal drives an
+      ``audit_log`` write that takes the store-wide lock.
+
+    **The global arm never refuses a peer that has already authenticated in this window** (AC-19).
+    ``SlidingWindowRateLimiter`` refuses on the global bucket *regardless of key*, so consulting it for
+    everyone would hand an attacker a denial-of-service against a legitimate partner: roughly one bad
+    request per second exhausts the shared budget, and the partner's valid message is then refused
+    ``429`` **pre-ingress**, where it is not even counted. That is exactly the silent-loss defect this
+    design exists to avoid, merely relocated from the per-peer arm to the global one.
+
+    Injected as a synchronous predicate, so ``transports/`` gains no ``auth/`` edge. In-process and
+    non-distributed: under HA only the leader binds (so it is effectively global), and under engine
+    sharding each shard counts separately, making the effective ceiling N x limit for N shards.
+    """
+
+    def __init__(self, *, per_peer: int, glob: int, window_seconds: float = 60.0) -> None:
+        self._window = window_seconds
+        self._per_peer = SlidingWindowRateLimiter(
+            per_key=per_peer, glob=0, window_seconds=window_seconds
+        )
+        self._global = (
+            SlidingWindowRateLimiter(per_key=0, glob=glob, window_seconds=window_seconds)
+            if glob
+            else None
+        )
+        self._succeeded: dict[str, float] = {}
+
+    def check(self, peer: str) -> bool:
+        # would_allow, never allow: consulting must not consume the budget, or a correctly
+        # authenticated partner's Nth request would be refused as though it had been guessing.
+        if not self._per_peer.would_allow(peer):
+            return False
+        if self._global is None or self._authenticated_recently(peer):
+            return True
+        return self._global.would_allow(peer)
+
+    def charge_failure(self, peer: str) -> None:
+        self._per_peer.allow(peer)
+        if self._global is not None:
+            self._global.allow(peer)
+
+    def note_success(self, peer: str) -> None:
+        now = time.monotonic()
+        if len(self._succeeded) >= _INTAKE_SUCCESS_KEEP_MAX:
+            cutoff = now - self._window
+            self._succeeded = {k: v for k, v in self._succeeded.items() if v > cutoff}
+        self._succeeded[peer] = now
+
+    def _authenticated_recently(self, peer: str) -> bool:
+        stamp = self._succeeded.get(peer)
+        if stamp is None:
+            return False
+        if time.monotonic() - stamp > self._window:
+            del self._succeeded[peer]
+            return False
+        return True
 
 
 class _StoreProcessedLedger:
@@ -361,6 +442,34 @@ _BIND_CONFLICT_ERRNOS = frozenset({errno.EADDRINUSE, errno.EADDRNOTAVAIL, errno.
 # fifo_claim_batch). OUTBOUND/RESPONSE are hard-1 (the dispatcher re-clamps; H2 atomicity + single-
 # outstanding-head retry semantics — exactly as ADR 0058 excludes them from batching).
 _PREFIX_STAGES = frozenset({Stage.INGRESS, Stage.ROUTED})
+
+
+class TeardownReason(StrEnum):
+    """Why :meth:`RegistryRunner._teardown_unsafe` is running (ADR 0157 C6).
+
+    SHUTDOWN — the historical single path (process stop, a failed start's unwind). Statement-for-
+    statement unchanged, and the ONLY value single-node SQLite can reach: the only DEMOTE caller is
+    ``Engine._stop_graph``, reachable only from ``_reconcile_graph``, which runs only under
+    ``is_clustered()`` — and ``[cluster].enabled`` is rejected on SQLite at config load.
+    DEMOTE — loss of leadership, racing a lease this node no longer holds. Dispatchers drain
+    cooperatively BEFORE any hard cancel, and both phases are bounded. An inbound that cannot stop
+    inside the budget is ABANDONED — not awaited, and not cancelled."""
+
+    SHUTDOWN = "shutdown"
+    DEMOTE = "demote"
+
+
+#: Share of the demotion budget given to the cooperative quiesce phase. Larger than the source
+#: share because quiesce overrun is the only one that can STRAND: a hard-cancelled serializer
+#: leaves rows INFLIGHT, whereas an abandoned listener is duplicate-direction.
+_DEMOTE_QUIESCE_SHARE = 0.7
+#: Used only if a caller passes no budget. Equals the stock 10/20/30 derivation; unreachable single-node.
+_DEMOTE_BUDGET_FALLBACK_SECONDS = 4.5
+#: How long start() waits for a PRIOR demotion's abandoned stops before cancelling them. Sized to
+#: 2x the client-shutdown grace because MLLP/TCP/X12/HTTP each consume that grace TWICE, serially,
+#: inside one stop() — a 1x bound would cancel in precisely the slow-but-healthy case it exists to
+#: settle, taking the ADR 0031 rebind-failure branch instead.
+_PENDING_STOP_SETTLE_SECONDS = 10.0
 
 
 def _peek_for_loopback(
@@ -657,6 +766,13 @@ class RegistryRunner:
     ) -> None:
         self.registry = registry
         self.store = store
+        #: ADR 0154 D3. One rendezvous per runner: the waiter and the capturing worker are the same
+        #: process by construction (under HA the graph runs on the leader only), so process-local is
+        #: the right scope. It carries no information — every signal is a latency hint and the waiter
+        #: re-reads the store — so a shard that never sees a signal is merely slower, never wrong.
+        self._reply_rendezvous = ReplyRendezvous()
+        #: Per-inbound sync-reply counters, exposed via sync_reply_metrics() (ADR 0154 D8).
+        self._sync_reply_metrics: dict[str, SyncReplyMetrics] = {}
         # ADR 0087 (#197) opt-in Router/Handler subprocess isolation. None or mode=off → in-process,
         # byte-identical, zero overhead (no session ever constructed). mode=subprocess → one PERSISTENT
         # worker child per inbound, built lazily on first dispatch (off the loop, inside the worker
@@ -762,6 +878,10 @@ class RegistryRunner:
         # against this map when a connector is built (a missing key fails loud — see resolve_env_settings).
         self._env_values: dict[str, Any] = dict(env_values or {})
         self._sources: dict[str, SourceConnector] = {}
+        # ADR 0157 Inc 4: inbound stop() tasks a DEMOTE abandoned when they overran the budget. Always
+        # EMPTY unless a demotion abandoned one, which is why every consumer sits behind a falsy-list
+        # guard and single-node never touches this list.
+        self._pending_source_stops: list[asyncio.Task[None]] = []
         self._destinations: dict[str, DestinationConnector] = {}
         # One delivery worker per outbound connection, addressable by name so a reload can
         # gracefully stop/swap a single connection's worker without touching its siblings.
@@ -1004,6 +1124,19 @@ class RegistryRunner:
         return self._running
 
     @property
+    def has_residual_state(self) -> bool:
+        """Anything still built after a teardown that did not complete (ADR 0157 D7).
+
+        Deliberately NOT the same expression as ``stop()``'s ``had_state``, and the two differences are
+        both load-bearing. It omits ``_running`` because this is asked precisely when ``_running`` is
+        already False (the ``finally`` in ``_teardown_unsafe`` clears it on every path, including a raise
+        or an outside cancel). It ADDS ``_dispatchers`` because they are cleared early in teardown, before
+        the destination ``aclose()`` / executor-shutdown awaits — so a cancel landing between those leaves
+        ``_dispatchers`` populated while the other three are not.
+        """
+        return bool(self._sources or self._workers or self._destinations or self._dispatchers)
+
+    @property
     def fusion_active(self) -> bool:
         """Whether ADR 0071 B5 thread-hop fusion is EFFECTIVELY active this run (SQL Server, pooled,
         pools+executors opened OK). False on every other backend/mode and when the flag is off — the
@@ -1144,6 +1277,101 @@ class RegistryRunner:
             )
 
         return _sink
+
+    def _intake_auth_enabled(self, ic: InboundConnection) -> bool:
+        return (
+            ic.spec.type is ConnectorType.HTTP
+            and str(ic.spec.settings.get("intake_auth") or "none") != "none"
+        )
+
+    def _make_intake_audit_sink(self, ic: InboundConnection) -> IntakeAuditSink | None:
+        """The per-inbound tamper-evident audit sink for intake-auth refusals (ADR 0154 D6).
+
+        ``None`` unless this inbound actually authenticates, so every other connection is
+        byte-identical. Unlike the ``connection_event`` sink this one **awaits** a store write: an
+        ``audit_log`` row is a hash chain and cannot be enqueued out of order. It is on the refusal
+        path only, never the accept path, so it cannot slow legitimate intake.
+
+        This is the engine's first internal writer of ``record_audit(client=)`` (ADR 0150), and the
+        column's "NULL means no client was in scope" docstring is exactly why: here one demonstrably is.
+        """
+        if not self._intake_auth_enabled(ic):
+            return None
+        # The runner holds its store as the narrower QueueStore; record_audit lives on AuditStore
+        # (Store = QueueStore + AuditStore + AuthStore), which all three shipped backends implement.
+        # Guarded rather than assumed, so a store without the audit plane degrades to the log +
+        # connection_event channels instead of raising on every refusal.
+        if not hasattr(self.store, "record_audit"):
+            return None
+        audit_store = cast(AuditStore, self.store)
+        name = ic.name
+
+        async def _sink(action: str, client: str | None, detail: str | None) -> None:
+            try:
+                await audit_store.record_audit(
+                    action, channel_id=name, client=client, detail=detail
+                )
+            except Exception as exc:  # fail-soft: an audit failure must not drop an HTTP client
+                log.warning("intake auth audit write failed: %s", safe_exc(exc))
+
+        return _sink
+
+    def _make_sync_reply_resolver(self, ic: InboundConnection) -> SyncReplyResolver | None:
+        """The per-inbound synchronous-reply resolver (ADR 0154 D2/D3), or ``None``.
+
+        ``None`` unless this inbound declares ``reply_from``, which is what keeps every other
+        connection on the shipped ``202`` path byte for byte (AC-8).
+
+        Also re-runs the cross-registry validation **here**, where ``[delivery]`` is resolved. The
+        offline arm in ``build_check_registry`` skips the effective ``ordering``/``max_attempts``
+        refusals whenever its caller could not supply those defaults, so this is the backstop that
+        makes them unconditional — a graph that would serialise every concurrent caller behind one
+        FIFO lane fails to start rather than degrading silently under load, and ADR 0031 isolates
+        that to this one connection.
+        """
+        if ic.spec.type is not ConnectorType.HTTP or not ic.spec.settings.get("reply_from"):
+            return None
+        check_http_sync_reply(
+            ic,
+            self.registry,
+            delivery=DeliverySettings(
+                ordering=self._ordering_default,
+                # The runner resolves an outbound's retry as `oc.retry or self._delivery_defaults`,
+                # so the inherited max_attempts is that default policy's — not a separate scalar.
+                retry_max_attempts=self._delivery_defaults.max_attempts,
+            ),
+        )
+        settings = ic.spec.settings
+        metrics = self._sync_reply_metrics.setdefault(ic.name, SyncReplyMetrics(ic.name))
+        return SyncReplyResolverImpl(
+            self.store,
+            self._reply_rendezvous,
+            destination=str(settings["reply_from"]),
+            timeout=float(settings.get("reply_timeout") or 30.0),
+            content_type=str(settings.get("reply_content_type") or "passthrough"),
+            on_timeout=str(settings.get("reply_on_timeout") or "504"),
+            metrics=metrics,
+        )
+
+    def sync_reply_metrics(self) -> dict[str, SyncReplyMetrics]:
+        """Per-inbound synchronous-reply counters, keyed by connection name (ADR 0154 D8).
+
+        The PUBLIC accessor the metrics exporter reads. api/metrics.py builds every family per scrape
+        from engine.store alone and has no view of the runner, while transports/ may not import api/
+        (AC-17) — so the counters live with the runner that owns the resolvers, and the exporter pulls
+        them through here rather than reaching into a private attribute.
+        """
+        return dict(self._sync_reply_metrics)
+
+    def _make_intake_rate_limiter(self, ic: InboundConnection) -> IntakeRateLimiter | None:
+        """The per-inbound failed-attempt budget, or ``None`` when both arms are disabled."""
+        if not self._intake_auth_enabled(ic):
+            return None
+        per_peer = int(ic.spec.settings.get("intake_auth_rate_limit") or 0)
+        glob = int(ic.spec.settings.get("intake_auth_rate_limit_global") or 0)
+        if not per_peer and not glob:
+            return None
+        return _IntakeRateLimiter(per_peer=per_peer, glob=glob)
 
     def _enqueue_connection_event(self, **fields: Any) -> None:
         """Non-blocking enqueue onto the drain queue (#46). On overflow drop the event + count it — a
@@ -1956,6 +2184,11 @@ class RegistryRunner:
             allow_insecure_bind=self._allow_insecure_bind,
             posture=self._hop_posture,
         )
+        # ADR 0154 D7, immediately after its confidentiality sibling and deliberately separate from it:
+        # check_http_tls_exposure returns early whenever tls is truthy, which is exactly the case an
+        # authentication requirement most needs to cover. No allow_insecure_bind is passed — a
+        # cleartext escape hatch does not get to waive authentication.
+        check_http_intake_auth(source_cfg, ic.name, posture=self._hop_posture)
         # #200 (ADR 0092): stamp the posture for the source build too (a DATABASE poll source keys its
         # weakened-TLS refusal on it), matching the exposure-check posture threading above.
         with active_hop_posture(self._hop_posture):
@@ -1969,6 +2202,19 @@ class RegistryRunner:
         # sniffing poll source (RemoteFileSource) reads it to gate its HL7-header quarantine to hl7v2
         # drops only, so a legitimate X12/DICOM/binary drop is not wrongly rejected.
         source.content_type = ic.content_type
+        # Inject the intake-auth seams (ADR 0154 D6) the same runtime way. Both are None unless this
+        # inbound actually authenticates, so every other connection stays byte-identical. The audit
+        # sink keeps transports/ store-free; the limiter is a SYNCHRONOUS predicate, so transports/
+        # gains no auth/ edge either — pipeline/ owns both, which is the only layer allowed to.
+        source.on_intake_audit = self._make_intake_audit_sink(ic)
+        source.intake_rate_limiter = self._make_intake_rate_limiter(ic)
+        # ADR 0154 D2: the resolver that lets the listener return bytes out of the store while
+        # transports/ imports neither store/ nor pipeline/ (AC-17). None unless this inbound declares
+        # reply_from, so every other connection keeps the shipped 202 path byte for byte.
+        source.sync_reply = self._make_sync_reply_resolver(ic)
+        if source.sync_reply is not None:
+            # ADR 0154 D5/AC-10: stop() wakes blocked turns through this BEFORE closing writers.
+            source.reply_drain = self._reply_rendezvous.drain
         # Inject the process-in-place dedup ledger (#142): a store-backed adapter keyed to THIS inbound, so
         # a leave-in-place (after_read='leave') File/RemoteFile source records/skips files it has ingested
         # by a HASHED key. Every other source ignores it (byte-identical); transports/ stays store-agnostic
@@ -2168,6 +2414,15 @@ class RegistryRunner:
         async with self._reload_lock:
             if self._running:
                 return
+            if self._sources or self._workers or self._destinations or self._dispatchers:
+                # ADR 0157 D7: a prior teardown raised or was cancelled from outside, so _running is
+                # False (the finally) but the built state survives. Building on top of it would leave
+                # orphaned listeners bound — and _start_inbound_unsafe's `if name in self._sources:
+                # return` would silently skip EVERY rebind — plus two dispatchers per stage claiming one
+                # lane, the per-lane FIFO hazard the single-consumer invariant exists to close.
+                # Idempotent, and structurally unreachable after a clean stop, so single-node never
+                # enters it.
+                await self._teardown_unsafe(TeardownReason.SHUTDOWN)
             self._stop.clear()
             # Capture the engine loop so a handler's worker thread can bridge a db_lookup back onto it.
             self._loop = asyncio.get_running_loop()
@@ -2263,7 +2518,9 @@ class RegistryRunner:
                 # is isolated above) must not leave half the graph wired with _running still False:
                 # unwind everything we started so the listeners are released and a retry can rebind (M-8).
                 log.exception("wiring start failed; unwinding the partial start")
-                await self._teardown_unsafe()
+                # Explicitly SHUTDOWN (ADR 0157): a partial start is not a demotion — there is no lease
+                # being handed over, so there is nothing to bound and no reason to abandon a listener.
+                await self._teardown_unsafe(TeardownReason.SHUTDOWN)
                 raise
             self._running = True
             # #147 (ADR 0095): spawn one active-window scheduler task per SCHEDULED connection. Each
@@ -2331,21 +2588,222 @@ class RegistryRunner:
         session = self._sandbox_sessions.get(name)
         if session is None:
             env = self._sandbox_config_source[1] if self._sandbox_config_source else None
-            session = SandboxSession(policy, config_dir=cfg_dir, env=env)
+            # The engine's code-set tables travel once per spawn in the boot frame (not per dispatch),
+            # so the child serves exactly what mode=off would rather than its own re-read of codesets/.
+            session = SandboxSession(
+                policy, config_dir=cfg_dir, env=env, code_sets=self.registry.code_sets
+            )
             self._sandbox_sessions[name] = session
         return session
 
-    async def stop(self) -> None:
+    async def stop(
+        self,
+        *,
+        reason: TeardownReason = TeardownReason.SHUTDOWN,
+        budget_seconds: float | None = None,
+    ) -> None:
+        """Stop the graph. ``reason`` is keyword-only with a SHUTDOWN default, so all ~170 existing
+        ``runner.stop()`` call sites across the engine, the tests and the harness are unchanged and
+        behave identically (ADR 0157 C6)."""
         async with self._reload_lock:  # serialize against an in-flight reload (no torn-down state)
             had_state = self._running or bool(self._sources or self._workers or self._destinations)
-            await self._teardown_unsafe()
+            await self._teardown_unsafe(reason, budget_seconds=budget_seconds)
+            if reason is TeardownReason.SHUTDOWN and self._pending_source_stops:
+                # Never orphan a task at loop close. Under DEMOTE we deliberately leave them running —
+                # settling them is start()'s job, at the next promotion.
+                await self._settle_pending_source_stops()
             if had_state:
-                log.info("wiring stopped")
+                log.info("wiring stopped")  # UNCHANGED string on the SHUTDOWN path
 
-    async def _teardown_unsafe(self) -> None:
+    async def _stop_sources_demote(self, budget: float) -> None:
+        """DEMOTE-only bounded, CONCURRENT source stop (ADR 0157 Inc 4 / D6). NEVER raises.
+
+        ONE phase-level deadline over ALL tasks — not a per-source timeout under a semaphore, which
+        would cost ``ceil(N/C) x budget`` (~63s at the 1,500-connection target against an ~8s margin).
+
+        ``asyncio.wait`` is the primitive, NOT ``wait_for``: it never cancels its awaitables, so
+        "abandon, do not cancel" is a property of the call itself rather than of one ``asyncio.shield``
+        token a later edit can silently drop.
+
+        Tasks are created eagerly, outside any gate. The four ``asyncio.start_server`` sources
+        (MLLP/TCP/X12/HTTP) call ``server.close()`` in their SYNCHRONOUS prologue, so accept stops on
+        the first loop pass after task creation — before this ``wait``'s timeout can fire, even at
+        budget 0.0 — and the expensive part is only the client drain. Note the precise claim:
+        ``create_task`` merely SCHEDULES, so nothing runs until we suspend on the ``wait`` below; do not
+        insert anything between them.
+
+        Abandonment is safe for those four. It is NOT safe for DICOM, which releases its port inside
+        ``await to_thread(server.shutdown)`` — an abandoned DICOM stop can still hold the port at
+        re-promotion. File/RemoteFile/Database/Timer only set an Event, but each is leader-gated and
+        parks on that Event, so an abandoned one finishes at most its single in-flight scan.
+
+        The bound is applied HERE, at the call site — never by editing a transport constant, which would
+        make ``transports/`` know about clustering (the one-way dependency rule).
+        """
+        # A PREVIOUS demotion's stops have had a whole leadership term; cancel them rather than
+        # accumulating a generation per flap. Generation-scoped, so no arbitrary count cap is needed.
+        for stale in self._pending_source_stops:
+            stale.cancel()
+        self._pending_source_stops = []
+        sources = list(self._sources.items())  # snapshot BEFORE the first await
+        if not sources:
+            return
+        tasks = [asyncio.create_task(src.stop(), name=f"demote-stop:{n}") for n, src in sources]
+        _done, still = await asyncio.wait(tasks, timeout=max(0.0, budget))
+        for task in _done:
+            if not task.cancelled() and task.exception() is not None:
+                log.warning("demotion: an inbound stop() failed: %s", task.exception())
+        if still:
+            self._pending_source_stops = list(still)
+            for task in still:
+                task.add_done_callback(self._reap_pending_stop)
+            log.warning(
+                "demotion: %d inbound listener(s) did not stop within %.2fs and were ABANDONED "
+                "(their listening sockets are already closed; the client drain finishes in the "
+                "background and is settled at the next promotion). The node is NOT quiescent — a "
+                "message mid-handler still finishes its commit and its ACK, which count-and-log "
+                "requires; the successor drains the body.",
+                len(still),
+                budget,
+            )
+
+    async def _quiesce_workers_demote(self, budget: float) -> None:
+        """per_lane parity for the pooled quiesce (ADR 0157 Inc 5). NEVER raises.
+
+        These loops are ``while not self._stop.is_set()`` and ``_stop`` was set at the top of teardown,
+        so they exit on their own once the CURRENT claimed prefix resolves. ``asyncio.wait`` never
+        cancels and never raises on timeout; the existing cancel + gather below remains the fallback.
+
+        No-op in pooled mode: all FOUR dicts are empty there, because ``_ensure_inbound_workers``
+        returns early under ``pooled`` and ``_spawn_worker`` is a documented pooled no-op.
+
+        MUST run ABOVE the source phase, or per_lane workers keep issuing post-demotion terminal writes
+        for the whole source phase.
+        """
+        live = [
+            task
+            for task in (
+                *self._workers.values(),
+                *self._router_workers.values(),
+                *self._transform_workers.values(),
+                *self._response_workers.values(),
+            )
+            if not task.done()
+        ]
+        if live:
+            await asyncio.wait(live, timeout=max(0.0, budget))
+
+    async def _quiesce_dispatchers_demote(self, budget: float) -> None:
+        """DEMOTE-only cooperative dispatcher stop (ADR 0157 Inc 5). NEVER raises. No-op in per_lane.
+
+        ``d.stop()`` cancels the lane serializers, and a cancelled serializer leaves its claimed prefix
+        INFLIGHT BY DESIGN. On Postgres that is latency; on SQL Server there is no periodic in-flight
+        recovery at all. So on the one path we KNOW is handing over, drain first: a serializer allowed
+        to reach its terminal transition leaves ZERO rows INFLIGHT — its tail is ``release_claimed``'d,
+        its faulting head ``reschedule_claimed``'d, and a claimed OUTBOUND head that has not sent hits
+        the pre-send bail and re-pends un-errored.
+
+        ``stop()`` still runs unconditionally afterwards: it is BOTH the state-clearing path AND the
+        hard-cancel fallback, so there is exactly ONE dispatcher teardown to keep correct, not two.
+        """
+        if not self._dispatchers:
+            return
+        dispatchers = list(self._dispatchers.values())  # held across an await
+        drained = await asyncio.gather(
+            *(d.quiesce(budget) for d in dispatchers), return_exceptions=True
+        )
+        if any(result is not True for result in drained):
+            log.warning(
+                "demotion: %d of %d stage dispatcher(s) did not drain within %.2fs — hard "
+                "cancelling. Their claimed rows stay INFLIGHT: bounded on Postgres by "
+                "reclaim_expired_leases, but on SQL Server recovered ONLY by the successor's "
+                "on-promotion reset_stale_inflight — so if no node takes over, they strand.",
+                sum(1 for result in drained if result is not True),
+                len(dispatchers),
+                budget,
+            )
+        await asyncio.gather(*(d.stop() for d in dispatchers), return_exceptions=True)
+        self._dispatchers.clear()
+
+    def _reap_pending_stop(self, task: asyncio.Task[None]) -> None:
+        """Retrieve an abandoned stop's exception, else asyncio logs 'never retrieved' at GC."""
+        if task in self._pending_source_stops:
+            self._pending_source_stops.remove(task)
+        if not task.cancelled() and task.exception() is not None:
+            log.warning(
+                "demotion: an abandoned inbound stop() ended with an error: %s", task.exception()
+            )
+
+    async def _settle_pending_source_stops(self) -> None:
+        """Join a prior demotion's abandoned stops, BOUNDED — and the bound is mandatory.
+
+        This runs inside ``_reload_lock``, which ``reload()``, ``stop()``, the per-connection
+        start/stop/restart and every ``/connections`` handler also take. An unbounded join would
+        therefore wedge re-promotion, engine shutdown and the connection API for as long as a wedged
+        File/Database ``stop()`` runs (those gather with no cancel and no timeout).
+
+        On timeout we cancel and proceed: a failed rebind is isolated per connection (ADR 0031,
+        operator-recoverable), whereas refusing to re-promote strands the whole graph — and
+        strand-direction is forbidden.
+        """
+        pending = [task for task in self._pending_source_stops if not task.done()]
+        self._pending_source_stops = []
+        if not pending:
+            return
+        _done, still = await asyncio.wait(pending, timeout=_PENDING_STOP_SETTLE_SECONDS)
+        for task in still:
+            task.cancel()
+        if still:
+            await asyncio.gather(*still, return_exceptions=True)
+            log.warning(
+                "%d abandoned inbound stop(s) did not finish within %.1fs and were cancelled; a "
+                "rebind of those ports may fail (isolated per connection, ADR 0031)",
+                len(still),
+                _PENDING_STOP_SETTLE_SECONDS,
+            )
+
+    async def _teardown_unsafe(
+        self,
+        reason: TeardownReason = TeardownReason.SHUTDOWN,
+        *,
+        budget_seconds: float | None = None,
+    ) -> None:
         """Tear down all sources/workers/destinations and mark stopped. Lock-free (callers hold
         _reload_lock) and idempotent — cleans up whatever is registered even if the runner never
-        reached _running, so a half-started runner (review M-8) and a double stop() are both safe."""
+        reached _running, so a half-started runner (review M-8) and a double stop() are both safe.
+
+        ``reason`` (ADR 0157 C6) selects the SOURCE + DISPATCHER phases only; every other phase, and
+        their order, is shared. Under SHUTDOWN the executed statements are today's, verbatim.
+
+        **THE INVARIANT: ``self._running = False`` must execute on every path.**
+        ``Engine._reconcile_graph``'s bring-up branch is ``is_leader() and not running``, so a teardown
+        that returns or raises without clearing it makes this node **un-re-promotable, silently, with no
+        exception**. Two mechanisms enforce it: every DEMOTE bound is absorbed at its own call site (a
+        timeout CONTINUES the sequence rather than unwinding it — unwinding would skip the worker
+        cancel, the destination aclose and every ``.clear()``), and the ``finally`` below.
+
+        The ``finally`` is a BACKSTOP, **not** a licence to wrap this coroutine in ``wait_for`` from
+        OUTSIDE: a cancelled teardown still leaves ``_sources`` populated, which is why ``start()``
+        re-runs teardown on residual state and ``_reconcile_graph`` carries a ``has_residual_state``
+        branch (ADR 0157 D7).
+        """
+        demote = reason is TeardownReason.DEMOTE
+        budget = (
+            max(
+                0.0,
+                budget_seconds if budget_seconds is not None else _DEMOTE_BUDGET_FALLBACK_SECONDS,
+            )
+            if demote
+            else 0.0
+        )
+        try:
+            await self._teardown_body(demote, budget)
+        finally:
+            self._running = False
+
+    async def _teardown_body(self, demote: bool, budget: float) -> None:
+        """The teardown sequence itself. Split out ONLY so the ``finally`` above contains no await —
+        an external cancel therefore cannot interrupt the one statement that must always run."""
         self._stop.set()
         # #147 (ADR 0095): cancel the active-window scheduler tasks FIRST so no schedule tick calls
         # start/stop_inbound/outbound while the rest of teardown runs (a task blocked awaiting the reload
@@ -2362,19 +2820,32 @@ class RegistryRunner:
         # here would notify_work() dispatchers we are about to stop.
         if self._claim_mode != "pooled":
             self._wake_all(Stage.INGRESS, Stage.ROUTED, Stage.RESPONSE, Stage.OUTBOUND)
-        for source in self._sources.values():
-            await source.stop()
-        # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
-        # listener can no longer mark_ready an already-cleared dispatcher — NOT right after _stop.set().
-        # The shared _stop already broke their loops; d.stop() cancels each claimer/sweep/lane task +
-        # timer and clears its state, then we drop the dict. A cancelled serializer leaves its claimed
-        # rows INFLIGHT for reset_stale_inflight (crash-safety) — never released. Empty in per_lane mode,
-        # so this is a no-op there and the per_lane worker cancel/gather below is unchanged.
-        if self._dispatchers:
-            await asyncio.gather(
-                *(d.stop() for d in self._dispatchers.values()), return_exceptions=True
-            )
-            self._dispatchers.clear()
+        if demote:
+            # ADR 0157 Inc 5: DEMOTE INVERTS the ADR 0066 D3 order below, deliberately. Egress is the
+            # split-brain-relevant action, so its budget must start NOW rather than after the source
+            # phase. A listener staying up for those milliseconds is CORRECT under count-and-log (its
+            # ACKed message is durable at the ingress stage, PENDING and never INFLIGHT, and the
+            # successor drains it), and a listener wake into an already-cleared dispatcher is a verified
+            # no-op (_wake_lane returns on `is None`) — which is what D3 exists to guarantee, and what
+            # makes the inversion safe.
+            await self._quiesce_workers_demote(budget * _DEMOTE_QUIESCE_SHARE)
+            await self._quiesce_dispatchers_demote(budget * _DEMOTE_QUIESCE_SHARE)
+            await self._stop_sources_demote(budget * (1.0 - _DEMOTE_QUIESCE_SHARE))
+        else:
+            for source in self._sources.values():
+                await source.stop()
+            # ADR 0066 D3 ordering: stop the pooled dispatchers AFTER the sources are stopped — so a
+            # listener can no longer mark_ready an already-cleared dispatcher — NOT right after
+            # _stop.set(). The shared _stop already broke their loops; d.stop() cancels each
+            # claimer/sweep/lane task + timer and clears its state, then we drop the dict. A cancelled
+            # serializer leaves its claimed rows INFLIGHT for reset_stale_inflight (crash-safety) —
+            # never released. Empty in per_lane mode, so this is a no-op there and the per_lane worker
+            # cancel/gather below is unchanged.
+            if self._dispatchers:
+                await asyncio.gather(
+                    *(d.stop() for d in self._dispatchers.values()), return_exceptions=True
+                )
+                self._dispatchers.clear()
         inbound_tasks = (
             *self._router_workers.values(),
             *self._transform_workers.values(),
@@ -2475,7 +2946,8 @@ class RegistryRunner:
         # ADR 0071 B5: reset the fusion degraded gauge so a start()-after-stop() begins clean (the
         # executors + pools were already torn down above; _fusion_active reset there too).
         self._fusion_pool_open_failed = False
-        self._running = False
+        # NOTE: `self._running = False` is NOT here — it moved into _teardown_unsafe's `finally`
+        # (ADR 0157 D7) so a raised or cancelled teardown still leaves this node re-promotable.
 
     # --- outbound worker management ------------------------------------------
 
@@ -3831,7 +4303,10 @@ class RegistryRunner:
                     items = [head] if head is not None else []
                 else:
                     # UNORDERED lanes are intentionally NOT lane-owned — concurrent draining across
-                    # nodes is fine, so claim_ready stays unchanged.
+                    # nodes is fine for ORDERING. That is a statement about lane ownership, not about
+                    # who may claim at all: claim_ready is leader-epoch fenced like every other claim
+                    # path (ADR 0157 C5), so a superseded ex-leader draining an unordered lane claims
+                    # nothing.
                     items = await self.store.claim_ready(
                         limit=self.claim_limit, destination_name=name
                     )
@@ -3996,21 +4471,38 @@ class RegistryRunner:
         # ONLY, but leadership can be lost (a self-fence) BETWEEN claiming this row and the
         # send below. A cheap, SYNCHRONOUS is_leader() read (cached state — no DB round-trip)
         # closes that narrow window: a node that has stopped being leader must not emit egress
-        # as a stale ex-leader. We do NOT drop the row — re-queue it via the existing retry
-        # (mark_failed → PENDING with backoff) so the new leader delivers it (count-and-log,
-        # REL-4). This is a cheap fast-path guard, NOT the authority: the durable backstop is
+        # as a stale ex-leader.
+        #
+        # RELEASE the claim (attempts--, next_attempt_at UNCHANGED, no last_error) rather than
+        # mark_failed: losing leadership is NOT a delivery failure and must not spend a retry.
+        # Under a finite RetryPolicy.max_attempts, mark_failed here re-reads the claim's own
+        # attempts++ and dead-letters on `attempts >= max_attempts` — writing terminal DEAD on a
+        # row that was NEVER SENT. The new leader never sees a DEAD row, so that is a STRAND,
+        # which the count-and-log invariant forbids (duplication is permitted; loss is not).
+        # release_claimed is guarded `status='inflight'`, so it is idempotent if the row already
+        # resolved.
+        #
+        # Then STOP the lane rather than resolving it: a demoted node must stop claiming, and a
+        # release without a stop would hot-spin — release applies no backoff, so the row is
+        # immediately due again — for however long teardown takes, which is not bounded against
+        # the fence-to-expiry margin (ADR 0157 F2). _teardown_unsafe clears the dispatchers and
+        # workers and start() rebuilds them, so promotion re-arms the lane; a STOPPED lane never
+        # outlives the term that stopped it.
+        #
+        # This is a cheap fast-path guard, NOT the authority: the durable backstop is
         # H1's store-checked leader_epoch fence, which rejects a superseded ex-leader's claim
         # at the DB inside the claim transaction even if this in-memory check raced. On the
         # single-node NullCoordinator is_leader() is always True, so this never fires and the
         # delivery path is byte-identical.
         if not self._coordinator.is_leader():
-            retry_until = await self._mark_failed_and_arm(
+            await self.store.release_claimed([item.id])
+            log.warning(
+                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+                "un-errored (no attempt spent) and stopped the lane for the new leader",
                 name,
-                item.id,
-                "leadership lost before send; re-queued for the new leader",
-                retry,
+                1,
             )
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.STOPPED, None
         try:
             if self._simulate.get(name, False):
                 # Shadow / parallel-run (#15): suppress the real egress entirely — no bytes/
@@ -4151,6 +4643,27 @@ class RegistryRunner:
                 )
                 if self._delivery_phase_timing:
                     self._delivery_phase_stats.record_mark_done(time.perf_counter_ns() - _done_t0)
+                # ADR 0154 D3 — the latency hint, and its POSITION is the correctness argument.
+                #
+                # Strictly after the await returned NORMALLY. Under SQLite group commit
+                # complete_with_response enrols in a shared batch whose future resolves post-commit,
+                # so a signal here is committed-authoritative; in a `finally`, or before the await,
+                # it would fire on a transaction that may have rolled back.
+                #
+                # It is only ever a hint — the woken turn re-reads the store — so both ways it can be
+                # "wrong" are harmless: it can fire for a vanished row that wrote nothing
+                # (complete_with_response returns normally in that case), and it can fail to fire at
+                # all when an engine shard other than the listener's owns this lane. The first costs
+                # one extra read; the second costs latency, never correctness.
+                #
+                # NOT placed beside the _wake_lane below, which is where the ADR says to put it: that
+                # call is nested under `if reingress_to is not None`, and a reply_from outbound never
+                # re-ingresses, so a hint there would be unreachable dead code.
+                # destination_name is NULL on ingress/routed rows and set on outbound ones, so it is
+                # non-None everywhere this path runs — but the type says otherwise, and a hint keyed
+                # on None would silently match nothing rather than fail, so the guard is explicit.
+                if item.destination_name is not None:
+                    self._reply_rendezvous.signal(item.message_id, item.destination_name)
                 if reingress_to is not None:
                     # B12 (ADR 0061): CROSS-LANE — wake the loopback's RESPONSE lane
                     # (reingress_to), NOT this delivery worker's own OUTBOUND lane.
@@ -4232,11 +4745,19 @@ class RegistryRunner:
             await self._maybe_alert_buildup(name)
             await self._maybe_alert_stall(name)
             return _ItemOutcome.PROCESSED, retry_until
+        # L1 batch twin — see the single-item path for the full rationale. Same reasoning, and the
+        # stakes are higher here: mark_batch_failed decides ONE disposition from the head's
+        # attempts and applies it to all N, so a finite retry cap dead-letters the whole batch on a
+        # leadership change, un-sent.
         if not self._coordinator.is_leader():
-            retry_until = await self._mark_batch_failed_and_arm(
-                name, ids, "leadership lost before send; re-queued for the new leader", retry
+            await self.store.release_claimed(ids)
+            log.warning(
+                "delivery worker %r: leadership lost before send; released %d claimed row(s) "
+                "un-errored (no attempt spent) and stopped the lane for the new leader",
+                name,
+                len(ids),
             )
-            return _ItemOutcome.PROCESSED, retry_until
+            return _ItemOutcome.STOPPED, None
         # Frame + send inside ONE try so a FRAMING error (an unparseable / non-HL7 head member — MLLP is
         # payload-agnostic, ADR 0004, so a non-hl7v2 feed can reach here) routes to the internal-error
         # policy below (dead-letter / STOP) instead of stranding every claimed row INFLIGHT forever with
@@ -5745,6 +6266,7 @@ def build_check_registry(
     reserved_bindings: Sequence[tuple[str, str, int]] = (),
     posture: HopPosture | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct (and discard) every **deployed** connector in ``registry`` + run the fail-closed
     connect/egress allowlists, so a bad connector spec or a non-allowlisted host fails as a
@@ -5782,7 +6304,7 @@ def build_check_registry(
         # so it need not run inside the scope.
         with active_hop_posture(posture):
             _build_check_connectors(
-                registry, inbound_bind_host, env_values, egress, trust_anchor_policy
+                registry, inbound_bind_host, env_values, egress, trust_anchor_policy, delivery
             )
     except WiringError:
         raise
@@ -5796,6 +6318,7 @@ def _build_check_connectors(
     env_values: Mapping[str, Any],
     egress: EgressSettings,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    delivery: DeliverySettings | None = None,
 ) -> None:
     """Construct-and-discard every DEPLOYED connector + run the connect/egress allowlists (the body of
     :func:`build_check_registry`, split out so the whole block runs inside the ``active_hop_posture``
@@ -5815,11 +6338,25 @@ def _build_check_connectors(
     nothing. The fail-loud guarantee is UNCHANGED for a deployed connection: a missing ``env()`` value on
     one still raises here, which is exactly the promote-time gate ("a graph whose env keys aren't defined
     for the target never goes live")."""
+    # ADR 0154 D4: normalise the graph BEFORE validating it, so the passthrough content-type rule
+    # below sees the implied header rather than refusing the ADR's own headline shape. Idempotent.
+    apply_sync_reply_capture_implication(registry)
     for ic in registry.inbound.values():
         if not ic.deployed:
             continue
         source_cfg = _source_config(ic, inbound_bind_host, env_values)
         check_source_allowed(source_cfg, ic.name, egress)
+        # ADR 0154 D4's cross-registry arm: reply_from's target must exist, be deployed, capture
+        # responses, and resolve to a lane that can actually serve concurrent callers.
+        check_http_sync_reply(ic, registry, delivery=delivery)
+        # ADR 0154 D7's parallel offline arm. The runner-side call in _start_inbound_unsafe does NOT
+        # fire at `messagefoundry check`, so without this a config that refuses to start would pass
+        # the commit/CI gate and only fail at serve. Same predicate, and posture-keyed the same way:
+        # the ADR describes this arm as running "without a posture", but that is not true of the
+        # source — build_check_registry takes one and `messagefoundry check` passes the real derived
+        # posture, which active_hop_posture has stamped around this whole loop. Warning-only here
+        # would leave this gate weaker at check time than every posture-keyed neighbour.
+        check_http_intake_auth(source_cfg, ic.name, posture=current_hop_posture())
         build_source(source_cfg)
     # The whole config's Loopback inbounds — NOT just this process's. Under engine sharding (ADR 0073)
     # `registry.inbound` holds only this shard's inbounds while EVERY shard keeps every outbound, so a
@@ -6058,26 +6595,49 @@ def check_lookup_allowed(name: str, settings: Mapping[str, Any], egress: EgressS
             )
 
 
-def _check_smart_token_url_egress(
+# Every settings key naming a SECOND egress host that the HTTP family POSTs **credentials** to — a
+# host distinct from the data ``url`` the caller's own gate already checks. Each one must ride the
+# same ``[egress].allowed_http`` allowlist or it is a fail-open credential-exfiltration hole: the
+# allowlist would gate the data host while the credential leaves for anywhere.
+#
+# ADD A KEY HERE when a new credential-bearing endpoint setting is introduced. That is the whole
+# maintenance contract — both call sites iterate this table, so a new key is gated on both arms at
+# once and cannot repeat the DELTA-04 drift (one arm gated, the other not).
+_CREDENTIAL_EGRESS_URL_KEYS: tuple[tuple[str, str], ...] = (
+    # ADR 0024 — the connector POSTs a signed ``client_assertion`` here.
+    ("smart_token_url", "SMART token endpoint"),
+    # ADR 0126 — the client-credentials grant POSTs ``client_id`` + ``client_secret`` here, either as
+    # form fields or as a Basic header (``transports/http_auth.py`` ``_fetch_token``). Ungated until
+    # 2026-07-31: the scheme was constrained to http(s) and nothing else, so a crafted
+    # ``oauth2_token_url`` exfiltrated the client credentials to any host while ``[egress]
+    # .allowed_http`` gated only the data URL. Found re-scoring ASVS 14.2.3.
+    ("oauth2_token_url", "OAuth2 token endpoint"),
+)
+
+
+def _check_credential_token_url_egress(
     label: str, settings: Mapping[str, Any], allowed_http: list[str]
 ) -> None:
-    """Gate a SMART Backend Services token endpoint (ADR 0024): the connector POSTs the signed
-    ``client_assertion`` there, so a crafted ``smart_token_url`` pointing at an un-allowlisted host
-    would exfiltrate the assertion (a fail-open hole). Shared by the FHIR **outbound** and the
-    **FhirLookup** read arm so the two never drift out of lockstep — DELTA-04 was exactly that drift
-    (the read arm gated only ``url``). Only REST/FHIR/FhirLookup carry the key; an unset value is a
-    no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
-    token_url = str(settings.get("smart_token_url", ""))
-    if token_url and not _http_egress_allowed(token_url, allowed_http):
-        host = urllib.parse.urlsplit(token_url).hostname or ""
-        log.warning(
-            "egress denied: %s SMART token endpoint host %r not in [egress].allowed_http",
-            label,
-            host,
-        )
-        raise WiringError(
-            f"{label}: SMART token endpoint host {host!r} is not in the [egress].allowed_http allowlist"
-        )
+    """Gate every credential-bearing token endpoint on an HTTP-family connection against
+    ``[egress].allowed_http`` — see :data:`_CREDENTIAL_EGRESS_URL_KEYS` for the keys and why each one
+    carries a secret. A crafted token URL pointing at an un-allowlisted host would exfiltrate the
+    credential (a fail-open hole), so this is checked at config load/reload/start alongside the data
+    host. Shared by the FHIR/REST **outbound** and the **FhirLookup** read arm so the two never drift
+    out of lockstep — DELTA-04 was exactly that drift (the read arm gated only ``url``). An unset key
+    is a no-op. Call only when ``allowed_http`` is non-empty (matching the host gate's own guard)."""
+    for key, what in _CREDENTIAL_EGRESS_URL_KEYS:
+        token_url = str(settings.get(key, "") or "")
+        if token_url and not _http_egress_allowed(token_url, allowed_http):
+            host = urllib.parse.urlsplit(token_url).hostname or ""
+            log.warning(
+                "egress denied: %s %s host %r not in [egress].allowed_http",
+                label,
+                what,
+                host,
+            )
+            raise WiringError(
+                f"{label}: {what} host {host!r} is not in the [egress].allowed_http allowlist"
+            )
 
 
 def check_fhir_lookup_allowed(
@@ -6106,10 +6666,11 @@ def check_fhir_lookup_allowed(
             raise WiringError(
                 f"FhirLookup {name!r}: host {host!r} is not in the [egress].allowed_http allowlist"
             )
-        # The SMART token endpoint (ADR 0024) is a SECOND egress host on this read arm — gate it with
-        # the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
-        # with_smart_backend()) exfiltrates the signed client_assertion to an unlisted host (DELTA-04).
-        _check_smart_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
+        # Every credential-bearing token endpoint is a SECOND egress host on this read arm — gate
+        # each with the same allowlist as the FHIR outbound, or a crafted smart_token_url (set via
+        # with_smart_backend()) exfiltrates the signed client_assertion, and a crafted
+        # oauth2_token_url exfiltrates client_id + client_secret, to an unlisted host (DELTA-04).
+        _check_credential_token_url_egress(f"FhirLookup {name!r}", settings, egress.allowed_http)
 
 
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1", "::ffff:127.0.0.1"})
@@ -6208,6 +6769,198 @@ def check_http_tls_exposure(
         "cleartext risk on a trusted, firewalled network (refused even with the flag on a "
         "production-PHI instance — set tls_hop_attested=true if the segment is secured by other means)."
     )
+
+
+#: Minimum prefix length an entry of ``source_ip_allowlist`` must carry before it counts as an
+#: effective peer control (ADR 0154 D7). Generous on purpose — ``/8`` admits ``10.0.0.0/8``, a
+#: legitimate private scope — but it excludes ``0.0.0.0/0`` and ``::/0``, which allow-list the entire
+#: internet while reading, in a config file, exactly like a restriction.
+_INTAKE_ALLOWLIST_MIN_PREFIX_V4 = 8
+_INTAKE_ALLOWLIST_MIN_PREFIX_V6 = 32
+
+
+def _has_effective_peer_control(settings: Mapping[str, Any]) -> bool:
+    """Whether this HTTP listener actually requires a peer to be someone in particular.
+
+    **Strength-based, not presence-based.** Each of the obvious presence tests has a trivially
+    worthless satisfying instance: ``source_ip_allowlist = ["0.0.0.0/0"]`` parses fine and restricts
+    nobody, and ``tls`` + ``tls_ca_file`` means *"any certificate this CA ever signed"* — no subject
+    binding at all. A gate satisfied by controls that authenticate nobody is theatre, so a
+    configuration that fails this test is treated exactly as one with no control, and is not given a
+    softer landing for having a control that does not work.
+    """
+    mode = str(settings.get("intake_auth") or "none")
+    if mode in ("api_key", "bearer"):
+        return bool(settings.get("intake_api_key"))
+    if mode == "mtls_subject":
+        # The subject list is what tls_ca_file alone does not give you.
+        return bool(settings.get("tls_ca_file")) and bool(settings.get("intake_client_subjects"))
+
+    allowlist = settings.get("source_ip_allowlist")
+    if not allowlist:
+        return False
+    for entry in allowlist:
+        try:
+            net = ipaddress.ip_network(str(entry), strict=False)
+        except ValueError:
+            return False  # unparseable: cannot be shown to restrict anyone, so it does not count
+        floor = (
+            _INTAKE_ALLOWLIST_MIN_PREFIX_V4 if net.version == 4 else _INTAKE_ALLOWLIST_MIN_PREFIX_V6
+        )
+        if net.prefixlen < floor:
+            return False  # ONE too-wide entry defeats the whole list
+    return True
+
+
+def check_http_sync_reply(
+    ic: InboundConnection,
+    registry: Registry,
+    *,
+    delivery: DeliverySettings | None = None,
+) -> None:
+    """Cross-registry refusals for a ``reply_from`` inbound (ADR 0154 D4).
+
+    These are the facts one ``Http()`` call cannot know, because they are about the *other*
+    connection. Runs with no store, so it fires at ``messagefoundry check`` and in dry-run exactly as
+    at serve.
+
+    The ``ordering``/``max_attempts`` pair is the subtle one, and both are refusals rather than
+    warnings because together they make the feature's headline use case unserviceable. ``ordering``
+    resolves to **FIFO**, which drains one message at a time and blocks the head on failure — so N
+    concurrent HTTP callers do not get N concurrent downstream calls; they serialise behind a single
+    lane bounded by one partner round-trip, and one transiently-failing head message holds that lane
+    until an operator purges it, timing out **every** concurrent and subsequent caller.
+    ``max_attempts`` resolves to retry-forever, which is not merely incoherent with "the caller gave
+    up 30 seconds ago" — it is a total outage with a config-shaped cause.
+
+    **Both are read as EFFECTIVE values, never declared ones.** ``OutboundConnection.ordering``
+    defaults to ``None`` meaning *inherit*, and ``retry`` defaults to no ``RetryPolicy`` object at
+    all; resolution against ``[delivery]`` happens in the runner. A literal ``ordering == FIFO`` test
+    would therefore pass cleanly for the overwhelmingly common shape — the exact shape this refusal
+    exists to catch. When ``delivery`` is not supplied the caller could not resolve them either, so
+    that arm is **skipped rather than guessed**; the runner re-checks at start, where the resolved
+    values always exist.
+    """
+    settings = ic.spec.settings
+    reply_from = settings.get("reply_from")
+    if not reply_from:
+        return
+    name, target = ic.name, str(reply_from)
+
+    oc = registry.outbound.get(target)
+    if oc is None:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names unknown outbound {target!r} — a "
+            "synchronous reply can only come from an outbound declared in this graph"
+        )
+    if not oc.deployed:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which is declared "
+            "deployed=False — it will never run, so every HTTP turn could only time out"
+        )
+    if not oc.spec.settings.get("capture_response"):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, which does not set "
+            "capture_response=True — with no captured reply there is nothing to return, and every "
+            "call would block until reply_timeout"
+        )
+
+    # apply_sync_reply_capture_implication has already added content-type for any factory that HAS
+    # the allow-list. One that does not cannot echo a content type at all, so refuse here rather than
+    # let it surface as an AttributeError deep in the capture path.
+    if (
+        settings.get("reply_content_type") == "passthrough"
+        and "capture_response_headers" not in oc.spec.settings
+    ):
+        raise WiringError(
+            f"inbound connection {name!r}: reply_content_type='passthrough' needs {target!r} to "
+            "capture the partner's content-type, but that connector has no "
+            "capture_response_headers setting — pin a literal MIME type on reply_content_type "
+            "instead"
+        )
+
+    if ic.ack_after is AckAfter.DELIVERED:
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from cannot be combined with ack_after='delivered' "
+            "— the HTTP turn already blocks on the downstream reply, so deferring the receipt too "
+            "would mean waiting for the same delivery twice"
+        )
+
+    if delivery is None:
+        return  # the caller could not resolve [delivery]; the runner re-checks at start
+
+    if (oc.ordering or delivery.ordering) is OrderingMode.FIFO:
+        declared = oc.ordering.value if oc.ordering else "unset, inheriting [delivery].ordering"
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE ordering is "
+            f"FIFO (declared: {declared}). A FIFO lane drains one message at a time and blocks the "
+            "head on failure, so concurrent HTTP callers serialise behind a single partner "
+            "round-trip and one stuck message times out every caller — set ordering=UNORDERED on "
+            "that outbound"
+        )
+
+    effective_attempts = (
+        oc.retry.max_attempts if oc.retry is not None else delivery.retry_max_attempts
+    )
+    if effective_attempts is None:
+        declared = (
+            "no retry policy, inheriting [delivery].retry_max_attempts"
+            if oc.retry is None
+            else "max_attempts=None"
+        )
+        raise WiringError(
+            f"inbound connection {name!r}: reply_from names {target!r}, whose EFFECTIVE max_attempts "
+            f"is unset — retry forever (declared: {declared}). Retrying forever is incoherent with a "
+            "caller that gave up seconds ago; set a finite max_attempts so a failed delivery "
+            "dead-letters instead of holding the lane"
+        )
+
+
+def check_http_intake_auth(source: Source, name: str, *, posture: HopPosture | None = None) -> None:
+    """Peer-control gate (ADR 0154 D7): refuse an **off-loopback HTTP listener with no effective peer
+    control** — no sufficiently narrow ``source_ip_allowlist``, no ``intake_auth``, and no
+    ``mtls_subject`` binding. Refuses under an enforcing PHI posture, warns otherwise.
+
+    **A separate function, never folded into :func:`check_http_tls_exposure`.** That gate returns early
+    the moment ``tls`` is truthy — precisely the case an authentication requirement most needs to
+    cover. ``Http(port=..., tls=True, tls_cert_file=...)`` on ``0.0.0.0`` therefore binds a PHI intake
+    socket today with no peer identity requirement at all, and passes every gate.
+
+    **The composition rule, stated once: TLS is confidentiality; intake auth is authentication.**
+    Enabling auth is never an argument for relaxing the exposed gate, and TLS being on is never a
+    reason to skip auth. ``check_http_tls_exposure`` is unchanged and unweakened by this.
+
+    **It ignores ``allow_insecure_bind`` entirely** — note the deliberate signature divergence from its
+    four siblings. Handing a *cleartext* escape hatch the power to also waive *authentication* is a
+    category error, so this gate is posture-keyed only. ``posture is None`` (a direct or embedding
+    call) warns rather than refusing: a new refusal must not start firing for un-postured callers.
+
+    A raise is a :class:`WiringError`, so ADR 0031 degrades that one connection rather than the engine.
+    Loopback binds start byte-identical (ADR 0148 GIVEN 1).
+    """
+    if source.type is not ConnectorType.HTTP:
+        return
+    host = str(source.settings.get("host", "127.0.0.1"))
+    # CIDR-aware, and it treats an empty host as loopback — which matches HttpSource's own
+    # `s.get("host") or "127.0.0.1"` fallback. Reused rather than minting another _LOOPBACK_HOSTS
+    # frozenset; the tree already carries five same-named copies across two distinct contents.
+    if is_loopback_hop_host(host):
+        return
+    if _has_effective_peer_control(source.settings):
+        return
+
+    detail = (
+        f"inbound connection {name!r} binds non-loopback host {host!r} with no effective peer "
+        "control: anyone who can reach the socket can submit a message. Set intake_auth "
+        "(api_key/bearer with intake_api_key, or mtls_subject with tls_ca_file + "
+        "intake_client_subjects), or narrow source_ip_allowlist so every entry is at least a "
+        f"/{_INTAKE_ALLOWLIST_MIN_PREFIX_V4} (IPv4) or /{_INTAKE_ALLOWLIST_MIN_PREFIX_V6} (IPv6). "
+        "Note that tls + tls_ca_file alone does NOT satisfy this: it accepts any certificate that CA "
+        "ever signed, which binds no subject. TLS is confidentiality; this gate is authentication."
+    )
+    if posture is not None and posture.enforcing and posture.is_phi:
+        raise WiringError(detail)
+    log.warning("%s (warned, not refused: this instance is not an enforcing PHI posture)", detail)
 
 
 def check_dimse_tls_exposure(
@@ -6401,10 +7154,13 @@ def check_egress_allowed(dest: Destination, egress: EgressSettings) -> None:
                 f"outbound {dest.name!r}: {dest.type.value} host {host!r} is not in the "
                 "[egress].allowed_http allowlist"
             )
-        # ADR 0024: the SMART Backend Services token endpoint is a SECOND egress host — the connector
-        # POSTs the signed client_assertion there — so gate it with the same allowlist. Shared helper,
-        # so the FhirLookup read arm in check_fhir_lookup_allowed stays in lockstep (DELTA-04).
-        _check_smart_token_url_egress(f"outbound {dest.name!r}", dest.settings, egress.allowed_http)
+        # Credential-bearing token endpoints are SECOND egress hosts — the connector POSTs the signed
+        # client_assertion (ADR 0024) or client_id + client_secret (ADR 0126) there — so gate each
+        # with the same allowlist. Shared helper, so the FhirLookup read arm in
+        # check_fhir_lookup_allowed stays in lockstep (DELTA-04).
+        _check_credential_token_url_egress(
+            f"outbound {dest.name!r}", dest.settings, egress.allowed_http
+        )
     elif dest.type is ConnectorType.DATABASE and egress.allowed_db:
         host = str(dest.settings.get("server", ""))
         port = dest.settings.get("port", 1433)

@@ -63,7 +63,15 @@ connect_batch = 50
 connect_batch_pause_s = 0.05
 poll_interval_s = 1.0
 drain_timeout_s = 300.0
-base_port = 2600
+# Inbound MLLP base. The N inbound ports occupy [base_port, base_port + count), and the shape guard
+# (harness/config/connscale/_shape.py) fails loud when that block overlaps the sink port range. A base
+# of 2600 spanned 2600..3623 at N=1024 and collided with the single-box default `--sink-port 2700` at
+# EVERY count above (the block reaches 2700 from 101 connections on); it also straddles RDP 3389 on a
+# Windows bench box (docs/benchmarks/results/2026-07-06-adr0071-b5-throughput/environment.txt:39).
+# 20000 puts the band at [20000, 21023] — clear of both, clear of the two-box `--sink-base 40000`
+# band, and matching the shardcert/multishard `--inbound-base` default. If you pass `--sink-port`,
+# keep it outside [20000, 21023].
+base_port = 20000
 transform = "cheap"
 # The A/B is about steady-state batched-handoff throughput, not reload latency — leave wall #5 off.
 reload_probe = false

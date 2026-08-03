@@ -429,6 +429,9 @@ harness process only.)
 - **State a load-bearing fact ONCE and link to it; never restate it.**
 - **A completeness claim is a liability — prefer "at least" to an enumeration.**
 - **A compensating control must not rest on a false premise.**
+- **Confirm your instrument answers the question you asked, not one adjacent to it** — `git diff` on a
+  staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job* conclusion for a *step*
+  question. Name the question and what the tool returns; check they are the same sentence.
 
 ---
 
