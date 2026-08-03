@@ -157,7 +157,7 @@ xml = ["lxml>=6.0.0", "xmlschema>=4.0.0", "signxml>=4.0.0"]
 # (CVE-2026-26209, fixed in cbor2 5.9.0); <4 because the 2.x/3.x cbor2 ranges are disjoint and a bare
 # >= spec silently jumps majors on re-lock. Deliberate fallback line if 3.x regresses: 2.8.0
 # (cbor2>=5.6.5,<6 — a re-lock, never a bare >=2.8 spec). Net-new transitives (dep-vet 2026-07-03):
-# pyOpenSSL>=26.3.0 (maintenance-mode upstream; hard-caps cryptography<50 — kept OUT of core so
+# pyOpenSSL>=26.3.0 (maintenance-mode upstream; hard-caps cryptography<51 — kept OUT of core so
 # repo-wide cryptography upgrades stay uncoupled), cbor2>=6.1.2 (parses untrusted browser CBOR — its
 # advisory stream is WebAuthn-relevant supply chain; never let this floor drift down), and
 # pyasn1-modules>=0.4.2. pyasn1 rides in via ldap3 (0.6.3 was the CVE-2026-30922 decoder-DoS fix); the
