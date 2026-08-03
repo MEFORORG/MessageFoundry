@@ -135,6 +135,84 @@ def test_the_interstitial_page_carries_no_destination_url_to_post_back() -> None
     assert 'action="/ui/oidc/start"' in r.text  # posts back to us, carrying nothing
 
 
+def test_a_cross_site_post_to_the_start_leg_is_refused() -> None:
+    """⛔ ASVS 3.5.1 — the assertion the rest of this file could not make.
+
+    Every other test here sends NO `Sec-Fetch-*` headers, so the origin guard never fires and they
+    would all pass just as happily with it deleted. This one supplies the header a real browser sends
+    on a cross-site form submission and asserts the 403.
+
+    Why it matters specifically to 3.7.3: the GET/POST split moved flow-minting behind a POST, and a
+    cross-site `<form method=post>` is still `Sec-Fetch-Mode: navigate` — so the navigate check does
+    NOT stop it. Without the origin guard the split relocates the drive-by sign-in hole rather than
+    closing it, which is what the first version of this change did while claiming otherwise.
+    """
+    c = _client(
+        organization_domains=("hospital.example",),
+        oidc_authorization_host="login.microsoftonline.com",
+    )
+    r = c.post(
+        "/ui/oidc/start", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert r.status_code == 403
+
+
+def test_a_same_origin_post_is_not_refused_by_the_guard() -> None:
+    """Reach control. Without it, a guard that 403s EVERYTHING would pass the test above."""
+    c = _client(
+        organization_domains=("hospital.example",),
+        oidc_authorization_host="login.microsoftonline.com",
+    )
+    r = c.post(
+        "/ui/oidc/start", headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert r.status_code != 403
+
+
+def test_a_cross_site_GET_renders_the_interstitial_and_stages_nothing() -> None:
+    """The GET is deliberately NOT origin-guarded, and the reason is worth stating precisely.
+
+    An external page CAN link here and get our interstitial rendered. That is acceptable because the
+    page is **side-effect free**: no flow is staged, no cookie is set, nothing is minted, and the only
+    way onward is a Continue button that POSTs — and the POST *is* guarded (see the two tests above).
+    So a drive-by can cause a harmless page to render; it cannot cause a sign-in to start.
+
+    ⚠️ Asserted here rather than left implicit because the first version of this change claimed the
+    split "closed the standing hole where any external page could start a federated sign-in by linking
+    here". Half true: the LINK no longer starts one. What actually closes it is the origin guard on
+    the POST, not the split.
+    """
+    c = _client(
+        organization_domains=("hospital.example",),
+        oidc_authorization_host="login.microsoftonline.com",
+    )
+    r = c.get(
+        "/ui/oidc/start", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert r.status_code == 200
+    assert "leaving" in r.text.lower()
+    assert not r.cookies  # nothing staged
+
+
+def test_a_cross_site_GET_with_an_INTERNAL_idp_is_refused() -> None:
+    """⛔ The asymmetry, asserted so it cannot be forgotten.
+
+    With an internal IdP there is no interstitial, so the GET delegates straight to the minting leg —
+    and inherits its origin guard. The consequence a reader needs: for an INTERNAL-IdP deployment the
+    GET still mints a flow, exactly as before this change. The bounded-flow-cache DoS lever is closed
+    for external IdPs (where the interstitial interposes) and is merely ORIGIN-GUARDED for internal
+    ones. The earlier claim that the split closed it outright was too broad.
+    """
+    c = _client(
+        organization_domains=("hospital.example",),
+        oidc_authorization_host="adfs.hospital.example",
+    )
+    r = c.get(
+        "/ui/oidc/start", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
+    )
+    assert r.status_code == 403
+
+
 @pytest.mark.parametrize("method", ["get", "post"])
 def test_both_start_legs_exist(method: str) -> None:
     """The GET renders, the POST acts. Losing either silently breaks sign-in or the control."""

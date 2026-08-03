@@ -216,7 +216,11 @@ def leaving_site(
         el("p", el("a", "Cancel", href=cancel_href), class_="muted"),
         class_="card",
     )
-    return page("Leaving this site", body, nav=Markup(""))
+    # ASVS 7.4.4: `nav=Markup("")` would suppress the shared chrome AND its sign-out control,
+    # stranding a signed-in operator on a page with no way out. `minimal_nav()` is what the
+    # sibling interstitial (`oidc_landing`) uses for exactly this reason. The first version of
+    # this page used the bare Markup("") and was wrong.
+    return page("Leaving this site", body, nav=minimal_nav())
 
 
 def sso_challenge() -> Markup:
