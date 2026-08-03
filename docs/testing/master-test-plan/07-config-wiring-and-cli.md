@@ -1,0 +1,385 @@
+[← Master Test Plan index](../MASTER-TEST-PLAN.md) · *Part II — Subsystem chapters*
+
+---
+
+## 6. Configuration, Wiring & CLI
+
+**ID prefix:** `CFG` · **Surface:** CLI + engine (loader/settings), with IDE and infra legs
+· **Primary risk:** the shipped adopter gate `messagefoundry check` is executed by **no engine CI leg**, so a regression that makes it exit 0 on a broken or posture-refused config ships green — and the settings loader silently drops unknown sections/keys, so a mistyped or mis-sectioned security switch is believed on and is off.
+
+### 6.1 Scope & objectives
+
+This chapter covers the **configuration bundle and the command-line surface that reads, writes and gates it**:
+
+- **Code-first wiring loader + `Registry`** — `load_config` ([`messagefoundry/config/wiring.py:3793`](messagefoundry/config/wiring.py)), `validate_config` (`:4213`), `Registry` (`:2779`), the `_*` helper-module skip and the `_SiblingHelperFinder` restricted to `_`-prefixed names (`:3729`, SEC-019 / CWE-427).
+- **Config-source trust** — POSIX group/world-writable + foreign-owner refusal (`wiring.py:4147`, `:4124`) and the Windows NTFS-DACL guard (`_evaluate_config_dacl:3889`, `_assert_safe_config_source_windows:3917`, ADR 0036), plus the `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` dev escape (`settings.py:244/247`).
+- **`connections.toml` config-as-data (ADR 0007)** — the read path (`connections_file.py:156/273`, `_TRANSPORTS:70`), the comment-preserving write path (`connections_edit.py:161/202/349/363`), the `connection list|upsert|remove|schema` CLI (`__main__.py:3788`), the `connection schema` form contract (`connection_schema.py:56`), and the console→TOML `flagged` write seam (ADR 0007 amendment).
+- **Service settings** — precedence CLI > env(`MEFOR_*`) > toml > default (`settings.py:4128`), the `MEFOR_<SECTION>_<KEY>` parser (`:3777`) against `_SECTIONS` (`:109`), the ADR 0118 `[security]` desugar + relocated-key rejection (`:3861`, `:3848`), secrets-in-file warning (`:3789`), and `extra="ignore"` tolerance (`ServiceSettings:3623`).
+- **Environments + deferred `env()`** — `environments/<env>.toml` + `MEFOR_VALUE_*` overlay (`environments.py`), `EnvRef` inline-table decode and bounded casts (`wiring.py:195/226`), fail-loud-at-build resolution (`wiring.py:563`).
+- **Single project-root anchoring (ADR 0050)** — `anchor.py` (`resolve_project_root`, `anchor_under_root`, `graph_references_env`), the offline anchor trio on `validate`/`graph`/`dryrun`/`check` (`__main__.py:754/783`), the AC-3 scoped fail-loud (`:846`), and the drive-relative member guard.
+- **The `messagefoundry check` gate** — 5 **required** checks (`validate`, `dryrun`, `posture`, `build-check`, `reference-backend`) and 9 **advisory** checks (`cleartext-accepted`, `ruff`, `mypy`, `ruff-security`, `raise-fstring`, `accepts-candidate`, `dead-config`, `send-target`, `handler-security`), assembled in `run_checks` (`checks.py:109`, roster at `:132-188`); the ADR 0144 handler-security lint (`:863`) with `--strict-handler-security` / `--handler-security-allow`.
+- **`messagefoundry init` scaffold** (`scaffold.py:353/370`) including the generated adopter CI workflow.
+- **The full CLI surface** — the 30 subcommands in `_DISPATCH` (`__main__.py:4302`) and their flags.
+- **The ADR 0076 typed action vocabulary** (`actions.py`, 15 pure `Message` helpers) and the **lens Steps backend** (`lens.py:270/285/1406/1423`) that the VS Code Steps view consumes.
+
+**Explicitly NOT in scope here.** *Promotion, publishing, config reload and environment targeting belong to the **PUB** chapter* — `POST /config/reload`, the IDE Stage→Promote flow, the promote pre-flight and env-aware targeting are cross-referenced, never re-planned here. Also out of scope and owned elsewhere:
+
+| Adjacent area | Owner |
+|---|---|
+| On-box `verify` acceptance (host/store/smoke/manual), saved-report sign-off | `docs/testing/WIN2025-TEST-PLAN.md` `W25:S1.2`–`W25:S1.5`, `W25:S6.3` |
+| Service-account file ACLs on the config dir as a human-closed row | `W25:S1.AC-ACL` / W25 matrix A6 |
+| Per-backend `MEFOR_*` PowerShell env blocks for the W2025 box | `W25:S5.2` |
+| Per-subcommand CLI behaviour already audited | `docs/testing/FEATURE-COVERAGE-PLAN.md` §22 rows `FCP:CLI-1`..`FCP:CLI-32` |
+| Config subsystem coverage audit (wiring core, source trust, code sets, fingerprint/provenance, lifecycle seams, Corepoint import) | FEATURE-COVERAGE-PLAN §21 rows `FCP:CFG-1`..`FCP:CFG-23` (a **different** ID space from this chapter's `CFG-nn`) |
+| Store internals, transports, API/auth, sandbox runtime | their own chapters |
+
+**Objectives.** (1) Put the shipped gate under an engine CI leg and pin its contract. (2) Make every settings switch either reachable-and-tested or loudly unreachable. (3) Close the config-as-data and anchoring asymmetries that let an edit pass a gate and fail at `serve`. (4) Give the IDE Steps contract a drift guard. (5) Reconcile the stale status sources this plan otherwise inherits.
+
+### 6.2 Already covered — do not re-test
+
+| Evidence | What it proves |
+|---|---|
+| `tests/test_wiring.py` (33) + `tests/test_load_config.py` (15) | loader/`Registry`, inbound→router resolution, port-collision and duplicate-name detection, world-writable and foreign-owner refusal |
+| `tests/test_sibling_helper_finder.py` | SEC-019 / CWE-427 — the finder serves only `_`-prefixed siblings, so a config-dir `os.py`/`ssl.py` cannot shadow the stdlib |
+| `tests/test_config_source_trust.py` (15) | the `_evaluate_config_dacl` policy matrix (Everyone / Authenticated Users / BUILTIN Users RX vs modify, foreign SID, NULL DACL, DENY ACE), the win32 refuse / warn-with-escape / owner-only-loads paths, and fail-open-on-API-error |
+| `tests/test_connections_file.py` (27) | ADR 0007 desugar, unknown transport/key/router refusal, `env()` casts, inbound host-guard reuse, `ack_after=delivered` refusal on the TOML arm, shipped sample loads, read↔write key parity (`test_write_schema_matches_read_schema_per_direction`) |
+| `tests/test_connections_cli.py` (13), `test_connections_roundtrip.py` (11), `test_connections_trivia.py` (7) | upsert/remove, validate-before-persist rollback, egress-deny block, hand-comment survival, byte-idempotent second upsert, unknown-key rejection writes nothing |
+| `tests/test_connection_schema.py` (13) | `connection schema` output is set-equal to `_TRANSPORTS` and to `_INBOUND_KEYS`/`_OUTBOUND_KEYS`; secret flags, `env()` capability, JSON-safe defaults |
+| `tests/test_connection_flag.py` | ADR 0007 amendment AC-1/AC-2 — the flag persists through the comment-preserving writer; 409 on a code-first connection |
+| `tests/test_settings.py` (100) | CLI > env > file > default precedence, per-section validators, cluster/dr/backup/auth/logging/store cross-field refusals |
+| `tests/test_checks_gate_parity.py` (2) | ADR 0118 AC-7 — the `[security]` desugar never loosens a shipped `serve` refusal, and `checks.py` mirrors `serve`'s posture fail-closed |
+| `tests/test_environments.py` (24) + `tests/test_active_environment.py` | value-file load, `MEFOR_VALUE_*` overlay wins, lower-case key folding + collision warning, nested-table ignore, `base_dir` resolution |
+| `tests/test_config_anchoring.py` (25) | ADR 0050 AC-1..AC-5, AC-7, AC-8 — root precedence, relative/absolute members, fail-loud with `env()` refs, CWD-mismatch and NSSM warnings, drive-relative guard, malformed `<env>.toml` clean error at `serve` |
+| `tests/test_cli_offline_resolution.py` (8) | AC-6 — the anchor trio on all four offline subcommands, explicit `--service-config` wins, upward-walk suppressed under `--project-root`, custom `[environments].dir` honoured |
+| `tests/test_checks.py` (38) | clean/broken config exit codes, dryrun gating + feed-subdir pinning + not-deployed skip, the `.expect` acceptance matrix, posture custom-env refusal, reference-backend refusal, `snapshot_on_send` threading, one `--json` shape assertion |
+| `tests/test_checks_handler_security.py` (24 tests / 52 matrix cases) | ADR 0144 AC-1..AC-8 — per-rule positive+negative, deny-list matrix, block mode via API + `run_checks` + CLI exit code, allow-root threading, broken-module skip, and `test_real_samples_config_is_clean` |
+| `tests/test_checks_lint.py` (4) | the run-if-installed ruff/mypy advisory legs never block when the tool is absent |
+| `tests/test_scaffold.py` (6) + `tests/test_scaffold_requirements.py` (3) | skeleton contents, `--force` never clobbers, a freshly scaffolded repo passes the FULL gate with `--messages`, the scaffolded CI is valid YAML and hardens the transitive resolve |
+| `tests/test_actions.py` (43) | every typed-vocabulary helper's semantics including the purity-relevant branches (field-to-field `date_diff`, closed arithmetic op set, no `eval`) |
+| `tests/test_lens_parse.py`, `test_lens_rewrite.py`, `test_lens_rewrite_v2.py`, `test_lens_{control,dnd,fanout,native,palette,paste,type}.py` | coverage/partition invariant, the never-imports guarantee, the degradation ladder, byte-stability of row-scoped splices, refusals, UTF-8/CRLF/BOM handling |
+| `tests/test_cli.py` (80) | ~50 `serve` posture/exposure gates, `gen-key`, `rotate-key`, `protect-key` DACL grants, `validate`/`graph`/`dryrun` incl. PHI redaction by default, cp1252 `--help` hardening |
+| `tests/test_supervisor.py` (12) | engine-shard argv/db/port derivation, `--project-root` forwarding, AC-9 engine-shard DB under the root, **real spawn-one-child-per-engine-shard, restart-on-crash, no-restart-when-disabled, terminate→kill escalation** |
+| `tests/test_verify.py` (34) | host checks never error, self smoke, **real-socket live MLLP smoke AA/AR/unreachable**, store connectivity, **disposition classification + poll**, section selection, unknown-section exit 2 |
+| `tests/test_config_fingerprint.py`, `test_config_provenance.py`, `test_reachability.py` | ADR 0041 content fingerprint + load-path provenance; the reverse-reachability index the `dead-config` advisory uses |
+| `.github/workflows/ci.yml` `test` matrix (ubuntu-latest + windows-latest, py3.14) | the whole pytest suite — every CFG unit test above — plus ruff, `ruff format --check`, mypy strict on both `linux` and `win32` platforms |
+| `.github/workflows/ci.yml:1081` `windows-service-smoke` (windows-2022 + windows-2025) | **`install-service.ps1 -LockConfigDir` end-to-end**: a locked `samples/config` dir is accepted by `_assert_safe_config_source_windows` under the least-privilege virtual account `NT SERVICE\MessageFoundry`, the service starts and serves `/health` + MLLP |
+| `.github/workflows/security.yml` `semgrep` | ADR 0144 Inc 3 — the packaged handler-security rules validate, a deterministic taint regression gate (`scripts/ci/assert_semgrep_handler_taint.py`), `samples/config` scans clean |
+| `.github/workflows/ci.yml:263` `ide` job (ubuntu + windows) | tsc, esbuild bundle, node-side unit tests and headless `@vscode/test-electron` integration — including `steps.test.ts`, `steps-edit.test.ts`, `steps-addmenu.test.ts`, `connection-form`, `connection-schema`, `config-editor-model` |
+| FEATURE-COVERAGE-PLAN §21 rows `FCP:CFG-1`..`FCP:CFG-23` (lines 1377-1416) | owns wiring core, source trust, `connections.toml` desugar+edit, `env()`/environments, anchoring, fingerprint/provenance, code sets, settings loader, lifecycle seams, Corepoint import |
+| FEATURE-COVERAGE-PLAN §22 rows `FCP:CLI-1`..`FCP:CLI-32` (lines 1418-1467) | owns per-subcommand CLI coverage and its own recommended-tests list |
+| WIN2025-TEST-PLAN `W25:S1.2`/`W25:S1.3`/`W25:S1.4`/`W25:S1.5`, `W25:S1.AC-ACL`, `W25:S5.2` | owns on-box `verify` acceptance, service-account ACLs on the config dir (W25 matrix A6), and the per-backend `MEFOR_*` env blocks |
+
+**Done — do not re-plan.** The wiring loader and `Registry`, the `_*` helper skip and the SEC-019 shadow guard, the POSIX source-trust arm, the `_evaluate_config_dacl` policy matrix and its fail-open branch, the ADR 0007 read path and its refusal set, the read↔write key-parity guard, the `connection schema` set-equality, the `connections.toml` edit rollback/comment-survival/byte-idempotence, settings precedence and the per-section validators, ADR 0118 desugar parity with `serve`, the environments loader and its overlay/folding/collision behaviour, ADR 0050 AC-1..AC-9, the `.expect` disposition acceptance matrix, the ADR 0144 rule set and its block mode, the typed action vocabulary, the lens parse/rewrite invariants, the scaffold skeleton, and the `-LockConfigDir` **positive** arm on both Windows Server SKUs are all covered. Three recon claims are **corrected** and must not be carried forward as gaps: `supervise` **does** have real spawn/kill/restart/stop tests (`tests/test_supervisor.py`), `verify` **does** have live-MLLP-smoke and `--check-disposition` tests (`tests/test_verify.py`), and the `-LockConfigDir` ACL **does** get exercised against the real guard by `windows-service-smoke` (only the negative arm is missing).
+
+### 6.3 Risk analysis
+
+| Risk | Failure mode | Blast radius | Detected today? | Priority |
+|---|---|---|---|---|
+| The shipped gate runs in no engine CI leg | A change demotes `build-check` from required, or breaks a sub-check, and every unit slice still passes | Every adopter's whole config-quality gate exits 0 on a config `serve` will refuse; discovered at deploy or in production | No — `.pre-commit-config.yaml` owns `.git/hooks/pre-commit`; `.mefor-hooks/pre-commit` is generated but not installed; no workflow invokes `check` | P0 |
+| No pin on the check roster | A check is dropped or its `required` flag flipped; exit-code contract changes silently | `build-check` is the only gate catching an ADR 0092 production-PHI cleartext hop pre-`serve`; `reference-backend` the only one catching a `Reference()` against SQL Server that raises post-ACK forever | No test enumerates `run_checks`' result names or flags | P0 |
+| Unknown settings sections/keys silently dropped | `[secrity]`, a misspelled `require_mfa`, or `allow_unencrypted_phi` in the wrong section loads clean and applies a default | An operator believes a posture switch is set; in the mis-sectioned case the **insecure** default applies with zero signal | No — `ServiceSettings` and each section are `extra="ignore"` (`settings.py:3623`) and `tests/test_settings.py:118` pins the silence as intended. Only `[security]` warns (`settings.py:3880`), and that warning itself is untested | P0 |
+| IDE Steps contract drift | `lens.py` changes `kind` / `params` / `literal_params` / `line_start` / `line_end`; both suites stay green against committed static fixtures | Steps view mis-renders or, worse, `lens rewrite` splices an edit into the wrong statement of a clinical transform — wrong data downstream | No — `ide/src/test/suite/steps.test.ts:28` reads `ide/src/test/fixtures/lens/*.json`; the `ide` CI job has no Python and nothing regenerates or diffs them | P0 |
+| 5 of 28 settings sections unreachable by `MEFOR_*` | `sandbox`, `service`, `cert_monitor`, `secret_rotation`, `update_check` are absent from `_SECTIONS`; the three multi-word names are additionally unreachable through `.partition("_")` | `MEFOR_SANDBOX_MODE=subprocess` in an NSSM environment block yields `off` — the ADR 0087 Router/Handler isolation boundary believed on and silently off | No test asserts `_SECTIONS` equals `ServiceSettings.model_fields`; an unmatched `MEFOR_*` var is dropped without a warning | P0 |
+| Shift-left checks disable themselves on the likeliest-wrong input | `posture` / `build-check` / `reference-backend` return `ok=True, skipped=True` when `messagefoundry.toml` will not load (`checks.py:1189`, `:1266`, `:1415`) | An adopter with an ADR 0118 relocated key (a hard `ValueError`) gets fully green CI then a `serve` refusal at deploy | No test covers the settings-did-not-load skip path | P1 |
+| `_TRANSPORTS` vs the factory set drifts | A transport factory added to `wiring.py` without a `_TRANSPORTS` entry is invisible to config-as-data and the GUI form; a mis-mapped name produces a wrong `ConnectionSpec` | A silently unauthorable connector, or a byte-wrong spec that only shows up at runtime | No — `test_connection_schema.py` asserts the schema mirrors `_TRANSPORTS`, not that `_TRANSPORTS` mirrors the 19 factories | P1 |
+| Write CLIs carry no `--project-root` | `connection`/`codeset`/`alert`/`security`/`impact` resolve `env()` from `Path.cwd()` only (`__main__.py:3836`) | Under a CLI-only anchor or an IDE cwd off the repo root, validate-before-persist resolves a different `env()` view than `serve` — an upsert persists a connection `serve` will refuse at reload | No test exercises the asymmetry | P1 |
+| Windows DACL negative arm unproven end-to-end | The icacls string in `Set-SecureConfigAcl` and `_evaluate_config_dacl`'s policy drift apart | Either a correctly-locked production config dir is REFUSED and the service will not start, or an inherited low-priv write ACE survives and passes — the CWE-732 local privesc into the PHI-bearing identity ADR 0036 closes | Partly — `windows-service-smoke` proves the locked dir loads, but nothing asserts the unlocked dir is refused with a legible message | P1 |
+| `[engine]` documented but not implemented | `docs/CONFIGURATION.md:1058-1063` documents `data_dir` = "base for relative paths" and `shutdown_timeout_seconds`; neither exists on `ServiceSettings` | An operator sets `data_dir` believing the store DB and value files are anchored; they are not — the CWD/wrong-DB footgun ADR 0050 exists to close is re-opened by the documentation | No doc-drift test | P1 |
+| Status sources materially stale | FEATURE-MAP §12 lists 4 CLI commands against 30 built and has no row for ADR 0050/0036/0144/0076, scaffold, backup/verify/support-bundle/cert/security; §10 still marks the **retired** PySide6 console shipped (`messagefoundry/console/` does not exist); ADR 0007's header still reads "Status: Proposed … Built: Not yet"; ADR 0036's Related links point at `console/service_control.py` | A plan author or auditor scoping from the map under-scopes this chapter by roughly two thirds and can claim coverage for a deleted surface | No | P1 |
+| Concurrent `connections.toml` writers | `connection upsert`/`remove`, the console flag endpoint and a hand edit all read-modify-write with temp+`os.replace` and no lock or mtime precondition | Two IDE windows, or a GUI save racing a hand edit, silently discards one connection — a lost inbound is a feed that stops receiving while the operator believes it is deployed | No | P2 |
+| `unvetted-import` false-positive rate unmeasured | `samples/config` imports zero third-party packages, so the FP calibration is the easy case | An org that turned on `--strict-handler-security` cannot ship a valid feed and disables the whole handler-security family, losing the only static control over the ASVS 15.2.5 residual | No | P2 |
+| `verify` report writers untested | `--report-md` / `--report-json` (`__main__.py:4075-4078`) | `W25:S1.5` and the `W25:S6.3` sign-off gate depend on those saved artifacts; an empty or malformed report means an acceptance run with no evidence behind it | No | P2 |
+| No offline validation of `<env>.toml` **content** | AC-3 checks presence only (`__main__.py:846`); malformed TOML is classified at `serve` startup | A malformed value file passes CI and fails in the deployment window — the shift-left the anchor work was for | No | P2 |
+
+### 6.4 Test matrix
+
+**Row class (`Cls`).** **T** = *Test* — a falsifiable assertion with an observable pass criterion; **only T rows count toward the release gate**. **C** = *Characterisation* — produces a recorded measurement, finding or dated owner decision with no threshold yet; legitimate work, but it cannot fail, so it never gates a release (a C row becomes a T row the day its threshold or decision is recorded). **A** = *Assurance* — an external engagement, blocking only for an off-loopback / production-exposure release and excluded from the ordinary P0 count.
+
+This chapter has **60 rows: 56 T, 4 C, 0 A**. The C rows are **CFG-46** (the `unvetted-import` false-positive count has no threshold until Q10 is answered), **CFG-56** and **CFG-57** (editorial ADR / FEATURE-COVERAGE-PLAN reconciliations — work items, not assertions: each becomes a T row the day its reconciliation is expressed as a doc-drift test) and **CFG-58** (a deferral recorded so the umbrella plan does not double-book it). **11 of the 56 T rows are P0** (CFG-01, CFG-02, CFG-03, CFG-04, CFG-05, CFG-11, CFG-12, CFG-14, CFG-15, CFG-34, CFG-35). Two T rows — **CFG-08** (owned by **SEC-35**) and **CFG-55** (owned by **MIG-28**) — are **pointer rows**: the deliverable belongs to another chapter, this chapter contributes inputs only, and no separate work is scoped here.
+
+**Foreign IDs.** A bare ID is this plan's own row. `FCP:` prefixes a `docs/testing/FEATURE-COVERAGE-PLAN.md` ID and `W25:` a `docs/testing/WIN2025-TEST-PLAN.md` one — both use colliding ID spaces (FEATURE-COVERAGE-PLAN §21 has its own `CFG-1..CFG-23`, unrelated to this chapter's `CFG-nn`).
+
+| ID | Test | Type | Method | Env | Backend | Cls | Pri | Pass criteria |
+|---|---|---|---|---|---|---|---|---|
+| CFG-01 | Add an engine CI leg running `python -m messagefoundry check --config samples/config --messages samples/messages` | Functional | CI-leg | container-CI | n/a | T | P0 | A required job in `ci.yml` runs the command on every PR on ubuntu-latest and windows-latest and fails the build on a non-zero exit. Job log shows all 5 required checks as `ok` or `skip` and names each advisory result. A deliberately broken `samples/config` module in a scratch branch turns the job red |
+| CFG-02 | Pin the gate roster: names and `required` flags of every `CheckResult` from `run_checks` | Negative/Security | pytest | any | n/a | T | P0 | With `run_lint=True`, `[(r.name, r.required) for r in run_checks(...).results]` equals the frozen expected list: required `validate`, `dryrun`, `posture`, `build-check`, `reference-backend`; advisory `cleartext-accepted`, `ruff`, `mypy`, `ruff-security`, `raise-fstring`, `accepts-candidate`, `dead-config`, `send-target`, `handler-security`. Flipping any `required=` in `checks.py` fails this test naming the check |
+| CFG-03 | Pin the exit-code contract: 0 iff no required check ran-and-failed | Negative/Security | pytest | any | n/a | T | P0 | A config whose only failure is advisory (e.g. a `raise-fstring` hit) exits 0; a required failure exits 1; a required check that is `skipped=True` never exits non-zero. Asserted through `main(["check", ...])`, not only `CheckReport.ok` |
+| CFG-04 | `check` against a config dir whose discovered `messagefoundry.toml` will not load (ADR 0118 relocated key `[auth].require_mfa`) | Negative/Security | pytest | any | n/a | T | P0 | Today: `posture`, `build-check`, `reference-backend` all return `ok=True, skipped=True, detail="settings did not load: …"` and the gate exits 0. The test pins whichever behaviour the owner ratifies in Q3, and the `detail` string names the failing file and the relocated key |
+| CFG-05 | `build-check` blocks a production-PHI cleartext outbound hop end-to-end through the CLI | Negative/Security | pytest | any | n/a | T | P0 | A `samples`-shaped config dir plus a `messagefoundry.toml` declaring `[security] handles_real_patient_data=true, production_instance=true` and one cleartext `Rest()`/`Http()` outbound makes `main(["check", ...])` exit 1 with `FAIL  build-check` naming the connection. Removing `--strict-handler-security` does not change the outcome |
+| CFG-06 | `check --json` payload contract pinned field-by-field | Functional | pytest | any | n/a | T | P1 | `json.loads(stdout)` has exactly keys `ok`, `checks`; each check has exactly `name`, `ok`, `required`, `skipped`, `detail`; `ok` equals `not any(required and not ok and not skipped)`. A field rename fails the test |
+| CFG-07 | `check` advisory legs with `ruff`, `mypy` and `semgrep` all present on PATH | Functional | CI-leg | container-CI | n/a | T | P1 | With the tools installed, `ruff`, `mypy` and `ruff-security` appear as non-skipped results and a lint finding in `samples/config` produces `ok=False, required=False` and still exits 0 |
+| CFG-08 | **Pointer.** `check --strict-handler-security` over the engine's own `samples/config` as a CI leg | Negative/Security | — | container-CI | n/a | T | P1 | Covered by SEC-35; no separate work scoped. This chapter contributes only the invocation shape it needs the SEC leg to keep (`--config samples/config --messages samples/messages`), so the gate roster pinned by CFG-02 and the block mode stay exercised by one job, not two |
+| CFG-09 | The generated `.mefor-hooks/pre-commit` actually blocks a bad commit in a scratch repo | Functional | pytest | dev-PC | n/a | T | P2 | In a `tmp_path` git repo with `core.hooksPath` set to the generated dir, committing a config dir with an unresolvable router reference exits non-zero and the commit is absent from `git log`; fixing the reference lets the same commit succeed. Never run against the engine repo's own hooks path |
+| CFG-10 | `messagefoundry check` output legibility to a non-developer feed author | Usability | manual | dev-PC | n/a | T | P2 | A reviewer who is not a Python developer can, from the console output alone, name the failing check, the file and the corrective action for each of: unresolvable router, `.expect` mismatch, posture-refused hop, `reference-backend` mismatch. Recorded as pass/fail per case with the reviewer's paraphrase |
+| CFG-11 | `_SECTIONS` set-equal to `ServiceSettings.model_fields` | Negative/Security | pytest | any | n/a | T | P0 | `set(settings._SECTIONS) == set(ServiceSettings.model_fields)`. Today this fails naming `sandbox`, `service`, `cert_monitor`, `secret_rotation`, `update_check`; the test ships either green (after Q2's fix) or as an xfail carrying the owner's written exemption list |
+| CFG-12 | `MEFOR_SANDBOX_MODE` and the four other unreachable sections | Negative/Security | pytest | any | n/a | T | P0 | Parametrized over the 5 sections: `load_settings(environ={"MEFOR_SANDBOX_MODE": "subprocess"})` currently yields the default. The test asserts the ratified behaviour — either the value applies, or the loader emits a WARNING naming the ignored variable. Silent-drop with no signal fails |
+| CFG-13 | Multi-word section names through the `.partition("_")` split | Negative/Security | pytest | any | n/a | T | P1 | `MEFOR_CERT_MONITOR_ENABLED` must not be silently parsed as section `cert`, key `monitor_enabled` and dropped. Same for `MEFOR_SECRET_ROTATION_*` and `MEFOR_UPDATE_CHECK_*`. Asserted as either a correct assignment or a named warning |
+| CFG-14 | An unmatched `MEFOR_*` variable is reported, not silently dropped | Negative/Security | pytest | any | n/a | T | P0 | `load_settings(environ={"MEFOR_SECRITY_REQUIRE_MFA": "true"})` emits a WARNING (caplog) naming the variable. A typo in an NSSM environment block must never be invisible |
+| CFG-15 | Unknown TOML section and unknown key inside a known section | Negative/Security | pytest | any | n/a | T | P0 | Pins the ratified decision from Q1 for: an unknown section `[secrity]`; an unknown key inside `[security]`; and `allow_unencrypted_phi` placed in `[store]` (a relocated key, already a hard `ValueError`) versus placed in `[telemetry]` (silently dropped today). Each case asserts an observable signal at WARNING or above, or a documented, tested silence |
+| CFG-16 | The `[security]` unknown-key WARNING is emitted and names every unknown key | Negative/Security | pytest | any | n/a | T | P1 | `load_settings` over `[security]\nblock_unlisted_outbund = true\n` logs a WARNING at `messagefoundry.config.settings` containing `block_unlisted_outbund` and the word IGNORED. The shipped behaviour at `settings.py:3880` currently has no test |
+| CFG-17 | Relocated-key rejection fires on the **env** arm, not just the file arm | Negative/Security | pytest | any | n/a | T | P1 | Parametrized over all 15 entries of `_RELOCATED_TO_SECURITY`: `load_settings(environ={"MEFOR_AUTH_REQUIRE_MFA": "true"})` raises `ValueError` naming the `[security]` replacement, identically to the file arm |
+| CFG-18 | `_warn_file_secrets` fires for every `_FILE_SECRET_KEYS` entry | PHI | pytest | any | n/a | T | P2 | Parametrized over all 8 `(section, key)` pairs: a file-set value logs a WARNING naming the section, the key, the file path and the `MEFOR_<SECTION>_<KEY>` alternative; the **value itself never appears** in the log record |
+| CFG-19 | `_TRANSPORTS` parity with the wiring transport factory set | Functional | pytest | any | n/a | T | P1 | `set(_TRANSPORTS)` plus a module-level, commented `_NOT_DATA_AUTHORABLE` exclusion set equals the 19 `ConnectionSpec` factories in `wiring.py` (`MLLP`, `Tcp`, `X12`, `Http`, `File`, `Timer`, `Loopback`, `PassThrough`, `Rest`, `FHIR`, `Email`, `Direct`, `DICOM`, `DICOMweb`, `Database`, `DatabasePoll`, `Soap`, `Sftp`, `Ftp`). Adding a 20th factory without a decision fails this test |
+| CFG-20 | Each `_TRANSPORTS` entry maps to the right factory, proven by spec equality | Functional | pytest | any | n/a | T | P1 | For all 11 authorable transports, a `connections.toml` entry and the equivalent code-first `inbound()`/`outbound()` call produce equal `ConnectionSpec` objects (kind and settings), so a mis-mapped name such as `"rest" -> Soap` fails |
+| CFG-21 | Concurrent `connections.toml` writers — lost-update detection | Negative/Security | pytest | any | n/a | T | P2 | Two `upsert_connection` calls interleaved around a shared read (simulating two IDE windows) must not silently drop the first writer's connection: either the second write fails on an mtime/content precondition, or both connections are present after both writes. A silent loss fails |
+| CFG-22 | `ack_after=delivered` stays fail-closed on **both** arms | Negative/Security | pytest | any | n/a | T | P2 | Refused with a named error from a `connections.toml` entry (already covered) **and** from a direct code-first `inbound(..., ack_after=AckAfter.DELIVERED)` call. Standing regression while FEATURE-MAP marks the mode deferred |
+| CFG-23 | `connection upsert` from a cwd that is not the project root resolves the same `env()` view as `serve` | Negative/Security | pytest | any | n/a | T | P1 | With `environments/dev.toml` under the repo root and the process cwd elsewhere, an upsert whose host comes from `env("epic_host")` must resolve the same value `serve --project-root <root>` resolves — or fail loudly. It must not silently validate against an empty value set and persist |
+| CFG-24 | The write CLIs gain, or are documented as deliberately lacking, the anchor trio | Functional | pytest | any | n/a | T | P1 | Pins Q6's decision for `connection`, `codeset`, `alert`, `security`, `impact`: either each accepts `--project-root` and threads it into `resolve_values_base_dir`, or a test asserts the documented CWD-only contract and the `--help` text says so |
+| CFG-25 | Offline validation of `<env>.toml` **content** by `check` / `validate` | Negative/Security | pytest | any | n/a | T | P2 | A malformed `environments/dev.toml` (unclosed string) under `--project-root <root> --env dev` makes `check` exit non-zero with a message naming the file and the parse position, instead of passing and failing later at `serve` startup |
+| CFG-26 | ADR 0050 ordering caveat — a file/env-only `[environments].base_dir` must NOT retro-anchor `--config` / `--service-config` | Negative/Security | pytest | any | n/a | T | P2 | With `[environments].base_dir` set in `messagefoundry.toml` and no `--project-root`, a relative `--config` still resolves against the CWD. A refactor that "helpfully" anchors it fails this test |
+| CFG-27 | `[engine]` doc-drift guard | Compat | pytest | any | n/a | T | P1 | Either `docs/CONFIGURATION.md` contains no `### \`[engine]\`` heading (the ADR 0050 candidate-E deletion), or `ServiceSettings` has an `engine` field present in `_SECTIONS`. The current state — documented and unimplemented — fails |
+| CFG-28 | AC-3 fail-loud stays scoped: zero-`env()` graph never hard-fails | Negative/Security | pytest | any | n/a | T | P2 | Standing regression: `--project-root <root> --env prod` with no `environments/prod.toml` over a graph with no `env()` reference exits 0; adding one `env("x")` to the graph flips it to exit 2 with the message naming the expected path |
+| CFG-29 | Drive-relative anchor and member guard on a real two-drive Windows host | Compat | manual | W2025-box | n/a | T | P2 | With the repo on `C:` and the process launched from `D:`, `serve --project-root /repo` and a `[store].path` of `/data/mf.db` both log the drive-relative WARNING and resolve **under** the root — no file is created on `D:`. Verified by inspecting both drives after the run |
+| CFG-30 | ADR 0050 startup advisories are actionable in a real NSSM stdout log | Usability | manual | W2025-box | n/a | T | P2 | Install with `-Config` pointing at an absolute repo path and a service working directory outside it; the NSSM stdout log contains the CWD-mismatch and NSSM silent-miss WARNINGs, each naming a path and a corrective flag, and contains no message body or `env()` value |
+| CFG-31 | Windows DACL **negative** arm under a real service identity | Negative/Security | CI-leg | W2025-box | n/a | T | P1 | Install without `-LockConfigDir` on a config dir that inherits a `BUILTIN\Users` write ACE: `serve` refuses with `refusing to load config from writable-by-others path …` naming the offending principal SID, the service does not reach `SERVICE_RUNNING`, and no message is accepted on the MLLP port |
+| CFG-32 | `install-service.ps1 -LockConfigDir` icacls output satisfies `_evaluate_config_dacl` | Negative/Security | pytest | W2025-box | n/a | T | P1 | A windows-only test applies the same `icacls /inheritance:r` + SYSTEM/Administrators F + account RX grants `Set-SecureConfigAcl` applies to a `tmp_path` dir, then asserts `_assert_safe_config_source_windows` returns without raising. Changing either side alone fails the test |
+| CFG-33 | `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` appears in no shipped deployment artifact | Negative/Security | pytest | any | n/a | T | P1 | Grep-style assertion: the string does not appear in `scripts/service/*.ps1`, `messagefoundry/scaffold.py` templates, `docker/`, `packaging/`, or `.github/workflows/*.yml` except in explicitly-annotated dev/test context. The `windows-service-smoke` leg must keep using `-LockConfigDir`, not the escape |
+| CFG-34 | Regenerate the committed IDE lens fixtures and byte-compare | Functional | pytest | container-CI | n/a | T | P0 | A Python test runs `parse_module` over each `samples/config/<name>.py` that has a fixture (`IB_ACME_ADT`, `IB_FHIR_INTAKE`, `IB_IMMUNIZATION_VXU`, `IB_PARTNER_X12`, `IB_RADIOLOGY_SR`, `IB_RTE_ELIGIBILITY`, `adt`) and asserts the JSON equals `ide/src/test/fixtures/lens/<name>.json`. All **seven** committed fixtures are stale today, so the first run is expected red and this row's first deliverable is the regeneration commit; thereafter any `lens.py` row-contract change fails here with the diff |
+| CFG-35 | `stepsModel.ts` row-type field set matches the `lens parse` contract | Functional | pytest | container-CI | n/a | T | P0 | The same Python test extracts the union of keys the fixtures carry per row `kind` and asserts every key is declared on the TS `Row` interface in `ide/src/stepsModel.ts` (parsed as text), and vice versa for required fields. A field added on one side only fails |
+| CFG-36 | `lens rewrite` row→line mapping against real `samples/config` handlers | Functional | pytest | any | n/a | T | P1 | For every row of every fixture handler, a `set_params` no-op (`params={}`) returns the source byte-identically, and a real single-param edit changes bytes **only** within `[line_start, line_end]`. Extends the existing byte-stability suite from synthetic sources to the shipped clinical-shaped modules |
+| CFG-37 | Steps view authoring session in VS Code | Usability | manual | dev-PC | n/a | T | P2 | A human opens `samples/config/IB_DEMO_ORU_handler.py` in the Steps view, uses the Add palette, the row context menu and drag-reorder, and confirms the resulting Python matches intent and the file re-parses. Every rendered row maps to the statement the author expects |
+| CFG-38 | `connections.toml` edited through the VS Code connection form preserves comments and ordering visually | Usability | manual | dev-PC | n/a | T | P2 | After saving one connection from the form, `git diff samples/config/connections.toml` shows only the edited table's changed keys — no reflow, no comment loss, no CRLF/LF churn |
+| CFG-39 | `_DISPATCH` roster pin plus a `--help` smoke over every subcommand | Functional | pytest | any | n/a | T | P1 | `set(_DISPATCH)` equals the frozen 30-name list; `main([cmd, "--help"])` raises `SystemExit(0)` for each and prints a non-empty usage line. A new subcommand added without a plan/doc row fails |
+| CFG-40 | `verify --report-md` and `--report-json` writers | Functional | pytest | any | SQLite | T | P2 | Both files are created, non-empty, and UTF-8; the JSON parses and its section/result counts equal `render_console`'s; the Markdown contains a row per executed check. Neither file contains a message body or a store password |
+| CFG-41 | Legacy cp1252 console sweep across the subcommands that print non-ASCII | Compat | pytest | any | n/a | T | P2 | With stdout forced to cp1252, `adr-analyze` (via `_safe_print`), `check` (advisory details carrying em-dashes), `lens rewrite`, `validate` and `connection schema --json` all complete without `UnicodeEncodeError` and emit ASCII-safe JSON |
+| CFG-42 | `import corepoint` CLI wrapper driven through `main()` | Functional | pytest | any | n/a | T | P2 | Text and `--json` summaries, exit code, and a malformed-export clean error (no traceback). Owned as a gap by `FCP:CLI-17`; carried here so the umbrella plan has one row |
+| CFG-43 | `cert import\|inventory\|self-signed` driven through `main()` | Functional | pytest | any | n/a | T | P1 | Extends `tests/test_cert_cli.py` (19 test functions) at the **CLI** layer only — the adversarial PKCS#12 corpus and the key-material-egress assertion against `messagefoundry/pki.py` stay with the SEC chapter, which cites the same module. `main(["cert", …])` (`__main__.py:3003`) is asserted for: each subcommand's exit code on the happy path; a malformed/unreadable bundle exiting 2 through `_cert_fail` (`:2977`) with no traceback and identical text/`--json` failure semantics; the PFX password read **only** from `MEFOR_PFX_PASSWORD`, never accepted as a CLI arg and never echoed to stdout/stderr or a log record; `cert self-signed` refusing to overwrite an existing `key.pem` and writing it `0600` |
+| CFG-44 | `messagefoundry init` into a fresh empty repo, pushed to GitHub, scaffolded workflow runs green | Functional | manual | cloud | n/a | T | P1 | On a scratch GitHub repo: `verify-engine` passes `gh attestation verify` against a published attested wheel, `check` passes, `audit-pin` passes, and the hash-pin step emits the documented warning when no `requirements.lock` is present. Then repeat against a mirror that strips attestations and confirm `verify-engine` fails closed and `MEFOR_VERIFY_ENGINE=off` skips it while `check` still runs |
+| CFG-45 | `init --force` into a non-empty directory never clobbers | Functional | pytest | any | n/a | T | P2 | Standing regression (already covered by `tests/test_scaffold.py`); listed so the exit criteria can count it |
+| CFG-46 | `--strict-handler-security` false-positive rate on a realistic adopter config repo | Negative/Security | harness | dev-PC | n/a | C | P2 | A synthetic multi-feed config repo built with `harness/config` graphs plus legitimate third-party imports (`dateutil`, `pandas`) is scanned; the count of `unvetted-import` hits requiring `--handler-security-allow` is recorded against the threshold set in Q10. Zero `phi-to-log` / `ambient-authority` / `impure-transform` hits on the clean feeds |
+| CFG-47 | Semgrep handler-taint leg stays out of `check` and inside `security.yml` | Negative/Security | pytest | any | n/a | T | P2 | `run_checks` never invokes semgrep (no `semgrep` result name), and `.github/workflows/security.yml` still runs `scripts/ci/assert_semgrep_handler_taint.py`. Prevents an accidental merge of the two gates |
+| CFG-48 | Config-source trust applies to `validate_config`, not only `load_config` | Negative/Security | pytest | any | n/a | T | P2 | Standing regression: a world-writable (POSIX) or `Everyone:M` (Windows, synthetic ACE) config dir makes `validate_config` return a single `Diagnostic` naming the refusal, and executes no module in it |
+| CFG-49 | `env()` cast surface: bounded named casts only | Negative/Security | pytest | any | n/a | T | P2 | `{env="k", cast="int"\|"float"\|"bool"\|"str"}` decode correctly; any other `cast` value is refused by name at load. Confirms no arbitrary callable can be named from data |
+| CFG-50 | Missing referenced `env()` key fails loud at connector build, never as a blank host | Negative/Security | pytest | any | n/a | T | P1 | With `environments/dev.toml` absent a referenced key, `build_check_registry` raises naming the key and the connection; the resulting settings dict never contains an empty string for that setting. Asserted through `check` (exit 1) as well as the library call |
+| CFG-51 | Reference-set declaration against an unsupporting backend is refused identically by `check` and by `serve` | Cross-backend | pytest | any | x3 | T | P1 | For each declared `[store] backend`, `reference-backend` and the engine's start-time refusal agree: SQLite and PostgreSQL accept, SQL Server refuses with the same connection names in both messages |
+| CFG-52 | Settings cross-field validators fire identically on the three store backends | Cross-backend | pytest | any | x3 | T | P2 | Parametrized over `sqlite`/`sqlserver`/`postgres`: the `[store]`-section validators (encryption requirement, warm-pool vs leader-fence timing, credential placement) raise the same named `ValueError`s. Server-DB legs run under the existing `ci.yml` service containers |
+| CFG-53 | `check` under an engine-shard deployment resolves the same bundle members `supervise` forwards | Functional | pytest | any | SQLite | T | P2 | With `supervise --project-root <root> --env dev`, the per-engine-shard `serve` argv's `--config`, `--service-config` and derived DB path resolve to the same files `check --project-root <root> --env dev` uses. Guards the AC-9 engine-shard DB composition against gate drift. Engine shards only — no database shard is involved |
+| CFG-54 | Config dir containing a `_`-prefixed helper that is itself unsafe | Negative/Security | pytest | any | n/a | T | P2 | A group/world-writable `_helpers.py` (POSIX) inside an otherwise safe dir is refused by `_assert_safe_config_source` before any sibling executes — the helper sits inside the same trust boundary as its importers |
+| CFG-55 | **Pointer.** FEATURE-MAP §10/§12 drift guard | Compat | — | any | n/a | T | P2 | Covered by the MIG chapter's single consolidated FEATURE-MAP drift-guard row (**MIG-28**, extending `tests/test_feature_map_claims.py`); no separate work scoped. This chapter contributes only the claims that row must kill: §10 marking the **retired** PySide6 desktop console shipped (`messagefoundry/console/` does not exist), and §12 listing 4 CLI commands against the 30 in `_DISPATCH` with no row for ADR 0050 anchoring, ADR 0036 config trust, ADR 0144 handler security, ADR 0076 vocabulary/lens, scaffold, or backup/verify/support-bundle/cert/security |
+| CFG-56 | ADR 0007 header and ADR 0036 Related links corrected | Compat | manual | any | n/a | C | P1 | An editorial work item, not an assertion — it cannot fail, so it never gates a release; it becomes a T row the day it is folded into an ADR-status-vs-code hygiene guard (SEC-01 owns that guard). Done when: ADR 0007's header no longer reads "**Status:** Proposed (2026-06-13)" / "**Built:** Not yet" (`docs/adr/0007-gui-manageable-connections-toml.md:3-5`) for a read **and** write path that shipped; and ADR 0036's links to `console/service_control.py` (`docs/adr/0036-windows-config-source-trust.md:46`, `:105`) are repointed, the retired PySide6 console having no module on disk |
+| CFG-57 | FEATURE-COVERAGE-PLAN stale claims reconciled | Compat | manual | any | n/a | C | P1 | An editorial work item, not an assertion — it cannot fail, so it never gates a release; it becomes a T row the day the reconciliation is expressed as a doc-drift test. Done when: `FCP:CLI-2` no longer claims `supervise` has no spawn/kill/restart/stop test; `FCP:CLI-28` narrows its gap to the report writers only; `FCP:CLI-6` reads 5 required + 9 advisory; and §22 says 30 subcommands and carries `cert` and `security` rows (it has none), replacing the editorial half of the former CFG-43 |
+| CFG-58 | Corepoint import against a real customer action-list export | Compat | manual | AD-lab | n/a | C | P2 | Deferred to `WIN2025-TEST-PLAN.md` Phase 2 on the customer network; no such export exists in dev. Recorded here only so the umbrella plan does not double-book it |
+| CFG-59 | **Multi-operator concurrency:** two real OS processes run `connection upsert` against one `connections.toml` | Negative/Security | pytest | any | n/a | T | P2 | Not CFG-21's in-process simulation — two genuine `subprocess` invocations of `python -m messagefoundry connection upsert --config <dir>`, each adding a different connection, released from a barrier and repeated over ≥20 rounds (plus one round where a third process holds the file open for read). After **every** round: (a) the file parses as TOML and round-trips through `connections_edit.list_connections` (`:122`) **and** `connections_file.load_connections_file` (`connections_file.py:156`) into a `Registry` — never truncated, never half-written, no surviving `connections.toml.*.tmp` from the `mkstemp` + `os.replace` path (`connections_edit.py:369`, `:377`), and hand comments survive; and (b) either both connections are present, **or** the losing process exited non-zero naming an mtime/content precondition conflict. A silent last-write-wins fails the test. Q12's ratified answer decides which arm of (b) is asserted |
+| CFG-60 | `security show\|set` driven through `main()` | Functional | pytest | any | n/a | T | P1 | Extends `tests/test_security_cli.py` (12 test functions) at the CLI layer: `main(["security", "show", …])` (`__main__.py:4171`) over an **absent**, a **clean** and a **will-not-load** `messagefoundry.toml` — the absent file reports the shipped secure defaults as the effective posture, and the unloadable file emits the `loosenings_partial` marker instead of silently reporting a subset of loosenings as if it were all of them. `security set` re-loads the whole file **before** persisting, so an ADR 0118 relocated legacy key is rejected (pairs with CFG-17) and the file is byte-identical after any failed set. Neither output contains a `[store]`/`[auth]` secret value |
+
+### 6.5 Detailed scenarios
+
+#### S-CFG-A — Stand up the `check` gate as an engine CI leg (CFG-01, CFG-05; step 7 feeds SEC-35 via the CFG-08 pointer)
+
+**Preconditions.** A branch off `main`; Python 3.14; the engine installed with the extras `samples/config` needs. Note the trap the `windows-service-smoke` job documents: the runner checks `samples/config` out with a default ACL granting `BUILTIN\Users` write, so `_assert_safe_config_source_windows` will **refuse** it on a Windows runner.
+
+**Steps.**
+1. Reproduce locally first: `python -m messagefoundry check --config samples/config --messages samples/messages`. Record the exit code and the full result list.
+2. Repeat with `--no-lint` (the documented adopter invocation, `docs/ADOPTER-CI.md:71`) and confirm `ruff`, `mypy`, `ruff-security` vanish from the roster and the exit code is unchanged.
+3. Add a `config-gate` job to `.github/workflows/ci.yml` with the ubuntu-latest and windows-latest matrix used by the `test` job. On the Windows leg, either apply the same lock the service installer applies (`icacls <dir> /inheritance:r /grant *S-1-5-18:(OI)(CI)F /grant *S-1-5-32-544:(OI)(CI)F`) **or** run the leg on ubuntu only and record the reason — do **not** reach for `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` (CFG-33 forbids it in shipped artifacts).
+4. Add the leg to the `ci-gate` `needs:` list so it is required.
+5. Prove it bites: on a scratch branch, edit one `samples/config` module so an inbound names a router that does not exist. Push. The job must go red with `FAIL  validate`.
+6. Prove CFG-05: add a temporary `messagefoundry.toml` at the repo root with `[security] handles_real_patient_data = true` and `production_instance = true`, and one cleartext outbound. Re-run locally; expect exit 1 with `FAIL  build-check`.
+7. Re-run with `--strict-handler-security`, then seed `print(msg.raw)` into a scratch handler and confirm it flips to exit 1. This arm is **SEC-35's** CI leg (CFG-08 is a pointer to it) — record the invocation and hand it over rather than adding a second job here.
+
+**Observation point.** The GitHub Actions job log's `check` step (each result line is `status  name[ (advisory)]: detail`) and its exit status.
+
+**Expected result.** The leg is required, green on a clean tree, and red for each of the three seeded regressions.
+
+**Cleanup / rollback.** Delete the scratch branch and the temporary `messagefoundry.toml`; revert the seeded handler edit. Never commit the prod-PHI `messagefoundry.toml`. The gate prints check details only — no message bodies — but if step 6 is run with `--messages`, do not redirect stdout into a committed file or a CI artifact.
+
+#### S-CFG-B — The shift-left checks disable themselves on a broken service config (CFG-04)
+
+**Preconditions.** A `tmp_path` config dir that loads cleanly (copy `samples/config`), plus a sibling `messagefoundry.toml`.
+
+**Steps.**
+1. Write `messagefoundry.toml` containing a relocated key in its old section, e.g. `[auth]\nrequire_mfa = true\n` — `_reject_relocated_keys` (`settings.py:3848`) makes `load_settings` raise `ValueError`.
+2. Run `python -m messagefoundry check --config <tmp>/config --service-config <tmp>/messagefoundry.toml`.
+3. Read the three shift-left lines in the output.
+4. Repeat with a syntactically malformed TOML (unclosed string) to exercise the `OSError`/decode arm.
+5. Repeat with `--project-root <tmp>` and no `--service-config` to exercise the suppressed-upward-walk path (`checks.py:1249`).
+
+**Observation point.** The `posture`, `build-check` and `reference-backend` lines and the process exit code.
+
+**Expected result today.** All three read `skip  … : settings did not load: …` and the process exits **0** — a fully green CI over a config `serve` will refuse. Record this verbatim as the baseline. After Q3 is decided, the test asserts the ratified behaviour (most likely: a required FAIL naming the file, with the existing "no messagefoundry.toml" SKIP preserved).
+
+**Cleanup / rollback.** `tmp_path` teardown; nothing touches the repo.
+
+#### S-CFG-C — A security switch set in the NSSM environment block that is silently off (CFG-11, CFG-12, CFG-14)
+
+**Preconditions.** W2025 box with the service installed per `docs/SERVICE.md`; or reproduce the loader half on any dev PC.
+
+**Steps.**
+1. Dev-PC half: `python -c "from messagefoundry.config.settings import load_settings; print(load_settings(environ={'MEFOR_SANDBOX_MODE':'subprocess'}).sandbox.mode)"`.
+2. Repeat for `MEFOR_SERVICE_*`, `MEFOR_CERT_MONITOR_ENABLED`, `MEFOR_SECRET_ROTATION_*`, `MEFOR_UPDATE_CHECK_*`.
+3. Repeat with a deliberately mistyped reachable var: `MEFOR_SECRITY_REQUIRE_MFA=true`.
+4. Capture the logger output for each at WARNING with `caplog` (or `-W` plus a logging config) and record whether anything at all is emitted.
+5. Box half: add `MEFOR_SANDBOX_MODE=subprocess` to the NSSM `AppEnvironmentExtra` block, restart the service, and read `GET /security/posture` (or the service's startup log) to see the effective value.
+
+**Observation point.** The returned settings value, the presence or absence of a log record, and the posture endpoint on the box.
+
+**Expected result.** Step 1 currently prints the default, with no log record — the finding. The test ships asserting either the value applies or a WARNING names the ignored variable. Step 3 must produce a signal; a silent drop is a fail.
+
+**Cleanup / rollback.** Remove the env var from the NSSM block and restart the service. No PHI is involved — this is a settings read only.
+
+#### S-CFG-D — Windows config-source trust, both arms, under a real service identity (CFG-31, CFG-32)
+
+**Preconditions.** Windows Server 2025, domain-joined, NSSM present, a dedicated AD service account or gMSA (not LocalSystem), an elevated admin session, and a separate low-privileged local account whose SID is neither the file owner, the current process user, SYSTEM (S-1-5-18), nor Administrators (S-1-5-32-544). This is the WIN2025 box; the ACL inspection row itself is `W25:S1.AC-ACL` / W25 matrix A6 — this scenario adds the **engine-side enforcement** arms only.
+
+**Steps.**
+1. **Negative arm.** Place the config dir where it inherits a `BUILTIN\Users` write ACE (a plain user-profile or repo checkout). Install *without* `-LockConfigDir`: `pwsh -NoProfile -File scripts\service\install-service.ps1 -AppExe <exe> -Config <dir> -Environment prod -ServiceAccount <acct>`. Note the installer's always-on WARNING.
+2. Start the service. Read the NSSM stdout log.
+3. Confirm the service does not reach `SERVICE_RUNNING` (it crash-loops to `SERVICE_PAUSED`) and that nothing is listening on the inbound MLLP port (`Test-NetConnection -Port <p>`).
+4. **Positive arm.** `scripts\service\install-service.ps1 … -LockConfigDir`. Restart. Confirm `/health` responds and one synthetic MLLP ADT is accepted.
+5. **Escape arm.** Revert to the unlocked dir, set `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE=1` in the service environment, restart, and confirm the refusal downgrades to a WARNING and the service starts. Then remove it and confirm the refusal returns.
+6. **Contract arm (CFG-32, runnable on any Windows).** In a pytest `tmp_path`, apply the same grants `Set-SecureConfigAcl` applies, then call `wiring._assert_safe_config_source_windows(tmp_path)` and assert no raise; then add a grant for the low-privileged account and assert a `WiringError` naming its SID.
+
+**Observation point.** The NSSM stdout log line beginning `refusing to load config from writable-by-others path`, the SCM state, the MLLP port, and the pytest assertion.
+
+**Expected result.** Refuse / start / warn-and-start / refuse again, in that order, and the contract test green in both directions.
+
+**Cleanup / rollback.** `scripts\service\uninstall-service.ps1`; remove `MEFOR_ALLOW_INSECURE_CONFIG_SOURCE` from the machine and service environment; restore the config dir's ACL. Only synthetic HL7 is sent (`samples/messages/adt_a01.hl7` or `messagefoundry generate`).
+
+#### S-CFG-E — Lens contract drift guard (CFG-34, CFG-35)
+
+**Preconditions.** Dev PC with the engine installed and the `ide/` workspace present. Seven fixtures exist in `ide/src/test/fixtures/lens/`, each named after a `samples/config` module.
+
+**Steps.**
+1. For each fixture name, run `python -m messagefoundry lens parse samples/config/<name>.py --json` and diff against `ide/src/test/fixtures/lens/<name>.json`. All seven diverge today — the committed fixtures are already stale, and that is the finding; record each diff before regenerating.
+2. Add `tests/test_lens_ide_fixture_parity.py` performing the same comparison in-process via `lens.parse_module`, parametrized over the fixture directory listing so a new fixture is picked up automatically.
+3. Add the interface half: read `ide/src/stepsModel.ts` as text, extract the declared field names of the row interface, and assert every key present in any fixture row is declared, and every non-optional declared field is present in at least one fixture row.
+4. Prove it bites: temporarily rename `line_end` to `end_line` in `lens.py`'s row dict. The new test must fail; `tests/test_lens_*.py` and the `ide` job must **both** still pass (demonstrating the hole this closes). Revert.
+5. Record in the test docstring that the fixtures are generated artifacts and how to regenerate them.
+
+**Observation point.** The pytest failure diff naming the changed field, and the fact that the pre-existing suites stay green in step 4.
+
+**Expected result.** The parity test is the single place a row-contract change surfaces.
+
+**Cleanup / rollback.** Revert the step-4 mutation. The fixtures are derived from `samples/config`, which is synthetic — no PHI.
+
+#### S-CFG-F — Two writers race `connections.toml` (CFG-21, CFG-59)
+
+**Preconditions.** A `tmp_path` copy of `samples/config` including its `connections.toml`. No engine running.
+
+**Steps.**
+1. Read the file into memory (writer A's view).
+2. Run `python -m messagefoundry connection upsert --config <dir> --data '{"direction":"outbound","name":"OB_RACE_ONE","transport":"file","settings":{"directory":"<tmp>/out1"}}'` (writer B commits first).
+3. From writer A's stale in-memory view, perform a second upsert adding `OB_RACE_TWO` via `connections_edit.upsert_connection` seeded with the stale text.
+4. Reload with `connections_edit.list_connections` and count the connections.
+5. Repeat with the console flag seam (`POST /connections/{name}/flag`) as writer B against a hand edit as writer A, on a running engine bound to loopback.
+6. **CFG-59 — the multi-operator arm steps 1-4 cannot reach.** Steps 1-4 are a single process interleaving two library calls, so they exercise the lost update but never the real OS-level race. Launch **two genuine `subprocess`es** of `python -m messagefoundry connection upsert --config <dir>` (adding `OB_RACE_A` and `OB_RACE_B`), released together from a `multiprocessing.Barrier`, and repeat for ≥20 rounds. After every round, list the directory and reload the file through `connections_edit.list_connections` and `connections_file.load_connections_file`: assert it always parses, keeps its hand comments, leaves no `connections.toml.*.tmp` behind (`connections_edit.py:369` mkstemp → `:377` `os.replace`), and that the round ended either with both connections present or with the losing process exiting non-zero on a named precondition conflict.
+7. Add one round with a third process holding the file open for read across the replace, to confirm the atomic-rename path is what makes a torn read impossible rather than luck.
+
+**Observation point.** The connection list after both writes, `git diff` on the file, the per-round exit codes of both child processes, and the directory listing for leftover temp files.
+
+**Expected result today.** `OB_RACE_ONE` is silently gone — one writer's connection is lost with no error. The test pins the ratified fix (mtime/content precondition raising a named conflict, or a merge that preserves both). A silent loss must fail the test. Step 6 is expected to show the **file** intact on every round (the `mkstemp` + `os.replace` path is per-write unique and atomic) while the **content** still loses a writer — record the two outcomes separately so the fix in Q12 is scoped to the lost update, not to the write path.
+
+**Cleanup / rollback.** `tmp_path` teardown, including any leftover temp files the race produced. If the running-engine variant is used, stop the engine and delete its scratch store; never point it at a real store.
+
+#### S-CFG-G — Gate-versus-`serve` `env()` divergence on the write CLI (CFG-23, CFG-24)
+
+**Preconditions.** A scratch config repo laid out as `messagefoundry init` produces it: `<root>/config/`, `<root>/environments/dev.toml`, `<root>/messagefoundry.toml`. Put a real value in `environments/dev.toml` (e.g. `epic_host = "10.20.0.5"`) and have one connection's host come from `env("epic_host")`.
+
+**Steps.**
+1. From `<root>`: `python -m messagefoundry check --config config --project-root . --env dev --service-config messagefoundry.toml`. Record the result.
+2. `cd` to a directory that is **not** `<root>` (mirroring a VS Code window opened on a parent folder).
+3. Run `python -m messagefoundry connection upsert --config <root>/config --service-config <root>/messagefoundry.toml --data '<a connection whose host is {"env":"epic_host"}>'`.
+4. Inspect what `_connection`'s validate callback resolved: it builds `env_values` from `resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd())` (`__main__.py:3836`), so with `base_dir` unset the value dir is looked for under the *current* directory, not `<root>`.
+5. Set `[environments] base_dir = "<root>"` in `messagefoundry.toml` and repeat step 3.
+
+**Observation point.** Whether the upsert is accepted, and whether the persisted connection would build under `serve --project-root <root> --env dev` (run `check` again from `<root>` to confirm).
+
+**Expected result.** Step 3 either resolves the same values `serve` will, or fails loudly. It must not accept-and-persist a connection whose `env()` reference resolved to nothing while `check` from the root would have refused it. Step 5 documents the only workaround available today.
+
+**Cleanup / rollback.** Delete the scratch repo. All hosts are synthetic RFC 5737 / RFC 1918 literals; no real endpoint is contacted (the CLI is offline).
+
+### 6.6 Automation disposition
+
+**New pytest modules.**
+
+| Module | Rows | Effort |
+|---|---|---|
+| `tests/test_checks_roster.py` | CFG-02, CFG-03, CFG-04, CFG-05, CFG-06, CFG-47 | M |
+| `tests/test_settings_surface.py` | CFG-11, CFG-12, CFG-13, CFG-14, CFG-15, CFG-16, CFG-17, CFG-18 | M |
+| `tests/test_connections_transport_parity.py` | CFG-19, CFG-20, CFG-22 | S |
+| `tests/test_connections_concurrent_write.py` | CFG-21, CFG-59 | M (CFG-59 spawns real processes under a barrier and must stay deterministic on both OSes) |
+| `tests/test_lens_ide_fixture_parity.py` | CFG-34, CFG-35, CFG-36 | M |
+| `tests/test_config_doc_drift.py` | CFG-27, CFG-33, CFG-39 | S |
+| `tests/test_config_trust_acl_contract.py` (windows-only) | CFG-32, CFG-54 | M |
+
+**Extends an existing module.**
+
+| Existing module | Rows | Effort |
+|---|---|---|
+| `tests/test_cli_offline_resolution.py` | CFG-23, CFG-24, CFG-25, CFG-26, CFG-28, CFG-53 | M |
+| `tests/test_verify.py` | CFG-40 | S |
+| `tests/test_cli.py` | CFG-41, CFG-42 | S |
+| `tests/test_checks.py` | CFG-49, CFG-50 | S |
+| `tests/test_config_source_trust.py` | CFG-48 | S |
+| `tests/test_cert_cli.py` | CFG-43 | S |
+| `tests/test_security_cli.py` | CFG-60 | S |
+| `tests/test_scaffold.py` | CFG-09, CFG-45 | S |
+| `tests/test_checks.py` parametrized over the store fixtures | CFG-51, CFG-52 | M |
+
+**New CI legs.** A required `config-gate` job in `.github/workflows/ci.yml` (CFG-01) on the same ubuntu+windows matrix as `test`, with the Windows arm either ACL-locked or explicitly ubuntu-only; and a second invocation with the advisory toolchain installed (CFG-07). The `--strict-handler-security` invocation is **not** a third job here — CFG-08 points at **SEC-35**, which owns that leg. Extend `windows-service-smoke` with the **negative** arm (CFG-31) as a second matrix entry that installs without `-LockConfigDir` and asserts the refusal, rather than a new workflow. Effort **M** for the gate job, **M** for the smoke extension (it must assert a *failure to start*, which needs care not to hang the runner).
+
+**Harness / probe capability.** One new `harness/config/` graph set — a multi-feed synthetic adopter config repo with legitimate third-party imports — to measure the `unvetted-import` false-positive rate (CFG-46). Effort **M**. It reuses the existing PHI-free `harness/config` conventions and never carries a message body.
+
+**Stays manual, and why.** CFG-10 (gate legibility to a non-developer) is a judgement the advisory-versus-blocking UX premise rests on and cannot be asserted. CFG-29/CFG-30 need a real two-drive Windows host and a real NSSM stdout log. CFG-31's human half (setting the ACLs with a genuine low-privileged principal) is already scoped as `W25:S1.AC-ACL`. CFG-37/CFG-38 are rendering and interaction, which the headless `@vscode/test-electron` leg does not exercise. CFG-44 needs real GitHub Actions, a published attested wheel and a stripping mirror. CFG-56/57 are documentation reconciliations (**C** rows — work items, not release gates); CFG-55's automated half is MIG-28's, so nothing manual is scoped for it here. CFG-58 needs a customer export that does not exist in dev. Effort **S** each except CFG-44 (**M**) and CFG-31's box half (**M**).
+
+**Rough totals.** New pytest ≈ **L** overall (7 modules, ~45 tests). Existing-module extensions ≈ **M**. CI legs ≈ **M**. Harness ≈ **M**. Manual ≈ one W2025 box day plus one cloud half-day plus a documentation pass.
+
+### 6.7 Environment, data & prerequisites
+
+**Hosts and runners.**
+- ubuntu-latest and windows-latest with Python 3.14 — matches the existing `ci.yml` `test` matrix; carries every pytest row and the new `config-gate` leg.
+- A POSIX runner for the group/world-writable and foreign-owner arms of `_assert_safe_config_source` (the Windows leg cannot exercise them).
+- **Windows Server 2025**, domain-joined, NSSM installed, with a dedicated AD service account or gMSA — the WIN2025 box. Needed for CFG-29, CFG-30, CFG-31 and the box half of CFG-32.
+- A Windows host with **two drive letters** for the AC-8 drive-relative member guard (CFG-29) — string inspection is not sufficient.
+- Node 20 + VS Code + `@vscode/test-electron` (the existing `ide` leg) plus a human-driven VS Code session for CFG-37/CFG-38.
+- A GitHub-hosted runner with `gh` and `GH_TOKEN` for CFG-44's `verify-engine` job.
+- Cloud: a scratch GitHub repository (not the engine repo) for CFG-44, and a scratch local git repo for CFG-09 so the shared `core.hooksPath` is never touched.
+
+**Accounts and privileges.**
+- An elevated local administrator on the W2025 box.
+- A **separate low-privileged local account** whose SID is not the file owner, not the current process user, not S-1-5-18 and not S-1-5-32-544 — required to author the negative DACL cases genuinely rather than with synthetic ACE tuples.
+- A dedicated AD service account or gMSA for the service identity; do **not** fall back to LocalSystem, which trivially satisfies the trust guard.
+
+**Services and toolchain.**
+- SQL Server and PostgreSQL instances for CFG-51/CFG-52 — already service-container-gated in `ci.yml`.
+- `ruff`, `mypy`, `semgrep~=1.90` and `pip-audit` on PATH for CFG-07 and CFG-46 (semgrep is installed only in `security.yml` today).
+- **Python on the `ide` CI leg** is *not* required by this plan: CFG-34/CFG-35 are deliberately Python-side tests that read the committed TS/JSON as text, so the `ide` job stays Python-free.
+- A published MessageFoundry wheel carrying SLSA / PEP 740 attestations on a real index, **plus** a mirror that strips attestations, for CFG-44's two arms.
+- A UNC share or second volume for an absolute `[store].path` that must bypass the project root (AC-7 side of CFG-29).
+- A cp1252 legacy-codepage Windows console session for CFG-41's manual confirmation (the pytest arm forces the codec).
+
+**Synthetic data — PHI discipline.** Every fixture is synthetic and PHI-free: `samples/messages/` (`adt_a01.hl7`, `adt_batch.hl7`, `x12_270_eligibility.edi`, the `hapi-hl7v2` set), the `harness/config` graphs, and generated corpora from `messagefoundry generate --type ADT --count 50 --seed <n> --out <scratch>` (default output root is `samples/messages/<type>`; the corpus is git-ignored). No customer config repo and no real action-list export exist in dev (`W25:S0.7`, Phase 1) — CFG-46 and CFG-58 are explicitly built on synthetic substitutes or deferred.
+
+**Standing PHI rules for this chapter.** `dryrun` and `generate` can print full message bodies; never redirect their output into a committed file, a ticket or a CI log, and never run them against real traffic. `check` prints check details only, but the `dryrun` sub-check runs the graph — keep its output in the job log, not in an artifact. The `verify` report writers (CFG-40) must be asserted to contain no message body and no store credential. Endpoint hosts in scratch configs use RFC 5737 / RFC 1918 literals.
+
+### 6.8 Exit criteria
+
+This area is signed off for release when **all** of the following hold:
+
+1. **Gate in CI.** A required `config-gate` job runs `messagefoundry check` over `samples/config` + `samples/messages` on every PR, has been observed red for each of the three seeded regressions in S-CFG-A, and is listed in `ci-gate`'s `needs:`.
+2. **Roster pinned.** `tests/test_checks_roster.py` asserts the exact 5-required / 9-advisory roster and the exit-code contract, and fails when any `required=` flag in `checks.py` is flipped.
+3. **All 11 P0 rows green or explicitly waived in writing by the owner:** CFG-01, CFG-02, CFG-03, CFG-04, CFG-05, CFG-11, CFG-12, CFG-14, CFG-15, CFG-34, CFG-35. Each waiver names the open question it depends on.
+4. **Settings surface has no silent hole.** Either `_SECTIONS` equals `ServiceSettings.model_fields`, or the difference is an explicit, tested exemption list, and an unmatched `MEFOR_*` variable produces a WARNING naming it.
+5. **No unknown-key silence on a security switch.** Q1 is decided and CFG-15/CFG-16 pin the decision; the `[security]` unknown-key warning has a test.
+6. **Lens contract has a drift guard.** CFG-34/CFG-35 are in the suite and were demonstrated to fail on a deliberate `lens.py` field rename while both pre-existing suites stayed green.
+7. **`connections.toml` authorability is a decision, not drift.** CFG-19's exclusion set is committed with a comment naming the owner's decision for X12, FHIR, Email, Direct, DICOM, DICOMweb, Loopback and PassThrough.
+8. **Windows trust proven in both directions.** CFG-31 (negative arm, no `-LockConfigDir` refuses and the service does not serve) and CFG-32 (icacls ↔ `_evaluate_config_dacl` contract) are green; the positive arm remains green on both Server SKUs via `windows-service-smoke`.
+9. **Anchor symmetry closed or documented.** Q6 is decided and CFG-23/CFG-24 pin it; no write CLI can persist a connection that `serve` would refuse purely because of a different `env()` view.
+10. **Status sources reconciled.** The FEATURE-MAP half is **MIG-28**'s (CFG-55 points at it); this chapter's contribution is the §10/§12 claim list handed to that row. CFG-56 and CFG-57 — ADR 0007's header, ADR 0036's Related links, and FEATURE-COVERAGE-PLAN's four stale claims — are **C** rows: work items to be closed **before** the master plan is published citing those sources, tracked here but **not** release-gating, since neither can fail a run.
+11. **P1 completion ≥ 90%**, with every remaining P1 carrying a dated owner decision. P2 rows may remain open if each has a named owner and a target release.
+12. **Zero PHI findings.** No test, fixture, report artifact or CI log added by this chapter contains a real or realistic patient identifier; `verify`'s saved reports (CFG-40) are asserted body-free and credential-free.
+
+### 6.9 Open questions
+
+1. **Should `load_settings` warn — or refuse — on an unknown section or unknown key outside `[security]`?** `ServiceSettings` and every section are `extra="ignore"` (`settings.py:3623`) and `tests/test_settings.py:118` pins that silence as intended, while `[security]` already warns (`settings.py:3880`). *Blocks:* CFG-15 and CFG-16's assertions, and the forward-compat blast radius of an estate mid-upgrade.
+2. **Should `_SECTIONS` be asserted set-equal to `ServiceSettings.model_fields`, and should the `.partition("_")` first-underscore split be fixed now** so `sandbox`, `service`, `cert_monitor`, `secret_rotation` and `update_check` become `MEFOR_*`-overridable? *Blocks:* CFG-11, CFG-12, CFG-13 — and, until decided, `MEFOR_SANDBOX_MODE` remains a security control an operator can set and the engine will ignore.
+3. **Should `check` FAIL rather than SKIP when a discovered `messagefoundry.toml` exists but will not load** (`checks.py:1189`, `:1266`, `:1415`)? *Blocks:* CFG-04's pass criteria. Today the three checks that exist to shift posture failures left all disable themselves on exactly the input most likely to be wrong.
+4. **Is `messagefoundry check` intended to run as an engine CI leg over `samples/config` + `samples/messages` — and if so, with lint on, and with `--strict-handler-security`?** *Blocks:* CFG-01 and CFG-07 job configuration, whether the Windows arm is ACL-locked or dropped, and — through the CFG-08 pointer — the invocation SEC-35's leg adopts.
+5. **Which wiring transport factories are deliberately not authorable from `connections.toml`?** `_TRANSPORTS` has 11 of the 19 `ConnectionSpec` factories; X12, FHIR, Email, Direct, DICOM, DICOMweb, Loopback and PassThrough are absent with no written policy. *Blocks:* CFG-19's exclusion set.
+6. **Should the offline anchor trio extend to the write CLIs** (`connection`, `codeset`, `alert`, `security`, `impact`) so a GUI edit validates the same `env()` view `serve` resolves? *Blocks:* CFG-23, CFG-24 and scenario S-CFG-G's expected result.
+7. **Should the committed IDE lens fixtures be generated and byte-compared by a Python test (this plan's proposal), or should the `ide` CI leg gain Python so it calls the real `messagefoundry lens parse --json`?** *Blocks:* CFG-34/CFG-35's method and whether the `ide` job's toolchain changes.
+8. **Delete the `[engine]` section from `docs/CONFIGURATION.md:1058-1063` (the ADR 0050 candidate-E follow-up) or implement it as a real anchor?** *Blocks:* CFG-27. Leaving it live keeps `data_dir` reading as the exact anchor ADR 0050 exists to provide.
+9. **Should ADR 0007's header be corrected from "Status: Proposed … Built: Not yet", ADR 0036's `console/service_control.py` links repointed, and FEATURE-MAP §10/§12 refreshed BEFORE the master plan cites them as the status source?** *Blocks:* CFG-56, exit criterion 10, and the claim list this chapter owes MIG-28 (the row CFG-55 points at).
+10. **What `unvetted-import` false-positive count on a realistic adopter config repo is acceptable before `--strict-handler-security` is recommended (or defaulted), and who supplies that repo** given none exists in Phase 1? *Blocks:* CFG-46's threshold and whether SEC-35's leg (which CFG-08 points at) can be promoted to a default.
+11. **Should the `install-service.ps1 -LockConfigDir` ↔ `_evaluate_config_dacl` contract test live in this chapter or in DEPLOY**, given WIN2025 already owns the on-box ACL inspection row (`W25:S1.AC-ACL` / W25 matrix A6)? *Blocks:* CFG-31/CFG-32 ownership and which plan's exit criteria count them.
+12. **Should the concurrent-writer fix be a precondition failure or a merge?** `connection upsert`, the console flag seam and a hand edit all read-modify-write with no lock — the write itself is atomic (`mkstemp` + `os.replace`, `connections_edit.py:369/377`), so the exposure is a lost update, not a torn file. *Blocks:* CFG-21's and CFG-59's pass criteria and whether the console seam needs a new 409 path.
