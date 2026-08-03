@@ -598,12 +598,22 @@ start**, and refuses only if the estate opts in via `[security].require_memory_e
 That turns the deployment requirement from prose into a declaration of record with a standing warning
 where it is absent.
 
-**The scorecard is unchanged, and this document does not pre-empt it.** ADR 0152 holds that rung 2 is
-what would justify `Fail → Partial`, and the evidence for that now exists — but 11.7.1 is scored on the
-ASVS L3 assessment of record (`ASVS-L3-ASSESSMENT-2026-07-22.md`), which still reads **Fail**,
-and re-scoring it is an owner decision rather than a side effect of shipping a build. A **Pass** would
-in any case require SEV-SNP/TDX hardware plus a verified CPU-signed quote (ADR 0152 rung 3, not built),
-and even then the CPython-heap residual above is unchanged.
+**This document does not pre-empt the scorecard.** 11.7.1 is scored **`na`**: the requirement's verb is
+*"full memory encryption is in use"* — a property of the hosting substrate, which
+[`ASVS-ASSESSMENT-METHOD.md`](ASVS-ASSESSMENT-METHOD.md) §2 places outside the assessed software, so
+rule 1 takes it out of scope. Re-scoring remains an owner decision rather than a side effect of
+shipping a build.
+
+⚠️ **The record is the scorecard itself** — `docs/security/asvs-scorecard.toml`, rendered and CI-gated
+([ADR 0156](adr/0156-asvs-scorecard-as-data-a-derived-count-verified-evidence-anchors-and-a-fail-closed-drift-gate.md))
+— **never a prose assessment.** ADR 0156 replaced the dated-document lineage precisely because prose
+asserts facts about code and the code moves; do not cite a dated assessment file as the verdict of
+record. *(This paragraph previously did exactly that, naming a dated assessment and reporting a `Fail`
+that the record no longer carried.)*
+
+**An out-of-scope verdict buys nothing operationally**, which is the point of §2.1: the CPython-heap
+residual above is unchanged either way, and a deployment still needs the host-side control. Rung 3
+(SEV-SNP/TDX plus a verified CPU-signed quote) remains unbuilt.
 
 ---
 
