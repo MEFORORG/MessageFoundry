@@ -49,6 +49,17 @@ LOCAL_EXTENSION_VERDICTS: Final[frozenset[str]] = frozenset(
 #: the first was never examined, the second was examined and left open on purpose.
 DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", "na"})
 
+#: A verdict whose cell has been READ against the requirement text. Not the same set as
+#: :data:`DECIDED_VERDICTS`, and the difference is `needs-review`: that cell was examined and then
+#: left open on purpose, so it belongs in survey PROGRESS while staying out of the verdict counts.
+#:
+#: Survey progress used `DECIDED_VERDICTS` until the scorecard acquired its first `needs-review` cell
+#: (11.4.4, the V7/V11 baseline sweep). The page then reported "123 of 345 read … 222 have not"
+#: directly above its own table saying 221 unverified — two numbers for one quantity, on the page
+#: that IS the record. The bug had been latent since the renderer was written: with zero
+#: `needs-review` cells the two sets are identical, so no test and no CI run could tell them apart.
+EXAMINED_VERDICTS: Final[frozenset[str]] = DECIDED_VERDICTS | {"needs-review"}
+
 #: How far from the recorded line the expected token may drift before the anchor is considered broken.
 #: Anchors name a TOKEN rather than a bare line number precisely so that ordinary edits above a cell's
 #: evidence do not thrash every anchor in the file; the window keeps the line number meaningful without
@@ -496,8 +507,10 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """
     n = count(cells)
     total = sum(n.values())
-    decided = [c for c in cells if c.verdict in DECIDED_VERDICTS]
-    examined = [c for c in decided if c.last_verified]
+    # EXAMINED, not DECIDED: a `needs-review` cell was read and then parked, so it is survey progress
+    # even though it carries no verdict. Counting it as unread made this line contradict the table
+    # below it (see EXAMINED_VERDICTS).
+    examined = [c for c in cells if c.verdict in EXAMINED_VERDICTS and c.last_verified]
     unexamined = total - len(examined)
     pct = (100.0 * len(examined) / total) if total else 0.0
     inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)

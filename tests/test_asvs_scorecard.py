@@ -366,6 +366,33 @@ def test_render_leads_with_survey_progress_not_a_headline_score() -> None:
     assert "deadbeef" in out
 
 
+def test_render_counts_a_needs_review_cell_as_read_not_as_unexamined() -> None:
+    """Survey progress counts what was READ; `needs-review` was read and then parked on purpose.
+
+    Latent from the day the renderer was written and invisible until the scorecard acquired its first
+    `needs-review` cell: with none present, "decided" and "examined" are the same set, so nothing
+    could distinguish them. The symptom was two numbers for one quantity on the page that IS the
+    record — a survey line saying N have *not* been read, directly above a table whose `unverified`
+    row said N-1.
+
+    The assertion that matters is the LAST one: the two figures the page prints must agree, because a
+    reader comparing them is the only thing that ever noticed.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-02"),
+        Cell(id="1.1.2", level=2, verdict="unverified"),
+        Cell(id="2.1.1", level=3, verdict="needs-review", last_verified="2026-08-02"),
+    ]
+    out = render_current(cells, anchor_sha="x")
+
+    assert (
+        "**2 of 3 requirements have been read against the ASVS text (66.7%).** 1 have not." in out
+    )
+    # ...and it stays OUT of the verdict counts, which is why the two sets differ at all.
+    assert "| Needs review | 1 |" in out
+    assert "| **Unverified** | **1** |" in out
+
+
 def test_render_flags_a_decided_verdict_carrying_no_verified_date_as_inherited() -> None:
     cells = [Cell(id="1.1.1", level=1, verdict="pass")]  # decided, but never dated
     out = render_current(cells, anchor_sha="x")
