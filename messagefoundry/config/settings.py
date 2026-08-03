@@ -4129,6 +4129,29 @@ def security_loosenings(
                 "in cleartext (still refused on a production-PHI bind)",
             )
         )
+    if not sec.external_link_interstitial:
+        out.append(
+            (
+                "external_link_interstitial",
+                "the console navigates OFF-SITE with no notification and no cancel — an operator can be "
+                "sent to a third-party site (including an identity provider) with no chance to stop it "
+                "(ASVS 3.7.3)",
+            )
+        )
+    if sec.external_link_allowlist:
+        # Reported even though the switch is a LIST rather than a bool, because the completeness floor
+        # only pins bools and an exempted list would be an unreported loosening by omission. Entries
+        # are named individually: a count would say "3 destinations are exempt" without saying which,
+        # which is the shape that lets an entry nobody intended survive a posture review.
+        out.append(
+            (
+                "external_link_allowlist",
+                "these destinations are exempt from the off-site interstitial and are navigated to "
+                "with no notification and no cancel: "
+                + ", ".join(sec.external_link_allowlist)
+                + " (ASVS 3.7.3)",
+            )
+        )
     if not sec.require_sign_in:
         out.append(
             (
