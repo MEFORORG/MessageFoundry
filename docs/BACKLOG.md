@@ -7302,13 +7302,15 @@ So `calling_ae_allowlist` **alone** satisfies a gate whose stated purpose is to 
 
 **Source:** the empty §6.1 *Dynamic* tier row, filed and built 2026-07-31.
 
-## 320. windows-2025 MLLP ingress is ~10x slower than a healthy runner
+## 320. windows-2025 is the slowest CI leg (1.8x-3.5x), but that does not explain the 60/s failures
 
 > 🚧 **Status: OPEN INVESTIGATION (filed 2026-08-01, not started).** Diagnosis only — the CI symptom is already fixed (#115, `06fd327d`) by widening the reconcile's stranding budget. This item is the **underlying capacity fact**, which that fix does not address and deliberately did not try to. Tooling to measure it landed in #118 (`harness/load/ingress_probe.py` + a dispatch-only sweep across ubuntu / windows-2022 / windows-2025). The decisive experiment — the same sweep on the **self-hosted WS2025 rig** — is blocked: that runner is unregistered (`actions/runners` → `total_count: 0`) and `selfhosted-win2025-sql.yml` has never run.
 
 **Type:** CI/runner capacity — not a correctness defect. No message was ever lost in any observed instance.
 
-**What:** the `test (windows-2025, py3.14)` leg cannot service the load smoke's offered rate. `tests/test_load_runner.py` offers **60 msg/s for 1.5s** (90 messages, `pool_size = 4`) at a listener whose ingress is **strictly serial per connection** — `mllp.py:1433` is `read chunk → for each frame → await handler → next`, where the handler is the durable ingress commit the ACK depends on. Total ingress throughput is therefore `pool_size ÷ per-message-commit-latency`. On windows-2025 that product is under 60/s, so roughly half the offered run is never ingested inside the measurement window and strands unacknowledged at teardown.
+**What:** `tests/test_load_runner.py` offers **60 msg/s for 1.5s** (90 messages, `pool_size = 4`) at a listener whose ingress is **strictly serial per connection** — `mllp.py:1433` is `read chunk → for each frame → await handler → next`, where the handler is the durable ingress commit the ACK depends on. Total ingress throughput is therefore `pool_size ÷ per-message-commit-latency`. That leg red `main` twice on runs that lost nothing, stranding ~51% of sends at teardown.
+
+> ⚠️ **THE ORIGINAL DIAGNOSIS HERE WAS WRONG AND IS CORRECTED BELOW.** This item first claimed windows-2025 "cannot service 60/s" and is "~10x slower". A 36-run measured sweep (#118, run `30705885914`) does not support either: windows-2025 strands **0% at 60/s, 150/s and 300/s**, and is **1.8x-3.5x** slower than ubuntu, not 10x. The leg *is* reproducibly the slowest — that part holds — but the 60/s CI failures remain **unexplained**.
 
 **Measured (2026-08-01), and one measurement RETRACTED — read this before quoting a number.**
 
@@ -7332,7 +7334,36 @@ What the repeats support:
 
 **Correcting the record:** `harness/load/report.py` previously justified the stranding budget with *"observed teardown stranding is ~16%, so half is ~3x the worst seen."* Both halves are wrong. **Healthy stranding at this rate is 0%**, not 16% — the 16% figure was itself measured on a partially-saturated run — and "half" was ~1.0x the worst seen by the time it red `main`, not 3x.
 
-**Not yet determined:** *why* that runner's per-message commit is ~10x slower. Disk/fsync characteristics of the hosted windows-2025 image, Defender scanning the temp SQLite DB, and CPU contention are all plausible; none has been measured, and it cannot be measured from outside the runner.
+**MEASURED ACROSS ALL THREE HOSTED SKUs (2026-08-01, run `30705885914`, 36 runs, 3 per cell).** This supersedes every rate claim above it.
+
+Stranded fraction:
+
+| offered | ubuntu | windows-2022 | windows-2025 |
+|---|---|---|---|
+| 60/s | 0, 0, 0 | 0, 0, 0 | **0, 0, 0** |
+| 150/s | 0, 0, 0 | 0, 0, 0 | **0, 0, 0** |
+| 300/s | 0, 0, 0 | 0, 0, 0 | **0, 0, 0** |
+| 600/s | 0, 0, 0 | 4.6%, 8.9%, 19.2% | **25.4%, 30.7%, 31.1%** |
+
+Wall time (the cleaner signal — all three still ingest everything up to 300/s):
+
+| offered | ubuntu | win-2022 | win-2025 | 2025 vs ubuntu |
+|---|---|---|---|---|
+| 60/s | 2.8s | 4.7s | 4.9s | **1.8x** |
+| 150/s | 4.3s | 10.1s | 11.9s | **2.8x** |
+| 300/s | 8.4s | 22.0s | 29.8s | **3.5x** |
+
+**What this settles.** A consistent ordering — ubuntu > windows-2022 > windows-2025 — and windows-2025 strands ~3x more than windows-2022 at saturation, tightly clustered. It is genuinely the slowest leg, and measurably slower than its sibling on identical hosted infrastructure.
+
+**What it refutes.** "~10x slower" and "cannot service 60/s" are both wrong. The gap is a **latency** gap of 1.8x-3.5x, not a capacity cliff: windows-2025 ingests **everything** up to 300/s, five times the rate the failing test offers.
+
+**So the 60/s failures are still unexplained** — real (byte-identical twice) but not a property of the SKU at that rate, or this sweep would show them.
+
+**The untested variable is CONTENTION, and it is now the leading hypothesis.** The probe runs the engine **alone** on an idle runner; the CI failure happens with the full suite running alongside it inside a ~20-minute job. That also matches the one developer-box outlier retracted above, which appeared only while an unrelated suite was running. The honest next experiment is measuring under concurrent load — not another quiet-runner sweep, which would answer nothing new.
+
+**Consequence for priority: this is a TOLERANCE problem, not a throughput one.** A leg 3x slower than ubuntu, occasionally contended by its own test suite, will occasionally strand at 60/s — which is exactly what #115's widened stranding budget absorbs. That fix is now better supported than when it was made, and the product concern this item originally raised (a shipping deployment target being 10x slow) is **not supported by measurement**. A 1.8x-3.5x gap on a hosted VM image says nothing about Windows Server 2025 as a deployment target.
+
+**Still not determined:** why the hosted windows-2025 image is 1.8x-3.5x slower than ubuntu — disk/fsync, Defender scanning the temp SQLite DB, CPU contention are all plausible and none is measurable from outside the runner. Low value now that the magnitude is unremarkable.
 
 **Adjacent finding, unverified:** at saturation `engine_read` (452) cleared the reconcile's unconditional anti-vacuity floor `read >= sent // 2` (450) by **two messages**. A breach of that floor is a hard failure no budget widening can rescue. A probe at 1200/s did *not* reproduce it, but that run is not comparable — its drain timed out (`max_drain_seconds` observed `-1.0`) and it took the branch that skips the settle-poll. Untested, not disproven.
 
