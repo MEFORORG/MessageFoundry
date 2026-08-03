@@ -583,7 +583,13 @@ it is carried as a **stated deployment requirement** (§10) accepted via a signe
 (ASVS-L3-RISK-ACCEPTANCE-REGISTER.md theme 5), not code.
 The compensating controls are the documented restricted-service-account + volume-encryption posture (§10)
 on a single-tenant host: keep the decrypted-secret window inside an OS-isolated process whose memory and
-swap an attacker cannot reach without already owning the host.
+swap an attacker cannot reach without already owning the host. ⚠️ **Both halves are operator-asserted
+and engine-unchecked — say so whenever this is offered as compensating.** §2 records it directly: there
+is **no** `[security].volume_encryption_declared` setting at HEAD and **nothing in the engine verifies
+that FDE is on**. So this mitigates only where the operator actually applied it, and the engine cannot
+tell you whether they did. *(Qualified 2026-08-02: the sentence previously read as though the posture
+were a control the product supplies. A compensating control must not rest on a false premise —
+`CLAUDE.md` §11 — and an unenforced prerequisite offered as a control is that premise.)*
 
 **Since [ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md)
 the residual is *measured and surfaced*, not only asserted `[BUILT]`.** Three changes, none of which
