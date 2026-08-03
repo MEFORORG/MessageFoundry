@@ -13,7 +13,9 @@ and testing it that way keeps the test honest about which layer is under test.
 
 from __future__ import annotations
 
+import re
 from typing import Any
+from urllib.parse import urlsplit
 
 import pytest
 from fastapi import FastAPI
@@ -64,7 +66,11 @@ def test_an_external_idp_gets_the_interstitial_not_a_redirect() -> None:
     assert r.status_code == 200
     body = r.text
     assert "You are leaving this site" in body or "leaving" in body.lower()
-    assert "idp.example.com" in body
+    # Anchored to the element that renders it, not a bare substring of the whole page. Two reasons:
+    # a substring test passes if the host appears ANYWHERE (a stray comment, an unrelated attribute),
+    # and CodeQL flags `host in page` as incomplete-URL-sanitization because that is exactly the
+    # shape of a broken redirect check. Asserting the rendered tag is both stronger and unambiguous.
+    assert "<code>idp.example.com</code>" in body
     assert 'method="post"' in body  # Continue is a form, not a link
     assert "Cancel" in body
 
@@ -88,7 +94,7 @@ def test_with_no_org_domains_even_a_plausible_idp_is_interstitialed() -> None:
         "/ui/oidc/start"
     )
     assert r.status_code == 200
-    assert "adfs.hospital.example" in r.text
+    assert "<code>adfs.hospital.example</code>" in r.text
 
 
 def test_the_allowlist_escape_suppresses_the_interstitial() -> None:
@@ -131,8 +137,18 @@ def test_the_interstitial_page_carries_no_destination_url_to_post_back() -> None
         oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
     assert r.status_code == 200
-    assert "https://idp.example.com" not in r.text  # host shown, full URL never
-    assert 'action="/ui/oidc/start"' in r.text  # posts back to us, carrying nothing
+    # PARSE the Continue form's action rather than string-matching the page. A string-absence check
+    # ("the IdP URL does not appear") passes for the wrong reason the moment the markup changes shape;
+    # parsing asserts the actual property — the form posts to a LOCAL PATH with no host component and
+    # no query, so there is nothing in it for an attacker to steer.
+    action = re.search(r'<form[^>]*action="([^"]*)"[^>]*class="login"', r.text)
+    assert action, "the Continue form is missing"
+    target = urlsplit(action.group(1))
+    assert target.scheme == "" and target.netloc == "", (
+        "the Continue form must post to a local path"
+    )
+    assert target.path == "/ui/oidc/start"
+    assert target.query == "", "no destination may ride in the query string"
 
 
 def test_a_cross_site_post_to_the_start_leg_is_refused() -> None:
