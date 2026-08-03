@@ -135,6 +135,24 @@ level was achieved anyway. Any published attestation must say which requirements
 something weaker than "verified at Level 3". Writing `na` in the record and "Level 3 verified" in a
 brochure is the failure mode this section exists to prevent.
 
+### 2.1a ⛔ The pinned corpus cannot settle a question about ASVS's *prose*
+
+**A corpus that cannot express a class of claim cannot refute one.** `[scorecard].corpus_sha256` pins
+the ASVS **requirements** — `req_id`, text, level. It carries **no chapter prose**: no assessment
+guidance, no scoping discussion, no definitions. So a claim about *what the standard says* outside a
+requirement's own text is **structurally uncheckable** against it, and every check will come back clean.
+
+This is not hypothetical. A false statement — *"ASVS reserves non-applicable for functionality-based
+exclusions"* — survived **two independent assessors** and reached a signed-adjacent risk-acceptance
+block, because every one of them verified against the corpus and the corpus had nothing to say. What
+`0x03` actually says is the opposite: it excludes requirements *"where configuration is outside the
+application's responsibility."* One fetch of the chapter settled it; no amount of corpus checking could
+have.
+
+**So: to cite ASVS prose, fetch the chapter at the `v5.0.0` tag and quote it verbatim.** Never
+paraphrase it from memory, from an earlier assessment, or from another agent — and never treat a green
+corpus check as evidence about a claim the corpus cannot represent.
+
 ### 2.2 A count movement is not a posture movement — read the counts accordingly
 
 **The single most misreadable thing this method produces is a change in the bucket totals.** Counts move
