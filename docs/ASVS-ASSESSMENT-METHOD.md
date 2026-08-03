@@ -62,7 +62,7 @@ These are the real disputes. They are here so the next assessor reaches the same
 |---|---|---|
 | **5.4.3** | `fail` | Rule 3. A scan *hook* exists but its only shipped implementation is `_no_scan`, and there is **no configuration key at all** — an operator must **author** the scanner. Supplying a control is not configuring one. |
 | **15.2.5** | `partial` | Rule 5, **not** rule 3. `[sandbox].mode` ships `off`, but `subprocess` mode is real and was verified by executing it. A working control that ships off. |
-| **11.7.1** | `fail` | Rule 3. The read-out is all-`None` off Linux and the only refusing branch keys on a **TOML declaration**, never on the measured property. Zero percent of the verb is satisfied by shipped code. |
+| **11.7.1** | `na` | **Rule 1 — the hardest call in this table, and it moved.** The verb is *"full memory encryption is in use"*: a property of the **CPU, firmware and hypervisor**, not of the three software artifacts in §2. Outside the declared scope, so rule 1 fires before rule 3 is ever reached. **The objection this has to answer, because it is a good one:** ADR 0152's rungs 1–2 *do* ship in-engine, so the engine is not silent on this cell. But that code **reports on and gates against** the platform property — it never provides it. Reporting is not implementing (§2's first guard). ⚠️ Previously scored `fail` under rule 3 and cited here as the worked example of one. That reading was not wrong on its own terms; it answered *"does code implement the verb"* without first asking *"is the verb's subject in scope"*, and rule 1 runs first. **This cell has moved four times in eighteen days — it is CLOSED by owner decision (2026-08-02); do not re-derive it.** ⛔ It buys **no** Level 3 claim: see §2.1. |
 | **3.7.3** | `fail` | Rule 3. One off-site navigation, a bare 303, no interstitial and no cancel. `oidc_enabled=False` removes the **trigger**, not a control. |
 | **10.5.5** | `na` | Rule 1. The requirement is conditional — *"**when using** OIDC back-channel logout"* — and the precondition is false and unreachable by configuration. **Building it would create applicability.** |
 | **12.2.2** | `na` | Rule 1. No external-facing services on the declared scope. *Also a scoping error worth remembering: this row spent months scoring 12.3.1's verb.* |
@@ -85,6 +85,55 @@ Per ASVS's guidance, stated as what **is** included rather than what is excluded
 
 **Included:** the MessageFoundry engine, the web console, and the IDE extension, assessed as source,
 at a named commit, against **all 345 ASVS 5.0.0 requirements** at **Level 3**.
+
+**The boundary that phrase implies, stated explicitly because it decides verdicts.** The subject of
+this assessment is those three **software artifacts**. It is not the host, the hypervisor, the CPU, the
+firmware, or the network the operator deploys onto. Where a requirement's **verb** names a property of
+that substrate rather than of the software, the requirement is outside the declared scope and takes
+`na` under rule 1 — with the rationale written, as always.
+
+**This is ASVS's own principle, not a local invention.** Verbatim from `0x03-What-is-the-ASVS.md` at the
+`v5.0.0` tag:
+
+> "Conversely, ASVS generally excludes requirements that are not directly relevant to the application or
+> **where configuration is outside the application's responsibility**. For example, DNS issues are
+> typically managed by a separate team or function."
+
+⚠️ **Do not over-read that, and do not reach for the fork clause to do this job.** The same chapter says
+organizations are *"strongly encouraged to create an organization- or domain-specific fork that adjusts
+requirements"* — but its worked examples of omission are **technology-not-used** (*"omitting irrelevant
+sections (e.g., GraphQL, WebSockets, SOAP, if unused)"*), which is the functionality-based shape, and
+**forking changes what you are claiming conformance TO**: your tailored ASVS, not stock ASVS 5.0. This
+project does **not** fork. It applies rule 1 against a positively-declared scope, which is narrower,
+cheaper to defend, and leaves the conformance target unchanged.
+
+Two guards on that boundary, because it is exactly the kind of clause that grows to swallow
+inconvenient cells:
+
+* **Shipping code that *reports on* a platform property is not the same as *providing* it, and neither
+  direction is decisive on its own.** A cell does not become in-scope merely because the engine
+  observes the substrate; nor does it leave scope merely because the substrate is involved. Ask what
+  the **verb** requires to be true, and of what.
+* ⛔ **This boundary does not shrink the conformance claim's denominator.** A requirement excluded here
+  is still a requirement OWASP assigns to Level 3. See §2.1.
+
+### 2.1 What an out-of-scope cell does NOT buy
+
+**It does not preserve an unqualified Level 3 claim.** Two facts, both from ASVS 5.0.0 itself:
+
+* **4.0's clause that an organization excluding requirements "may still claim full ASVS compliance"
+  was DROPPED in 5.0.** The 5.0 text says only that non-applicability must be noted in the report.
+  There is no longer any standard text saying a documented exclusion preserves a compliance claim, and
+  a rationale that cites the older wording is citing a superseded standard.
+* **OWASP does not certify anyone — but it does retain normative authority over the requirement SET.**
+  It assigns each requirement to a level. So a Level 3 claim that silently omits a requirement OWASP
+  places at Level 3 is non-conformant **on OWASP's own terms**, regardless of how well-argued the
+  exclusion is.
+
+**Therefore:** scoping a cell out is a statement about *what was assessed*, never a statement that the
+level was achieved anyway. Any published attestation must say which requirements were excluded, or say
+something weaker than "verified at Level 3". Writing `na` in the record and "Level 3 verified" in a
+brochure is the failure mode this section exists to prevent.
 
 **The configuration assessed** — one posture, not a matrix:
 
