@@ -52,7 +52,23 @@ def _scorecard_file(tmp_path: Path, body: str) -> Path:
 
 
 def _cells(*specs: tuple[str, int, str]) -> list[Cell]:
-    return [Cell(id=i, level=lv, verdict=v) for i, lv, v in specs]  # type: ignore[arg-type]
+    """Fixture cells for the id / level / count checks.
+
+    Decided verdicts carry a placeholder anchor because `check_completeness` now refuses an
+    unevidenced one. These fixtures are about ids and levels, so the anchor keeps them focused rather
+    than tripping a rule they do not test; `check_anchors` is never called on them.
+    """
+    decided = {"pass", "partial", "fail", "na"}
+    return [
+        Cell(
+            id=i,
+            level=lv,
+            verdict=v,  # type: ignore[arg-type]
+            evidence=(Anchor("messagefoundry/m.py", 1, "x"),) if v in decided else (),
+            residual="rationale" if v == "na" else "",
+        )
+        for i, lv, v in specs
+    ]
 
 
 # --- completeness: the check whose absence cost ten cells ---------------------------------------
@@ -165,7 +181,10 @@ def test_absence_holds_when_pattern_is_quiet_and_control_speaks(tmp_path: Path) 
     )
     cells = [
         Cell(
-            id="1.1.1", level=1, verdict="fail", absence=(Absence("clamav|clamd", "ScanRejected"),)
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamav|clamd", "ScanRejected", "import clamd"),),
         )
     ]
     f = Findings()
@@ -180,7 +199,12 @@ def test_absence_is_rejected_as_BLIND_when_the_positive_control_matches_nothing(
     (tmp_path / "messagefoundry").mkdir()
     (tmp_path / "messagefoundry" / "m.py").write_text("unrelated\n", encoding="utf-8")
     cells = [
-        Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence("clamav", "ScanRejected"),))
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamav", "ScanRejected", "import clamav"),),
+        )
     ]
     f = Findings()
     check_absences(cells, tmp_path, f)
@@ -193,10 +217,69 @@ def test_absence_is_rejected_as_FALSE_when_the_thing_now_exists(tmp_path: Path) 
     (tmp_path / "messagefoundry" / "m.py").write_text(
         "import clamd\nclass ScanRejected: pass\n", encoding="utf-8"
     )
-    cells = [Cell(id="1.1.1", level=1, verdict="fail", absence=(Absence("clamd", "ScanRejected"),))]
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("clamd", "ScanRejected", "import clamd"),),
+        )
+    ]
     f = Findings()
     check_absences(cells, tmp_path, f)
     assert not f.ok and "FALSE" in f.problems[0]
+
+
+def test_absence_is_rejected_as_INERT_when_the_pattern_is_prose_not_a_pattern(
+    tmp_path: Path,
+) -> None:
+    """The real defect: an entire chapter was authored as narrations of shell commands.
+
+    The field's type is ``str`` and prose is a valid ``str``, so the shape permitted it. Prose greps
+    to nothing, which is indistinguishable from a true absence -- nine claims would have shipped
+    proving nothing. Requiring the pattern to fire on a stated reintroduction makes prose unwritable.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "class ScanRejected: pass\n", encoding="utf-8"
+    )
+    prose = "rg -n 'tar.extractall' messagefoundry/ -> exit 1 (zero hits)"
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence(prose, "ScanRejected", "tar.extractall(dest)"),),
+        )
+    ]
+    f = Findings()
+    check_absences(cells, tmp_path, f)
+    assert not f.ok and "INERT" in f.problems[0]
+
+
+def test_absence_INERT_is_decided_before_the_corpus_is_consulted(tmp_path: Path) -> None:
+    """A live positive control must not launder a pattern that cannot fire.
+
+    BLIND and INERT are different failures: BLIND means the search could not have seen the thing,
+    INERT means the pattern could not have matched it. A prose claim whose control happens to speak
+    would otherwise pass every existing check while measuring nothing.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "class ScanRejected: pass\n", encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="fail",
+            absence=(Absence("zero hits for pyclamd", "ScanRejected", "import pyclamd"),),
+        )
+    ]
+    f = Findings()
+    check_absences(cells, tmp_path, f)
+    assert not f.ok and "INERT" in f.problems[0]
+    assert not any("BLIND" in p for p in f.problems)
 
 
 # --- fail closed, never skip ----------------------------------------------------------------------
@@ -255,6 +338,10 @@ id = "2.1.1"
 level = 3
 verdict = "partial"
 residual = "ships off"
+[[cell.evidence]]
+path = "messagefoundry/m.py"
+line = 1
+expect = "tls_cert_file"
 """,
     )
     findings = verify(sc, corpus, tmp_path)
@@ -279,6 +366,33 @@ def test_render_leads_with_survey_progress_not_a_headline_score() -> None:
     assert "deadbeef" in out
 
 
+def test_render_counts_a_needs_review_cell_as_read_not_as_unexamined() -> None:
+    """Survey progress counts what was READ; `needs-review` was read and then parked on purpose.
+
+    Latent from the day the renderer was written and invisible until the scorecard acquired its first
+    `needs-review` cell: with none present, "decided" and "examined" are the same set, so nothing
+    could distinguish them. The symptom was two numbers for one quantity on the page that IS the
+    record — a survey line saying N have *not* been read, directly above a table whose `unverified`
+    row said N-1.
+
+    The assertion that matters is the LAST one: the two figures the page prints must agree, because a
+    reader comparing them is the only thing that ever noticed.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-02"),
+        Cell(id="1.1.2", level=2, verdict="unverified"),
+        Cell(id="2.1.1", level=3, verdict="needs-review", last_verified="2026-08-02"),
+    ]
+    out = render_current(cells, anchor_sha="x")
+
+    assert (
+        "**2 of 3 requirements have been read against the ASVS text (66.7%).** 1 have not." in out
+    )
+    # ...and it stays OUT of the verdict counts, which is why the two sets differ at all.
+    assert "| Needs review | 1 |" in out
+    assert "| **Unverified** | **1** |" in out
+
+
 def test_render_flags_a_decided_verdict_carrying_no_verified_date_as_inherited() -> None:
     cells = [Cell(id="1.1.1", level=1, verdict="pass")]  # decided, but never dated
     out = render_current(cells, anchor_sha="x")
@@ -301,6 +415,89 @@ def test_na_with_a_rationale_is_accepted(tmp_path: Path) -> None:
         '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "na"\nresidual = "no WebRTC surface"\n',
     )
     assert load_scorecard(sc)[0].verdict == "na"
+
+
+def test_a_closed_cell_whose_verdict_still_matches_its_pin_loads(tmp_path: Path) -> None:
+    """The green half. Without this, the red tests below could pass by refusing every closed cell."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "na"\nresidual = "out of declared scope"\n'
+        'decision_closed = true\ndecision_closed_verdict = "na"\n'
+        'decision_closed_on = "2026-08-02"\ndecision_closed_by = "owner"\n',
+    )
+    assert load_scorecard(sc)[0].verdict == "na"
+
+
+def test_rescoring_a_closed_cell_is_refused(tmp_path: Path) -> None:
+    """The whole point: a survey cannot quietly re-grade a cell the owner closed.
+
+    This was prose before it was a gate, and prose is not what stops a sweep — the cell this rule
+    exists for moved FOUR times in eighteen days, each pass believing it was doing careful work. A
+    rationale they could read was never the thing that stopped them.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "fail"\nresidual = "re-graded by a sweep"\n'
+        'decision_closed = true\ndecision_closed_verdict = "na"\n',
+    )
+    with pytest.raises(ScorecardError, match="CLOSED at"):
+        load_scorecard(sc)
+
+
+def test_a_closure_without_a_pinned_verdict_is_refused(tmp_path: Path) -> None:
+    """A closure with nothing to compare against is a comment, not a control.
+
+    The failure mode it forecloses: someone writes `decision_closed = true`, believes the cell is
+    protected, and the checker has no way to tell a re-score from the original verdict.
+    """
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "11.7.1"\nlevel = 3\nverdict = "na"\nresidual = "out of declared scope"\n'
+        "decision_closed = true\n",
+    )
+    with pytest.raises(ScorecardError, match="the pin is what makes the closure checkable"):
+        load_scorecard(sc)
+
+
+def test_a_closed_cell_is_rendered_even_when_its_verdict_is_not_an_open_state() -> None:
+    """The regression this exists for: a closure visible only while the verdict is open.
+
+    11.7.1 was closed while it was a `fail`, so its stop text surfaced in the open-cells table — then
+    the same ruling moved it to `na`, it dropped out of `open_states`, and the rendered record went
+    silent about the one cell that had just been ruled on. Closure visibility must not depend on which
+    verdict the cell happens to hold.
+    """
+    out = render_current(
+        [
+            Cell(
+                id="11.7.1",
+                level=3,
+                verdict="na",
+                residual="out of declared scope",
+                decision_closed=True,
+                decision_closed_on="2026-08-02",
+                decision_closed_by="owner",
+            )
+        ],
+        anchor_sha="x",
+    )
+    assert "Closed by owner decision" in out
+    assert "| 11.7.1 | L3 | **na** | 2026-08-02 | owner |" in out
+
+
+def test_the_closed_section_is_absent_when_no_cell_is_closed() -> None:
+    """Negative control on REACH: the heading must not appear for a scorecard with no closures."""
+    out = render_current([Cell(id="1.1.1", level=1, verdict="pass")], anchor_sha="x")
+    assert "Closed by owner decision" not in out
+
+
+def test_an_unclosed_cell_is_unaffected_by_the_closure_rule(tmp_path: Path) -> None:
+    """Negative control on the rule's REACH: it must not police cells that never opted in."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\nresidual = "no control"\n',
+    )
+    assert load_scorecard(sc)[0].verdict == "fail"
 
 
 def test_needs_review_is_a_valid_verdict(tmp_path: Path) -> None:
@@ -332,3 +529,139 @@ def test_pinning_passes_when_version_and_digest_are_declared(tmp_path: Path) -> 
         f'[scorecard]\nasvs_version = "5.0.0"\ncorpus_sha256 = "{corpus_digest(corpus)}"\n',
     )
     assert check_pinning(sc, corpus) == []
+
+
+def test_pinning_refuses_an_abbreviated_anchor_sha(tmp_path: Path) -> None:
+    """actions/checkout resolves a short ref as a BRANCH OR TAG name, so an abbreviated anchor fails
+    with "A branch or tag with the name ... could not be found" -- a gate failing for a reason with
+    nothing to do with what it measures. Caught in CI twice before it was refused here."""
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(
+        tmp_path,
+        '[scorecard]\nasvs_version = "5.0.0"\nanchor_commit = "8f01cef8"\n'
+        f'corpus_sha256 = "{corpus_digest(corpus)}"\n',
+    )
+    assert any("must be a FULL 40-character SHA" in p for p in check_pinning(sc, corpus))
+
+
+def test_pinning_accepts_a_full_anchor_sha(tmp_path: Path) -> None:
+    corpus = _corpus_file(tmp_path)
+    sc = _scorecard_file(
+        tmp_path,
+        '[scorecard]\nasvs_version = "5.0.0"\n'
+        'anchor_commit = "28d186b5d85b10c8e0ce3fc35adc01b7269bcb28"\n'
+        f'corpus_sha256 = "{corpus_digest(corpus)}"\n',
+    )
+    assert check_pinning(sc, corpus) == []
+
+
+def test_load_refuses_an_absence_claim_with_no_mutation(tmp_path: Path) -> None:
+    """Authored, never inferred: a mutation derived from its pattern would pass by construction."""
+    sc = _scorecard_file(
+        tmp_path,
+        '[[cell]]\nid = "1.1.1"\nlevel = 1\nverdict = "fail"\n'
+        '  [[cell.absence]]\n  pattern = "clamd"\n'
+        '  positive_control = "ScanRejected"\n',
+    )
+    with pytest.raises(ScorecardError, match="has no `mutation`"):
+        load_scorecard(sc)
+
+
+def test_the_module_does_not_contaminate_the_corpus_it_scans() -> None:
+    """scorecard.py lives INSIDE the corpus that absence patterns are searched over.
+
+    A literal code example in this module therefore becomes a real corpus hit. The first draft of
+    the `mutation` guidance carried one, and it broke two live absence claims (5.2.5, 5.3.3) the
+    moment they were backfilled -- the documentation OF a check contaminated the check.
+
+    This is an INSTANCE lock, not a class lock. It pins the one literal that has actually bitten;
+    the general rule -- write examples in escaped-regex form, which cannot self-match -- is stated
+    in the Absence docstring and is not mechanically enforceable.
+    """
+    import scripts.asvs.scorecard as mod
+
+    src = Path(mod.__file__).read_text(encoding="utf-8")
+    for literal in (".extractall(", "unpack_archive("):
+        assert literal not in src, (
+            f"scorecard.py contains the literal {literal!r}. This module is inside the scanned "
+            "corpus, so that literal is a corpus hit and will read as FALSE for any absence claim "
+            "excluding it. Write the example in escaped-regex form instead."
+        )
+
+
+def test_anchor_is_rejected_as_AMBIGUOUS_when_the_token_is_not_unique(tmp_path: Path) -> None:
+    """A token occurring many times resolves from almost anywhere, so it certifies nothing.
+
+    Measured on the real scorecard: 46 of 292 anchors (15%) had a non-unique token, and the worst
+    occurred 101 times in one file -- meaning ANY line number in that file landed within the window.
+    Those were not anchors at risk of going hollow; they were already hollow, and passing.
+    """
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "await conn.rollback()" + chr(10) + "x = 1" + chr(10) + "await conn.rollback()" + chr(10),
+        encoding="utf-8",
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 1, "await conn.rollback()"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert not f.ok and "AMBIGUOUS" in f.problems[0] and "occurs 2 times" in f.problems[0]
+
+
+def test_anchor_holds_when_the_token_is_unique(tmp_path: Path) -> None:
+    """The uniqueness rule must not reject a legitimate anchor -- proved alongside its negative."""
+    (tmp_path / "messagefoundry").mkdir()
+    (tmp_path / "messagefoundry" / "m.py").write_text(
+        "a" + chr(10) + "tls_cert_file = None" + chr(10) + "b" + chr(10), encoding="utf-8"
+    )
+    cells = [
+        Cell(
+            id="1.1.1",
+            level=1,
+            verdict="pass",
+            evidence=(Anchor("messagefoundry/m.py", 2, "tls_cert_file"),),
+        )
+    ]
+    f = Findings()
+    check_anchors(cells, tmp_path, f)
+    assert f.ok and f.checked_anchors == 1
+
+
+def test_completeness_catches_a_decided_verdict_with_no_evidence_at_all() -> None:
+    """The gate could only validate evidence that EXISTED, never assert that it must.
+
+    check_anchors iterates the anchors a cell has, so a cell with none is skipped and fails nothing.
+    Measured when this landed: 14 of 59 decided cells carried zero anchors and zero absence claims --
+    verdicts inherited from the prose lineage that were reached but never anchored. That is precisely
+    the guess-wearing-a-verdict conflation this tool exists to prevent.
+    """
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", evidence=(Anchor("m.py", 1, "x"),)),
+        Cell(id="1.1.2", level=2, verdict="partial"),  # no anchor, no absence
+        Cell(id="2.1.1", level=3, verdict="unverified"),  # unverified needs none
+    ]
+    problems = check_completeness(cells, CORPUS)
+    hit = [p for p in problems if "carry NO anchor" in p]
+    assert len(hit) == 1, problems
+    assert "1.1.2" in hit[0] and "1.1.1" not in hit[0] and "2.1.1" not in hit[0]
+
+
+def test_completeness_accepts_a_decided_cell_evidenced_only_by_an_absence_claim() -> None:
+    """A `fail` is often proved by absence, not presence -- the rule must not demand a presence anchor."""
+    cells = [
+        Cell(id="1.1.1", level=1, verdict="pass", evidence=(Anchor("m.py", 1, "x"),)),
+        Cell(
+            id="1.1.2",
+            level=2,
+            verdict="fail",
+            absence=(Absence("clamd", "ScanRejected", "import clamd"),),
+        ),
+        Cell(id="2.1.1", level=3, verdict="unverified"),
+    ]
+    assert not [p for p in check_completeness(cells, CORPUS) if "carry NO anchor" in p]

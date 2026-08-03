@@ -235,6 +235,18 @@ class _TimeoutSysLogHandler(logging.handlers.SysLogHandler):
 
     def __init__(self, *args: Any, timeout: float | None = None, **kwargs: Any) -> None:
         self._sock_timeout = timeout
+        # Forward the timeout to the stdlib ctor as well (BACKLOG #350). SysLogHandler.createSocket
+        # applies `self.timeout` via settimeout() *before* sock.connect(), so this is the only thing
+        # that bounds the STARTUP connect; our own settimeout in createSocket runs after connect has
+        # already returned and can bound nothing but later sends/reconnects. Without this the startup
+        # connect fell back to the OS default — on a collector host that DROPS rather than refuses,
+        # that stalls engine start, contradicting this class's own "can't block the calling thread"
+        # contract and _build_syslog_handler's docstring.
+        # Routed through kwargs rather than passed explicitly: `timeout` is also SysLogHandler's 4th
+        # POSITIONAL parameter, so `super().__init__(*args, timeout=...)` is a possible double-bind
+        # that mypy rejects outright. Every construction site here is keyword-only, so this is
+        # equivalent at runtime and honest to the checker.
+        kwargs["timeout"] = timeout
         super().__init__(*args, **kwargs)  # SysLogHandler.__init__ calls createSocket() (3.11+)
 
     def createSocket(self) -> None:

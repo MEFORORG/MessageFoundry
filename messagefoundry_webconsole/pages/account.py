@@ -25,6 +25,7 @@ from .._html import Markup, el, minimal_nav, page, register_nav, wordmark
 
 __all__ = [
     "account_page",
+    "leaving_site",
     "login",
     "oidc_landing",
     "mfa_confirm_page",
@@ -155,6 +156,71 @@ def oidc_landing() -> Markup:
         nav=minimal_nav(),
         head_extra=el("meta", **{"http-equiv": "refresh", "content": "0;url=/ui"}),
     )
+
+
+def leaving_site(
+    *,
+    destination_host: str,
+    continue_action: str,
+    idn_disguised: bool = False,
+    cancel_href: str = "/ui/login",
+    purpose: str = "",
+) -> Markup:
+    """The ASVS 3.7.3 interstitial: you are leaving, here is where to, and you may cancel.
+
+    **The destination URL is deliberately NOT a parameter of this page.** Only the host is passed, for
+    display. The actual URL lives in server-side flow state and is looked up by the POST handler — if
+    the page carried the target, the interstitial would itself be an open redirect, which is strictly
+    worse than having no interstitial at all.
+
+    **``destination_host`` must already be punycode/ASCII** (see ``_external.display_host``). Showing
+    the decoded Unicode would show the operator a host that is not the one the browser resolves, which
+    makes this page actively misleading rather than merely useless. ``idn_disguised`` surfaces the
+    case where the two differ, because a homograph is invisible by construction and cannot be left to
+    the reader to spot.
+
+    Continue is a **form POST**, not a link. Two reasons: the POST target carries no URL so it cannot
+    be pointed anywhere else, and it puts the navigation behind the console's existing same-origin /
+    ``Sec-Fetch-Site`` check — which also closes the pre-existing hole where any external page could
+    start a federated sign-in just by linking to the start leg.
+
+    No JavaScript: the ``/ui`` CSP is strict, with no nonce and no ``script-src`` relaxation.
+    """
+    warn = (
+        el(
+            "p",
+            el("strong", "This address uses non-ASCII characters."),
+            " It is shown above in its encoded form, which is what your browser will actually look "
+            "up. A name that looks familiar may not be the site you expect.",
+            class_="warn",
+        )
+        if idn_disguised
+        else Markup("")
+    )
+    reason = el("p", purpose, class_="muted") if purpose else Markup("")
+    body = el(
+        "div",
+        el("h1", wordmark(tm=True)),
+        el("p", el("strong", "You are leaving this site.")),
+        reason,
+        el("p", "You will be taken to:"),
+        el("p", el("code", destination_host)),
+        warn,
+        el(
+            "form",
+            el("button", "Continue", type="submit"),
+            method="post",
+            action=continue_action,
+            class_="login",
+        ),
+        el("p", el("a", "Cancel", href=cancel_href), class_="muted"),
+        class_="card",
+    )
+    # ASVS 7.4.4: `nav=Markup("")` would suppress the shared chrome AND its sign-out control,
+    # stranding a signed-in operator on a page with no way out. `minimal_nav()` is what the
+    # sibling interstitial (`oidc_landing`) uses for exactly this reason. The first version of
+    # this page used the bare Markup("") and was wrong.
+    return page("Leaving this site", body, nav=minimal_nav())
 
 
 def sso_challenge() -> Markup:

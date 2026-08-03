@@ -38,7 +38,15 @@ import json
 import logging
 import queue
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Callable,
+    Collection,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AsyncExitStack, asynccontextmanager, contextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -135,6 +143,14 @@ _RELEASE_CHUNK = 500
 # pyodbc's ~2,100-parameter bound with the fixed parameters; chunks run inside the reset's single
 # transaction, so the all-or-nothing recovery pass is unchanged.
 _RESET_LANE_CHUNK = 500
+
+# BACKLOG #348 / ADR 0159: how long the quarantine of a cancellation-poisoned pooled connection waits
+# for its off-loop close before giving up and leaving it to finish detached. A BOUND, not a deadline:
+# the connection is already out of the pool before this wait starts, so expiring it costs nothing but
+# a slower reclaim. It exists because the close runs on a worker thread that may still be occupied by
+# the abandoned statement, which is bounded only by command_timeout (default 30s) — without a cap here
+# an engine.stop()/demotion would block for that long, per lane.
+_DIRTY_CLOSE_TIMEOUT = 5.0
 
 # SQL Server native error 1222 = "Lock request time out period exceeded" — raised by SET LOCK_TIMEOUT 0
 # in the pooled claim (ADR 0066 §9) when a probe cannot IMMEDIATELY acquire a contended head lock. It is
@@ -1093,22 +1109,13 @@ _SCHEMA: list[str] = [
         CREATE INDEX ix_messages_channel ON messages(channel_id, received_at)""",
     """IF INDEXPROPERTY(OBJECT_ID('messages'),'ix_messages_control','IndexID') IS NULL
         CREATE INDEX ix_messages_control ON messages(channel_id, control_id)""",
-    """IF OBJECT_ID('outbox','U') IS NULL CREATE TABLE outbox (
-        id NVARCHAR(64) NOT NULL PRIMARY KEY, message_id NVARCHAR(64) NOT NULL,
-        channel_id NVARCHAR(256) NOT NULL, destination_name NVARCHAR(256) NOT NULL,
-        payload NVARCHAR(MAX) NOT NULL, status NVARCHAR(32) NOT NULL,
-        attempts INT NOT NULL DEFAULT 0, next_attempt_at FLOAT NOT NULL, last_error NVARCHAR(MAX) NULL,
-        created_at FLOAT NOT NULL, updated_at FLOAT NOT NULL)""",
-    """IF INDEXPROPERTY(OBJECT_ID('outbox'),'ix_outbox_ready','IndexID') IS NULL
-        CREATE INDEX ix_outbox_ready ON outbox(status, next_attempt_at)""",
-    """IF INDEXPROPERTY(OBJECT_ID('outbox'),'ix_outbox_message','IndexID') IS NULL
-        CREATE INDEX ix_outbox_message ON outbox(message_id)""",
     # Unified staged queue (ADR 0001) — ingress -> routed -> outbound, one row per stage-unit with a
-    # `stage` discriminator. The SQL Server backend originally shipped only the flat `outbox`; the
-    # staged pipeline (enqueue_ingress + the handoffs) and ALL delivery-side methods now read/write
-    # this table (outbox is retained only for legacy read-compat). `seq` IDENTITY is the FIFO
-    # insertion-order tiebreak (PG uses BIGSERIAL); owner/lease_expires_at are present for parity but
-    # written NULL on this single-node backend (reset_stale_inflight is the recovery path).
+    # `stage` discriminator. The SQL Server backend originally shipped a flat `outbox` table; it was
+    # RECREATED by this very `_SCHEMA` on every open and read by nothing (the staged pipeline and every
+    # delivery-side method read/write `queue`), so any legacy PHI body left in it was retained forever
+    # with no purge on any backend — see the migrate-and-drop below, and docs/PHI.md §2. `seq` IDENTITY
+    # is the FIFO insertion-order tiebreak (PG uses BIGSERIAL); owner/lease_expires_at are present for
+    # parity but written NULL on this single-node backend (reset_stale_inflight is the recovery path).
     """IF OBJECT_ID('queue','U') IS NULL CREATE TABLE queue (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, seq BIGINT IDENTITY(1,1) NOT NULL,
         message_id NVARCHAR(64) NOT NULL, stage NVARCHAR(16) NOT NULL,
@@ -1169,6 +1176,54 @@ _SCHEMA: list[str] = [
     # Sch-M lock on the hot queue table (review). lock_escalation 2 = DISABLE.
     """IF (SELECT lock_escalation FROM sys.tables WHERE object_id=OBJECT_ID('queue')) <> 2
         ALTER TABLE queue SET (LOCK_ESCALATION = DISABLE)""",
+    # ASVS 14.2.7 — fold the legacy flat `outbox` into `queue` (stage=outbound) and DROP it.
+    #
+    # WHY THIS IS A PHI FIX AND NOT A TIDY-UP. The table was recreated on every open and read by
+    # nothing, so `outbox.payload` — a FULL transformed PHI body — was **purged by nothing on any
+    # backend**: `purge_old_messages` and `purge_dead_letters` both scope to `queue`. A store upgraded
+    # from the pre-staged-pipeline layout therefore kept every legacy body forever while `messages.raw`
+    # blanked on its window, so the message READ as purged. Migrating the rows in puts them under
+    # `[security].delete_message_bodies_after_days` / `[retention].dead_letter_days` like any other
+    # outbound row; dropping the table is what makes the retirement true rather than merely documented.
+    #
+    # WHY IT LIVES IN `_SCHEMA` AND NOT AN OPEN-PATH METHOD (the SQLite backend uses a method,
+    # `_migrate_outbox_to_queue`): on this backend `_schema_hash()` is the ONLY thing that decides
+    # whether the DDL batch runs at all — a current marker skips it entirely — so migration code
+    # outside `_SCHEMA` would be invisible to that decision. See `_schema_hash`'s docstring.
+    #
+    # WHY IT IS PLACED HERE, after the `queue` DDL rather than where the `outbox` DDL used to be:
+    # SQL Server defers name resolution, so an earlier placement would PARSE fine and then fail at RUN
+    # time against a legacy DB old enough to have `outbox` but not yet `queue` — a failed open, which
+    # under the batch's single transaction is a startup crash-loop, not a degraded start.
+    #
+    # The two filters are each load-bearing:
+    #   * EXISTS(messages) — `fk_queue_message` is enforced, and an orphan row (a `message_id` with no
+    #     surviving message) would abort the whole batch with an opaque FK error. It was unreplayable
+    #     anyway: nothing can view or route it. Same call the SQLite migration makes.
+    #   * NOT EXISTS(queue) — `queue.id` is the PK. Ids are uuid4 so a collision is not a real
+    #     expectation, but the cost of being wrong is a 2627 that rolls back the batch and re-fails on
+    #     every restart. A cheap anti-join buys immunity from that, and also makes a partially-applied
+    #     migration (rolled back after the INSERT, before the marker) safely re-runnable.
+    # ORDER BY created_at feeds the `seq` IDENTITY in arrival order so a legacy backlog drains FIFO
+    # (ADR 0059 orders a lane by `seq` alone). MEASURED, not assumed: against SQL Server 2022 CU25,
+    # rows INSERTed into `outbox` in the exact reverse of their created_at order came out of the
+    # migration with `seq` ascending by created_at. It is still not a documented guarantee — a parallel
+    # plan over a large backlog may assign otherwise — so it is deliberately not asserted by a test
+    # that would then be flaky. Each row's own created_at is carried over verbatim either way, so a
+    # reorder costs ordering, never data.
+    f"""IF OBJECT_ID('outbox','U') IS NOT NULL
+    BEGIN
+        INSERT INTO queue (id, message_id, stage, channel_id, destination_name, payload,
+                           status, attempts, next_attempt_at, last_error, created_at, updated_at)
+        SELECT o.id, o.message_id, '{Stage.OUTBOUND.value}', o.channel_id, o.destination_name,
+               o.payload, o.status, o.attempts, o.next_attempt_at, o.last_error,
+               o.created_at, o.updated_at
+        FROM outbox o
+        WHERE EXISTS (SELECT 1 FROM messages m WHERE m.id = o.message_id)
+          AND NOT EXISTS (SELECT 1 FROM queue q WHERE q.id = o.id)
+        ORDER BY o.created_at, o.id;
+        DROP TABLE outbox;
+    END""",
     # #47/ADR 0042: messages.documents_pruned (the "embedded doc evicted vs never present" flag). NULL on
     # existing rows = never pruned; COL_LENGTH-gated like the others so a re-open is a no-op.
     """IF COL_LENGTH('messages','documents_pruned') IS NULL
@@ -1695,6 +1750,10 @@ class SqlServerStore:
         # insert helpers; no new lock, no commit-boundary change. See tests/test_live_cost_counters.py.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQL Server's terminal resolves are NOT yet
+        # epoch-fenced (that is ADR 0157 Inc 3), so this stays 0 on this backend until then. Declared
+        # because Store (base.py) requires it and open_store() returns this class as a Store.
+        self.fenced_writes = 0
 
     async def _commit(self, conn: Any) -> None:
         """Commit a durable **write**-path transaction and count it (A1 live cost counters). A bare async
@@ -2412,10 +2471,16 @@ class SqlServerStore:
         # recognised as already-encrypted and skipped — never re-wrapped.
         like = f"{_ENC_MARKER_PREFIX}%"
         total = 0
+        # `("outbox", "payload")` was here until the legacy table was migrated + DROPped (ASVS
+        # 14.2.7). Leaving it would fail this pass with *Invalid object name 'outbox'* on EVERY keyed
+        # open — and the keyed path does not run in CI (every SQL Server leg is keyless), so
+        # `tests/test_sqlserver_encrypt_pass_tables.py` is the only mechanism that can catch a stale
+        # entry here. Rows the migration folded in are covered by `("queue", "payload")` below: the
+        # migration carries the payload over VERBATIM, so a legacy plaintext body arrives unencrypted
+        # and this pass — which runs after `_ensure_schema` — seals it on the same open.
         for table, column in (
             ("messages", "raw"),
             ("queue", "payload"),
-            ("outbox", "payload"),
             (
                 "users",
                 "totp_secret",
@@ -2909,7 +2974,60 @@ class SqlServerStore:
             raw = getattr(conn, "_conn", None)
             if raw is not None:
                 raw.timeout = self._settings.command_timeout  # seconds; 0 = no limit
-            yield conn
+            try:
+                yield conn
+            except BaseException as exc:
+                # BACKLOG #348 / ADR 0159. Every caller's own handler is `except Exception` (90 of
+                # the 91 _acquire sites), so an ordinary error has ALREADY rolled back by the time it
+                # reaches here — leave that path exactly as it was, connection recycled. A
+                # CancelledError derives from BaseException, so NONE of those handlers ran: the body
+                # is unwinding with its transaction still open and its X locks still held, and
+                # aioodbc's pool does not compensate (`Pool.release()` appends a non-closed
+                # connection straight back onto the free deque — 0.5.0 pool.py:196-205 — and
+                # `_ContextManager.__aexit__` releases identically on the exception path). Quarantine
+                # it so the next borrower can never inherit it.
+                if not isinstance(exc, Exception):
+                    await self._release_dirty(conn)
+                raise
+
+    async def _release_dirty(self, conn: Any) -> None:
+        """Quarantine a pooled connection whose transaction was abandoned by a cancellation, so it
+        can never be lent to another caller (BACKLOG #348, ADR 0159).
+
+        **The load-bearing line is the synchronous one.** aioodbc derives ``Connection.closed`` from
+        ``self._conn`` (0.5.0 connection.py:89-93) and ``Pool.release()`` re-adds a connection to the
+        free deque only ``if not conn.closed`` (pool.py:200-204) — so dropping the handle is a plain
+        attribute write that makes the connection unlendable with **no await in front of it**. That
+        matters: shutdown cancels the lane task and the gather can cancel it AGAIN, so any cleanup
+        that awaits *before* containing the poison is defeated by the second cancellation and
+        silently restores the bug. Ordering here is the guarantee; the close below is only hygiene.
+
+        Closing the raw handle is then best-effort, off the event loop, and time-boxed. pyodbc's
+        ``close()`` rolls back uncommitted work (DBAPI), which is what actually frees the X locks —
+        but it runs on a worker thread that may still hold the abandoned statement, so it is never
+        awaited unbounded on a shutdown/demotion path. On expiry the close finishes detached; the
+        pool has already lost the connection and reopens on demand (``size`` is derived, so the pool
+        simply shrinks). This costs one reconnect per cancelled call — paid only on a path that was
+        previously corrupting the pool.
+        """
+        raw = getattr(conn, "_conn", None)
+        if raw is None:  # already closed/quarantined — nothing lendable to contain
+            return
+        conn._conn = None  # ← MUST stay first, and MUST stay await-free
+        closer = asyncio.ensure_future(asyncio.to_thread(raw.close))
+        try:
+            await asyncio.wait_for(asyncio.shield(closer), _DIRTY_CLOSE_TIMEOUT)
+        except (TimeoutError, asyncio.CancelledError):
+            # Expired, or a further cancellation landed while we waited. Either way the connection is
+            # already out of the pool; let the close land on its own. Swallowed deliberately — the
+            # caller re-raises the ORIGINAL cancellation, which is the outcome that must propagate.
+            log.debug(
+                "sqlserver: quarantined connection close did not complete within %.1fs; it will"
+                " finish detached (the connection is already out of the pool)",
+                _DIRTY_CLOSE_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - a close failure must not mask the cancellation
+            log.debug("sqlserver: quarantined connection close failed", exc_info=True)
 
     def pool_status(self) -> PoolStatus | None:
         """The aioodbc pool snapshot (B11): size/idle occupancy + the PRIMARY acquire-wait percentiles.
@@ -5942,6 +6060,66 @@ class SqlServerStore:
                 await conn.rollback()
                 raise
         return int(purged) if purged is not None else 0
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # See Store.purge_reference_snapshots for the full contract. ADR 0006 `reference.value` is PL-2
+        # and had no purge path at all before ASVS 14.2.7. Orphan-scoped: a DECLARED set is never
+        # touched however old its synced_at.
+        if not declared:
+            # Positive-signal guard — an empty `declared` reads as "every set is abandoned" and would
+            # wipe the store. Never a legitimate instruction, so it raises rather than deleting.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        deleted = 0
+        purged_names: list[str] = []
+        async with self._acquire() as conn, self._cursor(conn) as cur:
+            try:
+                await cur.execute(
+                    "SELECT name FROM reference_version WHERE synced_at < ?", (older_than,)
+                )
+                candidates = [r[0] for r in await cur.fetchall() if r[0] not in declared]
+                for name in candidates:
+                    # Eligibility RE-ASSERTED inside the delete. `declared` is computed by the caller
+                    # outside any lock and write_reference_snapshot takes no applock here, so a config
+                    # reload can commit a fresh patient-keyed snapshot between the SELECT above and
+                    # this statement. This predicate is the only thing preventing a routine reload from
+                    # destroying live data. `older_than` is bound TWICE (T-SQL has no named params).
+                    await cur.execute(
+                        "DELETE FROM reference WHERE name = ?"
+                        " AND EXISTS (SELECT 1 FROM reference_version v"
+                        "             WHERE v.name = ? AND v.synced_at < ?)",
+                        (name, name, older_than),
+                    )
+                    count = int(cur.rowcount or 0)
+                    if not count:
+                        continue  # a concurrent re-sync won the race — leave it alone
+                    deleted += count
+                    # KEEP the pointer, BUMP the version — converge_reference_cache only reloads a set
+                    # whose active version DIFFERS, so an unchanged version leaves every follower
+                    # serving purged PHI from `_reference_cache` until restart, and deleting the
+                    # pointer is worse (converge only adds/updates names present in a fresh read).
+                    await cur.execute(
+                        "UPDATE reference_version SET row_count = 0,"
+                        " version = 'purged:' + version"
+                        " WHERE name = ? AND version NOT LIKE 'purged:%'",
+                        (name,),
+                    )
+                    purged_names.append(name)
+                await self._commit(conn)
+            except Exception:
+                await conn.rollback()
+                raise
+        # Evict only AFTER the commit — a rolled-back purge must not leave the cache claiming rows the
+        # store still holds (the same post-commit discipline purge_state follows below).
+        for name in purged_names:
+            self._reference_cache.pop(name, None)
+            self._reference_versions.pop(name, None)
+        return deleted
 
     async def purge_state(self, *, older_than: float, now: float | None = None) -> int:
         """Delete transform-state rows last set before ``older_than`` (ADR 0005 retention), evicting

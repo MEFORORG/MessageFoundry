@@ -55,7 +55,7 @@ import logging
 import os
 import socket
 import time
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager
 from time import perf_counter
 from types import MappingProxyType
@@ -174,6 +174,48 @@ _AUDIT_LOCK = "mefor_audit_chain"
 _SCHEMA_LOCK = "mefor_schema_init"
 _FINALIZE_LOCK_PREFIX = "mefor_finalize:"
 _OUTBOUND_LANE_LOCK_PREFIX = "mefor_outlane:"
+
+# H1 epoch-fence guard templates (ADR 0157 C1/C2). Templates rather than literals because the guard
+# lands at a different `$N` at every site; `{h}` is bound once and referenced twice, already the house
+# idiom (see the twice-referenced `$5` at claim_next_fifo). `leader_lease.leader_epoch` is BIGINT, so
+# `COALESCE(bigint, $N)` types `$N` as bigint with no cast.
+#
+# THE TWO POLARITIES ARE OPPOSITE ON PURPOSE. Do not unify them.
+
+#: CLAIM guard — FAIL-CLOSED. A missing leader_lease row yields NULL and `NULL <= $h` is false, so an
+#: unvalidatable claim is DECLINED. Declining is free: the row stays PENDING and any node may claim it.
+#: NEVER use this on a write that RESOLVES a claimed row.
+_EPOCH_GUARD_CLAIM = (
+    " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=${k}) <= ${h}"
+)
+
+#: TERMINAL-RESOLVE guard — FAIL-OPEN, and the inversion is the whole point. Rejecting a resolve leaves
+#: the row INFLIGHT; reusing the claim idiom here would mass-strand every in-flight row the moment the
+#: lease row went missing. COALESCE makes a MISSING ROW resolve to "current", so the write LANDS.
+#: Fail-open covers a missing lease ROW, not a missing lease TABLE — an absent table raises out to the
+#: caller (row stays INFLIGHT, recovery takes it), and it cannot be absent while an epoch is armed (only
+#: a started coordinator creates it; only the engine arms it).
+#: NO `status='inflight'` conjunct: reclaim_expired_leases is owner-BLIND by its own docstring and can
+#: re-pend the CURRENT leader's own long-running row; today that leader's mark_done still lands. A status
+#: conjunct would be the only thing firing there — on long-hold WAN lanes, same node, same term, where
+#: the epoch cannot fire — and firing is worse.
+_EPOCH_GUARD_RESOLVE = (
+    " AND COALESCE((SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=${k}), ${h})"
+    " <= ${h}"
+)
+
+
+class _FencedWrite(Exception):
+    """Sentinel raised INSIDE the enclosing ``conn.transaction()`` so asyncpg rolls the whole
+    disposition back — the queue flip, the ``delivered_keys`` row, the ``message_events`` row and the
+    ``_maybe_finalize_message`` call go together (ADR 0157 C3). Caught immediately outside; the method
+    returns its existing no-op value, then RE-PENDS the row (ADR 0157 D1). Never escapes the store."""
+
+    def __init__(self, method: str, outbox_ids: tuple[str, ...]) -> None:
+        super().__init__(method)
+        self.method = method
+        self.outbox_ids = outbox_ids
+
 
 # Schema (PostgreSQL). All DDL is `IF NOT EXISTS`, run once under the schema advisory lock so
 # concurrent opens don't race on CREATE. Epoch timestamps are DOUBLE PRECISION; ids TEXT (uuid4 hex);
@@ -840,10 +882,14 @@ class PostgresStore:
         self._cluster_state_convergence: bool = False
         # H1 fencing token: the leader epoch this node currently holds + the leader_lease row to validate
         # it against, both pushed by the engine on promotion via set_leader_epoch() (the store NEVER
-        # imports the coordinator — ARCH-6). None disables the claim's epoch guard (single-node / not yet
-        # leader), keeping claim_next_fifo byte-identical to pre-H1.
+        # imports the coordinator — ARCH-6). None OMITS BOTH GUARDS ENTIRELY — None means NO FENCE, not a
+        # safe null token (ADR 0157 C4) — keeping every claim and every terminal resolve byte-identical to
+        # pre-H1/pre-0157 on a single node.
         self._leader_epoch: int | None = None
         self._lease_key: str | None = None
+        # ADR 0157 C3/D1 — TERMINAL resolves rejected by the H1 fence since store open. Additive and
+        # monotone; read with getattr(store, "fenced_writes", 0) exactly like committed_txns above.
+        self.fenced_writes = 0
 
     @classmethod
     async def open(
@@ -1890,6 +1936,69 @@ class PostgresStore:
             now,
         )
 
+    def _resolve_guard(self, first: int) -> tuple[str, list[Any]]:
+        """``(sql_suffix, extra_args)`` for a TERMINAL resolve whose next free placeholder is ``$first``
+        (ADR 0157 C1/C2).
+
+        ``("", [])`` when unfenced — the emitted SQL is then CHARACTER-IDENTICAL to pre-0157 and the arg
+        list is unchanged. That identity is the SQLite/single-node parity anchor, and it is pinned by
+        ``test_unfenced_terminal_sql_is_character_identical``."""
+        if self._leader_epoch is None:
+            return "", []
+        return (
+            _EPOCH_GUARD_RESOLVE.format(k=first, h=first + 1),
+            [self._lease_key, self._leader_epoch],
+        )
+
+    async def _exec_terminal(
+        self,
+        conn: Any,
+        method: str,
+        ids: tuple[str, ...],
+        sql: str,
+        *args: Any,
+        checked: bool = True,
+    ) -> None:
+        """Run a TERMINAL resolve UPDATE, raising :class:`_FencedWrite` when the epoch fence rejected it.
+
+        ``checked`` is False when no guard was spliced (``mark_failed``'s retry branch), which makes "the
+        retry branch is never inspected" a property of the code rather than of an argument. Unfenced,
+        today's code does not read the rowcount at all — do not start: a zero rowcount there is the
+        already-vanished-row case the callers treat as an idempotent no-op."""
+        result = await conn.execute(sql, *args)
+        if not checked or _rowcount(result) != 0:
+            return
+        raise _FencedWrite(method, ids)
+
+    async def _after_fenced_write(self, exc: _FencedWrite) -> None:
+        """Count, log, and RE-PEND after the H1 fence rejected a terminal resolve (ADR 0157 C3 + D1).
+
+        The transaction is already rolled back by the time this runs. The re-pend happens in a FRESH
+        transaction so the fence's own residue is a bounded DUPLICATE rather than an INFLIGHT row —
+        which on Postgres is ~90s of ``reclaim_expired_leases`` latency and on SQL Server (which has NO
+        periodic in-flight recovery at all) is an UNBOUNDED STRAND. ``release_claimed`` is
+        ``status='inflight'``-guarded so it is idempotent and cannot disturb an already-resolved row, and
+        it is the exact write C1 forbids FENCING — so re-pending here is invariant-legal by C1's own
+        rule. Best-effort: a raise here leaves the row INFLIGHT for recovery (the pre-D1 state)."""
+        self.fenced_writes += 1
+        log.warning(
+            "H1 FENCE rejected a terminal %s for %d row(s): this node holds leader_epoch %s but "
+            "leader_lease has advanced. The write was rolled back WHOLE (no delivered_keys row, no "
+            "message_events row, no finalize) and the row(s) re-pended for the current leader — an "
+            "accepted duplicate, never a strand (ADR 0157 C1/C3/D1).",
+            exc.method,
+            len(exc.outbox_ids),
+            self._leader_epoch,
+        )
+        try:
+            await self.release_claimed(list(exc.outbox_ids))
+        except Exception:  # noqa: BLE001 — recovery still covers the row; never mask the fence
+            log.warning(
+                "fenced %s: re-pend failed; row(s) left INFLIGHT for recovery",
+                exc.method,
+                exc_info=True,
+            )
+
     async def _insert_message(
         self,
         conn: Any,
@@ -2606,7 +2715,30 @@ class PostgresStore:
         undecryptable payload is dead-lettered and dropped (poison-row containment), not raised."""
         now = time.time() if now is None else now
         lease_until = now + self._settings.lease_ttl_seconds  # Track B Step 2: stamp the lease
+        claim_args: list[Any] = [
+            stage,  # $1
+            OutboxStatus.PENDING.value,  # $2
+            now,  # $3 (due cutoff + updated_at)
+            channel_id,  # $4
+            destination_name,  # $5
+            limit,  # $6
+            OutboxStatus.INFLIGHT.value,  # $7
+            self._owner,  # $8
+            lease_until,  # $9
+        ]
+        # H1 FENCING TOKEN (ADR 0157 C5) — the UNORDERED claim is fenced exactly like the three FIFO
+        # claims: a superseded ex-leader's UPDATE matches 0 rows and it claims nothing. When fenced, the
+        # lease key + held epoch ride as $10/$11.
+        epoch_guard = ""
+        if self._leader_epoch is not None:
+            epoch_guard = _EPOCH_GUARD_CLAIM.format(k=10, h=11)
+            claim_args.extend([self._lease_key, self._leader_epoch])
         # All filters are bound; explicit ::text casts let asyncpg type the optional-filter idiom.
+        # The guard rides the UPDATE, not the CTE: that is placement parity with all three FIFO claims,
+        # and it evaluates in the same snapshot as the write it gates. The honest cost of that choice is
+        # that a fenced claim's CTE still briefly SKIP LOCKED-hides those rows from a concurrent claimer;
+        # transient and self-correcting (the txn ends immediately), so it is accepted rather than hidden.
+        # `attempts` is untouched either way — a declined claim consumes no retry.
         sql = (
             "WITH due AS ("
             " SELECT id FROM queue"
@@ -2617,20 +2749,9 @@ class PostgresStore:
             ")"
             " UPDATE queue q SET status=$7, attempts=attempts+1, updated_at=$3,"
             " owner=$8, lease_expires_at=$9"
-            " FROM due WHERE q.id=due.id RETURNING q.*"
+            f" FROM due WHERE q.id=due.id{epoch_guard} RETURNING q.*"
         )
-        rows = await self._fetchall(
-            sql,
-            stage,
-            OutboxStatus.PENDING.value,
-            now,
-            channel_id,
-            destination_name,
-            limit,
-            OutboxStatus.INFLIGHT.value,
-            self._owner,
-            lease_until,
-        )
+        rows = await self._fetchall(sql, *claim_args)
         items: list[OutboxItem] = []
         for row in rows:
             try:
@@ -2641,9 +2762,12 @@ class PostgresStore:
         return items
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
-        # H1: the engine pushes the held leader epoch + lease key here on promotion/demotion (read from
-        # the coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next
-        # claim_next_fifo validates it inside its single claim txn. epoch=None disables the guard.
+        # H1: the engine pushes the held leader epoch + lease key here on promotion (read from the
+        # coordinator — the store never imports it, ARCH-6). Stamps cached state only; the next claim or
+        # terminal resolve validates it inside that statement's own txn.
+        # epoch=None OMITS BOTH GUARDS ENTIRELY — None means NO FENCE, not a safe null token. That is why
+        # _stop_graph deliberately does NOT clear it on demotion (ADR 0157 C4): clearing would DISARM the
+        # guard at exactly the moment a superseded ex-leader may still be mid-teardown and mid-write.
         self._leader_epoch = epoch
         self._lease_key = lease_key
 
@@ -2698,9 +2822,7 @@ class PostgresStore:
         # `NULL <= $held` is false → fail-closed (no claim) rather than racing without a fence.
         epoch_guard = ""
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=$8) <= $9"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM.format(k=8, h=9)
         head_sql = (
             "WITH head AS ("
             f" SELECT id, next_attempt_at FROM queue WHERE stage=$1 AND {lane_col}=$2 AND status=$3"
@@ -2828,9 +2950,7 @@ class PostgresStore:
         # When fenced, the lease key + held epoch are $9/$10 (after the fixed args + the LIMIT $8).
         epoch_guard = ""
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=$9) <= $10"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM.format(k=9, h=10)
             claim_args.extend([self._lease_key, self._leader_epoch])
         # Two-level CTE: the inner FOR UPDATE locks the N oldest pending rows (no window, no SKIP LOCKED ->
         # BLOCK on a producer-locked head, never skip — strict per-lane FIFO #285); the outer window
@@ -2946,9 +3066,7 @@ class PostgresStore:
             lease_until,  # $8
         ]
         if self._leader_epoch is not None:
-            epoch_guard = (
-                " AND (SELECT ll.leader_epoch FROM leader_lease ll WHERE ll.lease_key=$9) <= $10"
-            )
+            epoch_guard = _EPOCH_GUARD_CLAIM.format(k=9, h=10)
             claim_args.extend([self._lease_key, self._leader_epoch])
         claim_sql = (
             "WITH cand AS MATERIALIZED ("  # STEP 1: plain MVCC snapshot read, non-locking
@@ -3180,73 +3298,57 @@ class PostgresStore:
             error
         )  # PHI chokepoint (#120) — incl. the f"undecryptable payload: {exc}" callers
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-            if row is None:
-                return
-            await conn.execute(
-                "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                OutboxStatus.DEAD.value,
-                now,
-                self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                now,
-                outbox_id,
-            )
-            await self._event(conn, row["message_id"], "dead", row["destination_name"], error, now)
-            await self._maybe_finalize_message(conn, row["message_id"], now)
+        guard, guard_args = self._resolve_guard(6)  # ADR 0157 C1 — TERMINAL
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                if row is None:
+                    return
+                await self._exec_terminal(
+                    conn,
+                    "dead_letter_now",
+                    (outbox_id,),
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    OutboxStatus.DEAD.value,
+                    now,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_args,
+                    checked=bool(guard),
+                )
+                await self._event(
+                    conn, row["message_id"], "dead", row["destination_name"], error, now
+                )
+                await self._maybe_finalize_message(conn, row["message_id"], now)
+        except _FencedWrite as exc:
+            # The sharpest of the terminal writes: a DEAD row is never re-claimed, so H2's
+            # skip-and-complete cannot heal a false dead-letter the way it heals a false DONE.
+            await self._after_fenced_write(exc)
+            return
 
     async def mark_done(self, outbox_id: str, now: float | None = None) -> None:
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-            if row is None:
-                return
-            await conn.execute(
-                "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
-                " owner=NULL, lease_expires_at=NULL WHERE id=$3",
-                OutboxStatus.DONE.value,
-                now,
-                outbox_id,
-            )
-            # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
-            await self._record_delivered_key(
-                conn,
-                outbox_id=outbox_id,
-                message_id=row["message_id"],
-                destination_name=row["destination_name"],
-                handler_name=row["handler_name"],
-                now=now,
-            )
-            await self._event(
-                conn,
-                row["message_id"],
-                "delivered",
-                row["destination_name"],
-                f"attempt {row['attempts']}",
-                now,
-            )
-            await self._maybe_finalize_message(conn, row["message_id"], now)
-
-    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
-        """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
-        :meth:`mark_done` (ADR 0082). All N flip ``DONE`` together; each writes its H2 ledger row +
-        ``delivered`` event, and the finalizer runs once per distinct ``message_id``. A vanished member
-        is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
-        now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            finalize: dict[str, None] = {}
-            for outbox_id in outbox_ids:
+        guard, guard_args = self._resolve_guard(4)  # ADR 0157 C1 — TERMINAL
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
                 row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
                 if row is None:
-                    continue  # vanished member — idempotent no-op
-                await conn.execute(
+                    return
+                await self._exec_terminal(
+                    conn,
+                    "mark_done",
+                    (outbox_id,),
                     "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$3",
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$3" + guard,
                     OutboxStatus.DONE.value,
                     now,
                     outbox_id,
+                    *guard_args,
+                    checked=bool(guard),
                 )
+                # H2: record the idempotency-ledger row in THIS same txn as the DONE flip.
                 await self._record_delivered_key(
                     conn,
                     outbox_id=outbox_id,
@@ -3263,9 +3365,65 @@ class PostgresStore:
                     f"attempt {row['attempts']}",
                     now,
                 )
-                finalize[row["message_id"]] = None
-            for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                await self._maybe_finalize_message(conn, message_id, now)
+                await self._maybe_finalize_message(conn, row["message_id"], now)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return
+
+    async def mark_batch_done(self, outbox_ids: Sequence[str], now: float | None = None) -> None:
+        """Complete N delivered outbound rows in ONE transaction — the batch counterpart of
+        :meth:`mark_done` (ADR 0082). All N flip ``DONE`` together; each writes its H2 ledger row +
+        ``delivered`` event, and the finalizer runs once per distinct ``message_id``. A vanished member
+        is skipped; a crash before commit rolls all N back to ``INFLIGHT``."""
+        now = time.time() if now is None else now
+        # ADR 0157 C1 — TERMINAL. Rendered ONCE for the whole loop: a fence on ANY member raises out and
+        # rolls all N back, which is exactly the all-or-nothing contract the docstring already promises.
+        guard, guard_args = self._resolve_guard(4)
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                finalize: dict[str, None] = {}
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is None:
+                        continue  # vanished member — idempotent no-op
+                    await self._exec_terminal(
+                        conn,
+                        "mark_batch_done",
+                        # ALL N, not the prefix walked so far: the rollback undoes every member, and
+                        # members past the raise were never touched — but all N are still INFLIGHT from
+                        # the claim, so all N need re-pending. release_claimed is status-guarded, so a
+                        # vanished member is a harmless no-op.
+                        tuple(outbox_ids),
+                        "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$3" + guard,
+                        OutboxStatus.DONE.value,
+                        now,
+                        outbox_id,
+                        *guard_args,
+                        checked=bool(guard),
+                    )
+                    await self._record_delivered_key(
+                        conn,
+                        outbox_id=outbox_id,
+                        message_id=row["message_id"],
+                        destination_name=row["destination_name"],
+                        handler_name=row["handler_name"],
+                        now=now,
+                    )
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        "delivered",
+                        row["destination_name"],
+                        f"attempt {row['attempts']}",
+                        now,
+                    )
+                    finalize[row["message_id"]] = None
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                    await self._maybe_finalize_message(conn, message_id, now)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return
 
     async def complete_with_response(
         self,
@@ -3286,90 +3444,108 @@ class PostgresStore:
         finalizer (it scans ``queue`` only). When ``reingress_to`` is set (Increment 2) the same
         transaction also inserts the drainable ``Stage.RESPONSE`` work-row (identical to SQLite)."""
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn:  # noqa: SIM117
-            async with conn.transaction():
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is None:
-                    return
-                message_id = row["message_id"]
-                destination_name = row["destination_name"]
-                await conn.execute(
-                    "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$3",
-                    OutboxStatus.DONE.value,
-                    now,
-                    outbox_id,
-                )
-                seq = await conn.fetchval(
-                    "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
-                    " WHERE message_id=$1 AND destination_name=$2",
-                    message_id,
-                    destination_name,
-                )
-                headers_json = encode_response_headers(response_headers)  # #154
-                await conn.execute(
-                    "INSERT INTO response"
-                    " (message_id, destination_name, response_seq, body, outcome, detail,"
-                    " resp_headers, captured_at)"
-                    " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
-                    message_id,
-                    destination_name,
-                    seq,
-                    self._enc(
-                        body, aad=cell_aad("response", "body", message_id, destination_name, seq)
-                    ),
-                    outcome,
-                    self._enc(
-                        detail,
-                        aad=cell_aad("response", "detail", message_id, destination_name, seq),
-                    ),
-                    self._enc(
-                        headers_json,
-                        aad=cell_aad("response", "resp_headers", message_id, destination_name, seq),
-                    ),
-                    now,
-                )
-                if reingress_to is not None:
-                    # ADR 0013 Increment 2: drainable Stage.RESPONSE work-row in the SAME txn (orphan-free)
-                    # — a token referencing the immutable artifact by its PK, on the loopback inbound's lane.
-                    artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
-                    # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
-                    work_created = now
-                    # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
-                    work_row_id = uuid4().hex
-                    await conn.execute(
-                        "INSERT INTO queue"
-                        " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
-                        "  status, attempts, next_attempt_at, created_at, updated_at)"
-                        " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
-                        work_row_id,
-                        message_id,
-                        Stage.RESPONSE.value,
-                        reingress_to,
-                        self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
-                        OutboxStatus.PENDING.value,
+        guard, guard_args = self._resolve_guard(4)
+        try:
+            async with self._timed_acquire() as conn:  # noqa: SIM117
+                async with conn.transaction():
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is None:
+                        return
+                    message_id = row["message_id"]
+                    destination_name = row["destination_name"]
+                    # ADR 0157 C1 — TERMINAL, and the guard rides THIS (the first) statement deliberately:
+                    # a rejection then discards the `response` artifact, the Stage.RESPONSE re-ingress
+                    # work-row, the ledger row and the finalize TOGETHER. Do not try to keep the response
+                    # row — an artifact with no resolved queue row is precisely the half-applied state C3
+                    # rejects. The successor re-sends and captures a fresh reply.
+                    await self._exec_terminal(
+                        conn,
+                        "complete_with_response",
+                        (outbox_id,),
+                        "UPDATE queue SET status=$1, last_error=NULL, updated_at=$2,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$3" + guard,
+                        OutboxStatus.DONE.value,
                         now,
-                        work_created,
+                        outbox_id,
+                        *guard_args,
+                        checked=bool(guard),
+                    )
+                    seq = await conn.fetchval(
+                        "SELECT COALESCE(MAX(response_seq), 0) + 1 FROM response"
+                        " WHERE message_id=$1 AND destination_name=$2",
+                        message_id,
+                        destination_name,
+                    )
+                    headers_json = encode_response_headers(response_headers)  # #154
+                    await conn.execute(
+                        "INSERT INTO response"
+                        " (message_id, destination_name, response_seq, body, outcome, detail,"
+                        " resp_headers, captured_at)"
+                        " VALUES ($1,$2,$3,$4,$5,$6,$7,$8)",
+                        message_id,
+                        destination_name,
+                        seq,
+                        self._enc(
+                            body,
+                            aad=cell_aad("response", "body", message_id, destination_name, seq),
+                        ),
+                        outcome,
+                        self._enc(
+                            detail,
+                            aad=cell_aad("response", "detail", message_id, destination_name, seq),
+                        ),
+                        self._enc(
+                            headers_json,
+                            aad=cell_aad(
+                                "response", "resp_headers", message_id, destination_name, seq
+                            ),
+                        ),
                         now,
                     )
-                # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
-                await self._record_delivered_key(
-                    conn,
-                    outbox_id=outbox_id,
-                    message_id=message_id,
-                    destination_name=destination_name,
-                    handler_name=row["handler_name"],
-                    now=now,
-                )
-                await self._event(
-                    conn,
-                    message_id,
-                    "delivered",
-                    destination_name,
-                    f"attempt {row['attempts']} (response {outcome})",
-                    now,
-                )
-                await self._maybe_finalize_message(conn, message_id, now)
+                    if reingress_to is not None:
+                        # ADR 0013 Increment 2: drainable Stage.RESPONSE work-row in the SAME txn (orphan-free)
+                        # — a token referencing the immutable artifact by its PK, on the loopback inbound's lane.
+                        artifact_ref = f"{message_id}\x1f{destination_name}\x1f{seq}"
+                        # ingest-time (ADR 0009) + metrics only; per-lane FIFO orders by seq — ADR 0059.
+                        work_created = now
+                        # Hoist the row id so the artifact-ref payload binds to its own (queue, payload, id) cell.
+                        work_row_id = uuid4().hex
+                        await conn.execute(
+                            "INSERT INTO queue"
+                            " (id, message_id, stage, channel_id, destination_name, handler_name, payload,"
+                            "  status, attempts, next_attempt_at, created_at, updated_at)"
+                            " VALUES ($1,$2,$3,$4,NULL,NULL,$5,$6,0,$7,$8,$9)",
+                            work_row_id,
+                            message_id,
+                            Stage.RESPONSE.value,
+                            reingress_to,
+                            self._enc(artifact_ref, aad=cell_aad("queue", "payload", work_row_id)),
+                            OutboxStatus.PENDING.value,
+                            now,
+                            work_created,
+                            now,
+                        )
+                    # H2: idempotency-ledger row joins this SAME txn as the DONE flip + the response artifact.
+                    await self._record_delivered_key(
+                        conn,
+                        outbox_id=outbox_id,
+                        message_id=message_id,
+                        destination_name=destination_name,
+                        handler_name=row["handler_name"],
+                        now=now,
+                    )
+                    await self._event(
+                        conn,
+                        message_id,
+                        "delivered",
+                        destination_name,
+                        f"attempt {row['attempts']} (response {outcome})",
+                        now,
+                    )
+                    await self._maybe_finalize_message(conn, message_id, now)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return
 
     async def ingress_handoff(
         self,
@@ -3391,6 +3567,11 @@ class PostgresStore:
             pass
 
         now = time.time() if now is None else now
+        # ADR 0157 C1 — both DEAD branches below are TERMINAL on a claimed RESPONSE work-row AND finalize
+        # the origin message, so both are guarded. The SUCCESS path is deliberately NOT guarded: it
+        # *admits* a message, and fencing it would convert a permitted duplicate into a LOST re-ingress,
+        # breaking count-and-log.
+        guard, guard_args = self._resolve_guard(6)
         try:
             async with self._timed_acquire() as conn:  # noqa: SIM117
                 async with conn.transaction():
@@ -3418,9 +3599,12 @@ class PostgresStore:
                         # the token + ERROR the origin in THIS transaction and CONSUME it (return True ⇒
                         # the conn.transaction() commits) — never re-loop. Mirrors the SQLite branch and
                         # the depth-cap branch (NOT the _Noop rollback, which would leave the token live).
-                        await conn.execute(
+                        await self._exec_terminal(
+                            conn,
+                            "ingress_handoff(corrupt-ref)",
+                            (response_row_id,),
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
-                            " updated_at=$4 WHERE id=$5",
+                            " updated_at=$4 WHERE id=$5" + guard,
                             OutboxStatus.DEAD.value,
                             self._enc(
                                 "re-ingress work-row reference is corrupt/unparseable",
@@ -3429,6 +3613,8 @@ class PostgresStore:
                             now,
                             now,
                             response_row_id,
+                            *guard_args,
+                            checked=bool(guard),
                         )
                         await self._event(
                             conn, origin_id, "dead", None, "re-ingress ref corrupt", now
@@ -3468,9 +3654,12 @@ class PostgresStore:
                     child_depth = int(origin_meta.get("correlation_depth", 0) or 0) + 1
                     root = origin_meta.get("correlation_root_id") or origin_id
                     if child_depth > correlation_depth_cap:
-                        await conn.execute(
+                        await self._exec_terminal(
+                            conn,
+                            "ingress_handoff(depth-cap)",
+                            (response_row_id,),
                             "UPDATE queue SET status=$1, last_error=$2, next_attempt_at=$3,"
-                            " updated_at=$4 WHERE id=$5",
+                            " updated_at=$4 WHERE id=$5" + guard,
                             OutboxStatus.DEAD.value,
                             self._enc(
                                 f"re-ingress correlation depth exceeded "
@@ -3480,6 +3669,8 @@ class PostgresStore:
                             now,
                             now,
                             response_row_id,
+                            *guard_args,
+                            checked=bool(guard),
                         )
                         await self._event(
                             conn,
@@ -3568,6 +3759,12 @@ class PostgresStore:
                         raise _Noop()  # unreachable under single-owner claim; roll back defensively
                     await self._maybe_finalize_message(conn, origin_id, now)
         except _Noop:
+            return False
+        except _FencedWrite as exc:
+            # Same shape as _Noop: the transaction rolled back, so the work-row is untouched and still
+            # claimed. D1 re-pends it. Returning False only gates a wake in _process_response_item, and
+            # the response worker's next claim is itself fenced — so there is no hot spin.
+            await self._after_fenced_write(exc)
             return False
         return True
 
@@ -4116,41 +4313,61 @@ class PostgresStore:
         arms the per-lane retry wake on a float — WS-C; see the base contract)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-            if row is None:
-                return None
-            attempts = row["attempts"]
-            # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
-            if retry.max_attempts is not None and attempts >= retry.max_attempts:
-                status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
-            else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                if row is None:
+                    return None
+                attempts = row["attempts"]
+                # max_attempts None = retry forever; a finite cap dead-letters once exhausted.
+                if retry.max_attempts is not None and attempts >= retry.max_attempts:
+                    status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
+                else:
+                    backoff = min(
+                        retry.max_backoff_seconds,
+                        retry.backoff_seconds * (retry.backoff_multiplier ** (attempts - 1)),
+                    )
+                    status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+                # ADR 0157 C1 — guard the DEAD branch ONLY. The retry branch returns the row to PENDING;
+                # fencing THAT would leave it INFLIGHT instead — converting a permitted duplicate into a
+                # forbidden strand. The suffix is "" on the retry branch, so its statement and arg list
+                # are byte-identical to pre-0157, and checked=False means it is never even inspected.
+                # ONE statement with a conditional suffix, not two: the DEAD/retry decision is already
+                # computed above, strictly before the UPDATE.
+                guard, guard_args = (
+                    self._resolve_guard(6) if status == OutboxStatus.DEAD.value else ("", [])
                 )
-                status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-            await conn.execute(
-                "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                status,
-                next_at,
-                self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                now,
-                outbox_id,
-            )
-            await self._event(
-                conn,
-                row["message_id"],
-                event,
-                row["destination_name"],
-                f"attempt {attempts}: {error}",
-                now,
-            )
-            if status == OutboxStatus.DEAD.value:
-                await self._maybe_finalize_message(conn, row["message_id"], now)
-                return None
-            return next_at
+                await self._exec_terminal(
+                    conn,
+                    "mark_failed(dead)",
+                    (outbox_id,),
+                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                    " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                    status,
+                    next_at,
+                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                    now,
+                    outbox_id,
+                    *guard_args,
+                    checked=bool(guard),
+                )
+                await self._event(
+                    conn,
+                    row["message_id"],
+                    event,
+                    row["destination_name"],
+                    f"attempt {attempts}: {error}",
+                    now,
+                )
+                if status == OutboxStatus.DEAD.value:
+                    await self._maybe_finalize_message(conn, row["message_id"], now)
+                    return None
+                return next_at
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            # None is what the DEAD branch returns today, so _mark_failed_and_arm arms no retry timer.
+            # Correct: D1 re-pended the row and only the SUCCESSOR may claim it.
+            return None
 
     async def mark_batch_failed(
         self,
@@ -4165,47 +4382,62 @@ class PostgresStore:
         all dead-letter together). Returns the shared ``next_attempt_at`` or ``None`` on dead-letter."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            present = []
-            for outbox_id in outbox_ids:
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is not None:
-                    present.append((outbox_id, row))
-            if not present:
-                return None
-            head_attempts = present[0][1]["attempts"]
-            if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
-                status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
-            else:
-                backoff = min(
-                    retry.max_backoff_seconds,
-                    retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                present = []
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is not None:
+                        present.append((outbox_id, row))
+                if not present:
+                    return None
+                head_attempts = present[0][1]["attempts"]
+                if retry.max_attempts is not None and head_attempts >= retry.max_attempts:
+                    status, next_at, event = OutboxStatus.DEAD.value, now, "dead"
+                else:
+                    backoff = min(
+                        retry.max_backoff_seconds,
+                        retry.backoff_seconds * (retry.backoff_multiplier ** (head_attempts - 1)),
+                    )
+                    status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
+                # ADR 0157 C1 — the identical DEAD-branch-only split as mark_failed, decided ONCE from
+                # head_attempts and rendered ONCE for the whole loop: a fence on any member raises out
+                # and rolls all N back, matching the all-or-nothing contract the docstring promises.
+                guard, guard_args = (
+                    self._resolve_guard(6) if status == OutboxStatus.DEAD.value else ("", [])
                 )
-                status, next_at, event = OutboxStatus.PENDING.value, now + backoff, "failed"
-            finalize: dict[str, None] = {}
-            for outbox_id, row in present:
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    status,
-                    next_at,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                    now,
-                    outbox_id,
-                )
-                await self._event(
-                    conn,
-                    row["message_id"],
-                    event,
-                    row["destination_name"],
-                    f"attempt {row['attempts']}: {error}",
-                    now,
-                )
-                if status == OutboxStatus.DEAD.value:
-                    finalize[row["message_id"]] = None
-            for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                await self._maybe_finalize_message(conn, message_id, now)
-            return None if status == OutboxStatus.DEAD.value else next_at
+                finalize: dict[str, None] = {}
+                for outbox_id, row in present:
+                    await self._exec_terminal(
+                        conn,
+                        "mark_batch_failed(dead)",
+                        tuple(oid for oid, _row in present),
+                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                        status,
+                        next_at,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_args,
+                        checked=bool(guard),
+                    )
+                    await self._event(
+                        conn,
+                        row["message_id"],
+                        event,
+                        row["destination_name"],
+                        f"attempt {row['attempts']}: {error}",
+                        now,
+                    )
+                    if status == OutboxStatus.DEAD.value:
+                        finalize[row["message_id"]] = None
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                    await self._maybe_finalize_message(conn, message_id, now)
+                return None if status == OutboxStatus.DEAD.value else next_at
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return None
 
     async def dead_letter_batch(
         self, outbox_ids: Sequence[str], error: str, now: float | None = None
@@ -4214,27 +4446,39 @@ class PostgresStore:
         :meth:`dead_letter_now` (ADR 0082 decision #1: a permanent envelope reject dead-letters all N)."""
         error = safe_text(error)  # PHI chokepoint (#120)
         now = time.time() if now is None else now
-        async with self._timed_acquire() as conn, conn.transaction():
-            finalize: dict[str, None] = {}
-            for outbox_id in outbox_ids:
-                row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
-                if row is None:
-                    continue
-                await conn.execute(
-                    "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
-                    " owner=NULL, lease_expires_at=NULL WHERE id=$5",
-                    OutboxStatus.DEAD.value,
-                    now,
-                    self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
-                    now,
-                    outbox_id,
-                )
-                await self._event(
-                    conn, row["message_id"], "dead", row["destination_name"], error, now
-                )
-                finalize[row["message_id"]] = None
-            for message_id in sorted(finalize):  # H-8 canonical order (see below)
-                await self._maybe_finalize_message(conn, message_id, now)
+        guard, guard_args = self._resolve_guard(
+            6
+        )  # ADR 0157 C1 — TERMINAL, once for the whole loop
+        try:
+            async with self._timed_acquire() as conn, conn.transaction():
+                finalize: dict[str, None] = {}
+                for outbox_id in outbox_ids:
+                    row = await conn.fetchrow("SELECT * FROM queue WHERE id=$1", outbox_id)
+                    if row is None:
+                        continue
+                    await self._exec_terminal(
+                        conn,
+                        "dead_letter_batch",
+                        tuple(outbox_ids),
+                        "UPDATE queue SET status=$1, next_attempt_at=$2, last_error=$3, updated_at=$4,"
+                        " owner=NULL, lease_expires_at=NULL WHERE id=$5" + guard,
+                        OutboxStatus.DEAD.value,
+                        now,
+                        self._enc(error, aad=cell_aad("queue", "last_error", outbox_id)),
+                        now,
+                        outbox_id,
+                        *guard_args,
+                        checked=bool(guard),
+                    )
+                    await self._event(
+                        conn, row["message_id"], "dead", row["destination_name"], error, now
+                    )
+                    finalize[row["message_id"]] = None
+                for message_id in sorted(finalize):  # H-8 canonical order (see below)
+                    await self._maybe_finalize_message(conn, message_id, now)
+        except _FencedWrite as exc:
+            await self._after_fenced_write(exc)
+            return
 
     async def pending_depth(
         self, name: str, *, stage: str = Stage.OUTBOUND.value
@@ -6564,6 +6808,57 @@ class PostgresStore:
             older_than,
         )
         return _rowcount(result)
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        # See Store.purge_reference_snapshots for the full contract. ADR 0006 `reference.value` is PL-2
+        # and had no purge path at all before ASVS 14.2.7. Orphan-scoped: a DECLARED set is never
+        # touched however old its synced_at.
+        if not declared:
+            # Positive-signal guard — an empty `declared` reads as "every set is abandoned" and would
+            # wipe the store. Never a legitimate instruction, so it raises rather than deleting.
+            raise ValueError(
+                "purge_reference_snapshots requires a non-empty `declared` set; an empty one would "
+                "purge every snapshot in the store. A registry declaring zero reference sets cannot "
+                "authorize purging any — the caller must skip the phase instead."
+            )
+        rows = await self._pool.fetch(
+            "SELECT name FROM reference_version WHERE synced_at < $1", older_than
+        )
+        candidates = [r["name"] for r in rows if r["name"] not in declared]
+        deleted = 0
+        for name in candidates:
+            # Eligibility RE-ASSERTED inside the delete. `declared` is computed by the caller outside
+            # any store lock, so a config reload can land a fresh patient-keyed snapshot between the
+            # SELECT above and this statement. Postgres has no equivalent of SQLite's process-wide
+            # `self._lock`, so this predicate is the ONLY thing standing between a routine reload and
+            # deleting live data — do not "simplify" it away because the SELECT already filtered.
+            result = await self._pool.execute(
+                "DELETE FROM reference WHERE name = $1"
+                " AND EXISTS (SELECT 1 FROM reference_version v"
+                "             WHERE v.name = $1 AND v.synced_at < $2)",
+                name,
+                older_than,
+            )
+            count = _rowcount(result)
+            if not count:
+                continue  # a concurrent re-sync won the race — leave it alone
+            deleted += count
+            # KEEP the pointer, BUMP the version. converge_reference_cache only reloads a set whose
+            # active version DIFFERS from the one this handle reflects, so leaving the version alone
+            # would let every follower keep serving the purged PHI out of `_reference_cache` until the
+            # process restarts — and deleting the pointer outright is worse, because converge only ever
+            # adds/updates names present in a fresh read and would never notice. Bumping routes the
+            # deletion through the convergence path that already exists.
+            await self._pool.execute(
+                "UPDATE reference_version SET row_count = 0, version = 'purged:' || version"
+                " WHERE name = $1 AND version NOT LIKE 'purged:%'",
+                name,
+            )
+            self._reference_cache.pop(name, None)
+            self._reference_versions.pop(name, None)
+        return deleted
 
     async def purge_dead_letters(
         self,

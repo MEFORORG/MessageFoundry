@@ -72,14 +72,14 @@ log = logging.getLogger(__name__)
 # to). On a SERVER backend every (mode, count) step shares ONE database, so — mirroring the SQLite
 # fresh-file-per-step path — each step first EMPTIES these so the pooled arm never runs second against
 # the per_lane arm's residue (the carryover confound). Table lists verified against the store schemas
-# (store/sqlserver.py, store/postgres.py) and match the reset the store tests use: SQL Server carries
-# the legacy `outbox` table alongside the unified `queue`; the Postgres backend has no `outbox`.
+# (store/sqlserver.py, store/postgres.py) and match the reset the store tests use. Neither backend has
+# an `outbox` table: SQL Server's legacy one was folded into `queue` and DROPped (ASVS 14.2.7), and
+# Postgres never had one. Naming it here would fail the reset with *Invalid object name*.
 _SQLSERVER_PIPELINE_TABLES = (
     "message_events",
     "queue",
     "response",
     "delivered_keys",
-    "outbox",
     "messages",
 )
 

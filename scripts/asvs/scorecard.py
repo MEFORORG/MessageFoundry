@@ -49,6 +49,17 @@ LOCAL_EXTENSION_VERDICTS: Final[frozenset[str]] = frozenset(
 #: the first was never examined, the second was examined and left open on purpose.
 DECIDED_VERDICTS: Final[frozenset[str]] = frozenset({"pass", "partial", "fail", "na"})
 
+#: A verdict whose cell has been READ against the requirement text. Not the same set as
+#: :data:`DECIDED_VERDICTS`, and the difference is `needs-review`: that cell was examined and then
+#: left open on purpose, so it belongs in survey PROGRESS while staying out of the verdict counts.
+#:
+#: Survey progress used `DECIDED_VERDICTS` until the scorecard acquired its first `needs-review` cell
+#: (11.4.4, the V7/V11 baseline sweep). The page then reported "123 of 345 read … 222 have not"
+#: directly above its own table saying 221 unverified — two numbers for one quantity, on the page
+#: that IS the record. The bug had been latent since the renderer was written: with zero
+#: `needs-review` cells the two sets are identical, so no test and no CI run could tell them apart.
+EXAMINED_VERDICTS: Final[frozenset[str]] = DECIDED_VERDICTS | {"needs-review"}
+
 #: How far from the recorded line the expected token may drift before the anchor is considered broken.
 #: Anchors name a TOKEN rather than a bare line number precisely so that ordinary edits above a cell's
 #: evidence do not thrash every anchor in the file; the window keeps the line number meaningful without
@@ -77,10 +88,22 @@ class Absence:
     absence claims survived for weeks. So an absence claim is only admissible with a
     ``positive_control`` that must still match; if the control goes quiet the search has gone blind and
     the claim is void, regardless of what the pattern returns.
+
+    ``mutation`` closes the hole the control does not: it is the realistic REINTRODUCTION this pattern
+    claims to exclude, and the pattern must actually fire on it. A whole chapter of claims was once
+    authored as prose narrations of shell commands — ``"rg -n 'tar.extractall' -> exit 1 (zero hits)"``
+    where the field wanted ``tar\\.extractall\\(``. The field's type is ``str`` and prose is a valid
+    ``str``, so the shape permitted it and only a detector caught it. Requiring the pattern to match a
+    stated reintroduction makes prose *unwritable* rather than merely detectable.
+
+    Do NOT derive ``mutation`` from ``pattern``. A value generated from the thing it validates
+    satisfies the check by construction, which would make this the most authoritative-looking vacuous
+    gate in the file — the same defect class it exists to close, arriving through the fix.
     """
 
     pattern: str
     positive_control: str
+    mutation: str
 
 
 @dataclass(frozen=True)
@@ -93,6 +116,13 @@ class Cell:
     last_verified: str = ""
     verified_at: str = ""
     reviewed_by: str = ""
+    #: Owner has closed this cell: it is excluded from surveys, sweeps and rescores, and the loader
+    #: refuses it if the verdict has moved off the pin recorded alongside. Modelled on the Cell rather
+    #: than left as loose TOML so the renderer can surface it — a closure nobody can see is one a pass
+    #: will walk straight past, which is how this cell moved four times in eighteen days.
+    decision_closed: bool = False
+    decision_closed_on: str = ""
+    decision_closed_by: str = ""
     evidence: tuple[Anchor, ...] = ()
     absence: tuple[Absence, ...] = ()
 
@@ -171,6 +201,49 @@ def load_scorecard(path: Path) -> list[Cell]:
                 "recording the reason for non-applicability is the one MUST in ASVS 5.0's assessment "
                 "chapter (docs/ASVS-ASSESSMENT-METHOD.md §1)"
             )
+        # A cell the OWNER has closed is not re-scorable by a survey, sweep or agent. The stop was
+        # written in prose first and prose is not a gate: the reason this cell needed closing at all
+        # is that four different passes each believed they were doing careful work, and a rationale
+        # they could read was never what stopped them. `decision_closed_verdict` pins the verdict as
+        # of the ruling, so a later verdict change is DETECTABLE rather than merely discouraged.
+        #
+        # Deliberately not a warning. The cost of a false stop is one conversation with the owner; the
+        # cost of a silent re-score is a posture document that disagrees with the record and is
+        # discovered months later by a reader — which has already happened here, four times in
+        # eighteen days on the one cell this rule was written for.
+        if raw.get("decision_closed") is True:
+            pinned = str(raw.get("decision_closed_verdict", "")).lower()
+            if not pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: `decision_closed = true` without "
+                    "`decision_closed_verdict` — the pin is what makes the closure checkable, so a "
+                    "closure without one is a comment, not a control"
+                )
+            if verdict != pinned:
+                raise ScorecardError(
+                    f"cell {raw.get('id')!r}: verdict is {verdict!r} but this cell is CLOSED at "
+                    f"{pinned!r} (`decision_closed = true`, closed "
+                    f"{raw.get('decision_closed_on', 'date not recorded')} by "
+                    f"{raw.get('decision_closed_by', 'owner')}). Re-scoring a closed cell needs an "
+                    "explicit owner instruction — not a sweep's own judgement. If you hold one, move "
+                    "the pin in the SAME commit and say so in the message; if you do not, revert the "
+                    "verdict. See `decision_reopen_requires` on the cell"
+                )
+        for a in raw.get("absence", []):
+            if not str(a.get("mutation", "")).strip():
+                raise ScorecardError(
+                    # NO LITERAL CODE EXAMPLE HERE. This module is inside the corpus that absence
+                    # patterns are searched over, so an illustrative call in this string becomes a
+                    # real corpus hit and reads as FALSE. The first draft used one and broke two
+                    # live claims (5.2.5, 5.3.3) the moment they were backfilled: the guidance for
+                    # a check contaminated the check. The Absence docstring carries the example in
+                    # escaped-regex form, which cannot self-match.
+                    f"cell {raw.get('id')!r}: absence claim {a.get('pattern')!r} has no `mutation` — "
+                    "state the realistic reintroduction this pattern excludes, so the pattern can "
+                    "be proved capable of firing. Author it from what the code would look like if "
+                    "the thing came back; do NOT derive it from the pattern, which makes the check "
+                    "vacuous. See the Absence docstring for a worked example"
+                )
         cells.append(
             Cell(
                 id=str(raw["id"]),
@@ -178,6 +251,9 @@ def load_scorecard(path: Path) -> list[Cell]:
                 verdict=verdict,  # type: ignore[arg-type]
                 residual=str(raw.get("residual", "")),
                 posture=str(raw.get("posture", "single")),
+                decision_closed=raw.get("decision_closed") is True,
+                decision_closed_on=str(raw.get("decision_closed_on", "")),
+                decision_closed_by=str(raw.get("decision_closed_by", "")),
                 last_verified=str(raw.get("last_verified", "")),
                 verified_at=str(raw.get("verified_at", "")),
                 reviewed_by=str(raw.get("reviewed_by", "")),
@@ -186,7 +262,13 @@ def load_scorecard(path: Path) -> list[Cell]:
                     for e in raw.get("evidence", [])
                 ),
                 absence=tuple(
-                    Absence(pattern=str(a["pattern"]), positive_control=str(a["positive_control"]))
+                    Absence(
+                        pattern=str(a["pattern"]),
+                        positive_control=str(a["positive_control"]),
+                        # No default. A missing mutation must be authored, not inferred — see the
+                        # Absence docstring on why deriving one from the pattern is worse than none.
+                        mutation=str(a["mutation"]),
+                    )
                     for a in raw.get("absence", [])
                 ),
             )
@@ -231,14 +313,45 @@ def check_completeness(cells: list[Cell], corpus: dict[str, int]) -> list[str]:
         want = corpus.get(c.id)
         if want is not None and c.level != want:
             problems.append(f"{c.id}: level {c.level} but the corpus says L{want}")
+
+    # A DECIDED verdict with no evidence at all is the conflation this whole tool exists to prevent:
+    # a guess wearing a verdict's clothes. The method is explicit — every non-`unverified` cell carries
+    # at least one anchor — but nothing enforced it, because `check_anchors` iterates the evidence a
+    # cell HAS. A cell with none is not checked and fails nothing; the gate could only ever validate
+    # evidence that existed, never assert that it must. Measured when this landed: 14 of 59 decided
+    # cells carried zero anchors AND zero absence claims, several inherited from the prose lineage
+    # where the verdict was reached but never anchored.
+    unevidenced = sorted(
+        (c.id for c in cells if c.verdict in DECIDED_VERDICTS and not c.evidence and not c.absence),
+        key=_sort_key,
+    )
+    if unevidenced:
+        problems.append(
+            f"evidence: {len(unevidenced)} decided cell(s) carry NO anchor and NO absence claim, so "
+            "nothing about them is verified — either anchor them or return them to `unverified`, "
+            f"which is what an unevidenced verdict actually is: {', '.join(unevidenced)}"
+        )
     return problems
 
 
 def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
-    """Open every evidence anchor and assert its token still resolves.
+    """Open every evidence anchor and assert its token still resolves, and resolves UNAMBIGUOUSLY.
 
     When the code moves, this reds a test — instead of the sentence rotting in place and the next
     session funding work that is already done.
+
+    **Uniqueness is not pedantry; it is what makes the resolution mean anything.** An ``expect`` that
+    occurs many times in its file resolves from almost anywhere: with ``await conn.rollback()``
+    appearing 101 times in one module, *any* line number in that file lands within ±40 of some
+    occurrence, so the anchor cannot fail and certifies nothing. Two such anchors sat in this scorecard
+    as evidence for weeks.
+
+    It also closes a defect in the REPAIR path rather than the detection path. When code moves, the
+    check correctly reports it — but a re-anchor to the nearest occurrence can silently install a
+    *stale-but-resolving* anchor that passes forever. That happened live: after ADR 0154 landed,
+    ``UPDATE sessions SET revoked_at=`` had two occurrences 19 lines apart — one the keep-N revoke, one
+    a different method entirely — each inside the other's window, so the check would have accepted the
+    wrong one. A repair is exactly where suspicion lapses, because the tool has just proved it works.
     """
     for c in cells:
         for a in c.evidence:
@@ -246,10 +359,19 @@ def check_anchors(cells: list[Cell], root: Path, findings: Findings) -> None:
             if not target.is_file():
                 findings.problems.append(f"{c.id}: evidence path {a.path} does not exist")
                 continue
-            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            text = target.read_text(encoding="utf-8", errors="replace")
+            lines = text.splitlines()
             lo = max(0, a.line - 1 - ANCHOR_WINDOW)
             hi = min(len(lines), a.line + ANCHOR_WINDOW)
             findings.checked_anchors += 1
+            occurrences = text.count(a.expect)
+            if occurrences > 1:
+                findings.problems.append(
+                    f"{c.id}: {a.path}:{a.line} anchor is AMBIGUOUS — {a.expect!r} occurs "
+                    f"{occurrences} times in the file, so the line number is not load-bearing and a "
+                    "re-anchor cannot be checked. Cite a longer token that appears exactly once"
+                )
+                continue
             if a.expect in "\n".join(lines[lo:hi]):
                 continue
             where = " (found elsewhere in the file)" if a.expect in "\n".join(lines) else ""
@@ -265,6 +387,14 @@ def check_absences(cells: list[Cell], root: Path, findings: Findings) -> None:
     for c in cells:
         for a in c.absence:
             findings.checked_absences += 1
+            # Before asking what the corpus says, ask whether the pattern is a pattern at all. A prose
+            # narration greps to nothing and is indistinguishable from a true absence.
+            if not re.search(a.pattern, a.mutation):
+                findings.problems.append(
+                    f"{c.id}: absence claim is INERT — {a.pattern!r} does not match its own stated "
+                    f"reintroduction {a.mutation!r}, so it would stay quiet if the thing came back"
+                )
+                continue
             control = _grep_count(a.positive_control, corpus_files)
             if control == 0:
                 findings.problems.append(
@@ -328,6 +458,17 @@ def check_pinning(scorecard: Path, corpus: Path) -> list[str]:
             "pinning: [scorecard].asvs_version is missing — bare requirement ids re-point across "
             "ASVS versions, so the scorecard must say which version its ids mean"
         )
+    anchor = str(meta.get("anchor_commit", "")).strip()
+    # actions/checkout resolves `ref:` as a BRANCH OR TAG name unless it is a full 40-char hash, so an
+    # abbreviated anchor fails with "A branch or tag with the name ... could not be found" -- a gate
+    # failing for a reason with nothing to do with what it measures. Caught in CI twice; refused here.
+    if anchor and not re.fullmatch(r"[0-9a-f]{40}", anchor):
+        problems.append(
+            f"pinning: [scorecard].anchor_commit {anchor!r} must be a FULL 40-character SHA -- an "
+            "abbreviated hash is not resolvable by actions/checkout, which treats a short ref as a "
+            "branch or tag name"
+        )
+
     declared = str(meta.get("corpus_sha256", "")).strip()
     actual = corpus_digest(corpus)
     if not declared:
@@ -366,8 +507,10 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     """
     n = count(cells)
     total = sum(n.values())
-    decided = [c for c in cells if c.verdict in DECIDED_VERDICTS]
-    examined = [c for c in decided if c.last_verified]
+    # EXAMINED, not DECIDED: a `needs-review` cell was read and then parked, so it is survey progress
+    # even though it carries no verdict. Counting it as unread made this line contradict the table
+    # below it (see EXAMINED_VERDICTS).
+    examined = [c for c in cells if c.verdict in EXAMINED_VERDICTS and c.last_verified]
     unexamined = total - len(examined)
     pct = (100.0 * len(examined) / total) if total else 0.0
     inherited = sum(1 for c in cells if c.verdict in DECIDED_VERDICTS and not c.last_verified)
@@ -416,6 +559,29 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     for c in sorted((c for c in cells if c.verdict in open_states), key=lambda c: _sort_key(c.id)):
         seen = c.last_verified or "—"
         lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {seen} | {c.residual[:150]} |")
+
+    # Closed cells render even though they are not "open", and the reason is a defect this renderer
+    # caused. 11.7.1 was closed by owner decision while it was a `fail`, so its STOP text surfaced
+    # here — then the same ruling moved it to `na`, it dropped out of `open_states`, and the record's
+    # rendered face went silent about the one cell that had just been the subject of a ruling. A
+    # closure that is visible only while the verdict happens to be open is not a closure.
+    closed = sorted((c for c in cells if c.decision_closed), key=lambda c: _sort_key(c.id))
+    if closed:
+        lines += [
+            "",
+            "## Closed by owner decision — do not re-score",
+            "",
+            "These cells are **excluded from surveys, sweeps and rescores**, whatever a pass's own",
+            "instructions say. Re-scoring one needs an explicit owner instruction; the loader refuses",
+            "a closed cell whose verdict has moved off its pin, so this is enforced, not advisory.",
+            "",
+            "| Cell | L | Verdict | Closed | By |",
+            "|---|---|---|---|---|",
+        ]
+        for c in closed:
+            when = c.decision_closed_on or "—"
+            who = c.decision_closed_by or "owner"
+            lines.append(f"| {c.id} | L{c.level} | **{c.verdict}** | {when} | {who} |")
     return chr(10).join(lines) + chr(10)
 
 

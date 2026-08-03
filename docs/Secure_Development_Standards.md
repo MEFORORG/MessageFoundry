@@ -100,10 +100,37 @@ asking what happens to someone who acts on the sentence; **none** was caught by 
   console's own search route. The control itself was sound; the stated reason was not, and the next
   person to touch it reasons from the comment. A wrong justification is worse than none.
 
+- **Confirm your instrument answers the question you asked, not one adjacent to it.** The rules above
+  catch prose that is true and misleading; this one catches a claim that is **false when written, while
+  feeling measured**. The rule is the question — ***does my instrument answer the question I asked, or
+  one adjacent to it?*** — and it outlives every example below. **The pairs are dated illustrations, not
+  the rule:** `--is-ancestor` misleads here only because this repository squash-merges, and any of them
+  may stop being true without the question changing at all. On 2026-08-02 four parallel sessions
+  retracted eleven claims in a single night and every one traced to an instrument answering in adjacent
+  terms: `git diff` on a **staged** file (returns
+  *"is there an unstaged delta"*; the question was *"is the tree dirty"*); `merge-base --is-ancestor`
+  (*"is this an ancestor"* vs *"did this work land"* — **squash-merge makes the answer always no**); a
+  hash **inequality** (*"are these different"* vs *"is the installed copy **worse**"*); a session-start
+  **banner** (*"who was live when it printed"* vs *"who is live now"*); `grep -c $'\r$'` over `git diff`
+  output (*"does the diff **render** a CR"* vs *"does the file contain CRLF"* — it reported a
+  byte-perfect file as mangled); `$?` after `cmd | tail` (*"did `tail` succeed"*); the Actions
+  `?filter=latest` view (*"what did the **latest attempt** do"* vs *"what did the suite ever do"*); and a
+  **job** conclusion answering a **step** question, which drops the tightest samples by construction.
+  **Re-reading caught none of the eleven; a check that could fail caught one immediately.** Nor were
+  these facts that expired — "#119 never merged (it died on a CI timeout)" was never true at any instant:
+  that pull request's timeline carries exactly one `closed` event, simultaneous with `merged`. Dating a
+  claim does not protect against this class; only re-deriving it does. So before publishing a measured
+  claim, write down the question and write down what the instrument returns, and check that they are the
+  same sentence.
+
 *Provenance (the evidence is the point):* the completeness-claim and false-premise rules, and the
 governing instruction above, came out of the 2026-07-30 public-documentation audit; the
 state-it-once rule was named by the parallel ASVS review session, which also supplied the
-`harden_kex_groups` and `PHI.md` §5/§7 instances. `CLAUDE.md` §11 carries these as bare one-line
+`harden_kex_groups` and `PHI.md` §5/§7 instances. The instrument rule came out of the 2026-08-02
+parallel-session cluster — four sessions, eleven retractions, none caught by its own author — and was
+named by the repo-security-review session after applying it to its own four and finding four for four;
+the remaining instances were contributed by the ci-margin-correction, announce-hook, sandbox-codec and
+ADR 0154 sessions, each of which had made one. `CLAUDE.md` §11 carries these as bare one-line
 imperatives — deliberately duplicated, because an instruction that short cannot meaningfully drift and
 a pointer nobody follows mid-task changes no behaviour. **This section is the source of record for the
 reasoning, the evidence and the dates.**
@@ -337,7 +364,16 @@ The project maintains a current evidence set so any claim is backed:
 - **Per-project applicability profile** (Appendix A and onward).
 - A **claims register** recording each published claim, its wording, and the evidence behind it.
 
-**Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, verified against OWASP ASVS 5.0 Level 3, and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and the ASVS 5.0 Level 3 assessment raises the weight of these claims. **Attestations are published with releases** so adopters can rely on them; each adopter still performs its own deployment risk assessment (§7.3). None of these is a NIST certificate; displayable certificates (SOC 2, ISO 27001, HITRUST) are a separate, organization-level track.
+**Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, **assessed against** OWASP ASVS 5.0 **using Level 3 as the target** — an assessment **in progress**, not a completed verification — and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and of the ASVS assessment raises the weight of these claims.
+
+> **The ASVS wording above changed on 2026-08-02, and the previous wording was wrong.** It read *"verified against OWASP ASVS 5.0 Level 3."* Three facts make that unsupportable, and they are stated here rather than quietly corrected because the claim was **published**:
+> 1. **The survey is incomplete.** A minority of the 345 requirements have been read against the ASVS text at a known commit; the remainder are recorded as *unverified*, which is explicitly **not** a pass. "Verified" asserted a completed verification that had not occurred.
+> 2. **Open requirements exist**, including at Level 2 — so the claim was not rescuable by narrowing it to a lower level.
+> 3. **At least one Level 3 requirement is scoped out** as a hosting-platform property outside the assessed software. Under ASVS 5.0 that does **not** preserve a Level 3 claim: 4.0's "may still claim full ASVS compliance" clause was **dropped** in 5.0, and OWASP retains normative authority over which requirements sit at which level. A Level 3 claim omitting a Level 3 requirement is non-conformant on OWASP's own terms.
+>
+> **No accredited Level 3 pathway exists to appeal to.** OWASP certifies no vendor or software and states that any trust mark claiming ASVS compliance is not officially endorsed by it; the one ASVS-based accreditation scheme accredits testing *firms*, and its published scope is Levels 1–2. So "self-attested" is the only honest register available here, and this section now uses it.
+>
+> Current status is held in the project's private assessment record, which is the count of record; **no figure is restated here**, deliberately, so this page cannot go stale against it. **Attestations are published with releases** so adopters can rely on them; each adopter still performs its own deployment risk assessment (§7.3). None of these is a NIST certificate; displayable certificates (SOC 2, ISO 27001, HITRUST) are a separate, organization-level track.
 
 ---
 

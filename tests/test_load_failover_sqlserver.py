@@ -39,7 +39,6 @@ pytestmark = pytest.mark.skipif(
 # table already exists (a fresh DB has none yet — the nodes create them empty on start).
 _RESET_TABLES = (
     "queue",
-    "outbox",
     "response",
     "leader_lease",
     "nodes",

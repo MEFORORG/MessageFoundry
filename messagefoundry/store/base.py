@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
@@ -234,6 +234,14 @@ class QueueStore(StoreLifecycle, Protocol):
     #: older engine without the fields degrades gracefully.
     committed_txns: int
     body_copies: int
+
+    #: ``fenced_writes`` = TERMINAL queue resolves REJECTED by the H1 leader-epoch fence since store open
+    #: (ADR 0157 C3). Additive and monotone like the two above, read the same ``getattr(store, name, 0)``
+    #: way, and **Postgres-only**: it is the one backend where terminal resolves carry the fence, so the
+    #: SQLite and SQL Server handles expose it at a permanent 0 for protocol / ``/stats`` uniformity. A
+    #: non-zero value means a superseded ex-leader tried to resolve a row the current leader owns and was
+    #: stopped — the split-brain signal an operator actually wants paged on.
+    fenced_writes: int
 
     # --- write path ----------------------------------------------------------
     async def enqueue_message(
@@ -587,16 +595,23 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
-        """Push this node's currently-held **leader epoch** (the H1 fencing token) into the store so the
-        FIFO claim can fence a superseded ex-leader, **inside** the existing single claim transaction.
+        """Push this node's currently-held **leader epoch** (the H1 fencing token) into the store so a
+        superseded ex-leader can be fenced **inside** the existing statement's own transaction.
 
-        The engine calls this on promotion/demotion: it reads the value from the cluster coordinator
-        (:meth:`ClusterCoordinator.current_epoch` / :meth:`ClusterCoordinator.lease_key`) and pushes it
+        The engine calls this on **promotion** — and re-stamps it on every leader+running reconcile pass
+        (ADR 0157 D2) — reading the value from the cluster coordinator
+        (:meth:`ClusterCoordinator.current_epoch` / :meth:`ClusterCoordinator.lease_key`) and pushing it
         here, so the **store never imports the coordinator** (the one-way ARCH-6 dependency direction).
-        ``epoch=None`` disables the guard (single-node / not yet leader / demoted) — the claim is then
-        byte-identical to before H1. With a non-``None`` epoch the server-DB backends add
-        ``leader_lease.leader_epoch <= :held`` to the claim's UPDATE so a paused/superseded ex-leader
-        (whose held epoch is now strictly older than the live leader's) claims **0 rows**.
+
+        ``epoch=None`` **OMITS THE GUARD ENTIRELY** — it means *no fence*, not "a safe null token", and
+        the emitted SQL is then character-identical to pre-H1. That is why demotion deliberately does
+        **not** clear it (ADR 0157 C4): clearing on demotion would disarm the guard at precisely the
+        moment a superseded ex-leader is most likely to still be writing.
+
+        With a non-``None`` epoch the server-DB backends splice a ``leader_lease.leader_epoch``
+        comparison. Which statements carry it, and with which polarity, differs by backend — see
+        :meth:`ClusterCoordinator.current_epoch` for the authoritative scope. It is **not** a general
+        write fence.
 
         Cheap + synchronous (it only stamps cached state — no DB round-trip). A **no-op on SQLite**
         (single active node — no second writer to fence)."""
@@ -1292,6 +1307,45 @@ class QueueStore(StoreLifecycle, Protocol):
         The greatest-of-two is null-safe on every backend — a row that predates the column
         (``last_used_at`` NULL) still ages out on ``updated_at`` alone. Returns the number purged. Off
         unless ``[retention].search_preset_days`` is set."""
+        ...
+
+    async def purge_reference_snapshots(
+        self, *, older_than: float, declared: Collection[str], now: float | None = None
+    ) -> int:
+        """Delete ORPHANED reference snapshots — sets no longer declared in config — synced before
+        ``older_than``. Returns the number of ``reference`` rows deleted.
+
+        ``reference.value`` is a versioned lookup snapshot (ADR 0006) and can hold patient-keyed rows,
+        so PHI.md §2 classifies it **PL-2**. Before ASVS 14.2.7 it had **no purge path at all**: a set
+        dropped from config left its fully-decryptable snapshot in the store indefinitely, replaced only
+        by the next sync's build-new-then-flip — which never comes for a set nobody declares any more.
+
+        **Orphan-scoped by design, and that limit must be stated rather than glossed.** A set that IS
+        declared is never touched however old its ``synced_at``, because its snapshot is live data the
+        engine serves. So the normal case — a wired set holding live PHI — is still purged by nothing.
+        That is an honest residual, not a closed cell; do not let a classification table describe this as
+        `rides <window>`, which would machine-bless a false claim.
+
+        **``declared`` must be non-empty and implementations MUST reject an empty one.** An empty
+        collection reads as "every set is abandoned", so a caller that loaded a registry declaring zero
+        reference sets — a subset ``--config``, a per-team split, a harness redirect pointed at the real
+        DB — would wipe every snapshot in the store. Absence-based guards fail open by construction, so
+        this one is positive-signal: an empty ``declared`` is a programming error, not an instruction.
+        Worse, ``ReferenceSyncRunner`` deliberately does **not** advance ``synced_at`` when a source
+        fetch fails, so the victim would be precisely the last-good snapshot of a still-wired set whose
+        source is merely down.
+
+        **Eligibility must be re-asserted INSIDE the delete statement**, not read first and trusted. The
+        caller computes ``declared`` outside any store lock, so a config reload can commit a fresh
+        patient-keyed snapshot between the decision and the delete; a purge that then fires deletes live
+        data and the set goes present-but-empty, returning ``None`` from ``reference(name).get(k)``
+        silently. Do not assume any backend's own locking closes this — the race is at the caller level
+        on all three.
+
+        **The ``reference_version`` pointer row SURVIVES.** Deleting it is invisible to
+        :meth:`converge_reference_cache`, which only adds/updates names present in a fresh read, so a
+        cluster follower would keep serving the purged PHI from RAM forever. Keeping the pointer costs a
+        row and makes the set read as present-but-empty; that trade is deliberate and recorded."""
         ...
 
     async def wal_checkpoint(self) -> None: ...

@@ -79,7 +79,12 @@ _DANGEROUS_ROW_KEYS: dict[str, str] = {
     "**In-process (default) or subprocess-isolated execution": "sandbox",
     "**`db_lookup`**": "db_lookup",
     "**`fhir_lookup`**": "fhir_lookup",
-    "**Sandbox IPC deserialization**": "pickle",
+    # The pipe no longer pickles (ADR 0087 MFW2, BACKLOG #339): a Handler's `__reduce__` executed in
+    # the engine parent. Pinning "pickle" here would now REQUIRE the private doc to keep asserting a
+    # mechanism the code does not have, so the anchor moved to the module that replaced it. This is a
+    # COUPLED edit — `docs/security/THREAT-MODEL.md` lives in the vault (gitignored, absent from every
+    # checkout, so these tests skip here and in CI) and its 15.1.5 row must be rewritten to match.
+    "**Sandbox IPC deserialization**": "_sandbox_codec",
     "**Other subprocess invocations**": "shell=False",
 }
 

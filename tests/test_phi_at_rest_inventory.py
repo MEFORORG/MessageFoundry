@@ -83,8 +83,12 @@ _RETIRED_CLAIMS = (
     # exactly the opposite — so the suite stayed green while the docs said there was no purge.
     #
     # Each string is deliberately NARROWER than it looks. The bare "no purge on any backend" is NOT
-    # listed: it is a substring of PHI.md's legacy `outbox.payload` row, which is still TRUE. Adding
-    # the short form would red the suite on a correct statement.
+    # listed, and the reason CHANGED without changing the answer. It used to collide with PHI.md's
+    # legacy `outbox.payload` row, which was then still true. ASVS 14.2.7 retired that row — but the
+    # same edit added a PAST-TENSE account of what the retirement fixed ("...kept full outbound PHI
+    # bodies there that no purge on any backend reached"), which is a true statement about history and
+    # would red on the short form just as the old row did. Re-verified by grep at retirement time; a
+    # phrase whose collision merely MOVED is not a phrase that became safe to register.
     "nulled by no purge on any backend",
     "No retention purge nulls this column",
     "No retention purge on any backend",
@@ -98,6 +102,29 @@ _RETIRED_CLAIMS = (
     # uses "no retention path" (the surviving gaps say "no purge"/"keep-forever").
     "no retention path at all",
     "no retention path exists at all",
+    # ASVS 14.2.7 (this change): `reference.value` gains purge_reference_snapshots, and the legacy
+    # SQL Server `outbox` table is migrated into `queue` and DROPped. The three statements below are
+    # TRUE TODAY and become false in Commits 3 and 6 — they are registered HERE, first, so that
+    # `test_retired_false_claims_do_not_reappear` goes RED against the UNEDITED docs and only turns
+    # green once the edits actually land. Registering after the edit proves nothing: it would pass on
+    # day one whether or not the guard works.
+    #
+    # A FOURTH candidate was DELIBERATELY STRUCK. The obvious string "no retention purge" collides
+    # with a still-TRUE sentence:
+    #     docs/security/ASVS-292-289-HANDOFF-2026-07-25.md:173
+    #     "`pending_approvals.params` is unencrypted and has no retention purge on any backend."
+    # `_retired_claim_hits()` globs docs/*.md PLUS docs/security/*.md — and docs/security/ is
+    # GIT-IGNORED. So registering it reds on a developer's machine and passes in CI, where the file
+    # does not exist. A guard that is strictly weaker in CI than on a laptop is not a guard.
+    # Grep evidence recorded at registration time (docs/*.md | docs/security/*.md):
+    #     "no retention purge"                    1 | 1   <- STRUCK, collides with a true statement
+    #     "**No purge path at all**"              1 | 0
+    #     "touched by no purge on any backend"    1 | 0
+    #     "is purged by nothing on any backend"   1 | 0
+    # Re-run that grep before adding any further string here.
+    "**No purge path at all**",
+    "touched by no purge on any backend",
+    "is purged by nothing on any backend",
 )
 #: Filename markers identifying an ASVS **scoring / evidence** artifact. Those documents quote the
 #: retired wording deliberately, as the record of what was found, so scanning them for it would be a
@@ -302,7 +329,10 @@ def test_cipher_registry_is_enumerable_from_code() -> None:
         "users.totp_secret",
         "connection_event.reason",
         "alert_instance.reason",
-        "outbox.payload",
+        # `outbox.payload` was here until the legacy SQL Server table was migrated into `queue` and
+        # DROPped (ASVS 14.2.7). It is gone from the registry BECAUSE the cell no longer exists —
+        # `test_per_backend_cipher_counts_are_derived_not_hand_written` is what proves that is a real
+        # retirement and not a silently narrowed enumeration: it re-derives 18/17/17 from the code.
         "uploaded_file.body",
     ):
         assert expected in cells, f"{expected} vanished from the code-derived cipher registry"
@@ -500,10 +530,16 @@ def test_guard_detects_a_planted_omission() -> None:
         _assert_purge_surface_documented(["purge_alert_instances"], damaged_purge)
 
 
-@pytest.mark.parametrize("victim", ["shared_body.body", "outbox.payload"])
+@pytest.mark.parametrize("victim", ["shared_body.body"])
 def test_guard_detects_a_planted_full_row_deletion(victim: str) -> None:
-    """The case the whole-section check passed: both tokens survive in §2's coverage PROSE, so
-    deleting their inventory ROW was undetectable until the assertion was table-scoped."""
+    """The case the whole-section check passed: the token survives in §2's coverage PROSE, so
+    deleting its inventory ROW was undetectable until the assertion was table-scoped.
+
+    `outbox.payload` was the second parameter until ASVS 14.2.7 retired the legacy SQL Server table.
+    It is dropped rather than kept because this case needs a victim that is BOTH in the code-derived
+    cipher registry AND named in §2's prose; a retired cell is in neither, so keeping it would fail on
+    the `assert victim in cells` precondition — a fixture failure, not a guard failure.
+    """
     cells = _cipher_cells()
     assert victim in cells
     rows = _table_rows(_section(2))
