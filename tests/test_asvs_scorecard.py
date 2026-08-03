@@ -349,7 +349,14 @@ expect = "tls_cert_file"
 
 
 def test_render_leads_with_survey_progress_not_a_headline_score() -> None:
-    """Phase 0: a count over unexamined cells is an average of guesses, so it is not the headline."""
+    """Phase 0: a count folding in not-yet-re-verified cells is not a measurement, so not the headline.
+
+    The wording is asserted, not just the numbers, and that is deliberate. `unverified` measures
+    RE-VERIFICATION DEBT: the earlier lineage graded these cells against the requirement verb as
+    paraphrased in our own scorecards, because the ASVS 5.0.0 text was not held until 2026-07-31.
+    Rendering them as "never examined" overstates the deficit and misdescribes the lineage, and the
+    rendered page is where every downstream reader picks the phrase up.
+    """
     cells = [
         Cell(id="1.1.1", level=1, verdict="pass", last_verified="2026-08-01"),
         Cell(id="1.1.2", level=2, verdict="unverified"),
@@ -359,10 +366,12 @@ def test_render_leads_with_survey_progress_not_a_headline_score() -> None:
     ]
     out = render_current(cells, anchor_sha="deadbeef")
     assert (
-        "**2 of 3 requirements have been read against the ASVS text (66.7%).** 1 have not." in out
+        "**2 of 3 requirements have been verified against the pinned ASVS requirement text "
+        "(66.7%).** 1 carry a verdict that has not been re-verified against it." in out
     )
     assert "There is deliberately no headline score here" in out
-    assert "never examined — not a Pass" in out
+    assert "not re-verified against the requirement text — not a Pass" in out
+    assert "never examined" not in out  # the overstatement must not come back
     assert "deadbeef" in out
 
 
@@ -386,7 +395,8 @@ def test_render_counts_a_needs_review_cell_as_read_not_as_unexamined() -> None:
     out = render_current(cells, anchor_sha="x")
 
     assert (
-        "**2 of 3 requirements have been read against the ASVS text (66.7%).** 1 have not." in out
+        "**2 of 3 requirements have been verified against the pinned ASVS requirement text "
+        "(66.7%).** 1 carry a verdict that has not been re-verified against it." in out
     )
     # ...and it stays OUT of the verdict counts, which is why the two sets differ at all.
     assert "| Needs review | 1 |" in out
