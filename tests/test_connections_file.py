@@ -303,6 +303,25 @@ def test_duplicate_name_across_file_and_code_fails(tmp_path: Path) -> None:
         load_config(cfg)
 
 
+def test_outbound_validate_directory_is_rejected_from_toml(tmp_path: Path) -> None:
+    # #114: the guard lives in build_outbound_connection, the single choke point BOTH authoring
+    # surfaces pass through — so the data-authored outbound is rejected by the same rule as the
+    # code-first one, with no second check in the TOML reader. This test pins that claim.
+    cfg = _config(
+        tmp_path,
+        """
+        [[outbound]]
+        name = "OB_FILE"
+        transport = "file"
+          [outbound.settings]
+          directory = "out"
+          validate_directory = true
+        """,
+    )
+    with pytest.raises(WiringError, match="validate_directory is an inbound-only option"):
+        load_config(cfg)
+
+
 def test_unknown_transport_fails(tmp_path: Path) -> None:
     cfg = _config(
         tmp_path,

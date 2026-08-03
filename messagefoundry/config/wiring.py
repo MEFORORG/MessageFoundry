@@ -1455,7 +1455,7 @@ def File(
     sort: str = "name",  # inbound: process order — "name" | "mtime"
     recursive: bool = False,  # inbound: also scan subdirectories
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on a missing/unusable dir (#114); default defers to run time
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on a missing/unusable dir; default defers to run time
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -1479,9 +1479,10 @@ def File(
     ``after_read`` (inbound) chooses the source-file disposition: ``move`` (→ ``processed_subdir``,
     the default), ``delete``, or ``leave`` — **process in place** for a read-only share / a directory
     another system owns (#142; a HASHED per-file ledger dedups so a left file is ingested once).
-    ``validate_directory`` (inbound, #114) makes a missing/unusable directory **fail startup** (the
-    connection is reported ``failed``) instead of the default deferral to run time; a ``leave`` source
-    validates read-only (a read-only share passes).
+    ``validate_directory`` (**inbound only**, #114) makes a missing/unusable directory **fail startup**
+    (the connection is reported ``failed``) instead of the default deferral to run time; a ``leave``
+    source validates read-only (a read-only share passes). On an **outbound** it raises a
+    :class:`WiringError` at bind — no destination reads it, so accepting it would be a silent no-op.
 
     ``credential_username`` / ``credential_domain`` / ``credential_password`` (ADR 0132, #111) give the
     endpoint an **alternate Windows identity** for a UNC/SMB share, distinct from the engine service
@@ -2433,7 +2434,7 @@ def Sftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on an unreachable remote dir
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -2493,7 +2494,7 @@ def Ftp(
     ] = "move",  # inbound: "move" (to processed_subdir) | "delete" | "leave" (process in place, #142)
     min_age_seconds: float = 0.0,  # inbound: skip files modified within this window (partial writes)
     max_file_bytes: int | None = 16 * 1024 * 1024,  # inbound: skip files over this (OOM guard)
-    validate_directory: bool = False,  # inbound: fail-fast at start on an unreachable remote dir (#114)
+    validate_directory: bool = False,  # inbound ONLY (a WiringError on an outbound, #114): fail-fast at start on an unreachable remote dir
     overwrite: bool = False,  # outbound: overwrite vs. uniquify a name collision
     processed_subdir: str = ".processed",
     error_subdir: str = ".error",
@@ -3781,6 +3782,23 @@ def build_outbound_connection(
         raise WiringError(
             f"outbound connection {name!r}: {kind} outbound requires a host (the downstream peer), "
             f"e.g. {kind.title()}(host=..., port=...)."
+        )
+    if spec.type in (ConnectorType.FILE, ConnectorType.REMOTEFILE) and spec.settings.get(
+        "validate_directory"
+    ):
+        # BACKLOG #114: validate_directory is INBOUND-ONLY. Only SourceConnector carries the
+        # validate_startup hook the runner awaits at bind (pipeline/wiring_runner.py) — no destination
+        # reads the setting, and DestinationConnector has no equivalent hook. Set on an outbound it was
+        # accepted and silently ignored, so an operator asking for fail-fast validation got none and saw
+        # no error. It is caught HERE rather than in File()/Sftp()/Ftp() because those factories serve
+        # BOTH directions and cannot know which one they are — only the bind does. (Same choke-point
+        # reasoning as the capture_response guard below, which spells it out.) Truthy-only, so the
+        # `False` the factories always write into settings keeps building byte-identically.
+        kind = spec.type.value.upper()
+        raise WiringError(
+            f"outbound connection {name!r}: validate_directory is an inbound-only option — an outbound "
+            f"{kind} never reads it, so requesting it here would be a silent no-op. Remove it. "
+            "(Startup validation of an outbound target directory is not implemented; see BACKLOG #114.)"
         )
     _check_metadata(name, metadata)
     # ADR 0013 Increment 2: reingress_to (route this outbound's reply back as a new inbound message)

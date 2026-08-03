@@ -629,7 +629,7 @@ def route(msg):
 | `sort` | in | `name` | process order: `name` or `mtime` |
 | `recursive` | in | `false` | also scan subdirectories |
 | `max_file_bytes` | in | `16 MiB` | route files larger than this to the error dir instead of reading them into memory (OOM guard). `None`/`0` = unlimited. |
-| `validate_directory` | in | `false` | validate the poll directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. No mkdir — a merely-missing dir fails. A `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. |
+| `validate_directory` | in | `false` | validate the poll directory **at startup** (#114): a missing/unusable dir reports the connection **`failed`** (ADR 0031) instead of the default deferral to run time. No mkdir — a merely-missing dir fails. A `leave` source validates read-only (a read-only share passes); `move`/`delete` also require write. **Inbound only** — on an outbound it is a `WiringError` at bind (an outbound target directory is never validated at startup; it is `mkdir`ed on write). |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read/failed files go |
 | `filename` | out | `{MSH-10}.hl7` | output name (supports `{HL7-path}` placeholders). Resolved values are sanitized to a **single safe filename** — path separators/unsafe chars stripped, leading dots removed, and `.`/`..`/reserved device names fall back — so a message field can never write outside the directory. |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (collisions are resolved by an **atomic** exclusive create, so concurrent writes never clobber) |
@@ -850,7 +850,7 @@ poll/write shape against a remote server, selected by an internal `protocol` set
 | `min_age_seconds` | in | `0.0` | **accepted but not honoured on a remote source today** — the connector never reads it (a remote directory listing carries no reliable mtime). Only `File(...)` implements it; use `after_read`/the partner's own write-then-rename to avoid partial reads. |
 | `after_read` | in | `move` | `move` (→ `processed_subdir`), `delete`, or `leave` (process **in place**, #142 — a durable dedup ledger keyed on a hash of the **full remote path** + size ensures a left file is ingested once) |
 | `max_file_bytes` | in | `16 MiB` | move a file larger than this to `error_subdir` instead of retrieving it (OOM guard). `None`/`0` = unlimited. |
-| `validate_directory` | in | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time |
+| `validate_directory` | in | `false` | validate `remote_dir` **at startup** (#114): unreachable/unusable reports the connection **`failed`** (ADR 0031) instead of deferring to run time. **Inbound only** — on an outbound it is a `WiringError` at bind (the upload dir is `ensure_dir`ed on write, never validated at startup). |
 | `processed_subdir` / `error_subdir` | in | `.processed` / `.error` | where read / failed files go |
 | `filename` | out | `{MSH-10}.hl7` | upload name (supports `{HL7-path}` placeholders, sanitized to a **single safe filename** exactly as `File(...)`) |
 | `overwrite` | out | `false` | overwrite vs. uniquify a name collision (never a silent clobber) |
