@@ -33,7 +33,7 @@ does not define it — an undefined grade is one two assessors will apply differ
 | `na` | The requirement does not apply to this product on the declared scope. **A written rationale is mandatory** | yes — and the rationale is the one **"must"** in ASVS's assessment chapter |
 | `partial` | A control exists but ships off, warns instead of refusing, or covers only part of the in-scope surface | **local extension** — see §1.1 |
 | `needs-review` | Examined, but the verdict is genuinely contested or blocked on a decision | **local extension** |
-| `unverified` | **Never examined.** Inherited from an earlier assessment and never read against the requirement text | **local extension** |
+| `unverified` | **Not re-verified against the requirement text.** The cell carries a verdict from an earlier assessment that reasoned from the verb *as paraphrased in our own scorecards*, never from the pinned text at a known commit | **local extension** |
 
 ### 1.1 The decision procedure — apply in order
 
@@ -42,7 +42,11 @@ Ambiguity is resolved by taking the **first** rule that matches, not by judgemen
 1. **Does the requirement apply to this product on the declared scope (§2)?**
    No → **`na`**, and write the rationale. No rationale, no `na`.
 2. **Has this cell been read against the ASVS requirement text at a known commit?**
-   No → **`unverified`**. *This is not a Pass.* An inherited verdict is a guess.
+   No → **`unverified`**. *This is not a Pass.* ⚠️ It is also **not** "nobody looked" — the earlier
+   lineage graded these cells. What it graded them against was a paraphrase, because the ASVS 5.0.0
+   text was not held anywhere in the project until 2026-07-31. So an inherited verdict is a verdict
+   about a restatement of the requirement, which is why it has to be re-derived rather than trusted —
+   and why re-verification moves some of them.
 3. **Does code implementing the requirement's verb exist anywhere in the tree, reachable by any
    configuration?**
    No → **`fail`**.
@@ -161,7 +165,7 @@ for four different reasons, and only one of them means the software got better:
 | The count moved because… | Did the posture improve? | What actually happened |
 |---|---|---|
 | A control was **built or turned on by default** | **Yes** | The verb is now satisfied by shipped code |
-| A cell was **read for the first time** (`unverified` → anything) | **No** | The survey advanced. A cell moving `unverified` → `pass` is a *discovery*, not an improvement |
+| A cell was **re-verified against the requirement text** for the first time (`unverified` → anything) | **No** | The survey advanced. A cell moving `unverified` → `pass` is a *discovery* — or a paraphrase-based grade being corrected — never an improvement |
 | A **scope boundary was stated** (→ `na`) | **No** | The requirement left the denominator. Identical code, smaller question |
 | A **rule was applied more carefully** (re-grade in either direction) | **No** | The assessment got more accurate. Some of these move *down* |
 | **The standard moved** (a new ASVS release changes requirement text, levels, or the requirement count) | **No** | The denominator changed. Zero code changed and zero assessment work happened — and this is the cause most easily mistaken for the survey advancing |
@@ -196,10 +200,16 @@ gate is watching, which is the entire reason the drift gate exists (ADR 0156).
    digest in `[scorecard]`, and a 5.0.x patch release would move requirement text and counts on its own.
 
 ⚠️ **This cuts against us more often than for us, which is why it is written down.** The survey is
-incomplete, so most future movement will come from cause 2 — cells being read for the first time — and
-the aggregate will get *worse* before it gets better as `unverified` cells resolve into real verdicts.
-**That is the survey working, not a regression**, and it should be reported as such rather than
-defended against.
+incomplete, so most future movement will come from cause 2 — cells being re-verified against the
+requirement text for the first time — and the aggregate will get *worse* before it gets better as
+`unverified` cells resolve into real verdicts. **That is the survey working, not a regression**, and it
+should be reported as such rather than defended against.
+
+⚠️ **And state the debt in the right words.** `unverified` measures **re-verification debt**, not
+unassessed surface. Describing those cells as "never examined" or "nobody has looked at them"
+overstates the deficit and misdescribes the lineage: they were graded, repeatedly, against a
+paraphrase. The honest phrasing is *"N of 345 verified against the pinned requirement text; M carry
+verdicts not yet re-verified against it."*
 
 **The configuration assessed** — one posture, not a matrix:
 
@@ -243,8 +253,8 @@ verdict can be traced to the pass that set it.
 - **No document states a count.** The count is **computed** from the scorecard, and prose renders it.
   Five documents once asserted three different counts.
 - **`unverified` is reported separately from `pass`.** A headline that merges them is not a
-  measurement — it is an average over guesses. Publish *verified / unexamined*, not a single total,
-  until the baseline sweep completes.
+  measurement — it is an average over verdicts reached against a paraphrase. Publish
+  *verified / not-yet-re-verified*, not a single total, until the baseline sweep completes.
 
 ---
 
