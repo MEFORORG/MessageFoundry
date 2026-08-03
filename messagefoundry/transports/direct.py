@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import smtplib
+import ssl
 from collections.abc import Mapping
 from email.message import EmailMessage
 from pathlib import Path
@@ -57,7 +58,11 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.serialization import pkcs7
 
 from messagefoundry.config.models import ConnectorType, Destination
-from messagefoundry.config.settings import INSECURE_TLS_ESCAPE_ENV, insecure_tls_allowed
+from messagefoundry.config.settings import (
+    INSECURE_TLS_ESCAPE_ENV,
+    weakened_tls_escape_permitted_here,
+)
+from messagefoundry.config.tls_policy import build_smtp_tls_context
 from messagefoundry.transports.base import (
     DeliveryError,
     DeliveryResponse,
@@ -140,6 +145,13 @@ class DirectDestination(DestinationConnector):
         self.username: str | None = str(username) if username else None
         self.password: str | None = str(password) if password else None
         self.use_tls = bool(s.get("use_tls", True))
+        # #323: server-certificate verification on the TLS hop, kept byte-identical to
+        # EmailDestination's spelling (this connector's SMTP core is a deliberate copy, not an import —
+        # the one-way dependency rule — so the two must not drift).
+        self.tls_verify = bool(s.get("tls_verify", True))
+        tls_ca_file = s.get("tls_ca_file")
+        self.tls_ca_file: str | None = str(tls_ca_file) if tls_ca_file else None
+        self.tls_check_hostname = bool(s.get("tls_check_hostname", True))
         self.timeout: float = float(s.get("timeout_seconds", 30.0))
         self.encoding: str = str(s.get("encoding", "utf-8"))
 
@@ -167,11 +179,26 @@ class DirectDestination(DestinationConnector):
         # SMTP is refused unless the project-wide dev escape is set, and credentials are NEVER sent over
         # a cleartext channel.
         if not self.use_tls:
-            if not insecure_tls_allowed():
+            # #323: read through the CLAMPED escape, not the raw insecure_tls_allowed(). This call site
+            # was the last unclamped one in the file, sitting one branch away from the clamped arm
+            # below — two different escapes in one connector is how the next bug gets written. The
+            # change strictly ADDS refusals (ADR 0092 decision 5): an enforcing production-PHI instance
+            # can no longer silence a cleartext Direct hop with the blunt process-wide env var.
+            #
+            # THE ESCAPE STILL EXISTS — it is CLAMPED, not removed. Stated because this file now has
+            # NO CALL to `insecure_tls_allowed()` (only these comments mention it), and reading that
+            # as "this connector has no escape" would be a FALSE ABSENCE claim.
+            # MEFOR_ALLOW_INSECURE_TLS still governs this hop: weakened_tls_escape_permitted_here() is
+            # that same env var plus the production-PHI clamp. Any absence claim about the raw call is
+            # scoped to THIS FILE and never repo-wide — `insecure_tls_allowed()` remains live at call
+            # sites in auth/ldap.py, pipeline/alert_sinks.py, transports/{ai_broker,database,mllp}.py
+            # and config/settings.py (docs/DEPLOYMENT.md enumerates the ones the clamp does not yet
+            # cover — see #329). Verified by grep at the time of writing, not assumed.
+            if not weakened_tls_escape_permitted_here():
                 raise ValueError(
                     "Direct destination use_tls=false submits over cleartext SMTP; refused unless "
-                    f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use STARTTLS "
-                    "(the default)"
+                    f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only, and refused on a "
+                    "production-PHI instance even with the escape, #200) — use STARTTLS (the default)"
                 )
             if self.username is not None:
                 raise ValueError(
@@ -183,6 +210,40 @@ class DirectDestination(DestinationConnector):
                 "network in CLEARTEXT (dev/trusted-network only)",
                 self.host,
             )
+        elif not self.tls_verify:
+            # #323 arm 2 — same shape and wording as EmailDestination's, deliberately.
+            if not weakened_tls_escape_permitted_here():
+                raise ValueError(
+                    "Direct destination tls_verify=false disables server-certificate verification on "
+                    f"the SMTP hop to {self.host} — the session is encrypted but UNAUTHENTICATED. The "
+                    "S/MIME body still protects the clinical payload, but envelope metadata and any "
+                    "SMTP AUTH credential are exposed to an on-path attacker presenting any "
+                    "certificate. Use a trusted CA (tls_ca_file, or [tls].internal_ca_file for the "
+                    f"instance), or set {INSECURE_TLS_ESCAPE_ENV}=1 to allow it on a trusted-network "
+                    "bind (refused on a production-PHI instance even with the escape, #200)."
+                )
+            if self.username is not None:
+                raise ValueError(
+                    "Direct destination sends SMTP AUTH credentials over an UNVERIFIED TLS session "
+                    "(tls_verify=false); refused — credentials require a verified TLS session"
+                )
+        # Built once at construction (fail-fast), reused by every send. None when TLS is off entirely.
+        # DIRECT does not take a RevocationHopGuard even though the hop now verifies: adding it would
+        # make the enumerated count eight and force four "seven verifying hops" docs to change, and the
+        # clinical payload is S/MIME-protected at the message layer so the PHI argument is materially
+        # weaker than EMAIL's (ADR 0085). Recorded rather than silently omitted.
+        self._tls_context: ssl.SSLContext | None = (
+            build_smtp_tls_context(
+                host=self.host,
+                cell="Direct destination",
+                verify=self.tls_verify,
+                ca_file=self.tls_ca_file,
+                check_hostname=self.tls_check_hostname,
+                trust_anchor_policy=config.trust_anchor_policy,
+            )
+            if self.use_tls
+            else None
+        )
 
     def _load_private_key(self, value: Any, password: Any) -> Any:
         """Load the sender's signing private key (PEM/DER, optionally passphrase-protected). PHI/secret-
@@ -317,10 +378,13 @@ class DirectDestination(DestinationConnector):
         """Open an SMTP connection, applying STARTTLS / implicit TLS per config (identical posture to
         EmailDestination). The caller closes it (``with`` / ``quit``)."""
         if self.port == 465 and self.use_tls:
-            return smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout)
+            # context= is REQUIRED (#323) — SMTP_SSL's own default is an unverified stdlib context.
+            return smtplib.SMTP_SSL(
+                self.host, self.port, timeout=self.timeout, context=self._tls_context
+            )
         smtp = smtplib.SMTP(self.host, self.port, timeout=self.timeout)
         if self.use_tls:
-            smtp.starttls()
+            smtp.starttls(context=self._tls_context)
         return smtp
 
     def _send(self, payload: str) -> None:

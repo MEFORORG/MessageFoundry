@@ -398,7 +398,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#22b Alerts GUI page** | Med | **done** | S | ✅ Endpoint `/alerts/rules` shipped (#415); console Alerts page shipped (**PR #420**, merged 2026-06-20). Operator-parity polish, not a migration-unblocker. |
 | **#33 config-UX audit** | Med | do-next | M | Right timing to audit config sprawl — but value realizes **only if** the spawned follow-ups are funded. Keep bounded to transport/service config (logic stays code-first — never drift toward #26). |
 | **FEATURE-MAP refresh** | Med | do-next → **done** | S | Verified stale (Dead-Letters row); ASVS score synced to 212/0/0/133 (#425). |
-| **#7 inbound HTTP listener (+ SOAP/FHIR-facade tail)** | Med | **done (first slice) / on-trigger (tail)** | XL | ✅ REST body-POST listener shipped `0.2.10` (ADR 0023, PR #624). **Deferred tail (on-trigger):** SOAP sync-reply, intake-auth, routing-metadata, inbound FHIR-server facade (#20) / DICOMweb receiver (#24). |
+| **#7 inbound HTTP listener (+ SOAP/FHIR-facade tail)** | Med | **done (first slice) / on-trigger (tail)** | XL | ✅ REST body-POST listener shipped `0.2.10` (ADR 0023, PR #624). Intake auth (ADR 0154 increment A) and the SOAP sync-reply (`reply_from`, increment B) have since shipped. **Deferred tail (on-trigger):** routing-metadata, inbound FHIR-server facade (#20) / DICOMweb receiver (#24). |
 | **#16 eventlog (0021 half)** | Med | **done** | L | ✅ Shipped `0.2.3` (#541): metadata-only `connection_event` log + "Response Sent" ACK/NAK capture + console Event Log (jointly with #46). **ADR 0020 raw protocol-trace stays dropped** (raw-PHI-at-rest tier nobody named). |
 | **#34 per-connection retention** | Med | **done** | M | ✅ Shipped `0.2.9` (ADR 0027): per-connection `messages_days` / `dead_letter_days` over the global default, across all 3 backends. |
 | **least-priv service-account default** | Med | on-trigger | S | Account + ACLs already built; only the default flip off LocalSystem remains. Ride the next green `windows-service-smoke`. |
@@ -412,7 +412,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#24 DICOM** | **Med–High** | **done (Phases 1 + 2)** | L | **Adopter-driven** — a radiology practice on Corepoint DICOM Gear wants to adopt. ✅ **Phases 1 + 2 SHIPPED** ([ADR 0025](adr/0025-dicom-codec-store-connectors.md) Accepted): pure codec + DIMSE **C-STORE SCP** + code-first SR→HL7 Handler (Phase 1, PR #439); **C-STORE SCU + C-ECHO + DICOMweb STOW-RS** outbound (Phase 2, `rest.py` reuse — no new dep). **MWL/Q-R/inbound-DICOMweb declined/deferred.** Did **not** need #7. |
 | **Meta — v0.3 cut** | Low | **done** | S | ✅ The v0.3-candidate wave was cut as **`0.2.10`** (Plan-5; ADR 0023 inbound-HTTP among others). Next buildable set planned in PLAN-6. |
 | **#30 version-update check** | Low | **done** | M | ✅ Shipped `0.2.10` (ADR 0026, PR #618) — but as a **zero-egress local lock-diff** (no PyPI call), resolving the on-prem tension; the live-egress variant stays off-by-default / deferred. |
-| **ASVS 11.7.1 in-use memory encryption** | Low | **drop (N/A)** | XL | Already scored **N/A** — a hardware/OS/hypervisor capability, unachievable for pure-Python on-prem. |
+| **ASVS 11.7.1 in-use memory encryption** | Low | **drop (N/A)** | XL | **`na` on the record** (closed by owner decision 2026-08-02; do not re-score). ⚠️ The verdict is right but the *reason* here is not: "unachievable for pure-Python on-prem" is **not** the ground. The engine does ship rungs 1–2 — they **report on** the platform property rather than **provide** it. The ground is that the verb names a CPU/firmware/hypervisor property, outside the declared scope of three software artifacts. See `docs/ASVS-ASSESSMENT-METHOD.md` §2. |
 | **#18 git-offering** | Low | **confirm-decline** | M | Buyers already run git/ADO/GHE — a non-problem. Fold conventions into #33; AGPL-compat entanglement. |
 | **#25 JMS** | Low | **confirm-decline** (as named) | M | Java-broker artifact vs the **no-broker identity** (the staged SQLite queue *is* the durability story). Keep only a *generic* AMQP/Kafka on-trigger candidate. |
 | **#26 visual/template authoring** | Low | **confirm-decline** | S | Code-first IS the differentiator (recorded #411). The failure mode is a "guided editor" drifting toward declarative *logic* authoring. |
@@ -426,7 +426,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 **Top strategic calls** *(2026-06-19; updated 2026-06-28)*:
 1. ✅ **v0.2 locked and shipped** through `0.2.10` (#28/#29 evidence published; #22b shipped). The release-close move is done.
 2. **The connector + codec backlog largely shipped, on its triggers** — #7 (first slice) / #23 (SMTP) / #24 / #31 / #32 all landed; #25 stays declined. The discipline held: each shipped against a real adopter/contract or as an additive opt-in, never speculative. The remaining transport tails (#23 IMAP/POP, #7 SOAP-reply) stay demand-gated.
-3. **Treat the ASVS L3 residuals as closed/N-A, not a staffing queue** — #377 + #378 merged; 11.7.1 is N/A; WebAuthn #11 buys zero ASVS movement. The only live security item is the cheap least-priv default flip.
+3. **Treat the ASVS L3 residuals as closed/N-A, not a staffing queue** — #377 + #378 merged; 11.7.1 is N/A (still true, and re-confirmed on the record 2026-08-02 — but on a different ground than this line assumed; see the 11.7.1 row above); WebAuthn #11 buys zero ASVS movement. The only live security item is the cheap least-priv default flip. ⚠️ **Do not read "residuals are closed" as a posture summary** — the survey is incomplete and most cells have never been read against the requirement text, so this line describes a *staffing* judgement, not coverage.
 4. ✅ **The v0.3-candidate set was cut as `0.2.10`** (anchored on ADR 0023 inbound-HTTP). The next buildable set is the actionable **#33** + the **#40** AWS campaigns + owner-decision **#60** — planned in PLAN-6, still ADRs-first and demand-aware. (**#41** shipped as ADR 0047; **#61** as ADR 0048 / #641; **#52** is the parity index → #65–#85; **#39** was built then 🪦 retired 2026-07-01.)
 5. **Re-confirm the #26 visual-authoring decline loudly** — the strategic failure mode is an audit or "guided editor" quietly drifting toward declarative *logic* authoring.
 
@@ -881,8 +881,12 @@ functionally tested; the `ide` build job (PR #133) closes the compile gap, not t
 > inbound HTTP/1.1 listener (`transports/http_listener.py`, `ConnectorType.HTTP`) accepts a partner's body
 > POST, feeds it to payload-agnostic ingress (ADR 0004) as a `RawMessage`, and returns **respond-with-
 > receipt** under ACK-on-receipt — living in `transports/`, not `api/` (the one-way dependency rule holds).
-> **Deferred tail (still open):** the synchronous **SOAP-envelope reply** (block-on-captured-downstream via
-> the ADR 0013 query-response seam), **intake auth**, **routing-metadata**, and the inbound **FHIR-server
+> **Intake auth SHIPPED** (2026-08-01, ADR 0154 increment A, `f2ef0ea9`) and the synchronous
+> **SOAP-envelope reply SHIPPED** (ADR 0154 increment B, `reply_from`, PR #119) — naming
+> `reply_from` blocks the HTTP turn until the named outbound's reply is captured **and committed**,
+> then returns it as the response body. Its `capture_error_responses` gap is open: a partner 4xx
+> still yields a fixed-JSON `502` rather than the partner's own status and body.
+> **Deferred tail (still open):** **routing-metadata**, and the inbound **FHIR-server
 > facade** (#20) / **DICOMweb STOW-RS receiver** (#24). Original deferred-to-v0.3 description kept below for history.
 
 **Type:** feature — a new inbound transport direction (HTTP-listener source). Deferred by design:
@@ -5259,11 +5263,13 @@ sourced — **#1 (SQL Server concurrency)** and **#2 (console off-thread)** — 
 
 **Trigger:** build when a partner mandates an SMTP server whose TLS certificate cannot be validated. **Prefer fixing the trust chain.**
 
-**Why:** Real gap. The alert SMTP sink (EmailTransport in pipeline/alert_sinks.py) calls starttls() with the default SSL context and exposes only email_use_tls plus the global MEFOR_ALLOW_INSECURE_TLS cleartext escape, so there is no per-mail-server option to keep TLS on yet unconditionally trust a self-signed/mismatched certificate.
+**Why (AS FILED — both halves are now false; see the correction below).** Filed as a real gap: the alert SMTP sink called `starttls()` with the default SSL context and exposed only `email_use_tls`, so there was no per-mail-server option to keep TLS on yet trust an unvalidatable certificate. [#323](#323) layer 3 changed both facts — the hop now builds a **verifying** context, and `[alerts].email_tls_verify` **is** that per-server override.
 
-**Why it is an anti-feature:** unconditionally trusting an SMTP server's certificate defeats TLS. The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design; the only escape (`MEFOR_ALLOW_INSECURE_TLS`) is global and deliberately loud. Recorded for parity completeness, not as a want.
+**Why it is an anti-feature:** unconditionally trusting an SMTP server's certificate defeats TLS. The only escape (`MEFOR_ALLOW_INSECURE_TLS`) is global and deliberately loud. Recorded for parity completeness, not as a want.
 
-**Nearest existing mechanism:** EmailTransport / send_plain_email in pipeline/alert_sinks.py (SMTP alert sink, built by notifier_from_settings from AlertsSettings in config/settings.py); its only TLS knob is email_use_tls (STARTTLS on/off) plus the global MEFOR_ALLOW_INSECURE_TLS / insecure_tls_allowed() escape, which permits CLEARTEXT SMTP — not a keep-TLS-but-trust-any-cert override.
+> ⚠️ **CORRECTED 2026-08-01, RESOLVED 2026-08-02.** This item once asserted "The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design." That was **FALSE when written** — the shape [`CLAUDE.md`](../CLAUDE.md) §11 names as worst, *a compensating control resting on a false premise*: `smtplib.starttls()` with no context falls back to `ssl._create_stdlib_context`, which **is** `ssl._create_unverified_context` (`CERT_NONE`, `check_hostname=False`), so the sink encrypted without authenticating and a reader would have concluded alert email was TLS-verified when it was not. [#323](#323) layer 3 has now landed, so **the sentence is true for the first time** — verification is built, not assumed, and `tests/test_alert_smtp_tls.py` asserts it against a negative control. The standing instruction is therefore lifted, with one condition: state it as **built and tested**, never as "by design". ⚠️ **This item stays DECLINED.** #323 built *verification*; #139 asks for the **anti-feature** — unconditionally trusting any certificate. That capability now exists as `email_tls_verify = false`, but it is deliberately **not** the per-mail-server knob this item wanted: it is instance-wide, it is a named loosening, and on an enforcing PHI instance it refuses to start without `[security].allow_unverified_alert_smtp_tls`. If a partner ever mandates an unvalidatable relay, the answer is `email_tls_ca_file`, not this item.
+
+**Nearest existing mechanism (UPDATED 2026-08-02):** `EmailTransport` / `send_plain_email` in `pipeline/alert_sinks.py`. Its TLS knobs are now `email_use_tls` (STARTTLS vs cleartext), **`email_tls_verify`** (authenticate the relay — the keep-TLS-but-trust-any-cert override this item described, though instance-wide rather than per-server) and **`email_tls_ca_file`** (the preferred answer: trust the relay's own CA and keep verification on), gated by `[security].allow_unverified_alert_smtp_tls`. ⚠️ The old text here claimed the global `MEFOR_ALLOW_INSECURE_TLS` / `insecure_tls_allowed()` escape applied to this cell; it never did — measured, that escape is read in `alert_sinks.py` **only** on the webhook `http://` branch, so cleartext alert SMTP was gated by nothing at all until #323 layer 3's serve gate covered it.
 
 **Source:** Corepoint v8.1.0 help-export coverage sweep (2026-07-09) — five adversarially-verified passes over the full help export (1,569 pages); absence re-verified against `origin/main` before filing. Cross-ref [#52](#52-corepoint-capability-parity-gaps--prioritized-roadmap-input-2026-06-27).
 
@@ -6359,7 +6365,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 ## 197. Runtime sandbox for admin-authored Router/Handler code
 
-> ✅ **SHIPPED 2026-07-10 (ADR 0087, PLAN-9 Wave 3).** Opt-in `[sandbox]` subprocess isolation built: `mode=off` (default) runs Routers/Handlers in-process **byte-identically, zero overhead**; `mode=subprocess` runs each inbound's Router/Handler in a **persistent per-inbound worker child** (`pipeline/sandbox.py` + `_sandbox_worker.py`; stdlib-only, no new dep — RestrictedPython rejected), never a per-message fork. The OS-process boundary denies admin code reach to the parent DEK/audit-chain/sockets (the child loads only the message *graph*); plus a forbidden-import guard (socket/store/crypto), a parent-enforced wall-clock cap (+ POSIX `RLIMIT_CPU`/`RLIMIT_AS`), and a **fail-closed** refusal of the live `db_lookup`/`fhir_lookup` bridges. Interposed at the `route_only`/`transform_one` seam (the in-process `mode=off` path composes with the ADR 0072 tracer; `mode=subprocess` bypasses the tracer — see residuals); engine-side handler/outbound-name validation stays engine-side; a denial → `ERROR`/dead-letter **post-ACK** (no NAK, never dropped). Wired live through `wiring_runner`/`engine`/`app`; RunContext re-marshalled across the boundary. **Closes the WP-L3-17 (ASVS 15.2.5) residual** (residual-closure — `ASVS-L3-REMEDIATION-PLAN.md` + `THREAT-MODEL.md` flipped). **Deferred residuals:** default-off (opt-in); the ADR 0072 protocol-tracer is not forwarded across the subprocess boundary (`mode=subprocess` bypasses it; `mode=off` composes); `db_lookup`/`fhir_lookup` forward-over-IPC (sandboxed live-enrichment Handlers run `mode=off`); load-time top-level config exec not sandboxed (unchanged safe-source DACL gate); least-privilege service account default is environment-delegated.
+> ✅ **SHIPPED 2026-07-10 (ADR 0087, PLAN-9 Wave 3).** Opt-in `[sandbox]` subprocess isolation built: `mode=off` (default) runs Routers/Handlers in-process **byte-identically, zero overhead**; `mode=subprocess` runs each inbound's Router/Handler in a **persistent per-inbound worker child** (`pipeline/sandbox.py` + `_sandbox_worker.py` + `_sandbox_codec.py`; stdlib-only, no new dep — RestrictedPython rejected), never a per-message fork. The OS-process boundary denies admin code reach to the parent DEK/audit-chain/sockets (the child loads only the message *graph*); plus a forbidden-import guard (socket/store/crypto), a parent-enforced wall-clock cap (+ POSIX `RLIMIT_CPU`/`RLIMIT_AS`), and a **fail-closed** refusal of the live `db_lookup`/`fhir_lookup` bridges. Interposed at the `route_only`/`transform_one` seam (the in-process `mode=off` path composes with the ADR 0072 tracer; `mode=subprocess` bypasses the tracer — see residuals); engine-side handler/outbound-name validation stays engine-side; a denial → `ERROR`/dead-letter **post-ACK** (no NAK, never dropped). Wired live through `wiring_runner`/`engine`/`app`; RunContext re-marshalled across the boundary. **Does NOT close the WP-L3-17 (ASVS 15.2.5) residual — corrected 2026-08-02 (BACKLOG #339).** Two independent reasons, both verified rather than inferred: (a) confinement is **address-space only** — `DEFAULT_FORBIDDEN_MODULES` blocks socket/ssl/asyncio/multiprocessing and the secret-bearing packages but **not `os`/`subprocess`**, so a sandboxed Handler still reaches host command execution; and (b) until #339 the IPC transport pickled the child's return value and the *engine parent* deserialized it, so the boundary was bypassable outright by any Handler with a custom `__reduce__`. OS-level default-deny is [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md), still Proposed. The private `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17 row and `THREAT-MODEL.md` 15.1.5 row were flipped on the original claim and are corrected to match. **Deferred residuals:** default-off (opt-in); the ADR 0072 protocol-tracer is not forwarded across the subprocess boundary (`mode=subprocess` bypasses it; `mode=off` composes); `db_lookup`/`fhir_lookup` forward-over-IPC (sandboxed live-enrichment Handlers run `mode=off`); load-time top-level config exec not sandboxed (unchanged safe-source DACL gate); least-privilege service account default is environment-delegated.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (large). **Severity:** high (blast radius), low (likelihood).
 
@@ -6381,7 +6387,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Build history.** *Partial build (PLAN-9 Wave 1, 2026-07-10 — branch `plan9-secmem`):* best-effort `mlock`/`VirtualLock` + `memset`-zeroize of the unwrapped DEK and the plaintext buffers the code owns landed in `store/crypto.py`; `mfenc:v1` ciphertext byte-identity is preserved and the public cipher seam is unchanged. *Close (2026-07-13):* the partial was verified complete against the full code-owned mutable-buffer surface (DEK + retired keys + `encrypt`/`decrypt` plaintext — no further mutable buffer remains to wipe), a full-path zeroize-verification test was added, and the residual disposition was documented and risk-accepted (see the banner). The residual is a documented *partial* of ASVS 13.3.3, not a technical close: CPython immutable `str`/`bytes` (caller plaintext, the returned marker, cryptography's `decrypt()` output) and cryptography's internal OpenSSL key copy are unreachable to wipe (documented in the module docstring), and **11.7.1** full in-use memory encryption is a host/hypervisor deployment requirement accepted via signed risk-acceptance, not code.
 
-**Closes (ASVS 5.0 L3):** 11.7.1, 11.7.2, 13.3.3 · *(classes 2 and 4)* — **scope addressed, not verdict**: 13.3.3/11.7.1 remain **Fail** and 11.7.2 **Partial** (accepted with a deployment requirement + signed risk-acceptance, see banner), not passing.
+**Closes (ASVS 5.0 L3):** 11.7.1, 11.7.2, 13.3.3 · *(classes 2 and 4)* — **scope addressed, not verdict**: 11.7.2 is **Partial** (accepted with a deployment requirement + signed risk-acceptance, see banner), not passing. ⚠️ **Verdicts corrected 2026-08-02 — do not read the original clause as current.** It said *"13.3.3/11.7.1 remain **Fail**"*. Neither is a Fail on the record: **11.7.1 is `na`** (closed by owner decision, out of declared scope — a CPU/firmware property, not one of the three assessed software artifacts), and **13.3.3 is `unverified`** — never read against the requirement text, which is explicitly **not** a verdict of any kind. The verdict of record is the scorecard, never this ledger; take any current figure from there.
 
 **Scope:** Add zeroization of plaintext PHI and key material after use, and mlock-style anti-swap protection where the platform allows. Decide the disposition of full memory encryption (TME/SGX/SEV, confidential VM) — enforce as a deployment requirement, or accept and document.
 
@@ -6910,13 +6916,13 @@ phases 2–3. **Composes with:** #92 (shipped), #84, #33, #48, the AI participan
 
 **Cluster:** Migration / DX. **Priority:** P2. **Verdict:** build (per-feed, mechanical). **Severity:** low.
 
-**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → iECG TraceMaster port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
+**What:** The ported migration estate currently lands each feed as a **single monolithic `.py`** bundling the inbound/outbound connections, the `@router`, and the `@handler(s)` with inline transform logic (e.g. the `IB_400` EKG/ECG → vendor ECG management system port). Convert each migrated feed to the per-feed **Hybrid** layout the project now documents — transport config → `connections.toml`; `@router` → `<INBOUND>_router.py`; `@handler` → `<INBOUND>_handler.py`; the field-level transform steps → a `_<feed>_transforms.py` helper. Reference: [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" + the runnable `samples/config/IB_DEMO_ORU_*` worked example. Sweep the estate feed-by-feed, verifying parity with `messagefoundry check` (+ dry-run fixtures) after each split.
 
 **Why:** The monolith co-mingles three concerns — transport config, routing, and a large pile of transform logic — in one file, which is hard to review, unit-test, and GUI-edit. The engine **already supports** the split (the graph is name-wired and flat-merged across the config dir — zero engine change); this is authoring hygiene plus Corepoint-familiar separation, and it moves connections onto the data surface (ADR 0007) and the transform steps into small, testable helpers.
 
 **Also:** align the IDE Corepoint-import / scaffold path (`ide/`) to **emit** the Hybrid layout so future ports start compliant; and consider a recursive-glob / folder-per-feed loader enhancement if the **flat** config dir gets unwieldy at estate scale (hundreds of feeds → hundreds of flat prefixed files, since `load_config` globs `*.py` non-recursively today).
 
-**Source:** config-convention decision (2026-07-11, Scott Hall); motivated by the `IB_400` EKG/ECG → iECG TraceMaster port review.
+**Source:** config-convention decision (2026-07-11, Scott Hall); motivated by the `IB_400` EKG/ECG → vendor ECG management system port review.
 
 ---
 
@@ -6948,7 +6954,7 @@ That makes a real question **unmeasurable today**: *does `fifo_claim_batch` reli
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** low.
 
-**What:** the MessageFoundry sidebar search (the box over the MESSAGEFOUNDRY view) matches **connection** names only. Searching for a **handler / router / transform** name — e.g. `xform_600100_to_erp_mfn` — returns “No matching results” even though that handler exists (it is defined inside `IB_FILE_HR_Materials_600100_MFN.py`, a role-combined feed module whose *filename* is the connection, not the handler). VS Code's own `Ctrl+P` also misses it, because the name is a symbol inside a file, not a filename.
+**What:** the MessageFoundry sidebar search (the box over the MESSAGEFOUNDRY view) matches **connection** names only. Searching for a **handler / router / transform** name — e.g. `xform_SITEA_to_erp_mfn` — returns “No matching results” even though that handler exists (it is defined inside `IB_FILE_HR_Materials_SITEA_MFN.py`, a role-combined feed module whose *filename* is the connection, not the handler). VS Code's own `Ctrl+P` also misses it, because the name is a symbol inside a file, not a filename.
 
 **Why:** operators think in terms of the **transform / message name**, not the feed file it happens to live in. The connection→router→handler wiring is a graph (CLAUDE.md §1), so a user who knows the transform name has no direct path to its definition. It is sharper for the ported migration estate where feeds are still monolithic (see #226): one file holds the connection + router + handler, so the handler name appears nowhere in the tree or the filename.
 
@@ -7364,3 +7370,1373 @@ Wall time (the cleaner signal — all three still ingest everything up to 300/s)
 **Related:** #115 (`06fd327d`, the budget fix), `harness/load/report.py` `_reconcile`, `harness/load/connscale/runner.py`, `harness/load/estate/runner.py`, `tests/test_load_runner.py`, `tests/test_harness_reconcile.py`, `messagefoundry/transports/mllp.py:1433`, and the sibling windows-2025 failure `test_coord_lock` (fixed in #109) — a *different* mechanism on the same leg.
 
 **Source:** investigation of the `test_run_load_end_to_end_no_loss` failures on `main` at `9b03057f` and `56f7d240`, 2026-08-01.
+
+---
+
+## 321. Leak gate is blind to the ported-estate site-code and partner-product token class
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **7/10** · Difficulty **3/10** · _fill-in_. The forbidden-content gate exits 0 on content carrying a ported-estate site code and a partner product name; the class was never gated, so the redaction that removed them was not a duplicate of any control.
+
+**Cluster:** Security / Supply chain. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** `scripts/security/scan_forbidden.py` does **not** detect the estate tokens that were sitting in `docs/BACKLOG.md` items #226/#228 until `f3c6d348` removed them — a six-digit ported-estate site code embedded in a feed-module identifier (`IB_FILE_HR_Materials_<site>_MFN.py`, `xform_<site>_to_erp_mfn`) and a partner ECG product name. Measured 2026-08-01 against the **real** token set (`loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1` — the CI-authoritative load, not the synthetic example):
+
+```
+git show HEAD~1:docs/BACKLOG.md > $T/docs/BACKLOG.md
+python scripts/security/scan_forbidden.py --path $T   # -> exit 0, clean
+```
+
+`.md` is **not** in `_SITE_SKIP_SUFFIXES` (`{".lock", ".svg"}`) and `docs/BACKLOG.md` is not in `scan-allowlist.txt`, so the file *was* scanned — the detectors simply do not cover these values. The configured `[site_prefix]` does not match this site code's prefix, and the partner product is absent from `[names]`/`[estate]`.
+
+**Why:** this is the repo's evergreen lesson firing again — *a GREEN gate is evidence only if you proved it can SEE that class.* The gate is a **required merge context**, so a green run reads to a reviewer as "no customer tokens present." Here it was green on content that contained two. Nothing stops the next estate-derived identifier landing the same way, and the migration estate is an active source of them (#226 is an open estate-wide sweep whose examples are drawn from real ported feeds).
+
+Note the item is **not** "the scanner is broken" — it is that the token *source* is incomplete and there is no test proving the detector set covers the classes the project actually leaks. Presence of a source is not sufficiency.
+
+**Proposed:**
+1. Add the real site-code prefix and the partner product name to the private token source (owner-run; the file is git-ignored and never committed), and to the `MEFOR_FORBIDDEN_TOKENS` Actions **and Dependabot** secret stores — both, or every Dependabot PR hard-fails the required check.
+2. Add a **negative** regression test: a fixture line carrying a synthetic value of each class must make the scanner exit 1. Today no test asserts the detectors can see a site code at all, which is why the hole was invisible.
+3. Consider a structural backstop for the estate-identifier *shape* (`[A-Z]{2}_[A-Z]+_[A-Z]+_\d{6}_[A-Z]{3}\.py`) so a NEW site code trips even before anyone adds it to the token list — the same argument #320-adjacent work makes for MRN/SSN/DOB detectors in `anon/leak.py` (ADR 0030 §5's known gap).
+
+**Related:** `scripts/security/scan_forbidden.py`, `scripts/security/scan-tokens.local.txt.example`, `tests/test_scan_forbidden.py`, `messagefoundry/anon/leak.py`, [`docs/SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md), #322.
+
+**Source:** public-repo disclosure audit, 2026-08-01 (commit `f3c6d348`). The tokens were found by reading, not by the gate.
+
+---
+
+## 322. Synthetic leak-gate placeholders can collide with the real gate's own guards
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. Redacting a real token to a placeholder built on the example token file's **own** designated synthetic site prefix blocks every commit for any contributor running the synthetic set — because that prefix is exactly what the synthetic `[site_prefix]` detector looks for. Caught pre-commit; nothing shipped.
+
+**Cluster:** Security / DX. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+> **This item deliberately does not spell out the offending value.** Writing the prefix, or the prefix followed by four digits, would trip the very detector described — `[site_prefix]` builds *two* patterns from its entry: the prefix plus four digits, **and** the pattern written out as an x-run or quantifier. That recursion is the whole point of the item, so it is demonstrated rather than described.
+
+**What:** while redacting the #321 tokens, the first replacement chosen followed `scripts/security/scan-tokens.local.txt.example`'s own stated convention — that file designates a specific non-real numeric prefix for synthetic use, and the replacement was built from it. Under the **real** token set that value is clean. Under the **synthetic** set it is a site-code hit, twice, and the scan exits 1:
+
+```
+MEFOR_FORBIDDEN_TOKENS=scripts/security/scan-tokens.local.txt.example \
+  python scripts/security/scan_forbidden.py --path $T
+# -> docs/BACKLOG.md:<line>: site code  (x2), exit 1
+```
+
+`scripts/dev/setup-leak-gate.ps1 -Synthetic` is a **documented, supported contributor setup** (the example file calls it so in its own header), and the pre-commit hook passes `--require-tokens`, so it blocks *every* commit — not just ones touching that file. A contributor with no access to the real token list would hit an unexplained hard block on unrelated work. The final commit uses the non-numeric `SITEA` instead, which cannot collide with any numeric detector.
+
+**Why:** the example file's synthetic-prefix guidance is written for the person filling in the **token list**, where it is correct and necessary. But it reads as general guidance for *placeholder values*, and a placeholder written into tracked prose is then scanned by the gate that list configures. The convention is self-colliding for its second audience, and nothing warns you. The same trap caught [#325](BACKLOG.md), whose worked examples had to be rewritten to the exempt `<name>` form for exactly this reason.
+
+**Proposed:** state in `scan-tokens.local.txt.example` (and in the redaction guidance) that a placeholder written **into tracked content** must not use any prefix appearing in `[site_prefix]` in *either* the real or the example set — prefer a non-numeric stand-in (`SITEA`, `<site>`), matching the `<…>` convention `_HOME_PATH` already exempts. Optionally have the scanner's hit message name the loaded set, so a synthetic-set false positive is self-diagnosing rather than reading as a real leak.
+
+**Related:** `scripts/security/scan-tokens.local.txt.example`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml` (the `--require-tokens` arm), #321.
+
+**Source:** public-repo disclosure audit, 2026-08-01; found by testing the redaction under both token sets before committing `f3c6d348`.
+
+
+---
+
+## 323. SMTP TLS is unverified on all three send paths
+
+> ✅ **SHIPPED 2026-08-02 — all three cells.** Connectors in PR #132 (layers 1–2); the **alerts cell** in layer 3. `send_plain_email` builds an explicit verifying context via `tls_policy.build_smtp_tls_context()` and passes it to `starttls()`, from new `[alerts].email_tls_verify` / `email_tls_ca_file`, plumbed through **three** construction seams — `EmailTransport` (ops alerts), `SecurityEventNotifier` (per-user security email — a genuinely separate call site, not an inheritor), and the hand-rolled transport inside `POST /alerts/test-email`, which had to be plumbed too or the operator's "test my mail server" button would have exercised a *different* TLS posture than live alerts. Gated by a `[security].allow_unverified_alert_smtp_tls` **acknowledgment switch** at the serve gate, registered in `security_loosenings()` (two entries — see below), and reported by a new `alert-smtp-tls` `checks.py` advisory. Proven by **negative control**: with the production change stashed and the tests kept, 7 assertions go red at `assert None is not None` — including the pre-existing `test_email_transport_sends_via_smtp`, whose `sent["tls"] is True` assertion stayed green for the entire insecure period and whose fake had *already* been widened to accept `context=` by PR #132 without the production code passing one. Filed 2026-08-01: Value **8/10** · Difficulty **4/10**. All SMTP send paths called `starttls()` / `SMTP_SSL()` with **no** SSL context, so Python 3.14's stdlib default applied (`ssl._create_stdlib_context` **is** `ssl._create_unverified_context` — `CERT_NONE`, `check_hostname=False`) — the EMAIL destination put Handler PHI *and* the SMTP credential over an encrypted-but-unauthenticated hop, while the #201 revocation guard, the cleartext-credential rule and `DEPLOYMENT.md` all described that same hop as **verified**.
+
+**Layer 3 as built, and the two places it departs from the residual as filed.** Both departures are recorded here rather than left as silent omissions.
+
+1. **The serve gate also refuses `[alerts].email_use_tls=false` (cleartext), which is broader than this item asked for.** Measured: `insecure_tls_allowed()` is read in `alert_sinks.py` **only** on the webhook `http://` branch, so cleartext alert SMTP was gated by *nothing*. Refusing verify-off while permitting cleartext would have handed an operator a bypass onto the strictly **worse** posture, so the gate's condition is “this hop does not authenticate the relay”, which is true of both. Strictly **adds** refusals (ADR 0092 decision 5); byte-identical on the shipped defaults.
+
+2. **The `refuse_unverified_smtp_tls()` helper this item called for was NOT built.** Two reasons, and the second is the load-bearing one. (a) The alerts cell refuses at the **serve gate**, not against the clamp, so it would never call the helper — it would ship with zero callers. (b) The two connectors' verify-off refusals are **not** identical (measured by `ast.Raise` collection with the cell name normalised: 483 vs 542 chars — `Direct` truncates `Email`'s first sentence and inserts an S/MIME-specific harm sentence), so “extracting” them would be a **rewording of a shipped operator-facing refusal**, and would reverse the written decision at `transports/email.py:180-185` that a third spelling is how the next bug gets written. If a helper is ever wanted here, the sibling **credential** refusals are the safe mechanical extraction — those *are* identical modulo the cell name.
+
+**`security_loosenings()` gained a 5th REQUIRED `alerts` parameter and TWO entries, not one.** The deviation and the acknowledgment of it are different facts: under `enforcement=warn` an operator can run verify-off with **no** acknowledgment at all, so keying the report on the switch alone would have left the actual weakening invisible — the exact failure mode the registry exists to prevent. Required rather than optional per the function's own contract (“an optional parameter is a detector that silently fails to fire”). Unlike `cleartext_accepted` this deviation is **settings-scoped**, so `security show` and a graphless `GET /security/posture` report it completely rather than declaring a gap.
+
+**Still open, and NOT closed by this item:** `[alerts].email_smtp_port=465` (implicit TLS) does not work on this cell and never did — `send_plain_email` has no `SMTP_SSL` arm at all. Stated, not fixed. The connection-scoped `unverified_smtp_hops()` reader that would report the **connectors'** `tls_verify=false` belongs to [#333](#333), which stays open.
+
+**Also landed, called out rather than folded in silently.** `transports/direct.py`'s cleartext arm read the **unclamped** `insecure_tls_allowed()` while its sibling arm one branch away read the clamped `weakened_tls_escape_permitted_here()`. Two different escapes in one connector is how the next bug gets written, so it now reads the clamped one. Strictly **adds** refusals (ADR 0092 decision 5). Partially closes the [#329](#329) concern.
+
+**Correction to this item's own text.** The "Migration risk, stated plainly" framing filed with this item presumed existing deployments. The owner confirmed on 2026-08-01 that **there are none**, so secure-by-default was simply correct and no phased rollout, CHANGELOG breaking entry or migration guide was warranted. Do not resurrect that framing from this item's history.
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** high.
+
+**What (AS FILED — every row below is now historical).** All five call sites were fixed: the four connector rows by PR #132, the `alert_sinks.py` row by layer 3. Kept as the record of what was found, not as a description of live code:
+
+| Site | Call |
+|---|---|
+| `messagefoundry/transports/email.py:216` | `smtp.starttls()` |
+| `messagefoundry/transports/email.py:213` | `smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout)` |
+| `messagefoundry/transports/direct.py:323` | `smtp.starttls()` |
+| `messagefoundry/transports/direct.py:320` | `smtplib.SMTP_SSL(self.host, self.port, timeout=self.timeout)` |
+| `messagefoundry/pipeline/alert_sinks.py:384` | `smtp.starttls()` |
+
+Measured against the interpreter the project requires (`>=3.14`; local 3.14.6), that resolves to an **unverified** context on both arms — this is stdlib source, not inference:
+
+```
+Lib/smtplib.py:789-790   if context is None:
+                             context = ssl._create_stdlib_context()     # SMTP.starttls
+Lib/smtplib.py:1031-1032 if context is None:
+                             context = ssl._create_stdlib_context()     # SMTP_SSL.__init__
+Lib/ssl.py:789           _create_stdlib_context = _create_unverified_context
+Lib/ssl.py:730-731       def _create_unverified_context(protocol=None, *, cert_reqs=CERT_NONE,
+                                                        check_hostname=False, ...)
+```
+
+Nothing in the product moves that default: grep for `_create_default_https_context` / `_create_stdlib_context` / `_create_unverified_context` across `messagefoundry/` and `tee/` returns **zero** hits. There is also no knob to fix it per connection — the Email factory exposes only `use_tls` (`config/wiring.py:1615-1640`, read at `transports/email.py:110`); there is no `tls_verify`, no `ca_cert`.
+
+**Three compensating controls rest on the false premise that this hop verifies** — the failure mode CLAUDE.md §11 names explicitly:
+
+1. `transports/email.py:173` — *"STARTTLS (587) / implicit-TLS SMTP_SSL (465) verifies the server cert"*. It does not.
+2. `transports/email.py:182-187` runs `RevocationHopGuard` on that hop, labelled `cell="Email destination (verified SMTP TLS, no revocation check)"` and `description="delivers over verified SMTP TLS but performs no certificate revocation checking"` (`:184-185`). The guard is defined for *"a **VERIFYING** outbound TLS hop"* (`config/tls_policy.py:685`, `:721`) and its docstring asserts *"the caller has already built a verifying context"* (`:703`). So on an enforcing production-PHI instance the engine **refuses to start** because a verified certificate might be *revoked*, on a hop that never checked the certificate at all.
+3. `transports/email.py:147-151` refuses SMTP AUTH only when `use_tls=false` (*"refused — credentials require STARTTLS/implicit TLS"*). With `use_tls=true` the password is sent over the unverified hop, so an on-path attacker presenting any self-signed certificate harvests it.
+
+The same false premise is published to operators: `docs/DEPLOYMENT.md:129` counts *"SMTP/EMAIL"* among *"**seven** verifying outbound TLS hops"*, and #201's shipped banner (`docs/BACKLOG.md:6430`) says the guard *"fires only on a VERIFYING hop"*.
+
+`docs/PHI.md` stream 11 was the one place that was **honest** — it stated the `send_plain_email` defect plainly and warned readers not to generalise it to the connectors. ⚠️ The sentence this item quoted verbatim from it (*"PR #1163 hardened the EMAIL message destination connector, not the `[alerts]` SMTP path"*) **no longer exists** — PR #132 rewrote that row, so the quotation was already stale before layer 3 touched it. Layer 3 rewrote the row again, to the verifying posture. What that doc did not say is that the destination connector it points at has the identical defect.
+
+**Why:** The EMAIL destination is a PHI egress — the Handler payload **is** the body (`transports/email.py:197-205`). "Encrypted but unauthenticated" means an active on-path attacker terminates the TLS session with any self-signed certificate and reads the PHI in clear, then relays. The engine's own posture machinery cannot see this: #200 keys on `use_tls=false` / `tls_verify=false` and #201 keys on revocation, so a `use_tls=true` EMAIL connection passes **every** hop gate as a secure hop.
+
+Honestly bounded — this is not remotely exploitable on its own:
+
+- It **requires network position** (on-path MITM: ARP/DNS/BGP interception, or a compromised intermediate) between the engine and the SMTP server. An attacker without that position gets nothing.
+- **`direct.py` is materially less bad.** Its clinical payload is S/MIME signed+encrypted at the *message* layer, independent of transport TLS (ADR 0085; `transports/direct.py:3-15`), so a TLS MITM there gets envelope metadata, recipients and the AUTH credential — not the clinical body. It is also the one path with no `RevocationHopGuard` at all (grep: the guard appears in `mllp.py:736`, `rest.py:642`, `email.py:182`, never `direct.py`).
+- **The credential exposure is bounded.** It is a mail-submission password; an attacker already on that hop can already read the messages, so it mostly buys persistence and relay abuse rather than a larger PHI win.
+- **No other transport is affected.** MLLP/FTPS/REST/SOAP/FHIR/DICOM-SCU all build explicit contexts through `config/tls_policy.py` helpers (`_mllp_ssl_context` and siblings, per #129's write-up at `docs/BACKLOG.md:5046`). This is specific to the `smtplib` seam — which is precisely *why* it escaped: the shared TLS-policy helpers are never called on it.
+- **Nothing here is a regression.** It has been the behaviour since ADR 0029; #201's amendment layered a guard on top without checking the premise.
+
+The reason to rate this high anyway is the second-order damage: a green posture gate and a `DEPLOYMENT.md` table currently tell an operator this hop is verified. A control that lies is worse than an absent one.
+
+**Proposed:**
+
+1. Add one shared verifying-context factory for the `smtplib` seam in `config/tls_policy.py` (reusing the existing hardening helpers, so `VERIFY_X509_STRICT` and the expiry-relaxation path compose), and pass it as `context=` at all five call sites above.
+2. Expose per-connection `tls_verify` + `ca_cert` on the `Email()` / `Direct()` factories and the `[alerts].email_*` settings, so a private-CA or self-signed mail server is served by **trust configuration**, not by silent non-verification.
+3. Route any resulting `tls_verify=false` through the **same** #200 posture gate as MLLP/FTPS (`docs/BACKLOG.md:6410`), so a production-PHI instance refuses it. Then #201's `RevocationHopGuard` on this path becomes true rather than aspirational.
+4. Correct the false-premise prose in the same commit: `transports/email.py:173`, the guard labels at `:184-185`, `config/tls_policy.py:703`, `docs/DEPLOYMENT.md:129`, and the #201 banner at `docs/BACKLOG.md:6430`. Update `docs/PHI.md:916` to cover all three paths once fixed.
+5. Tests: ⚠️ **the parameter half of this step was already false when layer 3 started** — PR #132 widened all three fakes (including the alerts one) to accept `context`, without the alerts production code ever passing one. So the fakes accepted the kwarg and **discarded** it, and the assertion half was the part that mattered: none asserted verification — they will need the kwarg, plus a positive assertion that the passed context has `check_hostname=True` / `verify_mode=CERT_REQUIRED`. A real-handshake test against a wrong-host certificate is the one that would actually have caught this.
+
+**Related:** [`messagefoundry/transports/email.py`](../messagefoundry/transports/email.py), [`messagefoundry/transports/direct.py`](../messagefoundry/transports/direct.py), [`messagefoundry/pipeline/alert_sinks.py`](../messagefoundry/pipeline/alert_sinks.py), [`messagefoundry/config/tls_policy.py`](../messagefoundry/config/tls_policy.py), [ADR 0029](adr/0029-email-smtp-destination.md), [ADR 0078](adr/0078-certificate-revocation-posture.md), [ADR 0085](adr/0085-direct-hisp-smime-connector.md), [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), [`docs/PHI.md`](PHI.md) §7 stream 11, [`docs/DEPLOYMENT.md`](DEPLOYMENT.md), #200, #201, #139.
+
+**Amends #139:** its rationale at `docs/BACKLOG.md:5264` — *"The engine's `EmailAlertSink` uses STARTTLS with a verifying context by design"* — is **false** and should be retracted there. Note that #139's own **Why:** two lines earlier at `:5262` is accurate (*"calls `starttls()` with the default SSL context"*), so the item contradicts itself; fix both lines together. Note also the inversion: #139 declines building an opt-in trust-any-certificate toggle because *"unconditionally trusting an SMTP server's TLS certificate defeats TLS"*, while the code already does exactly that, unconditionally, with no toggle to turn it off. Once this item lands, #139's decline becomes coherent for the first time.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified CLOSE-THE-WEAKNESS-INSTEAD: `docs/PHI.md:916` is accurate and stays; the defect it describes is wider than the doc's scope.
+
+---
+
+---
+
+## 324. Custom role with `messages:edit` alone reads raw PHI via the `/ui` editor
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **7/10** · Difficulty **2/10** · _fill-in_. `GET /ui/messages/{id}/edit` renders the stored raw body on `messages:edit` alone, and nothing stops an admin minting a custom role that holds it without `messages:view_raw` — so a role meaning "may resubmit, must not read" reads PHI.
+
+**Cluster:** Security / RBAC. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** four links, each individually reasonable, compose into a PHI read that no permission authorizes.
+
+1. A custom role may hold `messages:edit` alone. The carve-out set is three permissions wide — [`auth/permissions.py:178-180`](../messagefoundry/auth/permissions.py):
+
+```python
+CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
+    {Permission.USERS_MANAGE, Permission.APPROVALS_APPROVE, Permission.DR_OPERATE}
+)
+```
+
+and `permissions.py:212` (`forbidden = perms & CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) is the only capability check `validate_custom_role_permissions` applies, so `{"messages:edit"}` is an accepted role set.
+
+2. The `/ui` editor gates on that permission and nothing else — [`messagefoundry_webconsole/routes/core.py:597-604`](../messagefoundry_webconsole/routes/core.py):
+
+```python
+@app.get("/ui/messages/{message_id}/edit", response_class=HTMLResponse)
+async def ui_message_edit(
+    ...
+    identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_EDIT)),
+) -> HTMLResponse:
+    detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+```
+
+3. The JSON twin's own gate does not fire. `api/app.py:3150` declares `Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW))`, but the console calls the handler as a plain function with `identity=` supplied, so the default is never evaluated. That skip is deliberate and documented at [`api/_ui_seam.py:92`](../messagefoundry/api/_ui_seam.py) — the `/ui` route "re-asserts the equivalent permission via `require_ui*`". Here it re-asserts a *different* one.
+
+4. No per-property backstop catches it. `MessageDetail`'s entry in `PHI_FIELDS` ([`api/field_authz.py:64-68`](../messagefoundry/api/field_authz.py)) lists `summary`/`error`/`metadata` only — `raw` is deliberately left to the route gate ("The raw body stays on this route's view_raw gate"). So `redact_unauthorized` (`field_authz.py:89-95`) returns the body untouched and [`pages/messages.py:440,454`](../messagefoundry_webconsole/pages/messages.py) renders it: `original = detail.raw` → `data_original=original` in the editor textarea.
+
+**Two details beyond the original write-up.** The `POST /ui/messages/{id}/edit-resend` rejection path (`routes/core.py:637-644`) re-calls `core.get_message` and re-renders `pages.message_edit(detail, ...)`, so the **pristine stored** body ships again via `data_original` — the same leak on a second verb. And `require_ui_step_up` builds its base as `require_ui(*permissions, allow_mfa_pending=True)` (`_auth.py:521`) with no `phi=`, so the `_auth.py:260` `allow_phi_read` per-actor throttle never runs here, while the sibling `/ui/messages/{id}`, `/parse-tree` and `/attachments` routes all pass `phi=True` (`routes/core.py:473,483,501`). That second point is **not unique to this route** — `/ui/messages/search`, `/ui/messages/search/layered` and `/ui/uploaded-logs/file/{id}` ride `require_ui_step_up` too — so it may warrant its own item rather than being fixed only here.
+
+**Why:** it is a least-privilege failure, not a privilege boundary an attacker crosses unaided — and the blast radius is narrower than "PHI exposure" sounds:
+
+- **No shipped configuration is affected.** Only `ADMINISTRATOR` and `OPERATOR` grant `messages:edit` (`permissions.py:111,129-152`) and both also grant `messages:view_raw`. Reaching the gap requires an administrator holding `users:manage` to have deliberately minted and assigned a custom role — and that administrator could grant `view_raw` outright anyway, so **no one gains PHI they could not otherwise obtain**. The victim is the *org's stated intent*, not the trust boundary.
+- **`/ui` only.** The JSON plane is clean: `GET /messages/{id}` gates on `view_raw`, and `EditResendResult` "Carries ids only, never a body" (`api/models.py:198-209`). An engine run with `serve_ui=False` does not have this route.
+- **Every read is audited.** `core.get_message` fires `record_view` + `record_audit("message_view")` (`api/app.py:3162-3163`), so this is a silent *authorization* gap, not a silent *access* gap — an auditor sees it after the fact.
+- **What it does cost:** a custom role is exactly the mechanism an org reaches for to build "resubmit-only, must not read" for lower-trust or outsourced staff (and an AD group map delivers it — `auth/service.py:1103-1111` feeds the same `_custom_permissions_for_ids` into `Identity.build`). The role is accepted without warning and silently exceeds its stated scope, which is a HIPAA minimum-necessary problem for the deploying org. `docs/SECURITY.md:213` and `:474-477` already state this honestly in both the catalogue row and the PHI-route list, so the doc is not the defect — the code is.
+
+**Proposed:** pick one of two, not both blindly.
+
+1. *Preferred — enforce the implication at the gate.* Change `routes/core.py:602` (and the `/edit-resend` gate at `:609-620`, which re-renders the same body) to `require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW)`. This makes the catalogue's "implies `view_raw`" true by construction, is local, and leaves the permission assignable so a future write-only edit surface stays possible.
+2. *Alternative — forbid the combination.* Add `Permission.MESSAGES_EDIT` to `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`. Blunter: it also blocks legitimate custom roles that pair edit *with* view_raw, and it is an [ADR 0045](adr/0045-custom-rbac-roles.md) D1 amendment (that set is scoped to escalation primitives, which `messages:edit` is not). Prefer 1.
+
+Either way: add `phi=True` equivalence for this route (a `phi` parameter threaded through `require_ui_step_up` into its `require_ui` base at `_auth.py:521`), and add the missing regression test. `packaging/messagefoundry-webconsole/tests/test_webui.py:546-555` only exercises `Role.VIEWER`, which holds *neither* permission — nothing today asserts what an edit-without-view_raw identity gets. The new test must mint a `custom:` role holding `messages:edit` alone and assert 403.
+
+**Fix ordering:** `tests/test_security_doc_drift.py:1167-1196` derives the Operator PHI-capability sentence from the catalogue's PHI column and specifically names `messages:edit` as PHI-marked "and it renders the raw body". Fixing the gate makes `docs/SECURITY.md:213` and `:474-477` false, so the doc edit and the code edit must land in the **same commit** or that guard reds.
+
+**Related:** [`messagefoundry_webconsole/routes/core.py`](../messagefoundry_webconsole/routes/core.py), [`messagefoundry_webconsole/_auth.py`](../messagefoundry_webconsole/_auth.py), [`messagefoundry/auth/permissions.py`](../messagefoundry/auth/permissions.py), [`messagefoundry/api/field_authz.py`](../messagefoundry/api/field_authz.py), [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py), [ADR 0045](adr/0045-custom-rbac-roles.md) (custom roles), [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 (edit-and-resubmit), [ADR 0065](adr/0065-mount-the-web-console-in-process.md) (the `/ui` mount that creates the gate-skip seam), `docs/SECURITY.md` (catalogue row + PHI-route list), `packaging/messagefoundry-webconsole/tests/test_webui.py`, `tests/test_security_doc_drift.py`, #153 (shipped edit-and-resubmit — the origin of the unenforced "implying `messages:view_raw`" phrasing; closed, do not amend), #177 (effective-permission inspector — would surface such a role).
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: the doc is honest and stays; the code is what changes.
+
+---
+
+---
+
+## 325. Leak gate's home-path detector is case-blind on Windows paths
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **2/10** · _fill-in_. The leak gate's home-path detector matches a literal capital-U `Users`, so `c:\users\<name>\proj` — the same path as `C:\Users\<name>\proj` on a case-insensitive filesystem — passes the required merge check while the canonical form is blocked.
+
+> **Note on the examples below.** Every path here writes the account segment as the placeholder `<name>`, because `_HOME_PATH`'s negative lookahead exempts a segment beginning `<` — a literal account name in this item would trip the very gate it describes. Read `<name>` as "a real login name"; the FIRES/MISSED column describes what happens once one is substituted. This is [#322](BACKLOG.md) in miniature: a placeholder written into tracked prose is itself scanned.
+
+**Cluster:** Security / Supply chain. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `scripts/security/scan_forbidden.py:99-106` compiles the structural home-path detector with **no flags argument**:
+
+```python
+_HOME_PATH = re.compile(
+    r"(?:[A-Za-z]:[\\/]Users|/home|/Users)[\\/]"
+    ...
+```
+
+The drive letter is class-matched (`[A-Za-z]`) but `Users` is a **literal**, so only the canonical casing fires. Measured at HEAD by executing the module's own compiled pattern:
+
+| probe | result |
+|---|---|
+| `C:\Users\<name>\proj` | **FIRES** |
+| `c:\users\<name>\proj` | **MISSED** |
+| `c:/users/<name>/proj` | **MISSED** |
+| `C:\USERS\<name>\proj` | **MISSED** |
+
+Windows filesystems are case-insensitive, so all four name the **same** directory and disclose the same OS account. The gate blocks one spelling of it and waves through three.
+
+This detector is the odd one out in its own module: `[names]` token patterns default to case-insensitive (`scan_forbidden.py:347`, `flags = 0 if case == "s" else re.I`) and the estate file detectors pass `re.IGNORECASE` explicitly (`:440`). The module also states its own tie-breaking rule at `:336-338` — *"under-detection is the dangerous direction … Fail toward more detection"* — which this line violates.
+
+No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_home_path_is_flagged_but_placeholders_are_not`) is the only home-path test, and both its positive fixtures — a `C:\Users\<name>\Code\thing` form and a `/home/<name>/src` form, written there with real-looking account segments — are canonical case. Nothing asserts a casing variant in either direction.
+
+**Why:** `forbidden-content (customer/PHI leak guard)` is a **required merge context** (`.github/required-contexts.txt`), and `.github/workflows/security.yml:449-452` names *"absolute home paths"* among the things it scans the whole tracked tree for. A green run therefore reads to a reviewer as "no internal-environment disclosure present." For the lowercased spelling that reading is unearned. It is a **structural** detector, so it is the control that is supposed to work even in a fork with no token source at all. There is no compensating control: `scan_forbidden.py:10-12` is explicit that gitleaks finds *secrets*, not this class.
+
+**Bounded honestly — this is latent blindness, not a live leak.** Scanning every git-tracked file at HEAD, the current pattern finds **0** home-path hits and the proposed fix also finds **0**: there is no lowercased home path sitting in the tree right now. The disclosure it fails to catch is an **OS account name** — not a credential, not PHI, not customer data. Nobody needs privilege or an exploit to trip it; the failure mode is a developer pasting a stack trace or a shell transcript in non-canonical case and the gate not noticing. The blast radius is one developer login name reaching a public repo, which is exactly what this detector exists for and no more than that.
+
+**Proposed:**
+
+1. Case-fold **only the drive-letter arm**, inline, leaving the POSIX arms alone:
+
+   ```python
+   r"(?:(?i:[A-Za-z]:[\\/]users)|/home|/Users)[\\/]"
+   ```
+
+2. **Do not reach for whole-pattern `re.IGNORECASE`** — measured, it adds **47 false positives** across the tracked tree, every one of them the web console's `/ui/users/…` REST route (`messagefoundry_webconsole/routes/admin.py:38`, `:91`; `docs/SECURITY.md:575`). That would red the required context on the first run. `/users/` is an extremely common URL path segment; `/Users/` is not. The asymmetry in the current pattern is load-bearing, and the inline form preserves it: measured **0** new false positives.
+
+3. Keep the exemption list (`Public|Default|runner|me|svc|you|…`) **case-sensitive**. Case-folding it would widen the exemptions on POSIX, where an upper-cased and a lower-cased spelling of the same exempt word are genuinely different accounts — and widening an exemption is the under-detection direction. (Note a pre-existing, unchanged over-match: a Windows path whose account segment is a **lower-cased** spelling of one of those exempt words fires today, because the exemption compares case-sensitively and the lower-cased form misses the literal. That is the safe direction; out of scope here.)
+
+4. Add the regression case to `tests/test_scan_tokens_source.py:559`, alongside the existing canonical fixtures — a lowercased and an upper-cased Windows path must both produce a hit, and the POSIX `/users/…` non-match should be asserted deliberately so the next person does not "fix" it into the 47-false-positive form.
+
+5. **Same fix site, sibling defect:** `_WORKTREE_SLUG` at `scripts/security/scan_forbidden.py:92` is case-blind the same way (`[a-z0-9]+`); `claude/Some-Task-a1b2c3` is MISSED. `scripts/worktree/new.ps1:43,86` passes `-Name` through verbatim with no lowercasing, so an upper-cased worktree name is reachable. Narrower than the home-path case (agent-created slugs are lowercase by convention), but it is a two-character edit in the same block — take it in the same change or say why not.
+
+**Related:** `scripts/security/scan_forbidden.py` (`_HOME_PATH` :99-106, `_WORKTREE_SLUG` :92, call site :758-759), `tests/test_scan_tokens_source.py:559-583`, `.github/workflows/security.yml:446-493`, `.github/required-contexts.txt`, `scripts/worktree/new.ps1`. Sibling **#321** — same gate, same "green gate that cannot see the class" root cause, but the **opposite mechanism**: #321 is an incomplete *token source* (data, fixed by the owner updating a private secret) and explicitly scopes itself away from scanner defects at `docs/BACKLOG.md:7356`; this is a *structural detector* defect (code, fixed by a regex edit) that is live even with no token source. Also **#322**, and the anonymizer's structural-detector item from this same audit. Note #321's **Related:** line at `docs/BACKLOG.md:7363` cites `tests/test_scan_forbidden.py` for regression tests, but the home-path test actually lives in `tests/test_scan_tokens_source.py` — worth correcting when someone next touches #321.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Verified open at HEAD (`12efbffc`) by executing the compiled pattern and by diffing the current, proposed and naive-`re.I` variants across every git-tracked file.
+
+---
+
+---
+
+## 326. MFA-at-exposure refusal reads `serve_ui` after it is flipped off
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **3/10** · _fill-in_. The ADR 0143 console auto-degrade flips `settings.api.serve_ui` to `False` **in place** before `ui_exposed` is derived from it, so `admin_exposed` is `False` in the recommended loopback-behind-a-declared-proxy topology and the ASVS 6.3.3 single-factor-admin refusal never evaluates — measured: a production PHI instance under `enforce` with `[security].require_mfa = false` starts **rc=0**.
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** the `serve` startup ladder derives its admin-exposure predicate from a field an earlier arm has already mutated. In [`messagefoundry/__main__.py`](../messagefoundry/__main__.py):
+
+```python
+console_exposed = (                                             # :1741
+    not settings.api.is_loopback
+    or settings.api.tls_terminated_upstream
+    or bool(settings.api.public_origin)
+)
+if settings.api.serve_ui and not settings.api.serve_ui_explicit and console_exposed:
+    ...
+    settings.api.serve_ui = False                               # :1755  (ADR 0143 auto-degrade)
+
+ui_exposed = settings.api.serve_ui and (                        # :1834  reads the flipped field
+    not settings.api.is_loopback or settings.api.tls_terminated_upstream
+)
+admin_exposed = not settings.api.is_loopback or ui_exposed      # :1879
+```
+
+`serve_ui` defaults to `True` and `serve_ui_explicit` to `False` (`messagefoundry/config/settings.py:674`, `:680`), so on a **loopback bind behind a declared terminator** — the topology the gate's own comment at `:1874-1878` names as the one it exists to cover, *"the runbook's RECOMMENDED topology (loopback bind BEHIND a declared proxy, `ui_exposed`)"* — an operator who never touches `serve_web_console` gets `serve_ui=False` at `:1755`, `ui_exposed=False` at `:1834`, and `admin_exposed=False` at `:1879`. The MFA refusal at `:1888` and the #189 dual-control warning at `:1936` are both gated on that flag and never evaluate.
+
+Measured 2026-08-01 against HEAD (`prod`, PHI, `enforcement=enforce`, loopback bind, `[api].tls_terminated_upstream` + `trusted_proxies`, `[security].require_mfa = false`, retention/alerts pre-satisfied):
+
+| arm | `serve_web_console` | result |
+|---|---|---|
+| A | explicit `true` | **rc=2** — `error: browser console exposed through a declared reverse proxy … require_mfa off; refusing to start` |
+| B | default, `web_console_public_address` set | MFA refusal **absent**; rc=2 only from the unrelated ASVS 12.1.1 TLS-floor probe (`:1978-2009`) |
+| C | default, no `web_console_public_address` | **rc=0 — starts.** MFA refusal absent, #189 approvals warning absent |
+
+Arm C is the load-bearing one: the TLS-floor probe is itself gated on `settings.api.public_origin` (`:1982`), and once the console degrades nothing requires that key (the `:1779` refusal only applies while `serve_ui` is on), so a JSON-only proxied deployment skips it. In that same rc=0 run the ADR 0152 arm printed `warning: EXPOSED PHI instance ('prod') …` — because it computes the predicate this gate wants, `instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream` (`:2223`). The engine calls one instance *exposed* for ASVS 11.7.1 and *not exposed* for ASVS 6.3.3 in a single boot.
+
+Test coverage never caught it because the only test of this arm, `tests/test_cli.py:1230-1252` `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, sets `security.serve_web_console = true` **explicitly** — the one input that keeps the refusal reachable. [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) does not mention `require_mfa`, `admin_exposed`, or single-factor admin anywhere, so the interaction was introduced rather than adjudicated.
+
+**Why:** ASVS 6.3.3's admin-MFA backstop is inert in the deployment shape the project recommends, and the operator gets no signal — arm C starts clean with the Administrator role single-factor over a network-facing proxy. **Bounded, and the bound matters.** `require_mfa` still **defaults on** (`settings.py:1696`), so this is only reachable after an operator has *explicitly* written `require_mfa = false`; `security_loosenings()` names that opt-out on every boot (`settings.py:4044-4050`, seen in the arm-C log) and `GET /security/posture` reports it. **The blast radius is NOT** a default deployment, **NOT** an off-loopback bind (`admin_exposed` is `True` from the `not is_loopback` arm regardless of `serve_ui` — arm A's non-loopback sibling is pinned at `tests/test_cli.py:768`), **NOT** an authentication bypass, and **NOT** a way in for an unauthenticated attacker: it removes a *refusal to start*, not a credential check. What is lost is the hard stop that was supposed to make the explicit opt-out impossible to combine with exposure — i.e. exactly the case ADR 0140 built `allow_single_factor_admin_when_exposed` to force an operator to acknowledge. The same flag also silences the #189 dual-control warning (`:1936`) in the same topology, so a second control degrades with it. Finally, the docs at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182` currently have to carry a *"the gate will not catch you"* caveat; closing the defect is what lets that prose go.
+
+**Proposed:** stop deriving admin exposure from a mutated presentation flag.
+
+1. Key `:1879` on a `serve_ui`-independent predicate. The house-consistent one **already exists in this file**: reuse/hoist `instance_exposed` from `:2223` (`not settings.api.is_loopback or settings.api.tls_terminated_upstream`), which is precisely the intent stated at `:1874-1878`. Keying on `console_exposed` (`:1741`) also works but is **wider** — its `bool(public_origin)` branch would turn the undeclared-proxy heuristic, today a warning at `:1811`, into a hard refusal. Pick the narrow predicate unless the owner wants that widening.
+2. Fix `exposure_desc` at `:1881-1886`: its else-branch hardcodes *"browser console exposed through a declared reverse proxy (`[api].serve_ui` + `tls_terminated_upstream`)"*, which becomes false as soon as the gate fires without a served console. Same for the `:1937-1942` twin.
+3. Owner fork to settle before building — this makes a currently-starting configuration **refuse on upgrade**, against the repo's own rule at `docs/CONFIGURATION.md:1439` (*"a new refusal fires only on a new opt-in"*). The rule is weaker here than in its ADR 0152 precedent: the affected population is only deployments that explicitly disabled MFA, and the remedy is one line they already know (`require_mfa = true`, or the existing audited `allow_single_factor_admin_when_exposed = true`). Refuse-on-upgrade is defensible; warn-first-then-refuse is the conservative alternative.
+4. Tests: add the arm-C case (declared proxy, console left at default, no `public_origin`) to `tests/test_cli.py` beside `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, plus a `serve_web_console = false` variant — an operator who *explicitly disables* the console is in the same exposure posture and must also be caught.
+5. Docs to update once it lands: strike the blind-spot sentences at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182`, and re-state the two `admin_exposed` decision-table rows at `docs/SECURITY.md:1083-1084`.
+
+**Related:** [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) `:1741`/`:1755`/`:1834`/`:1879`/`:1936`/`:2223`, [`messagefoundry/config/settings.py`](../messagefoundry/config/settings.py) `:674`/`:680`/`:1696`/`:4044`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (introduced the in-place flip; silent on this gate), [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) (the refusal + its acknowledged escape), [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §8 (the exposure ladder), [ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) (source of the correct predicate at `:2223`), `tests/test_cli.py:1230-1252`, `tests/test_checks_gate_parity.py:185-194` (its MFA row uses a non-loopback bind, so it is unaffected), `docs/SECURITY-LOOSENING.md` §`allow_single_factor_admin_when_exposed`, #187 (the `require_mfa` default), #189 (the dual-control arm that shares the flag).
+
+**Source:** public-repo disclosure audit, 2026-08-01 — classified close-the-weakness-instead: the disclosure at `docs/CONFIGURATION.md:1437` / `docs/REMOTE-CONSOLE.md:182` is honest and stays until the defect is fixed.
+
+---
+
+---
+
+## 327. No test asserts the private-path `.gitignore` block still ignores anything
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **2/10** · _fill-in_. Six `.gitignore` rules are the sole control keeping maintainer-internal security docs out of a public commit since the publish deny-list was retired, and no test, hook or workflow asserts they still match.
+
+**Cluster:** Security / Publishing boundary. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `.gitignore:128` opens the block that replaced the retired publish deny-list, and states its own stakes at `.gitignore:131-132`:
+
+```
+# repo, a gitignore rule is now the ONLY thing keeping them out of a commit -- and the cutover runbook
+# runs `git add -A`. Same failure shape as the leak-scanner token file, different files.
+```
+
+The rules are `/.claude/`, `/TRANSCRIPTS.md`, `/docs/security/`, `/docs/reviews/`, `/docs/marketing/` (`.gitignore:142-146`) and `/docs/CI-TOPOLOGY.md` (`.gitignore:160` — a **sixth** rule in the same block, in the same posture). All six match at HEAD and no tracked file sits under any of them, both confirmed directly:
+
+```
+git check-ignore -v docs/security/x.md   # -> .gitignore:144:/docs/security/  docs/security/x.md
+git ls-files -- .claude docs/security docs/reviews docs/marketing TRANSCRIPTS.md docs/CI-TOPOLOGY.md
+# -> (empty)
+```
+
+Nothing asserts either half stays true. A repo-wide search for `check-ignore` matches exactly two files: the untracked `.claude/settings.local.json`, and `scripts/dev/setup-leak-gate.ps1:58` — which checks **one** path (`scripts/security/scan-tokens.local.txt`), and only when an operator runs that setup script by hand. `scripts/security/scan_forbidden.py` enumerates tracked files (`_git_tracked()`, `scan_forbidden.py:679-683`) but every check downstream is content-based — tokens, IPs, home paths — so it has no opinion about a path. None of `.pre-commit-config.yaml`'s hooks (ledger-gate, ruff, forbidden-content, gitleaks, actionlint, bandit) is path-prefix based, and `ci.yml` / `security.yml` contain no reference to `docs/security`, `publish-denylist`, `private-path` or `check-ignore`.
+
+The two nearest-looking guards are neither: `tests/test_scaffold.py:51-52` asserts a gitignore substring for the **scaffolded config repo** `messagefoundry init` writes, not for this repo; `tests/test_release_pipeline.py:38`'s `PRIVATE_CANARY = "docs/security/THREAT-MODEL.md"` guards the **sdist/PyPI** channel (the hatchling `only-include` vs `release.yml` leak-gate cross-check), which is a different publication path from `git commit`.
+
+**Why:** this is the project's own evergreen lesson pointed at the highest-consequence boundary it has — the one deciding whether maintainer-internal security material (threat model, ASVS assessments, point-in-time review findings, per `docs/SECURITY-DOCS-POLICY.md`) is public. It is defended today by a text file nobody checks and by review attention.
+
+**Bounded honestly — the blast radius is what it is and no more:**
+
+- **Nothing is exposed right now.** All six rules match and zero files are tracked under them. This is a preventive gap, not a live leak.
+- **It is not an attacker-exploitable defect.** Reaching it needs push access to this repo — reordering a rule, adding an un-ignore above one, resolving a merge conflict in the block, or `git add -f`. Anyone with that access could publish those documents deliberately in one commit. The guard defends against **accident and drift**, not against a hostile committer, and should be valued that way.
+- **No PHI, no credentials.** The private set is prose about the system's posture. Real secrets are covered separately (`.env`, `*.key`, `*.pem` at `.gitignore` lines above, plus gitleaks in `.pre-commit-config.yaml`).
+- **The obvious compensating control does not actually travel.** `scripts/hooks/block-blanket-git-stage.ps1` denies `git add -A` — the exact command `.gitignore:132` warns about — but it is wired through `.claude/settings.json`, which is itself inside the now-gitignored `/.claude/` tree and **untracked** (`git ls-files .claude/settings.json` is empty while the file exists on disk). It is a local Claude Code session control, fail-open by design, absent from a fresh clone or a new `git worktree add`. Do not count it as coverage.
+
+**Proposed:**
+
+1. Add `tests/test_private_paths_stay_ignored.py` with a **pinned literal list** of the six rules and two assertions per entry: (a) `git check-ignore -q` exits 0 for a synthetic probe child (`docs/security/__probe__.md`) — probing a synthetic path, not a real private file, so the test is valid in a public checkout where the private tree is absent by definition (the groundedness problem `tests/test_release_pipeline.py:117-127` already worked through); (b) `git ls-files` returns nothing under the prefix, since a gitignore rule never un-tracks a file that got added first.
+2. **Pin the list in the test; do not parse it out of `.gitignore`.** Guarding a file by parsing that same file is how this repo already burned itself once — `tests/test_feature_map_claims.py:52-55` records a `.gitignore` marker-block parser whose marker existed only inside the test, exercised against a `tmp_path` fixture: *"It was a check that could not fail."*
+3. **Wire it where it will fire on the PR that breaks it.** `ci.yml:472` puts `^\.gitignore$` in the docs-only `noncode` allowlist, so a `.gitignore`-only PR sets `code=false` and the `Tests (pytest)` step (`ci.yml:226-227`) is skipped — a pytest-only guard would go green on exactly the change it exists to catch, and would only fire on the post-merge push to `main`. Fix by dropping `^\.gitignore$` from that regex (a `.gitignore` edit is not a docs edit; it is the publishing boundary), and/or adding a `local` pre-commit hook alongside `ledger-gate` with `always_run: true` / `pass_filenames: false`. The CI arm is the load-bearing one — `.pre-commit-config.yaml`'s own header shows the hooks need a per-clone `pre-commit install`.
+4. Consider promoting the resulting context per `.github/required-contexts.txt` rather than adding a paths-filtered workflow — a paths-filtered required check is the required-but-absent trap `manifest-lint.yml` documents.
+
+**Also (small, same block):** `docs/SESSION-DRIFT-CONTROLS.md:69-71` links to `[.claude/settings.json](../.claude/settings.json)`, which `/.claude/` now ignores and which is untracked — the link cannot resolve in the public repo, and the paragraph presents the blanket-`git add -A` guard as an active control while pointing at a file no public reader has. Fix in the same commit. The stale comment above the `.claude/settings.local.json` rule ("settings.json is shared/tracked") is contradicted by the later `/.claude/` rule at `:142` and should go with it.
+
+**Related:** `.gitignore` (lines 128-146, 160), `scripts/security/scan_forbidden.py`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml`, `.github/workflows/ci.yml` (`noncode` at :472, pytest gate at :226), `tests/test_release_pipeline.py`, `tests/test_feature_map_claims.py`, `tests/test_scaffold.py`, `scripts/hooks/block-blanket-git-stage.ps1`, [`docs/SECURITY-DOCS-POLICY.md`](SECURITY-DOCS-POLICY.md), [`docs/SESSION-DRIFT-CONTROLS.md`](SESSION-DRIFT-CONTROLS.md), #321, #322.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Verified against HEAD `12efbffc`; the audit flagged the finding as unconfirmed, and the absence of any such test/hook/gate is confirmed here.
+
+---
+
+---
+
+## 328. `audit-verify` cannot detect a truncated audit tail
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. The tail-truncation detector exists and is correct on all three store backends, but no CLI flag, config key, or API route can supply it an anchor — so `audit-verify` **and** the startup auto-verify both report a truncated audit log as CLEAN.
+
+**Cluster:** Security / Audit integrity. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** the audit hash chain links each row to its predecessor, so deleting the **newest** rows leaves a shorter prefix that still verifies. The store layer already solves this. `verify_audit_chain` takes an optional out-of-band anchor and compares it in constant time ([`store/store.py:7475-7486`](../messagefoundry/store/store.py)), returning `"audit log diverges from recorded anchor … — truncated or rewritten"`; the producing side, `audit_anchor() -> tuple[int, str]`, is implemented on **all three** backends ([`store/store.py:7387`](../messagefoundry/store/store.py), [`store/sqlserver.py:8591`](../messagefoundry/store/sqlserver.py), [`store/postgres.py:5676`](../messagefoundry/store/postgres.py)). Its docstring states the contract plainly:
+
+> "Recording this anchor out-of-band … and passing it back to :meth:`verify_audit_chain` is what makes truncation/rewrite detectable" — `store/store.py:7390-7393`
+
+Nothing an operator can run does that. **Both** shipped verification surfaces call the method bare:
+
+```python
+messagefoundry/__main__.py:3451      return await store.verify_audit_chain()
+messagefoundry/pipeline/engine.py:834    ok, msg = await self.store.verify_audit_chain()
+```
+
+and the `audit-verify` subparser declares exactly two arguments, neither of them an anchor ([`__main__.py:570-578`](../messagefoundry/__main__.py): `--service-config`, `--db`). `audit_anchor()`'s only callers in the tree are the DR cold-seed marker ([`pipeline/dr.py:569`](../messagefoundry/pipeline/dr.py), `:585`), which reads it to fingerprint a restored chain and never persists it as a verifiable anchor. There is no API route either — `audit_anchor`/`expected_anchor` appear nowhere under `messagefoundry/api/`. The capability is built, tested at the store boundary, and unreachable.
+
+This is **wider than the disclosure describes.** [`CONFIGURATION.md:718`](CONFIGURATION.md) and [`:1363-1368`](CONFIGURATION.md) name only the CLI; the `[integrity].audit_verify_on_start` check at `engine.py:834` is equally truncation-blind, so enabling it does not close the gap.
+
+**Why:** the sharp case is the **keyed** chain, which is the normal PHI posture — a PHI instance cannot start keyless without a deliberate acknowledgment ([`CONFIGURATION.md:1357-1361`](CONFIGURATION.md)). There, an attacker with DB write **cannot forge** rows (the MAC is HKDF-derived from the DEK) but **can still delete** the tail, and truncation is precisely the residue the anchor was built to catch. So the missing plumbing removes the one local defense that a keyed chain actually depends on. On a *keyless* chain the anchor buys much less: that attacker can recompute the whole chain end-to-end anyway.
+
+**Bounding it honestly — what this is NOT.** It is not an access path. It presupposes DB-level write access or filesystem access to the store file, i.e. the attacker is already inside; this is post-compromise **anti-forensics**, not a way in. There is no unauthenticated reach, no PHI disclosure, no authz bypass, and no remote trigger. The documented compensating control is real — every committed audit row is teed off-box PHI-redacted ([`store/audit_tee.py:3-9`](../messagefoundry/store/audit_tee.py)) — but it is **opt-in and off by default** (`forward_host: str | None = None`, [`config/settings.py:1347`](../messagefoundry/config/settings.py)), so on a default install there is no truncation detection at all, local or remote.
+
+**Proposed:**
+1. Add `messagefoundry audit-anchor` (`--service-config` / `--db` / `--json`, mirroring `audit-verify`) printing the `(count, head_hash)` pair. It is PHI-free by construction — a row count and a digest — so it is safe for a compliance job to snapshot off-box.
+2. Add `--expected-anchor COUNT:HEAD` (or `--expected-anchor-file`) to `audit-verify` and plumb it into the existing `expected_anchor=` keyword at [`__main__.py:3451`](../messagefoundry/__main__.py). The comparison logic needs no change.
+3. Consider an `[integrity]` key pointing at a stored anchor file so the startup auto-verify at [`engine.py:834`](../messagefoundry/pipeline/engine.py) can use it too — alert-only, matching that path's existing never-crash-startup contract (`engine.py:827-834`). Without this, item 2 leaves the automatic check still blind.
+4. Only **after** 1–3 ship, update [`CONFIGURATION.md:718`](CONFIGURATION.md) and [`:1363-1368`](CONFIGURATION.md). That row is the source of record and explicitly forbids the edit until then: *"do not upgrade this to 'the anchor detects it' without also shipping a way to pass one."* While there, refresh its two stale citations — it cites `__main__.py:3418` for a call now at `:3451` and `store/store.py:7385` for a docstring now at `:7390-7393`.
+
+**Related:** [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) (`_audit_verify`, subparser), [`messagefoundry/store/store.py`](../messagefoundry/store/store.py) / [`sqlserver.py`](../messagefoundry/store/sqlserver.py) / [`postgres.py`](../messagefoundry/store/postgres.py) (`audit_anchor`, `verify_audit_chain`), [`messagefoundry/store/base.py:1398-1405`](../messagefoundry/store/base.py) (the protocol), [`messagefoundry/pipeline/engine.py`](../messagefoundry/pipeline/engine.py) (`_verify_audit_chain_on_start`), [`messagefoundry/pipeline/dr.py`](../messagefoundry/pipeline/dr.py) (today's only anchor consumer), [`messagefoundry/store/audit_tee.py`](../messagefoundry/store/audit_tee.py), [`docs/CONFIGURATION.md`](CONFIGURATION.md) `[retention].audit_days` + `[integrity]`, #190 (shipped 2026-07-11 — keyed the chain and added the startup auto-verify; the anchor surfacing was never in its built scope, and it is closed, so this is a new item rather than an amendment).
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: the two `CONFIGURATION.md` passages are accurate and stay.
+
+---
+
+---
+
+## 329. Five `MEFOR_ALLOW_INSECURE_TLS` cells bypass the ADR 0092 clamp
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _fill-in_. Five weakening cells still call the raw `insecure_tls_allowed()` instead of the ADR 0092 clamp, so one process-wide env var crosses an enforcing production-PHI posture — including LDAPS certificate verification and an unknown SSH host key — while their in-file siblings are clamped.
+
+**Cluster:** Security / TLS posture. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** ADR 0092 decision 2 introduced `weakened_tls_escape_permitted(posture)` so the blunt global `MEFOR_ALLOW_INSECURE_TLS` can never relax a hop on an enforcing PHI instance (`config/settings.py:226-230` — *"if not insecure_tls_allowed(): return False … return not (posture.enforcing and posture.is_phi)"*). Five cells never adopted it and still call the raw predicate. Confirmed at HEAD:
+
+| Cell | Site | What the env var buys |
+| --- | --- | --- |
+| SFTP host key | `transports/remotefile.py:375` | `self._accept_unknown = insecure_tls_allowed()` → paramiko `AutoAddPolicy` instead of `RejectPolicy` (`:392-394`) |
+| Direct (S/MIME) SMTP | `transports/direct.py:170` | `if not insecure_tls_allowed():` → cleartext SMTP submission |
+| LDAPS | `auth/ldap.py:113` | `if not insecure_tls_allowed():` → `ad_tls_verify=false`, i.e. `ssl.CERT_NONE` on the bind (`:131`) |
+| Webhook alert sink | `pipeline/alert_sinks.py:290` | `if scheme == "http" and not insecure_tls_allowed():` → cleartext alert POST |
+| AI broker | `transports/ai_broker.py:140` | `if scheme == "http" and not insecure_tls_allowed():` → the `[ai].api_key` credential on cleartext http |
+
+The inconsistency is sharpest *within a single file*. `transports/remotefile.py` decides three escape questions: FTPS `tls_verify=false` at `:176` and credentialed plain-ftp at `:577` both go through `weakened_tls_escape_permitted_here()`; the unknown-host-key question three hundred lines away does not. Likewise `transports/email.py:134` gates cleartext SMTP on `weakened_tls_escape_permitted_here() or config.tls_hop_attested or config.cleartext_accepted`, while its near-identical Direct sibling at `direct.py:170` consults nothing but the env var.
+
+This is an omission, not a recorded decision. [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md):14-19 lists six non-connection cells the escape "survives for" — engine→store TLS, LDAPS, the webhook alert sink, the AI broker, the `[logging]` forwarder, the API PHI-read serve hop — but *survives* is a statement about the variable, not about the clamp: three of those six are clamped in code (store via `store/sqlserver.py:1498`, the forwarder and the PHI-read hop via `hop_insecure_escape_downgrades`) and three are not. And `config/settings.py:203-207`, which enumerates the surviving clamped cells, names only the forwarder and the PHI-read hop — LDAPS, the webhook sink and the AI broker appear in no list at all.
+
+**Not** part of this: `transports/database.py:110-113` reads `insecure_tls_allowed()` only on the `posture is None` arm and `hop_insecure_escape_downgrades(...)` otherwise. That is the documented unstamped fallback (`config/settings.py:228-229`), same as the store's, and was examined and excluded.
+
+**Why:** the clamp exists to contain an *operator mistake*, and that is the whole of the blast radius here. `MEFOR_ALLOW_INSECURE_TLS` is not attacker-influenceable — setting it on a Windows service means editing the NSSM service definition or machine environment, which needs Administrator, and an Administrator can already do strictly worse (the config dir is executed as the service account; `config/settings.py:247-256`). Nobody reaches these cells over the network. So this is **not** a remotely exploitable vulnerability and should not be described as one.
+
+What it *is*: the realistic failure is a dev/CI environment variable riding into a production service definition — the exact scenario ADR 0092 decision 2 was written for, and the reason the store, MLLP, FTPS and plain-ftp cells were converted. With it set, an enforcing production-PHI instance silently accepts an unknown SSH host key (trust-on-first-use against a MITM on a PHI file feed), disables LDAPS certificate validation on the service-account and user binds, and puts the `[ai].api_key` on the wire. The LDAPS case is the one worth ranking first: it is instance-wide rather than per-connection, it is the authentication substrate for every AD identity, and `auth/ldap.py`'s own comment claims the refusal means it "can no longer be silently turned on in production" — which is true of the refusal but not of the clamp.
+
+The AI-broker cell has an additional argument: `transports/smart.py:126-149` moved the *same* question — a credential on a cleartext token endpoint — off the raw escape and onto `refuse_cleartext_credential_hop` in commit `a3015196`, with a comment describing exactly this defect (*"It used to read the raw, UNCLAMPED `MEFOR_ALLOW_INSECURE_TLS`"*). `ai_broker.py:140` is the un-migrated twin of a cell fixed days ago.
+
+**Additionally — converting all five is what makes the property *checkable*, not just true.** While these five remain, "no unclamped escape survives on an enforcing PHI posture" is five separate per-site facts, each verifiable only by opening the site and reading it, and each silently falsified by a sixth cell added later. Convert them all and it collapses into **one repo-wide invariant**: the raw `insecure_tls_allowed()` becomes unreachable outside `config/settings.py`'s own clamp, so the absence of the raw predicate is checkable everywhere at once, with `weakened_tls_escape_permitted_here` as the thing that must still be present. Today the property is a convention enforced by review; afterwards it is an invariant enforced by a grep — and a *new* unclamped cell fails immediately instead of waiting for the next audit to enumerate it.
+
+That distinction matters concretely for the ASVS record. The scorecard's absence-claim mechanism runs regexes over the whole `*.py` corpus and **cannot scope a grep to one file**, so a per-connector claim ("`direct.py`'s escape is clamped") is not expressible and has to be carried as stated-but-unchecked prose. A repo-wide claim is expressible and machine-verified on every commit. So this item is not only five leaks to plug: it is the difference between a security property that must be re-audited by hand and one that a gate can hold. *(Framing contributed by the ADR 0156 ASVS-sweep session, 2026-08-02.)*
+
+**Scope note, because the count is moving and two censuses will disagree.** #323 routes `transports/direct.py` and `transports/email.py` through the clamp, taking the remaining set to four once it lands — so a census taken on that branch disagrees with one taken on `main`, and neither is wrong. Measured at `main` by counting **`ast.Call` nodes**, not matching lines: six real call sites outside `config/settings.py` — `auth/ldap.py`, `pipeline/alert_sinks.py`, `transports/ai_broker.py`, `transports/database.py`, `transports/direct.py`, `transports/remotefile.py`. `transports/database.py` is the documented unstamped fallback, excluded above; `transports/mllp.py` matches a naive grep for the raw name but its occurrence is **prose inside a docstring, not a call at all**. A line-based census reports it as a further site; an AST-based one does not — which is the instrument distinction, not a detail about this item.
+
+**Proposed:** convert all five, but note that a blanket swap to `weakened_tls_escape_permitted_here()` would silently fix only two of them.
+
+1. **In-gate cells — a one-line swap each.** `remotefile.py:375` and `direct.py:170` are built inside `build_check_registry`/`wiring_runner`'s `active_hop_posture` scope (`config/tls_policy.py:587-603`; the stamping sites are all in `pipeline/wiring_runner.py`), so `weakened_tls_escape_permitted_here()` reads a real posture there — byte-identical to how `remotefile.py:176`/`:577` and `email.py:134` already behave.
+2. **Out-of-gate cells — thread an explicit posture.** `auth/ldap.py`, `pipeline/alert_sinks.py` and `transports/ai_broker.py` are constructed from `create_app`/`AuthService` (`auth/service.py:275`, `api/app.py:5335`), which never stamp the contextvar; `current_hop_posture()` returns `None` there and `weakened_tls_escape_permitted(None)` returns `True` (`config/settings.py:228-229`), so `_here()` would be **inert** — the fix would ship green and change nothing for LDAPS, the highest-value cell. Pass a posture explicitly, as the store does at `store/sqlserver.py:1498`. `create_app` already derives one at `api/app.py:1174-1179` (`_phi_read_posture = hop_posture_from_ai(ai_settings, enforcement=…)`) — thread that into the three constructors rather than deriving a fourth.
+3. **Prefer the credential authority for `ai_broker.py:140`** — `refuse_cleartext_credential_hop` (`transports/rest.py:478-515`), matching the SMART fix, since it fail-closes on an unstamped posture (`rest.py:292-300`) and gives the same error contract.
+4. **Consider whether the SFTP host-key cell belongs on this env var at all.** It is an SSH TOFU decision, not TLS; a dedicated per-connection `known_hosts` requirement (or a `host_key_accepted` declaration in the ADR 0153 idiom) would express it better than a global TLS switch. Filing the swap does not settle that; call it out in the fix PR.
+5. Update the `docs/DEPLOYMENT.md`:408-418 bullet list (three *(Not clamped)* / *(raw escape)* annotations become *(Clamped)*) and the `config/settings.py:200-208` surviving-cells docstring in the same commit, and add regression tests asserting each cell refuses under `enforcement=enforce` + PHI **with the escape set** — the assertion that does not exist today for any of the five.
+
+**Related:** [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) decision 2 (+ its ADR 0153 amendment banner), [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md) decision 5, [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md); `messagefoundry/config/settings.py` (`insecure_tls_allowed` / `weakened_tls_escape_permitted` / `_here`), `messagefoundry/config/tls_policy.py`, `messagefoundry/transports/remotefile.py`, `messagefoundry/transports/direct.py`, `messagefoundry/transports/email.py`, `messagefoundry/auth/ldap.py`, `messagefoundry/pipeline/alert_sinks.py`, `messagefoundry/transports/ai_broker.py`, `messagefoundry/transports/smart.py` (the shipped precedent, `a3015196`); [`docs/DEPLOYMENT.md`](DEPLOYMENT.md) §*The `MEFOR_ALLOW_INSECURE_TLS` escape hatch*, [`docs/SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md); tests `tests/test_asvs_phase0.py`, `tests/test_remotefile_transport.py`, `tests/test_direct_transport.py`, `tests/test_email_destination.py`, `tests/test_hop_refusal_residuals.py`; #200 (closed — it built the clamp for the store/MLLP/FTPS/plain-ftp cells but never enumerated these five); the SMTP-unverified-TLS item from this same audit (`transports/direct.py` appears in both, at different lines and with a different fix).
+
+**Source:** public-repo disclosure audit, 2026-08-01. The audit classified the `docs/DEPLOYMENT.md` disclosure as honest and keep-as-is — the doc correctly names all five as unclamped; this item is the weakness the doc describes.
+
+---
+
+---
+
+## 330. The IDE's `ai:assist` gate can never fire
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. The IDE fetches `GET /ai/policy` with no bearer, so the engine can only ever answer `assist_permitted: null` and the `ai:assist` deny branch is unreachable — the documented control is inert whether or not the operator signs in.
+
+**Cluster:** Security & Compliance / IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `resolveAiPolicy` reads the authoritative policy **without attaching the session bearer** it already holds:
+
+```ts
+// ide/src/aiPolicy.ts:78
+const policy = fromWire(await getJson<AiPolicyWire>(engineUrl(), "/ai/policy"));
+```
+
+`getJson`'s third parameter is the token (`ide/src/engineClient.ts:128`), and the header is attached only when it is present — `const headers: Record<string, string> = token ? { Authorization: \`Bearer ${token}\` } : {};` (`engineClient.ts:141`). With no bearer, `optional_identity` returns `None` under enabled auth (`messagefoundry/api/security.py:708`), so the endpoint computes `permitted = None if identity is None else identity.has(Permission.AI_ASSIST)` (`messagefoundry/api/app.py:1372`) and answers `assist_permitted: null` **on every IDE read**.
+
+The consequence is that `assistantState`'s deny branches take an input the engine path can never produce:
+
+```ts
+// ide/src/aiPolicy.ts:128-131
+if (p.mode === "byo" && p.assistPermitted === false) {
+  return { enabled: false, message: "Your role does not include the ai:assist permission." };
+}
+// BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
+```
+
+The same holds for the `managed_endpoint` arm at `aiPolicy.ts:116`. **This is wider than the originating audit described.** The audit framed it as an operator defeating org intent *by never signing in*; in fact signing in changes nothing, because the token is never sent on this route. The two remaining sources of a policy are also incapable of returning `false`: `allow_no_auth` yields `_SYSTEM_IDENTITY` holding every role (`security.py:56-58`, `:707`) → `true`, and the CLI fallback hard-codes `"assist_permitted": None` (`messagefoundry/__main__.py:3771`). So no code path in the shipped extension can produce the `false` the gate tests for.
+
+**A second, latent defect in the same function.** The cache write at `aiPolicy.ts:79` is unconditional:
+
+```ts
+await ctx.globalState.update(LAST_POLICY_KEY, policy); // remember the authoritative answer
+```
+
+This does **not** currently clobber anything: line 79 is the sole writer of `LAST_POLICY_KEY` (`aiPolicy.ts:29`/`:79`/`:84` are its only occurrences in `ide/`), and its input is always the same tokenless read — so a cached `false` can never exist to be overwritten. The missing guard is real and must be fixed, but it is **latent**: it becomes live the moment the bearer is attached, not before. SEC-022's primary purpose is also intact — `mode` is identity-independent, so a central `mode:"off"` still caches and still survives going offline exactly as `docs/adr/0035-ide-extension-workspace-trust-and-scope.md:49-51` intends.
+
+**Why:** ADR 0035's SEC-022 entry names the control this breaks — the cache exists so that *"a central `mode='off'` (or `ai:assist` deny)"* cannot be re-enabled by stopping the engine (`0035-…:28-32`). The `mode` half works; the `ai:assist` half was never wired, so an org that assigns a role without `ai:assist` gets no enforcement at the IDE at all. `docs/AI.md:188` publishes the deny row as live behavior, which makes the gap a documentation-vs-code divergence as well as a control gap.
+
+Honestly bounded — this is a **governance-enforcement** defect, not a data or privilege defect:
+
+- **No PHI is at risk, by construction.** BYO attaches `code_only` context only, capped unconditionally in `chat.ts:122-130`; ADR 0035 makes the same concession about the original SEC-022 (*"No PHI was ever at risk … but it defeats a governance control"*).
+- **The brokered path is correctly gated server-side.** `POST /ai/chat` carries `Depends(require(Permission.AI_ASSIST))` (`app.py:1388`), so `managed_endpoint` egress is enforced at the engine regardless of the IDE. The inert client-side branch there costs a clean local message, not authorization — the user gets a 403 instead.
+- **Nothing on the engine becomes reachable, and no credential is exposed.** The whole payoff is "use the BYO assistant your org told you not to, against your own model provider, with your own source code."
+- **No privilege is needed to hit it** — it is the default state under the default fail-closed posture (`security.py:153-155`), not an attack.
+
+Nothing caught it because `ide/src/test/suite/ai-policy.test.ts:31-40` tests the **pure predicate** (`assistantState({assistPermitted:false}) → disabled`) with a hand-built object. The predicate is correct; it is the input that never arrives. `resolveAiPolicy`'s fetch-and-cache is untested, which is exactly where both defects live.
+
+**Proposed:**
+1. Guard the cache write at `:79` **first**, so a null can never downgrade a known-negative once step 2 lands: preserve a cached `assistPermitted === false` when the fresh answer is `null`, or skip the write entirely when the fetch carried no bearer.
+2. Attach the cached bearer in `resolveAiPolicy` — `peekToken` (`ide/src/auth.ts:93`), never `ensureToken`, so a chat turn cannot pop a sign-in modal. Gate it on `assertTargetAllowed(url).ok` first, following the SEC-005 precedent at `ide/src/liveStatus.ts:79-81`, so a bearer never goes in clear to a non-loopback `http://` target.
+3. **Leave `statusBar.ts:312` tokenless.** That is a second `/ai/policy` reader (`POLICY_ROUTE`, `engineStatusModel.ts:159`) that only wants the environment name and runs on the status-bar path, where the CWE-613 idle-clock rule at `engineStatusModel.ts:17-20`/`:146-148` forbids a bearer — a naive "add the token to the `/ai/policy` call" fix would make the engine's idle timeout unreachable. `resolveAiPolicy` is user-initiated (`chat.ts:110`, `showAiPolicy` at `aiPolicy.ts:137`), so a bearer there is honest activity under that module's own `VERIFY_PLAN` rationale (`:151-155`). Worth expressing the distinction as a plan constant rather than a comment, matching how `POLL_PLAN`/`VERIFY_PLAN` already make it CI-assertable data.
+4. Test `resolveAiPolicy` itself with an injected fetch + fake `globalState`: (a) a bearer is attached when a session exists, (b) a `null` response does not overwrite a cached `false`, (c) the tokenless status-bar probe is unaffected.
+5. Once the gate can actually fire, re-check `docs/AI.md:188-191` — the trust note's reasoning is sound, but the "`assist_permitted == false` → Disabled" row only becomes true after this change.
+
+**Related:** [`../ide/src/aiPolicy.ts`](../ide/src/aiPolicy.ts), [`../ide/src/engineClient.ts`](../ide/src/engineClient.ts), [`../ide/src/chat.ts`](../ide/src/chat.ts), [`../ide/src/statusBar.ts`](../ide/src/statusBar.ts), [`../ide/src/engineStatusModel.ts`](../ide/src/engineStatusModel.ts), [`../ide/src/auth.ts`](../ide/src/auth.ts), [`../ide/src/test/suite/ai-policy.test.ts`](../ide/src/test/suite/ai-policy.test.ts), `messagefoundry/api/app.py` (`/ai/policy`, `/ai/chat`), `messagefoundry/api/security.py` (`optional_identity`), [ADR 0035](adr/0035-ide-extension-workspace-trust-and-scope.md) (SEC-022 — the control this completes; note its own Related line miscites "ADR 0024 (AI policy)", which is the SMART token provider), [ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md) (the brokered path, server-gated), [`AI.md`](AI.md), #95.
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+## 331. Anonymizer's fail-closed leak-check has no structural PHI detectors
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **4/10** · _fill-in_. `anonymize_checked()`'s fail-closed leak-check only looks for known partner/site *strings*, so PHI left in any field the rule map omits passes it clean — and on a checkout with no token source it silently degrades to a routable-IP check over an HL7 body.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `anonymize_checked()` is the function that "earns the right" to write a de-identified dataset somewhere shareable, and its entire verification is one call ([`messagefoundry/anon/__init__.py:88-96`](../messagefoundry/anon/__init__.py)):
+
+```python
+output = anonymize(raw, salt=salt, overlay=overlay, rules=rules)
+hits = leak_check(output)
+if hits:
+    raise LeakError(...)
+```
+
+`leak_check` ([`anon/leak.py:59-61`](../messagefoundry/anon/leak.py)) is `_scanner().scan_text(text, include_estate=True)` plus `message_has_site_code(text)`. `scan_text`'s full body ([`scripts/security/scan_forbidden.py:784-795`](../scripts/security/scan_forbidden.py)) is: the `FORBIDDEN` name patterns, one routable-`_IPV4` check, and the `ESTATE_TOKENS` substrings. There is no MRN-shape, SSN-shape, DOB-shape, phone-shape or name detector anywhere on this path. The module's other structural detectors, `_WORKTREE_SLUG` (:92) and `_HOME_PATH` (:99), are called **only** from `scan_file` (:756, :758) and are unreachable from `leak_check` — so on the anonymizer path the live structural detector set is routable-IPv4 alone.
+
+Three of the four live detectors are token-sourced and load **empty** without a token file — the scanner "degrades to STRUCTURAL-ONLY (routable-IPv4 only)" (:23-25), and `message_has_site_code` is "Always False when no site-code prefix is configured" ([`anon/surrogates.py:335-341`](../messagefoundry/anon/surrogates.py)). The fail-closed floor that exists for exactly this case, `token_floor_failure()` (:547), is consulted only inside `main()` (:881); the module-level `reload_tokens()` (:671) that the anonymizer's import path uses never checks it. So on a fork or a token-less checkout, `anonymize_checked` returns a green "leak-check passed" having verified that the HL7 body contains no routable IP address — and says nothing about it.
+
+**This was hit in practice.** De-identifying `samples/messages/hapi-hl7v2/batch_18_messages.txt` in `f3c6d348` required a hand-authored overlay for the fields the default map omits — GT1-8/16/17/18, IN1-4/5/6/7/11/18/44, OBR-35, and a non-standard DST segment (per that commit's own message). Those omissions are real at HEAD: `DEFAULT_RULES` ([`anon/rules.py:68-121`](../messagefoundry/anon/rules.py)) covers GT1-3/5/6/7/12, IN1-16/19/36/49 and OBR-16/32 and nothing else, and `git log -- messagefoundry/anon/rules.py` shows the file unchanged since the clean snapshot. Nothing flagged their absence — a human reading the corpus did. The overlay was never committed (`git show --stat f3c6d348` lists 7 files, no `anon.toml`), so the derived knowledge is gone and the next corpus starts from the same blind map.
+
+**Why:** the framework's promise is that a leak-check makes a dataset *proven* PHI-free before it may be committed or shared. What it actually proves is the absence of a **known string list**; a real MRN is not a denylisted string. The gap is honestly documented — [ADR 0030](adr/0030-anonymization-test-harness-tee.md):265-266 states it verbatim ("a field whose PHI the rule map **missed** sails through the fail-closed gate *clean*") and :268-270 / :339-343 defer structural detectors as a candidate improvement. This item is to build that deferral, not to report it.
+
+Bounded honestly:
+- **This is not a runtime data-plane defect.** Nothing under `pipeline/`, `store/`, `api/` or `transports/` imports `anon` — the only production caller is `tee anonymize-captures` ([`tee/__main__.py:47,519`](../tee/__main__.py)), and the harness's `anonymizer=` hook is optional and unwired by default ([`harness/reconcile/capture.py:46,57`](../harness/reconcile/capture.py)). No attacker-reachable path exists; no inbound message triggers it.
+- **Exploitation is not the failure mode.** Reaching this code means already holding real captures — i.e. someone legitimately handling PHI, who could mishandle it more directly. The risk is a *human* one: a green result reading as an assurance it does not carry, and a PHI-bearing corpus being committed on the strength of it.
+- **The primary control genuinely is rule-map completeness**, and the ADR says so. This is a missing backstop, not a broken control. The residual is the ordinary case of a corpus using a field nobody thought to map — which is precisely what happened in `f3c6d348`.
+- **Free-text is already handled**: OBX-5/NTE-3 default to a blunt full-redact (ADR 0030 §3), so the highest-risk residual is not this one.
+
+**Proposed:**
+1. **Scope shape detection to what the anonymizer did not touch.** ADR 0030 (~:255) is right that a broad shape search over HL7 mass-false-positives — bodies are dense with 6-9 digit runs. But `anonymize` knows exactly which fields it rewrote, so run structural detectors **only over the fields no rule matched**. That makes SSN/NANP-phone/date/MRN shapes tractable without a false-positive storm.
+2. **Add a cheaper coverage report first.** Have `anonymize_checked` surface every segment/field present in the input with no rule and no explicit keep-decision ("N unmapped fields: GT1-16, DST-4, …"). This alone would have caught the batch_18 case, needs no shape heuristics, and is a much smaller change than (1).
+3. **Stop degrading silently.** Wire the existing `token_floor_failure()` (`scan_forbidden.py:547`) into the `leak_check` bridge so `anonymize_checked` refuses — or demands an explicit opt-out — when the token tables load empty, instead of returning clean. Have `LeakError`/the clean path name which detector tables were live.
+4. **Land the batch_18 overlay** as a committed `anon.toml` fixture, or fold those fields into `DEFAULT_RULES`, so the hand-derived rule set is reusable rather than re-derived.
+5. **Negative tests.** No test asserts the leak-check can see structural PHI, and none asserts behaviour on an empty token load — which is why the hole is invisible. Same lesson as #321: a green gate is evidence only once you have proved it can see that class. Mirror any change into `tee/anon/leak.py` (`test_anon_parity` pins the two).
+
+**Related:** [`messagefoundry/anon/leak.py`](../messagefoundry/anon/leak.py), [`messagefoundry/anon/__init__.py`](../messagefoundry/anon/__init__.py), [`messagefoundry/anon/rules.py`](../messagefoundry/anon/rules.py), [`tee/anon/leak.py`](../tee/anon/leak.py), [`scripts/security/scan_forbidden.py`](../scripts/security/scan_forbidden.py), [`tee/__main__.py`](../tee/__main__.py), `tests/test_anon_core.py`, `tests/test_anon_parity.py`, [ADR 0030](adr/0030-anonymization-test-harness-tee.md) §5 + Consequences (the deferral this item builds), #36 (shipped — its "Verifiability" bullet is the claim this narrows; closed, so not an amendment target), #321 (sibling: the publish-path token *source* is incomplete — a different mechanism; its Proposed §3 cross-references this gap, and its "#320-adjacent" phrasing there is a mis-reference, since #320 is the windows-2025 MLLP ingress item), and the case-blind `_HOME_PATH` item from this same audit (a third, disjoint leak-gate mechanism).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+## 332. Release signing toolchain is unhashed
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **5/10** · _fill-in_. The signing step installs `sigstore==4.4.0` with plain pip inside the job holding `contents`/`id-token`/`attestations: write`, so ~30 transitive dependencies resolve live from PyPI in the seconds before that job signs the wheel, sdist, SBOM and VEX and publishes to PyPI — and no Dependabot ecosystem can move the top pin either.
+
+**Cluster:** Security / Supply chain. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `.github/workflows/release.yml:253-255` says so in its own comment and then does it:
+
+```
+# NOTE: this pins the TOP only; sigstore's ~30 transitive deps still float at signing time.
+# Closing the Scorecard alert outright needs the hashed release-tools lock (ADR 0034 option B).
+python -m pip install "sigstore==4.4.0"
+```
+
+No `--require-hashes`, no lock. `sigstore` is absent from every committed lock — `grep -c sigstore uv.lock` → **0**, and no `*.lock` in the tree matches. `ci/locks/` holds exactly two files (`ci-scanners.lock`, `ci-quality.lock`) and `pyproject.toml:244` `[dependency-groups]` declares exactly two groups, `ci-scanners` (:256) and `ci-quality` (:280). There is no `release-tools` group.
+
+The install sits in the job declared at `release.yml:67-71`:
+
+```
+contents: write       # create the release + upload its assets
+id-token: write       # Sigstore signing, PyPI Trusted Publishing, + provenance — all via the GitHub OIDC identity
+attestations: write   # write the SLSA build-provenance attestation
+```
+
+The next command (`:258-259`) signs the wheel, sdist, SBOM and VEX; the SLSA attestation (`:277-279`) and the PyPI Trusted Publishing step (`:340`) run later in that **same** job.
+
+**Two things the finding as originally written understates, both verified here:**
+
+1. **The top pin has no updater.** `.github/dependabot.yml` registers three ecosystems — `uv` (:17), `github-actions` (:42), `npm` (:61). None parses an inline `pip install X==Y` inside a workflow `run:` block. `tests/test_ci_venv_pinning.py:26-32` already records the consequence: *"a stale pin rots invisibly and a DELETED pin is invisible twice over."* So ADR 0034's *"Re-evaluate when 4.5.0 ages out"* (`:350`) has no trigger and no owner — it is a manual action nothing will ever prompt.
+2. **`sigstore` is not the only one.** Two sibling installs in the same privileged job float their transitives identically: `release.yml:104` `python -m pip install "pip==26.1.2" "build==1.5.0"` (the PEP 517 frontend that produces the published wheel) and `release.yml:207` `python -m pip install "pip==26.1.2" "cyclonedx-bom~=7.3.1"` — the latter a `~=` *range*, into the main interpreter. Only the scratch venv at `:210` uses `--require-hashes`. Fixing `sigstore` alone narrows the window; it does not close the class.
+
+**Correction to the audit's framing:** it cites ADR 0034's *"Option B … remains the only thing that closes the alert"* (`:206-208`), but the ADR's own 2026-07-29 amendment at `:263-265` states it **supersedes that sentence**. The mechanism is no longer hypothetical — it was built for CI tooling and is running. What is open is that `sigstore` was deliberately left out of it, for a reason at `:350` that a naive "just add it to the lock" fix would silently invert (see **Proposed**).
+
+**Why:** exploitation is an **upstream** compromise, not a repo-local weakness — an attacker needs to own one of ~30 PyPI packages in `sigstore`'s closure (or land a hijack/typosquat) during the window a maintainer pushes a tag. The release job is **not reachable from a pull request**; it is gated on a tag push or `workflow_dispatch` (`release.yml:66` also pins it to `MEFORORG/MessageFoundry`). Anyone who can already trigger it is a maintainer who could do worse directly.
+
+What makes it worth fixing anyway is the **blast radius if it lands**: arbitrary code executing at `:255` runs with the OIDC identity that then signs the artifacts, writes the SLSA attestation, and publishes to PyPI. That is not "a bad build" — it is a backdoored wheel carrying a *valid* Sigstore bundle and *valid* SLSA provenance. The compromise defeats the exact controls it is standing next to, and every downstream verifier (`gh attestation verify`, PEP 740) reports success.
+
+Honestly bounded: **this is build-time only.** No PHI path, no running-engine surface, no operator-reachable behaviour. It does not touch the store, the API, or any connector. And per ADR 0034 §3 (`:162-170`) the fix moves the OPEN Scorecard count only for the lines it actually converts to `--require-hashes`; the two genuinely-open `PinnedDependenciesID` alerts named at `:336-341` are the SBOM scratch-venv pair, not this one.
+
+**Proposed:** repeat the mechanism ADR 0034's 2026-07-29 amendment already proved, and handle the version question the residual row raises rather than stepping over it.
+
+1. **Resolve the 4.4.0-vs-4.5.0 decision first, explicitly.** ADR 0034:350 keeps `sigstore` out of the lock *because* routing it through would resolve **4.5.0**, which was `<48 h` old against `.github/dependabot.yml`'s `cooldown: default-days: 5` (:26-30). That was written 2026-07-29. By the ADR's own arithmetic the window closes around 2026-08-01/02 — i.e. now — but **confirm the actual PyPI publish date before acting**; this item does not verify it, and the whole rationale hangs on it. If the window has closed, the objection is spent and the residual row should be amended, not quietly contradicted. This is a recorded owner decision; do not invert it silently.
+2. **Add a PEP 735 `release-tools` group** to `pyproject.toml` alongside `ci-scanners`/`ci-quality`, non-default (ADR 0034:283-287, decision 2 — an extra becomes a real install target; a default group lands in the release SBOM and in what `pip-audit` audits as runtime).
+3. **Export it as a seventh lock** in `.github/workflows/security.yml:87-89`, added to the `git diff --exit-code` gate on `:89`, to `dependabot-lock-resync.yml`, and to `tests/test_dep1_lock_resync_lockstep.py` (which asserts the export set, the per-file flags, and that everything exported is staged — currently six-place). Install it at `release.yml:255` with `--require-hashes`.
+4. **Measure the resolve contamination before committing.** This is the known failure mode: ADR 0034:354 records that `semgrep` was excluded by decision precisely because a new group *"still forces a `click 8.4.1 → 8.4.2` re-resolve across all four artifacts."* `sigstore` pulls `cryptography`, `requests` and `pydantic`-adjacent packages that the runtime closure also carries. Acceptance criterion is the one that ADR used at :287 — re-export all existing locks and require `git diff --exit-code` → 0. If it is non-zero, this becomes the same excluded-by-decision call semgrep got, recorded as a residual rather than forced through.
+5. **Update the guard.** `tests/test_ci_venv_pinning.py:204-210` `RELEASE_PINNED_TOOLS` asserts a `sigstore` pin *exists* at an inline install site; a lock install removes that site, so the non-vacuity backstop needs re-pointing at the lock rather than deleting (deleting it is exactly the regression `:202-203` exists to catch).
+6. **Then take `build` and `cyclonedx-bom` in the same group** — but note `cyclonedx-bom` is half of the byte-identity pair `test_sbom_install_is_byte_identical_in_release_and_security` enforces, so per ADR 0034:336-341 both halves must move in lockstep or the test reds.
+
+**Testability caveat, stated up front:** ADR 0034:218-225 records that `release.yml` runs **only on a tag push**, so no PR CI leg executes this path — the first real run of any change here is a release. Follow that section's own protocol: dry-run via `workflow_dispatch` and read the log before the next tag.
+
+**Related:** `.github/workflows/release.yml:104,207,244-259`, `.github/workflows/security.yml:87-89`, `.github/dependabot.yml:17,26-30,42,61`, `pyproject.toml:244-284`, `ci/locks/`, `tests/test_ci_venv_pinning.py`, `tests/test_dep1_lock_resync_lockstep.py`, [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) §3 + the 2026-07-29 amendment (esp. the residuals table, `:350`), #321, and the Dependabot auto-merge item from this same audit (a different file and a different fix — the two are siblings, not one change).
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: the `release.yml:253-254` note and ADR 0034's residual row are honest and stay — the unhashed install is what needs fixing.
+
+---
+
+---
+
+## 333. Per-connection TLS deviations are invisible to the loosening registry
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **3/10** · _fill-in_. Two per-connection TLS deviations — `tls_allow_expired` on six outbound connectors, and the generic-ODBC DATABASE hop's warn-and-cross delegation — never reach `security_loosenings()`, so `GET /security/posture`, `messagefoundry security show`, `messagefoundry check` and the VS Code `[security]` editor all report a clean posture while either is set.
+
+*(Filed as one item, not two: both are fixed by the same edits to the same four files — a reader beside `accepted_cleartext_hops`, an entry in `security_loosenings()`, an advisory beside `_check_cleartext_accepted`, and threading at `api/app.py`. Stated once rather than twice, per the docs rule against restating a load-bearing fact.)*
+
+**Partial delivery from [#323](#323) layer 3 (2026-08-02) — this item stays OPEN.** #323 added the `[alerts]` SMTP hop's deviations (`email_use_tls` / `email_tls_verify`) to `security_loosenings()`, which required giving it a 5th **required** `alerts` parameter, and added an `alert-smtp-tls` advisory beside `_check_cleartext_accepted`. So the *shape* this item asks for now exists and has a worked precedent — but **neither of this item's two deviations is closed**: `tls_allow_expired` on the six outbound connectors and the generic-ODBC DATABASE hop are both still invisible, and no connection-scoped `unverified_smtp_hops()` reader was built (that would report the **connectors'** `tls_verify=false`, which is this item's territory, not #323's). The completeness floor in `tests/test_security_posture_defaults.py` still iterates `SecuritySettings.model_fields` only, so per-connection settings and `[alerts]` fields remain structurally invisible to it — #323's entries are guarded by hand-written tests, not by the floor. Do not read this note as progress toward closure; read it as one worked example to copy.
+
+**Cluster:** Security / Posture reporting. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** two different weakenings, one shared blind spot. `security_loosenings()` ([`config/settings.py:3955-4140`](../messagefoundry/config/settings.py)) covers neither: the function was read end to end, and the last entry is the ADR 0153 `cleartext_accepted` block at `:4130-4139`, immediately followed by `return out` at `:4140`. Its own scope paragraph enumerates the deviations it covers from outside `[security]` — `settings.py:3967-3968`:
+
+> …an ENUMERATED set of deviations that live elsewhere: `[store].aad_bind`, `[auth].ad_session_recheck_seconds`, and the per-connection `cleartext_accepted`.
+
+**(a) `tls_allow_expired`.** A repo-wide grep confirms it reaches no reporting surface: it appears only in `config/wiring.py` (the six factory parameters at `:811`, `:1470`, `:1550`, `:1733`, `:2126`, `:2291` — `MLLP`/`Rest`/`FHIR`/`DICOM`/`Soap`/`Ftp`), in `config/tls_policy.py`, in the six transports that consume it, in `tests/test_tls_expiry_relaxation.py`, and in docs. It is absent from `config/settings.py`, `api/app.py:1517` (the `GET /security/posture` registry call), `__main__.py:1468` (the serve-time loosening warning), `__main__.py:4342` (`security show`), `checks.py`, the web console, and `ide/src/securityEditor.ts`. The one thing that *does* fire is a construction-time log WARNING naming the host — [`config/tls_policy.py:221-227`](../messagefoundry/config/tls_policy.py).
+
+**(b) The generic-ODBC DATABASE hop.** `_build_connection` returns the weakened flag hard-coded false for that dialect — `messagefoundry/transports/database.py:325`, `if dialect == "generic": return _build_odbc_dsn(s), False` — so the send-time re-assertion `_assert_send_hop` (`:129`) short-circuits at `if weakened and not _weakened_tls_permitted(...)` (`:134`) and never fires. `_warn_generic_tls_unenforced` (`:286`) logs at `:304-308` and returns. That much is deliberate and correctly documented ([ADR 0092's 2026-07-12 amendment](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md):111-127, [`DEPLOYMENT.md:300`](DEPLOYMENT.md) / `:377-381`, [`CONNECTIONS.md:1014-1019`](CONNECTIONS.md)). The defect is that the warning is the *entire* control, and it has two further holes:
+
+- **The detector is value-blind, so the one signal is defeatable.** `_ODBC_TLS_HINT_RE` (`:217`) is `re.compile(r"ssl|tls|encrypt", re.IGNORECASE)` and `:298` matches it against **keys only** (`if any(_ODBC_TLS_HINT_RE.search(str(k)) for k in params):`). So `odbc_params={"SSLmode": "disable"}` — psqlODBC's explicit *no TLS* value — is read as "the operator has taken TLS ownership" and the WARNING drops to `logger.debug` (`:299-302`). Same for `sslmode=prefer` and `Encrypt=no`. The comment at `:213-216` concedes the regex "cannot prove the value *verifies* the cert, only that TLS was addressed", but `disable` is not "addressed" — and it lands in the quieter branch. `tests/test_database_transport.py:202-212` pins the present behaviour by asserting the WARNING is absent whenever any TLS-ish key exists.
+- **The line names no connection.** `_warn_generic_tls_unenforced(params)` (`:286`) receives only the params mapping, so with several generic DB connections it is not actionable. Both directions are affected — `DatabaseDestination.__init__` (`:547`) and `DatabaseSource.__init__` (`:770`) share `_build_connection` — and the credential rides the same DSN (`:263-270`).
+
+**The shared root cause, stated once:** the registry's only completeness floor, `tests/test_security_posture_defaults.py:177-211`, iterates `SecuritySettings.model_fields` (`:203-204`) with an exemption set at `:189-202`. A **connection-scoped** deviation is outside its reach by construction. That is why `cleartext_accepted` needed a hand-written entry (`config/wiring.py:3078-3104`, `accepted_cleartext_hops`), why these two have none, and why nothing would catch the next one either.
+
+**Why:** under ADR 0148's "one posture, loosen only", the governing rule is that every deviation is visible in the registry — `settings.py:3981-3988` and `wiring.py:3091-3094` both argue that a deviation the registry cannot see is a second posture by the back door. The practical loss is review and audit visibility over time: an auditor querying `GET /security/posture`, or an operator opening the VS Code `[security]` editor, gets a list that says nothing, and `security show`'s `loosenings_scope` string (`__main__.py:4349-4351`) names only `cleartext_accepted` as the known omission — so the declared scope is itself incomplete. `docs/DEPLOYMENT.md:349-351` states the concrete consequence for (a): a two-week bridge set when a partner's certificate lapses "has **nothing that expires it or surfaces it**". For (b) it is the repo's own rule that *a compensating control must not rest on a false premise* — ADR 0092 accepted the exemption on the strength of one mitigation ("construction **logs it**"), and that mitigation is defeatable, anonymous, and lives in a log stream rather than any surface a reviewer reads.
+
+**Bounded honestly, in three directions.**
+
+1. **Neither is a MITM primitive.** `tls_allow_expired` ORs only `_X509_V_FLAG_NO_CHECK_TIME` (`0x200000`), documented at `tls_policy.py:182-192` as disabling *only* the validity-period check while "the chain signature, name constraints, key usage / EKU, basic constraints, and — separately — the hostname match (`check_hostname`) all still apply"; `tests/test_tls_expiry_relaxation.py` proves a wrong-host and a broken-chain peer are still rejected with the flag set, and `tls_policy.py:217-220` makes it a guarded no-op on a `CERT_NONE` context. For (b) the engine does not create the cleartext hop — a driver keyword does, and `dialect` defaults to `sqlserver` (`database.py:318`), which keeps the byte-identical posture-keyed refusal (`:319-323`).
+2. **Neither is an attacker capability.** Both require write access to the connection config — a `.py` module in the config dir or `connections.toml` — and anyone with that access could instead set `tls_verify=false`, repoint the host, or add an outbound to a destination they control. Nothing in an inbound payload selects a dialect, params, or the expiry flag. `db_lookup` is not on the generic path at all: the ADR 0010 read executor calls `_build_dsn` directly (`database.py:986`) and stays SQL-Server-only.
+3. **Neither is silent.** Both log at construction. What is missing is that a log line emitted once at startup is not the surface anyone queries three months later, and today it is the *only* one.
+
+**Proposed** (all advisory — do **not** convert the generic-ODBC delegation into a refusal; ADR 0092:113-118 is right that the engine cannot enumerate arbitrary driver keywords, and a guess-based refusal would break legitimate drivers):
+
+1. **Fix the value-blind detector first.** Keep `_ODBC_TLS_HINT_RE` (`database.py:217`) as the key finder, and add a small deny-list of known no-TLS / no-verify *values* — psqlODBC `disable`/`allow`/`prefer`, MySQL `DISABLED`/`PREFERRED`, `Encrypt` in `no`/`0`/`false` — that keeps the branch at `:304` (WARNING) instead of `:299` (DEBUG). Invert `tests/test_database_transport.py:202-212` into a pair: `verify-full` stays quiet, `disable` warns. **This must precede steps 3–4** or any new surface inherits the false negative and reports the worst real case as clean.
+2. **Name the connection** in `_warn_generic_tls_unenforced` (`:286`). `DatabaseDestination` already has `config.name` (`config/models.py:579`); `Source` (`config/models.py:235-242`) carries no name field, so the inbound name has to come from the registry at the construction site (`:770`).
+3. **Add two readers beside `accepted_cleartext_hops`** (`config/wiring.py:3078-3104`): an `expiry_relaxed_hops(registry)` returning `(name, host)` for every `registry.outbound` entry whose `settings` dict has `tls_allow_expired` truthy — the flag lands in `Destination.settings` (`config/models.py:581`), not in a model field like `cleartext_accepted` (`:615`) — and a generic-ODBC reader that walks **both** `registry.outbound` *and* the inbound table, since `accepted_cleartext_hops` reads only outbound + FHIR-lookup today and DATABASE sources need coverage. Note that only the outbound table is needed for the expiry flag right now: `FhirLookup` (`wiring.py:485-499`) exposes `verify_tls` but no `tls_allow_expired`. Say that in the docstring so adding it later cannot silently escape the reader.
+4. **Add both entries to `security_loosenings()`** immediately after the `cleartext_accepted` block (`settings.py:4130-4139`), taking the names as **required** parameters per the function's stated rule at `settings.py:3976-3979` (an optional parameter is a detector that silently fails to fire). Risk text must state both halves honestly for the expiry flag: an expired server certificate is accepted indefinitely on the named hop; chain, hostname and key usage are still verified.
+5. **Thread at the two call sites that have a graph** — `api/app.py:1503` (alongside the existing `accepted_cleartext_hops` resolution) and sibling advisory `CheckResult`s in `checks.py` modelled on `_check_cleartext_accepted` (`checks.py:1317-1360`), same `required=False` shape and same SKIP-on-unloadable-config behaviour. For the two graphless callers (`__main__.py:1468`, `:4342`) extend the `loosenings_scope` string at `:4349-4351` to name all three connection-scoped deviations rather than only `cleartext_accepted`.
+6. **Update the docstring's enumerated deviation list** (`settings.py:3964-3974`) and add rows to [`docs/SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md), which mentions neither today.
+7. **Move `docs/DEPLOYMENT.md` in the same commit** — `:250`, `:342-344`, `:442` and the maintenance note at `:629` all assert that no loosening register covers `tls_allow_expired`, and each becomes false the moment step 4 lands. While there, tighten `:348`: "with nothing refusing it, warning at posture level, or reporting it" — the trailing clause overreaches against the construction WARNING the same section acknowledges four lines earlier at `:343-344`. The rest of that section was verified accurate: the "six connectors" list, the "chain, hostname and key usage are still fully verified" claim, and the DICOMweb exclusion at `:352-353`.
+8. **The durable half:** extend the completeness floor (`tests/test_security_posture_defaults.py`) with a connection-scoped arm, so the next per-connection deviation is a test failure rather than a re-audit.
+
+**Related:** [`messagefoundry/config/settings.py`](../messagefoundry/config/settings.py) (`security_loosenings`), [`messagefoundry/config/tls_policy.py`](../messagefoundry/config/tls_policy.py) (`relax_verify_expiry`), [`messagefoundry/config/wiring.py`](../messagefoundry/config/wiring.py) (`accepted_cleartext_hops` + the six factories), [`messagefoundry/transports/database.py`](../messagefoundry/transports/database.py) (`_ODBC_TLS_HINT_RE` `:217`, `_warn_generic_tls_unenforced` `:286`, `_build_connection` `:311`), [`messagefoundry/checks.py:1317`](../messagefoundry/checks.py), [`messagefoundry/api/app.py:1503,1515`](../messagefoundry/api/app.py), `messagefoundry/__main__.py`, `ide/src/securityEditor.ts`, `tests/test_security_posture_defaults.py`, `tests/test_tls_expiry_relaxation.py`, `tests/test_database_transport.py:186-212`, [ADR 0092 amendment 2026-07-12](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md), [ADR 0094](adr/0094-tls-expiry-relaxation.md), [ADR 0118](adr/0118-security-loosening-warning-and-posture-view.md) (AC-4/AC-5), [ADR 0148](adr/0148-phi-default-posture-and-an-explicit-security-enforcement-level.md), [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md) (the `cleartext_accepted` precedent), [`docs/DEPLOYMENT.md`](DEPLOYMENT.md), [`docs/CONNECTIONS.md`](CONNECTIONS.md), [`docs/SECURITY-LOOSENING.md`](SECURITY-LOOSENING.md); #129 (shipped — built the expiry relaxation; its write-up says "PHI-free construction WARN" and never claimed registry coverage), #66 (shipped — introduced the generic ODBC dialect and recorded the exemption as intentional), #200.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified *close-the-weakness-instead*: the `DEPLOYMENT.md` and `CONNECTIONS.md` prose is accurate and stays — this item is the defect behind it.
+
+---
+
+---
+
+## 334. semgrep, a required blocking gate, scans a two-directory allow-list
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. The blocking semgrep gate scans `messagefoundry tee` only, so 56 tracked `.py` files that bandit's own scope declares in-bounds — including the 32-file web-console wheel and `scripts/` — never see the project's curated rules, and the parity test that exists to stop exactly this drift has no semgrep arm.
+
+**Cluster:** Security / CI gates. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** `.github/workflows/security.yml:413` runs the project SAST gate as an allow-list:
+
+```
+semgrep --config .semgrep --error --metrics off messagefoundry tee
+```
+
+It is a **required merge context** (`.github/required-contexts.txt:78`) and **blocking** (`security.yml:396`). Its sibling on the same file was moved off that shape deliberately — `security.yml:359-360` is `bandit -r .` minus an explicit `--exclude` list, and the rationale at `:348-352` names the failure by name: *"It was `-r messagefoundry tee` while the hook scanned everything except tests/harness/samples — so scripts/ (security tooling, subprocess-heavy) was gated locally and by nothing in CI."* semgrep was never given the same treatment.
+
+Taking bandit's exclude set as the project's own declaration of what SAST is supposed to cover, the delta is **56 tracked `.py` files**: `messagefoundry_webconsole/` (32 files, which ships as its own separately-versioned wheel — `packaging/messagefoundry-webconsole/pyproject.toml:17`, force-included at `:55-58`), `scripts/` (22 — the security tooling the bandit comment was written about), and `docker/` (2). `packaging/`'s 14 files are all tests and are excluded on both sides.
+
+`tests/test_lint_scope_parity.py` is cited at `security.yml:358` as the control that stops this ("fails if this and the hook drift apart again"), and it does hold that line for ruff and bandit — `test_ci_bandit_scans_the_repo_not_an_allow_list` (`:119-125`) asserts `bandit\s+-r\s+\.` against the workflow directly. **The string "semgrep" does not appear anywhere in that file.** There is no semgrep pre-commit hook either, so semgrep is CI-only and that CI-only assertion at `:119` is the exact template a semgrep arm would follow.
+
+**Why:** the honest blast radius is **drift, not exposure** — three things bound it, and the item is worth filing anyway:
+
+1. **Nothing is being missed today.** Grepping `messagefoundry_webconsole/` for every sink the five rules match (`shell=True`, `os.system`, `eval(`, `exec(`, `pickle.`, `marshal.`, `yaml.load(`, `verify=False`) returns **zero** hits. The console makes no outbound HTTP calls of its own — `routes/oidc.py` delegates code redemption to `messagefoundry.auth.oidc`, which *is* scanned.
+2. **bandit is a real compensating control on the same PR.** It is also required (`required-contexts.txt:74`), it does scan all 56 files, and its built-in checks for `exec`/`eval`, pickle/marshal, `yaml.load` and `shell=True` are **not** in the `--skip` list at `:359` (that list is only `B101,B110,B311,B404,B608`). So four of the five rules have overlapping enforcement. *(Confirm the specific bandit check-id mapping before leaning on this in review; the skip list is what was read, not bandit's plugin source.)*
+3. **CodeQL also covers it** — `codeql.yml:55` analyses python repo-wide with `security-extended` (`:66`) and has no paths filter. But it is **deliberately not a required context** (`required-contexts.txt:108-110`: fork-PR tokens lack `security-events: write`), so it is a detector, not a gate.
+
+What is *not* covered is the thing that will grow: `.semgrep/messagefoundry.yml` is where **project-specific** rules land — rules bandit will never ship. A future rule written because of something an operator hit in the console would silently not run on the console. The second step in the same job (`security.yml:414-424`, the ADR 0144 handler-taint rules) is scoped to `samples/config` only, so it does not close this either.
+
+**Correcting the audit that produced this item:** the source finding claimed the five rules "cover exactly the sinks that matter in an HTML-rendering console." They do not — `.semgrep/messagefoundry.yml:5-53` contains no HTML, template, escaping or XSS rule at all. The rules are generic dangerous-sink rules (`:6`, `:14`, `:21`, `:30`, `:43`). The finding also named only the web console; `scripts/` is out of scope on the same line and is the directory the bandit widening was specifically about.
+
+**Proposed:**
+
+1. Change `security.yml:413` to scan the tree the way bandit does — `semgrep --config .semgrep --error --metrics off --exclude … .` — mirroring bandit's `--exclude` set exactly so the two gates cannot disagree about what "the project" is. **Verify the tree is clean at that bar in the same PR**: `--error` is blocking, and `tests/` (563 files) very plausibly contains `pickle`/`yaml.load`/`eval` test idioms, which is presumably why `tests`/`harness`/`samples` are excluded on the bandit side too.
+2. Add `test_ci_semgrep_scans_the_repo_not_an_allow_list` to `tests/test_lint_scope_parity.py`, modelled on `:119-125`, so the next narrowing has to be deliberate. This is the durable half — without it, step 1 can rot again exactly as bandit's did.
+3. If a full widening is rejected, the fallback is appending `messagefoundry_webconsole scripts docker` to the argument list — but note that this is the allow-list shape `:348-352` explicitly retired, and it will go stale the next time a directory is added.
+
+**Related:** `.github/workflows/security.yml:348-360` (the bandit precedent) and `:393-424` (the semgrep job), `.semgrep/messagefoundry.yml`, `tests/test_lint_scope_parity.py`, `.github/required-contexts.txt:74`/`:78`/`:108-110`, `.github/workflows/codeql.yml`, `packaging/messagefoundry-webconsole/pyproject.toml`, [ADR 0065](adr/0065-web-ops-dashboard.md) (the console is a distinct distribution), [ADR 0144](adr/0144-handler-config-taint-rules.md) Inc 3 (the second, `samples/config`-scoped semgrep step).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+## 335. Control-char scrub misses `exc_text`/`stack_info`
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **4/10** · Difficulty **3/10** · _fill-in_. `ControlCharScrubFilter` escapes only the rendered message, so a CR/LF inside a logged exception traceback reaches the human-readable text sink verbatim and can forge a whole log record; the JSON sink is unaffected and the reachable call sites are few.
+
+**Cluster:** Security / Logging. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+**What:** `ControlCharScrubFilter` ([logging_setup.py:81-87](../messagefoundry/logging_setup.py)) covers the rendered message and nothing else:
+
+```python
+def filter(self, record: logging.LogRecord) -> bool:
+    message = record.getMessage()
+    scrubbed = message.translate(_CTRL_TRANSLATION)
+    if scrubbed != message:
+        record.msg = scrubbed
+        record.args = ()
+    return True
+```
+
+`_CTRL_TRANSLATION` is defined at `logging_setup.py:65-69` and referenced exactly once more, at `:83` — nowhere else in the tree. `record.exc_text` and `record.stack_info` are touched only by `RedactionFilter` (`logging_setup.py:124-131`), which applies `redact()` — an HL7/date/name-shaped **span** rewriter, not a control-character escaper. `logging.Formatter.format` then appends `exc_text` verbatim, and `_LOG_FORMAT` (`:54`) is `"%(asctime)s %(levelname)-8s %(name)s: %(message)s"`, so a payload only has to pad the level to eight columns to be byte-indistinguishable from a real record.
+
+Reproduced at HEAD (worktree source on `sys.path[0]`, `configure_logging("INFO", fmt="text")`):
+
+```
+2026-08-01T15:29:08Z ERROR    messagefoundry.demo: delivery failed
+Traceback (most recent call last):
+  ...
+ValueError: boom
+2026-08-01T00:00:00Z INFO messagefoundry.auth: FORGED admin login ok
+2026-08-01T15:29:08Z INFO     messagefoundry.demo: arg path: boom\nFORGED-VIA-ARG
+```
+
+The forged line lands at column 0 on its own physical line; the identical payload passed as a `%`-arg in the same run comes out escaped. The filter order is already right for the fix — `_install_phi_filters` (`:309-311`) adds `RedactionFilter` → `CredentialQueryScrubFilter` → `ControlCharScrubFilter`, so `exc_text` is populated before the scrub filter runs.
+
+This is the residual [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) already discloses at `:131` and `:144-147` (*"Open hardening (not done)"*). The ADR is honest — its older register line at `:40` is superseded in place by the correction block opened at `:126` — so **the defect is what needs fixing, not the disclosure.**
+
+**Why:** it defeats the ASVS 16.4.1 control the project claims, on the sink an operator actually reads during an incident: a forged `… INFO messagefoundry.auth: …` line in the NSSM-captured stdout is indistinguishable from a real one, and a line-oriented SIEM parser ingests it as a record.
+
+Honestly bounded — this is **not**:
+
+- **Not the JSON sink.** `JsonFormatter` emits through `json.dumps(payload, ensure_ascii=False)` (`logging_setup.py:197`), which escapes C0 regardless of `ensure_ascii`. The off-box forwarder defaults to `fmt="json"` (`:215`).
+- **Not PHI exposure.** `RedactionFilter` runs first and rewrites HL7/date/name-shaped spans to `[redacted]`, which also neuters the obvious HL7-shaped forgery payload. The surviving vector is a *non*-HL7-shaped CR/LF-bearing string.
+- **Not widely reachable.** Contrary to ADR 0034:140-142's list, the router/transform **content**-fault catches log the exception **type only**, with no `exc_info` — `wiring_runner.py:4525-4531` and `:4541-4546` (docstring `:4521-4523`: *"the log emits the exception TYPE only"*), same shape in `_apply_transform_internal_error` at `:4550-4571`. `messagefoundry/transports/` contains **zero** `exc_info` sites. Of the 107 `log.exception(`/`exc_info=` sites engine-wide, the ones on the message path are the ADR 0054 built-ins-parser fallback guards (`parsing/peek.py:209`, `parsing/message.py:107`) and the respawn callbacks (`wiring_runner.py:2651`, `:2724`, `exc_info=task.exception()`); the rest are pollers and store/OS faults whose text is not peer-derived.
+- **Not remote-code/privilege anything.** It is log-record integrity only.
+
+One correction *widening* the bounding: the residual is not stdout/NSSM alone. `SyslogForward.fmt` accepts `"text"` (`logging_setup.py:215`) and `:401` honours it (`fwd_handler.setFormatter(_make_formatter(forward.fmt))`), so a `forward_format = "text"` collector receives the same unescaped `exc_text`.
+
+**Proposed:**
+
+1. Extend `ControlCharScrubFilter.filter` to apply `_CTRL_TRANSLATION` to `record.exc_text` and `record.stack_info` as well as the message. It runs last (`:309-311`), so both fields are already populated and redacted.
+2. **Make the readability call ADR 0034:146 defers.** A blanket translate collapses every traceback to one physical line, which is a real operator-facing regression — and is precisely why this few-line fix has been deferred. The cheaper option that keeps both properties: escape CR/LF **and** re-indent — split on newline, escape all other control chars, and rejoin with `"\n    | "` (or any fixed non-empty prefix). A continuation line can then never start at column 0, so it can never match `_LOG_FORMAT`, and the traceback stays readable. Pick one explicitly and record it as an ADR 0034 amendment rather than a drive-by edit.
+3. Add the missing tests. `tests/test_asvs_phase0.py:60-80` has three `ControlCharScrubFilter` tests and all three build records with `exc_info=None` (`_record` at `:56-57`); `tests/test_logging.py:231-237` covers PHI in `stack_info` but asserts nothing about control chars. Add a record carrying `exc_text`/`stack_info` with an embedded CRLF and assert the formatted output has no line matching the record prefix.
+4. Update ADR 0034 `:144-147` from "not done" to the shipped state in the same commit.
+
+**Related:** [`messagefoundry/logging_setup.py`](../messagefoundry/logging_setup.py) (`ControlCharScrubFilter`, `RedactionFilter`, `_install_phi_filters`, `JsonFormatter`, `SyslogForward`), [`messagefoundry/redaction.py`](../messagefoundry/redaction.py) (`redact`/`safe_text`/`safe_exc` — `:81-101`; these do not strip control chars either, but their output is a `%`-arg and so *is* covered), `tests/test_asvs_phase0.py`, `tests/test_logging.py`, [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) §"Class-rationale corrections" §1, [ADR 0080](adr/0080-tls-syslog-forwarding.md) (the off-box text-format sink), ASVS 5.0 16.4.1.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: ADR 0034's prose is accurate and self-correcting and stays as written.
+
+---
+
+---
+
+## 336. Dependabot auto-merge shields review with a deny-list
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. Auto-merge clears everything a 16-name Python deny-list does not name, and the same workflow also auto-merges `github-actions` bumps — an ecosystem its own header says is cooldown-aged but which has no `cooldown:` configured.
+
+**Cluster:** Security / Supply chain. **Priority:** P3. **Verdict:** build. **Severity:** low.
+
+**What:** `.github/workflows/dependabot-auto-merge.yml` decides unattended merges by exclusion. Guardrail #3 is a hard-coded shield list at `.github/workflows/dependabot-auto-merge.yml:78-79`:
+
+```
+denylist="cryptography argon2-cffi argon2-cffi-bindings paramiko ldap3 pyspnego \
+  fastapi starlette uvicorn pydantic pydantic-core python-jose pyjwt passlib bcrypt cffi"
+```
+
+Anything not on that list, on any ecosystem, auto-merges if it is a patch — the merge gate at `:155-161` keys only on `update-type == 'version-update:semver-patch'` (plus dev-only minors), with no ecosystem or dependency-type qualifier. The workflow itself already names the residual at `:31-34`: "a malicious patch that BOTH rides a real concurrent published advisory AND is not on the deny-list would still auto-merge."
+
+Two things measured at HEAD make the exposed set **wider than that comment implies**:
+
+1. **All 16 names are Python distributions, but the job has no ecosystem filter.** The only gate is `if: github.event.pull_request.user.login == 'dependabot[bot]'` (`:58`), so the npm (`/ide`) and `github-actions` ecosystems configured in `.github/dependabot.yml` run this same path with **zero** deny-list coverage — no npm or action name can ever match a Python token.
+2. **The `github-actions` ecosystem has no cooldown.** `.github/dependabot.yml:42-56` carries `schedule` + `groups` only; there is no `cooldown:` key, unlike uv (`default-days: 5`, `:26-30`) and npm (`default-days: 3`, `:66-68`). That falsifies the compensating-control claim in the workflow header at `.github/workflows/dependabot-auto-merge.yml:16-18` — "Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`" — for the one ecosystem whose artifacts execute inside CI. Actions are SHA-pinned (e.g. `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`, `.github/workflows/release.yml:73`), and a Dependabot patch bump rewrites that SHA with no aging and no shield.
+
+Two smaller corrections to the record. The deny-list is 16 names but only **13** are real dependencies: `python-jose`, `pyjwt` and `passlib` do not appear in `requirements.lock` (98 pinned distributions), so the shield covers 13 of 98. And `tests/test_dependabot_automerge_guardrails.py:97-108` asserts a cooldown only for `package-ecosystem == "uv"` — nothing tests that the other two ecosystems have one, which is why the gap is invisible to CI.
+
+**Why:** this is the "compensating control resting on a false premise" rule (CLAUDE.md §11) firing on a supply-chain gate. The header's stated backstop is weaker than it reads in a second way too: `.github/workflows/security.yml:261` says in the repo's own words that "pip-audit (lockfile only) and bandit/semgrep (source only)" never see a dependency's contents — semgrep targets `messagefoundry tee` (`security.yml:413`) — and the required contexts `pip-audit (dependency vulnerabilities)` / `npm-audit (ide dependency vulnerabilities)` (`.github/required-contexts.txt`) are known-advisory scanners, which by construction cannot flag a package that was malicious at publish time. So "main's required CI backstops both" (`.yml:33-34`) does not hold against the specific threat the deny-list exists to cover.
+
+**Bounding this honestly — the blast radius is NOT what it first looks like:**
+
+- **The attacker must already own an upstream publisher account.** That is a capability with worse uses than this repo; nothing here is a privilege escalation for a lesser attacker.
+- **On the security track the GHSA gate is real and fails closed** (`:136-145`): an API error or a no-matching-advisory result routes to manual review. Because it queries `ecosystem=pip` (`:132-135`), npm and actions security PRs can never match and always fall to manual — a false negative in the *safe* direction.
+- **On the version track the uv and npm ecosystems are cooldown-aged** (5 and 3 days). Only `github-actions` is unaged.
+- **Merging to main is not publication.** `.github/workflows/release.yml:30-41` gates PyPI on a `vX.Y.Z` tag push, and `workflow_dispatch` explicitly does not publish (`release.yml:5-8`), so reaching a downstream install still requires the owner to cut a tag. The sharpest theoretical path — a poisoned action riding in `release.yml`, whose job holds `id-token: write` for Trusted Publishing (`release.yml:70`) — needs that same owner tag push to execute at all.
+- **This is hardening, not an incident.** No evidence of exploitation; the item is that the control's stated premise and its configuration disagree.
+
+**Proposed:**
+
+1. **Invert guardrail #3 to an allow-set.** Replace the 16-name deny-list at `:78-79` with an explicit list of packages eligible for unattended patch merge; everything else routes to manual review. The current default is "merge unless named"; it should be "hold unless named." Keep the fail-safe whole-group denial semantics (`:81-92`).
+2. **Add a `cooldown:` to the `github-actions` ecosystem** in `.github/dependabot.yml:42-56`, matching uv's 5/7. This is the one-line change that makes the header's claim at `:16-18` true instead of aspirational.
+3. **Extend `tests/test_dependabot_automerge_guardrails.py:97-108` to assert a cooldown on every ecosystem**, not just `uv` — the test's narrowness is why item 2 was invisible.
+4. **Security-track aging must be workflow-side, not dependabot-side.** "Extend the cooldown to the security track" is *not* implementable in `.github/dependabot.yml`: that file records at `:22-25` that security updates ignore cooldown by Dependabot design. The equivalent is a release-age check in the workflow — require the candidate version to have been published for N hours before auto-merging — placed alongside the GHSA step and failing closed the same way.
+5. **Correct the header comment.** `:33-34` should stop citing pip-audit/bandit/semgrep as a backstop against a fresh malicious publish, since `security.yml:261` already states they cannot see it. Either drop the clause or scope it to "known-CVE regressions."
+6. **Prune or annotate the three non-dependency deny-list entries** (`python-jose`, `pyjwt`, `passlib` are absent from `requirements.lock`) so the list's apparent breadth matches its effective breadth. If they are deliberately prophylactic, say so in the comment.
+
+**Related:** `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml`, `.github/workflows/security.yml`, `.github/workflows/release.yml`, `.github/required-contexts.txt`, `requirements.lock`, `tests/test_dependabot_automerge_guardrails.py`, `.github/workflows/dependabot-lock-resync.yml`; #321, #322, and the unhashed release-toolchain item from this same audit (a different file and a different fix).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+## 337. handler-security lint: `getattr` indirection and the undecorated helper
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. One level of indirection (`getattr(os, "system")(...)`) walks past the `ambient-authority` rule even in strict block mode, and `phi-to-log` never opens the undecorated `_<feed>_transforms.py` helper the project's own Hybrid layout tells authors to put transform logic in.
+
+**Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+**What:** Two execution-verified coverage holes in `_check_handler_security` ([`checks.py`](../messagefoundry/checks.py), ADR 0144), both still open at HEAD.
+
+*(1) `ambient-authority` sees only a literal name chain.* `_ambient_authority_hit` (`checks.py:690-721`) matches a bare `ast.Name` against `_AMBIENT_BARE_NAMES` — `frozenset({"eval", "exec", "compile", "__import__"})` at `checks.py:464` — then falls through to `_dotted_call_name`, which by its own docstring returns `None` "when it is not a pure Name/Attribute chain (e.g. the receiver is itself a call or subscript)" (`checks.py:549-560`). `getattr(os, "system")("…")` is precisely that shape: the outer call's `func` is an `ast.Call`, and the inner call's `func` is `Name("getattr")`, which is in no deny-list. Measured, in **strict** mode:
+
+```python
+# <config_dir>/IB_T_handler.py
+@handler("H")
+def h(msg):
+    getattr(os, "system")("whoami")          # line 7  — NOT flagged
+    globals()["__builtins__"]["eval"]("1")   # line 8  — NOT flagged
+    mod = __import__("subprocess")           # line 9  — flagged
+```
+```
+_check_handler_security(cfg, strict=True)
+# -> ok=False, required=True, "1 handler-security finding(s) … IB_T_handler.py:9 [ambient-authority]"
+```
+
+The opt-in Semgrep leg does not recover it either: `messagefoundry/security/semgrep/handler-security.yml:148-151` lists `eval(...)` / `exec(...)` / `compile(...)` / `__import__(...)` and no `getattr` pattern. ADR 0144:189-192 states this outright ("`getattr(os, "system")` remains a false-negative") — the defect is that nothing executable pins it, and the cheap resolution was never taken.
+
+*(2) `phi-to-log` is decorated-scope only, which excludes the documented transforms helper.* The rule loop is gated by `if _message_fn_decorator(node) is None: continue` (`checks.py:921-934`), `_body_calls` refuses to descend into nested defs (`checks.py:762-778`), and `_message_fn_decorator` is `FunctionDef`-only so an `async def` handler is out too (`checks.py:536`). Measured, in **strict** mode:
+
+```python
+# <config_dir>/_feed_transforms.py   (undecorated — the documented Hybrid helper)
+def xform(msg):
+    log.info("transforming %s", msg.raw)
+```
+```
+_check_handler_security(cfg, strict=True)  -> ok=True, skipped=True, "no handler-security findings"
+```
+
+ADR 0144:193-195 records the decorated-scope trade, but justifies it with an **`impure-transform`** false positive ("the trade that keeps the shipped `_pdf_mdm_transforms.py` timestamp fallback clean") and then applies it to `phi-to-log` as well. `samples/config/_demo_oru_transforms.py` and `_pdf_mdm_transforms.py` exist, [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role" tells authors to put field-level transform logic there, and #226 is an estate-wide sweep to do exactly that — so the one CLAUDE.md §9 rule the lint encodes systematically skips the file the convention steers PHI handling into.
+
+**The third gap the audit named is narrower than described.** The non-recursive `base.glob("*.py")` at `checks.py:893`/`:898` (ADR 0144:196) is **not** an unscanned execution path. `load_config` globs `directory.glob("*.py")` non-recursively too (`config/wiring.py:3969`, and `:4392` for `validate_config`), and `_SiblingHelperFinder.find_spec` returns `None` for any dotted name and serves only `_`-prefixed top-level helpers from the config dir (`wiring.py:3902`, `:3908-3912`). A `.py` in a config subdirectory is therefore neither executed by the loader nor importable by a sibling — and `_assert_safe_config_source` is non-recursive for the same reason (`wiring.py:4194`, `:4324`). The lint's file set already equals the executable set. A recursive walk here would make the lint report on files the safe-source ownership gate never vets — an asymmetry in the other direction. #226 (`docs/BACKLOG.md:6917`) already parks recursion as a *loader* question; it belongs there, not here.
+
+**Why:** Bounded, and bounded hard. The lint is advisory by default (`checks.py:953`, `ok=not strict, required=strict`), so a finding blocks nobody unless an adopter opts into `--strict-handler-security` on their own CI. It governs code the adopter's own administrator authors, inside a directory whose write access is already the trust boundary (`_assert_safe_config_source`, `wiring.py:4194`/`:4324`) — anyone who can drop a `.py` there already has arbitrary in-process execution under the engine account, so this is **not** a privilege boundary and evading it buys an attacker nothing they did not already have.
+
+> ⚠️ **Rationale amended 2026-08-01 (ADR 0087 sandbox session) — the severity is right, the reason was not.** "The author already has in-process execution" is true at the **default** `[sandbox].mode=off`, and **false** under `mode=subprocess`, where the entire premise is that the author is *not* trusted with it. A severity floor resting on a posture-specific claim reads as settled and misleads the next reader. The rationale that holds in **both** postures: the lint is advisory and pre-deployment; under `mode=off` the author already has in-process execution, and under `mode=subprocess` an evasion still only reaches **host** actions the sandbox does not confine — `DEFAULT_FORBIDDEN_MODULES` (`pipeline/sandbox.py:84-95`) blocks `socket`, `ssl`, `asyncio`, `multiprocessing`, the I/O-bearing `messagefoundry.*` subpackages and `cryptography`, but **not `os` or `subprocess`** (verified at HEAD). ADR 0087 confines the **address space** (the child cannot reach the parent's DEK, audit chain or sockets), not the **host**; OS-level default-deny is ADR 0147, *Proposed with no code*. So an evasion reaches neither the DEK nor the audit chain in either posture. **Re-score upward when ADR 0147 lands**, at which point the lint becomes load-bearing for exactly the class OS confinement is meant to close. ADR 0144:171-174 and the `_check_handler_security` docstring (`checks.py:878`) both say so: "a filter, not a fix." There is no PHI-exposure path and no runtime behaviour change of any kind.
+
+What it *is*: an adopter who turns on the strict gate gets a **green build** on a Handler containing `getattr(os, "system")`, and gets a green build on a transforms helper logging `msg.raw` at INFO. Gap (2) is the one that actually costs something, because the miss is not a malicious bypass — it is the ordinary fallible-author case ADR 0144 exists for, landing in the exact file the project's own layout guidance created. Gap (1) is mostly a claim-hygiene problem: the ADR asserts the false negative in prose and no test proves it, so nobody notices if a future change silently widens or narrows it.
+
+**Proposed:**
+1. **Resolve `getattr` on a known-dangerous root** in `_ambient_authority_hit` (`checks.py:690`): when the call's `func` is `getattr(<name-chain>, <const str>)`, splice the constant into the chain and re-run the existing predicate; when the second arg is **non-constant** on a root already in `_AMBIENT_ROOTS`/`_AMBIENT_OS_PATHS`, flag it directly (it is unresolvable statically, and that is the honest answer). ~15 lines, no new dependency, reuses `_dotted_call_name`.
+2. **Widen `phi-to-log` past the decorated scope** — scan module-level functions in `_*.py` helpers (and nested defs inside a decorated body) for the same rule, keying on a parameter whose name matches the caller's message symbol or on `.raw`/subscript access. `impure-transform` stays decorated-scope: the ADR's stated FP rationale is specific to it, so widening only `phi-to-log` costs nothing against that rationale. Recalibrate against `samples/config/_demo_oru_transforms.py` + `_pdf_mdm_transforms.py` before landing.
+3. **Pin both with tests** in `tests/test_checks_handler_security.py` — a positive for the `getattr` form and a positive for the undecorated-helper PHI log; today only the *negative* undecorated cases are pinned (`:205`, `:287`, `:298`), so the gaps are asserted in prose and nowhere in code.
+4. **Update ADR 0144's residual list** (`:189-196`) as part of the same change: strike the getattr and decorated-scope-`phi-to-log` bullets when fixed, and rewrite the "Non-recursive" bullet to state *why* it is correct (the loader is non-recursive too) rather than listing it as a gap.
+5. Optional: add a `getattr` pattern to `security/semgrep/handler-security.yml` for the opt-in taint leg, and fix the `_body_calls` docstring (`checks.py:763-766`), which claims "each nested def is scanned on its own iteration" — true only for a nested def that itself carries `@handler`/`@router`.
+
+**Related:** [`messagefoundry/checks.py`](../messagefoundry/checks.py) (`_ambient_authority_hit`, `_check_handler_security`, `_body_calls`, `_message_fn_decorator`), [`messagefoundry/security/semgrep/handler-security.yml`](../messagefoundry/security/semgrep/handler-security.yml), [`tests/test_checks_handler_security.py`](../tests/test_checks_handler_security.py), [ADR 0144](adr/0144-security-lint-gate-over-admin-authored-router-handler-config.md) (this lint), [ADR 0087](adr/0087-sandbox-subprocess-isolation.md) + #197 (the runtime half — SHIPPED), [`docs/ADOPTER-CI.md`](ADOPTER-CI.md) (the operator control listing, line 178), [`docs/CONNECTIONS.md`](CONNECTIONS.md) §"Decomposing by role", #226 (the Hybrid-layout sweep, and the loader-recursion question).
+
+**Source:** public-repo disclosure audit, 2026-08-01. ADR 0144 is honest and stays — the defect is what needs fixing.
+
+---
+
+---
+
+## 338. TLS key-exchange groups are inherited, not pinned
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `harden_kex_groups` pins nothing on every interpreter this project supports, and after the 2026-07-29 correction sweep two surfaces plus #200's own ASVS roll-up still describe the engine's own contexts as having pinned/hardened key-exchange groups.
+
+**Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build. **Severity:** low.
+
+**What:** [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py):150-152 returns without pinning whenever the API is absent —
+
+```python
+set_groups = getattr(ctx, "set_groups", None)
+if set_groups is None:
+    return None
+```
+
+`SSLContext.set_groups` is a **Python 3.15** addition, so on this tree (3.14.6 / OpenSSL 3.5.7) `hasattr(ctx, "set_groups")` is `False` and `APPROVED_KEX_GROUPS` (`tls_policy.py`:89) reaches **zero** of its six call sites — [`api/tls.py`](../messagefoundry/api/tls.py):55, [`transports/mllp.py`](../messagefoundry/transports/mllp.py):543 and :582, [`transports/dicom.py`](../messagefoundry/transports/dicom.py):145 and :463, [`transports/remotefile.py`](../messagefoundry/transports/remotefile.py):213. Every built context inherits OpenSSL's default group list. Re-measured 2026-08-01 against the real `build_api_ssl_context`, at both `tls_min_version` 1.2 and 1.3 (identical results):
+
+```
+approved     = {'X25519': True, 'secp384r1': True, 'prime256v1': True}
+non_approved = {'ffdhe2048': True, 'ffdhe3072': True, 'secp521r1': True,
+                'secp224r1': False, 'sect571r1': False}
+```
+
+**The code and the primary docs are already honest about this.** The 2026-07-29 correction sweep fixed the docstrings (`tls_policy.py`:11-15, :114-148), [`PHI.md`](PHI.md):638 (now scored `[PARTIAL — … the group pin is INERT until Python 3.15]`) and :648-655, [`ASVS-L2-PHASE0-CHANGES.md`](ASVS-L2-PHASE0-CHANGES.md):230-231, and struck §4(b) of [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md):170-172 with an amendment at :215-247. Three restatements survived it:
+
+1. [`CONTAINER-EXPOSURE-EVALUATION.md`](CONTAINER-EXPOSURE-EVALUATION.md):50 — under a heading that reads *"What is actually built (verification, not re-derivation)"*, the `build_api_ssl_context` row's **Confirmed behavior** cell says `optional ciphers, hardened KEX groups + strict X.509`, unqualified. This is the strongest surviving instance: the column asserts verification.
+2. `BACKLOG.md`:6416 — #200's `**Closes (ASVS 5.0 L3):** 4.2.1, 4.4.1, 11.6.2, …` still claims 11.6.2 closed, while `PHI.md`:638 scores the same cell PARTIAL. #200's banner at :6412 carries the correction, so the item contradicts itself two lines later.
+3. `ASVS-L2-PHASE0-CHANGES.md`:253 — the PQC migration row says *"add it to the pinned group/cipher policy"*, presupposing a pin.
+
+Separately: the docstring argues *"the return value is the point"*, but all six call sites discard it, so the report exists only in tests. `SecurityPosture` already carries a report-only read-out sourced from this same module (`api/app.py`:1528, `fips_attestation()`), and carries nothing for KEX groups.
+
+**Why:** the residual is **wider than policy, not weak**, and this item is documentation accuracy plus observability — not a transport weakness. Every group that gets in is forward-secret; `ffdhe2048`/`ffdhe3072`/`secp521r1` are the whole delta, and the genuinely weak `secp224r1` (112-bit) and `sect571r1` (binary-field) are refused. The forward-secrecy property ASVS 11.6.2's first clause is about comes from the enforced TLS 1.2+ floor, and `harden_cipher_suites` (`tls_policy.py`:334-364) **raises** on any non-forward-secret suite at every one of the same six sites — so nothing here admits static RSA/DH. There is no exploit path: an attacker cannot downgrade to anything the floor does not already permit; the only reachable effect is a *client* choosing a still-forward-secret group outside the preferred three. It is immaterial on the default `127.0.0.1` bind, where no TLS is presented at all. The cost of leaving it is a reader of `CONTAINER-EXPOSURE-EVALUATION.md` §0 or of #200's Closes line concluding the pin is enforced and not looking again — which is exactly how the "3.13+" error survived three assessments.
+
+**Proposed:**
+1. Correct `CONTAINER-EXPOSURE-EVALUATION.md`:50 to say the groups are **inherited** (attempted pin inert until Python 3.15) and point at `PHI.md` §4 rather than restating the measured set — per CLAUDE.md §11, state it once and link.
+2. Reconcile the ledger: drop `11.6.2` from #200's Closes line at `BACKLOG.md`:6416, or annotate it to match `PHI.md`:638's PARTIAL score. Two ledger surfaces must not disagree on one ASVS cell.
+3. Reword `ASVS-L2-PHASE0-CHANGES.md`:253 to "the approved group/cipher policy".
+4. Consider an additive report-only `kex_groups: str | None` on `SecurityPosture` fed by the discarded `harden_kex_groups` return (same shape as `fips_mode`/`openssl_version`, `api/app.py`:1528) so the inertness is operator-visible, not test-only. Additive → a `_ui_seam` bump.
+5. **Do not delete or relax the tripwires.** `tests/test_tls_policy.py`:117 asserts the `None` unconditionally and `tests/test_api_tls.py`:1278 measures the accepted-group set with an assertion at :1318 that a non-approved group *does* get in. Both go red the day an interpreter grows the API — that red **is** the "re-evaluate when 3.15 lands" trigger, so no dated review is needed. Their failure messages already name the docs to re-derive.
+6. **Do not** substitute `set_ecdh_curve`. It takes exactly one OpenSSL curve short name, so pinning through it would refuse two of the three approved groups (`tls_policy.py`:139-148 records the trap, including that `secp256r1` is a valid group-list alias but not a valid curve name — the curve spelling is `prime256v1`).
+
+**Related:** [`config/tls_policy.py`](../messagefoundry/config/tls_policy.py) `harden_kex_groups` / `APPROVED_KEX_GROUPS` / `harden_cipher_suites`; the six call sites listed above; [ADR 0092](adr/0092-posture-keyed-transport-hop-refusal-refuse-the-insecure-phi-hop.md) 2026-07-29 amendment; [`PHI.md`](PHI.md) §4; [`ASVS-L2-PHASE0-CHANGES.md`](ASVS-L2-PHASE0-CHANGES.md) §*TLS key-exchange & cipher posture*; [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (this defect is its worked example); `tests/test_tls_policy.py`, `tests/test_api_tls.py`; #200 (closed — its Closes line is fix (2) above; amending a closed item's prose is fine, but it must not gain an OPEN banner).
+
+**Source:** public-repo disclosure audit, 2026-08-01. Re-verified and re-measured at HEAD on the same date.
+
+---
+
+## 340. Enable a GitHub merge queue: strict + no queue makes every merge a race that fails silently
+
+> 🔢 **Filed 2026-08-01 — not started.** Value **8/10** · Difficulty **3/10** · _fill-in_. `strict = true` with no merge queue and a ~20-minute suite means a PR must go green *and* have `main` hold still, or it flips to `BEHIND` and stops. Measured this date: **9 open PRs green (0 failing, 0 pending) and none able to merge**, 6 with auto-merge armed that will never fire.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** branch protection on `main` sets `required_status_checks.strict = true` — a PR must be up to date with the base to merge — and the repo has **no merge queue** (`repository.mergeQueue` is null; `allow_auto_merge` is true). The slowest required leg runs ~20–25 minutes. Those three facts compose into a race: a PR is mergeable only in the window between its checks going green and the next thing landing on `main`.
+
+Losing that race is **silent**. Armed auto-merge does *not* update a `BEHIND` branch — it waits on checks that already passed — so the PR sits armed and stalled with no failing check, no notification, and no run in flight. Measured 2026-08-01:
+
+```
+PR     mergeState  failing  pending  auto-merge
+#128   BEHIND      0        0        ARMED
+#125   BEHIND      0        0        ARMED
+#107   BEHIND      0        0        -
+#106   BEHIND      0        0        ARMED
+#101   BEHIND      0        0        ARMED
+#96    BEHIND      0        0        ARMED
+#71    BEHIND      0        0        ARMED
+#60    BEHIND      0        0        -
+```
+
+(Nine at the hand survey; eight when [`check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) ran ~20 minutes later, because #120 had been re-synced in between. The set moves — the condition does not.)
+
+Two worked instances the same day. **#74** went green on 2026-07-30 and sat unmergeable until 2026-08-01, found only by someone hunting "stuck CI" by hand; it took three merges from `main` to land. **#119** was green with 25 passing checks and armed, stalled, was re-synced, and lost the window again — on two separate heads its last required check completed *after* another PR had already merged (by 2m11s on `2a2900cb`, by 2m38s on `8c407fb5`), so it was never simultaneously green and up to date. A hand-coordinated merge freeze was declared across the parallel sessions and did **not** hold `main` still: `main` advanced four times between #119's first fully-green head and its merge, one of those 8m26s after the freeze was recorded in a work claim. #119 did land in the end, at 2026-08-02T01:45:00Z, 12h15m after auto-merge was armed. That is the evidence that hand coordination is not the fix.
+
+**Why:** the cost is finished work sitting undelivered while everyone believes it is landing. This is the repo's recurring defect shape — a signal accurate about what it looks at and silent about what it does not ([`Secure_Development_Standards`](Secure_Development_Standards.md) §3) — but the worst variant, because every other instance has *someone waiting on a result*. Here the author already had their full pass and has no reason to look again. It also scales the wrong way: the more sessions working in parallel, the more often `main` moves, so the race gets harder to win exactly as throughput rises.
+
+**Measured cost, re-derived 2026-08-02.** The first account of this instance was wrong in every load-bearing figure, and a peer caught it rather than its author — so every number below is re-derived from the Actions API and carries its unit.
+
+*One worked instance.* #132 dispatched **nine CI runs — ten attempts — across eleven head moves** in a 3h28m open window. `main` moved **five times** underneath it. Five of the eleven head moves were rebases, four of them onto a tip that had landed 1–14 minutes earlier; **four runs were cancelled in flight** by `ci.yml`'s `cancel-in-progress` concurrency when a newer push superseded them. Cost: **212.7 min of run wall-clock**, or **442.5 min of job wall-clock** summed across matrix legs — the two differ by 2.08x, so neither is meaningful without its unit, and neither is *billable* minutes (`/timing` reports 0 billable ms on every run; these legs are self-hosted, so no billable figure exists to quote). Note what this instance is **not**: two of its attempts failed on real defects — one of them on the very head it opened at — so it is not a change that was right on the first pass and re-run anyway. The cost that generalises is the four superseded runs and the four rebase-driven re-runs — the ones that carried no new information about the change.
+
+*The general form.* N ready PRs become N sequential suite-length cycles, because each merge invalidates every other. `main` moved **22 times on 2026-08-01**. Re-measured 2026-08-02T04:10Z: **0 of 14 open PRs were `CLEAN`** — not one could merge. Nine were green (0 failing, 0 pending) and stopped only by staleness or conflict; separately, nine of the fourteen carried armed auto-merge that could not fire. The cohort tabulated above **did not drain**: all eight are still open, and #96 has now been armed 39h at 26 commits behind. Re-read **nine hours later at 13:25Z** — 15 open, 10 armed, still **0 `CLEAN`**. The membership churns constantly; the condition has not lifted once.
+
+*It is also a measurement cost, which is how this joins #344.* Supersession-and-re-run turns this population into one that **two different filters prune in two different ways**, and a margin read off either without naming it is not a margin. Filtering by **job** conclusion deletes rows where the job was cancelled but the *step* succeeded — the tightest rows, by construction, because a step near the cap is exactly what pushes its job past the job cap. The default **latest-attempt** view (`actions/runs/{id}/jobs`, `gh run list`) instead hides *failed earlier* attempts; it does not move a step-success maximum, but it conceals that the sample is **right-censored** — the largest step observable is the largest that *fit* under the cap, never the largest the suite wanted. Read `?filter=all` to see the censoring, and key on the **step's** own conclusion, not the job's.
+
+*The readiness signal cannot be distinguished from its own absence.* Re-measured 2026-08-02T13:41Z: of 14 open PRs, **9 carried armed auto-merge and 6 of those were inert** — five `BEHIND`, plus #71 armed *and* `DIRTY`, which cannot land at all. **Zero armed PRs were `CLEAN`.** Every session here reads `autoMergeRequest != null` as *"this will land"* — the author of this paragraph did exactly that about their own PR an hour earlier — when for two-thirds of them it means *"this waits until a human runs `gh pr update-branch`"*, with nothing reporting the difference. That is what lifts this item out of efficiency and into correctness: *"merges are slow"* has a **"then be patient"** answer; *"the merge-readiness signal is unfalsifiable from outside without a second query nobody runs"* does not. Same defect class as ADR 0158's — a green signal that means nothing — observed live rather than in retrospect.
+
+*The largest cost is protocol, not throughput.* With no queue, sessions invent an ordering ritual to compensate — and the ritual is less reliable than the mechanism it replaces. Self-reported instance from the same night: a session assured a peer it would not jump the queue **while its own PR had auto-merge armed** and would have landed with nobody deciding anything. [`WORKTREES.md`](WORKTREES.md) already names that failure — *"'Don't do X' is the wrong primitive when automation already has X armed"* — and that session had read the line, about this very freeze, hours earlier. Effort spent negotiating a merge order is effort a queue spends for free, and it is where the night's stale facts and unenforceable promises came from. Wall-clock a reader can dismiss as impatience; this is not that.
+
+**What a merge queue does not fix.** Stated level with the cost, because filing an overclaim inside the ticket about overclaiming would be its own instance:
+
+- The overnight run of eight merges was strictly serialized (min gap 26m06s, mean 35m16s over 7 gaps) — but **serialization is not evidence that hand coordination worked.** It is entailed by `strict = true` plus a full-suite cycle, human or no human. `strict` also does not always serialize: #110 and #111 merged **24 seconds apart** on 2026-08-01, #111's squash commit parented directly on #110's. That mechanism is **not established** — only the timestamps and the parentage are.
+- A queue does not shorten the suite. It reorders the same cycles; the wall-clock bounds tracked in #344 are untouched by it.
+- **A queue would not report at all today.** Measured 2026-08-02: **no workflow under `.github/workflows/` carries a `merge_group:` trigger**, against 13 required contexts in branch protection — so by the mechanism step 2 describes, zero of them would report. Enabling the queue before step 2 lands would wedge every open PR. Step 2 is a precondition, not a follow-up.
+
+**Proposed:**
+1. Enable a merge queue on `main` (branch protection → *Require merge queue*), squash method to match the existing history.
+2. Reconcile the required set against it: a queue runs checks on a `gh-readonly-queue/**` ref, so any workflow that must gate the queue needs a `merge_group:` trigger. Every context in [`.github/required-contexts.txt`](../.github/required-contexts.txt) lacking one will never report there — that file's own required-but-absent trap, in a new place.
+3. Decide the interaction with `strict = true`. A queue makes it largely redundant; leaving both on is safe but keeps the re-sync burden for anything bypassing the queue.
+4. Once landed, [`check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) goes quiet on its own. Keep it — it is the detector for this class returning.
+
+**Related:** [`scripts/ci/check_stalled_prs.py`](../scripts/ci/check_stalled_prs.py) + [`.github/workflows/stalled-prs.yml`](../.github/workflows/stalled-prs.yml) (built alongside this filing — it reports the condition, it does not remove it); [`.github/required-contexts.txt`](../.github/required-contexts.txt); [`scripts/ci/check_required_workflow_state.py`](../scripts/ci/check_required_workflow_state.py) (sibling: "can this context ever report?" to this one's "can this PR ever merge?"); #344 (the wall-clock bounds that killed one of #119's runs, and the sibling half of the measurement cost above); #320.
+
+**Source:** stuck-CI triage, 2026-08-01. Measured live against `MEFORORG/MessageFoundry` branch protection and the open-PR set that date; independently reached by three parallel sessions from separate evidence. Cost evidence and both corrections above re-derived from the Actions API on 2026-08-02 under adversarial verification, after the first hand account of #132 proved wrong in every load-bearing figure.
+
+---
+
+## 344. Fixed wall-clock bounds have drifted out of proportion to the work they bound
+
+> 🚧 **Status OPEN (filed 2026-08-01).** Value **6/10** · Difficulty **4/10** · _fill-in_. Hardcoded real-time budgets — a CI `step_timeout`, a CI `job_timeout`, a test helper's poll deadline — were sized when the work was smaller or the machine faster, and nothing re-derives them. The CI-cap instances are closed as each is re-measured; **instance 2 was resolved 2026-08-02 and turned out not to be a bound problem at all** — a swallowed SQL Server lock-timeout stranded a lane in a terminal IDLE, and no budget would have helped. The generic remedy — a mechanical margin check, and a sweep of the remaining bounds — is **not** built. *Deliberately no count of instances in this banner:* concurrent PRs are adding and closing them, so an enumeration is a completeness claim that goes stale on whichever lands first — the liability [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 warns about. The item's real lesson is now instance 2's: **a timeout with zero failing assertions is a diagnosis to be made, not a number to be raised.**
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** a fixed wall-clock bound with no relationship to the work it bounds fails the day the work grows, and it fails as a **timeout with zero assertion failures** — which reads as a broken branch when nothing is broken.
+
+*Instance 1 (fixed 2026-08-01, this filing).* `ci.yml`'s Windows `step_timeout: 26`. windows-2025's max PASSING `Tests (pytest)` step was **25:51** — a **1.006x** margin, nine seconds — and PR #119 was killed at 26:07 with zero test failures after #74 added a 1,506-line test file. The comment beside the cap asserted "~2x headroom", a figure that matched no leg. Raised to 36:00 (1.393x) with the measurement, its pool and its date recorded in place of the multiple. Pool: every `ci.yml` run created 2026-08-01 UTC — 70 runs, per-leg n = 42 ubuntu / 39 windows-2022 / 36 windows-2025 — timing the STEP and filtering on the STEP's own conclusion. That pool is **right-censored**: it predates the raise, so every observation survived a 26:00 cap and 25:51 is a *lower bound* on what the suite wants. Confirmed the next day, once the cap no longer censored it: windows-2025 produced **26:23 twice, both passing** — runs that the old cap would have killed. The API hides this by default: the jobs endpoint returns only the latest attempt, so a step killed at the cap is invisible behind its passing re-run unless you ask for `?filter=all`.
+
+*Instance 2 (**RESOLVED 2026-08-02 — and it was never a bound problem**).* Presented as `tests/test_stage_dispatcher.py`'s `_wait_until` 8.0s budget expiring on the SQL Server leg with zero logic assertions failing (two occurrences in 21 days: `test_adr0070_1_stop_policy_bounds_deterministic_infra_head`, run 30733129076; `test_adr0070_9_content_retry_is_not_an_infra_fault`, run 30716979773 attempt 1 — ~0.4%/test over ~479 observations, zero on Postgres/119 and zero on SQLite/1,105). **The bound was never the cause and must not be raised**: the test passes in max 0.204s on green SQL Server jobs and 0.576s at worst across 241 runs, so 8.0s is 14–39× the worst passing run and both failures sit ~7× beyond the *entire* passing distribution — a gap, not a tail. Past ~31s a raise would convert a real 30-second store hang into a silent PASS.
+
+The actual mechanism, **proven by forcing it on a live SQL Server** rather than argued: `claim_fifo_heads` runs under `SET LOCK_TIMEOUT 0`, so a momentarily contended head raises native error **1222** instantly; the store **catches 1222 and returns a normal EMPTY result** (`store/sqlserver.py`, the `_is_lock_timeout` branch — deliberate, the "never-block" yield, logged only at DEBUG). The dispatcher's EMPTY branch then takes **T12**: `phase=IDLE` with **no timer armed**. In production the periodic sweep re-readies exactly such a lane; the ADR 0070 tests set `sweep_interval=3600` with an empty `lane_provider` **on purpose**, so IDLE is **terminal** there and the lane can never be re-claimed — the poll then cannot succeed at any budget. Holding a conflicting row lock across the post-unpark re-claim reproduces it deterministically: `empty_claims` goes `(0,0,0)` → `(1,0,1)`, the lane sits `IDLE` with `park_until=None` and no armed timer, the head is still `pending` and **due**, and releasing the lock does *not* recover it. The same stranding was then observed **unforced** on a local full-file run (`test_adr0070_1_retry_forever_never_stops_alerts_stuck[sqlserver]`). This is a **test-rig gap, not an engine defect** — production's backstop (the sweep) is intact, and arming a timer on every EMPTY instead would re-introduce the very spin ADR 0070's fix-A backoff exists to collapse.
+
+**"SQL Server-only" is the wrong reading, and the distribution does not say otherwise.** There is a *second*, quieter route to the same spurious EMPTY on SQL Server: the batch claim's lock probe runs `WITH (UPDLOCK, ROWLOCK, READPAST)`, so a contended head is **skipped**, and the head-pinned contiguity step then drops the whole lane ("rn=1 missing drops the whole lane => EMPTY") — with **no log line at all**, not even the DEBUG one. And Postgres is **not structurally immune**: its claim uses `FOR UPDATE SKIP LOCKED` ([`store/postgres.py`](../messagefoundry/store/postgres.py)), the same head-of-line skip; its 119 observations at a ~0.4% rate expect ~0.5 events, so they exonerate nothing. Only **SQLite's** 0/1,105 is structural (in-process, no lock-timeout translation and no skip-locked semantics). Read the symptom as **server-backed store**, and note that the counters cannot separate the two SQL Server routes — both read `(1, 0, 1)`.
+
+Fixed two ways in [`tests/test_stage_dispatcher.py`](../tests/test_stage_dispatcher.py): `_wait_until` now **raises on expiry** carrying the lane's phase, park deadline, streak, task state, the store row's status/`next_attempt_at`, the clock, and `empty_claims` — plus a one-line **verdict** naming which hypothesis the reading proves, so no future occurrence needs re-diagnosing from scratch; and the ADR 0070 waits now stand in for the sweep those tests disable — re-readying a lane found in terminal IDLE, but **counted and capped at one**, so a genuine contention regression still fails loudly instead of being absorbed. Both halves are falsification-tested: with the stand-in disabled the same injected EMPTY reproduces the original failure, now carrying the full diagnostic instead of a bare `assert False`.
+
+*Instance 2, RE-DIAGNOSED 2026-08-02 — and the original diagnosis was wrong.* It recurred on PR #138, on a different test (`test_adr0070_1_stop_policy_bounds_deterministic_infra_head[sqlserver]`, run 30733129076), and the timings refute "the bound is too small": the failing test took **8.185s**, i.e. `_wait_until` burned its full 8.000s and setup+teardown cost 0.185s — the store was *fast* at the moment of failure. In the same process, against the same container, the sibling `test_adr0070_1_retry_forever_never_stops_alerts_stuck[sqlserver]` drove **seven** identical fault cycles in **0.364s**, and the `[sqlite]` variant of the failing test passed in 0.144s. One fault cycle costs ~30-45 ms against an 8000 ms bound. Over a sample of green sqlserver jobs this test passes in min 0.185s / median 0.196s / max 0.204s, so the bound is ~39x its worst passing run; a wider 21-day pass put the worst passing observation at 0.576s, still ~14x. Rate: 2 failures in ~479 observations of the two affected tests (~0.4%). Postgres saw zero in 119 observations, which **exonerates nothing** — at ~0.4% that sample expects ~0.5 events, and Postgres claims via `FOR UPDATE SKIP LOCKED`, the same head-of-line skip; only SQLite's 0 in 1,105 is structural, because its global lock totally orders producers and claimers. Both failures sit ~7x beyond the entire passing distribution — a gap, not a tail, which is the signature of a categorically different event rather than latency creep.
+
+**This instance therefore inverts the item's own generic remedy, and that is the useful part.** "Size the bound against the work" (proposal 2) would derive ~1-2s here — *tighter* than the 8.0s already in place. There is no larger number to justify. Raising it would convert a 0.4% visible failure into a 0.4% invisible 30-60s pause. **What is settled is the negative: not latency, and the remedy is not a bigger number.**
+
+What is NOT settled is the mechanism. Two independent passes reached different answers — one proposes a sanctioned EMPTY claim dropping the lane to IDLE, terminal because these tests deliberately disable the production sweep (`lane_provider=set()`, `sweep_interval=3600`) that recovers it; the other returned NOT PROVEN, and is right that the evidence cannot distinguish that from a genuine stall, because the assertion is a bare `assert await _wait_until(...)` that prints only `assert False` — recording no phase, no park deadline, no streak, no task state. **The first fix is observability, not a bound** (proposal 6): a failure that cannot say why it failed will be re-diagnosed wrongly every time, which is exactly what happened here.
+
+*Instance 3 (fixed 2026-08-02).* The same `ci.yml`'s `job_timeout`, sized by a `+4`-over-`step_timeout` convention nobody ever summed against what it had to hold. **Two** steps in that job carry `step_timeout` — `Tests (pytest)` and `Web console tests (pytest)` — so the job must cover their sum plus setup, a quantity `step_timeout` cannot bound. Recomputed from measured maxima, ubuntu stood at **−0:20** and windows-2025 at **−0:53** against their own caps: both already underwater, unnoticed because the bound was derived from the other bound instead of from the work. It presents as a **green first step followed by an unattributed job-level kill** (run `30724385719`: `Tests` 25:51 SUCCESS, then the job cancelled at 30:13) — a signature instance 1's proposed step-level margin check would *not* catch, because the step it measures passed. Raised to 26:00 / 46:00. **Still open underneath:** the nesting invariant `ci.yml` asserts holds for the first gated step and for the second on *no* leg, since reaching it already spends setup plus `Tests`; satisfying it would need `job_timeout` past 39:24 (ubuntu) / 73:21 (Windows). The fix is proposal 5.
+
+*A note on this item's own measurements.* Instance 1's figures have now been published wrong twice — first as 24:35 over "11 passing runs" (a `gh run list` default page, filtered on the **job's** conclusion while timing the **step**, which deletes the tightest rows by construction), then as the right maxima over "101 runs" with an `n` that no pool definition reproduces. The maxima survived both passes; the *pools* did not. An item about bounds stated independently of the work is an uncomfortable place to state a sample size independently of the sample, so: the pool is named in instance 1 and is recomputable from the API in one query.
+
+**Why:** these fail *individually blameless*. The remaining CI margin is a **shared budget nobody accounts for** — three PRs each adding a minute of Windows time reproduce #119's death, with no single PR at fault. And this repo has twice mislabelled such a failure: the two famous "flakes" turned out to be a livelock and a test that was right. A timeout with no failing assertion is the exact signature that invites the wrong diagnosis.
+
+**Proposed:**
+1. **A mechanical margin check** (suggested by the ASVS-scorecard session, whose framing this is): compare each leg's actual `Tests (pytest)` step duration against its configured `step_timeout` and fail below ~1.3x. Computable from data CI already emits. It would have flagged windows-2025 *before* #119 died — it was already at 1.006x and nothing said a word — and unlike the "re-check the margin when the suite grows" instruction in `ci.yml`, it does not depend on anyone remembering. **The case for a computed gate over an instruction is now evidential, not a matter of diligence.** Across the 2026-08-01/02 CI-triage cluster, *seven* published claims were retracted — margin figures, pool sizes, "#119 died", "26:07 does not exist", a runner count read off an endpoint that cannot see org runners. Not one was caught by re-reading. Every one was caught by a mechanism that could return "no": an adversarial re-derivation, an independent query, or an assertion. The single error its own author caught was found by running exact arithmetic over all fifteen ratios in a block, not by looking at them again. **Re-reading confirms what you meant; only a check can test what you wrote** — and as a method it is 0-for-7 here. Three traps for whoever builds it: time the **STEP**, not the job (the job is ~3 min longer with its own cap — `c53f752b`'s job ran 28:41 and passed against job cap 30 / step cap 26, and two sessions misread job for step while triaging this); and size against the **max passing** run, not the mean (windows-2025's mean ~21 min looks comfortable, its max passing 25:51 is what bites); and treat that max as a **lower bound**, because the pool is censored by whatever cap was in force when it was collected — the runs that would have exceeded it were killed, so they are missing from exactly the tail you are trying to measure.
+2. Size the remaining bounds: `grep` hardcoded `timeout=` / deadline floats under `tests/` and judge each against the work it bounds.
+3. ~~Where a virtual clock drives the system under test, the poll deadline should follow that clock, not `loop.time()`.~~ **WITHDRAWN 2026-08-02 — this proposal was wrong and would have made things worse.** `_wait_until` waits on real asynchronous I/O (store round-trips), never on virtual time, and `ManualClock.now` advances *only* inside `advance()`, which nothing calls from within the poll loop. A `mc.now + timeout` deadline is therefore never reached: the poll spins forever, converting a bounded `assert False` into an **unbounded hang** stopped only by `pytest_timeout` or the job cap — i.e. it manufactures the exact signature instances 1 and 3 are about. Verified by reading `ManualClock` (`tests/test_stage_dispatcher.py`:182-204). The lesson generalises: *a virtual clock can only bound work the virtual clock drives.*
+4. Prefer bounds expressed as a measured ratio with a date **and its pool** over round multiples, per instance 1's post-mortem. A ratio whose pool is not stated cannot be rechecked, and a pool stated but never recomputed is how instance 1 was published wrong twice.
+5. **Stop two steps sharing one `timeout-minutes` budget.** Give `Web console tests (pytest)` its own cap sized to its own work (max observed 3:33) so `job_timeout` no longer has to absorb a budget that belongs to a step. Until then the nesting invariant `ci.yml` asserts is unenforceable for the second gated step on every leg — instance 3 is the worked example.
+6. **Make a bound's expiry diagnostic before tuning it — and for instance 2 the instrument already ships.** A bare `assert await _wait_until(...)` reports `assert False` and nothing else, so every occurrence is re-diagnosed from scratch; instance 2 was read as latency for a day on exactly that basis. Have the helper raise on timeout carrying the lane's phase, park deadline and streak, whether its task is alive or holds an exception, the store row's status, and the clock. **One assertion settles instance 2's open mechanism:** `StageDispatcher.empty_claims` ([`stage_dispatcher.py`](../messagefoundry/pipeline/stage_dispatcher.py):1230) returns `(total, wake_fanout, idle_poll)` and is fed by `_record_empty`, called from exactly one site — the EMPTY branch of `_claim_and_dispatch` (:686). Under these tests' topology a clean run must read `(0, 0, 0)`, so `empty_claims[0] > 0` at the moment of failure is proof of a spurious EMPTY, and `== 0` is proof the claim never returned at all. A second, free signature is in the captured log, **for the infra-fault test only**: a healthy `test_adr0070_1_*` emits **four** `re-pending head with backoff` records (at `1001.000 / 1003.500 / 1008.000 / 1016.500`) and the failing run emitted **one**. It does NOT generalise — `test_adr0070_9_*` takes the content path, which uses `mark_failed` and never emits that line, so **zero** there is expected and is not a second mechanism. Read the counter, not the log, when in doubt. This proposal cannot itself be wrong about the cause, which is why it comes before the others.
+
+**Related:** [`.github/workflows/ci.yml`](../.github/workflows/ci.yml) §*Tests (pytest)* (instance 1 and its measurement table); [`tests/test_stage_dispatcher.py`](../tests/test_stage_dispatcher.py) (instance 2 — `_wait_until`'s raising expiry report and the counted `_wait_lane` sweep stand-in); [`store/sqlserver.py`](../messagefoundry/store/sqlserver.py) (`_is_lock_timeout` — the 1222-as-EMPTY yield that instance 2 turned on); ADR 0070 (the infra-fault machinery the affected tests cover); #320 (windows-2025 slowness — the capacity fact that shrinks every Windows margin); #340 (the other half of this triage); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (prose asserting a margin the numbers do not support — five instances found on 2026-08-01 alone).
+
+**Source:** stuck-CI triage, 2026-08-01. Instance 1 re-measured 2026-08-02 across 36 step-success windows-2025 rows (pool: 70 `ci.yml` runs created 2026-08-01 UTC), by two agents deriving it independently after the first two measurements both reported pools that did not reproduce; instance 2 reported and diagnosed by the HA-construct-recheck session from PR #129's sqlserver leg; instance 3 from the same 2026-08-02 re-measurement.
+
+---
+## 339. Sandbox IPC codec: parent executed child-chosen code (ADR 0087 MFW2)
+
+> ✅ **SHIPPED 2026-08-01 (ADR 0087 MFW2 amendment, `c0d61b94`).** ADR 0087's `mode=subprocess` boundary was **bypassable**: the worker pickled a Handler's raw return into `{"ok": True, "result": ...}` and the **parent** called `pickle.loads` on it, so a Handler returning an object with a custom `__reduce__` executed arbitrary code in the engine process — the one holding the DEK, the audit chain and every live socket. Proven end-to-end. Both legs now use a **closed-tag, non-executing codec** ([`pipeline/_sandbox_codec.py`](../messagefoundry/pipeline/_sandbox_codec.py)): `json.loads` with no object hooks plus a literal tag dispatch over a closed constructor set, so the decode path cannot name a type, import a module, `getattr` on child data, or reach `__reduce__`. A **restricted unpickler was evaluated and disproved** — a `BUILD` opcode over an allowlisted frozen dataclass yields `Send(to=42, message=[])` with `__post_init__` never running. Adversarial review then found a **second, independent break in the correlation defense the codec introduced**: the request id was a per-spawn nonce + counter, disclosed to the child, and only `(id, phase)` was checked — a Handler could pre-stage a forged frame for the next id and have it consumed as an **unrelated** message's result (silent misdelivery to any registered outbound, no `ERROR`, no disposition anomaly, deterministic). Closed three ways: a fresh `secrets.token_hex(16)` per dispatch, binding of the whole `(id, phase, name)` triple, and an unsolicited-frame check fatal to the worker. `mode=off` stays default and byte-identical. Suppression hygiene: the `nosec B403` and the repo's **only** `nosemgrep` are deleted, not reworded — zero `pickle`/`marshal` remains in `messagefoundry/` or `tee/`.
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** shipped. **Severity:** high (blast radius: full bypass of the isolation boundary), low (likelihood: requires Handler-authoring rights, i.e. an admin — but distrusting admin code is the sandbox's entire purpose).
+
+**Relationship to #197:** #197 shipped the boundary; this fixes the transport that made it bypassable. It does **not** widen ASVS 15.2.5 — it restores the address-space half to what #197 claimed. Confinement is still address-space only.
+
+**Net effect on correctness:** measured against a HEAD baseline on a 41-check `mode=off` vs `mode=subprocess` parity sweep, the codec is a **win** — HEAD had 10 divergences, MFW2 has 3, two of which reproduce identically at HEAD. It also fixes `mode=subprocess` being outright **DOA for ADR 0013 loopback re-ingress** (`CapturedResponse` lived in the forbidden `messagefoundry.store`, so `pickle.loads` killed the child).
+
+**Residuals (stated in ADR 0087, not left implicit):** ~1.2–1.4× marshalling cost on a graph with a large reference table (~162 msg/s per lane at 20k entries — inside the existing ~60 msg/s per-interface end-to-end bound, so not the binding constraint); a compromised worker can still deny its **own** feed via a wrong-guess forged frame or a grandchild on the inherited fd 1 (fail-closed, kill+respawn); a contract-violating **mutating Router** diverges between modes (pre-existing at HEAD, pinned by a test that asserts the inequality on purpose so a future change cannot silently close it without deleting the residual); a Handler's exception reaches the operator wrapped in `SandboxError` (same disposition, `last_error` text only; pre-existing).
+
+**OPEN — owner decisions, deliberately not taken here:**
+
+1. **Erratum / advisory.** The shipped `mode=subprocess` did not deliver the boundary it advertised, for anyone who opted in. Whether that warrants a security advisory or release note is a disclosure call, not an engineering one.
+2. ~~**`docs/adr/README.md:121` still reads "Closes the WP-L3-17 residual (residual-closure)"**~~ — **DONE 2026-08-01, not open.** The contradiction with `:175` (ADR 0144, "15.2.5 stays **Partial**") was real and :175 was the correct position: confinement is address-space only until [ADR 0147](adr/0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md) lands. The edit landed as `08d898bc` in this same PR, once `claude/adr-asvs-scorecard-as-data` merged (ADR 0156, PR #120) and the worktree guard released; the row now records the MFW2 amendment and agrees with `:175`. **This entry is corrected rather than deleted because it read "the edit was NOT made" for the life of the branch, and at least four sessions saw it in that state.** The same closure claim in **#197's banner above** is corrected in the same pass as this note — it was the last copy of it in this file.
+3. **Private-vault doc pass.** `docs/security/THREAT-MODEL.md` 15.1.5 row, `ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17, and theme 6 of `ASVS-L3-RISK-ACCEPTANCE-REGISTER.md` all describe the pre-MFW2 boundary. `tests/test_threat_model_doc_drift.py` had **pinned the literal token `pickle`** in that row — which after this change would have *required* the doc to assert a mechanism the code no longer has — so the anchor moved to `_sandbox_codec`. Those 89 drift tests skip in every checkout (the directory is gitignored with zero tracked files), so **CI cannot catch this drift in either direction**; the vault edit is a manual, coupled follow-up.
+
+**Not fixed here, deliberately (each wants its own item):** process-group kill (a grandchild inherits fd 1 and outlives `proc.kill()`); the unframed inherited stderr; and the latent tuple/set-of-`Send`s accept-and-drop, which this codec **preserves on purpose** (it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()` so `_partition` stays the sole filter) rather than changing routing behaviour inside a security fix.
+
+**Related:** #197 (the boundary), ADR 0087 (amended in place — AC-8..AC-15, no new number), ADR 0147 (its broker now explicitly rides this codec's closed grammar), ADR 0104 (AC-4 re-worded off pickle; the copy-on-Send guarantee is strengthened — `Send` carries encoded text, so the parent's rebuild is a provable no-op), ADR 0144 (the static half of the same 15.2.5 defense).
+
+**Source:** evaluation of an unscoped "recheck the pickle sandbox" suggestion, 2026-08-01; defect confirmed by proof-of-concept before any code was written.
+
+---
+
+## 341. Handler returning a tuple or set of Sends delivers nothing, silently
+
+> 🚧 **Status OPEN (filed 2026-08-01).** `_partition` ([pipeline/dryrun.py:112](../messagefoundry/pipeline/dryrun.py)) narrows with `items = result if isinstance(result, list) else [result]`. A **`list`** of `Send`s works; a **tuple** or **set** does not — the container itself becomes the single item, matches none of the three `isinstance` filters, and yields `([], [], [])`. **Verified live:** `_partition((send, send))[0] == []`. The Handler ran, returned deliveries, and **nothing is delivered and nothing errors** — the message finalizes `FILTERED` (every handler ran but delivered nothing), which is indistinguishable from a handler deliberately declining it. That is an **accept-and-drop**, the one thing CLAUDE.md §12 forbids outright.
+
+**Cluster:** Correctness / data loss. **Priority:** P1. **Verdict:** build (small). **Severity:** high (silent PHI non-delivery, no operator signal), medium (likelihood: `return (Send(...), Send(...))` is a natural idiom and a one-character difference from the working form).
+
+**Why it is not merely cosmetic:** the disposition is not `ERROR` and not `UNROUTED` — it is `FILTERED`, a *legitimate* outcome. So the count-and-log invariant is satisfied on paper (the message is counted and logged) while the operator is told the handler chose to drop it. Nothing in the store, the console, or an alert distinguishes this from intent.
+
+**Fix direction (not yet decided):** accept any non-`str` iterable in `_partition`, **or** fail loud on a non-`list` container. Failing loud is probably right — silently accepting a tuple widens the contract, whereas a `ValueError` routes to `ERROR`/dead-letter and tells the author exactly what happened. Whichever is chosen, `SetState`/`SetMeta` must behave identically, and `HandlerFn`'s type hint should be widened or tightened to match so mypy catches it at authoring time.
+
+**Pre-existing, not introduced by #339.** ADR 0087's MFW2 codec **deliberately preserves** this behaviour rather than changing routing semantics inside a security fix: it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()`, so `_partition` stays the sole filter and `mode=off` / `mode=subprocess` agree. Fixing `_partition` fixes both modes at once.
+
+**Related:** #339 (found during its adversarial review), ADR 0005 / ADR 0081 (`SetState` / `SetMeta`), CLAUDE.md §12.
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; confirmed by direct execution of `_partition`.
+
+---
+
+## 342. Sandbox worker kill does not reap a grandchild holding the response pipe
+
+> 🚧 **Status OPEN (filed 2026-08-01).** `SandboxSession._kill` ([pipeline/sandbox.py:323](../messagefoundry/pipeline/sandbox.py)) calls `proc.kill()`, which terminates **only the direct worker child**. Admin-authored Handler code running in that child can spawn a grandchild, which **inherits fd 1 — the response pipe** — and survives the kill. It can then write frames onto a pipe the parent believes belongs to a freshly-spawned worker, and it leaks as an orphan process for the engine's lifetime.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build (small). **Severity:** medium, low (likelihood: requires Handler-authoring rights, i.e. the same admin threat model as #339).
+
+**Bounded by the #339 correlation fix, not closed by it:** a grandchild cannot make the parent accept a *forged answer* — the per-dispatch `secrets.token_hex(16)` id is unguessable and the unsolicited-frame check is fatal to the worker. So the residual is **availability and process hygiene**, not misdelivery: the orphan can force repeated kill+respawn cycles on its own feed (each dead-lettering the message in hand, fail-closed) and accumulate leaked processes.
+
+**Fix direction:** spawn into a job object on Windows (`CREATE_NEW_PROCESS_GROUP` + a kill-on-close job) and a process group on POSIX (`start_new_session=True`, then `killpg`), so the whole tree dies with the worker. Note the platform asymmetry is the same one ADR 0147 already documents for confinement, so the two should be designed together rather than twice.
+
+**Related:** #339, ADR 0087 (residual now stated there), ADR 0147 (OS-level confinement — the natural home for the job-object work), #343 (the sibling fd-2 issue).
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01.
+
+---
+
+## 343. Sandbox child stderr is inherited unframed into the engine log stream
+
+> 🚧 **Status OPEN (filed 2026-08-01).** The worker is spawned with `stderr=None` ([pipeline/sandbox.py:266](../messagefoundry/pipeline/sandbox.py)), so the child's stderr is the **engine's own stderr**, unframed and unattributed. fd 1 is the IPC channel and is strictly framed; fd 2 has no such discipline. Admin-authored Handler code can therefore write arbitrary bytes straight into the engine's log stream — including forged log lines, ANSI control sequences, or content that breaks whatever consumes those logs (NSSM captures stdout/stderr to files; see [docs/SERVICE.md](SERVICE.md)).
+
+**Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (small). **Severity:** medium (log forgery / audit confusion), low (likelihood — same admin threat model).
+
+**Two distinct problems, worth separating when fixed:** (a) **attribution** — a line from a sandboxed Handler is indistinguishable from an engine line, so an operator cannot tell which inbound produced it; (b) **PHI** — a Handler that `print()`s a message body to stderr writes a full payload into the general log at whatever level the operator is running, which CLAUDE.md §9 forbids for INFO and above. (b) is the one that matters for a PHI deployment.
+
+**Fix direction:** capture the child's stderr (`stderr=subprocess.PIPE`) and relay it through the engine's stdlib logger on a reader thread, prefixed with the inbound + worker identity and rate-limited. That also removes the interleaving hazard of two processes writing one fd concurrently.
+
+**Adjacent, same fd-discipline root:** a Handler that `print()`s to **stdout** is a latent landmine in both the pre- and post-#339 code — it lands in the `TextIOWrapper` buffer rather than the `BufferedWriter` the frames use, so it happens not to corrupt a frame today. That is luck, not design, and should be closed with this item (redirect the child's `sys.stdout` to stderr at bootstrap, leaving the raw fd 1 exclusively for frames).
+
+**Related:** #339, #342 (sibling fd-1 issue), CLAUDE.md §9 (PHI logging), ADR 0087.
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01.
+
+---
+
+## 346. The sandbox import boundary is enforced only at runtime, under an off-by-default flag
+
+> 🚧 **Status OPEN (filed 2026-08-02).** A type the sandbox child must **construct or receive** cannot live under a prefix on `DEFAULT_FORBIDDEN_MODULES` ([pipeline/sandbox.py](../messagefoundry/pipeline/sandbox.py)) — the child's import guard raises and the dispatch fails. That rule is real, it has already been violated once in shipped code, and **nothing enforces it**. `CapturedResponse` lived in `messagefoundry.store`; the child could not import it, which made `mode=subprocess` + ADR 0013 loopback re-ingress **DOA** until #339 relocated it to [config/response.py](../messagefoundry/config/response.py). The only guard runs **in the child, at dispatch time, and only when `[sandbox].mode=subprocess`** — which is not the default, so a re-violation is invisible to a green suite.
+
+**Cluster:** Correctness / test coverage. **Priority:** P2. **Verdict:** build (small). **Severity:** medium (blast radius: a feature is DOA for everyone who opted in), medium (likelihood: the codec's constructor set is precisely the surface that grows as the payload model does).
+
+**Why it fails selectively — the reason this wants a test and not a comment.** The population that could report the breakage is the population *not* running the default. A future violation yields a green CI suite, a byte-identical `mode=off`, and a hard failure **only** on installs that turned the sandbox on for security reasons. The failure mode is inverted: the more security-conscious the deployment, the worse its experience, and the quieter the signal reaching the maintainer.
+
+**Measured, not assumed (2026-08-02):** `git grep -l "FORBIDDEN_MODULES" -- tests/` returns nothing — no test references the constant in any form. [`_sandbox_codec.py`](../messagefoundry/pipeline/_sandbox_codec.py) imports exactly the types the two ends construct (`CodeSet`/`UnmappedKind`/`UnmappedPolicy`, `ContentType`, `CapturedResponse`, `RunContext`, `Send`/`SetMeta`/`SetState`/`WiringError`, `Message`/`RawMessage`), today all under `config/` and `parsing/` — so the invariant **currently holds**. This item is about keeping it that way, not repairing it.
+
+**Fix direction.** A static test that walks the imports of `_sandbox_codec.py` and `_sandbox_worker.py` (stdlib `ast`, transitively across first-party modules) and asserts none resolves under a `DEFAULT_FORBIDDEN_MODULES` prefix. Anchor it on the **constant**, never a copied list — two copies of a rule drift, and the copy that drifts is the one nobody is testing.
+
+**Measurement discipline — the part that decides whether this is worth building.** The test must be demonstrated to **fail** against a deliberately introduced forbidden import *before* it is trusted. An import-walker that silently resolves nothing passes for exactly the same reason a correct one does, so a green run proves neither. Have it report what it walked, not merely that it walked.
+
+**Related:** #339 (surfaced it; relocated `CapturedResponse`), ADR 0087 (the boundary), ADR 0013 (the loopback re-ingress that was DOA), #342 / #343 (the other two findings the #339 review filed but did not fix).
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; the `CapturedResponse` violation is measured, not hypothetical.
+
+---
+
+## 345. prune-merged.ps1 orphans coordination claims; claim.ps1 cannot see a vanished holder
+
+> ✅ **SHIPPED 2026-08-02 — both halves (PR #141 + PR #151).** Deleting a worktree stranded the work-claims it held, and the claim registry had no way to notice: the orphan then blocked that key for every future session, while the tool's own advice could not distinguish it from a colleague who was mid-build. **Half A** — `prune-merged.ps1` releases the claims of a worktree it has *proven* gone, matching on full normalised path equality and reporting them in the receipt. **Half B** — `-Take` and `-Release` now probe holder liveness through the same helper `-List` uses, so the blocking paths stop recommending `-Force` on a holder nobody looked at.
+
+**Cluster:** Developer Experience & CI. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What** (the defect as found, 2026-08-02 — past tense throughout; both halves have since shipped, see *Status*): two halves of one hole.
+
+*Half A — the orphan is created and nothing cleans it up.* [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1) removes worktrees. Across its 1,108 lines there **was** no handling of coordination claims — verified by search, not assumed. A claim is a JSON file at `<git-common-dir>/mefor-coord/claims/<key>.json` carrying the holder's `worktree` path; the file lives beside the *shared* object store, so it outlives the worktree that created it. Prune deletes the directory, the claim file remains, and [`claim.ps1`](../scripts/coord/claim.ps1)'s `-Take` hard-blocks on any existing claim file. The key is then unclaimable until a human happens to run `-Release <key> -Force`. Nothing surfaces the condition; nothing times it out (correctly — see *Non-goal*).
+
+*Half B — the registry could not see that a holder was gone.* `claim.ps1`'s only staleness signal was **age ≥ 12h**, advisory text emitted by `-List` alone. `-Take` — the path an operator actually hits — printed the same "held by another session" block whether the holder was deleted, dead, or actively committing. `-Release` went further and *advised* `-Force` ("If that session is gone, re-run with `-Force`") without ever checking whether it was. PR #106 fixed `-List` by testing the holder path and printing `[HOLDER GONE …]`, but deliberately did not touch `-Take` or `-Release` — so the *blocking* paths stayed blind, which is the half that matters: `-List` is where you browse, `-Take` is where you are stopped.
+
+**Why:** the claim registry exists so a collision becomes visible *before* the work. An orphaned claim inverts that: it is a permanent false positive that teaches sessions the gate is noise. This is the second defect class named in the 2026-08-01 stuck-CI triage — *a control that cannot observe its own failure*. Ask "if this were broken, what would tell me?" and the answer is the control itself, which is the defect.
+
+The failure is also **self-concealing in the dangerous direction.** Age-staleness and holder-death present identically, so the only remedy on offer is `-Force`, applied on a signal that cannot tell the two apart. PR #106's own filing records a claim reported `STALE ~21h` whose holder had committed **two minutes earlier** — releasing on that advice hands the key to a second session to rebuild what someone is mid-flight on, which is the exact duplicate-build the registry was built to stop.
+
+**Proposed:**
+1. **Release on proven deletion.** When `prune-merged.ps1` *confirms* a worktree is gone, release the claims whose `worktree` matches it, and report each release in the receipt. Match on the holder path using byte-identical normalisation to `claim.ps1`'s writer (backslash→forward, `TrimEnd('/')`, case-insensitive) — a near-miss silently releases nothing, and a too-loose match silently releases **someone else's live claim**, which is strictly worse than the orphan being fixed. Honour the script's dry-run: a preview must release nothing.
+2. **Teach `-Take` and `-Release` the liveness `-List` already knows** (layered on #106, not duplicating it). `-Take` blocked by a vanished holder should say so and name the exact `-Force` command; `-Release` should not recommend `-Force` on a holder it never checked.
+3. **Prove the guard can see the class before trusting it.** Each test fails on purpose first — a released-claim assertion that passes against unpatched code is measuring nothing. Cover at least: claim released on prune; claim held by a *different, living* worktree left alone; dry-run releases nothing; receipt counts honestly.
+
+**Non-goal:** auto-expiring claims. `claim.ps1`'s own docs give the reason — an auto-expiring claim silently re-opens the race it exists to prevent. Releasing on *proven* worktree deletion is a different act: it is evidence, not a timer.
+
+**Status (2026-08-02).**
+
+*Half A — done, PR #141.* `prune-merged.ps1` releases the claims of a worktree it has proven gone, matching on full normalised path equality, and reports them in both the receipt and the summary. Two defects surfaced during the build, each the shape this ledger keeps recording: an unreadable claim was counted once per *removed worktree* rather than once per run (one blocked key reporting as 2), and the survey that found it sat inside the removal branch with its `Set-Exit` *after* the `-Json` block that emits the receipt and exits — so a dry run could not see the condition and the receipt would have carried `exitCode: 0` over an unclaimable key. `claims.scanned` now separates "read the registry, found it clean" from "never looked".
+
+*Half B — done, PR #151.* Deferred once on purpose: `claim.ps1` had three sessions in it at once on 2026-08-02 (#106's `-List` liveness, #140's note-refresh on the `-Take` self-refresh path, and this), and a contended 170-line script is where a semantic conflict lands green. Built once both merged, which cost one round-trip and no rework.
+
+The three surfaces now share **one** liveness helper, because they had been disagreeing: `-List` probed the holder while `-Take` and `-Release` did not probe at all. `-Take` blocked by a vanished holder now names the exact take-over commands; blocked by a *living* one it withholds the `-Force` recipe entirely and says quiet is not dead. `-Release` no longer prints "If that session is gone, re-run with `-Force`" — advice it gave unconditionally, about a holder it had never looked at, at exactly the moment an operator was deciding whether to take someone else's key.
+
+**The asymmetry is the design, not an implementation detail.** A vanished worktree is a fact and the one state safe to act on unasked; *present*, *undatable* and *unprobeable* all read as "coordinate first", never "probably fine". A probe hardwired to `gone` would pass every positive test, so each one is paired with the negative case that catches it. `-Force` itself is untouched: this reports, it does not enforce — refusing to override a live claim would strand every key whose holder is merely unreachable, which is this same bug one level up.
+
+**Related:** [`scripts/worktree/prune-merged.ps1`](../scripts/worktree/prune-merged.ps1); [`scripts/coord/claim.ps1`](../scripts/coord/claim.ps1); [`docs/WORKTREES.md`](WORKTREES.md); PR #106 (`-List` liveness, the half already built); PR #74 (the prune hardening this sits beside — liveness *veto* before deletion, where this is cleanup *after*); #344 (the sibling defect class, *a bound stated independently of the thing it bounds*).
+
+**Source:** zizmor-1280 handoff, 2026-08-02, which reported claim `7` stranded by a prune and filed the mechanism as unbuilt. Half A and Half B were then re-verified against the code directly rather than inherited: the absent claim handling by search over `prune-merged.ps1`, the `-Take`/`-Release` blindness by reading both `main` and `claim-liveness`.
+
+---
+
+## 353. Gate the risk-acceptance register against the scorecard: nothing compares its cell lists to the record
+
+> 🚧 **Status OPEN (filed 2026-08-02).** The ASVS risk-acceptance register is **ungated prose**. No CI check has ever compared the cell ids in its signed sign-off blocks against the verdict of record, and a manual cross-check found the lists had drifted substantially with **zero** alarm.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** file now, build on owner green-light. **Severity:** medium-high — the artifact that records *accepted risk* can disagree with the artifact that records *what the risks are*, indefinitely and silently.
+
+**The finding that motivates it.** Asked to fix one sign-off block, a cross-check of **all eight** against `asvs-scorecard.toml` returned **29 entries that are not carried residuals**, in three classes:
+
+| Class | Count | Why it is wrong |
+|---|---:|---|
+| `unverified` | 22 | ⛔ **A signed acceptance of a risk that was never assessed.** The cell has never been read against the ASVS requirement text at any commit. Present in **every one of the eight blocks**. |
+| `na` | 3 | Out of declared scope — there is no residual to carry. |
+| `pass` | 4 | The cell passes — there is no residual to accept. |
+
+⚠️ **Those counts are ONE measurement by ONE session and are not independently confirmed.** They should not be load-bearing for any decision until a second implementation reproduces them — **which is exactly what this gate would be.** Treat the number as the reason to build the check, never as an established fact. *(Caveat raised by the coordinator session, and it is the right one.)*
+
+**What the check is.** Roughly fifteen lines, stdlib only: `tomllib`-load the scorecard, regex the register's sign-off table rows, and for every cell id in every block compare against the record. Fail on `unverified`, `na` or `pass` appearing in an acceptance list. It needs no new dependency and runs in milliseconds.
+
+**Design notes, because a gate written carelessly here would be worse than none:**
+
+- **Print what it scanned.** Block count, row count, ids-per-block. A gate that finds nothing because its regex stopped matching the table is indistinguishable from a clean one — that failure mode has already fired twice on this project.
+- **Prove it can go red before trusting a green.** Plant a known-bad id in a fixture and assert the check rejects it, and plant a clean fixture and assert it passes. Both directions, or the check is measuring nothing.
+- **Do not auto-correct.** The gate must **report**, never rewrite. The cell lists sit inside *signed* acceptances, and silently editing signed content to satisfy a checker is a worse defect than the drift it fixes.
+- **The register lives in the vault**, so this belongs with the existing `asvs-scorecard.yml` workflow rather than in the public engine repo.
+
+**⛔ Not to be built without the owner's go-ahead.** A new security-doc gate can block merges, and that is the owner's decision like any other enforcing control. This item exists so the finding is durable, not to authorise the build.
+
+**Related:** ADR 0156 (scorecard as data — the record this would check against); the §2 banner in the register recording the same finding; and the standing question this does **not** answer, which is the owner's alone: *what the 2026-07-14 signature actually covered*, given 22 of its ids had never been examined on that date either.
+
+---
+
+## 352. Consult on enterprise AV coverage for SFTP- and file-connector ingest from outside the domain (ASVS 5.4.3 premise check)
+
+> 🚧 **Status OPEN (filed 2026-08-02).** ASVS **5.4.3** was recorded `na` on 2026-08-02 on the ground that antivirus scanning is an **enterprise-provided** control. This item exists to *test that premise* against the one ingest path most likely to fall outside it, rather than assume it.
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** consult, then decide. **Severity:** medium — the verdict of a closed cell rests on the answer.
+
+**The question, for Gabe (enterprise security):** how does the enterprise scanning stack handle files that MessageFoundry *collects* rather than receives — specifically the **SFTP/FTPS remote-file source** and the **file connector** — when the origin is **outside the organisation's domain**?
+
+The distinction matters because these two paths do not look like the case AV coverage is usually designed around:
+
+- **The engine pulls, the perimeter doesn't see a delivery.** A gateway or mail-path scanner inspects content arriving *at* the enterprise. `RemoteFileSource` reaches *out* to a partner's SFTP/FTPS server and retrieves bytes over an encrypted session, landing them straight in the engine's working area. There is no inbound delivery event for a perimeter scanner to act on.
+- **On-access scanning depends on where the file lands.** If the drop directory is on a host and volume the EDR agent actually watches, on-access scanning may cover it. If it is a network share, a container volume, or a path excluded for performance (integration hosts frequently are), it may not.
+- **The origin is a partner, not the enterprise.** These feeds come from outside the domain by definition, so "internal traffic is trusted" does not apply.
+
+**What we need out of the conversation, stated as answers not opinions:**
+1. Is content retrieved by an outbound-initiated SFTP/FTPS pull scanned at all — and by what, at what point?
+2. Are integration hosts' drop/working directories inside on-access scanning, or excluded?
+3. What happens on detection — quarantine, delete, alert-only — and does MessageFoundry learn about it, or does the file simply vanish underneath a running connector?
+4. Is there an ICAP or equivalent service endpoint the engine *could* call, if we later decide to make scanning a shipped, configurable control?
+
+**Why this is filed rather than assumed.** The `na` on 5.4.3 records its own three exposures, and the load-bearing one is that **the engine ships a scan seam** (`set_scan_hook` / `scan_inbound_file`, fail-closed on both axes when installed) — so unlike full memory encryption, this is a control the product *could* implement. The cell's ground therefore depends on the enterprise actually covering these paths. If the answer to (1) or (2) is "no", the deployment requirement attached to that `na` is not satisfied for this class of feed and the cell should be reopened by the owner.
+
+**Do not** treat this item's existence as reopening 5.4.3. That cell is closed by owner decision; only the owner reopens it, and only with an explicit instruction.
+
+**Related:** the scan seam at [`transports/file.py`](../messagefoundry/transports/file.py) (`set_scan_hook`, `scan_inbound_file`) and its remote sibling in [`transports/remotefile.py`](../messagefoundry/transports/remotefile.py); the deployment requirement recorded with the 5.4.3 ruling.
+
+---
+
+## 347. A PHI-at-rest assertion that can pass for the wrong reason — short substring vs. random ciphertext
+
+> 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_store_encryption.py:95` asserts `raw.startswith(MARKER_PREFIX) and "DOE" not in raw` — three characters of a 76-character body — as the proof that a patient surname is unreadable at rest. **The instrument is wrong in both directions.** It **fails when encryption worked perfectly** (the value is encrypted under `make_cipher(generate_key())`, a fresh random key every run, so the base64 body is fresh random text and base64's alphabet contains `D`, `O` and `E`), and — the half that matters — it would **PASS on a weak encoding that merely happened to avoid those three characters**. A test that can pass for the wrong reason is a false assurance about PHI; one that occasionally fails for the wrong reason is only noise. **The flake is what made someone look; it is not what is wrong.**
+
+**Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build (small). **Severity:** medium (a PHI-at-rest gate that certifies a property it cannot see), medium (likelihood: measured below, and it has already fired).
+
+**How it surfaced.** PR #142, CI job `91502517146`, leg `test (windows-2022, py3.14)`: `AssertionError: assert (True and 'DOE' not in 'mfenc:v1:7f...oHUc/t9nnmT9')`.
+
+**The rate — the per-CI-run figure, not the per-assertion one.** For a uniform base64 string of length *L*, a given *k*-character pattern is expected `(L-k+1)/64^k` times. At the observed ciphertext (~146 chars for the `ADT` fixture: 12-byte nonce + 76-byte body + 16-byte tag, base64'd) a 3-char literal gives **p = 5.49e-4 per assertion per run**. Derived here exactly (`Fraction`, cross-checked with `-expm1(N*log1p(-x))`); **the 200k-trial simulation corroborating it came with the originating defect report, not from this filing**; one session reproduced it independently at N=144 windows and another recomputed it analytically. All four agree. But **there are two such assertions** (`:95` and `:303`, both `DOE`) and this repo runs **three OS legs** (`ubuntu` + `windows-2022` + `windows-2025`, one Python version — [`ci.yml`](../.github/workflows/ci.yml)), so what an operator actually experiences is:
+
+| Scope | Rate |
+| --- | --- |
+| one assertion, one leg | 1 in 1,821 |
+| either assertion, one leg | 1 in 911 |
+| **either assertion, one full CI run (3 legs)** | **1 in 304** |
+
+**Both caveats, because neither number should be handed on bare.** *L* is taken from one measured at-rest value and real strings vary in length; and the `mfenc:v1:<hex-fingerprint>:` prefix region is not base64, so the effective window count is lower and **every figure above is a slight over-estimate**. Same order, not exact. What is not in doubt is the scope correction: 1 in 304 CI runs is an operational cost, where 1 in 1,821 reads as ignorable.
+
+**Confirmed by prediction, not by agreement.** After the failure, PR #142's full re-run came back **25 passed, 0 failed** with `test_bodies_encrypted_at_rest` green. That prediction (P(same collision twice) ≈ 5e-4) was written down *before* the re-run — so a green re-run confirms a chance collision rather than resetting the question. Had it failed twice, the diagnosis would have been falsified and something real would be at fault.
+
+**The convention already exists in the same file; the sweep was incomplete.** `test_cipher_round_trip_and_hides_plaintext` (:49–58) was already converted to the deterministic form and carries the rule in a comment — *"NEVER assert short-substring absence ('MSH'/'DOE') … that assertion HAS flaked in CI"* — and `test_v2_round_trip_marker_and_decrypt` (:531) cites it. The **call sites were never swept**, so the identical assertion survives at :95 and :303.
+
+**The rule, so the next call site has a boundary rather than a precedent.** A substring assertion against ciphertext is safe on **either** of two grounds, and they are not equally good:
+
+1. **Deterministic — the token contains a character the *whole stored value* cannot contain.** The haystack is `<marker>:<base64>`, so the test is against that, not against the base64 alphabet alone: `|` and `\r` qualify, **`:` does not** (the marker carries colons). Where it holds, the assertion cannot fail by chance **at any length** — a *proof*, not a probability.
+2. **Probabilistic — the token is ≥ 6 characters.** The exponent is the token length, so risk collapses fast: at 6 chars p = 2.10e-9 (1 in 477 million), at 8 chars 5.12e-13, at 14 chars 7.44e-24. Below 6, unsafe.
+
+**Prefer (1). It is the same principle as the recommended fix** — `assert ADT not in raw` is deterministic precisely because the fixture carries `|` and `\r` — so the rule and the remedy are one idea, not two. Ground (2) is what to fall back on when the token must be a bare identifier; it makes an assertion *improbable*, never *impossible*.
+
+> **A trap for whoever re-derives these.** The obvious expression `1-(1-64**-k)**N` **underflows to exactly `0.0` at k=14** — `1 - 64**-14` is not representable in float64 and rounds to `1.0` — so it reports a probability of zero, silently, with no warning, in a column of otherwise plausible values. **It is correct everywhere you would sanity-check it and silently wrong only in the tail**, which is why it survives review: the first row you try agrees with every other method to six figures. That is how the 14-char row was first written down as "unreachable", inside an analysis arguing that token length is the discriminator, at the one row where length was extreme enough to break the arithmetic. Use `-expm1(N*log1p(-64**-k))`, or `Fraction`; both give 7.44e-24. **The figures above were computed both ways and agree.** Reproducing that zero in a doc about an assertion that states more confidence than it has would have been the same defect one level up — hence "7.44e-24", not "0".
+
+**Audit of the siblings — the answer is neither "just one" nor "all of them".**
+
+| Site | Literal | Chars | p per assertion per leg | Verdict |
+| --- | --- | --- | --- | --- |
+| `test_store_encryption.py:95` (`test_bodies_encrypted_at_rest`) | `DOE` | 3 | 5.49e-4 (1 in 1,821) | **fix — the one that fired** |
+| `test_store_encryption.py:303` (`test_summary_and_metadata_…`) | `DOE` | 3 | 5.49e-4 (1 in 1,821) | **fix — same shape, never observed** |
+| `test_content_search.py:123` | `JANE` | 4 | 8.58e-6 (1 in 116,509) | **fix — below the ≥6 rule** |
+| `test_store_encryption.py:232/233/251`, `:303` (`999001`), `:304`, `:1062`; `test_sqlserver_store.py:1582/1584/1682/1920/2044`; `test_postgres_store.py:2163/2164`; `test_reference_sets.py:170`; `test_transform_state.py:281` | `SECRET…`, `999001`, `WESTWING`, `bad parse`, … | ≥6 | ≤2.10e-9 | **leave alone** |
+
+**Do not rewrite the ≥6 group.** They are the same *pattern* but not a defect at any rate that will ever be observed, and churning a dozen correct assertions makes the diff harder to review for no risk reduction. The pattern-propagation concern is real but is answered by **writing the ≥6 rule into the :49–58 comment**, not by the churn.
+
+**The count, stated with its basis, because three different numbers were quoted before anyone checked.** Within `test_store_encryption.py` there are **7 lines carrying 8 substring-absence clauses against at-rest ciphertext** (:95, :232, :233, :251, :303 ×2, :304, :1062), of which **2 — both `DOE`, at :95 and :303 — are below the ≥6 rule**. Repo-wide the shape appears ~16 times. Correctly **excluded** and not to be counted again: `:905–908` and `:927–928` assert against exception/`caplog` text, not ciphertext (a different shape a grep sweeps up); `:56`, `:532`, `:625` (`ADT not in token`) are safe on **ground (1)** — `|` and `\r` appear nowhere in `<marker>:<base64>`. `:512` (`":v2:" not in produced`) is deterministic too but **not** on ground (1), and the distinction is worth keeping straight: `:` *is* present in the haystack (the marker is `mfenc:v1:<fp>:`), so ground (1) does not apply. It holds instead because the marker's layout is fixed and its version field reads `v1`, while the base64 body contains no `:` for the run to straddle — structure, not alphabet.
+
+`test_off_by_default_stores_plaintext` (:111) **does not share the shape** — `_raw_at_rest(db) == ADT`, deterministic equality against known plaintext. Nor do the many `"DOE" not in …` assertions elsewhere in `tests/` that check *scrubbed plaintext* (`safe_text`, the anonymizer, ACK detail): deterministic output, not ciphertext, correct as written.
+
+**Fix direction (maintainer's choice — do NOT simply widen or delete the substring check):**
+1. Assert against the **decoded** ciphertext bytes rather than the base64 text, or
+2. assert the plaintext is **not recoverable** from the stored value (the property actually claimed), or
+3. assert full-plaintext absence — `assert ADT not in raw` — deterministic because the fixture contains `|` and `\r`, bytes base64 can never emit. That is the idiom :56 already uses, so it is the cheapest change.
+
+The `startswith(MARKER_PREFIX)` half stays in every case.
+
+**Whichever is chosen, prove the new assertion can FAIL before trusting that it passes** — break the encryption deliberately (hand the store an `IdentityCipher`, or plant a plaintext body) and watch the rewritten test go red, then restore. This item exists because a green was taken as evidence for a property it could not see; shipping its replacement on an unfalsified green would reproduce the defect in the fix. Note the trap that makes this more than a formality, learned the hard way elsewhere in this repo today: proving the *instrument* can fire is only half — the *workload* must also be able to produce the failure class. An 800-iteration repro loop returned 800/800 green against a live SQL Server while hunting a lock-contention bug, because running the tests in isolation was the one configuration that could not generate contention. A rig that excludes the condition it is hunting reports silence, and silence reads like evidence.
+
+**Related:** [`tests/test_store_encryption.py`](../tests/test_store_encryption.py):95, :303, :49–58 (the convention comment, already correct — the natural home for the ≥6 rule); [`tests/test_content_search.py`](../tests/test_content_search.py):123; CLAUDE.md §9 (the PHI-at-rest guarantee the assertion is reaching for); [`Secure_Development_Standards`](Secure_Development_Standards.md) §3 (reviewing security prose by what a reader would DO with it — the same question, asked of a test instead of a paragraph).
+
+**#344 — cited for the harm, NOT the cause; do not fold them.** Both are individually-blameless CI reds that invite the wrong fix, in a repo whose two famous "flakes" turned out to be a livelock and a test that was right. But: **#344's thesis is a fixed bound meeting variable latency; #347 is a deterministic property tested by a probabilistic proxy.** (Its *thesis* deliberately — that item's instance 2 has since been re-diagnosed as a swallowed lock-timeout rather than a bound at all, so "#344 = timeouts" is not a premise to lean on.) Neither is fixed by changing a number, for opposite reasons. The one-line discriminator, from #344's owner: **this one would fire at exactly the same rate on an infinitely fast machine.** A reader who follows the link lands on a wall-clock item and must not back-infer that this is a timing bug — it is not.
+
+**#346 — the closer sibling.** Same defect class stated generally: *an assertion that passes for a reason unrelated to the property it claims to test.* This one passes because random base64 usually lacks a 3-character run; #346's would have passed because nothing walks the imports. Both are green signals that are not evidence.
+
+**ADR 0158 — the taxonomy, and where this item sits in it.** Cited by **rule**, not just by number, because the rule is what transfers: *"An equality check satisfiable by coincidence is not an equality check."* That is this defect exactly. By the ADR's own one-line test for **Class 2** — *a control that cannot observe or act on its own failure*: **if this control were broken, what would tell me?** If the encryption were replaced tomorrow with a weak encoding, `"DOE" not in raw` would still go green. The answer is the control, which is the defect. *(Deliberately unlinked: the ADR is on PR #145's branch and not yet on `main`, so a relative link would render broken. Guessing its filename from its title is the same failure mode this item is about — it was guessed, checked, and was wrong.)* **Follow-up, deliberately not done here:** file this against ADR 0158 **once 0158 is on `main`**. Padding a document at merge time with instances its author did not choose is its own defect, and the ADR's instances are attributed by convention.
+
+**Source:** PR #142 (BACKLOG #323 layer 3, SMTP TLS), 2026-08-02 — observed on that PR's CI and deliberately **not** fixed there, because it is unrelated to the SMTP change and widening the PR would have obscured it. **Provenance is itemised, not aggregated** — "produced by N sessions" is a confidence claim, and an unsourced one of exactly that shape is what this item is about. **Rates:** derived here exactly, reproduced independently by the #142 session at N=144, recomputed analytically by #344's owner; the 200k-trial simulation came with the originating report. **Sibling audit:** derived twice from different scopes and reconciled. **Instrument-first framing, the ≥6 rule, the leave-the-rest-alone scoping:** from the #142 session's review. **The "infinitely fast machine" discriminator:** from #344's owner. **The demand to falsify the banner gate before trusting its green:** from the #346 session. No claim here rests on a count of who agreed. **Verification of this filing's own instruments:** every probability recomputed by two methods that agree (`Fraction` and `-expm1(N*log1p(-x))`), the audit counts re-derived from the working tree rather than quoted, and `backlog_status_check.py` **falsified against this item** — a deliberately doubled banner made it fail at `BACKLOG.md:8429` naming #347, so its green is evidence that it can see this item rather than evidence it skipped it.
+## 348. SQL Server: a cancelled store call returns a pooled connection mid-transaction holding X locks
+
+> ✅ **Status CLOSED (filed + fixed 2026-08-02, [ADR 0159](adr/0159-cancellation-safe-pooled-connection-release-mid-txn-discard-at-the-acquire-chokepoint.md)).** `SqlServerStore`'s write idiom is `except Exception: await conn.rollback(); raise` — used at **90 of the 91** `self._acquire()` sites. `asyncio.CancelledError` derives from `BaseException`, so on a cancellation **no rollback runs**, and aioodbc's `Pool.release()` appends the connection straight back onto the free deque with no rollback, reset or transaction check (0.5.0 `pool.py:196-205`; `_ContextManager.__aexit__` uses the *same* `release` on the exception path). The next borrower inherited an open transaction still holding X locks on `queue` rows. Fixed by quarantining the connection at the `_acquire` chokepoint.
+
+**Cluster:** Store & Reliability. **Priority:** P2. **Verdict:** built. **Severity:** medium (pool integrity + a silent stall), low (likelihood: needs a cancellation to land inside a pooled write).
+
+**Reproduced on a live SQL Server 2022 before the fix**, cancelling each call mid-body and inspecting the server: `release_claimed` **7** X locks on `queue`, `reschedule_claimed` **7**, `mark_done` **9**, `enqueue_ingress` **11** — and `claim_fifo_heads` **0** (the control). The connection was back on the free list (`size=1 freesize=1`), a raw writer got **error 1222**, and a real second `claim_fifo_heads` returned **EMPTY-all**. After the fix: **0** locks, no open-transaction session, writer unblocked, connection dropped from the pool rather than re-lent.
+
+**Why it was invisible.** Under [ADR 0066](adr/0066-pooled-stage-claimers.md) §9 the claim runs `SET LOCK_TIMEOUT 0`, so a blocked claimer raises 1222 and the claim path translates that to a **sanctioned** EMPTY-all yield. The symptom is therefore silence — a lane that quietly claims nothing — not an error anyone would see. `enqueue_ingress` is the pre-ACK ingress commit, the engine's hottest path.
+
+**The path that bites is demotion, not shutdown.** `engine.stop()` closes the store shortly after cancelling, so the poisoned connection dies at teardown. Loss of leadership ([`engine.py:1242-1252`](../messagefoundry/pipeline/engine.py), `_stop_graph`) runs the identical cancel chain but **does not close the store** — the pool stays live and shared with the coordinator/convergence loops, so the connection sits in `_free` and is re-borrowed by unrelated callers.
+
+**Two corrections to the lead that opened this.** (1) It is **not** a two-method asymmetry: an AST census found 90 of 91 `_acquire` bodies share the idiom, and `mark_done`/`enqueue_ingress` were measured leaking identically — a two-method patch would have fixed an arbitrary slice. (2) `claim_fifo_heads` does **not** shield against this; its guard is a `SET LOCK_TIMEOUT` *reset* guard, [ADR 0114](adr/0114-phase-4-claim-path-call-complexity-reduction-driver-interface-redesign-ingress-routed-reset-fold.md) §2 states there is **no rollback** on its cancellation path, and `test_adr0114_claim_fold.py::test_ac3_cancellation_at_body_await_no_rollback_guard_runs` freezes that. It ends clean because the guard **commits**.
+
+**Not a data-integrity bug.** At-least-once was never at risk — a cancelled `release_claimed` leaves rows `INFLIGHT` and `reset_stale_inflight` re-pends them, which [`stage_dispatcher.py:491-492`](../messagefoundry/pipeline/stage_dispatcher.py) already declares the intended outcome. What was broken is pool integrity.
+
+**Backend scope: SQL Server only.** Postgres is safe twice over (asyncpg's `Transaction.__aexit__` rolls back on any `BaseException`; its pool also resets under `asyncio.shield`). SQLite shares the code shape but has one writer connection under an `asyncio.Lock` and no pool, so there is no next borrower.
+
+**Related:** ADR 0159, [ADR 0066](adr/0066-pooled-stage-claimers.md) §9, ADR 0114 §2, §1 of this file (the original H-6/H-7/H-8/M-6 concurrency-safety work — M-6 was scoped to `_fetchall`/bootstrap rollback hygiene and never covered the cancellation path).
+
+**Meets #344 instance 2 at the 1222.** That item (found independently and concurrently) traces the far end of this same chain: a contended head raises 1222, the store swallows it as a normal EMPTY, and the dispatcher goes to phase IDLE with no timer armed — **a test-rig gap, not an engine defect**, since production's periodic sweep re-readies such a lane and the ADR 0070 tests disable that sweep deliberately. Nothing here contradicts that and this item's severity is **not** escalated on it. What this adds is a **duration profile**: #344 assumes momentary producer contention, whereas a connection poisoned by *this* defect holds its `queue` X locks for as long as it sits unclaimed in the pool's free deque, so the 1222 can repeat across successive sweep ticks instead of clearing on the next. Cited by ledger number, not SHA — that branch is unpushed and may be rebased.
+
+**Source:** secondary lead from a PR #138 CI diagnosis, 2026-08-02; confirmed by live reproduction rather than by the reasoning in the lead, two of whose premises proved false.
+
+## 349. Two logging tests connect to a hardcoded ephemeral-range port and can self-connect
+
+> ✅ **Status CLOSED (filed + fixed 2026-08-02).** `test_configure_logging_tolerates_unreachable_tcp_collector` connected to `127.0.0.1:65500` on the stated premise *"Port 65500 is unbound → connect raises OSError."* **That premise is unsound on Windows for any port in 49152-65535.** `SysLogHandler.createSocket` issues a **blind** connect — it never calls `bind()` — so the kernel draws the socket's own **source** port from the same dynamic range (measured `netsh int ipv4 show dynamicport tcp`: start 49152, number 16384). When the allocator hands that socket the **destination** port, the SYN matches itself, TCP simultaneous open (RFC 793) establishes the socket **to itself**, `connect()` returns success with nothing listening anywhere, and `installed` is `True`. Fixed by injecting the refusal at the syscall seam instead of over the network.
+
+**Cluster:** Testing & CI. **Priority:** P2. **Verdict:** built. **Severity:** medium (a red that reads as the PR's own defect), low (likelihood: ~1/16384 per connect).
+
+**Reproduced on the real syscall path**, not inferred: non-blocking connects to an unbound loopback port, qualified by `select()` writability **plus** `SO_ERROR == 0` **plus** a non-`0.0.0.0` local address — deliberately avoiding the `getpeername()`-on-pending-connect false positive. Source ports marched 58357 → 58396 and on the attempt that drew the destination port the socket **established with `local == peer == ('127.0.0.1', 58396)`**, `SO_ERROR 0`. An explicit `bind(65500)` + `connect(65500)` succeeds identically: **the allocator does not skip the destination port.**
+
+**`installed is True` strictly entails a successful connect** — verified from CPython 3.14.6 source and re-demonstrated locally. `logging_setup.py` sets `forwarder_installed = True` only in the `else:` of `try: _build_syslog_handler(...) except OSError`. In stdlib `handlers.py` the **inet** branch ends `if err is not None: raise err`; the *"not regarded as an error if the other end isn't listening"* swallow applies **only** to the `isinstance(address, str)` AF_UNIX branch. Local negative control: with `createSocket` patched to succeed, `installed=True` (the observed CI failure); patched to raise, `installed=False`.
+
+**⛔ The obvious fix is wrong.** "Bind a socket, read the assigned port, close it, use that" returns a port **from the ephemeral range by construction** — precisely the enabling precondition — and was demonstrated self-connectable on its own output. It appears to pass only because Windows allocates forward-sequentially with the cursor one step past the returned port: undocumented behaviour on a **system-wide** cursor shared with every other process. **This repo had already retired that antipattern** — [`tests/test_load_runner.py`](../tests/test_load_runner.py) documents the TOCTOU race verbatim. A live instance still ships at `tests/test_connection_api.py:61-67` (`_dead_port`) and was **not** fixed here.
+
+**The fix, and the trap in it.** The contract under test is *"an `OSError` raised while **building** the handler is tolerated"* — **not** *"port X is closed."* Both tests now `monkeypatch.setattr(_TimeoutSysLogHandler | _TlsSysLogHandler, "createSocket", …)` to raise `ConnectionRefusedError`, matching an idiom already used in the same file. The real `_build_syslog_handler`, the real tcp/tls/udp dispatch and the real `except OSError` warn path are all still exercised. ⭐ **Patch `createSocket`, NOT `socket.create_connection`** — `SysLogHandler` uses `getaddrinfo` + `socket.socket()` + `sock.connect()` and never touches `create_connection`, so that patch intercepts nothing and ships a still-flaky test. Two independent analyses got this wrong.
+
+**The TLS sibling (port 65501) was fixed too, and was never safe — only lucky.** After a self-connect the client reads back its own ClientHello and dies with `ssl.SSLError`, an `OSError` subclass, so its assertions still passed. Self-healing by accident is not a property to rely on.
+
+**⛔ NOT repo-wide, and the "repo-wide" label was itself the costly error.** This test has failed on **one branch, one run, one job — ever**, established by two exhaustive scans (131 and 154 failed-job logs, the latter covering all 66 failed runs, the earlier attempts of all 15 re-run runs, and the 7 failed test jobs inside 208 cancelled runs) with **verified positive controls** — the same pipeline extracted 554 other `FAILED tests/...` lines, so the zeros are true negatives. For scale, genuinely repo-wide reds here show **129 / 69 / 27** occurrences. **It did not block PR #150:** `git diff origin/main <#150 head> -- tests/test_logging.py messagefoundry/logging_setup.py` is **empty** — the test and code at the failing commit are byte-identical to `main`, and #150's diff is `scorecard.py` + its test. Re-running that one job was the entire remedy.
+
+**⚠️ Mechanism CONFIRMED as sufficient, NOT as observed.** Nobody saw it happen in the failing job: the log carries **zero port telemetry** and no captured stdout, and a transient ephemeral listener held by any unrelated runner process produces an identical observable. All socket measurement was taken on a Windows 11 26200 host that is measurably non-stock (a refused loopback connect takes ~2.0s vs ~1ms to a live listener, indicating a filter driver) — **the windows-2022 runner's own dynamic range and port exclusions were never measured**, and if 65500 is excluded there the mechanism is impossible on the only OS where it has ever fired. The observed rate also underpredicts by ~15x. Not chased further: **the fix is identical under both surviving hypotheses.**
+
+**Related:** #350 (found in the same module during this work), #351 (same defect class — an environmental assumption asserted as fact), #347 and ADR 0158 (an assertion that passes for a reason unrelated to the property it tests).
+
+**Source:** the windows-2022 leg of an unrelated PR's CI run, 2026-08-02. A prior handoff attributed it to "the OS handing 65500 to any process opening an outbound socket during a 21-minute **parallel** run" — **refuted twice over**: a port held as another socket's ESTABLISHED **source** port is measurably *not* connectable (that conflates *in use* with *in LISTEN*), and there is no `pytest-xdist` (`addopts` is `--timeout=60 --timeout-method=thread`), so pytest runs **serially** and there is no parallelism for a race to occur in. Its dynamic-range premise survives and is what enables the real mechanism: **the right fact for the wrong reason.**
+
+## 350. _TimeoutSysLogHandler never forwards timeout to the stdlib ctor, leaving the startup connect unbounded
+
+> ✅ **Status CLOSED (filed + fixed 2026-08-02).** `_TimeoutSysLogHandler.__init__` captured `timeout=` into `self._sock_timeout` and called `super().__init__(*args, **kwargs)` **without it**, so `self.timeout` stayed `None`. In stdlib `handlers.py` the inet branch runs `if self.timeout: sock.settimeout(self.timeout)` **before** `sock.connect(sa)` — that is the only thing bounding the **startup** connect. The subclass's own `settimeout` runs in `createSocket` *after* `super().createSocket()` has already returned, so it can bound later sends and reconnects but never the initial connect.
+
+**Cluster:** Observability & Ops. **Priority:** P3. **Verdict:** built. **Severity:** low (needs a collector host that DROPS rather than refuses), low (likelihood).
+
+**Why it matters.** `_FORWARD_TCP_TIMEOUT = 5.0` existed precisely so a stalled collector could not block the calling thread — the asyncio event loop — yet the one connect made during engine startup ran under the OS default instead. This contradicted the class's own docstring (*"pins a socket timeout on its socket … so a runtime send to a stalled TCP collector can't block the calling thread indefinitely"*) and `_build_syslog_handler`'s. A collector host that silently **drops** SYNs rather than refusing them would stall engine start; under pytest it would hang to the 60s watchdog.
+
+**Confirmed by source, not by symptom.** `logging.handlers.SysLogHandler.__init__` in CPython 3.14.6 is `(self, address=('localhost', 514), facility=1, socktype=None, timeout=None)` — the parameter has been accepted all along and was simply never passed.
+
+**Implementation note.** The timeout is routed through `kwargs` rather than passed explicitly: `timeout` is also `SysLogHandler`'s **4th positional** parameter, so `super().__init__(*args, timeout=…)` is a possible double-bind that **mypy strict rejects outright** (caught by the checker, not by review). Every construction site is keyword-only, so this is equivalent at runtime.
+
+**Related:** #349 (same module; this was found while fixing that).
+
+**Source:** adversarial review of #349, 2026-08-02 — an incidental finding, not the thing being looked for.
+
+## 351. SQL Server failover test asserts on a 0.35s wall-clock margin across a real DB round-trip
+
+> 🚧 **Status OPEN (filed 2026-08-02).** `tests/test_cluster_failover_sqlserver.py::test_preferred_delay0_wins_expired_lease_race_over_delayed_node` sleeps `_TTL + 0.15` so the lease is expired by ~0.15s, then requires a node carrying a **0.5s** acquire handicap to be rejected. Correctness therefore rests on **less than 0.35s of wall clock** elapsing between the sleep and `dr._maintain_leadership()` — across a real SQL Server round-trip, on a shared CI runner. Observed failing as `assert dr.is_leader() is False → assert True is False`.
+
+**Cluster:** Testing & CI. **Priority:** P3. **Verdict:** triage — **do not "fix" by widening the margin until the question below is answered.** **Severity:** medium (a red that reads as the PR's own defect), unknown (likelihood: one observation).
+
+**The discriminating evidence.** On the **same commit**, the `sql server (store + connector) 2022` leg PASSED while `2025` FAILED. A genuinely broken delay predicate would fail on both — that logic is backend-version independent. The job log also states `Command failed with exit 1 (not a native crash) — not retrying`, so this is **not** the pyodbc 3.14 segfault and its retry mitigation is not involved. Across the last 12 runs it was the **only** sql-server-leg failure, and a sibling PR on the same `main` passed both legs — so it is **not** repo-wide either.
+
+**⚠️ What this does NOT establish.** It does not exonerate the PR it fired on. That PR (BACKLOG #348 / ADR 0159) adds work at the `_acquire` chokepoint — **the exact connection path this test round-trips through** — so it may be the *trigger* without being *wrong*: it spent latency the test had no headroom for. **Distinguishing "marginal test tipped by added latency" from "real regression in the delay predicate" needs that change's author**, and is why this is filed rather than patched. Widening the margin before answering it would convert a visible question into a silent one.
+
+**Related:** #349 (same defect class: an environmental assumption asserted as fact), #347, ADR 0158.
+
+**Source:** CI on an unrelated PR, 2026-08-02, observed while driving the merge queue.

@@ -56,6 +56,11 @@ from uuid import uuid4
 import aiosqlite
 
 from messagefoundry.config.models import RetryPolicy
+
+# The captured-reply record lives in the (store-free) config layer so a sandbox worker child — which
+# may not import `messagefoundry.store` — can rebuild the SAME class the engine publishes. Re-exported
+# here so every existing `from messagefoundry.store.store import CapturedResponse` keeps working.
+from messagefoundry.config.response import CapturedResponse as CapturedResponse  # re-export
 from messagefoundry.config.settings import StoreBackend
 from messagefoundry.parsing.binary import strip_documents as _strip_documents
 from messagefoundry.redaction import safe_text
@@ -537,27 +542,50 @@ class ClaimedHeads:
 
 
 @dataclass(frozen=True)
-class CapturedResponse:
-    """One captured request/response reply (ADR 0013), as returned by ``correlate_response`` for the
-    API/console read surface. ``body``/``detail`` are decrypted here; ``body`` is ``None`` once
-    retention has nulled it (the row is kept, like a purged ``messages.raw``)."""
+class ReplyWaitState:
+    """One metadata-only snapshot for a synchronous-reply wait tick (ADR 0154 D3).
 
-    message_id: str
-    destination_name: str
-    response_seq: int
-    outcome: str
-    detail: str | None
-    captured_at: float
-    body: str | None
-    # ADR 0021 "Response Sent": 'response' (outbound reply, the default) | 'ack_sent' (inbound ACK we
-    # returned). ack_code/ack_phase are non-PHI disposition metadata, populated only for ack_sent rows.
-    kind: str = "response"
-    ack_code: str | None = None
-    ack_phase: str | None = None
-    # BACKLOG #154 (ADR 0013 amendment): the captured allow-listed HTTP response headers ({} when none /
-    # once retention nulls them). Decrypted + JSON-decoded here; a re-ingressed Handler reads it via
-    # response_get(dest).headers.
-    headers: Mapping[str, str] = field(default_factory=dict)
+    **Metadata only, by construction.** Nothing here is encrypted at rest, so a tick decrypts nothing
+    and reads no body. The reply itself is fetched exactly once, via :meth:`correlate_response`, and
+    only after :attr:`latest_response_seq` proves a row is committed.
+
+    **The message's own status is the first field on purpose.** A routed row carries a NULL
+    ``destination_name`` (only ``handler_name`` is set), so a sibling handler's still-in-flight work
+    is *structurally invisible* to the destination-keyed query behind :attr:`row_states` — which
+    means an empty ``row_states`` does **not** mean "this message was excluded". Concluding that it
+    does is the defect ADR 0154 revision 1 shipped: a ``502`` returned for a message the engine then
+    delivered normally. Consult :attr:`message_is_terminal` before ever interpreting an empty list.
+    """
+
+    #: ``messages.status`` for the awaited message, or ``None`` when the row no longer exists.
+    message_status: str | None
+    #: ``queue.status`` for each **outbound** row of the awaited destination, in no guaranteed order.
+    #: Empty while a sibling handler is still upstream — see the class note.
+    row_states: tuple[str, ...]
+    #: Highest committed ``response_seq`` for this ``(message_id, destination_name)`` with
+    #: ``kind='response'``, or ``None`` when no reply has been captured. An ADR 0021 ``ack_sent`` row
+    #: is excluded, so the inbound ACK we returned can never be mistaken for the partner's reply.
+    latest_response_seq: int | None
+
+    @property
+    def message_is_terminal(self) -> bool:
+        """Whether no reply can still arrive for this message.
+
+        **Defined by EXCLUSION, never by enumeration**, and that is a correctness requirement rather
+        than a style preference. An enumerated terminal list
+        (``UNROUTED``/``FILTERED``/``NOT_DEPLOYED``/``ERROR``) silently omits **``PROCESSED``** — and
+        ``PROCESSED`` is exactly what the finalizer sets when a *sibling* handler delivered
+        successfully while the awaited destination's ``Send`` was declined, filtered out, or never
+        emitted by a code-first Handler. Enumerating therefore hangs that turn for the full
+        ``reply_timeout`` instead of failing fast, and a future :class:`MessageStatus` member would
+        inherit the same bug silently. Exclusion is total against the enum by construction.
+
+        A vanished message row is terminal too: nothing can arrive for a message that is gone.
+        """
+        return self.message_status is None or self.message_status not in (
+            MessageStatus.RECEIVED.value,
+            MessageStatus.ROUTED.value,
+        )
 
 
 @dataclass(frozen=True)
@@ -948,15 +976,27 @@ def not_deployed_detail(destination: str) -> str:
 # be dropped); `dead`/`error`/`failed` are terminal failure dispositions an operator relies on;
 # `not_deployed` is the count-and-log record + NOT_DEPLOYED-disposition signal (see above). A blanket
 # "off" that dropped these would silently discard the compliance-critical trail.
-_AUDIT_FLOOR_EVENTS = frozenset({"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT})
+#: ``reply_timeout`` joins the floor (ADR 0154 D8): it is the one row that explains a customer
+#: complaint — "we called you and got a 504" — and an instance that thinned its logs to "errors" or
+#: "off" would lose exactly the record needed to answer that, on exactly the deployments most likely
+#: to be asked. ``reply_returned`` is the routine happy-path counterpart and is deliberately NOT in
+#: the floor: it is thinnable like ``delivered``.
+_AUDIT_FLOOR_EVENTS = frozenset(
+    {"viewed", "dead", "error", "failed", NOT_DEPLOYED_EVENT, "reply_timeout"}
+)
 
 #: The COMPLETE ``message_events.event`` vocabulary, shared by all three backends.
 #:
 #: Exported (not private) because ``docs/PHI.md`` §7 row 6 documents this list as the per-message
-#: disposition timeline and ASVS 16.1.1 scores that inventory: the doc named 9 of these 19 while
+#: disposition timeline and ASVS 16.1.1 scores that inventory: the doc once named 9 of these while
 #: reading as exhaustive. ``tests/test_phi_logging_inventory.py`` asserts the doc names every
 #: member and that the set matches the literal ``_event``/``_event_stmt`` call sites, so a new kind
 #: cannot ship undocumented.
+#:
+#: **The literal-call-site check cannot see a kind passed through** :meth:`MessageStore.record_message_event`
+#: — it AST-walks for constant first arguments, and that method forwards a variable. So that method
+#: validates its ``event`` against this set at runtime; the two guards together keep the vocabulary
+#: closed from both directions.
 MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
     {
         "received",
@@ -978,6 +1018,11 @@ MESSAGE_EVENT_KINDS: Final[frozenset[str]] = frozenset(
         "edit_resubmit",
         "viewed",
         NOT_DEPLOYED_EVENT,
+        # ADR 0154 D8 — the synchronous-reply outcome pair. Names, counts and waited_ms only; never a
+        # fragment of the partner's reply body (that is the PHI class this design keeps structurally
+        # out of every log, event and exception).
+        "reply_returned",
+        "reply_timeout",
     }
 )
 
@@ -1757,6 +1802,10 @@ class MessageStore:
         # (before the committer below) so its note_commit hook can bump committed_txns from batch start.
         self.committed_txns = 0
         self.body_copies = 0
+        # ADR 0157 C3: protocol/`/stats` uniformity only. SQLite never fences a terminal resolve —
+        # set_leader_epoch is a hard no-op here and [cluster].enabled is rejected on SQLite at config
+        # load — so this is a permanent 0 and there is no increment site in this module.
+        self.fenced_writes = 0
         self._cipher: Cipher = cipher or IdentityCipher()
         # HKDF-derived HMAC key for the tamper-evident audit chain (#190). None → the chain stays the
         # keyless SHA-256 chain (byte-identical to a pre-#190 / unencrypted store). Held only in memory;
@@ -5782,6 +5831,40 @@ class MessageStore:
         oldest = row["oldest"] if row is not None else None
         return count, (float(oldest) if oldest is not None else None)
 
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3).
+
+        Deliberately **not** built on :meth:`outbox_for`. That is a ``SELECT *`` fed through
+        ``_decode_row``, so it decrypts ``last_error`` and pulls the payload ciphertext on **every
+        tick** — a cost a poll loop cannot carry, and PHI this path has no business touching.
+        Modelled on :meth:`pending_depth` instead: three narrow indexed reads sharing one pooled
+        connection, decoding nothing.
+
+        See :class:`ReplyWaitState` for why the message's own status is returned alongside the row
+        states rather than the rows being trusted alone."""
+        async with self._read() as db:
+            cur = await db.execute("SELECT status FROM messages WHERE id=?", (message_id,))
+            message_row = await cur.fetchone()
+            cur = await db.execute(
+                "SELECT status FROM queue WHERE message_id=? AND stage=? AND destination_name=?",
+                (message_id, Stage.OUTBOUND.value, destination_name),
+            )
+            queue_rows = await cur.fetchall()
+            # kind='response' excludes the ADR 0021 ack_sent row: the inbound ACK we returned must
+            # never be mistaken for the partner's reply.
+            cur = await db.execute(
+                "SELECT MAX(response_seq) AS seq FROM response"
+                " WHERE message_id=? AND destination_name=? AND kind=?",
+                (message_id, destination_name, "response"),
+            )
+            response_row = await cur.fetchone()
+        seq = response_row["seq"] if response_row is not None else None
+        return ReplyWaitState(
+            message_status=(str(message_row["status"]) if message_row is not None else None),
+            row_states=tuple(str(r["status"]) for r in queue_rows),
+            latest_response_seq=(int(seq) if seq is not None else None),
+        )
+
     # --- recovery / replay ---------------------------------------------------
 
     async def reset_stale_inflight(
@@ -7161,6 +7244,40 @@ class MessageStore:
         now = time.time() if now is None else now
         async with self._lock:
             await self._event(message_id, "viewed", None, actor or "", now)
+            await self._commit()
+
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        ``_event`` is private to each backend and is only ever called inside a store-owned
+        transaction, so before this there was no way for ``pipeline/`` or ``transports/`` to record a
+        disposition event at all. This is the public writer; it applies the same ``#63`` verbosity
+        gate and the same ``safe_text`` scrub on ``detail`` as every internal call site.
+
+        **``event`` is validated against** :data:`MESSAGE_EVENT_KINDS` **at runtime**, because the
+        static guard cannot cover this path: ``test_message_event_constant_matches_the_literal_emit_sites``
+        AST-walks for a *constant* first argument, and this method forwards a variable. Without the
+        runtime check a typo'd or undeclared kind would write silently and pass CI.
+
+        ``detail`` carries names, counts and timings only. On the sync-reply path in particular it
+        must never carry a fragment of the partner's reply — that rule is structural in the caller,
+        and ``safe_text`` here is defence in depth, not the control."""
+        if event not in MESSAGE_EVENT_KINDS:
+            raise ValueError(
+                f"unknown message_events kind {event!r} — add it to MESSAGE_EVENT_KINDS and to the "
+                "docs/PHI.md §7 row 6 vocabulary, which CI asserts against it"
+            )
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._event(message_id, event, destination, detail or "", now)
             await self._commit()
 
     async def record_audit(

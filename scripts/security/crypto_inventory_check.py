@@ -24,6 +24,26 @@ widened the original six-stdlib-module list so *delegated* crypto stops being in
 The walk-set (:data:`WALK_ROOTS`) is byte-identical to ``tests/test_security_static.py``'s
 ``_CRYPTO_ROOTS`` (BACKLOG #283 owns that pin; this gate consumes it).
 
+**Adding a TLS/crypto call site? Read this first — it is cheaper than a red CI leg.** #323's opening
+commit `e4728d7f` failed ``Tests (pytest)`` on all three OS legs by adding ``import ssl`` to
+``transports/{email,direct}.py`` without an entry here; layer 3 then avoided the gate entirely rather
+than feeding it. Four facts, each measured, that are not obvious from the code below:
+
+* **The gate is BIDIRECTIONAL, so "just register the file" is not a free fix.** An unregistered file
+  that imports a trigger fails one way (*undocumented crypto use*); a registered file that STOPS
+  importing it fails the other (*inventory lists ['ssl'] but the file no longer imports it*). A
+  registration is a standing commitment, not a one-time appeasement.
+* **``if TYPE_CHECKING: import ssl`` does NOT hide the import.** Under ``from __future__ import
+  annotations`` the annotation still trips the scanner. There is no cheap way to keep the name and
+  dodge the gate — nor should there be.
+* **The only real escape is not naming the type.** Hold the *inputs* (``tls_verify`` / ``tls_ca_file``
+  / a ``TrustAnchorPolicy``) as plain data and let one inventoried builder produce the context into a
+  **bare local** with no annotation. Then no ``ssl`` name exists in the calling module at all.
+* **For SMTP that builder already exists:** :func:`~messagefoundry.config.tls_policy.build_smtp_tls_context`.
+  All three SMTP cells (EMAIL, DIRECT, the ``[alerts]`` sink) route through it, so exactly one file is
+  registered here and the ``pipeline/`` call sites stay ``ssl``-free. That is centralization, not
+  evasion: one place decides the TLS policy for every SMTP hop in the product.
+
 Stdlib only (no install), like ``scripts/security/scan_forbidden.py`` — runnable as a CI step and a
 pytest. Usage::
 
@@ -189,6 +209,13 @@ INVENTORY: dict[str, frozenset[str]] = {
     # shards disagree on a lane's owner). Deterministic placement, not a security control, no secret
     # material involved.
     "messagefoundry/pipeline/sharding.py": frozenset({"hashlib"}),
+    # ADR 0087 (#197) — secrets = a fresh 16-byte token_hex per DISPATCH, carried as that call's
+    # request id and bound on the way back. This IS a security control: a grandchild the sandboxed
+    # Handler spawns inherits fd 1 (the response pipe) and outlives the worker's kill, so a DERIVABLE
+    # id (a per-spawn nonce plus a counter) would let the code running one call pre-stage the answer to
+    # the next — for an `accepts=` predicate, a routing-verdict flip with no ERROR and no disposition
+    # anomaly. Unpredictability is the whole property, hence secrets rather than random.
+    "messagefoundry/pipeline/sandbox.py": frozenset({"secrets"}),
     # ADR 0049 (#60): the .mfbak DR-backup archive codec — a chunked AES-256-GCM streaming framing
     # (cryptography AESGCM) keyed by the existing store DEK, with a SHA-256 (hashlib) header digest bound
     # as per-frame AAD + the one-way key_id fingerprint. Net-new crypto surface; the store DEK key source
@@ -228,7 +255,15 @@ INVENTORY: dict[str, frozenset[str]] = {
     "messagefoundry/transports/dicomweb.py": frozenset({"secrets"}),
     # ADR 0085: DIRECT-HISP outbound S/MIME — cryptography.serialization.pkcs7 SIGN then ENCRYPT of the
     # Handler body + x509 recipient-cert / trust-anchor cross-validation at construction. No new dependency.
-    "messagefoundry/transports/direct.py": frozenset({"cryptography"}),
+    # #323: ssl = the SMTP/HISP relay's TRANSPORT hop, a separate concern from the S/MIME message
+    # layer above. The context is built by tls_policy.build_smtp_tls_context and handed to smtplib,
+    # which otherwise defaults to ssl._create_stdlib_context -- which IS _create_unverified_context
+    # (CERT_NONE / check_hostname=False). CERT_NONE only under the CLAMPED tls_verify=false escape.
+    "messagefoundry/transports/direct.py": frozenset({"cryptography", "ssl"}),
+    # #323: EMAIL outbound STARTTLS (587) / implicit TLS (465). Same factory, same reason as above --
+    # an explicit verifying context anchored to the OS roots, a per-connection tls_ca_file, or
+    # [tls].internal_ca_file (ADR 0093), because smtplib's own default verifies nothing.
+    "messagefoundry/transports/email.py": frozenset({"ssl"}),
     # ADR 0129 (#142): hashlib = sha256 of a source file's identity (name+mtime+size) as a HASHED dedup
     # key for the leave-in-place processed_files ledger — a DERIVED id, never a cleartext filename (which
     # can embed an MRN), never logged. Not a secret/keyed primitive.
@@ -321,6 +356,14 @@ INVENTORY: dict[str, frozenset[str]] = {
     # the two ephemeral scan identities it provisions into a store it creates empty in a temp directory
     # and destroys with it. Not a key and never persisted: a checked-in constant would be strictly
     # weaker, and the alternative — an operator-supplied credential — is the optional escape hatch only.
+    # ADR 0156: SHA-256 over the OWASP ASVS corpus FILE, to pin it to the tagged v5.0.0_release
+    # asset. Integrity of a build input, not a security control: no secret, no key, no message
+    # authentication, and nothing user- or PHI-derived is hashed. It exists because the corpus was
+    # originally fetched from `master` (the bleeding-edge branch, where a rolling "latest" release
+    # republishes identical filenames) and happened to match the release by luck — so the digest is
+    # recorded and recomputed rather than assumed. Non-cryptographic alternatives were rejected only
+    # because SHA-256 is already the tree's convention for file pinning.
+    "scripts/asvs/scorecard.py": frozenset({"hashlib"}),
     "scripts/security/dast_target.py": frozenset({"secrets"}),
 }
 

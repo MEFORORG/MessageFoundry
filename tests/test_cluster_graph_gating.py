@@ -124,8 +124,9 @@ async def test_reconcile_starts_on_promotion_and_stops_on_demotion(tmp_path: Pat
 
 class _EpochCoordinator(_FlipCoordinator):
     """A flippable clustered coordinator that ALSO reports an H1 leader epoch + lease key, so the test
-    can prove the engine pushes them into the store on promotion (and clears on demotion) — the
-    store↔coordinator wiring (the store never imports the coordinator; the engine pushes — ARCH-6)."""
+    can prove the engine pushes them into the store on promotion, RE-STAMPS them while leader+running
+    (ADR 0157 D2), and RETAINS them on demotion (C4) — the store↔coordinator wiring (the store never
+    imports the coordinator; the engine pushes — ARCH-6)."""
 
     def __init__(self, *, epoch: int, lease_key: str) -> None:
         super().__init__(leader=False)
@@ -141,8 +142,13 @@ class _EpochCoordinator(_FlipCoordinator):
 
 async def test_engine_pushes_leader_epoch_into_store_on_promotion(tmp_path: Path) -> None:
     # H1 store↔coordinator wiring: on promotion the engine reads the coordinator's held epoch + lease key
-    # and pushes them into the store (store.set_leader_epoch), BEFORE workers drain; on demotion it pushes
-    # None to clear the fence. The store never imports the coordinator — the engine is the one-way bridge.
+    # and pushes them into the store (store.set_leader_epoch), BEFORE workers drain. The store never
+    # imports the coordinator — the engine is the one-way bridge.
+    #
+    # ADR 0157 C4 INVERTED THE DEMOTION HALF of this test. It used to assert that demotion pushes
+    # (None, None) "to clear the fence". That is exactly backwards: the store OMITS the guard entirely
+    # when the epoch is None, so clearing on demotion DISARMS the fence at the one moment it matters —
+    # while a superseded ex-leader may still be mid-teardown and mid-write. The epoch is now RETAINED.
     cfgdir = tmp_path / "cfg"
     _minimal_graph(cfgdir, tmp_path)
     coord = _EpochCoordinator(epoch=7, lease_key="public:mefor_cluster_leader")
@@ -167,8 +173,45 @@ async def test_engine_pushes_leader_epoch_into_store_on_promotion(tmp_path: Path
         assert (7, "public:mefor_cluster_leader") in pushes
 
         coord.leader = False
-        await eng._reconcile_graph()  # demotion → push (None, ...) to clear the fence
-        assert pushes[-1] == (None, None)
+        await eng._reconcile_graph()  # demotion → the held epoch is RETAINED, not cleared
+        # The pinned invariant, asserted as a membership test rather than on pushes[-1] alone: a
+        # background supervisor poll can interleave here, and D2 re-stamps on every leader+running pass,
+        # so the list length is nondeterministic — but a (None, None) must NEVER appear at all.
+        assert (None, None) not in pushes
+        assert pushes[-1] == (7, "public:mefor_cluster_leader")
+    finally:
+        await eng.stop()
+
+
+async def test_reconcile_restamps_the_epoch_while_leader_and_running(tmp_path: Path) -> None:
+    # ADR 0157 D2. _start_graph is the only OTHER push site, so without this branch a bring-up that spans
+    # demote → foreign takeover → re-acquire leaves the store holding a STALE epoch with neither of the
+    # other two branches ever matching again — a live leader that (post-C5) claims NOTHING, silently.
+    # Mutation: delete the `is_leader() and running` elif in _reconcile_graph and this fails.
+    cfgdir = tmp_path / "cfg"
+    _minimal_graph(cfgdir, tmp_path)
+    coord = _EpochCoordinator(epoch=7, lease_key="public:mefor_cluster_leader")
+    eng = await Engine.create(tmp_path / "restamp.db", poll_interval=0.05, coordinator=coord)
+    eng.add_registry(load_config(cfgdir))
+
+    pushes: list[tuple[int | None, str | None]] = []
+    orig = eng.store.set_leader_epoch
+
+    def _spy(epoch: int | None, *, lease_key: str | None = None) -> None:
+        pushes.append((epoch, lease_key))
+        orig(epoch, lease_key=lease_key)
+
+    eng.store.set_leader_epoch = _spy  # type: ignore[method-assign]
+    await eng.start()
+    try:
+        coord.leader = True
+        await eng._reconcile_graph()  # promotion → (7, key)
+        assert eng._registry_runner is not None and eng._registry_runner.running
+
+        # The lease was re-acquired with a bumped epoch while this node stayed leader+running.
+        coord._epoch = 9
+        await eng._reconcile_graph()
+        assert pushes[-1] == (9, "public:mefor_cluster_leader")
     finally:
         await eng.stop()
 
