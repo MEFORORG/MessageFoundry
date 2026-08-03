@@ -25,6 +25,13 @@ from messagefoundry.api.tls_client_cert import MF_CLIENT_PEERCERT_STATE_KEY
 from messagefoundry.auth import AuthProvider, Identity, Permission, Role
 from messagefoundry.auth.service import AuthService
 from messagefoundry.config.tls_policy import HopDisposition
+
+# Re-imported, not redefined. The cert->principal mapping now lives in the neutral package-root leaf
+# so the inbound connectors' `intake_auth` peer control (ADR 0154 D6) can reach it — this module
+# imports fastapi, so `transports/` cannot. Importing it back here keeps this the only definition, so
+# the two identity planes cannot drift apart. Re-exported for `tests/test_api_tls.py`, which has
+# imported it from this module since ADR 0083.
+from messagefoundry.credential import client_cert_principal
 from messagefoundry.pipeline.alerts import AlertSink, LoggingAlertSink
 from messagefoundry.pipeline.cert_expiry import peer_cert_expiry
 
@@ -275,44 +282,6 @@ def require_paced(*permissions: Permission) -> Callable[[Request], Awaitable[Ide
 # This is ADDITIVE and does NOT touch require()/the bearer path — the cert-identity plane is admitted ONLY
 # by require_service_cert (below), which is cert-only and PHI-fenced, so it can never bypass the session /
 # step-up / MFA controls. Activated by the scope-populating shim in api/tls_client_cert (ADR 0083).
-
-
-def _cert_name_candidates(peercert: Mapping[str, Any]) -> list[str]:
-    """The qualified subject/SAN names of a ``ssl.getpeercert()`` dict, in match order (#200).
-
-    Yields ``"CN:<commonName>"`` for each subject commonName RDN and ``"SAN:<type>:<value>"`` for each
-    subjectAltName entry (e.g. ``"SAN:DNS:svc.internal"``). These are the exact keys an operator lists
-    in ``[api].tls_client_cert_identities`` — qualifying the name space (CN vs SAN, SAN type) means a
-    spoofed commonName can never collide with a pinned DNS SAN."""
-    candidates: list[str] = []
-    for rdn in peercert.get(
-        "subject", ()
-    ):  # subject = tuple of RDNs; each RDN = tuple of (attr, value)
-        for pair in rdn:
-            if len(pair) == 2 and pair[0] == "commonName":
-                candidates.append(f"CN:{pair[1]}")
-    for pair in peercert.get("subjectAltName", ()):
-        if len(pair) == 2:
-            candidates.append(f"SAN:{pair[0]}:{pair[1]}")
-    return candidates
-
-
-def client_cert_principal(
-    peercert: Mapping[str, Any] | None, cert_map: Mapping[str, str]
-) -> str | None:
-    """The mapped MessageFoundry username for a verified peer cert, or ``None`` (deny-by-default) (#200).
-
-    Pure: given a ``ssl.getpeercert()`` dict (only ever populated by ``ssl`` AFTER the chain verified
-    against ``[api].tls_client_ca_file``) and the operator allow-list, return the first
-    subject/SAN candidate present in the map. An empty/absent cert, an empty map, or a subject with no
-    listed name all return ``None`` — an unmapped or spoofed-CN cert resolves to NO identity."""
-    if not peercert or not cert_map:
-        return None
-    for candidate in _cert_name_candidates(peercert):
-        principal = cert_map.get(candidate)
-        if principal:
-            return principal
-    return None
 
 
 def peer_cert_from_request(request: Request) -> Mapping[str, Any] | None:

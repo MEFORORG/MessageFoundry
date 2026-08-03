@@ -735,10 +735,10 @@ class _NeverSends:
 async def test_delivery_requeues_when_leadership_lost_before_send(
     store: MessageStore, tmp_path: Path
 ) -> None:
-    # L1: a delivery worker that has LOST leadership since claiming the row must re-queue it (mark_failed
-    # → PENDING with backoff), never emit egress as a stale ex-leader, and never drop it. The cheap
-    # synchronous is_leader() gate fires before connector.send(); the row stays deliverable for the new
-    # leader (count-and-log), and the connector is never called.
+    # L1: a delivery worker that has LOST leadership since claiming the row must RELEASE the claim —
+    # back to PENDING with the claim's attempts++ undone, next_attempt_at untouched and NO last_error —
+    # never emit egress as a stale ex-leader, and never drop it. Losing leadership is not a delivery
+    # failure, so it must not spend a retry (see the finite-cap test below for why that matters).
     inbox, outdir = tmp_path / "in", tmp_path / "out"
     inbox.mkdir()
     reg = _retry_registry(
@@ -754,33 +754,107 @@ async def test_delivery_requeues_when_leadership_lost_before_send(
         channel_id="file_in", raw=ADT, deliveries=[("file_out", "OUT|body")], control_id="C1"
     )
     coord.leader = False
+    # POSITIVE SIGNAL. A seeded row is already PENDING/attempts=0, so asserting that state proves
+    # nothing — it is indistinguishable from the worker never running. Spy on release_claimed so the
+    # test waits for the guard to actually FIRE. (An earlier revision of this test asserted the row
+    # state alone and passed against the pre-fix code; the signal is the whole point.)
+    released: list[list[str]] = []
+    real_release = store.release_claimed
+
+    async def _spy_release(ids: list[str], now: float | None = None) -> None:
+        released.append(list(ids))
+        await real_release(ids, now)
+
+    store.release_claimed = _spy_release  # type: ignore[method-assign]
     await runner.start()
     try:
-        # Poll for the OBSERVABLE re-queue: the row carries the leadership-lost last_error and is back to
-        # PENDING — a positive signal, not "nothing happened" (we don't assert absence by waiting).
         elapsed = 0.0
-        while True:
-            cur = await store._db.execute(
-                "SELECT status, last_error FROM queue WHERE message_id=?", (mid,)
-            )
-            row = await cur.fetchone()
-            if (
-                row is not None
-                and row["status"] == OutboxStatus.PENDING.value
-                and "leadership lost" in (row["last_error"] or "")
-            ):
-                break
+        while not released:
             await asyncio.sleep(0.02)
             elapsed += 0.02
-            assert elapsed < 3.0, (
-                "row was not re-queued with the leadership-lost error within timeout"
-            )
+            assert elapsed < 3.0, "the L1 guard never released the claim (release_claimed uncalled)"
+        cur = await store._db.execute(
+            "SELECT status, attempts, last_error FROM queue WHERE message_id=?", (mid,)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row["status"] == OutboxStatus.PENDING.value
+        assert row["attempts"] == 0, (
+            f"the claim's attempts++ must be undone (got {row['attempts']})"
+        )
+        assert not row["last_error"], (
+            f"a release must not write last_error (got {row['last_error']!r}) — "
+            "a leadership change is not a delivery failure"
+        )
     finally:
+        store.release_claimed = real_release  # type: ignore[method-assign]
         await runner.stop()
     assert dest.calls == 0  # no egress emitted as a stale ex-leader
     # The message was NOT dead-lettered or delivered — it stays in the pipeline for the new leader.
     assert (await store.stats()).get(OutboxStatus.DEAD.value) is None
     assert (await store.stats()).get(OutboxStatus.DONE.value) is None
+
+
+async def test_leadership_lost_before_send_does_not_dead_letter_under_a_finite_retry_cap(
+    store: MessageStore, tmp_path: Path
+) -> None:
+    # ADR 0157, the strand this fix exists for. With a FINITE RetryPolicy.max_attempts, routing the L1
+    # bail through mark_failed re-read the claim's own attempts++ and took the DEAD branch — writing a
+    # terminal dead-letter on a row that was NEVER SENT. The new leader never sees a DEAD row, so the
+    # message is stranded: not delivered, not deliverable, and recoverable only by an operator replay.
+    # At-least-once permits duplication; it forbids stranding. Releasing the claim cannot dead-letter.
+    #
+    # Non-vacuous: revert the body to `_mark_failed_and_arm(...)` and this fails on the DEAD assertion —
+    # attempts is already at the cap when the guard fires, which is exactly the shipped shape.
+    inbox, outdir = tmp_path / "in", tmp_path / "out"
+    inbox.mkdir()
+    reg = _retry_registry(inbox, outdir, RetryPolicy(backoff_seconds=30.0, max_attempts=1))
+    coord = _FlipCoordinator(leader=True)
+    runner = RegistryRunner(reg, store, poll_interval=0.02, coordinator=coord)
+    dest = _NeverSends()
+    runner._destinations["file_out"] = dest
+    mid = await store.enqueue_message(
+        channel_id="file_in", raw=ADT, deliveries=[("file_out", "OUT|body")], control_id="C1"
+    )
+    coord.leader = False
+    # Same positive signal as above: wait for the guard to fire, then assert the outcome. Waiting on
+    # row state alone would pass trivially, because the seeded row is already PENDING/attempts=0.
+    released: list[list[str]] = []
+    real_release = store.release_claimed
+
+    async def _spy_release(ids: list[str], now: float | None = None) -> None:
+        released.append(list(ids))
+        await real_release(ids, now)
+
+    store.release_claimed = _spy_release  # type: ignore[method-assign]
+    await runner.start()
+    try:
+        elapsed = 0.0
+        while not released:
+            await asyncio.sleep(0.02)
+            elapsed += 0.02
+            assert elapsed < 3.0, (
+                "the L1 guard never released the claim — under the pre-fix mark_failed body this "
+                "row is dead-lettered instead, un-sent"
+            )
+        cur = await store._db.execute(
+            "SELECT status, attempts FROM queue WHERE message_id=?", (mid,)
+        )
+        row = await cur.fetchone()
+        assert row is not None
+        assert row["status"] == OutboxStatus.PENDING.value, (
+            f"expected PENDING, got {row['status']!r} — DEAD here is the strand this test exists for"
+        )
+        assert row["attempts"] == 0, (
+            f"the claim's attempts++ must be undone (got {row['attempts']}) — otherwise a "
+            "leadership change spends a retry the delivery never used"
+        )
+    finally:
+        store.release_claimed = real_release  # type: ignore[method-assign]
+        await runner.stop()
+    assert dest.calls == 0
+    # The decisive assertion: nothing dead-lettered, so the row survives for the new leader.
+    assert (await store.stats()).get(OutboxStatus.DEAD.value) is None
 
 
 async def test_delivery_proceeds_while_leader(store: MessageStore, tmp_path: Path) -> None:

@@ -60,6 +60,7 @@ from messagefoundry.store.store import (
     OwnedLanes,
     ReingressOriginMissing,
     ReingressOutcome,
+    ReplyWaitState,
     ResendError,
     ResendKeyConflict,
     ResendOutcome,
@@ -233,6 +234,14 @@ class QueueStore(StoreLifecycle, Protocol):
     #: older engine without the fields degrades gracefully.
     committed_txns: int
     body_copies: int
+
+    #: ``fenced_writes`` = TERMINAL queue resolves REJECTED by the H1 leader-epoch fence since store open
+    #: (ADR 0157 C3). Additive and monotone like the two above, read the same ``getattr(store, name, 0)``
+    #: way, and **Postgres-only**: it is the one backend where terminal resolves carry the fence, so the
+    #: SQLite and SQL Server handles expose it at a permanent 0 for protocol / ``/stats`` uniformity. A
+    #: non-zero value means a superseded ex-leader tried to resolve a row the current leader owns and was
+    #: stopped — the split-brain signal an operator actually wants paged on.
+    fenced_writes: int
 
     # --- write path ----------------------------------------------------------
     async def enqueue_message(
@@ -586,16 +595,23 @@ class QueueStore(StoreLifecycle, Protocol):
         ...
 
     def set_leader_epoch(self, epoch: int | None, *, lease_key: str | None = None) -> None:
-        """Push this node's currently-held **leader epoch** (the H1 fencing token) into the store so the
-        FIFO claim can fence a superseded ex-leader, **inside** the existing single claim transaction.
+        """Push this node's currently-held **leader epoch** (the H1 fencing token) into the store so a
+        superseded ex-leader can be fenced **inside** the existing statement's own transaction.
 
-        The engine calls this on promotion/demotion: it reads the value from the cluster coordinator
-        (:meth:`ClusterCoordinator.current_epoch` / :meth:`ClusterCoordinator.lease_key`) and pushes it
+        The engine calls this on **promotion** — and re-stamps it on every leader+running reconcile pass
+        (ADR 0157 D2) — reading the value from the cluster coordinator
+        (:meth:`ClusterCoordinator.current_epoch` / :meth:`ClusterCoordinator.lease_key`) and pushing it
         here, so the **store never imports the coordinator** (the one-way ARCH-6 dependency direction).
-        ``epoch=None`` disables the guard (single-node / not yet leader / demoted) — the claim is then
-        byte-identical to before H1. With a non-``None`` epoch the server-DB backends add
-        ``leader_lease.leader_epoch <= :held`` to the claim's UPDATE so a paused/superseded ex-leader
-        (whose held epoch is now strictly older than the live leader's) claims **0 rows**.
+
+        ``epoch=None`` **OMITS THE GUARD ENTIRELY** — it means *no fence*, not "a safe null token", and
+        the emitted SQL is then character-identical to pre-H1. That is why demotion deliberately does
+        **not** clear it (ADR 0157 C4): clearing on demotion would disarm the guard at precisely the
+        moment a superseded ex-leader is most likely to still be writing.
+
+        With a non-``None`` epoch the server-DB backends splice a ``leader_lease.leader_epoch``
+        comparison. Which statements carry it, and with which polarity, differs by backend — see
+        :meth:`ClusterCoordinator.current_epoch` for the authoritative scope. It is **not** a general
+        write fence.
 
         Cheap + synchronous (it only stamps cached state — no DB round-trip). A **no-op on SQLite**
         (single active node — no second writer to fence)."""
@@ -775,6 +791,19 @@ class QueueStore(StoreLifecycle, Protocol):
         of rows still waiting and the enqueue time of the oldest (``None`` when empty). Lane key is
         stage-aware (``destination_name`` outbound, ``channel_id`` ingress). The workers use this to
         raise a ``queue_buildup`` alert when a lane stops draining. Cheap: a single COUNT + MIN."""
+        ...
+
+    async def reply_wait_state(self, message_id: str, destination_name: str) -> ReplyWaitState:
+        """Metadata-only state for one synchronous-reply wait tick (ADR 0154 D3): the message's own
+        status, the awaited destination's outbound row states, and the highest committed
+        ``response_seq`` for it.
+
+        The inbound HTTP listener's sync-reply path polls this while a caller is blocked, so it must
+        stay cheap and must decrypt **nothing** — see :class:`ReplyWaitState`, which also documents
+        why the message status is returned alongside the rows rather than the rows being read alone.
+        Returning ``latest_response_seq`` rather than the body is what keeps a tick metadata-only:
+        the reply is fetched once, through :meth:`correlate_response`, after a row is proven
+        committed."""
         ...
 
     async def reset_stale_inflight(
@@ -1007,6 +1036,31 @@ class QueueStore(StoreLifecycle, Protocol):
     async def events_for(self, message_id: str) -> Sequence[Row]: ...
 
     # --- connection events (Corepoint-style transport/lifecycle log, #46) -----
+    async def record_message_event(
+        self,
+        message_id: str,
+        event: str,
+        *,
+        destination: str | None = None,
+        detail: str | None = None,
+        now: float | None = None,
+    ) -> None:
+        """Append one ``message_events`` row with a caller-supplied kind (ADR 0154 D8).
+
+        Lives on this protocol rather than :class:`AuditStore` because ``message_events`` is the
+        per-message **disposition timeline** — queue-domain, the sibling of
+        :meth:`record_connection_event` — not the tamper-evident ``audit_log``. That placement is also
+        what lets ``pipeline/`` reach it through the store it already holds, with no cast.
+
+        Before this there was **no** public message-event writer: ``_event`` is private to each
+        backend and only ever called inside a store-owned transaction, so neither ``pipeline/`` nor
+        ``transports/`` could record a disposition event at all.
+
+        ``event`` is validated against :data:`MESSAGE_EVENT_KINDS` at runtime — the static
+        literal-call-site guard in ``tests/test_phi_logging_inventory.py`` AST-walks for a *constant*
+        first argument and therefore cannot see a kind forwarded through here."""
+        ...
+
     async def record_connection_event(
         self,
         *,
