@@ -2836,6 +2836,24 @@ No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_ho
 
 > 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **3/10** · _quick win_. ASVS 6.3.3's admin-MFA refusal and #189's dual-control warning are both inert in the topology the runbook recommends — the ADR 0143 auto-degrade sets `settings.api.serve_ui = False` in place before `ui_exposed` and `admin_exposed` are derived from it (`messagefoundry/__main__.py`, the flip and the two derivations in one ladder), so the engine calls one instance exposed for 11.7.1 and not exposed for 6.3.3 in a single boot — but `require_mfa` defaults on and `security_loosenings()` still names the explicit opt-out on every boot; re-key `admin_exposed` on the `instance_exposed` predicate already present in the file, fix two `exposure_desc` else-branches, and settle the refuse-on-upgrade fork against `docs/CONFIGURATION.md:1439`.
 
+> **OWNER RULING 2026-08-04 — WARN FIRST, with a DATED flip to refuse.** The fork at Proposed point 3
+> is settled: the corrected `admin_exposed` derivation ships as a **warning**, not as an immediate
+> refusal.
+>
+> The fix itself is unchanged — re-key `admin_exposed` off a `serve_ui`-independent predicate
+> (`instance_exposed` already exists in this file) and correct the two `exposure_desc` else-branches.
+> What is settled is the *upgrade behaviour*: because this makes a **currently-starting configuration
+> refuse**, against this repo's own rule at `docs/CONFIGURATION.md:1439`, the refusal is deferred.
+>
+> **The flip must carry a DATE, in the warning text and in this item.** A deferred refusal with no date
+> is a refusal that never happens — it becomes a warning everyone learns to scroll past, which is how
+> the inert control this item is about came to exist in the first place. Scheduling it is the point;
+> "flip it later" is not a plan.
+>
+> The gap is real and measured (arm C starts rc=0 with single-factor admin on production PHI), but it
+> has been latent for some time. Breaking a running production instance on upgrade, with no notice,
+> trades one silent failure for a loud one nobody scheduled.
+
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** medium.
 
 **What:** the `serve` startup ladder derives its admin-exposure predicate from a field an earlier arm has already mutated. In [`messagefoundry/__main__.py`](../messagefoundry/__main__.py):
@@ -3614,6 +3632,22 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 ## 341. Handler returning a tuple or set of Sends delivers nothing, silently
 
 > 🚧 **Status OPEN (filed 2026-08-01).** Value **9/10** · Difficulty **3/10** · _quick win_. `_partition` ([pipeline/dryrun.py:112](../messagefoundry/pipeline/dryrun.py)) narrows with `items = result if isinstance(result, list) else [result]`. A **`list`** of `Send`s works; a **tuple** or **set** does not — the container itself becomes the single item, matches none of the three `isinstance` filters, and yields `([], [], [])`. **Verified live:** `_partition((send, send))[0] == []`. The Handler ran, returned deliveries, and **nothing is delivered and nothing errors** — the message finalizes `FILTERED` (every handler ran but delivered nothing), which is indistinguishable from a handler deliberately declining it. That is an **accept-and-drop**, the one thing CLAUDE.md §12 forbids outright.
+
+> **OWNER RULING 2026-08-04 — RAISE, do not widen.** The fork this item reserved is settled: a
+> Handler returning a tuple or set of `Send`s must **raise**, so the message lands `ERROR`/dead-letter.
+> It must NOT be widened to accept any iterable.
+>
+> **The reasoning, because it decides how the fix is built.** Widening would start *delivering* messages
+> the engine drops today — every live Handler returning a tuple would begin flowing on upgrade, silently,
+> including PHI currently being dropped. An accept-and-drop is what CLAUDE.md §12 forbids; converting it
+> into an accept-and-**send** nobody asked for is the worse of the two failures. A loud dead-letter is
+> recoverable and visible; a quiet new delivery path is neither.
+>
+> ⚠️ `tests/test_sandbox_codec.py::test_partition_parity_table` pins the current `[0,0,0]` behaviour
+> deliberately and its docstring argues *against* normalising — that rationale is **superseded by this
+> ruling**, so the test is rewritten and its reasoning replaced, not extended around. `pipeline/_sandbox_codec.py`
+> preserves the container shape on purpose, so in-process and subprocess modes must agree on the new
+> behaviour or the fix creates a mode-dependent disposition.
 
 **Cluster:** Correctness / data loss. **Priority:** P1. **Verdict:** build (small). **Severity:** high (silent PHI non-delivery, no operator signal), medium (likelihood: `return (Send(...), Send(...))` is a natural idiom and a one-character difference from the working form).
 
