@@ -175,9 +175,11 @@ stdout); on error it prints `{"error": "..."}`. It prints **config only, never m
 ## IDE gating behavior
 
 The IDE assistant ([ide/src/chat.ts](../ide/src/chat.ts)) resolves the policy **before** every
-request: it first calls `GET /ai/policy` (authoritative); on any error it falls back to the local
-`messagefoundry ai-policy` CLI; if that also fails it uses a conservative built-in default
-(`byo` / `code_only` / `prod`, `assist_permitted: null`) so the safe assistant still works offline.
+request: it first calls `GET /ai/policy` (authoritative, and cached on success); on any error it falls
+back to that cached authoritative policy, then to the local `messagefoundry ai-policy` CLI; if none of
+those can positively confirm a policy it uses a fail-closed built-in default (`mode: unverified`),
+which **disables** assistance rather than re-enabling BYO — a central *off* must not be bypassable by
+taking the engine offline (SEC-022).
 
 Then it applies the effective policy:
 
@@ -186,13 +188,32 @@ Then it applies the effective policy:
 | `mode == off` | **Disabled.** "AI assistance is turned off by your MessageFoundry policy." |
 | `mode == managed_claude` / `managed_claude_baa` | **Disabled.** This IDE version can't service a managed provider; it does **not** silently fall back to BYO (that would violate operator intent). |
 | `mode == byo` and `assist_permitted == false` | **Disabled.** "Your role does not include the `ai:assist` permission." |
-| `mode == byo` and `assist_permitted` is `true` **or** `null` | **Enabled** (proceeds as today). |
+| `mode == byo` and `assist_permitted` is `true` **or** `null` | **Enabled** — *unless* an authoritative `false` was previously observed; see the sticky-deny rule below. |
+| `mode == unverified` (nothing could confirm a policy) | **Disabled.** Fail-closed; see above. |
 
-**The tokenless-IDE / `assist_permitted == null` trust note.** Under BYO, `null` (RBAC not evaluable
-offline) is **allowed**. This is safe by construction: BYO sends only **code-only** context to the
-developer's own provider — it never sees the engine or any message data, so there is no PHI to
-protect with RBAC at this stage. The central *off* switch is still honored because `mode` is read
+**The `assist_permitted == null` trust note.** Under BYO, `null` (RBAC not evaluable) is **allowed**.
+This is safe by construction: BYO sends only **code-only** context to the developer's own provider —
+it never sees the engine or any message data, so there is no PHI to protect with RBAC at this stage.
+The central *off* switch is honored regardless, because `mode` is identity-independent and is read
 straight from the policy, token or not.
+
+**The IDE's gate read is authenticated (BACKLOG #330).** `assist_permitted` is computed from the
+acting identity, so a tokenless caller can only ever be told `null` and the deny row above could never
+fire. `resolveAiPolicy` therefore attaches the cached bearer — never prompting for one, and never over
+plain `http://` to a non-loopback host. Two things this does **not** change: the engine endpoint stays
+tokenless-*readable* (the `GET /ai/policy` section above is unchanged and still true), and the status
+bar's **separate**, timer-driven read of the same route stays **tokenless** — it wants only the
+identity-independent `environment`, and a bearer on that timer would keep refreshing the session's
+idle clock and make the engine's 30-minute idle timeout unreachable (CWE-613).
+
+**The sticky-deny rule (ADR 0035 AC-7).** Because `null` means "could not be evaluated" rather than
+"permitted", a fresh `null` must not *upgrade* assistance a central policy switched off: an
+authoritative `assist_permitted: false` the IDE has already observed is **retained** over a later
+`null`, so under BYO that combination resolves to **Disabled**. The rule is deliberately one-way — a
+cached `true` is *not* sticky, since fabricating a permit from stale state is the fail-open direction
+— and any evaluable `true`/`false` replaces the cached value outright, so signing in is the escape
+hatch. Anything that is not the literal `true`/`false`, **including a response that omits the field**,
+counts as "not evaluated" and never as a permit.
 
 `messagefoundry.showAiPolicy` (command **"MessageFoundry: Show AI Policy"**) displays the current
 resolved policy in the IDE.
