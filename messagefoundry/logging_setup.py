@@ -68,6 +68,30 @@ for _i in range(0x20):
         _CTRL_TRANSLATION[_i] = f"\\x{_i:02x}"
 _CTRL_TRANSLATION[0x7F] = "\\x7f"
 
+#: Stamped on every physical line of a record's ``exc_text``/``stack_info`` (BACKLOG #335). A traceback
+#: is multi-line by nature, so collapsing it the way the rendered message is collapsed would cost the
+#: operator the readability an incident depends on. Its line breaks are kept and every line is indented
+#: instead, so no traceback line starts at column 0 and none can impersonate the ``_LOG_FORMAT`` record
+#: prefix (ASVS 16.4.1 — the readability call ADR 0034 §1 deferred).
+_CONTINUATION_PREFIX = "    | "
+
+
+def _scrub_block(text: str) -> str:
+    """Escape control characters in a multi-line block (``exc_text``/``stack_info``) while KEEPING its
+    line breaks, indenting every line with :data:`_CONTINUATION_PREFIX`.
+
+    The **first** line is indented too, so the guarantee does not rest on it being the stdlib
+    ``Traceback (most recent call last):`` header: ``Formatter.formatException`` emits no header at all
+    when the exception carries no ``__traceback__``, and that first line is then peer-derived text.
+
+    Idempotent — the prefix is stripped before it is re-applied — because every handler carries its own
+    filter chain, so a record dispatched to stdout *and* the off-box forwarder is scrubbed twice and the
+    two sinks must not disagree."""
+    return "\n".join(
+        _CONTINUATION_PREFIX + line.removeprefix(_CONTINUATION_PREFIX).translate(_CTRL_TRANSLATION)
+        for line in text.split("\n")
+    )
+
 
 class ControlCharScrubFilter(logging.Filter):
     """Neutralize CR/LF and other control characters in the rendered log message to prevent log
@@ -76,7 +100,13 @@ class ControlCharScrubFilter(logging.Filter):
     Untrusted MLLP peer data and HL7-derived exception text reach the general log; without this a
     crafted value containing a newline could inject a forged log line into NSSM's captured stdout.
     We render the message (applying ``%`` args) once, escape any control characters, and only then
-    replace ``record.msg`` — clean messages keep their lazy ``msg``/``args`` untouched."""
+    replace ``record.msg`` — clean messages keep their lazy ``msg``/``args`` untouched.
+
+    ``record.exc_text`` and ``record.stack_info`` are covered too (BACKLOG #335, ADR 0034 §1), via
+    :func:`_scrub_block`. This filter is installed **last** (see :func:`_install_phi_filters`), so
+    :class:`RedactionFilter` has already rendered ``exc_info`` into ``exc_text`` and cleared it; a
+    handler carrying this filter *without* that one would leave an unrendered ``exc_info`` for the
+    formatter to expand unscrubbed."""
 
     def filter(self, record: logging.LogRecord) -> bool:
         message = record.getMessage()
@@ -84,6 +114,14 @@ class ControlCharScrubFilter(logging.Filter):
         if scrubbed != message:
             record.msg = scrubbed
             record.args = ()
+        # The rendered message is only half the record: ``Formatter.format`` appends ``exc_text`` and
+        # ``stack_info`` VERBATIM, so a CR/LF inside an exception message forged a whole line on the
+        # text sink (BACKLOG #335). ``RedactionFilter`` is installed first and renders ``exc_info``
+        # into ``exc_text``, so both fields are already populated when this filter runs.
+        if record.exc_text:
+            record.exc_text = _scrub_block(record.exc_text)
+        if record.stack_info:
+            record.stack_info = _scrub_block(record.stack_info)
         return True
 
 

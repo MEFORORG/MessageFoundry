@@ -141,10 +141,18 @@ the class rationale **must not be inherited** by a future finding on a `log.exce
 `exc_info=True` site — the engine has many (the delivery/router/transform catches, the `_on_*_worker_done`
 callbacks, the pollers). `JsonFormatter` escapes `exc_text` through `json.dumps`, so the off-box
 forwarder (JSON by default) is unaffected; the residual is the human-readable stdout/NSSM text log.
-**Open hardening (not done):** apply `_CTRL_TRANSLATION` to `exc_text`/`stack_info` in
-`ControlCharScrubFilter` — it runs after `RedactionFilter`, so `exc_text` is already populated. It is a
-few lines, but it collapses every traceback to one physical line, which is an operator-facing
-readability change and wants an explicit decision rather than a drive-by edit.
+**Open hardening — CLOSED 2026-08-04 (BACKLOG #335).** `ControlCharScrubFilter` now scrubs
+`record.exc_text` and `record.stack_info` as well as the rendered message. The readability decision
+deferred above was taken explicitly, and it is **not** the collapse-to-one-line this paragraph feared:
+the traceback keeps its line breaks and every line is indented with `_CONTINUATION_PREFIX`, so no
+traceback line begins at column 0 and none can impersonate the `_LOG_FORMAT` record prefix. Why the
+block's *first* line is indented too, and why re-application is idempotent (every handler carries its
+own filter chain, so one record is scrubbed once per sink), is recorded at `_scrub_block`; the property
+is pinned by the `test_control_char_*` tests in `tests/test_logging.py`. **One residual survives, so the
+register line at `:40` still reads wider than the code:** a handler carrying `ControlCharScrubFilter`
+*without* `RedactionFilter` hands the formatter an unrendered `exc_info` that no filter has touched. No
+shipped handler is in that state — `_install_phi_filters` installs both — but that is a construction
+guarantee, not a scrub. The paragraph above stands as the record of what was true before.
 
 **2. `PinnedDependenciesID` — the blanket rationale was applied too widely.** "CI installs editably
 (`pip install -e .[extras]`), which cannot use `--require-hashes`" is true of the editable installs and
