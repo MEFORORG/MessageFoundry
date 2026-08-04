@@ -42,8 +42,8 @@ def test_the_org_domain_itself_and_its_subdomains_are_internal() -> None:
 
 
 def test_a_third_party_idp_is_external() -> None:
-    """The case that decides the SSO leg: Entra is trusted, and is not the hospital."""
-    assert is_external("https://login.microsoftonline.com/tenant/oauth2/authorize", ORG) is True
+    """The case that decides the SSO leg: the identity provider is trusted, and is not the hospital."""
+    assert is_external("https://idp.example.com/tenant/oauth2/authorize", ORG) is True
 
 
 # --- secure-by-default ------------------------------------------------------------------------
