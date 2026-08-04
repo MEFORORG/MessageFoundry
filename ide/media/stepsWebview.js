@@ -808,3 +808,35 @@
       vscode.postMessage({ command: 'stepsDiag', level: 'error', text: 'context-menu wiring failed: ' + e });
     }
 
+    // ---- TEST-ONLY EXPORT HOOK (BACKLOG #233; master test plan 13-steps-editor.md §S2 step 3) --------
+    // The ten functions above MIRROR pure, unit-tested helpers in ide/src/stepsModel.ts (the declared
+    // source of truth) because this script is loaded into a `default-src 'none'` webview and cannot
+    // import across that boundary. The differential suite (ide/src/test/suite/steps-mirror.test.ts) loads
+    // THIS FILE under jsdom and asserts every mirror agrees with its model counterpart, so a drift shows
+    // up as a red test instead of "the drop landed somewhere other than the indicator said".
+    //
+    // This is a HOOK, never a second implementation — it hands out the SAME function objects the page
+    // itself uses. It must be assigned LAST: `dragSrc` and the `rows` list are top-level bindings the
+    // closures read, so the hook has to sit after every declaration and after the wiring that populates
+    // them. Deliberately NO `setDragSrc` mutator — the suite drives `dragSrc` by dispatching a real
+    // `dragstart`, which also exercises the code-row drag interception above.
+    //
+    // Opt-in ONLY: the loader must set `window.__mfStepsTestExportsEnabled = true` BEFORE this script
+    // runs. Nothing in the extension sets it, so the shipped webview never publishes the hook. (Honest
+    // scope: this file is a CLASSIC script, so its top-level `function` declarations are already globals
+    // in the page — the gate adds a NAMED, greppable contract and keeps the shipped surface unchanged,
+    // it does not newly hide behaviour that was previously exposed.)
+    if (window.__mfStepsTestExportsEnabled === true) {
+      window.__mfStepsTestExports = {
+        stepsCtxRows: stepsCtxRows,
+        blockExtent: blockExtent,
+        captureBlock: captureBlock,
+        clipLabel: clipLabel,
+        buildDropSlots: buildDropSlots,
+        walkMove: walkMove,
+        canDrop: canDrop,
+        scopeLabel: scopeLabel,
+        resolveDrop: resolveDrop,
+        barAnchor: barAnchor,
+      };
+    }

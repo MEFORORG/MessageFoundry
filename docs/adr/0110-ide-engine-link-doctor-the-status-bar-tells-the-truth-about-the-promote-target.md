@@ -221,6 +221,41 @@ then it cannot warn about the states that do block an action: `unreachable`/`for
 - **#26 (no visual/declarative authoring) is untouched — #26-clean:** this surface authors nothing, projects to no `.py`,
   and executes no logic. No PySide6. No "channel"/"route" element.
 
+## Amendment — 2026-08-04 (BACKLOG #330)
+
+`/ai/policy` now has **two readers, with deliberately opposite probe plans**. This ADR is the record of
+authority for the probe-plan vocabulary (`ProbePlanEntry`, `PROBE_ENDPOINTS`, `POLICY_ROUTE`,
+`POLL_PLAN`, `VERIFY_PLAN`), so the second reader is recorded here rather than only in ADR 0035.
+
+- **`ENVIRONMENT_PLAN` (`authenticated: false`)** — the status bar's environment read, unchanged in
+  behaviour. It was previously a literal `undefined` token argument at the `readEnvironment` call site;
+  it is now driven by a named constant, so its tokenlessness is data CI asserts rather than an argument
+  a later tidy-up could "fix".
+- **`ASSIST_GATE_PLAN` (`authenticated: true`)** — `aiPolicy.ts`'s gate read of the same route. It wants
+  `assist_permitted`, which the engine computes from the acting identity and answers as `null` to any
+  caller it cannot attribute, so a tokenless read left ADR 0035's `ai:assist` half unable to fire at all.
+
+**Nothing in §2 or §5 is relaxed.** §2's prohibition on a bearer from the timer stands verbatim and
+still governs the status bar; §5's *"the environment is **read** (tokenless `/ai/policy`) and displayed,
+never set"* bullet is unchanged and describes `ENVIRONMENT_PLAN` exactly. The new reader is **not** on a
+timer: its only callers are user-initiated (a chat turn, and the *Show AI Policy* command), so it sits
+under **`VERIFY_PLAN`'s** rationale — a click or an activation is real user activity, so refreshing the
+idle clock there is honest rather than a forgery — and not under `POLL_PLAN`'s.
+
+Consequences for the acceptance criteria above, both verified rather than assumed:
+
+- **AC-3 still holds verbatim.** It quantifies over `POLL_PLAN`, which is untouched; and
+  `ENVIRONMENT_PLAN`, the other constant on the timer path, is `authenticated: false` and is now
+  asserted to be, which it was not before.
+- **AC-6 still holds as written.** `PROBE_ENDPOINTS` is unchanged — `/ai/policy` was already on the
+  allowlist — so no new route is probed by anything.
+
+The vocabulary itself is now **shared** rather than private to the status bar: `engineStatusModel.ts`
+is the IDE's probe-plan module, and `aiPolicy.ts` imports from it. That is the point of recording this
+here — without it, the next reader finds an `authenticated: true` plan for `/ai/policy` inside a module
+whose header forbids a bearer on the poll, and reasonably reads it as the exact bug this ADR exists to
+prevent.
+
 ## Alternatives considered
 
 - **A webview "Engine Doctor" panel** — rejected: opens from the same command dispatch (fixes a missed click no better);

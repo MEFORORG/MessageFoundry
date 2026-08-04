@@ -40,6 +40,16 @@ site keeps them unchanged).
 * *Thread-locality.* ``sys.settrace`` is per-thread. The pure dry-run runs the Router/Handler
   **synchronously on the calling thread**, so the tracer is installed on that same thread; ``trace_ok``
   in the result verifies a non-empty trace was actually captured.
+* *Lazy (generator) Router/Handler — declared, not silently under-reported.* A generator function's
+  body does not run when it is called; it runs when something iterates the returned generator, which
+  happens in ``_partition`` **after** this tracer has restored ``sys.settrace``. So that invocation
+  legitimately records **no line events**, and ``_sends_from``/``_routed_from`` decline to consume the
+  one-shot iterator (draining it here would leave ``_partition`` nothing to partition, making the
+  *traced* run deliver 0 where the untraced run delivers N — a tracer that changed the disposition).
+  The invocation therefore carries ``"lazy_result": true``: message-level ``sends``/``handlers`` stay
+  byte-identical to the untraced run, and the consumer can say *"this body was not traced"* instead of
+  rendering an apparently inert handler beside ``trace_ok: true`` (ADR 0072 §6 gate 1; the honest-
+  degradation rule of ADR 0089 §4).
 * *Python 3.14.* The tracer only touches ``sys.settrace`` — it never installs a ``sys.monitoring`` tool
   — so it coexists with coverage tooling on either mechanism.
 
@@ -62,7 +72,14 @@ from typing import Any
 
 from messagefoundry.config.db_lookup import DbLookupError
 from messagefoundry.config.fhir_lookup import FhirLookupError
-from messagefoundry.config.wiring import HandlerAccepts, HandlerFn, Payload, RouterFn, Send
+from messagefoundry.config.wiring import (
+    HandlerAccepts,
+    HandlerFn,
+    Payload,
+    RouterFn,
+    Send,
+    handler_result_items,
+)
 from messagefoundry.parsing.message import Message
 from messagefoundry.pipeline.dryrun import dry_run
 
@@ -118,16 +135,36 @@ def _safe_snapshot(frame: FrameType) -> dict[str, Any]:
 
 
 def _sends_from(result: object) -> list[str]:
-    """Outbound names in a Handler's raw return (``Send``/``SetState``/list/``None``) — mirrors the
-    ``Send`` half of :func:`messagefoundry.pipeline.dryrun._partition`, name-only (no payload = no PHI)."""
+    """Outbound names in a Handler's raw return (``Send``/``SetState``/an iterable/``None``) — mirrors
+    the ``Send`` half of :func:`messagefoundry.pipeline.dryrun._partition`, name-only (no payload = no
+    PHI). It shares that function's materialization rule so the trace does not drift from what actually
+    delivers now that any non-``str`` iterable fans out (BACKLOG #341).
+
+    **One deliberate divergence: a one-shot iterator is never consumed.** A generator Handler is
+    reported as no sends rather than drained here, because this hook is a *pure observer* — exhausting
+    the generator would leave ``_partition`` nothing to partition, so the traced run would deliver 0
+    where the untraced run delivers N. Under-reporting is the only safe option; it is symmetric with
+    :func:`_routed_from`'s long-standing gap for a generator Router, but on the Handler half **this
+    change opened it**: before BACKLOG #341 a generator Handler delivered nothing at all, so reporting
+    no sends was exact rather than a degradation. The caller marks the invocation ``lazy_result`` so
+    the gap is declared to the consumer instead of read as an inert handler (ADR 0072 §6 gate 1)."""
     if result is None:
         return []
-    items = result if isinstance(result, list) else [result]
+    if isinstance(result, Iterator):
+        return []
+    items = handler_result_items(result)
+    if items is None:
+        items = [result]
     return [it.to for it in items if isinstance(it, Send)]
 
 
 def _routed_from(result: object) -> list[str]:
-    """Handler names in a Router's raw return (``list``/``str``/``None``)."""
+    """Handler names in a Router's raw return (``list``/``str``/``None``).
+
+    A **generator** Router routes fine (``dryrun._handler_names`` materialises any non-``str``
+    iterable) but is reported as no ``routed_to`` here, for the same pure-observer reason as
+    :func:`_sends_from`: draining the one-shot iterator would leave the real routing nothing to
+    materialise. The invocation carries ``lazy_result`` so the omission is declared."""
     if isinstance(result, str):
         return [result]
     if isinstance(result, list):
@@ -159,6 +196,9 @@ class _Recorder:
         self.sends: list[str] = []
         self.routed_to: list[str] = []
         self.truncated = False
+        # The invocation returned a one-shot iterator (a generator Router/Handler): its body has not
+        # run yet, so this record has no line events and its sends/routed_to are not measurable here.
+        self.lazy_result = False
         # trace state
         self.frame: FrameType | None = None
         self._last_line: int | None = None
@@ -223,6 +263,13 @@ class _Recorder:
     # terminal classification --------------------------------------------------
 
     def record_return(self, result: object) -> None:
+        if self.kind in ("router", "handler"):
+            # A generator function returns WITHOUT running its body, so this record is structurally
+            # incomplete (no line events, no measurable sends/routed_to) — declare that rather than
+            # let a consumer read an empty record as "this handler did nothing". Set for BOTH halves:
+            # the Router gap is long-standing, the Handler gap was opened by BACKLOG #341 widening
+            # `_partition` so a generator Handler now delivers.
+            self.lazy_result = isinstance(result, Iterator)
         if self.kind == "router":
             self.routed_to = _routed_from(result)
         elif self.kind == "handler":
@@ -271,6 +318,8 @@ class _Recorder:
         }
         if self.truncated:
             out["truncated"] = True
+        if self.lazy_result:
+            out["lazy_result"] = True
         return out
 
 

@@ -192,6 +192,9 @@ def test_nested_append_inside_for_is_send_row() -> None:
         ('    return Send("OB", msg)\n', ("send", ["OB"])),
         ('    return [Send("A", msg), Send("B", msg)]\n', ("send", ["A", "B"])),
         ("    return []\n", ("send", [])),
+        # ADR 0108 §6 SHALLs `return ()` alongside `return []`, and lens.py recognizes both, but only
+        # `return []` was pinned — the tuple half had no regression coverage at all (BACKLOG #341).
+        ("    return ()\n", ("send", [])),
     ],
 )
 def test_legacy_return_forms_recognized_and_byte_identical(body: str, expect: tuple) -> None:
@@ -659,7 +662,7 @@ def _two_ob_registry(handler) -> Registry:  # type: ignore[no-untyped-def]
 
 def test_accumulator_delivers_identically_to_returned_list() -> None:
     """An append-built accumulator delivers the SAME destinations/order as the equivalent returned list —
-    ``_partition`` keys on ``isinstance(result, list)`` and never inspects the collector name."""
+    ``_partition`` materialises whatever container it is handed and never inspects the collector name."""
 
     def _accumulator(msg):  # type: ignore[no-untyped-def]
         sends = []
@@ -763,8 +766,10 @@ def test_orphan_append_not_returned_degrades_to_code() -> None:
 
 
 def test_convert_refuses_nonempty_tuple_return() -> None:
-    """A non-empty tuple return is dropped by the runtime `_partition`, so converting it would flip 0→N
-    deliveries — refuse it."""
+    """A non-empty tuple return DELIVERS at runtime since BACKLOG #341, so converting it up would be
+    delivery-neutral rather than the 0→N flip ADR 0108 §7 refused it for. The refusal stands on
+    conservative scope — the palette never authors this form, and enabling the rewrite carries its own
+    byte-stability obligations — so this pins the refusal, not the superseded reason."""
     src = _wrap('    return (Send("A", msg), Send("B", msg))\n')
     row = next(r for r in _rows(src) if r["kind"] == "send")
     with pytest.raises(LensRewriteError, match="can't be extended"):

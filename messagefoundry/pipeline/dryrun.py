@@ -26,6 +26,7 @@ from messagefoundry.config.wiring import (
     META_MAX_KEYS,
     HandlerAccepts,
     HandlerFn,
+    HandlerResult,
     InboundConnection,
     Registry,
     RouterFn,
@@ -33,6 +34,7 @@ from messagefoundry.config.wiring import (
     SetMeta,
     SetState,
     StateValue,
+    handler_result_items,
 )
 from messagefoundry.parsing import (
     HL7PeekError,
@@ -86,7 +88,7 @@ class TraceHook(Protocol):
 
     def trace_handler(
         self, fn: HandlerFn, name: str, payload: Message | RawMessage
-    ) -> Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None: ...
+    ) -> HandlerResult: ...
 
     def trace_accepts(
         self, pred: HandlerAccepts, name: str, payload: Message | RawMessage
@@ -100,16 +102,26 @@ def _handler_names(result: list[str] | str | None) -> list[str]:
 
 
 def _partition(
-    result: Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None,
+    result: HandlerResult,
 ) -> tuple[list[Send], list[SetState], list[SetMeta]]:
     """Split a Handler's return into (deliveries, state writes, metadata writes) — ADR 0005 + ADR 0081.
 
-    A Handler may return :class:`Send`\\ s, :class:`SetState`\\ s and/or :class:`SetMeta`\\ s (a single
-    value, a mixed list, or ``None``). ``Send``-only returns yield ``([...], [], [])`` — backward
-    compatible."""
+    A Handler may return :class:`Send`\\ s, :class:`SetState`\\ s and/or :class:`SetMeta`\\ s — a single
+    value, **any non-``str`` iterable** of them (list, tuple, set, generator — BACKLOG #341), or
+    ``None``. ``Send``-only returns yield ``([...], [], [])`` — backward compatible. An EMPTY container
+    (``[]`` / ``()`` / ``set()``) partitions to ``([], [], [])``, so the documented ``return []`` /
+    ``return ()`` filter idiom keeps **filtering** — it neither delivers nor raises.
+
+    :func:`~messagefoundry.config.wiring.handler_result_items` is the single materialization rule, and
+    the sandbox child applies the SAME one, so ``[sandbox].mode`` never changes **which** ``Send``\\ s a
+    Handler delivers. Order is the container's: an ordered one delivers in its order under either mode,
+    while a ``set`` has no defined iteration order at all — see that function for why, and why the docs
+    steer authors away from it. A value the rule does not recognise as a container is a single item,
+    matches none of the three ``isinstance`` filters below, and still drops."""
     if result is None:
         return [], [], []
-    items = result if isinstance(result, list) else [result]
+    materialized = handler_result_items(result)
+    items: list[object] = [result] if materialized is None else materialized
     sends = [it for it in items if isinstance(it, Send)]
     state_ops = [it for it in items if isinstance(it, SetState)]
     meta_ops = [it for it in items if isinstance(it, SetMeta)]
@@ -430,10 +442,10 @@ def transform_one(
     derived = payload is None
     if payload is None:
         payload = _payload(raw, content_type)
-    raw_result: Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None
+    raw_result: HandlerResult
     if sandbox is not None and sandbox.mode is SandboxMode.SUBPROCESS:
         raw_result = cast(
-            "Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None",
+            "HandlerResult",
             run_sandboxed(
                 handle,
                 payload,
