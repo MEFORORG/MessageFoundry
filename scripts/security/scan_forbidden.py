@@ -88,16 +88,30 @@ _ALLOWED_IP = re.compile(
 #
 # A worktree/branch slug is whatever the task happened to be CALLED, so it can name a prospect segment,
 # a customer engagement, or a competitor study. That is unbounded: the leak is the project name itself,
-# and there is no list to add it to. Matching the shape is the only control that scales.
-_WORKTREE_SLUG = re.compile(r"(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}")
+# and there is no list to add it to. Matching the shape is the only control that scales. It is
+# case-folded whole: agent slugs are lowercase by convention, but scripts/worktree/new.ps1
+# validates -Name as ^[A-Za-z0-9._-]+$ and hands it to `git worktree add -b` verbatim, so an
+# upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
+_WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")
 # An absolute user-home path carries the OS account name, and inside a worktree path the slug as well.
 # Exempt: bracket/env placeholders (<you>, $HOME, %USERPROFILE%, {home}), the well-known shared and CI
 # accounts, and the DOCUMENTATION placeholder names this repo already uses in examples (me, svc, you,
 # user, username, example). Everything else looks like a real account and fires. That list is the whole
 # judgement call here: "is this a real person's login" is not decidable by shape, so the pattern trusts
 # a small, explicit set of conventional stand-ins and treats anything else as a disclosure.
+#
+# The drive-letter arm folds case INLINE. Windows paths are case-INSENSITIVE, so `C:\Users\<name>`,
+# `c:\users\<name>` and `C:\USERS\<name>` are the SAME directory naming the SAME account, and a
+# literal `Users` caught only one of those four spellings. (The examples use the `<name>`
+# placeholder the lookahead below exempts: a real account segment written here would trip this
+# very detector.) Keep the fold SCOPED to that arm -- do NOT lift it to a whole-pattern
+# re.IGNORECASE. That also lower-cases the POSIX /Users arm, and `/users/` is an extremely
+# common URL segment: measured, it then matches the web console's /ui/users/... routes in 47
+# places on the tracked tree and reds this required context on its first run. The exemption
+# list below stays case-SENSITIVE for the inverse reason -- on POSIX `Public` and `public` are
+# DIFFERENT accounts, and widening an exemption is the under-detection direction.
 _HOME_PATH = re.compile(
-    r"(?:[A-Za-z]:[\\/]Users|/home|/Users)[\\/]"
+    r"(?:(?i:[A-Za-z]:[\\/]users)|/home|/Users)[\\/]"
     r"(?!<|\$|%|\{"
     r"|(?:Public|Default|All|ContainerAdministrator|runner|vsts"
     r"|me|svc|you|user|username|example)[\\/\s\"'`]"

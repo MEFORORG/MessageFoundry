@@ -583,6 +583,53 @@ def test_absolute_home_path_is_flagged_but_placeholders_are_not(
     ), "placeholders / CI / shared accounts must not fire"
 
 
+def test_home_path_casing_variants_all_fire_but_the_posix_users_route_does_not(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Windows paths are case-INSENSITIVE: all four spellings name the SAME account.
+
+    The ``/users/`` non-match at the end is asserted deliberately, not incidentally -- it pins the
+    asymmetry that keeps the case-fold scoped to the drive-letter arm, so the next reader cannot
+    quietly widen it to a whole-pattern ``re.I``. The scanner's ``_HOME_PATH`` comment says why.
+    """
+    mod = _load(None, monkeypatch)
+    variants = tmp_path / "variants.md"
+    # Assembled like the fixtures above so no SOURCE line here is itself a match -- this file is
+    # scanned by the gate it tests.
+    variants.write_text(
+        f"c:{_BS}users{_BS}Carol{_BS}Code\n"
+        f"C:{_BS}USERS{_BS}Dave{_BS}Code\n" + "c:/" + "users/Erin/Code\n",
+        encoding="utf-8",
+    )
+    hits = mod.scan_file(variants, "docs/variants.md")  # type: ignore[attr-defined]
+    assert sum("absolute user-home path" in h for h in hits) == 3
+    assert not any(n in h for h in hits for n in ("Carol", "Dave", "Erin"))
+
+    route = tmp_path / "route.md"
+    route.write_text("/users/list\nGET /ui/users/{id}/roles\n", encoding="utf-8")
+    assert not any(
+        "absolute user-home path" in h
+        for h in mod.scan_file(route, "docs/route.md")  # type: ignore[attr-defined]
+    ), "a lower-cased POSIX /users/ segment is a REST route, not a home path"
+
+
+def test_worktree_slug_casing_variant_is_flagged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An upper-cased slug is reachable, so it must not slip the gate.
+
+    ``scripts/worktree/new.ps1`` validates ``-Name`` as ``^[A-Za-z0-9._-]+$`` and hands it to
+    ``git worktree add -b`` verbatim, with no lowercasing anywhere on the path.
+    """
+    mod = _load(None, monkeypatch)
+    f = tmp_path / "notes.md"
+    # Split for the same reason as the fixtures above.
+    f.write_text("see .claude/work" + "trees/Some-Task-Name-a1b2c3 for details\n", encoding="utf-8")
+    hits = mod.scan_file(f, "docs/notes.md")  # type: ignore[attr-defined]
+    assert any("worktree/branch slug" in h for h in hits)
+    assert not any("Some-Task-Name" in h for h in hits)
+
+
 # --------------------------------------------------------------------------------------------------
 # Round-3 hardening: parser diagnostics, allowlist breadth, and per-section floors.
 # --------------------------------------------------------------------------------------------------
