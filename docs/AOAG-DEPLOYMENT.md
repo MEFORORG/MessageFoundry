@@ -307,14 +307,9 @@ The checklist behind those steps:
 
 - [ ] **Greenfield database.** There is no in-place migration from SQLite; drain and cut over
       ([`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) "greenfield-only"). The schema is created on
-      first `open()` as idempotent DDL, so either grant the engine login create rights for the
-      first run or pre-create the schema. The exact bootstrap privileges are still a
-      *filled-by-staging* item in that doc. Until it is filled in, use this known-good interim
-      posture: grant the engine login **`db_owner` on the `mefor` database only** (no server-level
-      roles) for the first run, then after schema creation you may reduce toward
-      `db_datareader` + `db_datawriter` + `EXECUTE`, validated in staging. With RCSI and
-      `ALLOW_SNAPSHOT_ISOLATION` pre-set per step 2 above, the engine login never needs
-      `ALTER DATABASE` rights.
+      first `open()` as idempotent DDL, so either give the engine login the bootstrap grants
+      (*Login grants* below) or pre-create the schema. With RCSI and `ALLOW_SNAPSHOT_ISOLATION`
+      pre-set per step 2 above, the engine login never needs `ALTER DATABASE` rights.
 - [ ] **Pre-enable RCSI on the primary before first engine start:**
       `ALTER DATABASE [mefor] SET READ_COMMITTED_SNAPSHOT ON WITH ROLLBACK IMMEDIATE;`
       (the database name must match `[store].database`). The store auto-enables RCSI at open if the
@@ -336,11 +331,24 @@ The checklist behind those steps:
       account on every instance. **Verify by connecting to each replica directly with the engine's
       credentials**, and make that check part of the pre-go-live failover drill; if it is missed,
       the very first failover to R2 leaves the engine in a login-failed retry loop.
-- [ ] **Login grants.** The store reads only `sys.databases` and `sys.database_files` for status
-      display, so it has no `VIEW SERVER STATE` dependency of its own. Still, validate the real
-      low-privilege login in staging: MessageFoundry's CI runs the SQL Server leg as `sa`, so a
-      green build does not prove a locked-down production login works. Missing grants surface as
-      errors 297/300 only in production.
+- [ ] **Login grants — least privilege, never `db_owner`.** The engine's database user needs
+      `db_datareader` + `db_datawriter` + `db_ddladmin` on `mefor` and **no server-level role**;
+      [`DEPLOY-SERVER-DB.md`](DEPLOY-SERVER-DB.md) §1.1 carries the T-SQL and §2 the
+      bootstrap-vs-steady-state rule. `db_ddladmin` is a **schema-change-window** grant, not a
+      first-run-only one: the store skips its whole DDL batch whenever the `schema_meta` marker
+      already records the shipped batch, so DDL is issued only against a virgin database and on the
+      first start of a build whose schema moved — and a login without it **fails that start
+      outright**, it does not degrade. Re-grant it for an upgrade window rather than discovering the
+      gap mid-change. `EXECUTE` on a **user** procedure is **not** in the set: the only
+      user procedures the engine calls are the two lane-family claim procs, and only under
+      `[store].fifo_claim_proc` ([`CONFIGURATION.md`](CONFIGURATION.md)), which is off by
+      default. The `sp_getapplock` calls the APPLOCK bullet above describes are a **system**
+      procedure `public` can already execute — no grant. The store reads only
+      `sys.databases` and `sys.database_files` for status display, so it has no `VIEW SERVER STATE`
+      dependency of its own. Still, validate the real low-privilege login in staging:
+      MessageFoundry's CI runs the SQL Server leg as `sa`, so a green build does not prove a
+      locked-down production login works. Missing grants surface as errors 297/300 only in
+      production.
 - [ ] **ODBC Driver 18** must be installed on every engine host. The driver name is hardcoded in
       the store's connection string; there is no override.
 - [ ] **Connection budget.** `[store].pool_size` defaults to **40 per engine** (the measured
