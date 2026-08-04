@@ -172,6 +172,29 @@ Every hotspot is held to **one owner per wave**. Banner positions verified on di
 - **One worktree / branch / `.venv` per session:** `scripts/worktree/new.ps1 -Name plan-<lane>` ([docs/WORKTREES.md](../WORKTREES.md)), branched off **`origin/main` @ `1cf04732`** (`git fetch` first — this worktree's HEAD is `857a70d4`). **Never branch off a sibling session's branch**, even when its work looks like a prerequisite: the only hard dependency in this plan (#233 → #237) is satisfied by #233 being **merged to `origin/main`**, not by branching from it. Re-check in-flight ownership before starting: `git worktree list`, `gh pr list --state all`, `git log origin/main`.
 - **Every session updates its own item's BANNER in `docs/BACKLOG.md` — and nothing else in that file.** Write the 🚧 in-progress claim naming the lane **before** writing code, in its own commit; flip to ✅/⛔/🪦 when the work lands. Edits are **line-disjoint per banner** (positions in §C) and the **owner serialises the merges within a wave**. **One `> <glyph>` banner per item; CLOSED must never coexist with OPEN.** The 🚧 claim is the *only* signal that stops a sibling worktree double-building the same item — neither the worktree gate nor the ledger gate catches duplicated work.
 
+- ⚠️ **RULE 1 FACTUAL CORRECTION 2026-08-04 — the census carve-out's UNIT is wrong. This changes nothing about who owns the table; RULE 1 below stands as written.**
+
+  Where the carve-out says to re-derive the census "from the table", the correct unit is **an open HEADING**, not a row:
+
+  > An open item is a `## N. ` heading in `docs/BACKLOG.md` — **not inside a fenced code block** — whose leading blockquote block carries at least one of `🔢 🚧` and **none** of `✅ ⛔ 🪦`.
+
+  The alphabet is taken from source, not memory: `scripts/docs/backlog_status_check.py:79-80` defines `_CLOSED = "✅⛔🪦"` and `_OPEN = "🔢🚧"`.
+
+  **Rows fail in BOTH directions, which is why "rows whose banner is open" — an earlier form of this correction, including mine — is also insufficient.** Two reachable shapes break it in opposite ways:
+
+  | shape | effect on a row-based count |
+  |---|---|
+  | item closed, **row retained** with `✅` (pending in PR #177 for #335) | over-counts by 1 |
+  | item filed with **no table row at all** (the shape PR #105 uses for its item) | under-counts by 1 |
+
+  ⭐ **And when both are present the total comes out RIGHT while both underlying sets are WRONG** — the errors cancel. Measured across four states of the ledger, only a **two-directional heading↔row comparison** catches that; every total-only assertion passes it. So a census that merely *adds up* is not evidence the table and the items agree.
+
+  Why the heading and its banner are authoritative is already stated at `docs/BACKLOG.md:165` — *"The per-item 🔢 banner is the live record. This table is a view of it, and where the two disagree the banner wins."* A census must therefore be **reproducible from the record**, not **true about the world**: #327's banner is stale while its work is merged, and "correcting" the count against the code would make every future recompute an argument about who inspected better. The stale banner stays visible as its own defect rather than being absorbed into a number.
+
+  ⚠️ **Edge case that fires on exactly this work:** the status gate has **no fenced-code handling** (verified — zero fence logic in `backlog_status_check.py`). A ```` ```markdown ```` block containing a `## 1234.` banner template inside an item body raises the parsed count. Pasting a template into an item body is the trigger. `ledger_check.py` *does* see fenced text, so an **unallocated** fenced number trips pre-commit — but a number you legitimately allocated slips through both gates.
+
+  **Published `main` is currently internally consistent** — 92 open headings, 92 rows, strict bijection both ways, ranks contiguous, all four census lines matching a fresh recompute. Nothing to repair today; both defects above are *pending* in open PRs.
+
 - **RULE 1 — the live ranked table (`docs/BACKLOG.md:180-272`) and the Distribution census (`:169-171`) are OWNER-ONLY. No session touches either, in any wave, for any reason.** The table holds **93** rows — one per open item, contiguous and one line each — and the plan's 41 schedulable items are **interleaved among them**, so wave-mates land inside git's 3-line merge context (W1 alone: `:180`/`:182`, `:191`/`:192`, `:208`/`:209`, `:233`/`:234`); the census is a single 4-line hunk every session would rewrite, and two sessions each re-deriving it from a tree the other already decremented **merge clean and publish a wrong count**. Both surfaces are *derived*: `:165` states it outright — **"the banner is the live record. This table is a view of it, and where the two disagree the banner wins."** So sessions move the record, and **the owner runs ONE reconcile pass per wave, after that wave's merges**, re-deriving the affected rows and recomputing all four census lines in a single commit. A session that believes its row is now false says so **in its PR body**; it does not edit the row.
 
   **When the owner is absent and a session must recompute the census itself: RE-DERIVE all four lines from the table as it stands, never apply a delta.** Two sequential recomputes-from-source cannot disagree, whatever order they land in. Two sessions each applying their own delta can — and the result merges clean and reads as current, which is the exact failure the file's own *"recomputed with the table, never carried forward"* rule exists to prevent. Do not hand another session a delta to carry, and do not accept one: carrying a number instead of deriving it reintroduces the carried-forward census under a different name. (Recorded because it was tried on 2026-08-03. One session offered a delta so the two passes would agree; the other refused it and was right.)
