@@ -987,6 +987,12 @@ def test_serve_loopback_prod_quiet_on_approvals(
     # Loopback byte-identity: admin_exposed is False on the loopback default, so even a production PHI
     # instance with approvals off never emits the advisory. Retention windows + SMTP satisfy the
     # #186a/#188 prod gates so the serve reaches rc 0 and only the approvals posture is under test.
+    #
+    # BACKLOG #326 re-keyed admin_exposed onto `instance_exposed` (off-loopback bind OR a declared
+    # TLS-terminating proxy). This case is unchanged BY CONSTRUCTION: `instance_exposed` is also False
+    # on a plain loopback bind with nothing declared, which is the property that keeps the loopback
+    # default quiet. test_plain_loopback_is_not_instance_exposed pins the same invariant against the
+    # MFA arm; both must hold or the re-key widened more than it was meant to.
     rc = _dualctl_serve(
         tmp_path,
         monkeypatch,
@@ -1275,6 +1281,177 @@ trusted_proxies = ["10.0.0.2"]
     assert rc == 0
     err = capsys.readouterr().err
     assert "declared reverse proxy" in err and "single-factor over the network" in err
+
+
+# --- BACKLOG #326: the exposure predicate must not read the mutated console flag ------------------
+#
+# `settings.api.serve_ui` is flipped False IN PLACE by both ADR 0143 degrade arms (console wheel
+# absent; default-on console meeting an exposed bind) BEFORE the exposure gates read it. Keying
+# `admin_exposed` on it therefore made the MFA-at-exposure refusal unreachable on the runbook's
+# RECOMMENDED topology — a loopback bind BEHIND a declared reverse proxy with the console left at its
+# default — while the ADR 0152 arm two hundred lines later called the very same boot exposed.
+#
+# These cases pin the corrected keying (`instance_exposed`) from OUTSIDE the engine: by exit code and
+# by operator-visible text, never by reading the source. The two arms above already cover an
+# EXPLICITLY-enabled console; what was missing was every arm where the console is not explicitly on.
+#
+# Each later production-PHI gate (bounded retention windows, the security-notification channel, the
+# ADR 0152 in-use-data-protection declaration) is pre-satisfied, so exactly one gate decides each case.
+_EXPOSURE_PRELUDE = (
+    "security.local_access_only = true\n"  # LOOPBACK bind — the whole point of these cases
+    "security.block_unlisted_outbound = true\n"
+    "security.delete_message_bodies_after_days = 30\n"
+    "security.memory_encryption_operator_declared = true\n"
+)
+_EXPOSURE_TAIL = (
+    "[retention]\ndead_letter_days = 30\n"
+    '[alerts]\nemail_smtp_host = "smtp.example.org"\nemail_from = "sec@example.org"\n'
+)
+_DECLARED_PROXY = (
+    '[api]\ntls_terminated_upstream = true\ntrusted_proxies = ["10.0.0.1"]\n'
+    'proxy_intra_service_auth = "network"\nproxy_tls_min_version = "1.2"\n'
+)
+
+
+def test_serve_default_console_declared_proxy_still_requires_mfa_on_prod_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ARM C — the load-bearing case. Loopback bind behind a DECLARED proxy with [security].
+    # serve_web_console left at its DEFAULT: the ADR 0143 auto-degrade clears serve_ui, so the old
+    # `admin_exposed = not is_loopback or ui_exposed` was False and this production PHI instance
+    # started with single-factor admin on the network. It must refuse.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        # require_mfa = false opts out of the BACKLOG #187 secure default so the exposure gate fires.
+        _EXPOSURE_PRELUDE + "security.require_mfa = false\n" + _EXPOSURE_TAIL + _DECLARED_PROXY,
+        env="prod",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "require_mfa off; refusing to start" in err
+    assert "declared reverse proxy" in err
+
+
+def test_serve_console_explicitly_disabled_still_requires_mfa_on_prod_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # ARM D — an operator who EXPLICITLY turns the console off is in the identical exposure posture:
+    # the single-factor admin surface is the JSON API, which is served either way. Keying on the
+    # console flag made "I disabled the browser console" silently disable an MFA refusal too.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        _EXPOSURE_PRELUDE
+        + "security.require_mfa = false\nsecurity.serve_web_console = false\n"
+        + _EXPOSURE_TAIL
+        + _DECLARED_PROXY,
+        env="prod",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "require_mfa off; refusing to start" in err
+
+
+def test_serve_default_console_declared_proxy_warns_dual_control_on_phi(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The #189 dual-control arm reads the SAME `admin_exposed`, so it degraded with the same flag.
+    # require_mfa on pre-clears the sec-mfa-on gate, leaving only the approvals posture under test.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        'security.enforcement = "warn"\n'
+        + _EXPOSURE_PRELUDE
+        + "security.require_mfa = true\n"
+        + _EXPOSURE_TAIL
+        + _DECLARED_PROXY,
+        env="prod",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "[approvals].enabled off" in err and "single caller's authority" in err
+
+
+def test_exposure_desc_names_the_proxy_not_the_console(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The refusal has to name a trigger the operator can act on. It used to read "([api].serve_ui +
+    # tls_terminated_upstream)" — grammatical, and false for every arm the fix newly catches, because
+    # serve_ui is False by the time the message is built. Pinned by BEHAVIOUR (the emitted text), not
+    # by a comment: on arm C the whole serve emits no other `serve_ui`, measured at HEAD.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        _EXPOSURE_PRELUDE + "security.require_mfa = false\n" + _EXPOSURE_TAIL + _DECLARED_PROXY,
+        env="prod",
+    )
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "serve_ui" not in err, (
+        "the exposure description names [api].serve_ui as the trigger, but serve_ui is False on every "
+        "arm this refusal newly catches — the operator would go looking for a flag that is already off"
+    )
+    assert "tls_terminated_upstream" in err
+
+
+def test_plain_loopback_is_not_instance_exposed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The byte-identity guard the re-key must not break, and the pin on the NARROW predicate. A plain
+    # loopback bind with nothing declared is not exposed, so neither the MFA refusal nor the #189
+    # dual-control advisory may fire — even on a production PHI instance with both knobs off. This is
+    # why `console_exposed` (which also counts a bare `public_origin`) was NOT reused here: nothing has
+    # been declared in that case, so exposure is an INFERENCE, and an inference must not refuse. It
+    # must not be silent either — test_undeclared_proxy_warns_about_single_factor_admin covers that
+    # half. This case sets no `public_origin`, so it exercises neither arm: it is the floor, where the
+    # correct output is nothing at all.
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        _EXPOSURE_PRELUDE + "security.require_mfa = false\n" + _EXPOSURE_TAIL,
+        env="prod",
+    )
+    assert rc == 0
+    err = capsys.readouterr().err
+    assert "require_mfa off" not in err
+    assert "approvals" not in err
+
+
+def test_undeclared_proxy_warns_about_single_factor_admin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The residual the narrow predicate leaves open must be WARNED about, not merely documented.
+
+    `instance_exposed` deliberately excludes a set `public_origin` with no declared terminator, and
+    the operator docs say that case "still only warns". Measured while this arm was written, it did
+    not: the only other candidate is the ADR 0068 §8 undeclared-proxy heuristic, which (a) is about
+    the /ui session cookie and HSTS and says nothing about admin factors, and (b) is gated on
+    `settings.api.serve_ui`, which the ADR 0143 auto-degrade clears in place for exactly this input —
+    a DEFAULT-on console plus a set `public_origin`. So on the commonest shape of this posture the
+    startup said nothing whatever about single-factor admin, and a compensating control cited in four
+    operator docs did not exist (CLAUDE.md §11: a compensating control must not rest on a false
+    premise).
+
+    Both halves are asserted: the new warning is present, and the §8 heuristic is NOT — which is what
+    makes this arm load-bearing rather than duplicative.
+    """
+    rc = _l5b_serve(
+        tmp_path,
+        monkeypatch,
+        _EXPOSURE_PRELUDE
+        + "security.require_mfa = false\n"
+        + 'security.web_console_public_address = "https://mefor.example.org"\n'
+        + _EXPOSURE_TAIL,
+        env="prod",
+    )
+    assert rc == 0, "an UNDECLARED proxy is an inference — it must warn, never refuse"
+    err = capsys.readouterr().err
+    assert "UNDECLARED reverse proxy" in err and "single-factor over the network" in err
+    assert "session cookie ships WITHOUT Secure" not in err, (
+        "the ADR 0068 §8 heuristic fired after all — re-check whether this arm is still needed, and "
+        "correct the docs either way"
+    )
 
 
 # --- ADR 0143: the browser console is ON by default (loopback secure-context) ---------------------
