@@ -305,12 +305,12 @@ async def test_summary_and_metadata_encrypted_at_rest_and_decrypt(tmp_path: Path
         # ...ciphertext on disk (no MRN/name/site visible)...
         sm = _raw_at_rest(db, column="summary")
         md = _raw_at_rest(db, column="metadata")
-        # Whole-plaintext absence, not sentinel substrings. Both stand-ins carry characters base64
-        # cannot emit (space, '^', '{', '"'), so their absence is DETERMINISTIC. The sentinels were a
-        # mixed bag that read as uniformly safe: "999001" (6 chars) and "WESTWING" (8) are effectively
-        # never hit, but "DOE" is 3 and collides with a random body about 1 CI run in 304.
-        assert sm.startswith(MARKER_PREFIX) and EF3_SUMMARY not in sm
-        assert md.startswith(MARKER_PREFIX) and EF3_METADATA not in md
+        # Only the 3-char "DOE" clause is replaced, with deterministic whole-plaintext absence
+        # (EF3_SUMMARY carries a space and '^', which base64 cannot emit). "999001" is 6 characters --
+        # p ≤ 2.1e-9 -- and stays exactly as written: churning correct assertions widens the diff for
+        # no gain, which is why #347 scopes the ≥6 group as leave-alone.
+        assert sm.startswith(MARKER_PREFIX) and "999001" not in sm and EF3_SUMMARY not in sm
+        assert md.startswith(MARKER_PREFIX) and "WESTWING" not in md
         # ...and decrypt on the detail + tracking-list read paths.
         rec = await store.get_message(mid)
         assert rec is not None and rec["summary"] == EF3_SUMMARY and rec["metadata"] == EF3_METADATA
