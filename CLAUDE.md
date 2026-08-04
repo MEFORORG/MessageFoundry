@@ -14,6 +14,43 @@ stops matching the code, fix the doc.
 
 ---
 
+## 0. Deployment status — read this before writing any severity claim
+
+> ⛔ **MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
+> running it.** **Published to PyPI is *not* deployed** — a release artifact on an index is not a
+> running instance, and the two get conflated constantly. Distinguish **shipped** (on `main`, on
+> PyPI), **deployable**, and **deployed**: only the first two are true today.
+
+This is load-bearing because the wrong premise silently corrupts severity, urgency, and prose
+across the repo. **Two consequences, and they pull in opposite directions — apply both:**
+
+1. **Present-tense impact claims are factually false.** *"PHI is exposed"*, *"customers are
+   affected"*, *"operators rely on this today"*, *"live feeds are shipping X"*, *"this needs an
+   incident response"* — none of these are true of anything here. Write beta defects in the
+   conditional: **"would expose X on first deployment"**, *"a deploying site would hit Y"*, *"is
+   wrong in the shipped code"*. False present tense does not stay local; it propagates into
+   security scorecards, review registers, BACKLOG banners and public docs, and a security record
+   asserting a live exposure that does not exist is exactly the *"compensating control resting on
+   a false premise"* defect §11 forbids.
+2. **Hypothetical migration costs are vacuous.** *"breaks a running deployment on upgrade"*,
+   *"operators need notice / a migration window / a deprecation period"*, *"backward compatibility
+   with what sites have configured"* — there is nothing to break and nobody to notify, so the cost
+   of a breaking change is currently **zero**. Prefer the simple, correct end state over a staged
+   migration or compatibility shim; those are real costs paid to protect users who do not exist.
+
+⛔ **It cuts one way only — never cite "not deployed" to relax a rule.** It removes false urgency
+and vacuous costs. It does **not** downgrade a fix, justify skipping a gate, weaken a control, or
+make a finding unimportant. The security, PHI (§9) and leak-gate rules exist so the **first**
+deployment is safe; zero deployments is why there is still time to get them right, not permission
+to lower the bar. Note that §9's *"this engine carries PHI"* is a statement about the design and
+intended use — **not** evidence of a live PHI-carrying instance.
+
+This is an **owner-stated fact**, repeatedly. Do not re-derive it, do not go looking for
+deployments to confirm it, and do not soften it to "as far as I can tell". If an adopter ever goes
+live, this section must be revised first — check with the owner before assuming it still holds.
+
+---
+
 ## 1. Project Overview
 
 MessageFoundry routes, transforms, and validates HL7 v2.x messages between **connections**,
@@ -370,6 +407,10 @@ python samples/send_mllp.py samples/messages/adt_a01.hl7
 This engine carries PHI. The full PHI map — threat model, data-at-rest inventory, redaction rules,
 and the retention/encryption roadmap + secure-ops checklist — is [`docs/PHI.md`](docs/PHI.md). Treat
 these as hard rules:
+
+> "Carries PHI" describes the **design and intended use** — it is not a claim that a live instance is
+> holding PHI today (§0: zero deployments). That changes how you word a *finding*, never whether these
+> rules apply: they are what make the first deployment safe, so none of them relax.
 - **Never log full message bodies at INFO or above.** Full payloads go only to the secured
   store, never to the general log. (Logging is stdlib today; structlog + redaction is planned —
   until then, don't raise the service to `DEBUG` in production.)
