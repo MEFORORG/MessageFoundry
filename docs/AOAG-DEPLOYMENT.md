@@ -378,7 +378,7 @@ cross-subnet listener:
 > the store connection takes exactly one AG-aware keyword, and **it has shipped**:
 > **`[store].multi_subnet_failover`** emits ODBC `MultiSubnetFailover=Yes` so the driver races the
 > subnets instead of serially waiting out each one
-> ([backlog #100](BACKLOG.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2),
+> ([backlog #100](archive/backlog/BACKLOG-CLOSED.md#100-multisubnetfailoveryes-opt-in-for-the-sql-server-store-connection-p2),
 > shipped 2026-07-10; see [`CONFIGURATION.md`](CONFIGURATION.md)). It is **opt-in and defaults to
 > `false`** — a deployment that sets nothing gets nothing. **Turn it on** for any multi-subnet AG.
 >
@@ -451,7 +451,7 @@ two hospital engines and the DR engine. Give each an **identical config dir** an
   engine**: every one of its ~7 commits/message now crosses the WAN to the AG primary (§3.3), and
   there is **no automatic fail-back** to the hospital once an engine there returns — leadership stays
   put until you deliberately move it (the §6 *Failback* runbook). **Leader preference IS built** —
-  [backlog #101](BACKLOG.md#101-cluster-leader-preference--non-promotable-standby-p2) shipped
+  [backlog #101](archive/backlog/BACKLOG-CLOSED.md#101-cluster-leader-preference--non-promotable-standby-p2) shipped
   2026-07-12 ([ADR 0096](adr/0096-cluster-leader-preference-and-non-promotable-standby.md)): two
   per-node `[cluster]` knobs, `acquire_delay_seconds` (handicaps take-over of an **expired** lease
   only — renews are never delayed, so there is no two-leader window) and `promotable = false` (the

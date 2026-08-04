@@ -62,7 +62,14 @@ jobs:
             exit 0
           fi
 
-          changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+          # THREE-dot, deliberately. The two-dot form asks "how do these two trees differ", which
+          # includes everything main gained since this PR branched -- as a REVERSE delta on paths the
+          # PR never touched. Any main-side change to docs/BACKLOG.md (the archive move being one
+          # large one) would then be credited to every open PR with an older base, and this gate would
+          # pass while enforcing nothing. Three-dot asks the question actually being posed: what did
+          # THIS PR change relative to the merge base. `ci.yml` already uses three-dot for the same
+          # question. fetch-depth: 0 above guarantees the merge base is present.
+          changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"
           touches_code=false
           case "$changed" in
             *messagefoundry/*|*ide/*|*messagefoundry_webconsole/*) touches_code=true ;;
@@ -73,17 +80,23 @@ jobs:
             exit 0
           fi
 
-          if printf '%s\n' "$changed" | grep -qx 'docs/BACKLOG.md'; then
-            echo "OK — PR claims '$claim', touches code, and updates docs/BACKLOG.md."
+          # The item's banner lives in docs/BACKLOG.md while the item is open, and moves verbatim into
+          # docs/archive/backlog/ once it is retired. Updating a retired item's banner is a legitimate
+          # satisfaction of this rule, so both locations count -- otherwise the one PR shape that
+          # correctly amends an archived item fails a REQUIRED check with no way to comply.
+          if printf '%s\n' "$changed" | grep -qE '^(docs/BACKLOG\.md|docs/archive/backlog/.+\.md)$'; then
+            echo "OK — PR claims '$claim', touches code, and updates the backlog item namespace."
             exit 0
           fi
 
           n="$(printf '%s' "$claim" | grep -oE '[0-9]+')"
           cat >&2 <<EOF
           ERROR: this PR says it implements '$claim' and changes engine/IDE code, but it does not
-          touch docs/BACKLOG.md.
+          touch docs/BACKLOG.md or any file under docs/archive/backlog/.
 
-          Update item #$n's status banner in the same PR. If the work is complete:
+          Update item #$n's status banner in the same PR — in docs/BACKLOG.md if the item is still
+          open, or in its docs/archive/backlog/ file if it has already been retired. If the work is
+          complete:
 
               > ✅ **SHIPPED in <version> (<ADR / PR>).** <one line of evidence>
 
