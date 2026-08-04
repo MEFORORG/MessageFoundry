@@ -661,7 +661,15 @@ jobs:
           #   Allowlisted (docs-only) paths: any *.md anywhere, docs/**, top-level LICENSE/NOTICE/AUTHORS,
           #   .editorconfig, .gitignore/.gitattributes, .github/{ISSUE_TEMPLATE,PULL_REQUEST_TEMPLATE,...}.md.
           # Be conservative: when in doubt a path is CODE. Empty diff (shouldn't happen on a PR) => code=true.
-          noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitignore$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
+          # `.gitignore` is NOT in this allowlist, deliberately (BACKLOG #327). Six of its rules are the
+          # sole control keeping maintainer-internal material out of a public commit, and
+          # tests/test_private_paths_stay_ignored.py is what asserts they still match. That test runs
+          # under pytest, which is gated on code == 'true' -- so allowlisting `.gitignore` as docs-only
+          # meant a `.gitignore`-only PR set code=false and the one guard that would catch the rule
+          # being deleted DID NOT RUN, on exactly the PR shape it exists to catch. Same defect the two
+          # ungated backlog guards above were added for. Treating it as code costs one suite run on a
+          # rare PR; the alternative costs the publishing boundary, silently.
+          noncode='(\.md$|^docs/|^LICENSE$|^NOTICE$|^AUTHORS$|^\.editorconfig$|^\.gitattributes$|^\.github/(ISSUE_TEMPLATE/|PULL_REQUEST_TEMPLATE))'
           if [ -z "$changed" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
           elif echo "$changed" | grep -qvE "$noncode"; then
