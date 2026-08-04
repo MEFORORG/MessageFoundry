@@ -74,12 +74,19 @@ $ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8123/ -H "Host: exam
 
 ## Engine integration (not wired here)
 
-MessageFoundry's REST transport already threads a **forward-proxy handler**
-(ADR 0126) into its per-connection opener. Point that proxy at this sidecar
-(`http://127.0.0.1:8123`) for connections whose destination publishes ECH. The
-sidecar upgrades the scheme to `https` and originates ECH; the engine keeps its own
-verifying opener for everything else. `messagefoundry/transports/rest.py` is **not**
-modified by this tool — wiring is a follow-up owned by the engine.
+⛔ **Superseded — do NOT pair this sidecar with the forward proxy.** This section predates the wiring
+and prescribed reusing the ADR 0126 forward-proxy handler; the engine **refuses** that pairing.
+
+ADR 0139 "Increment 1" has since landed in `messagefoundry/transports/rest.py`, and it did *not* reuse
+the proxy handler: the REST destination resolves a **dedicated** loopback sidecar URL via
+`ech_sidecar_url_from_settings` (`rest.py:1077`), sets no proxy at all on that path, and raises at
+construction on the pairing — *"ech_egress and proxy_url are mutually exclusive — the ECH sidecar IS
+this connection's egress path (ADR 0139)"* (`rest.py:1189-1193`).
+
+Point the engine at this sidecar with the per-connection `ech_egress` / `ech_sidecar` settings instead —
+see [`samples/ech-sidecar/`](../../samples/ech-sidecar/README.md) for the one authoring form that works.
+The sidecar terminates the loopback hop, upgrades the scheme to `https` and originates ECH; the engine
+keeps its own verifying opener for every other connection.
 
 ## Scope / limitations
 
