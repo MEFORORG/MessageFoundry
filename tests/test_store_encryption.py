@@ -92,8 +92,13 @@ async def test_bodies_encrypted_at_rest(tmp_path: Path) -> None:
         await store.close()
     raw = _raw_at_rest(db)
     payload = _raw_at_rest(db, column="payload", table="queue")
-    assert raw.startswith(MARKER_PREFIX) and "DOE" not in raw  # body is ciphertext on disk
-    assert payload.startswith(MARKER_PREFIX)
+    # Deterministic PHI-absence, per the rule at test_cipher_round_trip_and_hides_plaintext: assert the
+    # WHOLE plaintext is absent, never a short substring. `"DOE" not in raw` was the assertion here, and
+    # it is wrong in both directions against random ciphertext -- it FAILS on correct encryption roughly
+    # 1 CI run in 304 (measured; it fired on PR #142, job 91502517146), and it would PASS on a weak
+    # encoding that merely happened not to emit those three characters.
+    assert raw.startswith(MARKER_PREFIX) and ADT not in raw  # body is ciphertext on disk
+    assert payload.startswith(MARKER_PREFIX) and ADT not in payload
 
 
 async def test_reads_and_delivery_decrypt(tmp_path: Path) -> None:
@@ -300,8 +305,12 @@ async def test_summary_and_metadata_encrypted_at_rest_and_decrypt(tmp_path: Path
         # ...ciphertext on disk (no MRN/name/site visible)...
         sm = _raw_at_rest(db, column="summary")
         md = _raw_at_rest(db, column="metadata")
-        assert sm.startswith(MARKER_PREFIX) and "999001" not in sm and "DOE" not in sm
-        assert md.startswith(MARKER_PREFIX) and "WESTWING" not in md
+        # Whole-plaintext absence, not sentinel substrings. Both stand-ins carry characters base64
+        # cannot emit (space, '^', '{', '"'), so their absence is DETERMINISTIC. The sentinels were a
+        # mixed bag that read as uniformly safe: "999001" (6 chars) and "WESTWING" (8) are effectively
+        # never hit, but "DOE" is 3 and collides with a random body about 1 CI run in 304.
+        assert sm.startswith(MARKER_PREFIX) and EF3_SUMMARY not in sm
+        assert md.startswith(MARKER_PREFIX) and EF3_METADATA not in md
         # ...and decrypt on the detail + tracking-list read paths.
         rec = await store.get_message(mid)
         assert rec is not None and rec["summary"] == EF3_SUMMARY and rec["metadata"] == EF3_METADATA
