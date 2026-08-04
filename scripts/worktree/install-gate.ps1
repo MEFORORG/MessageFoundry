@@ -136,7 +136,32 @@ function Get-GateVersion([string]$Path) {
 
 function Get-GateHash([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return $null }
-    (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash
+    # A CONTENT hash, not a byte hash -- the same basis tests\test_gate_installed_parity.py uses, so the
+    # two instruments print the SAME digest and cannot disagree about one file.
+    #
+    # Get-FileHash is byte-exact, and that made every Windows checkout read as *** STALE *** in red: git's
+    # clean filter stores LF, core.autocrlf=true checks out CRLF, and the install below is a Copy-Item,
+    # which translates nothing -- so the installed copy carries whatever form the checkout that installed
+    # it had. Measured 2026-08-04, the two differed by 805 line endings and NOTHING else, while
+    # `git status` called the file clean. A false STALE is not a harmless false alarm here: the remedy it
+    # printed is a re-install, and re-installing from a checkout older than the installed gate DOWNGRADES
+    # this machine-global file for every session on the box.
+    #
+    # Folded on BYTES (drop the CR of each CRLF pair) rather than by decoding to text: the file need not
+    # be valid UTF-8, and a decode/re-encode round trip could move a BOM or a lone high byte and change
+    # the digest for a reason that has nothing to do with content.
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    $out = [System.Collections.Generic.List[byte]]::new($bytes.Length)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13 -and ($i + 1) -lt $bytes.Length -and $bytes[$i + 1] -eq 10) { continue }
+        $out.Add($bytes[$i])
+    }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        (($sha.ComputeHash($out.ToArray()) | ForEach-Object { $_.ToString('x2') }) -join '').ToUpperInvariant()
+    } finally {
+        $sha.Dispose()
+    }
 }
 
 # Every tool a gate script branches on. -Status calls this on the INSTALLED copy, deliberately: the
@@ -165,18 +190,30 @@ if ($Status) {
     # Print the SHA alongside the version. The version is a hand-bumped label and can disagree with
     # reality -- it did: three rules shipped without a bump, so both lines read the same version directly
     # above a STALE verdict. Showing the hash makes agreement VISIBLE instead of asserted.
-    # Lowercased: Get-FileHash returns uppercase, and every other hash a reader sees here (git, the
+    #
+    # That incident taught "when the version and the hash disagree, believe the hash", and on 2026-08-04
+    # this box produced the exact inverse: both lines read v2026.07.29.2, the byte hashes differed, and
+    # the VERSION was the one telling the truth -- the digests differed only in line endings. Neither
+    # number is authoritative on its own. The hash is now a CONTENT hash (Get-GateHash), which is what
+    # makes the pair meaningful: a disagreement between them is now a real disagreement.
+    #
+    # Lowercased: the digest is returned uppercase, and every other hash a reader sees here (git, the
     # parity test's output) is lowercase. Two spellings of the same digest invite a false "these differ".
     $shortSha = { param($h) if ($h) { " sha $($h.Substring(0, 12).ToLowerInvariant())" } else { "" } }
     Write-Host "installed   : $(if ($iSha) { "$GateDst  v$iVer$(& $shortSha $iSha)" } else { 'NOT installed' })"
     Write-Host "source      : $(if ($sSha) { "$srcGate  v$sVer$(& $shortSha $sSha)" } else { 'NOT FOUND' })"
     if ($iSha -and $sSha) {
         if ($iSha -eq $sSha) {
-            Write-Host "parity      : IN SYNC" -ForegroundColor Green
+            Write-Host "parity      : IN SYNC -- identical CONTENT (line endings are folded out, not compared)." -ForegroundColor Green
         } else {
-            Write-Host "parity      : *** STALE *** the running gate is NOT this checkout's script." -ForegroundColor Red
-            Write-Host "              Re-run this installer to update it. Until you do, rules added or"
-            Write-Host "              removed in source have no effect, and the tests still pass."
+            Write-Host "parity      : *** STALE *** the running gate's CONTENT differs from this checkout's." -ForegroundColor Red
+            Write-Host "              This is a difference in rules or logic -- CRLF vs LF cannot produce it."
+            Write-Host "              Until the installed copy is replaced, rules added or removed in source have"
+            Write-Host "              no effect, and the tests still pass."
+            Write-Host "              WORK OUT WHICH COPY IS OLDER FIRST. Installing from a checkout older than the"
+            Write-Host "              installed gate DOWNGRADES it for every session on this box:" -ForegroundColor Yellow
+            Write-Host "                git log --oneline -5 -- scripts/hooks/worktree_gate.ps1"
+            Write-Host "              Re-run this installer only once THIS checkout is confirmed the newer of the two."
         }
     }
 
