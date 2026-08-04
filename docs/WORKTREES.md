@@ -459,58 +459,6 @@ pwsh -NoProfile -File scripts\hooks\collision_gate.ps1 -PathOverride docs\BACKLO
 Empty output means no live session holds it. Documented in-script as a test affordance; surfaced here
 because a session that needed the answer found it by reading the source.
 
-## Account usage — knowing before a session is cut off
-
-**What it fixes.** Sessions were hitting the plan limit mid-task and losing work. The account's real
-quota state exists — Settings > Usage shows it — but it is not visible from inside a session, so nobody
-knew how much headroom was left until it ran out.
-
-**The one place the numbers arrive.** Claude Code hands `rate_limits` to a **statusLine command's stdin
-and nowhere else**. Not `SessionStart`, not `UserPromptSubmit`, not `Stop` — the payloads were enumerated
-in the shipped binary and it appears in exactly one of them. So quota state cannot be subscribed to; it
-has to be *collected* by a statusLine and published somewhere shared. That single fact determines the
-whole shape:
-
-| | |
-|---|---|
-| [`usage-collect.ps1`](../scripts/coord/usage-collect.ps1) | the statusLine. Publishes to `~/.claude/mefor-usage/latest.json` |
-| [`usage.ps1`](../scripts/coord/usage.ps1) | reads it, adds burn rate, answers *will this run out before it resets* |
-| [`install-usage-statusline.ps1`](../scripts/coord/install-usage-statusline.ps1) | wires it (owner, plain terminal) |
-
-**One publisher, N readers.** The quota is **account-wide** — every session in every repo draws down the
-same 5-hour and 7-day pools — so any one session's reading is the truth for all of them. Do not run a
-collector per session expecting to sum them; that double-counts a shared pool. The publish path is
-user-level for the same reason: the data is a property of the account, not of a checkout.
-
-**It only runs in an interactive session.** The statusLine is part of the TUI's render tree and never
-executes under `claude -p` or the SDK. A headless coordinator can *read* what this publishes and can
-never publish it itself. `refreshInterval` is set because statusLine updates are event-driven and go
-silent when a session is idle — Anthropic's docs name *"a coordinator waits on background subagents"* as
-exactly the case where that leaves you blind.
-
-**Two of the four Settings > Usage numbers are not available at all.** The payload carries `five_hour`
-and `seven_day` only. The **per-model weekly buckets** (the Fable/Opus/Sonnet bars) and the **plan tier**
-are absent, and the request to expose them was closed as not-planned. `usage.ps1` prints that on every
-run rather than burying it: if Opus is being burned hard across many sessions, the bucket most likely to
-stop you is the one nothing here can see. Two green bars and an invisible third is worse than no tool.
-
-```powershell
-pwsh -NoProfile -File scripts\coord\usage.ps1          # human
-pwsh -NoProfile -File scripts\coord\usage.ps1 -Json    # coordinator
-```
-
-Exit codes so a coordinator can branch without parsing prose: **0** ok, **10** warn, **11** critical,
-**20** unknown. `UNKNOWN` is a real answer here and is returned whenever the reading is stale, undateable
-or future-dated — a percentage is never extrapolated from a dead publisher, and every number is printed
-with its own age. **Do not read a missing bucket as an empty one.**
-
-> **`ccusage` does not do this**, despite being the tool everyone recommends and despite several
-> summaries claiming it "fetches real rate limit data". It parses transcripts for tokens and dollars; its
-> "5-hour block" is a client-side reconstruction and its statusline percentage is context-window.
-> `claude-usage-tracker` is the same mistake in cruder form — real token parsing compared against a
-> hardcoded limit table. Anything reading plan state from either is confidently wrong at exactly the
-> moment it matters. Tokens and plan-limit consumption are different quantities.
-
 ## Announcing yourself (UserPromptSubmit hook)
 
 **What it fixes.** Everything above is **pull**-based: a new session discovers its peers and the peers
