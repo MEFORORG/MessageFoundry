@@ -184,7 +184,7 @@ Every hotspot is held to **one owner per wave**. Banner positions verified on di
 
   | shape | effect on a row-based count |
   |---|---|
-  | item closed, **row retained** with `✅` (pending in PR #177 for #335) | over-counts by 1 |
+  | item closed, **row retained** (pending in PR #177 for #335) | over-counts by 1 |
   | item filed with **no table row at all** (the shape PR #105 uses for its item) | under-counts by 1 |
 
   ⭐ **And when both are present the total comes out RIGHT while both underlying sets are WRONG** — the errors cancel. Measured across four states of the ledger, only a **two-directional heading↔row comparison** catches that; every total-only assertion passes it. So a census that merely *adds up* is not evidence the table and the items agree.
@@ -192,6 +192,12 @@ Every hotspot is held to **one owner per wave**. Banner positions verified on di
   Why the heading and its banner are authoritative is already stated at `docs/BACKLOG.md:165` — *"The per-item 🔢 banner is the live record. This table is a view of it, and where the two disagree the banner wins."* A census must therefore be **reproducible from the record**, not **true about the world**: #327's banner is stale while its work is merged, and "correcting" the count against the code would make every future recompute an argument about who inspected better. The stale banner stays visible as its own defect rather than being absorbed into a number.
 
   ⚠️ **Edge case that fires on exactly this work:** the status gate has **no fenced-code handling** (verified — zero fence logic in `backlog_status_check.py`). A ```` ```markdown ```` block containing a `## 1234.` banner template inside an item body raises the parsed count. Pasting a template into an item body is the trigger. `ledger_check.py` *does* see fenced text, so an **unallocated** fenced number trips pre-commit — but a number you legitimately allocated slips through both gates.
+
+  ⭐ **AND THE RE-DERIVATION CANNOT STAND ALONE — this is the half that keeps the unit fix honest.** Deriving from open banners makes the census **consistent with the record**. It does not make the record **true**. #327 is the proof: its banner reads `🔢 not started` while `tests/test_private_paths_stay_ignored.py` is already on `main` and `ci.yml`'s own comment names that file as what asserts the rules still match. Derive today and #327 counts as open — correctly per the rule, and wrongly in fact.
+
+  So paired with a known-stale banner, a re-derivation **launders a false-open into a published count**, and the published number then carries more authority than the banner it came from.
+
+  **Therefore the re-derivation and the stale-banner sweep are ONE operation, not two.** Correct every banner known to be stale first, then derive all four lines. If a stale banner cannot be resolved in that pass, the census note must say the count is **banner-consistent but known-stale by N** rather than presenting it as current.
 
   **Published `main` is currently internally consistent** — 92 open headings, 92 rows, strict bijection both ways, ranks contiguous, all four census lines matching a fresh recompute. Nothing to repair today; both defects above are *pending* in open PRs.
 
