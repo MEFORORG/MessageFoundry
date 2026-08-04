@@ -42,7 +42,13 @@ reaches `docs/adr/README.md`, so the ADR becomes invisible. Three had already be
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr      -Title "Worktree gate"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -Title "Ledger allocator"
 pwsh -NoProfile -File scripts\coord\alloc.ps1 -List
+pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind backlog  -ShowFloor   # read-only: allocates nothing
 ```
+
+`-ShowFloor` prints the computed floor, **the paths it swept**, the sub-partition maximum and the number
+it would issue next — without claiming anything. Use it to answer "what can the floor see" instead of
+spending a number on the question: allocation is a one-way door, so before this existed the floor's own
+correctness was the one property nobody re-tested.
 
 It claims a number by **exclusively creating** `<git-common-dir>/mefor-coord/alloc/<kind>/<number>.json`.
 That create is atomic on NTFS: if a sibling session got there first it throws, and we move to the next
@@ -66,6 +72,34 @@ allocator silently resumes issuing numbers that are already in use, with no erro
 ever computed is stored at `<git-common-dir>/mefor-coord/alloc/<kind>/.floor-highwater` and the floor
 never goes below it; a computed floor beneath the mark prints a loud NOTE rather than quietly handing
 out a used number. The mark can only rise.
+
+**Two maximums, not one — and conflating them bricked the allocator on 2026-08-03.** The public backlog
+sequence is partitioned from the maintainer-internal one at `PUBLIC_BACKLOG_FLOOR` (`#1000`), so the
+allocator needs two different numbers:
+
+| Measurement | Question it answers | Must include public numbers? |
+|---|---|---|
+| **Floor** — max over everything swept | *What must I not re-issue?* | **Yes** |
+| **Sub-floor max** — max below the partition | *How much runway does the internal sequence have?* | **No** |
+
+The residual detector read `Floor`. So the first legitimate item filed in the public sequence — `BACKLOG
+#1000` — made every backlog allocation in the repository throw `REFUSING TO ALLOCATE … has reached the
+public floor`. The guard was not detecting a breach; it was detecting the partition being used exactly as
+designed, and it fired on correct input.
+
+**That detector can now only WARN, and the limit is the data, not the implementation.** Once an internal
+item is allocated at or above the boundary it is indistinguishable, in the published files, from a
+legitimate public item at the same number — both are just `## N.` with N ≥ the floor. A refusal arm would
+have to fire on correct input or never fire at all, so it was **removed** rather than made unreachable: a
+branch that cannot fire reads as protection and is worse than none. Detecting a real breach needs an
+internal-side input this repository does not have. What remains is a warning at 90 % of the boundary,
+measured on the sub-floor band, where public numbers cannot distort it.
+
+*(The sweep does reach internal numbers, which is worth stating because the opposite was suspected:
+measured 2026-08-03, 489 of 490 vault-ish remote-tracking refs carry `docs/BACKLOG.md`, and 67 item
+numbers live only there — including `#240`–`#247`, the numbers the Ledger erratum records as re-issued
+over cited work. Seeing them is what makes the floor trustworthy; it is telling an internal `#1001` from
+a public `#1001` that is impossible.)*
 
 Two consequences worth knowing before you tidy refs:
 
