@@ -59,12 +59,12 @@ def test_an_external_idp_gets_the_interstitial_not_a_redirect() -> None:
     """The control itself: a third-party IdP must produce a page with a destination and a cancel."""
     r = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
     assert r.status_code == 200
     body = r.text
     assert "You are leaving this site" in body or "leaving" in body.lower()
-    assert "login.microsoftonline.com" in body
+    assert "idp.example.com" in body
     assert 'method="post"' in body  # Continue is a form, not a link
     assert "Cancel" in body
 
@@ -95,8 +95,8 @@ def test_the_allowlist_escape_suppresses_the_interstitial() -> None:
     """The documented escape works — and this test exists so the warning in the docs is not a lie."""
     r = _client(
         organization_domains=("hospital.example",),
-        external_link_allowlist=("login.microsoftonline.com",),
-        oidc_authorization_host="login.microsoftonline.com",
+        external_link_allowlist=("idp.example.com",),
+        oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
     assert r.status_code != 200 or "leaving" not in r.text.lower()
 
@@ -105,7 +105,7 @@ def test_turning_the_interstitial_off_suppresses_it() -> None:
     r = _client(
         organization_domains=("hospital.example",),
         external_link_interstitial=False,
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
     assert r.status_code != 200 or "leaving" not in r.text.lower()
 
@@ -128,10 +128,10 @@ def test_the_interstitial_page_carries_no_destination_url_to_post_back() -> None
     """
     r = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     ).get("/ui/oidc/start")
     assert r.status_code == 200
-    assert "https://login.microsoftonline.com" not in r.text  # host shown, full URL never
+    assert "https://idp.example.com" not in r.text  # host shown, full URL never
     assert 'action="/ui/oidc/start"' in r.text  # posts back to us, carrying nothing
 
 
@@ -149,7 +149,7 @@ def test_a_cross_site_post_to_the_start_leg_is_refused() -> None:
     """
     c = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     )
     r = c.post(
         "/ui/oidc/start", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
@@ -161,7 +161,7 @@ def test_a_same_origin_post_is_not_refused_by_the_guard() -> None:
     """Reach control. Without it, a guard that 403s EVERYTHING would pass the test above."""
     c = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     )
     r = c.post(
         "/ui/oidc/start", headers={"Sec-Fetch-Site": "same-origin", "Sec-Fetch-Mode": "navigate"}
@@ -184,7 +184,7 @@ def test_a_cross_site_GET_renders_the_interstitial_and_stages_nothing() -> None:
     """
     c = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     )
     r = c.get(
         "/ui/oidc/start", headers={"Sec-Fetch-Site": "cross-site", "Sec-Fetch-Mode": "navigate"}
@@ -218,7 +218,7 @@ def test_both_start_legs_exist(method: str) -> None:
     """The GET renders, the POST acts. Losing either silently breaks sign-in or the control."""
     c = _client(
         organization_domains=("hospital.example",),
-        oidc_authorization_host="login.microsoftonline.com",
+        oidc_authorization_host="idp.example.com",
     )
     r = getattr(c, method)("/ui/oidc/start")
     assert r.status_code != 405
