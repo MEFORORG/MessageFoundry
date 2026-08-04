@@ -133,9 +133,15 @@ jobs:
       # scripts/docs/backlog_status_check.py imports only argparse/re/sys/pathlib and has its own CLI.
       # tests/test_backlog_status_check.py imports that SAME module, so there is one implementation and
       # the unit tests keep covering its edge cases — this only adds the always-on invocation.
+      # --min-items is the anti-narrowing floor, and it is the point of this invocation as much as the
+      # banner check is. The item namespace spans docs/BACKLOG.md AND docs/archive/backlog/: retiring
+      # items moves them between those files, so every OTHER assertion here — one banner per item, no
+      # contradictions, no duplicates — is satisfied just as easily by scanning a remnant of the corpus
+      # as the whole of it. Without a floor, a change that stopped the archive being read would go green.
+      # Raise the number when the total legitimately grows; it must never be lowered to make CI pass.
       - name: Backlog status invariant (ungated — see above)
         if: runner.os == 'Linux'
-        run: python scripts/docs/backlog_status_check.py
+        run: python scripts/docs/backlog_status_check.py --min-items 277
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.

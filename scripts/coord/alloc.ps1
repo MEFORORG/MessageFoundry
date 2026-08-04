@@ -35,7 +35,15 @@ param(
     [string]$Kind = "adr",
     [string]$Title,
     # Show what this worktree currently holds, and exit.
-    [switch]$List
+    [switch]$List,
+    # Print the computed floor and the paths it swept, then exit WITHOUT allocating.
+    #
+    # Allocation is a one-way door -- claims are never released ("holes are free, collisions are not")
+    # -- so before this switch the only way to find out what the floor could see was to spend a number
+    # on the question. That makes the floor's own correctness the one property nobody re-tests, which
+    # is how it went a whole release reading two refs while its header promised all of them. A gate
+    # that cannot be inspected without altering the thing it guards will not be inspected.
+    [switch]$ShowFloor
 )
 
 $ErrorActionPreference = "Stop"
@@ -59,7 +67,8 @@ if ($List) {
     return
 }
 
-if (-not $Title) { throw "-Title is required (it is recorded with the claim, so a sibling session can see what the number is for)." }
+# -ShowFloor allocates nothing, so there is no claim for a title to be recorded against.
+if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorded with the claim, so a sibling session can see what the number is for)." }
 
 # `git branch --show-current` prints NOTHING on a detached HEAD, so `& git ...` yields $null (not "")
 # -- calling .Trim() on it here threw *before* the detached-HEAD fallback below could run. Null-check first.
@@ -69,6 +78,12 @@ $branch = $branch.Trim()
 
 # FLOOR = max over (origin/main) U (every local + remote ref) U (existing allocations).
 function Get-Floor {
+    # -Peek computes the floor WITHOUT advancing the high-water ratchet. The ratchet is a one-way
+    # door, so an inspection that moves it is not an inspection -- and the first run of -ShowFloor
+    # against a deliberately planted number proved it, ratcheting this clone from 316 to a fabricated
+    # 990 that no later run could undo. Reading a value must not be able to corrupt it.
+    param([switch]$Peek)
+
     $seen = [System.Collections.Generic.List[int]]::new()
     $seen.Add(0)
 
@@ -90,8 +105,22 @@ function Get-Floor {
         #
         # Batched deliberately: ~550 refs share ~190 distinct BACKLOG.md blobs, and a `git show` per
         # ref costs ~34s on Windows (one process each). Two `git cat-file` processes do it in ~3s.
+        # THE NUMBER SPACE SPANS TWO PATHS. Retiring an item MOVES it verbatim out of docs/BACKLOG.md
+        # and into docs/archive/backlog/BACKLOG-CLOSED.md. Sweeping only the published file would make
+        # every archived number invisible here and free to re-issue -- the #240-#247 shape again, just
+        # sourced from a different blind spot. A number that exists in EITHER file, on ANY ref, is taken.
+        #
+        # The archive is ONE file with a FIXED name on purpose: `cat-file --batch-check` takes a spec
+        # list and cannot glob a directory, so a per-ref `git ls-tree -r` would be needed to discover
+        # archive filenames -- one process per ref, the ~34s cost the batching below exists to avoid.
+        # A fixed second spec keeps the sweep at two processes. Splitting the archive into several
+        # files means adding each one here; an archive file not listed here is not policed.
+        $backlogPaths = @("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md")
+
         $refs = @("origin/main", "HEAD") + @(& git for-each-ref --format='%(refname)' refs/heads refs/remotes)
-        $specs = ($refs | Select-Object -Unique | ForEach-Object { "${_}:docs/BACKLOG.md" })
+        $specs = foreach ($r in ($refs | Select-Object -Unique)) {
+            foreach ($p in $backlogPaths) { "${r}:${p}" }
+        }
 
         $oids = [System.Collections.Generic.HashSet[string]]::new()
         foreach ($line in ($specs -join "`n" | & git cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
@@ -99,16 +128,28 @@ function Get-Floor {
             if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
         }
 
-        $rx = [regex]'^#{2,3} (\d+)\.'
+        # MULTILINE IS LOAD-BEARING, and its absence was a silent hole. `[regex]'^...'` anchors at the
+        # start of the STRING, not of each line. The all-refs term below feeds it one line at a time
+        # (cat-file output through the pipeline), so it matched there and looked correct -- but the
+        # working-tree term feeds it `Get-Content -Raw`, one string starting "# Backlog", where `^`
+        # could never match. Measured on this tree: 0 of 277 headings found without Multiline, 277
+        # with. So the term that exists to catch a number written but committed NOWHERE has been
+        # finding nothing since it was written, and the all-refs term hid it by covering every number
+        # that had been committed somewhere -- i.e. every case except the one this term is for.
+        $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
         if ($oids.Count -gt 0) {
             foreach ($line in (($oids -join "`n") | & git cat-file --batch 2>$null)) {
                 $m = $rx.Match("$line")
                 if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
             }
         }
-        $wip = Join-Path $repo "docs/BACKLOG.md"
-        if (Test-Path $wip) {
-            foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
+        # Working-tree term: catches a number written to a file but committed nowhere. Both paths, for
+        # the same reason -- an item drafted straight into the archive is still a claim on its number.
+        foreach ($p in $backlogPaths) {
+            $wip = Join-Path $repo $p
+            if (Test-Path $wip) {
+                foreach ($m in $rx.Matches((Get-Content $wip -Raw))) { $seen.Add([int]$m.Groups[1].Value) }
+            }
         }
     }
 
@@ -143,7 +184,7 @@ function Get-Floor {
         Write-Host "      re-fetch them before trusting any number-space reasoning here." -ForegroundColor Yellow
     }
     $floor = [Math]::Max($computed, $previous)
-    if ($floor -gt $previous) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
+    if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
     # Measure-Object hands back a [double]; the 'D4' format specifier is integer-only and throws on one.
     [int]$floor
 }
@@ -166,7 +207,27 @@ if (Test-Path $gateFile) {
     if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
 }
 
-$observed = Get-Floor
+$observed = Get-Floor -Peek:$ShowFloor
+
+if ($ShowFloor) {
+    # Name the SOURCES, not just the number. "Which files did this sweep actually read" is the
+    # question every silent-narrowing bug turns on, and a bare integer cannot answer it -- a floor of
+    # 353 looks identical whether it swept one path or two.
+    Write-Host "kind     : $Kind"
+    Write-Host "floor    : $observed"
+    if ($Kind -eq "backlog") {
+        Write-Host "paths    : docs/BACKLOG.md, docs/archive/backlog/BACKLOG-CLOSED.md"
+        Write-Host "next     : $([Math]::Max($observed, $PublicBacklogFloor - 1) + 1)  (clamped to >= $PublicBacklogFloor)"
+    } else {
+        Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
+        Write-Host "next     : $($observed + 1)"
+    }
+    Write-Host "watermark: $(Join-Path $alloc '.floor-highwater')"
+    Write-Host ""
+    Write-Host "Read-only: nothing was allocated." -ForegroundColor DarkGray
+    return
+}
+
 if ($Kind -eq "backlog") {
     if ($null -eq $PublicBacklogFloor) {
         throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
