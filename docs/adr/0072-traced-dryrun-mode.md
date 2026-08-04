@@ -1,6 +1,6 @@
 # ADR 0072 — Traced dry-run mode: `dryrun --trace json` for the interactive live-debug loop
 
-**Status:** Accepted (2026-07-06). Ratified by the owner — the engine lane (MULTISESSION-PLAN-7 **L5**) may build. The traced mode is **additive + opt-in**; nothing here changes the shipped `dryrun` default. The §6 test gates are the acceptance criteria (byte-identical run · live-lookup identical · coverage-intact · redacted-by-default).
+**Status:** Accepted (2026-07-06). Ratified by the owner — the engine lane (MULTISESSION-PLAN-7 **L5**) may build. The traced mode is **additive + opt-in**; nothing here changes the shipped `dryrun` default. The §6 test gates are the acceptance criteria (byte-identical run · live-lookup identical · coverage-intact · redacted-by-default). **Amended 2026-08-04 (BACKLOG #341)** — gate 1 stated a single byte-identical equality; the repo reads it at two levels (message-level and per-invocation), and widening `_partition` to fan out any non-`str` iterable made a **generator Handler** deliver where it previously delivered nothing, which the per-invocation mirror cannot observe. Gate 1 in §6 is split by level and given an explicit generator carve-out, and §3 gains the `lazy_result` field that declares it. The message-level guarantee — the one the ADR exists to make — is **unchanged and still absolute**.
 **Deciders:** owner + IDE/DX working group
 **Related:** BACKLOG **#92** (interactive live-debug loop — the primary consumer, v2), BACKLOG **#84** (Test Bench profiling/coverage — the second consumer), BACKLOG **#48** (Insert Element palette — sibling DX lane), ADR 0004 (payload-agnostic ingress — `RawMessage` vs `Message` in a handler), ADR 0010/0043 (`db_lookup`/`fhir_lookup` — the sanctioned non-pure reads that raise in dry-run), CLAUDE.md §9 (PHI handling — `dryrun` output can contain full bodies). Plan: [`docs/releases/MULTISESSION-PLAN-7.md`](../releases/MULTISESSION-PLAN-7.md) (L5 builds this; L6/L7 consume it).
 **Code references** are `origin/main @ 0f0ba08`; line numbers are approximate — locate exactly at implementation time.
@@ -43,12 +43,15 @@ Emitted as JSON (streamed — see §5). One object per Router/Handler invocation
   "disposition": "PROCESSED" | "ROUTED" | "UNROUTED" | "FILTERED" | "ERROR",
   "sends": [ { "outbound": "<name>" }, ... ],   // handler only
   "routed_to": [ "<handler name>", ... ],       // router only
+  "lazy_result": true,                          // OPTIONAL, absent unless true — see below
   "annotations": [
     { "line": <int>, "kind": "live_lookup_skipped",
       "call": "db_lookup" | "fhir_lookup" }
   ]
 }
 ```
+
+- **`lazy_result` (added 2026-08-04, BACKLOG #341).** A **generator** Router/Handler returns without running its body; the body runs when the engine materialises the generator, which is *after* this tracer has restored `sys.settrace`. Such an invocation therefore has **no line events** and its `sends`/`routed_to` are **not measurable** — the tracer must not drain a one-shot iterator to find out, because that would leave the real run nothing to materialise and turn the traced run into a 0-delivery run (gate 1, §6). The invocation is flagged `"lazy_result": true` so a consumer renders *"this body was not traced"* rather than an apparently inert handler; the **message-level** `sends`/`handlers` are computed by the real run and stay exact. Return a list or tuple to get a line-by-line trace.
 
 - **Value-capture timing.** `sys.settrace` `"line"` events fire on line *entry*, so a value assigned on line *N* is only observable once the tracer reaches line *N+1*. The tracer therefore reports a **locals-diff per line** (`assigned` = locals that changed since the previous line event), and attributes each change to the line that produced it. This is deterministic and needs no AST rewrite; an AST-assisted refinement is a possible v2 (§7), out of scope here.
 - **`msg` mutations.** Field writes (`msg[...] = …` / `msg.set(...)`) surface as a change to the `msg` object; the tracer records the **path + new value** written on that line (not the whole message), so the IDE can annotate `msg["PID-5.1"] ▸ "SMITH"`. Whole-payload before/after stays the Test Bench's job (L4), not the trace's.
@@ -79,7 +82,10 @@ The sanctioned non-pure reads (ADR 0010/0043) are **unavailable in dry-run and r
 **Costs / risks:** a `sys.settrace` pass slows the traced handler (acceptable — dry-run is a dev-time preview, not the hot path). The trace function is correctness-sensitive (prior-tracer restore, thread-locality) — hence the mandatory §5 rules and the §6 test gates.
 
 **Test gates (L5 `tests/`):**
-1. **Byte-identical:** a `--trace` run's `disposition` + `sends`/`routed_to` equal the non-traced run's for the same sample.
+1. **Byte-identical (amended 2026-08-04 — stated by level):**
+   - **1a — message level (absolute, no exceptions).** A `--trace` run's top-level `disposition` + `sends` + `handlers` equal the non-traced run's for the same sample. This is the guarantee the ADR exists to make: installing the tracer must never change what the engine would do. It holds for **every** Router/Handler shape, generators included.
+   - **1b — per-invocation mirror (best-effort, degradation declared).** Each invocation's `sends`/`routed_to` mirror what that Router/Handler returned. **Carve-out:** where the Router/Handler is a **generator**, its body has not run at record time and the tracer refuses to consume the one-shot iterator (draining it is what would break 1a), so its `sends`/`routed_to` are `[]` and its `events` are `[]`. That invocation SHALL carry `"lazy_result": true` (§3), and 1a SHALL still hold — the under-report is **declared, bounded, and never a mis-report**: the trace may say less than the run did, never something different. → `tests/test_dryrun_trace.py::test_gate_1a_a_generator_handler_traces_byte_identically_at_message_level`, `tests/test_dryrun_trace.py::test_gate_1b_a_generator_invocation_declares_lazy_result` — the pair pins both halves, so the documented under-report cannot silently become a mis-report, and deleting the `_sends_from` iterator guard reddens 1a.
+   - *Why this is an amendment and not a discovered bug:* before BACKLOG #341 a generator Handler delivered **nothing**, so reporting no sends was exact and 1a and 1b agreed trivially. Widening `_partition` to fan out any non-`str` iterable made a generator Handler deliver — a change to the engine, made by that item, which opened the gap on the Handler half. The Router half has had it since this ADR shipped.
 2. **Live-lookup identical:** a handler hitting an unstubbed `db_lookup` yields identical disposition/Sends **with and without** `--trace`, plus a `live_lookup_skipped` annotation.
 3. **Coverage-intact:** a traced run executed **under `pytest-cov`** leaves the outer coverage data intact (proves the prior tracer was restored).
 4. **PHI-redacted-by-default:** values are `REDACTED` without the show-PHI opt-in.

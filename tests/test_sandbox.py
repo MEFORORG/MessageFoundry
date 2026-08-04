@@ -102,6 +102,22 @@ def h_gadget(msg):
     return _Gadget()
 
 
+@handler("h_gen_fanout")
+def h_gen_fanout(msg):
+    # A GENERATOR handler (BACKLOG #341). Its yields are lazy, so this also pins WHERE the child
+    # materialises them, not just that it does.
+    yield Send("OB_T", "GEN_A")
+    yield Send("OB_T", "GEN_B")
+
+
+@handler("h_set_fanout")
+def h_set_fanout(msg):
+    # A SET handler (BACKLOG #341). Six elements, because the contract this probes is the delivered
+    # MULTISET: the child is a different PROCESS with its own hash seed, so the order it materialises
+    # a set in is not the parent's.
+    return {Send("OB_T", f"SET_{c}") for c in "ABCDEF"}
+
+
 @handler("h_state")
 def h_state(msg):
     return [SetState("ns", "tup", (1, 2)), SetState("ns", "nan", float("nan"))]
@@ -458,6 +474,48 @@ def test_a_handler_returning_a_reduce_gadget_does_not_execute_in_the_engine(
     assert not sentinel.exists(), "a Handler's __reduce__ executed in the engine parent"
 
 
+def test_a_generator_handler_delivers_under_mode_subprocess(graph: tuple[Registry, str]) -> None:
+    """BACKLOG #341 across the process boundary. Before the shared materialization rule the child
+    described a generator/tuple/set return as ``{"o": "other"}`` and the parent rebuilt an inert
+    ``Ignored()``, so a fan-out that delivers N in-process delivered 0 under ``mode=subprocess``.
+    Fixing only the parent's ``_partition`` would leave exactly that mode-dependent disposition."""
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        sandboxed = _deliveries(registry, "h_gen_fanout", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    assert sandboxed == [("OB_T", "GEN_A"), ("OB_T", "GEN_B")]
+    assert sandboxed == _deliveries(registry, "h_gen_fanout")  # identical to mode=off
+
+
+def test_a_set_handler_delivers_the_same_multiset_under_mode_subprocess(
+    graph: tuple[Registry, str],
+) -> None:
+    """A ``set`` return crosses the boundary with every ``Send`` intact — and with its ORDER unpinned,
+    deliberately (ADR 0087 AC-11).
+
+    The child is a separate ``Popen`` with **no** inherited ``PYTHONHASHSEED``, and ``Send`` is a frozen
+    dataclass hashed on its fields, so the child iterates a 6-element set in a different order than the
+    parent would. Asserting an order here would pin a per-process accident and flake; asserting the
+    multiset is the contract the engine actually offers. That the two modes do NOT necessarily agree on
+    order is why `docs/CONNECTIONS.md` steers authors to a list/tuple when order matters.
+
+    The counts are pinned at 6 so the comparison cannot pass by both sides being empty — which is the
+    exact way this test would have "passed" before the fix, when a set delivered nothing in either mode.
+    """
+    registry, config_dir = graph
+    session = _session(config_dir)
+    try:
+        sandboxed = _deliveries(registry, "h_set_fanout", sandbox=session, run_context=RunContext())
+    finally:
+        session.close()
+    off = _deliveries(registry, "h_set_fanout")
+    assert len(sandboxed) == len(off) == 6
+    assert sorted(sandboxed) == sorted(off)
+    assert sorted(p for _, p in sandboxed) == [f"SET_{c}" for c in "ABCDEF"]
+
+
 def test_generator_router_routes_under_mode_subprocess(graph: tuple[Registry, str]) -> None:
     """A generator Router is documented-supported and unpicklable, so ``mode=subprocess`` used to
     dead-letter every message it routed. The child now materialises the router result with
@@ -698,7 +756,12 @@ def _codeset_graph(tmp_path: Path, mapped: str) -> Registry:
         '    return "h"\n'
         '@handler("h")\n'
         "def h(msg):\n"
-        '    return Send("OB_C", code_set("cs")["A"])\n',
+        '    return Send("OB_C", code_set("cs")["A"])\n'
+        '@handler("h_gen_cs")\n'
+        "def h_gen_cs(msg):\n"
+        "    # A GENERATOR whose BODY reads a run-scoped provider. The read happens when something\n"
+        "    # iterates the generator, so this probes WHERE that materialization runs in the child.\n"
+        '    yield Send("OB_C", code_set("cs")["A"])\n',
         encoding="utf-8",
     )
     return load_config(tmp_path)
@@ -720,6 +783,29 @@ def test_code_sets_are_loaded_by_the_child_and_resolve(tmp_path: Path) -> None:
     finally:
         session.close()
     assert [(d.to, d.payload) for d in ds] == [("OB_C", "MAPPED")]
+
+
+def test_a_generator_handlers_body_runs_inside_the_childs_run_context(tmp_path: Path) -> None:
+    """A generator Handler's body executes LAZILY — at the instant something materialises it. In the
+    child that instant must fall INSIDE ``with run_contexts(...)``.
+
+    The codec's ``enc_result`` is called from ``_respond``, *outside* that block, so materialising
+    there would run the Handler body with no active run context: a ``code_set(...)`` inside a
+    generator Handler would raise ``CodeSetError`` under ``mode=subprocess`` while working fine under
+    ``mode=off``. That is a mode-dependent disposition — the exact class of failure ADR 0087's parity
+    rule forbids, and the reason the worker materialises the result itself."""
+    registry = _codeset_graph(tmp_path, "MAPPED")
+    session = _session(str(tmp_path), code_sets=registry.code_sets)
+    rc = RunContext(code_sets=registry.code_sets)
+    try:
+        ds, _, _, _ = transform_one(registry, "h_gen_cs", RAW, sandbox=session, run_context=rc)
+    finally:
+        session.close()
+    assert [(d.to, d.payload) for d in ds] == [("OB_C", "MAPPED")]
+    # And byte-identical to mode=off, which activates the same providers around the same call.
+    with run_contexts(rc, phase="transform"):
+        off, _, _, _ = transform_one(registry, "h_gen_cs", RAW, run_context=rc)
+    assert [(d.to, d.payload) for d in ds] == [(d.to, d.payload) for d in off]
 
 
 def test_an_unreloaded_codeset_edit_does_not_brick_the_inbound(tmp_path: Path) -> None:

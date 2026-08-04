@@ -1,6 +1,6 @@
 # 0087 — Router/Handler subprocess isolation
 
-- **Status:** Accepted  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
+- **Status:** Accepted; **Amended (2026-08-04)** — the transform-result parity rule changed shape. The child now materialises a container return with `_partition`'s **own** rule instead of reproducing its exact input container, so a tuple/set/generator **delivers** in both modes (BACKLOG #341). AC-11 and the "Result parity" bullet below are rewritten accordingly; the isolation boundary and the codec grammar are untouched.  <!-- opt-in subprocess isolation built (#197, 2026-07-10) -->
 - **Date:** 2026-07-10
 - **Related:** [ADR 0009](0009-run-scoped-context-providers.md) (RunContext providers) · [ADR 0010](0010-handler-callable-db-lookup.md) / [ADR 0043](0043-fhir-read-lookup.md) (`db_lookup`/`fhir_lookup`) · [ADR 0072](0072-traced-dryrun-mode.md) (tracer seam it composes with) · [ADR 0036](0036-windows-config-source-trust.md) / [ADR 0041](0041-load-path-attestation-and-change-attribution.md) (config-source trust) · CLAUDE.md §2 (reliability/purity, count-and-log) · CLAUDE.md §4 (layering) · BACKLOG #197 · ASVS 15.2.5 / `docs/security/ASVS-L3-REMEDIATION-PLAN.md` WP-L3-17
 
@@ -146,9 +146,29 @@ target, no `pickle` import left to mis-suppress:
   registry. `mode=off` draws no such line either — see the residuals.
 - **Result parity.** The child materialises a router result with `_handler_names`' own logic (so a
   documented-supported **generator Router**, which is unpicklable, now works under `mode=subprocess`)
-  and reproduces `_partition`'s *exact* input container for a transform result — including describing
-  an item `_partition` would ignore rather than omitting it, so a tuple/set/int return still drops and
-  a `Send` **subclass** still delivers, byte-identically to `mode=off`.
+  and — since the 2026-08-04 amendment — a transform result with `_partition`'s own logic, the shared
+  `wiring.handler_result_items` rule. A **container** return (list, tuple, set, generator) is described
+  element-wise, so both modes deliver the **same `Send`s, into the same three partitions**; anything
+  that rule does not recognise as a container stays a single item, and an item `_partition` would ignore
+  is **described rather than omitted**, so it still drops and a `Send` **subclass** still delivers,
+  byte-identically to `mode=off`. The materialization runs inside the child's `with run_contexts(...)`,
+  so a **generator Handler's** lazily-executed body sees the same run-scoped providers (`code_set`,
+  `state_get`, …) it sees under `mode=off` — materialising it later, at describe time, would make those
+  raise under `mode=subprocess` only.
+  - **CAUTION — parity is over the delivered set, not the order, for an unordered container.** An *ordered*
+    container (list, tuple, generator) delivers in its own order under either mode. A **`set`** has no
+    defined iteration order — `Send` is a frozen dataclass hashed on its fields and `str` hashing is
+    seeded per process — so the child, being a **different process**, materialises it in a different
+    order than the parent would (measured: a six-element set iterated in a different order in **all
+    four** independent process pairs probed). Fan-out order from a
+    `set` is therefore unspecified in *both* modes and is **not** a mode-parity obligation; only the
+    multiset is. This is a property of `set`, not of the sandbox: the same non-reproducibility appears
+    across a crash re-run at `mode=off`. See `wiring.handler_result_items` for the full statement and
+    `docs/CONNECTIONS.md` for the author-facing steer toward ordered containers.
+  - **Residual (mode-independent, recorded in [ADR 0072](0072-traced-dryrun-mode.md) §6 gate 1 —
+    do not restate it here):** a generator Handler is not execution-traced and its per-invocation
+    `sends` are empty. It reproduces at `mode=off`, so it is not a sandbox residual; it is noted here
+    only because this bullet is where a reader meets generator Handlers.
 - **`Send` carries encoded text, never a live `Message`.** The sole parent-side consumer already
   reduces it to a `str`, so the parent's `Send(...)` rebuild is a provable no-op for ADR 0104's
   copy-on-Send choke point instead of taking a second snapshot.
@@ -231,10 +251,19 @@ target, no `pickle` import left to mis-suppress:
   `tests/test_sandbox_codec.py::test_hostile_frames_fail_closed[name_mismatch]`
 - **AC-11** — WHERE `[sandbox].mode=subprocess`, THE SYSTEM SHALL route a **generator** Router
   identically to `mode=off` (it previously dead-lettered every message), and SHALL preserve
-  `_partition` parity for every other return shape — a `Send` subclass still delivers, a tuple/set/int
-  still drops.
+  `_partition` parity for **every** return shape — where, since the 2026-08-04 amendment, a
+  tuple/set/generator of `Send`s **delivers** in both modes (BACKLOG #341), a `Send` subclass still
+  delivers, and a non-iterable unrecognized value (a bare `int`, a `__reduce__` gadget) still drops.
+  Parity is over the **multiset** of items in each of the three partitions, plus their **order for an
+  ordered container**; a `set` return has no defined iteration order in either mode, so its fan-out
+  order is explicitly **not** covered by this SHALL (see the Result-parity bullet).
+  WHERE the Handler is a **generator**, its body SHALL execute inside the child's run context, so a
+  run-scoped accessor within it resolves as it does under `mode=off` rather than raising.
   → `tests/test_sandbox.py::test_generator_router_routes_under_mode_subprocess`,
-  `tests/test_sandbox_codec.py::test_partition_parity_table`
+  `tests/test_sandbox_codec.py::test_partition_parity_table`,
+  `tests/test_sandbox.py::test_a_generator_handler_delivers_under_mode_subprocess`,
+  `tests/test_sandbox.py::test_a_generator_handlers_body_runs_inside_the_childs_run_context`,
+  `tests/test_sandbox_codec.py::test_handler_result_items_treats_a_str_as_a_single_value`
 - **AC-12** — WHERE the engine publishes code-set tables, THE SYSTEM SHALL serve **those** tables to a
   sandboxed Router/Handler — including after a transparent respawn that follows a `codesets/` edit
   made without a `/config/reload` — and the per-dispatch frame SHALL carry no code-set bytes.

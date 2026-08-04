@@ -58,7 +58,13 @@ from messagefoundry.config.code_sets import CodeSet, UnmappedKind, UnmappedPolic
 from messagefoundry.config.models import ContentType
 from messagefoundry.config.response import CapturedResponse
 from messagefoundry.config.run_context import RunContext
-from messagefoundry.config.wiring import Send, SetMeta, SetState, WiringError
+from messagefoundry.config.wiring import (
+    Send,
+    SetMeta,
+    SetState,
+    WiringError,
+    handler_result_items,
+)
 from messagefoundry.parsing.message import Message, RawMessage
 
 __all__ = [
@@ -725,8 +731,9 @@ class Ignored:
 
     The encoder never silently drops an item it does not recognise — a silent omission would be an
     accept-and-drop (CLAUDE.md §12). Rebuilding the ignored slot keeps ``_partition`` the SOLE filter,
-    so a tuple/set/int Handler return still resolves to ``([], [], [])`` byte-identically to
-    ``mode=off``."""
+    so an unrecognised Handler return (a bare ``int``, a ``__reduce__`` gadget) still resolves to
+    ``([], [], [])`` byte-identically to ``mode=off`` — as does an unrecognised ELEMENT inside a
+    container the child materialised."""
 
     __slots__ = ()
 
@@ -762,13 +769,18 @@ def enc_result(phase: str, result: object, blobs: _Blobs) -> dict[str, Any]:
                 )
         return {"r": "names", "n": names}
     if phase == "transform":
-        # `shape` reproduces _partition's EXACT input container so the parent hands the unmodified
-        # _partition the same thing mode=off would. Do NOT normalise an iterable into a list: that
-        # would start delivering Sends mode=off drops.
+        # Materialise with _partition's OWN rule HERE, in the child — exactly what the router branch
+        # above does with `_handler_names`' logic. `handler_result_items` (config.wiring) is that
+        # single shared rule, so a tuple/set/generator fan-out delivers under mode=subprocess exactly
+        # as it does under mode=off (BACKLOG #341); fixing only the parent's _partition would make the
+        # disposition MODE-DEPENDENT, which is worse than the original accept-and-drop. A value the
+        # rule does not recognise as a container stays a "one" item — the parent's unmodified
+        # _partition still filters it out (and `dec_result` still returns the ITEM, not a 1-list).
         if result is None:
             return {"r": "items", "shape": "none"}
-        if isinstance(result, list):
-            return {"r": "items", "shape": "list", "i": [_enc_item(it, blobs) for it in result]}
+        items = handler_result_items(result)
+        if items is not None:
+            return {"r": "items", "shape": "list", "i": [_enc_item(it, blobs) for it in items]}
         return {"r": "items", "shape": "one", "i": _enc_item(result, blobs)}
     raise SandboxCodecError(f"unknown sandbox phase {phase!r}")
 
