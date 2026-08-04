@@ -3538,6 +3538,43 @@ async def test_audit_verify_cli_server(store, capsys) -> None:
     assert "OK:" in out and "verified 2" in out
 
 
+async def test_audit_anchor_cli_server(store, capsys) -> None:
+    """BACKLOG #328 (Postgres mirror): ``audit-anchor`` + ``audit-verify --expected-anchor``.
+
+    ``audit_anchor()`` is implemented separately per backend (``store.py`` / ``sqlserver.py`` /
+    ``postgres.py``), so a SQLite-only test is not evidence for this one. The ``expected_anchor``
+    COMPARISON is byte-equivalent across all three, so what this case exercises is this backend's own
+    anchor SQL plus the CLI wrapper's connection handling.
+
+    Same idiom as CLI-22 above: backend from ``MEFOR_STORE_*`` env, NO ``--db`` (the M-31 missing-DB
+    guard is SQLite-only and inert here), driven through ``asyncio.to_thread`` because ``_audit_anchor``
+    calls ``asyncio.run`` internally. The anchor is captured at RUNTIME, never a literal."""
+    from messagefoundry.__main__ import main
+
+    await store.record_audit("message_view", actor="alice", detail="v1")
+    await store.record_audit("export", actor="bob", detail="e1")
+
+    rc = await asyncio.to_thread(main, ["audit-anchor"])  # backend from env; NO --db
+    assert rc == 0
+    anchor = capsys.readouterr().out.strip()
+    count_text, _, head = anchor.partition(":")
+    assert count_text == "2" and len(head) == 64
+
+    # Round-trips against the unchanged chain.
+    rc = await asyncio.to_thread(main, ["audit-verify", "--expected-anchor", anchor])
+    assert rc == 0
+    assert "OK:" in capsys.readouterr().out
+
+    # Cut the NEWEST row: the walk still verifies the surviving prefix; only the anchor sees it.
+    await store._execute("DELETE FROM audit_log WHERE id = (SELECT MAX(id) FROM audit_log)")
+    rc = await asyncio.to_thread(main, ["audit-verify"])
+    assert rc == 0
+    assert "OK:" in capsys.readouterr().out
+    rc = await asyncio.to_thread(main, ["audit-verify", "--expected-anchor", anchor])
+    assert rc == 1
+    assert "truncated or rewritten" in capsys.readouterr().out
+
+
 async def test_rekey_audit_cli_server(store, capsys, monkeypatch) -> None:
     """CLI-23 (Postgres mirror): the ``rekey-audit`` CLI wrapper enables HMAC keying of an existing
     keyless chain (#190-D). It reaches the live Postgres store purely via ``MEFOR_STORE_*`` env (no

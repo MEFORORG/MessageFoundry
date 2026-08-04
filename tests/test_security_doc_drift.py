@@ -1642,6 +1642,47 @@ def test_contextual_prefixed_settings_force_a_documented_decision() -> None:
     )
 
 
+def test_admin_exposed_is_not_derived_from_the_mutated_console_flag() -> None:
+    """The exposure predicate must not read a field an earlier arm has already rewritten.
+
+    ``settings.api.serve_ui`` is flipped to ``False`` IN PLACE by both ADR 0143 degrade arms before
+    the exposure gates run, so by the time ``admin_exposed`` is derived it answers "is /ui mounted?",
+    not "is the admin interface on the network?". Deriving the MFA-at-exposure and #189 dual-control
+    gates from it (BACKLOG #326) made both unreachable on the runbook's RECOMMENDED loopback-behind-
+    declared-proxy topology, while the ADR 0152 arm in the same function called that boot exposed.
+
+    The behavioural pins live in ``tests/test_cli.py`` and ``tests/test_checks_gate_parity.py``. This
+    is the SHAPE guard: it exists so the defect cannot quietly return through a refactor that keeps
+    every current test green (re-introducing the console term only changes behaviour for configs no
+    case happens to cover). Kept here beside the dual-control slice because it uses the same idiom on
+    the same file, including its liveness receipt.
+    """
+    source = (_ROOT / "messagefoundry" / "__main__.py").read_text(encoding="utf-8")
+    marker = "\n    admin_exposed = "
+    # Liveness receipt FIRST: a rename or a reflow that makes the slice empty must red this test, not
+    # make it unfailable. `in` is checked explicitly so the failure names the cause rather than
+    # surfacing a bare ValueError from `index`.
+    assert marker in source, (
+        "no top-level `admin_exposed = ` assignment found in messagefoundry/__main__.py. If it was "
+        "renamed, update this guard AND docs/SECURITY.md Table A AND the literal marker in "
+        "test_startup_dual_control_arm_is_documented_as_warn_only, which all name it."
+    )
+    start = source.index(marker) + 1
+    assignment = source[start : source.index("\n", start)]
+    assert assignment.strip().startswith("admin_exposed = ") and len(assignment.strip()) > len(
+        "admin_exposed = "
+    ), (
+        f"the assignment slice looks wrong — the assertions below would pass vacuously: {assignment!r}"
+    )
+    for banned in ("ui_exposed", "serve_ui"):
+        assert banned not in assignment, (
+            f"`admin_exposed` is derived from `{banned}`, which the ADR 0143 degrade arms rewrite in "
+            f"place further up this same function (BACKLOG #326). Derive it from `instance_exposed` "
+            f"— the console being mounted is a presentation fact, not an exposure fact. Slice was: "
+            f"{assignment!r}"
+        )
+
+
 def test_startup_dual_control_arm_is_documented_as_warn_only() -> None:
     """The bind/exposure inventory claimed a refusal the code does not implement.
 
