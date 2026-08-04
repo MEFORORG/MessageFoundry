@@ -141,7 +141,7 @@ superseded by the #75 browser ops dashboard). Sequencing context for the earlier
 
 ## Ranked backlog — value × difficulty on a ten-level scale (re-scored 2026-08-03)
 
-> **What this pass is, and what it replaces.** Every one of the **92 open items** is re-scored here
+> **What this pass is, and what it replaces.** Every one of the **93 open items** is re-scored here
 > against the code as it stands on 2026-08-03. The 2026-07-10 table below is kept as the record of
 > that pass and is **superseded** by this one: it scored 134 items, ~40 of which have since closed,
 > and its frozen distribution lines were never recomputed. The closed items it ranked now live in
