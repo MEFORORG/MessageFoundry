@@ -2836,55 +2836,25 @@ No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_ho
 
 > 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **3/10** · _quick win_. ASVS 6.3.3's admin-MFA refusal and #189's dual-control warning are both inert in the topology the runbook recommends — the ADR 0143 auto-degrade sets `settings.api.serve_ui = False` in place before `ui_exposed` and `admin_exposed` are derived from it (`messagefoundry/__main__.py`, the flip and the two derivations in one ladder), so the engine calls one instance exposed for 11.7.1 and not exposed for 6.3.3 in a single boot — but `require_mfa` defaults on and `security_loosenings()` still names the explicit opt-out on every boot; re-key `admin_exposed` on the `instance_exposed` predicate already present in the file, fix two `exposure_desc` else-branches, and settle the refuse-on-upgrade fork against `docs/CONFIGURATION.md:1439`.
 
-> **OWNER RULING 2026-08-04 — WARN FIRST, with a DATED flip to refuse.** The fork at Proposed point 3
-> is settled: the corrected `admin_exposed` derivation ships as a **warning**, not as an immediate
-> refusal.
+> **OWNER RULING 2026-08-04 — REFUSE OUTRIGHT. Supersedes an earlier ruling on this item that said
+> WARN-FIRST with a dated flip.** No warn-first, no dated flip, no opt-in flag. The corrected
+> `admin_exposed` gate refuses, as it was written to.
 >
-> The fix itself is unchanged — re-key `admin_exposed` off a `serve_ui`-independent predicate
-> (`instance_exposed` already exists in this file) and correct the two `exposure_desc` else-branches.
-> What is settled is the *upgrade behaviour*: because this makes a **currently-starting configuration
-> refuse**, against this repo's own rule — *"a new refusal fires only on a new opt-in"* — the refusal
-> is deferred.
+> ⚠️ **Why the first ruling was reversed.** It deferred the refusal because the fix *"makes a currently-
+> starting configuration refuse on upgrade"*, citing `docs/CONFIGURATION.md:1475` — *"a new refusal fires
+> only on a new opt-in"*. That rule exists **in as many words** to protect *working dev/staging/prod
+> deployments from booting on upgrade*. **There are none: MessageFoundry is a not-deployed beta with zero
+> production instances** (owner-confirmed 2026-08-04). Nothing starts today that would stop starting.
 >
-> ⚠️ **Anchors corrected 2026-08-04, in two passes — the second because the first was still imprecise.**
-> #326's own Proposed point 3 cites `docs/CONFIGURATION.md:1439`. Read verbatim at HEAD, that line is
-> *"…`[ai].production`) is **rejected at load** with a"* — mid-sentence in the `[security]` desugaring
-> section, about rejecting **moved legacy keys**. It is not a rule about upgrade behaviour in either
-> direction. (My first correction called it the No-loosen rule; that rule is real but sits at `:1445`,
-> six lines later, and concerns not *weakening* an existing refusal — still the opposite direction.)
-> The quoted text was right and the anchor was wrong; this ruling inherited it from the item without
-> re-checking, and two sibling sessions caught it.
+> **An afternoon was then spent distinguishing two mechanisms that were both solving this non-problem** —
+> a bespoke dated flip versus the house `[security].enforcement` split (`:88`, `:1020`) versus the opt-in
+> flag pattern (`:1475`, ADR 0152 rung 2 / ADR 0151). That analysis is preserved below for whoever
+> revisits it **if an adopter ever goes live**; it is not a live design question now. When there is no
+> installed base, the cost of a breaking change is zero and the simple correct end state wins.
 >
-> **The three anchors that are real, verified verbatim at HEAD:**
-> - `:1475` — *"a new refusal fires only on a new opt-in"* (`require_memory_encryption_declaration`,
->   ADR 0152 rung 2). Its stated reasoning is this exact case.
-> - `:88` and `:1020` — *"**The refuse/warn split is `[security].enforcement`, not the production
->   tier**"*, on `require_managed_identity` and `security_notifications_required`.
->
-> ⚠️ **THE MECHANISM IS A BUILD QUESTION THIS RULING DOES NOT SETTLE — and the repo already has one.**
-> `[security].enforcement` is the first-class refuse/warn split, and every sibling gate uses it: refuse
-> under `enforcement = enforce`, warn under `warn`. A bespoke dated flip for #326 alone would stand up a
-> **second, parallel mechanism for the same decision** — which is how a codebase ends up with two ways
-> to answer one question and no rule about which applies.
->
-> A reading that satisfies both, proposed by the lane building this and flagged to the owner: ship the
-> corrected `admin_exposed` as a warning **irrespective of `enforcement`** until the dated flip, after
-> which it **obeys `[security].enforcement` like its siblings**. That gets the deferral the owner asked
-> for and lands the gate on the existing mechanism rather than beside it.
->
-> The owner's ruling — warn first, with a dated flip — stands as given and is not reopened by this note.
-> What is open is only *how* the eventual refusal is expressed, and the precedents to follow rather than
-> invent are `require_memory_encryption_declaration` (ADR 0152 rung 2) and `allowed_client_networks`
-> (ADR 0151), both of which gate the refusal behind an opt-in.
->
-> **The flip must carry a DATE, in the warning text and in this item.** A deferred refusal with no date
-> is a refusal that never happens — it becomes a warning everyone learns to scroll past, which is how
-> the inert control this item is about came to exist in the first place. Scheduling it is the point;
-> "flip it later" is not a plan.
->
-> The gap is real and measured (arm C starts rc=0 with single-factor admin on production PHI), but it
-> has been latent for some time. Breaking a running production instance on upgrade, with no notice,
-> trades one silent failure for a loud one nobody scheduled.
+> **The fix itself is unchanged:** re-key `admin_exposed` off the `serve_ui`-independent predicate that
+> already exists in that file, and correct both `exposure_desc` else-branches (`__main__.py:1883` and
+> `approvals_exposure_desc` at `:1939`).
 
 **Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** medium.
 
@@ -2992,6 +2962,14 @@ The two nearest-looking guards are neither: `tests/test_scaffold.py:51-52` asser
 ## 328. `audit-verify` cannot detect a truncated audit tail
 
 > 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **3/10** · _quick win_. Both shipped verification surfaces call `verify_audit_chain()` bare (`messagefoundry/__main__.py:3596`, `pipeline/engine.py:860`) and the `audit-verify` subparser declares only `--service-config` and `--db` (`__main__.py:571-578`), so a truncated keyed chain — the residue the anchor exists to catch — reports CLEAN with no way for an operator to supply one; the remainder is a new `audit-anchor` subcommand, an `--expected-anchor` flag into the already-present `expected_anchor=` keyword, and an `[integrity]` key for the startup path, with no change to the comparison logic and no store migration. _(was 5/10 · 3/10.)_
+
+> ⚠️ **AMENDED 2026-08-04 — `api/app.py` is IN scope; the multisession plan was wrong to drop it.**
+> `SCHEDULABLE-BACKLOG-MULTISESSION-PLAN.md` scoped this item as "CLI + settings" and said **DROP
+> `api/app.py`**. Verified against HEAD: every `[integrity]` setting reaches the Engine **only** through
+> `create_managed_app` — `audit_verify_on_start=integ.audit_verify_on_start` at
+> `messagefoundry/api/app.py:5467`, fed from `__main__.py`. Building to the plan's scope would ship a
+> **dead setting**: configurable, documented, and never read. Caught by the lane doing recon before
+> building, which is the only reason it was caught at all.
 
 **Cluster:** Security / Audit integrity. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
@@ -3665,21 +3643,35 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 
 > 🚧 **Status OPEN (filed 2026-08-01).** Value **9/10** · Difficulty **3/10** · _quick win_. `_partition` ([pipeline/dryrun.py:112](../messagefoundry/pipeline/dryrun.py)) narrows with `items = result if isinstance(result, list) else [result]`. A **`list`** of `Send`s works; a **tuple** or **set** does not — the container itself becomes the single item, matches none of the three `isinstance` filters, and yields `([], [], [])`. **Verified live:** `_partition((send, send))[0] == []`. The Handler ran, returned deliveries, and **nothing is delivered and nothing errors** — the message finalizes `FILTERED` (every handler ran but delivered nothing), which is indistinguishable from a handler deliberately declining it. That is an **accept-and-drop**, the one thing CLAUDE.md §12 forbids outright.
 
-> **OWNER RULING 2026-08-04 — RAISE, do not widen.** The fork this item reserved is settled: a
-> Handler returning a tuple or set of `Send`s must **raise**, so the message lands `ERROR`/dead-letter.
-> It must NOT be widened to accept any iterable.
+> **OWNER RULING 2026-08-04 — WIDEN. Supersedes an earlier ruling on this item that said RAISE.**
+> A Handler returning a tuple, set or generator of `Send`s is **accepted**, like a list. It does not raise.
 >
-> **The reasoning, because it decides how the fix is built.** Widening would start *delivering* messages
-> the engine drops today — every live Handler returning a tuple would begin flowing on upgrade, silently,
-> including PHI currently being dropped. An accept-and-drop is what CLAUDE.md §12 forbids; converting it
-> into an accept-and-**send** nobody asked for is the worse of the two failures. A loud dead-letter is
-> recoverable and visible; a quiet new delivery path is neither.
+> ⚠️ **Why the first ruling was reversed, because the reasoning is the point.** It rested on: *"widening
+> would start delivering messages the engine drops today — every live Handler returning a tuple would
+> begin flowing on upgrade, including PHI currently being dropped."* That argument requires **live
+> Handlers to exist**. **MessageFoundry is a not-deployed beta with zero production instances**
+> (owner-confirmed 2026-08-04). There is no installed base, so the cost the first ruling priced is
+> **vacuous**. The same defect this backlog keeps recording — a conclusion resting on a premise nobody
+> checked — committed in a ruling other sessions were building from.
 >
-> ⚠️ `tests/test_sandbox_codec.py::test_partition_parity_table` pins the current `[0,0,0]` behaviour
-> deliberately and its docstring argues *against* normalising — that rationale is **superseded by this
-> ruling**, so the test is rewritten and its reasoning replaced, not extended around. `pipeline/_sandbox_codec.py`
-> preserves the container shape on purpose, so in-process and subprocess modes must agree on the new
-> behaviour or the fix creates a mode-dependent disposition.
+> **Three arguments for widening that never touch deployment, and would have carried it anyway:**
+> 1. **It removes an internal inconsistency.** `_handler_names` (`pipeline/dryrun.py:96-99`) already does
+>    `return [result] if isinstance(result, str) else list(result)` — so a **Router** returning a tuple,
+>    set or generator works **today**. Only the **Handler** path rejects it. Widening makes the two agree;
+>    raising entrenches a split with no stated rationale.
+> 2. **`return ()` is a documented filter idiom** (`lens.py:678`, SHALL'd at ADR 0108:60). It composes
+>    naturally under widen; under raise it needs a carve-out for the empty case.
+> 3. **It does what the author plainly meant.** A Handler that returns a container of `Send`s intended
+>    them to be sent.
+>
+> **Neutral either way, so not a tiebreaker:** both options need the subprocess-codec fix below, and both
+> falsify ADR 0108:37's *"No engine runtime change"*.
+>
+> ⚠️ **Build constraint, unchanged by the reversal.** `pipeline/_sandbox_codec.py` preserves the container
+> shape on purpose, and `tests/test_sandbox_codec.py::test_partition_parity_table` pins the current
+> `[0,0,0]` for both modes. In-process and subprocess must agree on the new behaviour or the fix creates a
+> **mode-dependent disposition**, which is worse than the bug. That test is rewritten under this ruling and
+> its docstring rationale replaced, not extended around.
 
 **Cluster:** Correctness / data loss. **Priority:** P1. **Verdict:** build (small). **Severity:** high (silent PHI non-delivery, no operator signal), medium (likelihood: `return (Send(...), Send(...))` is a natural idiom and a one-character difference from the working form).
 
