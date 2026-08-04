@@ -459,6 +459,35 @@ harness process only.)
 
 ## 11. Documentation
 
+- **NO GLYPHS OR EMOJI — in prose, comments, commit messages, PR bodies, or anything written back to
+  the user.** Say the word. `SHIPPED`, `BLOCKED`, `WARNING`, `DO NOT` all survive grep, copy-paste,
+  a cp1252 terminal and a screen reader; a pictograph does none of those reliably.
+
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
+  that is invisible to anyone who learns it from examples rather than from its definition. Measured
+  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
+  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
+  reading "the glyph appears in this item" and the other "this item declares closed status", and they
+  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
+  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
+  presence-equals-meaning reading and hides the ambiguity from review.
+
+  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
+  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
+  separate failures in one session.
+
+  ⚠️ **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
+  `docs/archive/backlog/BACKLOG-CLOSED.md` encode item status as a banner alphabet
+  (`scripts/docs/backlog_status_check.py`: `_CLOSED = "✅⛔🪦"`, `_OPEN = "🔢🚧"`), and
+  `.github/workflows/backlog-hygiene.yml` quotes it in its remediation text. **283 banners across the
+  two files and 12 referencing files** — changing it is a migration with its own item, not a doc edit,
+  and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
+  and nothing outside those two files may adopt one.
+
+  **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
+  re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
+  blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
+  the same single-source rule `ledger_check.py` already states for `PUBLIC_BACKLOG_FLOOR`.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
@@ -518,3 +547,7 @@ harness process only.)
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
   ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
+  word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
+  `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.
+
