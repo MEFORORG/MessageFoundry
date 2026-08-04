@@ -419,6 +419,20 @@ trade-off is that cross-subnet failover client recovery then depends on DNS TTL 
 cross-site DNS/AD replication. Plan and **drill** the cross-DC connect path (§5.3), and keep DNS
 replication to the DR site fast.
 
+> **Note — this outage may not be necessary for much longer (2026-07-31, engine 0.3.2).**
+> The listener configuration above, **including its brief outage, remains the recommendation** and is
+> what this guide supports today. It is possible that `[store].multi_subnet_failover` alone is
+> sufficient and the DNS-side change is not needed — but that setting is **unit-tested only and has
+> never been exercised against a live cross-subnet AG**, so this guide does not yet rely on it.
+> Proving it is tracked as [**BACKLOG #1002**](BACKLOG.md#1002-ag-rig-validation-prove-the-multi-subnet-failover-reconnect).
+>
+> Two things will **not** change even if that validation passes, so plan around them either way:
+> the keyword covers the **store** connection only — the `db_lookup` connector builds its own
+> connection string and emits nothing — and a listener **already** at `RegisterAllProvidersIP = 0`
+> will likely still need a restart to undo it, so an existing deployment may not escape the outage
+> regardless. If you are reading this well after the date above, check #1002 before assuming the
+> outage is still required.
+
 ### 4.6 Listener TLS certificate
 
 The engine connects with `Encrypt=yes` and **verifies** the server certificate. Setting
