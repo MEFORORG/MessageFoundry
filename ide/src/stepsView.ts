@@ -46,6 +46,7 @@ import {
   ADD_MENU_BY_ID,
   EditLoopGuard,
   REDACTED_LIVE_VALUE,
+  RerenderDebouncer,
   TOOLBAR_INSERT_DEFAULTS,
   addMenuGroups,
   buildAddDestinationRequest,
@@ -62,6 +63,7 @@ import {
   escapeHtml,
   mergeLiveValues,
   parseRewriteResult,
+  releaseEdit,
   renderHandlersHtml,
   renderStepsContextMenuHtml,
   shouldAttachLiveValues,
@@ -268,7 +270,6 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       enableScripts: true,
       localResourceRoots: [vscode.Uri.joinPath(this.extensionUri, "media")],
     };
-    let debounce: ReturnType<typeof setTimeout> | undefined;
     let disposed = false;
     // Handshake: the webview posts a `ping` the instant its script starts. If a render sets the html but no
     // ping arrives, the script never initialized (blocked / threw at load, e.g. a double acquireVsCodeApi) —
@@ -276,6 +277,24 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     let sawAlive = false;
     // One edit at a time + the webview↔document update-loop guard (ADR 0076 §5).
     const guard = new EditLoopGuard();
+
+    // The ONE debounced re-projection channel (ADR 0076 §5 "sync on save"). Both a save and a refresh
+    // the guard deferred (BACKLOG #234) go through it, so an owed refresh coalesces with a real save
+    // exactly like two rapid saves do instead of adding a second, differently-timed render. `render()`
+    // CANCELS it on entry, so a release site that forces a full re-projection discharges the debt
+    // rather than racing it into a second one (ADR 0076 Amendment C, AC-C2).
+    const rerender = new RerenderDebouncer<ReturnType<typeof setTimeout>>(
+      () => void render(),
+      RERENDER_DEBOUNCE_MS,
+      (fn, ms) => setTimeout(fn, ms),
+      (handle) => clearTimeout(handle),
+    );
+    const scheduleRerender = (): void => {
+      if (disposed) {
+        return;
+      }
+      rerender.schedule();
+    };
 
     // Reopen the same resource with the built-in text editor (the §4 degradation fallback).
     const fallBackToText = (reason: string): void => {
@@ -285,6 +304,17 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     };
 
     const render = async (): Promise<void> => {
+      // A re-projection reads the WHOLE current buffer below, so it SATISFIES any refresh still owed —
+      // by either route (ADR 0076 Amendment C, AC-C2: "exactly ONE re-projection"). Both discharges run
+      // FIRST and synchronously, before the `lens parse` await, so a save landing mid-render is recorded
+      // afresh and still honoured:
+      //   * the armed debounce, or it would replace the whole webview HTML a second time ~250 ms later
+      //     (the three release sites that force a render immediately after releasing the slot);
+      //   * the guard's owed-refresh debt, for the one path where the forced render happens BEFORE the
+      //     release rather than after it — `drainEdits`' unexpected-rejection handler renders inside the
+      //     drain, and its `finally` would otherwise arm a redundant second pass on the way out.
+      rerender.cancel();
+      guard.takeSuppressedChange();
       const ws = workspaceDir();
       // Project the LIVE buffer (piped over stdin as `lens parse -`), NOT the on-disk file: after a
       // structural edit's WorkspaceEdit the buffer is dirty (buffer != disk), and the row coordinates
@@ -392,12 +422,18 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
     // CLI-refusal path, which `applyOne` handles inline) releases the slot AND keeps draining the queue
     // rather than stranding a pending second edit until the user types again.
     const applyEdit = (msg: EditMessage): Promise<void> =>
-      drainEdits(guard, msg, applyOne, (err) => {
-        void vscode.window.showErrorMessage(
-          `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
-        );
-        void render(); // revert the optimistic webview change to the true projection
-      });
+      drainEdits(
+        guard,
+        msg,
+        applyOne,
+        (err) => {
+          void vscode.window.showErrorMessage(
+            `MessageFoundry: could not apply the edit — ${err instanceof Error ? err.message : String(err)}`,
+          );
+          void render(); // revert the optimistic webview change to the true projection
+        },
+        scheduleRerender, // a save the guard suppressed mid-drain is deferred, not dropped (#234)
+      );
 
     // Apply a STRUCTURAL op (insert/delete/move). Unlike a param edit these change the file's line count,
     // so every row coordinate the webview holds becomes stale — the op must run ALONE (never batched with
@@ -448,9 +484,12 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         // queued while it held the slot references stale PRE-op coordinates. DROP that queue before
         // releasing the slot — never let the next drain apply it against shifted rows (the orphaned-queue
         // hazard; without this the queued edit survives re-projection and is later applied on stale coords,
-        // ADR 0076 §5 v2). clearPending precedes endEdit so nothing can drain in between.
+        // ADR 0076 §5 v2). clearPending precedes the release so nothing can drain in between.
         guard.clearPending();
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit: a save that landed while this op held the slot still owes a
+        // re-projection (#234). Its `clearPending` semantics are unchanged — a DROPPED param edit and a
+        // DEFERRED document refresh are different rules and must not be folded together.
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return applied;
@@ -483,7 +522,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
           current = guard.takePending(); // drain a raced typed edit (F5) — NEVER clearPending (that drops it)
         }
       } finally {
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit — a save suppressed during the pick is deferred (#234).
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return;
@@ -511,7 +551,8 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
         );
       } finally {
         guard.clearPending();
-        guard.endEdit();
+        // releaseEdit, never a bare endEdit — a save suppressed during the undo/redo is deferred (#234).
+        releaseEdit(guard, scheduleRerender);
       }
       if (disposed) {
         return;
@@ -832,34 +873,39 @@ export class StepsEditorProvider implements vscode.CustomTextEditorProvider {
       },
     );
 
-    // The lens is READ-ONLY and refreshes ON SAVE only (ADR 0076 §5 "sync on save" guardrail): `lens parse`
-    // reads the file from disk, so re-projecting on every keystroke would slice the current (dirty) buffer
-    // against line ranges computed from stale disk content, and re-shell Python per keystroke. Saving makes
-    // disk == buffer, so the projection stays aligned. Debounced to coalesce rapid saves.
+    // The lens is READ-ONLY and refreshes ON SAVE only (ADR 0076 §5 "sync on save" guardrail, adopted
+    // wholesale from the verified InterSystems/VS Code set). Re-projecting per keystroke would re-shell
+    // Python on every character, and each re-projection replaces the whole webview HTML — which would
+    // destroy focus, selection and any half-typed param input mid-word. A save is the natural,
+    // user-chosen commit point. Debounced to coalesce rapid saves.
+    //
+    // NB (BACKLOG #234, corrected 2026-08-04): this comment used to justify the gate by claiming
+    // "`lens parse` reads the file from disk, so re-projecting on every keystroke would slice the current
+    // (dirty) buffer against line ranges computed from stale disk content". That is FALSE — `render()`
+    // above pipes `document.getText()` as `lens parse -` over stdin and slices that SAME snapshot for the
+    // view models, and ADR 0076's addendum says so too ("the rows are projected from the live buffer").
+    // The disk read belongs to the live-value TRACE (`dryrun --trace`), which is separately save-gated by
+    // #225 and is a different rule. A compensating control must not rest on a false premise
+    // (CLAUDE.md §11); whether to relax the gate is #234's other half and is not decided here.
     const sub = vscode.workspace.onDidSaveTextDocument((saved) => {
       if (saved.uri.toString() !== document.uri.toString()) {
         return;
       }
       // Don't re-project while our own edit's WorkspaceEdit is still applying — that is the webview↔
-      // document update loop the guard exists to break (ADR 0076 §5). A save after the edit settles
-      // re-renders normally.
+      // document update loop the guard exists to break (ADR 0076 §5). But the guard cannot tell OUR
+      // WorkspaceEdit apart from a USER save that merely landed mid-rewrite, and returning here used to
+      // DISCARD that save outright, leaving the view on a stale projection until the next one. Record the
+      // debt instead; `releaseEdit` runs it through this same debounced path when the slot frees (#234).
       if (!guard.shouldReactToDocumentChange()) {
+        guard.noteSuppressedChange();
         return;
       }
-      if (debounce) {
-        clearTimeout(debounce);
-      }
-      debounce = setTimeout(() => {
-        debounce = undefined;
-        void render();
-      }, RERENDER_DEBOUNCE_MS);
+      scheduleRerender();
     });
     panel.onDidDispose(() => {
       disposed = true;
       sub.dispose();
-      if (debounce) {
-        clearTimeout(debounce);
-      }
+      rerender.cancel();
     });
 
     void render();

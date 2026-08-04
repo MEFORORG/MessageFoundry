@@ -315,7 +315,10 @@ set: `app.js` is 1,506 lines carrying the ASVS 14.3.1 watchdog, both WebAuthn ce
 cookie jar anywhere; dual-control dead-ends in the sole operator console); `WEB-56` (the exposure
 runbook printed to operators six times that ships nowhere); `STEPS-01`..`STEPS-05` (all seven
 committed lens fixtures are stale) and `STEPS-06`..`STEPS-12` (the webview mirror re-implements ten
-model functions, "verified manually"); `STEPS-23`..`STEPS-27` (the verbatim `expr` splice that
+model functions which, when this phasing was written, were "verified manually" — **that half closed
+2026-08-04 with BACKLOG #233**: `ide/src/test/suite/steps-mirror.test.ts` gates all ten on every `ide`
+leg, leaving only the STEPS-01..05 fixture half of this P0 group open);
+`STEPS-23`..`STEPS-27` (the verbatim `expr` splice that
 produces output failing both `ruff format --check` and `ruff check --select F`);
 `IDE-09`..`IDE-22` (every credential and PHI path lives in a zero-test shell);
 `IDE-41`..`IDE-44` (the delivery vehicle — `vsce package` exists but appears in no workflow);

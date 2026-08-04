@@ -290,8 +290,10 @@ the comment merged into an unrelated row. **The build lands failing tests for (1
   `delete_row` would begin failing with "internal: could not locate the statement" on **every** action
   that has a leading comment. Attachment ("a statement travels with its leading comment block") is a
   separate, larger item and is gated on BACKLOG #233 — `blockExtent` / `walkMove` / `resolveDrop` are
-  implemented twice (`ide/src/stepsModel.ts:1767` vs `ide/media/stepsWebview.js:68`) with no
-  differential test.
+  implemented twice (`blockExtent` in `ide/src/stepsModel.ts` vs `ide/media/stepsWebview.js:68`) with no
+  differential test. *(2026-08-04: the "no differential test" half is closed —
+  `ide/src/test/suite/steps-mirror.test.ts` is that test. The duplication itself stands; the owner chose
+  the differential gate over de-duplication.)*
 - **No inline/trailing-comment extraction.** Verified working today: `set_params` on
   `msg.set("PID-3.1", "X")  # noqa: E501` preserves the pragma exactly, and interior comments in a
   multi-line call are absorbed into the action row's span. A note kind must not touch either.
@@ -539,3 +541,116 @@ Acceptance Criteria bucket. Promote to the block above if and when the owner acc
 - **AC-D5** — Descended rows SHALL either carry live values (requiring an accepted ADR 0072 amendment
   widening the tracer's frame scope) or SHALL render an explicit "not traced" state distinguishable from
   PHI redaction — never a redacted placeholder that can never resolve.
+
+## Amendment C (2026-08-04) — the update-loop guard DEFERS a save-triggered re-projection instead of dropping it (BACKLOG #234)
+
+> **Status of this amendment: PROPOSED — not ratified.** It is written and built because BACKLOG #234
+> requires the guardrail it touches to be re-argued in a dated amendment in the same change, not because
+> the owner has ruled on it; ratification is an owner decision, and until it lands this section follows
+> Amendment B's convention (its acceptance criteria sit under a distinct heading, outside this ADR's
+> counted Acceptance Criteria bucket).
+>
+> **What it claims:** it **strengthens** the §5 "sync on save only" guardrail and does **not** relax it.
+> The projection still syncs on save and on save only. What changes is what happens to a save that
+> arrives while a `lens rewrite` holds the single edit slot: it is now **deferred to slot release**
+> instead of being **silently discarded**. Nothing here widens the sync trigger, adds a keystroke path,
+> or touches the #225 live-value save gate.
+
+### C.1 The defect
+
+`EditLoopGuard.shouldReactToDocumentChange()` returns `false` while an edit is in flight — the correct
+answer for the `WorkspaceEdit` the provider itself is applying, which must not feed back into a re-render
+that fights the webview (the update loop §5's guardrail set exists to break).
+
+The provider's save subscription consumed that answer as an unconditional **return**. But the guard
+cannot distinguish *our own* `WorkspaceEdit` from a *user* save that merely happened to land inside an
+in-flight rewrite — and on that second case the early return **dropped the save**. The view would then
+keep rendering a projection of the pre-save buffer with no signal, until the user saved again. On the
+shipped code this would surface on first deployment as "I saved and the Steps view did not update";
+there are no deployments today, which is why there is still time to fix it properly rather than
+document it.
+
+### C.2 The change
+
+- `EditLoopGuard` gains `noteSuppressedChange()` / `takeSuppressedChange()` — a single clear-on-read
+  boolean, mirroring the existing `queue()` / `takePending()` shape. One boolean, not a queue: a
+  re-projection reads the whole buffer, so any number of suppressed saves owe exactly **one** refresh.
+- A new pure `releaseEdit(guard, onRefreshOwed?)` is **the only sanctioned way to release the slot**:
+  it calls `endEdit()` and then, only if a change was suppressed, invokes the callback. `drainEdits`
+  releases through it in its `finally`, including on the unexpected-rejection path.
+- The provider records the debt in the save subscription's guard-rejected branch and pays it through the
+  **same 250 ms debounced `render()`** a real save uses — so a deferred refresh coalesces with a
+  subsequent save exactly like two rapid saves do, rather than adding a second, differently-timed render.
+- That channel is a pure `RerenderDebouncer` (in `stepsModel.ts`, timer functions injected) with two
+  operations: `schedule()` and **`cancel()`**. **A re-projection DISCHARGES an owed refresh** — it reads
+  the whole current buffer, so the run starting now already satisfies whatever was owed — and `render()`
+  therefore begins by discharging both routes, synchronously, before its `lens parse` await (so a save
+  landing mid-render is recorded afresh and still honoured):
+  - `rerender.cancel()`, for the release-then-force order. Three of the four release sites
+    (`applyStructural`, `applyPickedEdit`, `applyUndoRedo`) release the slot and then FORCE a full
+    re-projection a few lines later; without the cancel a suppressed save produces **two** — the forced
+    one, then the armed one ~250 ms afterwards, replacing the whole webview HTML again.
+  - `guard.takeSuppressedChange()`, for the force-then-release order. `drainEdits`' unexpected-rejection
+    handler renders to revert the optimistic webview change *inside* the drain, and only then does the
+    `finally` release; nothing is armed yet, so a cancel cannot reach that path.
+  The paths that return BEFORE any render (a `lens rewrite` refusal, a disposed panel) reach neither
+  discharge, which is exactly where the deferral is the only route.
+- A source-scan test asserts `ide/src/stepsView.ts` contains no bare `guard.endEdit()`, so a future
+  fourth release site cannot silently reintroduce the drop, and that `render()` opens with both
+  discharges.
+
+### C.3 Guardrail accounting (what is NOT changed)
+
+- **"Sync on save only" stands.** No keystroke, `onDidChangeTextDocument`, or timer path is added. The
+  deferred refresh is a *save* that already happened; it is being honoured late, not invented.
+- **"One editor at a time" stands.** The slot semantics are untouched; `releaseEdit` releases exactly
+  when `endEdit()` did.
+- **The update-loop guard stands.** `shouldReactToDocumentChange()` still returns `false` in flight, so
+  our own `WorkspaceEdit` still cannot trigger a re-render. The deferral fires *after* the slot frees,
+  which is precisely when a re-render is safe.
+- **`clearPending()` is unchanged and NOT folded in.** Dropping a queued *param edit* on a structural op
+  (the orphaned-queue rule, §5 v2) and deferring a *document refresh* are different rules with different
+  reasons; both release sites keep their existing `clearPending()` / `takePending()` behaviour.
+- **The #225 live-value save gate is untouched** — an explicit non-goal of BACKLOG #234.
+
+### C.4 A correction this amendment depends on
+
+The comment in `ide/src/stepsView.ts` that justified the save gate claimed "`lens parse` reads the file
+from disk, so re-projecting on every keystroke would slice the current (dirty) buffer against line ranges
+computed from stale disk content". **That premise is false**, and is corrected in the same change:
+`render()` pipes `document.getText()` to `lens parse -` over stdin and slices that same snapshot for the
+view models, exactly as this ADR's 2026-07-10 addendum states ("the rows are projected from the **live
+buffer**"). The disk read belongs to the live-value **trace**, which is separately save-gated by #225.
+
+This matters beyond tidiness: BACKLOG #234's *other* half asks whether a bounded relaxation of the save
+gate is safe, and that question was about to be argued against a premise that does not hold. A
+compensating control must not rest on a false premise (CLAUDE.md §11). The real, surviving reasons for
+the gate are re-shelling Python per keystroke and the fact that each re-projection replaces the entire
+webview HTML — which would destroy focus, selection and any half-typed input mid-word.
+
+**Deliberately not decided here.** Whether to relax the gate to a debounced re-projection on *change* is
+BACKLOG #234's remaining half. It stays open, and it should be decided against the corrected premise
+above rather than the false one. This amendment lands the race fix **first**, on purpose: the dropped
+refresh is a defect under the current gate and would widen materially under any relaxation.
+
+## Acceptance Criteria (Amendment C — proposed, not ratified; deliberately outside the counted block)
+
+*(Same convention as Amendment B: kept under a distinct heading so unratified criteria do not merge into
+this ADR's accepted Acceptance Criteria bucket. Promote to the block above if and when the owner
+accepts. The criteria are nonetheless **built and tested** — the amendment lands with its gate.)*
+
+- **AC-C1** — WHILE an edit holds the single edit slot, WHEN a document save for the projected document
+  is observed, THE SYSTEM SHALL record it and SHALL NOT re-project immediately → guard unit test refs.
+- **AC-C2** — WHEN the edit slot is released after one or more suppressed saves, THE SYSTEM SHALL run
+  exactly ONE re-projection, in EITHER order relative to a forced one: the deferred run goes through the
+  same debounced channel a direct save uses, and any `render()` discharges the owed refresh on entry —
+  cancelling the armed channel (release-then-force) and taking the guard's debt (force-then-release)
+  → `releaseEdit` / `drainEdits` / `RerenderDebouncer` test refs, including a kept-in-tree falsification
+  showing a render that does not discharge yields two.
+- **AC-C3** — WHERE no save was suppressed, releasing the slot SHALL NOT trigger any additional
+  re-projection → negative test ref.
+- **AC-C4** — WHEN `apply` rejects unexpectedly during a drain, THE SYSTEM SHALL still release the slot
+  AND still run an owed re-projection → rejected-apply test ref.
+- **AC-C5** — THE SYSTEM SHALL release the edit slot only through `releaseEdit`; a bare `endEdit()` call
+  in the provider SHALL fail a source-scan test, as SHALL a `render()` whose first statement is not the
+  debounce cancel → inventory test refs.
