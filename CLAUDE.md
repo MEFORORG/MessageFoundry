@@ -16,7 +16,7 @@ stops matching the code, fix the doc.
 
 ## 0. Deployment status — read this before writing any severity claim
 
-> ⛔ **MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
+> **CRITICAL — MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
 > running it.** **Published to PyPI is *not* deployed** — a release artifact on an index is not a
 > running instance, and the two get conflated constantly. Distinguish **shipped** (on `main`, on
 > PyPI), **deployable**, and **deployed**: only the first two are true today.
@@ -38,7 +38,7 @@ across the repo. **Two consequences, and they pull in opposite directions — ap
    of a breaking change is currently **zero**. Prefer the simple, correct end state over a staged
    migration or compatibility shim; those are real costs paid to protect users who do not exist.
 
-⛔ **It cuts one way only — never cite "not deployed" to relax a rule.** It removes false urgency
+**IT CUTS ONE WAY ONLY — never cite "not deployed" to relax a rule.** It removes false urgency
 and vacuous costs. It does **not** downgrade a fix, justify skipping a gate, weaken a control, or
 make a finding unimportant. The security, PHI (§9) and leak-gate rules exist so the **first**
 deployment is safe; zero deployments is why there is still time to get them right, not permission
@@ -459,6 +459,39 @@ harness process only.)
 
 ## 11. Documentation
 
+- **NO GLYPHS OR EMOJI — in prose, comments, commit messages, PR bodies, or anything written back to
+  the user.** Say the word. `SHIPPED`, `BLOCKED`, `WARNING`, `DO NOT` all survive grep, copy-paste,
+  a cp1252 terminal and a screen reader; a pictograph does none of those reliably.
+
+  **The one allowed use is QUOTING a glyph as a token, in backticks** — naming the thing under
+  discussion, as this rule does below. That is code, not decoration, and it is how you talk about the
+  banner alphabet without adopting it.
+
+  **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
+  that is invisible to anyone who learns it from examples rather than from its definition. Measured
+  2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
+  in an item's prose it is narrative. Two parsers of the same file disagreed on exactly that, one
+  reading "the glyph appears in this item" and the other "this item declares closed status", and they
+  **agreed on the current corpus by luck** because no item happens to have the discriminating shape.
+  Words carry their scope in the sentence around them; a bare glyph does not, so it invites
+  presence-equals-meaning reading and hides the ambiguity from review.
+
+  Secondary but real: emoji need variation-selector handling (`️`) in every regex that touches
+  them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
+  separate failures in one session.
+
+  **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
+  `docs/archive/backlog/BACKLOG-CLOSED.md` encode item status as a banner alphabet
+  (`scripts/docs/backlog_status_check.py`: `_CLOSED = "✅⛔🪦"`, `_OPEN = "🔢🚧"`), and
+  `.github/workflows/backlog-hygiene.yml` quotes it in its remediation text. **283 banners across the
+  two files and 12 referencing files** — changing it is a migration with its own item, not a doc edit,
+  and until it lands those five glyphs stay. **No NEW glyph vocabulary may be introduced anywhere**,
+  and nothing outside those two files may adopt one.
+
+  **When you must read that alphabet, import `parse_items` from `backlog_status_check.py`. Never
+  re-derive it.** It *defines* item status — the banner block ends at the first line that is neither
+  blank nor a blockquote — and a hand-rolled scan is a second, silently different definition. That is
+  the same single-source rule `ledger_check.py` already states for `PUBLIC_BACKLOG_FLOOR`.
 - Specs/requirements in **Markdown**, kept consistent across the project.
 - Document each connector/transport and transform with its config schema and an example
   message.
@@ -518,3 +551,7 @@ harness process only.)
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
   ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
+- Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
+  word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
+  `parse_items`, never a hand-rolled scan, and introduce no new glyph vocabulary anywhere.
+
