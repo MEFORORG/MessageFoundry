@@ -2843,7 +2843,23 @@ No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_ho
 > The fix itself is unchanged — re-key `admin_exposed` off a `serve_ui`-independent predicate
 > (`instance_exposed` already exists in this file) and correct the two `exposure_desc` else-branches.
 > What is settled is the *upgrade behaviour*: because this makes a **currently-starting configuration
-> refuse**, against this repo's own rule at `docs/CONFIGURATION.md:1439`, the refusal is deferred.
+> refuse**, against this repo's own rule — *"a new refusal fires only on a new opt-in"* — the refusal
+> is deferred.
+>
+> ⚠️ **Anchor corrected 2026-08-04: that rule is at `docs/CONFIGURATION.md:1475`, not `:1439`.** #326's
+> own Proposed point 3 cites `:1439`; at HEAD that line sits in the `[security]` desugaring section,
+> whose rule is *"no shipped refusal is **loosened**"* (the No-loosen rule, ADR 0092 §5) — which is
+> about not WEAKENING an existing refusal, the opposite direction from adding one. The quoted text was
+> right and the line number was wrong; this ruling inherited the wrong anchor from the item without
+> re-checking it, and a sibling session caught it.
+>
+> **The real rule reads stronger than "warn first", and the implementer should know it.** Its stated
+> reasoning is this exact case — *"a refusal by default would stop working dev/staging/prod deployments
+> from booting on upgrade over something they cannot change"* — and the house pattern it names
+> (`require_memory_encryption_declaration`, ADR 0152 rung 2; `allowed_client_networks`, ADR 0151) is a
+> refusal gated behind an **opt-in flag**, not merely a dated flip. The owner ruled warn-first with a
+> dated flip; whether the eventual refusal also sits behind an opt-in is a build detail that should
+> follow those two precedents rather than be invented.
 >
 > **The flip must carry a DATE, in the warning text and in this item.** A deferred refusal with no date
 > is a refusal that never happens — it becomes a warning everyone learns to scroll past, which is how
