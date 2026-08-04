@@ -1503,13 +1503,22 @@ export interface DropResolution {
 
 /**
  * Whether `target` can accept a drop of `drag` (pure). Widened from the same-suite rule to: same handler,
- * not itself, target draggable, and target is NOT inside the dragged block's own [start, end] span (so a
- * block can't be dropped into itself). NO same-suite requirement — the headline cross-suite move.
+ * not itself, target draggable, target is NOT a read-only `code` row, and target is NOT inside the
+ * dragged block's own [start, end] span (so a block can't be dropped into itself). NO same-suite
+ * requirement — the headline cross-suite move.
+ *
+ * The `code`-row rule is NOT redundant with `target.draggable`: {@link renderRowHtml} marks a `code` row
+ * draggable ON PURPOSE, purely so a drag ATTEMPT can be intercepted and answered with "edit it in the
+ * code editor" (see the comment at renderRowHtml, "never treats a code row as a drop target"). Without
+ * this line the model contradicted that stated contract while the webview mirror (`canDrop` in
+ * `media/stepsWebview.js`) honoured it — the one divergence `src/test/suite/steps-mirror.test.ts`
+ * found (BACKLOG #233).
  */
 export function canDropRow(drag: RowDropContext, target: RowDropContext): boolean {
   return (
     target !== drag &&
     target.draggable &&
+    target.kind !== "code" &&
     target.handler === drag.handler &&
     !(drag.lineStart <= target.lineStart && target.lineStart <= drag.lineEnd)
   );
@@ -1668,8 +1677,11 @@ export function insertionBarAnchor(res: DropResolution, rows: readonly RowDropCo
  * its elif/else continuation bodies, gets an "after the whole block" slot at the outer level; a
  * send/return contributes no "after" slot (a block never lands after the return). elif/else headers are
  * CONTINUATIONS (consumed with their `if`), never standalone slots.
+ *
+ * Exported (BACKLOG #233) so a parity suite can compare it against the CSP-isolated copy of
+ * `buildDropSlots` in `media/stepsWebview.js`; it has no production caller outside {@link walkMove}.
  */
-function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {
+export function buildDropSlots(rows: readonly RowDropContext[]): DropResolution[] {
   const childrenBySuite = new Map<string, RowDropContext[]>();
   for (const r of rows) {
     const list = childrenBySuite.get(r.suite);
@@ -1973,9 +1985,19 @@ export function buildPasteRequest(
  * `shouldReactToDocumentChange()` is false, so the `WorkspaceEdit` we apply does NOT feed back into a
  * re-render that would fight the webview (the loop). `endEdit()` releases the slot. Pure + synchronous,
  * so the provider's flow is unit-testable without the Extension Host.
+ *
+ * A suppressed change is DEFERRED, not dropped (BACKLOG #234). `shouldReactToDocumentChange()` returning
+ * false is the right answer for OUR OWN `WorkspaceEdit`, but the provider cannot tell that apart from a
+ * USER save that happened to land while a `lens rewrite` held the slot — and returning false made the
+ * caller return early, discarding the save outright. The view would then keep showing a projection of
+ * the pre-save buffer until the next save. So a caller that declines to react calls
+ * {@link EditLoopGuard.noteSuppressedChange}, and the release path ({@link releaseEdit}) runs the owed
+ * refresh once the slot frees. The debt is recorded as a single boolean (a re-projection is idempotent —
+ * ten suppressed saves owe exactly one refresh), mirroring the queue/take shape of the pending edits.
  */
 export class EditLoopGuard {
   private inFlight = false;
+  private suppressedChange = false;
   private readonly pending = new Map<string, EditMessage>();
 
   beginEdit(): boolean {
@@ -2023,8 +2045,31 @@ export class EditLoopGuard {
     this.inFlight = false;
   }
 
+  /**
+   * Record that a document change arrived while the slot was held and was therefore NOT acted on, so the
+   * re-projection it owes can run when the slot frees (BACKLOG #234). Idempotent: a re-projection reads
+   * the whole buffer, so any number of suppressed changes owe exactly one refresh. Prefer
+   * {@link releaseEdit} over calling {@link EditLoopGuard.endEdit} directly so the debt is always paid.
+   */
+  noteSuppressedChange(): void {
+    this.suppressedChange = true;
+  }
+
+  /** Take (and CLEAR) the owed-refresh flag — the same clear-on-read contract {@link takePending} has,
+   * so a refresh can never be run twice for one suppressed change. */
+  takeSuppressedChange(): boolean {
+    const owed = this.suppressedChange;
+    this.suppressedChange = false;
+    return owed;
+  }
+
   get isEditing(): boolean {
     return this.inFlight;
+  }
+
+  /** Whether a document change was suppressed and still owes a re-projection (diagnostics/tests). */
+  get hasSuppressedChange(): boolean {
+    return this.suppressedChange;
   }
 
   /** How many distinct-field edits are waiting to be applied after the in-flight one (F5). */
@@ -2039,6 +2084,80 @@ export class EditLoopGuard {
 }
 
 /**
+ * Release the single edit slot, then run any re-projection a document change owed while the slot was
+ * held (BACKLOG #234). THE ONLY sanctioned way to release: calling {@link EditLoopGuard.endEdit}
+ * directly frees the slot without paying the debt, which is exactly the dropped-save defect — a save
+ * that landed mid-rewrite would leave the view showing a stale projection until the user saved again.
+ *
+ * `onRefreshOwed` is invoked at most once per suppressed run (the flag is clear-on-read) and NOT AT ALL
+ * when nothing was suppressed, so the ordinary path is unchanged. Synchronous and never throwing on its
+ * own; the callback is the caller's (the provider schedules its debounced `render()`).
+ */
+export function releaseEdit(guard: EditLoopGuard, onRefreshOwed?: () => void): void {
+  guard.endEdit();
+  if (guard.takeSuppressedChange()) {
+    onRefreshOwed?.();
+  }
+}
+
+/**
+ * The ONE debounced re-projection channel (ADR 0076 §5 "sync on save", Amendment C / BACKLOG #234).
+ *
+ * Two callers ask for a re-projection and they must not stack: the save subscription, and
+ * {@link releaseEdit} paying the refresh a suppressed save owed. Both go through {@link schedule}, so
+ * they coalesce into one run exactly like two rapid saves do.
+ *
+ * {@link cancel} is the half that stops a suppressed save from producing TWO re-projections. Three of
+ * the provider's release sites (`applyStructural`, `applyPickedEdit`, `applyUndoRedo`) release the slot
+ * and then FORCE a full re-projection a few lines later. Without cancellation the forced run and the
+ * armed debounced run both fire — a second `lens parse` child process and a second whole-webview HTML
+ * replacement ~250 ms later, which lands on the user as a flicker that eats focus and any half-typed
+ * input. A re-projection reads the whole current buffer, so the run starting NOW already satisfies
+ * whatever the armed one owed: cancelling is a discharge, not a drop.
+ *
+ * `cancel` covers the release-THEN-force order only. The provider's `render()` therefore ALSO calls
+ * {@link EditLoopGuard.takeSuppressedChange} for the force-THEN-release order (`drainEdits`' rejection
+ * handler renders INSIDE the drain, before the `finally` releases, so nothing is armed yet to cancel).
+ * Paths that return before ANY render — a `lens rewrite` refusal, a disposed panel — reach neither
+ * discharge, so the deferral stays load-bearing exactly where it is the only route.
+ *
+ * Timer functions are injected rather than closed over so the whole channel is unit-testable node-side
+ * with a fake clock, the same reason {@link drainEdits} lives here instead of in the provider.
+ */
+export class RerenderDebouncer<H = unknown> {
+  private handle: H | undefined;
+
+  constructor(
+    private readonly run: () => void,
+    private readonly delayMs: number,
+    private readonly setTimer: (fn: () => void, ms: number) => H,
+    private readonly clearTimer: (handle: H) => void,
+  ) {}
+
+  /** Arm (or RE-arm) the debounce. Repeated calls before it fires collapse to one run. */
+  schedule(): void {
+    this.cancel();
+    this.handle = this.setTimer(() => {
+      this.handle = undefined;
+      this.run();
+    }, this.delayMs);
+  }
+
+  /** Discharge any armed run. Called at the TOP of a re-projection, and on panel dispose. */
+  cancel(): void {
+    if (this.handle !== undefined) {
+      this.clearTimer(this.handle);
+      this.handle = undefined;
+    }
+  }
+
+  /** Whether a run is currently armed (tests + diagnostics). */
+  get armed(): boolean {
+    return this.handle !== undefined;
+  }
+}
+
+/**
  * Drain one edit + any queued follow-ups through `apply`, one at a time, under the loop guard (ADR 0076
  * §5). Extracted from the provider (which imports vscode) so the whole drain — including the guarantee
  * that an UNEXPECTED `apply` rejection never strands a queued edit — is unit-testable node-side.
@@ -2048,13 +2167,16 @@ export class EditLoopGuard {
  * yields. `apply` performs the actual `lens rewrite` + `WorkspaceEdit`; its OWN handled outcomes (a CLI
  * refusal) never throw, but an unexpected `WorkspaceEdit` rejection (or a spawn failure) would — that is
  * caught, routed to `onError`, and the loop KEEPS DRAINING so a pending second edit is not wedged until
- * the user types again. The slot is always released in `finally`. Never throws.
+ * the user types again. The slot is always released in `finally` — through {@link releaseEdit}, so a
+ * document change suppressed during the drain still gets its re-projection (BACKLOG #234), including on
+ * the rejected-apply path above. Never throws.
  */
 export async function drainEdits(
   guard: EditLoopGuard,
   first: EditMessage,
   apply: (msg: EditMessage) => Promise<void>,
   onError?: (err: unknown, msg: EditMessage) => void,
+  onRefreshOwed?: () => void,
 ): Promise<void> {
   if (!guard.beginEdit()) {
     guard.queue(first);
@@ -2071,7 +2193,7 @@ export async function drainEdits(
       current = guard.takePending();
     }
   } finally {
-    guard.endEdit();
+    releaseEdit(guard, onRefreshOwed);
   }
 }
 

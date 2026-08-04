@@ -1,9 +1,12 @@
 import * as assert from "assert";
 
 import {
+  ASSIST_GATE_PLAN,
   CMD,
   DEEP_PROBE_ROUTE,
   ENGINE_LINK_FIELDS,
+  ENVIRONMENT_PLAN,
+  POLICY_ROUTE,
   POLL_PLAN,
   PROBE_ENDPOINTS,
   VERIFY_PLAN,
@@ -105,6 +108,54 @@ suite("engine doctor — the boundary, as CI", () => {
         `${entry.route} is not an allowed probe endpoint`,
       );
     }
+  });
+
+  test("T7: the status bar's /ai/policy environment read stays TOKENLESS (CWE-613)", () => {
+    // statusBar.readEnvironment runs off the same 15s timer as the poll, via runProbe — which attaches a
+    // bearer IFF the plan entry says `authenticated`. Flipping this to true would put a bearer on the
+    // timer and make the engine's 30-minute idle timeout unreachable, on the exact client the
+    // automatic-logoff control exists for. It wants `environment`, which is identity-INDEPENDENT, so it
+    // has nothing to gain from a token in the first place.
+    assert.ok(ENVIRONMENT_PLAN.length > 0);
+    for (const entry of ENVIRONMENT_PLAN) {
+      assert.strictEqual(
+        entry.authenticated,
+        false,
+        `the status bar's environment read must not authenticate (${entry.route}) — it is on a timer`,
+      );
+      assert.ok(
+        (PROBE_ENDPOINTS as readonly string[]).includes(entry.route),
+        `${entry.route} is not an allowed probe endpoint`,
+      );
+    }
+    assert.strictEqual(ENVIRONMENT_PLAN[0].route, POLICY_ROUTE);
+  });
+
+  test("T8: aiPolicy's gate read DOES authenticate — same route, opposite answer, on purpose", () => {
+    // BACKLOG #330. `assist_permitted` is computed from the acting identity (api/app.py), so a tokenless
+    // read can only ever answer null and the ai:assist deny branch can never fire. Unlike the status
+    // bar's read, this one is user-initiated only (a chat turn / the Show AI Policy command), so it sits
+    // under VERIFY_PLAN's rationale rather than POLL_PLAN's: refreshing the idle clock there is honest
+    // activity, not a forgery.
+    assert.strictEqual(ASSIST_GATE_PLAN.length, 1);
+    assert.strictEqual(ASSIST_GATE_PLAN[0].authenticated, true);
+    assert.ok(
+      (PROBE_ENDPOINTS as readonly string[]).includes(ASSIST_GATE_PLAN[0].route),
+      `${ASSIST_GATE_PLAN[0].route} is not an allowed probe endpoint`,
+    );
+    // The distinction itself, asserted — so a later reader who finds two plans for one route cannot
+    // "unify" them without turning this red. Same route; the ANSWER is what differs, and it differs
+    // because the two callers want different FIELDS of the same document.
+    assert.strictEqual(
+      ENVIRONMENT_PLAN[0].route,
+      ASSIST_GATE_PLAN[0].route,
+      "both plans read the same route",
+    );
+    assert.notStrictEqual(
+      ENVIRONMENT_PLAN[0].authenticated,
+      ASSIST_GATE_PLAN[0].authenticated,
+      "the timer-driven read and the user-initiated read must NOT agree about the bearer",
+    );
   });
 
   test("the user-initiated deep check MAY authenticate — and only it may", () => {
