@@ -1088,8 +1088,8 @@ def _handler_sends(
     (``from messagefoundry import Send as _S``). The walk is call-site-name-based while the
     runtime partitions by ``isinstance``, so every ``return`` expression must additionally be
     provably Send-free (:func:`_send_free_return`) or the handler is dynamic; a generator handler
-    is dynamic too (its yields are collected but never delivered by ``transform_one``, so its
-    static story is uncertain either way)."""
+    is dynamic too (its yields ARE delivered — ``_partition`` accepts any non-``str`` iterable,
+    BACKLOG #341 — but a call-site-name scan cannot prove WHICH of them a lazy body produces)."""
     located = _locate(fn, cache)
     if located is None:
         return None

@@ -1,6 +1,6 @@
 # ADR 0108 — Steps-view accumulator Send fan-out (copy-on-Send authoring)
 
-**Status:** Accepted (2026-07-14) — owner-directed ("do it") after two model iterations; built + adversarially verified this session (engine `lens.py` + `ide/`).
+**Status:** Accepted (2026-07-14) — owner-directed ("do it") after two model iterations; built + adversarially verified this session (engine `lens.py` + `ide/`). **Amended 2026-08-04** — §2's "no engine runtime change" invariant and one §7 rationale both rested on `_partition` narrowing on `isinstance(result, list)`. BACKLOG #341 changed that function: it now accepts any non-`str` iterable. Both statements are corrected in place below. **Nothing this ADR built changed** — the recognizer, the rewrites, the byte-stability contract and every §6 acceptance criterion stand as written.
 **Deciders:** owner + IDE/DX
 **Related:** [ADR 0076](0076-typed-action-vocabulary-action-list-lens.md) (the action-list lens + row-scoped-splice contract §5/§6 this extends), [ADR 0089](0089-recognition-first-lens-native-idioms.md) (recognition-first / honest degradation §4), [ADR 0104](0104-copy-on-send-outbound-message-model-recognition-first-handler-message-type-and-hl7-field-picker.md) (copy-on-Send — the snapshot-at-construction model this lets an analyst *author*), [ADR 0106](0106-steps-view-add-dropdown-vocabulary-expansion-adr-0076-phase-b.md) (the Add palette this repoints the **Send** item within; §6 byte-scoping exceptions), [ADR 0103](0103-steps-view-row-context-menu.md) (the insert-after-on-send suppression rule this refines), BACKLOG **#222** (Steps view), **#26** (the declined visual-authoring line + its structured-Steps-view carve-out — native `.py` stays the only artifact).
 **Code references** are this branch (`send-fanout`); locate by symbol, not absolute line.
@@ -34,7 +34,7 @@ def route_adt(msg):
 - Deleting every append leaves `sends = []; return sends` — an empty accumulator = **FILTERED** at runtime, honest, with **no coupled name-scrub**.
 - The three legacy returned forms (`return Send(...)`, `return [Send, ...]`, `return []`) stay **byte-identically** recognized for the estate; the palette simply stops *authoring* the return form.
 
-**Invariant (unchanged, #26).** Native `.py` is the only artifact and execution path. Every op emits Python the lens re-recognizes (byte-stable codegen), never a declarative logic engine. **No engine runtime change** — `dryrun.py::_partition` already delivers a NAME-built list identically to a returned list (it keys on `isinstance(result, list)` and never inspects the collector name); this is a pure recognizer + rewrite + view change.
+**Invariant (unchanged, #26).** Native `.py` is the only artifact and execution path. Every op emits Python the lens re-recognizes (byte-stable codegen), never a declarative logic engine. **No engine runtime change *for this ADR*** — `dryrun.py::_partition` already delivers a NAME-built list identically to a returned list, because it materialises whatever container it is handed and never inspects the collector name; this is a pure recognizer + rewrite + view change. *(Amended 2026-08-04: as originally written this sentence attributed that behaviour to `_partition` keying on `isinstance(result, list)`. BACKLOG #341 replaced that narrowing with a shared any-non-`str`-iterable rule — an engine runtime change to `_partition`, made by that item, not this one. The accumulator claim is unaffected: a `list` was and remains delivered element-wise.)*
 
 ## 3. Recognizer
 
@@ -68,6 +68,8 @@ def route_adt(msg):
 ## 7. Adversarial pass (caught + fixed)
 
 A multi-agent review (10 confirmed findings, 0 refuted) hardened the build before commit: the `Send` import was injected at a stale index when a top-level import trailed the edited handler (→ `_leading_import_end`); a destination containing `"` emitted a non-canonical escaped literal ruff reflows (→ `_str_lit` honors ruff's single-quote escape-avoidance); syntactic recognition mis-showed an append into a non-returned/rebound/closure list as a delivering send and mis-tagged its scaffold (→ the delivering-accumulator gate + demotion); the convert gate keyed on return **count** not top-level terminality (→ would move a nested guard's fan-out branch); a non-empty tuple return would flip 0→N deliveries on convert (→ refused); and a nested anchor could place an append inside a loop/if at the wrong indent (→ top-level placement). Each fix carries a regression test.
+
+*Amended 2026-08-04:* the tuple item's **premise** is gone — since BACKLOG #341 a non-empty tuple return **delivers**, so converting one up would be delivery-neutral, not a 0→N flip. **The refusal stands** on conservative scope: the palette never authors that form, and enabling the rewrite carries its own byte-stability obligations that belong to a Steps-view item. The §6 SHALL and its regression test are unchanged; only this rationale is corrected.
 
 ## 8. Declined / out of scope (v1)
 
