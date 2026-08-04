@@ -2846,20 +2846,36 @@ No test covers it. `tests/test_scan_tokens_source.py:559-583` (`test_absolute_ho
 > refuse**, against this repo's own rule — *"a new refusal fires only on a new opt-in"* — the refusal
 > is deferred.
 >
-> ⚠️ **Anchor corrected 2026-08-04: that rule is at `docs/CONFIGURATION.md:1475`, not `:1439`.** #326's
-> own Proposed point 3 cites `:1439`; at HEAD that line sits in the `[security]` desugaring section,
-> whose rule is *"no shipped refusal is **loosened**"* (the No-loosen rule, ADR 0092 §5) — which is
-> about not WEAKENING an existing refusal, the opposite direction from adding one. The quoted text was
-> right and the line number was wrong; this ruling inherited the wrong anchor from the item without
-> re-checking it, and a sibling session caught it.
+> ⚠️ **Anchors corrected 2026-08-04, in two passes — the second because the first was still imprecise.**
+> #326's own Proposed point 3 cites `docs/CONFIGURATION.md:1439`. Read verbatim at HEAD, that line is
+> *"…`[ai].production`) is **rejected at load** with a"* — mid-sentence in the `[security]` desugaring
+> section, about rejecting **moved legacy keys**. It is not a rule about upgrade behaviour in either
+> direction. (My first correction called it the No-loosen rule; that rule is real but sits at `:1445`,
+> six lines later, and concerns not *weakening* an existing refusal — still the opposite direction.)
+> The quoted text was right and the anchor was wrong; this ruling inherited it from the item without
+> re-checking, and two sibling sessions caught it.
 >
-> **The real rule reads stronger than "warn first", and the implementer should know it.** Its stated
-> reasoning is this exact case — *"a refusal by default would stop working dev/staging/prod deployments
-> from booting on upgrade over something they cannot change"* — and the house pattern it names
-> (`require_memory_encryption_declaration`, ADR 0152 rung 2; `allowed_client_networks`, ADR 0151) is a
-> refusal gated behind an **opt-in flag**, not merely a dated flip. The owner ruled warn-first with a
-> dated flip; whether the eventual refusal also sits behind an opt-in is a build detail that should
-> follow those two precedents rather than be invented.
+> **The three anchors that are real, verified verbatim at HEAD:**
+> - `:1475` — *"a new refusal fires only on a new opt-in"* (`require_memory_encryption_declaration`,
+>   ADR 0152 rung 2). Its stated reasoning is this exact case.
+> - `:88` and `:1020` — *"**The refuse/warn split is `[security].enforcement`, not the production
+>   tier**"*, on `require_managed_identity` and `security_notifications_required`.
+>
+> ⚠️ **THE MECHANISM IS A BUILD QUESTION THIS RULING DOES NOT SETTLE — and the repo already has one.**
+> `[security].enforcement` is the first-class refuse/warn split, and every sibling gate uses it: refuse
+> under `enforcement = enforce`, warn under `warn`. A bespoke dated flip for #326 alone would stand up a
+> **second, parallel mechanism for the same decision** — which is how a codebase ends up with two ways
+> to answer one question and no rule about which applies.
+>
+> A reading that satisfies both, proposed by the lane building this and flagged to the owner: ship the
+> corrected `admin_exposed` as a warning **irrespective of `enforcement`** until the dated flip, after
+> which it **obeys `[security].enforcement` like its siblings**. That gets the deferral the owner asked
+> for and lands the gate on the existing mechanism rather than beside it.
+>
+> The owner's ruling — warn first, with a dated flip — stands as given and is not reopened by this note.
+> What is open is only *how* the eventual refusal is expressed, and the precedents to follow rather than
+> invent are `require_memory_encryption_declaration` (ADR 0152 rung 2) and `allowed_client_networks`
+> (ADR 0151), both of which gate the refusal behind an opt-in.
 >
 > **The flip must carry a DATE, in the warning text and in this item.** A deferred refusal with no date
 > is a refusal that never happens — it becomes a warning everyone learns to scroll past, which is how
