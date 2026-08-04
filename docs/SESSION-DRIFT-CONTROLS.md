@@ -106,9 +106,14 @@ writes when measured.
   commit-time: the peers of a new session learn nothing until someone trips a gate or writes a commit
   subject, which is too late for two sessions building the same *thing* in different files. This one
   hands the model its live peer roster plus the id-resolution rule at the first prompt that has intent
-  to report, and asks it to introduce itself. It cannot send anything by itself — hooks cannot call MCP
-  — so it is an instruction, and whether a message was actually delivered is recorded by the model in
-  `sent/<key>.tsv`, not by the hook. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
+  to report, and asks it to introduce itself. It is an *instruction* rather than an action, so whether a
+  message was actually delivered is recorded by the model in `sent/<key>.tsv`, not by the hook — the one
+  control whose audit trail is self-reported by the component being audited. The reason recorded for that
+  design ("hooks cannot call MCP") is **false**: `type: "mcp_tool"` is a documented handler on every hook
+  event. Whether it can reach the host-provided `ccd_session_mgmt` is **untested** — probed 2026-08-03 and
+  the answer was unreadable, because with no MCP server connected on the box "not surfaced", "not
+  addressable" and "errored invisibly" produce identical bytes. That is this section's own lesson landing
+  on the section itself. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
 
 > **A control that cannot distinguish "ran and resolved" from "ran and found nothing" is not
 > installed, however it looks.** The hook the one above replaced fired on every prompt, printed its

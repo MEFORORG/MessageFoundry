@@ -471,9 +471,27 @@ closes the push direction.
 else, so it can only say "hello" — the interrupt without the information. One prompt later it knows its
 **intent**, and intent is the whole payload.
 
-**Why it's a prompt and not an action.** Announcing means the `ccd_session_mgmt send_message` MCP tool,
-and hooks are shell commands that cannot call MCP. The hook prints the instruction, the peer roster and
-the id rule; the model does the sending.
+**Why it's a prompt and not an action — and this rationale is now only half true.** Announcing means the
+`ccd_session_mgmt send_message` MCP tool, so the hook prints the instruction, the peer roster and the id
+rule, and the model does the sending.
+
+The reason recorded here used to be "hooks are shell commands and cannot call MCP." **That is wrong.**
+`type: "mcp_tool"` is a documented hook handler — one of five (`command`, `http`, `mcp_tool`, `prompt`,
+`agent`) — described as *"call a tool on an already-connected MCP server"*, available on every hook event,
+with the tool's text output treated like command-hook stdout. So a hook calling `send_message` directly is
+not categorically impossible, and if it works the whole prompt-and-hope design collapses into one hook
+entry — including the delivery receipt the model currently has to write by hand.
+
+What actually blocks it here is narrower and is a *measurement*, not a category: `server` must name an
+**already-connected, configured** MCP server ("the hook never triggers an OAuth or connection flow"), and
+`ccd_session_mgmt` is host-provided rather than a configured entry — `claude mcp list` on this box lists
+one server, unauthenticated. Probed 2026-08-03 with three hooks in one `UserPromptSubmit` array: a
+`command` control fired and its stdout reached the model verbatim; an `mcp_tool` naming `ccd_session_mgmt`
+produced nothing; an `mcp_tool` naming a **deliberately nonexistent** server also produced nothing, where
+the docs promise a non-blocking error. With no connected server anywhere on the box, those three outcomes
+are indistinguishable — output not surfacing, the server not being addressable, and every call correctly
+erroring with the error never reaching the model all produce identical bytes. **So this is untested, not
+impossible.** Re-run the probe against any genuinely connected MCP server before trusting either answer.
 
 **The id rule — stated here as the source of record.** The 8-character id in this repo's coordination
 banners is the **registry** id. `ccd_session_mgmt` uses a *different* id for the same session. **The cwd
@@ -484,8 +502,17 @@ match, since a session may sit in any subdirectory, and it took the **first** hi
 absorbed whichever nested-worktree session the hash table enumerated first and reported the primary LIVE
 on `main`. Where a prefix match is genuinely required, the rule has to be **longest prefix wins**.)
 Branch is not a join key either: measured 2026-08-01, the two rosters reported different
-branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`. **A registry id passed
-to `send_message` fails silently**, which reads as the peer ignoring you.
+branches for the same checkout in 2 of 6 cases. A usable id starts with `local_`.
+
+**A registry id passed to `send_message` does NOT fail silently — it errors loudly.** Measured 2026-08-03
+by calling `send_message` with a syntactically valid id belonging to no session: it returned
+`Session <id> not found.` and delivered nothing. Since the two namespaces carry *different* UUIDs for the
+same session, a registry id is precisely an id `send_message` does not know, so this is the path it takes.
+This doc previously asserted the opposite — that the call "fails silently, which reads as the peer ignoring
+you" — which was an inference stated as a measurement, and it was teaching every session to expect a
+failure mode that does not occur. Getting the id wrong is *self-announcing*; you do not need to detect it.
+(Tested only with an id that matches no session. If a registry uuid ever collided with a live MCP id the
+behaviour would differ, but they are distinct by construction.)
 
 **What it asks the model to send.** A fixed `[SESSION-ANNOUNCE]` envelope, one line of intent, one line
 of expected footprint, no question. It arrives in the recipient as a **user turn**, so an announcement is
