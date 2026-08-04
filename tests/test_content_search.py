@@ -120,7 +120,12 @@ async def test_content_match_on_encrypted_store(tmp_path: Path) -> None:
             at_rest = [str(r[0]) for r in con.execute("SELECT raw FROM messages").fetchall()]
         finally:
             con.close()
-        assert all(v.startswith(MARKER_PREFIX) and "JANE" not in v for v in at_rest)
+        # Whole-plaintext absence, not the 4-char needle: a random base64 body contains any given short
+        # run with probability ~len/64^k, so `"JANE" not in v` can fail on correct encryption -- and,
+        # worse, would pass on a weak encoding that merely missed those four characters. Both seeded
+        # messages carry '|' and '\r', which base64 cannot emit, so this form is deterministic.
+        assert all(v.startswith(MARKER_PREFIX) for v in at_rest)
+        assert all(ADT not in v and ADT2 not in v for v in at_rest)
 
         spec = make_spec(content="JANE", field_path=None, field_value=None)
         result = await store.search_messages(spec)
