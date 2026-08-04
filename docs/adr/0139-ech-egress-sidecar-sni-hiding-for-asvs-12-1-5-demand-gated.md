@@ -12,7 +12,7 @@
 ## Implementation status
 
 **Increment 1 — built + verified (commit `a0c336ce`): the engine-side routing + fail-closed plumbing only.**
-- `transports/rest.py` — `ech_route_from_settings` (an opt-in per-connection route to a **loopback** sidecar,
+- `transports/rest.py` — `ech_sidecar_url_from_settings` (an opt-in per-connection route to a **loopback** sidecar,
   reusing the ADR 0126 opener plumbing) + `egress_route_from_settings`, the single ECH-or-proxy resolver
   (mutually exclusive). Per-connection `ech_egress` / `ech_sidecar` settings. fhir/soap/dicomweb switched to
   the resolver (byte-identical when `ech_egress` is unset; smart/http_auth inherit via the threaded proxy).
