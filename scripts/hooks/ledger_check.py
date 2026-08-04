@@ -33,6 +33,22 @@ ADR_FILE = re.compile(r"^docs/adr/(\d{4})-[^/]+\.md$")
 INDEX_ROW = re.compile(r"^\|\s*\[(\d{4})\]", re.M)
 BACKLOG_HEADING = re.compile(r"^#{2,3} (\d+)\.", re.M)
 
+# THE ITEM NUMBER SPACE SPANS MORE THAN ONE FILE.
+#
+# docs/BACKLOG.md carries the OPEN items; retired ones are moved verbatim into docs/archive/backlog/.
+# A number is taken if it appears in EITHER, so every rule below reads their union. Keying on the one
+# published path was safe only while it was the only path, and would leave the archive an unpoliced
+# region: a commit touching only the archive would early-return having checked nothing, and two
+# sessions could file the same number there and merge clean -- the exact collision this gate exists
+# to stop, reintroduced through the back door of a file it does not look at.
+#
+# Reading the union on BOTH sides also disposes of a false positive that a base-only view would
+# create: the move commit RELOCATES 185 items, so head-union == base-union and `head - base` is
+# empty. A per-file view would instead see 185 numbers vanish from BACKLOG.md and, on any worktree
+# whose base straddles the move, report them -- with a remedy that would renumber cited items.
+BACKLOG_PATH = "docs/BACKLOG.md"
+BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
+
 # THE PUBLIC BACKLOG NUMBER SPACE IS PARTITIONED AT #1000.
 #
 # docs/BACKLOG.md is a published baseline of a larger maintainer-internal ledger. The two sequences
@@ -259,23 +275,51 @@ class Ledger:
                 "remove the duplicate row",
             )
 
+    def backlog_paths(self, side: str) -> list[str]:
+        """Every file carrying numbered items on ``side`` ('head' or 'base').
+
+        Enumerated per side rather than assumed, because the archive does not exist on a base that
+        predates it, and a path listed but absent makes `git show` exit 128 — indistinguishable from
+        a real failure, which is the false-clean this gate must never produce.
+        """
+        if side == "base":
+            listing = git("ls-tree", "-r", "--name-only", self.base, f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.base_has(BACKLOG_PATH)
+        elif self.ci:
+            listing = git("ls-tree", "-r", "--name-only", "HEAD", f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.head_has(BACKLOG_PATH)
+        else:
+            # The INDEX, matching head_text() — a staged archive edit must be policed before it lands.
+            listing = git("ls-files", "--", f"{BACKLOG_ARCHIVE_DIR}/")
+            have_main = self.head_has(BACKLOG_PATH)
+        paths = [BACKLOG_PATH] if have_main else []
+        paths += [p for p in listing.split() if p.endswith(".md")]
+        return paths
+
     def check_backlog(self) -> None:
-        if "docs/BACKLOG.md" not in self.changed_files():
+        changed = self.changed_files()
+        if not any(f == BACKLOG_PATH or f.startswith(f"{BACKLOG_ARCHIVE_DIR}/") for f in changed):
             return
-        if not self.base_has("docs/BACKLOG.md"):
+        base_paths = self.backlog_paths("base")
+        if not base_paths:
             # The base has no backlog at all — the file is being ADDED (it was gitignored until the
             # cutover published it). Numbers that do not exist on base cannot be collided with, so
             # there is nothing to police; without this, importing the ledger wholesale would report
             # every one of its ~229 items as "not allocated to this worktree".
             return
-        if not self.head_has("docs/BACKLOG.md"):
+        head_paths = self.backlog_paths("head")
+        if not head_paths:
             # Present on base, absent here: a branch that PREDATES the file's publication. CI diffs
             # against origin/main, so the file shows up as "changed" (a deletion relative to base)
             # although the branch never touched it — and reading HEAD for a copy that was never there
             # exits 128. A stale branch is not a ledger violation.
             return
-        head = set(BACKLOG_HEADING.findall(self.head_text("docs/BACKLOG.md")))
-        base = set(BACKLOG_HEADING.findall(self.base_text("docs/BACKLOG.md")))
+        head: set[str] = set()
+        for p in head_paths:
+            head |= set(BACKLOG_HEADING.findall(self.head_text(p)))
+        base: set[str] = set()
+        for p in base_paths:
+            base |= set(BACKLOG_HEADING.findall(self.base_text(p)))
         # Only `head - base` is examined, so everything already on origin/main -- including the
         # pre-partition overlap -- is grandfathered by construction. No allowlist, nothing to maintain.
         for number in sorted(head - base, key=int):
