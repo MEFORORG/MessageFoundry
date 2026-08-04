@@ -2,7 +2,7 @@
 
 - **Status:** Accepted  <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-06-26
-- **Related:** ADR 0007 (GUI-manageable connections.toml) · ADR 0024 (AI policy) · CLAUDE.md §9 (PHI/HIPAA), §10 (Console) · SEC-004, SEC-005, SEC-022
+- **Related:** ADR 0007 (GUI-manageable connections.toml) · docs/AI.md (the AI policy model) · ADR 0135 (the engine-brokered path) · CLAUDE.md §9 (PHI/HIPAA), §10 (Console) · SEC-004, SEC-005, SEC-022
 
 ---
 
@@ -74,6 +74,48 @@ online-permitted BYO assistant all keep working.
 - **AC-6** — WHEN the engine policy is read successfully, THE EXTENSION SHALL cache it so a
   previously-seen central "off" is not overridable by going offline.
   → `ide/src/test/suite/ai-policy.test.ts` (`pickOfflinePolicy` cached-wins case)
+- **AC-7** — WHEN the engine's answer to `GET /ai/policy` does NOT carry an evaluable
+  `assist_permitted` (the literal `true` or `false`) AND a cached authoritative policy holds
+  `assist_permitted: false`, THE EXTENSION SHALL retain the `false` in both the returned and the cached
+  policy, and SHALL NOT retain a cached `true` the same way.
+  → `ide/src/test/suite/ai-policy-model.test.ts` (the pure rule, node-side on every leg) +
+  `ide/src/test/suite/ai-policy.test.ts` (the cache write)
+  <br>The asymmetry is the decision: `assist_permitted` is identity-dependent, so a non-answer means
+  "could not be evaluated", and a degraded read must not *upgrade* assistance a central policy switched
+  off. A cached `true` is deliberately **not** sticky — a non-answer under BYO is allowed by design
+  (docs/AI.md, *"the `assist_permitted == null` trust note"*), so carrying a permit forward would
+  fabricate one, which is the fail-open direction.
+  <br>**"Not evaluable" is wider than `null` on purpose.** `AiPolicyWire` is a compile-time claim about
+  a response and `JSON.parse` does not enforce it, so a 200 that merely OMITS the field arrives as
+  `undefined`. A guard keyed on the literal `null` would let that through — and because `undefined` is
+  not `false` either, the cache would be poisoned so no later answer could restore the deny. The bit is
+  therefore narrowed at the boundary (`evaluatedPermission`), and only `true`/`false` count as answers.
+  <br>**Accepted consequences**, stated as decisions rather than surprises: (a) the deny is one-way
+  until an evaluable answer replaces it, so a user granted `ai:assist` later, who holds no valid
+  session, sees assistance disabled until the engine answers `true` for them — the escape hatch is
+  signing in, as there is no "clear cached policy" command; and (b) the cache is a **single global
+  key**, not keyed per engine URL as the bearer is, so a deny observed against one engine also
+  suppresses assistance against another until an evaluable answer arrives from it. Both are the
+  fail-CLOSED direction, which is why they are accepted here rather than treated as defects.
+- **AC-8** — WHEN `resolveAiPolicy` reads the authoritative policy, THE EXTENSION SHALL attach the
+  cached bearer (never prompting for one) so `assist_permitted` is resolvable for the acting user, and
+  SHALL NOT attach it to a non-loopback plain-`http://` target. The status bar's periodic `/ai/policy`
+  environment read SHALL be expressed as an `authenticated: false` plan constant.
+  → `ide/src/test/suite/ai-policy.test.ts` (the bearer reaches the request; `peekToken` by identity) +
+  `ide/src/test/suite/engine-client.test.ts` (the `Authorization` header, both polarities) +
+  `ide/src/test/suite/engine-doctor.test.ts` (`ASSIST_GATE_PLAN` / `ENVIRONMENT_PLAN`)
+  <br>The two `/ai/policy` readers give opposite answers about the bearer *on purpose*: the status
+  bar's read is timer-driven and wants the identity-independent `environment`, where a bearer would
+  defeat the engine's idle timeout (CWE-613, ADR 0110 §2); this one is user-initiated and wants the
+  identity-dependent `assist_permitted`, which no tokenless caller can ever receive. Both are expressed
+  as CI-asserted plan constants rather than call-site arguments.
+  <br>**Known gap in the evidence, recorded rather than papered over.** The third clause is deliberately
+  written about the CONSTANT, because that is all the tests pin. No suite constructs `EngineStatusBar`,
+  so nothing asserts that `readEnvironment` actually *uses* `ENVIRONMENT_PLAN` — rewiring that call site
+  to send a bearer would type-check and leave every test green. The constant is load-bearing only given
+  the call site reads it (`runProbe` attaches a bearer iff `entry.authenticated`), which is verified by
+  reading. Closing it needs an injectable-fetch seam on `EngineStatusBar` asserting `token === undefined`;
+  that is a test-infrastructure change beyond BACKLOG #330 and wants its own item.
 
 ## Options considered
 
