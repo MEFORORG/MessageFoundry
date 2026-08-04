@@ -185,8 +185,26 @@ function Get-Floor {
     }
     $floor = [Math]::Max($computed, $previous)
     if ($floor -gt $previous -and -not $Peek) { Set-Content -Path $watermark -Value $floor -Encoding ASCII }
-    # Measure-Object hands back a [double]; the 'D4' format specifier is integer-only and throws on one.
-    [int]$floor
+
+    # TWO NUMBERS, NOT ONE -- and conflating them is what bricked this script on 2026-08-03.
+    #
+    # `Floor` is the whole observed set's maximum. It answers "what must I not re-issue", so it MUST
+    # include public numbers.
+    #
+    # `SubFloorMax` is the maximum BELOW the partition. It answers a different question -- "how much
+    # runway does the maintainer-internal sequence have left" -- and it must EXCLUDE public numbers,
+    # because a public item at or above the boundary is the design working, not a breach.
+    #
+    # Returning one number for both is not a style problem. The residual detector below read `Floor`,
+    # so the first legitimate public item filed at #1000 made the guard throw on every subsequent
+    # backlog allocation, repo-wide, until it was patched. The guard fired on correct input.
+    #
+    # `[int]` on both: Measure-Object hands back a [double], and the 'D4' format specifier is
+    # integer-only and throws on one.
+    [pscustomobject]@{
+        Floor       = [int]$floor
+        SubFloorMax = [int](($seen | Where-Object { $_ -lt $PublicBacklogFloor } | Measure-Object -Maximum).Maximum)
+    }
 }
 
 # THE FLOOR IS DEFINED ONCE, IN THE GATE, AND READ HERE.
@@ -207,7 +225,16 @@ if (Test-Path $gateFile) {
     if ($m.Success) { $PublicBacklogFloor = [int]$m.Groups[1].Value }
 }
 
-$observed = Get-Floor -Peek:$ShowFloor
+$measured = Get-Floor -Peek:$ShowFloor
+$observed = $measured.Floor
+$subFloorMax = $measured.SubFloorMax
+
+# The residual warning is evaluated ONCE, here, so -ShowFloor and a real allocation cannot disagree.
+# They did: -ShowFloor returned 19 lines before the guard, so it printed `next: 1001` while every real
+# allocation threw. An inspector that does not run the checks it previews reports a number the tool
+# will refuse to issue -- it answers the adjacent question, which is the failure CLAUDE.md §11 names.
+$warnAt = if ($null -ne $PublicBacklogFloor) { [int]($PublicBacklogFloor * 0.9) } else { 0 }
+$residualWarning = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($subFloorMax -ge $warnAt)
 
 if ($ShowFloor) {
     # Name the SOURCES, not just the number. "Which files did this sweep actually read" is the
@@ -217,12 +244,17 @@ if ($ShowFloor) {
     Write-Host "floor    : $observed"
     if ($Kind -eq "backlog") {
         Write-Host "paths    : docs/BACKLOG.md, docs/archive/backlog/BACKLOG-CLOSED.md"
+        Write-Host "sub-floor: $subFloorMax  (highest number below the #$PublicBacklogFloor partition -- the internal sequence's runway)"
         Write-Host "next     : $([Math]::Max($observed, $PublicBacklogFloor - 1) + 1)  (clamped to >= $PublicBacklogFloor)"
     } else {
         Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
         Write-Host "next     : $($observed + 1)"
     }
     Write-Host "watermark: $(Join-Path $alloc '.floor-highwater')"
+    if ($residualWarning) {
+        Write-Host ""
+        Write-Host "WOULD WARN: sub-floor max $subFloorMax has reached 90% of the #$PublicBacklogFloor partition." -ForegroundColor Yellow
+    }
     Write-Host ""
     Write-Host "Read-only: nothing was allocated." -ForegroundColor DarkGray
     return
@@ -233,32 +265,40 @@ if ($Kind -eq "backlog") {
         throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
     }
 
-    # THE RESIDUAL DETECTOR, ON APPROACH RATHER THAN ARRIVAL.
+    # THE RESIDUAL DETECTOR -- IT CAN ONLY WARN, AND THAT IS A LIMIT OF THE INPUT, NOT AN OVERSIGHT.
     #
-    # The partition binds only the PUBLIC side; nothing can stop the maintainer-internal sequence
-    # allocating past the boundary, and CI cannot see it -- a public runner checks out origin only. But
-    # THIS machine can: Get-Floor already swept every ref, internal ones included. So the one place the
-    # breach is observable is here, at allocation time.
+    # The partition binds only the PUBLIC side; nothing stops the maintainer-internal sequence
+    # allocating past the boundary, and CI cannot see it -- a public runner checks out origin only.
     #
-    # Warning only on ARRIVAL would fire exactly when it is too late -- at that point the next internal
-    # allocation already collides and there is no room to move. A check that fires only on collision has
-    # the same practical value as no check for every moment until the collision. So: warn at 90% of the
-    # boundary, with hundreds of numbers of runway left, and REFUSE at the boundary itself.
-    $warnAt = [int]($PublicBacklogFloor * 0.9)
-    if ($observed -ge $PublicBacklogFloor) {
-        throw @"
-REFUSING TO ALLOCATE. The all-refs backlog maximum ($observed) has reached the public floor ($PublicBacklogFloor).
-The partition assumes the maintainer-internal sequence stays BELOW that boundary, and it no longer does
--- so the next number this would hand out is not safe to use. Raise PUBLIC_BACKLOG_FLOOR in
-scripts/hooks/ledger_check.py (the allocator reads it from there), and say so in the PR.
-"@
-    }
-    elseif ($observed -ge $warnAt) {
+    # What THIS machine can see is real and was measured on 2026-08-03, because the claim in the
+    # previous version of this comment was worth checking rather than repeating: sweeping every ref
+    # does reach internal numbers. 490 vault-ish remote-tracking refs are present, 489 carry
+    # docs/BACKLOG.md, and 67 item numbers live ONLY there -- including #240-#247, the very numbers
+    # the Ledger erratum records as re-issued over cited work. So "Get-Floor sweeps internal refs too"
+    # is TRUE, and the sweep is the reason the floor is trustworthy.
+    #
+    # But seeing internal numbers is not the same as being able to detect the breach, and that is the
+    # part that cannot be fixed here. Once an internal item is allocated at or above the boundary it is
+    # indistinguishable, in this data, from a legitimate public item at the same number -- both are just
+    # `## N.` with N >= the floor. There is no attribute in the published files that separates them. A
+    # refusal arm would therefore have to either fire on correct input or never fire at all.
+    #
+    # It used to fire on correct input. It compared the WHOLE-SET maximum against the floor, so the
+    # first legitimate public item filed at #1000 (BACKLOG #1000, 2026-08-03) made every subsequent
+    # backlog allocation throw, repo-wide. The guard was not detecting a breach; it was detecting the
+    # partition being used as designed.
+    #
+    # So the refusal is REMOVED rather than rewritten to be unreachable -- a branch that cannot fire
+    # reads as protection and is worse than none. What remains is honest: warn while the INTERNAL
+    # sequence still has runway, measured on the sub-floor band only, where public numbers cannot
+    # distort it. Detecting an actual breach needs an internal-side input this repository does not have.
+    if ($residualWarning) {
         Write-Host ""
-        Write-Host "WARNING: the all-refs backlog maximum ($observed) is approaching the public floor ($PublicBacklogFloor)." -ForegroundColor Yellow
-        Write-Host "         Still safe -- but the partition's headroom is running out, and at the boundary" -ForegroundColor Yellow
-        Write-Host "         this script will refuse to allocate. Plan to raise PUBLIC_BACKLOG_FLOOR in" -ForegroundColor Yellow
-        Write-Host "         scripts/hooks/ledger_check.py before that happens, not after." -ForegroundColor Yellow
+        Write-Host "WARNING: the highest sub-partition number ($subFloorMax) has reached 90% of the #$PublicBacklogFloor boundary." -ForegroundColor Yellow
+        Write-Host "         The maintainer-internal sequence is running out of room below the partition." -ForegroundColor Yellow
+        Write-Host "         Raise PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py (this script reads" -ForegroundColor Yellow
+        Write-Host "         it from there) BEFORE the two sequences meet, and say so in the PR. Once they" -ForegroundColor Yellow
+        Write-Host "         meet, nothing in this repository can tell the two apart." -ForegroundColor Yellow
         Write-Host ""
     }
     $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1

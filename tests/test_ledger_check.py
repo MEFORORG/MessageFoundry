@@ -608,3 +608,69 @@ def test_the_allocator_still_parses_the_floor_the_same_way() -> None:
         "alloc.ps1's floor regex must tolerate a type annotation "
         "(PUBLIC_BACKLOG_FLOOR: Final[int] = 1000), or an ordinary tidy-up silently disarms allocation"
     )
+
+
+# --- the partition guard must never again read the whole-set maximum -------------------------------
+#
+# On 2026-08-03 filing BACKLOG #1000 -- the FIRST legitimate item in the post-partition public sequence
+# -- made every backlog allocation in the repository throw:
+#
+#     REFUSING TO ALLOCATE. The all-refs backlog maximum (1000) has reached the public floor (1000).
+#
+# One number was serving two incompatible purposes. The emit start wants the maximum over EVERYTHING so
+# a number is never re-issued; the residual detector wants the maximum of the maintainer-internal
+# sequence, to see it running out of room below the partition. The detector read the union, so a public
+# item sitting where public items are SUPPOSED to sit read as a breach. The guard fired on correct input.
+#
+# These are source-text assertions, matching the seam above, and deliberately so: executing the
+# allocator to test it would either spend a real number (claims are never released -- "holes are free,
+# collisions are not") or write to .git/mefor-coord/alloc/**, and a test that mutates the ledger
+# registry to check the ledger registry is its own hazard.
+
+
+def test_the_allocator_measures_the_partition_band_separately() -> None:
+    """`Get-Floor` must return BOTH numbers, or the conflation is available to be made again."""
+    src = _ALLOC.read_text(encoding="utf-8")
+    assert "SubFloorMax" in src, (
+        "alloc.ps1 no longer computes a sub-partition maximum. The residual detector needs the highest "
+        "number BELOW the floor; if it reads the whole-set maximum instead, the first public item at "
+        "the boundary bricks every backlog allocation (this happened, with BACKLOG #1000)."
+    )
+    assert "Floor       =" in src or "Floor =" in src, (
+        "alloc.ps1's Get-Floor must still return the whole-set Floor for the emit start — without it "
+        "the allocator can re-issue a number that already exists."
+    )
+
+
+def test_the_residual_detector_does_not_read_the_whole_set_maximum() -> None:
+    """The exact regression: the guard compared `$observed` (union max) against the public floor."""
+    src = _ALLOC.read_text(encoding="utf-8")
+    assert re.search(r"\$observed\s+-ge\s+\$PublicBacklogFloor", src) is None, (
+        "alloc.ps1 compares the WHOLE-SET maximum against PUBLIC_BACKLOG_FLOOR again. That is the "
+        "2026-08-03 defect verbatim: every public item at or above the floor is indistinguishable from "
+        "an internal breach in this data, so the comparison fires on the partition working as designed. "
+        "Measure the sub-floor band instead."
+    )
+    assert re.search(r"\$subFloorMax\s+-ge\s+\$warnAt", src), (
+        "the residual warning must be derived from the sub-partition maximum, not the union maximum"
+    )
+
+
+def test_the_floor_preview_evaluates_the_same_guard_as_a_real_allocation() -> None:
+    """`-ShowFloor` must not be able to disagree with the run it previews.
+
+    It could, and did: the `-ShowFloor` block `return`ed 19 lines before the guard, so it printed a
+    `next:` number while every real allocation threw. An inspector that skips the checks it previews
+    answers a question adjacent to the one asked — and it is worse than no inspector, because a peer
+    session verified the allocator with it, got a green answer, and recorded it as a fact.
+    """
+    src = _ALLOC.read_text(encoding="utf-8")
+    show_at = src.index("if ($ShowFloor)")
+    assert "$residualWarning" in src[:show_at], (
+        "$residualWarning must be computed BEFORE the -ShowFloor block, so the preview and the real "
+        "allocation evaluate one shared expression rather than two that can drift apart."
+    )
+    assert src.count("$residualWarning") >= 3, (
+        "-ShowFloor must consult $residualWarning too; if only the allocation path reads it, the "
+        "preview is once again reporting a number the allocator would refuse to issue."
+    )
