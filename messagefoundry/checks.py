@@ -374,10 +374,10 @@ def _opens_with_guard_filter(body: list[ast.stmt]) -> bool:
     """True when the def's first executable statement is a bare guard-filter ``if <cond>: return []``.
 
     "Bare filter" = an ``if`` with no ``else``/``elif`` whose body is a single filter-return (``return``,
-    ``return None``, or ``return []`` — the empty list). A leading docstring is skipped. This is
-    deliberately conservative: a filter buried after real transform work is a genuine handler concern
-    (not an applicability rule) and is not flagged — the advisory only targets the leading guard that
-    belongs in ``accepts=``.
+    ``return None``, ``return []`` or ``return ()`` — either empty container). A leading docstring is
+    skipped. This is deliberately conservative: a filter buried after real transform work is a genuine
+    handler concern (not an applicability rule) and is not flagged — the advisory only targets the
+    leading guard that belongs in ``accepts=``.
     """
     stmts = list(body)
     # Skip a docstring first statement.
@@ -392,12 +392,18 @@ def _opens_with_guard_filter(body: list[ast.stmt]) -> bool:
     if not isinstance(inner, ast.Return):
         return False
     val = inner.value
-    # bare ``return`` / ``return None`` / ``return []`` are all filter-drops.
+    # bare ``return`` / ``return None`` / ``return []`` / ``return ()`` are all filter-drops. The tuple
+    # half matters as much as the list half: an EMPTY container of either kind partitions to no
+    # deliveries (``dryrun._partition`` materialises any non-``str`` iterable — BACKLOG #341), and
+    # ``return ()`` is a documented filter idiom the Steps lens already recognizes alongside ``return []``
+    # (``lens.py::_is_send_return`` / ``_is_collector_init``'s sibling gate, ADR 0108 §6). Recognizing
+    # only the list form made this advisory the sole place in the codebase that treated the two
+    # differently — it under-flagged a `return ()` guard rather than mis-flagging, but silently.
     if val is None:
         return True
     if isinstance(val, ast.Constant) and val.value is None:
         return True
-    return isinstance(val, ast.List) and not val.elts
+    return isinstance(val, ast.List | ast.Tuple) and not val.elts
 
 
 def _check_accepts_candidate(config_dir: str | Path) -> CheckResult:

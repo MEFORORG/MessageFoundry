@@ -1269,9 +1269,10 @@ def _merge_code_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _is_collector_init(s: ast.stmt, collectors: set[str]) -> bool:
     """Whether ``s`` is a ``NAME = []`` accumulator init for a NAME in ``collectors``.
 
-    A LIST only (never ``()``): a tuple has no ``.append`` and the runtime's ``_partition`` keys on
-    ``isinstance(result, list)``, so a tuple collector is not a valid accumulator — it stays a plain
-    code row."""
+    A LIST only (never ``()``): a tuple has no ``.append``, so a tuple collector cannot be an
+    accumulator — it stays a plain code row. (The runtime no longer narrows on ``list`` at all —
+    ``_partition`` accepts any non-``str`` iterable, BACKLOG #341 — but ``.append`` is the reason that
+    governs here, and it is unchanged.)"""
     return (
         isinstance(s, ast.Assign)
         and len(s.targets) == 1
@@ -2234,9 +2235,11 @@ def _is_send_return(s: ast.Return) -> bool:
     if isinstance(v, ast.List | ast.Tuple) and not v.elts:
         return True  # `return []` / `return ()` — the filter, converts to an accumulator with just the new send
     if isinstance(v, ast.Tuple):
-        # A NON-empty tuple return is dropped by the runtime ``_partition`` (it keys on
-        # ``isinstance(result, list)``), so it already delivers nothing; converting it to a list-building
-        # accumulator would silently flip 0→N deliveries. Refuse it — leave it a code row / edit-as-text.
+        # A NON-empty tuple return DELIVERS at runtime (``_partition`` accepts any non-``str`` iterable,
+        # BACKLOG #341), so converting it to a list-building accumulator would now be delivery-neutral
+        # rather than a silent 0→N flip. It is refused anyway, on CONSERVATIVE SCOPE: the palette never
+        # authors this form, and enabling the rewrite carries its own byte-stability obligations
+        # (ADR 0108 §6/§7) that belong to a Steps-view item, not here. Leave it a code row / edit-as-text.
         return False
     return _send_outbounds(v) is not None
 
