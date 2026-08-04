@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -674,3 +675,135 @@ def test_the_floor_preview_evaluates_the_same_guard_as_a_real_allocation() -> No
         "-ShowFloor must consult $residualWarning too; if only the allocation path reads it, the "
         "preview is once again reporting a number the allocator would refuse to issue."
     )
+
+
+# --- EXECUTION tests: the allocator is actually RUN, in a throwaway repo ---------------------------
+#
+# Nothing in tests/ had ever executed alloc.ps1. The two references above are `read_text()` assertions,
+# and they stayed green through the entire period the allocator refused every backlog allocation. A
+# gate that is only ever read is not a gate that has been tested.
+#
+# The seam is the PROCESS WORKING DIRECTORY, and it is the only one: alloc.ps1 takes no -Repo switch
+# and reads no environment variable. `$repo` and `$common` come from `git rev-parse` against the cwd,
+# so a throwaway git repo gets its OWN registry under its own .git AND supplies its own
+# ledger_check.py, which is where the floor is parsed from. That makes the boundary injectable.
+#
+# FLOOR = 100, deliberately not 10: at 10 the warn tier (9) and the highest sub-boundary number (9)
+# coincide, and every tier assertion would pass for the wrong reason.
+
+_PWSH = shutil.which("pwsh")
+
+
+def _mkrepo(tmp: Path, floor: int, items: list[int]) -> Path:
+    """A throwaway repo carrying its own alloc.ps1, its own floor constant, and its own registry."""
+    repo = tmp / "rig"
+    (repo / "scripts" / "coord").mkdir(parents=True)
+    (repo / "scripts" / "hooks").mkdir(parents=True)
+    (repo / "docs").mkdir()
+    shutil.copy(_ALLOC, repo / "scripts" / "coord" / "alloc.ps1")
+    (repo / "scripts" / "hooks" / "ledger_check.py").write_text(
+        f"PUBLIC_BACKLOG_FLOOR = {floor}\n", encoding="utf-8"
+    )
+    body = "# rig\n\n" + "".join(f"## {n}. item {n}\n\n> OPEN\n\n" for n in items)
+    (repo / "docs" / "BACKLOG.md").write_text(body, encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
+    subprocess.run(
+        ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "rig"],
+        cwd=repo,
+        check=True,
+    )
+    return repo
+
+
+def _alloc(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    assert _PWSH
+    return subprocess.run(
+        [_PWSH, "-NoProfile", "-File", str(repo / "scripts" / "coord" / "alloc.ps1"), *args],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
+def test_the_rig_cannot_reach_the_real_registry(tmp_path: Path) -> None:
+    """FIRST, because every later test here spends real numbers if this is false.
+
+    The registry lives beside the git common dir, so a throwaway repo must resolve to its OWN .git.
+    If it resolved to the project's, these tests would burn production ledger numbers on every run --
+    and claims are never released, so the damage would be permanent and silent.
+    """
+    repo = _mkrepo(tmp_path, floor=100, items=[5, 7])
+    out = _alloc(repo, "-Kind", "backlog", "-ShowFloor")
+    assert out.returncode == 0, out.stderr
+    real = str(Path(__file__).resolve().parents[1] / ".git").lower()
+    assert real not in out.stdout.lower().replace("/", "\\"), (
+        f"the rig resolved to the REAL registry — refusing to run the rest.\n{out.stdout}"
+    )
+    assert str(tmp_path).lower()[:12] in out.stdout.lower(), out.stdout
+
+
+@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
+def test_a_public_number_at_the_boundary_does_not_brick_allocation(tmp_path: Path) -> None:
+    """The 2026-08-03 regression, executed rather than pattern-matched.
+
+    An item at exactly the floor is the FIRST legitimate public allocation. Before the fix this threw
+    `REFUSING TO ALLOCATE … has reached the public floor` for every subsequent caller, repo-wide.
+    """
+    repo = _mkrepo(tmp_path, floor=100, items=[5, 100])
+    out = _alloc(repo, "-Kind", "backlog", "-Title", "after the boundary")
+    assert out.returncode == 0, f"allocation refused on legitimate input:\n{out.stdout}{out.stderr}"
+    assert "ALLOCATED BACKLOG #101" in out.stdout, out.stdout
+    assert "REFUSING" not in out.stdout + out.stderr
+
+
+@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
+def test_the_warning_reads_the_sub_boundary_band_not_the_union(tmp_path: Path) -> None:
+    """A public number above the boundary must NOT trip the runway warning; a sub-boundary one must."""
+    quiet = _alloc(
+        _mkrepo(tmp_path / "a", floor=100, items=[5, 100]), "-Kind", "backlog", "-ShowFloor"
+    )
+    assert "WOULD WARN" not in quiet.stdout, (
+        f"a public item at the boundary tripped the internal-runway warning:\n{quiet.stdout}"
+    )
+    loud = _alloc(_mkrepo(tmp_path / "b", floor=100, items=[95]), "-Kind", "backlog", "-ShowFloor")
+    assert "WOULD WARN" in loud.stdout, (
+        f"sub-boundary 95 is past the 90 warn tier and did not warn:\n{loud.stdout}"
+    )
+
+
+@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
+def test_lowering_the_boundary_is_refused(tmp_path: Path) -> None:
+    """The replacement refusal, and it must actually fire.
+
+    Neither the pre-commit gate nor CI can catch a LOWERED floor: both read only the current value and
+    have no memory of the previous one. The ratchet beside the registry is the only instrument that can.
+    """
+    repo = _mkrepo(tmp_path, floor=100, items=[5])
+    first = _alloc(repo, "-Kind", "backlog", "-Title", "sets the ratchet")
+    assert first.returncode == 0, first.stderr
+    gate = repo / "scripts" / "hooks" / "ledger_check.py"
+    gate.write_text("PUBLIC_BACKLOG_FLOOR = 50\n", encoding="utf-8")
+    after = _alloc(repo, "-Kind", "backlog", "-Title", "should be refused")
+    assert after.returncode != 0, f"a lowered boundary was accepted:\n{after.stdout}"
+    assert "REFUSING TO ALLOCATE" in after.stdout + after.stderr
+
+
+@pytest.mark.skipif(not _PWSH, reason="pwsh not on PATH")
+def test_showfloor_agrees_with_a_real_allocation(tmp_path: Path) -> None:
+    """The preview must not be able to contradict the run it previews — it could, and did."""
+    repo = _mkrepo(tmp_path, floor=100, items=[5, 100])
+    preview = _alloc(repo, "-Kind", "backlog", "-ShowFloor")
+    assert "next     : 101" in preview.stdout, preview.stdout
+    real = _alloc(repo, "-Kind", "backlog", "-Title", "must match the preview")
+    assert "ALLOCATED BACKLOG #101" in real.stdout, (
+        f"-ShowFloor promised 101 and the allocator issued something else:\n{real.stdout}"
+    )
+
+    # And the refusal case must agree too, in the same direction.
+    (repo / "scripts" / "hooks" / "ledger_check.py").write_text(
+        "PUBLIC_BACKLOG_FLOOR = 50\n", encoding="utf-8"
+    )
+    assert "WOULD REFUSE" in _alloc(repo, "-Kind", "backlog", "-ShowFloor").stdout
+    assert _alloc(repo, "-Kind", "backlog", "-Title", "x").returncode != 0

@@ -229,12 +229,32 @@ $measured = Get-Floor -Peek:$ShowFloor
 $observed = $measured.Floor
 $subFloorMax = $measured.SubFloorMax
 
-# The residual warning is evaluated ONCE, here, so -ShowFloor and a real allocation cannot disagree.
-# They did: -ShowFloor returned 19 lines before the guard, so it printed `next: 1001` while every real
+# Both checks are evaluated ONCE, here, so -ShowFloor and a real allocation cannot disagree. They did:
+# -ShowFloor returned 19 lines before the guard, so it printed a next number while every real
 # allocation threw. An inspector that does not run the checks it previews reports a number the tool
 # will refuse to issue -- it answers the adjacent question, which is the failure CLAUDE.md §11 names.
 $warnAt = if ($null -ne $PublicBacklogFloor) { [int]($PublicBacklogFloor * 0.9) } else { 0 }
 $residualWarning = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($subFloorMax -ge $warnAt)
+
+# THE BOUNDARY RATCHET -- the one refusal this data can actually justify.
+#
+# PUBLIC_BACKLOG_FLOOR is a constant in a source file, so it can be LOWERED: a bad revert, a merge
+# resolved the wrong way, a tidy-up. Lower it to 900 and ledger_check.py cheerfully accepts a new
+# public #900 sitting on top of an internal #900 -- with a GREEN pre-commit and a GREEN CI, because a
+# runner has no memory of yesterday's value and the constant is the only thing either consults.
+#
+# A ratchet OUTSIDE the constant is the only instrument that can see this, and unlike the boundary
+# check it replaces, it is genuinely reachable: it triggers on an observable local fact (the value
+# moved down) rather than on an integer whose provenance cannot be recovered.
+#
+# THREE QUANTITIES, THREE PURPOSES -- keep them strictly separate:
+#   $observed     (union max)      -> $start / the next number, ONLY
+#   $subFloorMax  (below boundary) -> the WARNING, ONLY
+#   $boundarySeen (highest floor)  -> the REFUSAL, ONLY
+$boundaryMark = Join-Path $alloc ".boundary-highwater"
+$boundarySeen = 0
+if (Test-Path $boundaryMark) { [void][int]::TryParse((Get-Content $boundaryMark -Raw).Trim(), [ref]$boundarySeen) }
+$boundaryLowered = ($Kind -eq "backlog") -and ($null -ne $PublicBacklogFloor) -and ($PublicBacklogFloor -lt $boundarySeen)
 
 if ($ShowFloor) {
     # Name the SOURCES, not just the number. "Which files did this sweep actually read" is the
@@ -244,16 +264,21 @@ if ($ShowFloor) {
     Write-Host "floor    : $observed"
     if ($Kind -eq "backlog") {
         Write-Host "paths    : docs/BACKLOG.md, docs/archive/backlog/BACKLOG-CLOSED.md"
-        Write-Host "sub-floor: $subFloorMax  (highest number below the #$PublicBacklogFloor partition -- the internal sequence's runway)"
+        Write-Host "sub-floor: $subFloorMax  (highest number BELOW the #$PublicBacklogFloor boundary; over-states the internal high-water)"
+        Write-Host "boundary : $PublicBacklogFloor  (highest ever seen on this clone: $boundarySeen)"
         Write-Host "next     : $([Math]::Max($observed, $PublicBacklogFloor - 1) + 1)  (clamped to >= $PublicBacklogFloor)"
     } else {
         Write-Host "paths    : docs/adr/NNNN-*.md (filenames, all refs)"
         Write-Host "next     : $($observed + 1)"
     }
     Write-Host "watermark: $(Join-Path $alloc '.floor-highwater')"
+    if ($boundaryLowered) {
+        Write-Host ""
+        Write-Host "WOULD REFUSE: PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor but this clone has allocated against $boundarySeen." -ForegroundColor Red
+    }
     if ($residualWarning) {
         Write-Host ""
-        Write-Host "WOULD WARN: sub-floor max $subFloorMax has reached 90% of the #$PublicBacklogFloor partition." -ForegroundColor Yellow
+        Write-Host "WOULD WARN: highest sub-boundary number $subFloorMax has reached 90% of #$PublicBacklogFloor." -ForegroundColor Yellow
     }
     Write-Host ""
     Write-Host "Read-only: nothing was allocated." -ForegroundColor DarkGray
@@ -265,33 +290,48 @@ if ($Kind -eq "backlog") {
         throw "Could not read PUBLIC_BACKLOG_FLOOR from $gateFile. Refusing to allocate a backlog number rather than guess a floor the gate will not honour."
     }
 
-    # THE RESIDUAL DETECTOR -- IT CAN ONLY WARN, AND THAT IS A LIMIT OF THE INPUT, NOT AN OVERSIGHT.
+    # WHY THE OLD "INTERNAL REACHED THE BOUNDARY" REFUSAL IS GONE.
     #
-    # The partition binds only the PUBLIC side; nothing stops the maintainer-internal sequence
-    # allocating past the boundary, and CI cannot see it -- a public runner checks out origin only.
+    # It compared the WHOLE-SET maximum against the floor, so the first legitimate public item filed at
+    # #1000 (BACKLOG #1000, 2026-08-03) made every subsequent backlog allocation throw, repo-wide. It
+    # was not detecting a breach; it was detecting the partition being used exactly as designed.
     #
-    # What THIS machine can see is real and was measured on 2026-08-03, because the claim in the
-    # previous version of this comment was worth checking rather than repeating: sweeping every ref
-    # does reach internal numbers. 490 vault-ish remote-tracking refs are present, 489 carry
-    # docs/BACKLOG.md, and 67 item numbers live ONLY there -- including #240-#247, the very numbers
-    # the Ledger erratum records as re-issued over cited work. So "Get-Floor sweeps internal refs too"
-    # is TRUE, and the sweep is the reason the floor is trustworthy.
+    # It is NOT that this clone cannot see internal numbers -- that was suspected and is false.
+    # Measured 2026-08-03: 490 vault-ish remote-tracking refs are present, 489 carry docs/BACKLOG.md,
+    # and 67 item numbers live ONLY there, including the #242-#246 band ADR 0115 cites. The sweep does
+    # reach them, and that is exactly why the floor is trustworthy.
     #
-    # But seeing internal numbers is not the same as being able to detect the breach, and that is the
-    # part that cannot be fixed here. Once an internal item is allocated at or above the boundary it is
-    # indistinguishable, in this data, from a legitimate public item at the same number -- both are just
-    # `## N.` with N >= the floor. There is no attribute in the published files that separates them. A
-    # refusal arm would therefore have to either fire on correct input or never fire at all.
+    # The premise fails for four other reasons, any ONE of them fatal:
+    #   (a) NO PROVENANCE. An integer does not say which sequence issued it. "Internal reached the
+    #       boundary" and "public was legitimately allocated at the boundary" are the SAME observation
+    #       -- which is why #1000, on origin/main and holding a registry claim, read as a breach.
+    #   (b) FOSSIL. The newest vault-ish ref here is 2026-07-26 and the only configured refspec is
+    #       +refs/heads/*:refs/remotes/origin/*, so nothing can advance them. The partition landed
+    #       eight days later. (Measured: these refs say 314 while the real vault is at 315 -- the
+    #       fossil is already stale by one item.)
+    #   (c) CLONE-LOCAL. A fresh public clone has zero vault refs, so the term is absent entirely.
+    #   (d) MASKED. Internal 314 < public 353, so the internal term does not even determine the
+    #       sub-boundary maximum today.
     #
-    # It used to fire on correct input. It compared the WHOLE-SET maximum against the floor, so the
-    # first legitimate public item filed at #1000 (BACKLOG #1000, 2026-08-03) made every subsequent
-    # backlog allocation throw, repo-wide. The guard was not detecting a breach; it was detecting the
-    # partition being used as designed.
+    # So the refusal moved to a trigger that IS observable and IS reachable -- the boundary ratchet
+    # above, which fires when PUBLIC_BACKLOG_FLOOR is lowered beneath a value this clone has already
+    # allocated against. What remains here is a warning only.
     #
-    # So the refusal is REMOVED rather than rewritten to be unreachable -- a branch that cannot fire
-    # reads as protection and is worse than none. What remains is honest: warn while the INTERNAL
-    # sequence still has runway, measured on the sub-floor band only, where public numbers cannot
-    # distort it. Detecting an actual breach needs an internal-side input this repository does not have.
+    # $subFloorMax is "the highest number below the boundary", NOT "the internal maximum". It includes
+    # public pre-partition numbers, so it deliberately OVER-states the internal high-water: it warns
+    # early rather than late, which is the safe direction for a runway indicator.
+    if ($boundaryLowered) {
+        throw @"
+REFUSING TO ALLOCATE. PUBLIC_BACKLOG_FLOOR is $PublicBacklogFloor, but this clone has already
+allocated against a boundary of $boundarySeen. The constant was LOWERED beneath numbers that were
+issued under the higher value, so the next number handed out could collide with the maintainer-internal
+sequence -- and neither the pre-commit gate nor CI can see it, because both read only the current value
+of the constant and have no memory of the previous one.
+
+Restore PUBLIC_BACKLOG_FLOOR in scripts/hooks/ledger_check.py to at least $boundarySeen. If the
+reduction is deliberate, delete $boundaryMark and say why in the PR.
+"@
+    }
     if ($residualWarning) {
         Write-Host ""
         Write-Host "WARNING: the highest sub-partition number ($subFloorMax) has reached 90% of the #$PublicBacklogFloor boundary." -ForegroundColor Yellow
@@ -301,6 +341,19 @@ if ($Kind -eq "backlog") {
         Write-Host "         meet, nothing in this repository can tell the two apart." -ForegroundColor Yellow
         Write-Host ""
     }
+    # Record the boundary we are about to allocate under. Only rises; only on a real allocation.
+    if ($PublicBacklogFloor -gt $boundarySeen) {
+        Set-Content -Path $boundaryMark -Value $PublicBacklogFloor -Encoding ASCII
+    }
+
+    # $observed IS THE UNION MAXIMUM HERE, DELIBERATELY, AND MUST STAY THAT WAY.
+    #
+    # The tempting "fix" for the #1000 brick is to repoint $observed at the sub-boundary maximum, since
+    # that is what the guard should have read. Do not: $start would become max(353, 999) + 1 = 1000 --
+    # a number already merged on origin/main -- and in a FRESH clone, whose registry is empty, the
+    # atomic CreateNew has no claim file to collide with and would NOT catch the re-issue. The union
+    # maximum is what makes "never hand out a number that exists anywhere" true; the sub-boundary
+    # maximum answers a different question and belongs only to the warning above.
     $start = [Math]::Max($observed, $PublicBacklogFloor - 1) + 1
 }
 else {
