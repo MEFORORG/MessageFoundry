@@ -98,6 +98,7 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     from messagefoundry.config.db_lookup import DbLookupError
     from messagefoundry.config.fhir_lookup import FhirLookupError
     from messagefoundry.config.run_context import run_contexts
+    from messagefoundry.config.wiring import handler_result_items
     from messagefoundry.pipeline._sandbox_codec import SandboxError
 
     phase = req.phase
@@ -133,6 +134,19 @@ def _run_one(registry: Any, req: Any, code_sets: Any) -> tuple[bool, object, str
     try:
         with run_contexts(run_context, phase=phase_key):
             result = fn(req.payload)
+            if phase == "transform":
+                # Materialise a CONTAINER return here, INSIDE the run context (BACKLOG #341). A
+                # generator Handler's body runs lazily, at whatever point something iterates it — and
+                # the codec's `enc_result`, which is where that would otherwise happen, is called from
+                # `_respond`, OUTSIDE this `with`. Materialising there would execute the Handler body
+                # with no active run context, so a `code_set(...)` inside a generator Handler would
+                # raise CodeSetError under mode=subprocess while working under mode=off: a
+                # mode-dependent disposition, exactly what ADR 0087's parity rule forbids. Applying the
+                # same rule again in `enc_result` is deliberate and free — list(list) is an idempotent
+                # shallow copy, and the codec is also exercised directly (parity table), bypassing this.
+                items = handler_result_items(result)
+                if items is not None:
+                    result = items
         if phase == "accepts":
             # HandlerAccepts is contractually ``(msg) -> bool`` and the PARENT coerces the verdict with
             # ``bool(...)`` (dryrun._accepted). Coerce HERE too, BEFORE the result is described back: a

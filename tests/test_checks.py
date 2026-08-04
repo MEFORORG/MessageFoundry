@@ -299,6 +299,37 @@ def test_accepts_candidate_flags_leading_guard_filter_and_is_advisory(tmp_path: 
     assert "0084" in res.detail
 
 
+def test_accepts_candidate_flags_an_empty_tuple_guard_exactly_like_an_empty_list(
+    tmp_path: Path,
+) -> None:
+    """``return ()`` is the same filter as ``return []`` and must be flagged the same (BACKLOG #341).
+
+    Both empty containers partition to no deliveries, and the Steps lens has always recognized the pair
+    together (ADR 0108 §6). This advisory recognized only the list form, making it the one place in the
+    codebase that treated the two idioms differently — it silently under-flagged the tuple guard. The
+    two handlers below are byte-identical apart from ``[]`` vs ``()``, so the assertion cannot pass by
+    the flagger being inert: ``H_list`` must appear for the same reason ``H_tuple`` must."""
+    cfg = tmp_path / "config"
+    cfg.mkdir()
+    (cfg / "feed.py").write_text(
+        "from messagefoundry import handler, Send\n\n"
+        "@handler('H_tuple')\n"
+        "def h_tuple(msg):\n"
+        "    if msg.field('MSH-9') != 'ADT':\n"
+        "        return ()\n"
+        "    return [Send('OB_X', msg)]\n\n"
+        "@handler('H_list')\n"
+        "def h_list(msg):\n"
+        "    if msg.field('MSH-9') != 'ADT':\n"
+        "        return []\n"
+        "    return [Send('OB_X', msg)]\n",
+        encoding="utf-8",
+    )
+    res = checks._check_accepts_candidate(cfg)
+    assert "h_tuple" in res.detail and "h_list" in res.detail
+    assert res.required is False and res.skipped is False  # still advisory, still fired
+
+
 def test_accepts_candidate_inert_without_leading_guard(tmp_path: Path) -> None:
     """A handler that does NOT open with a guard-filter yields a skipped no-op, still advisory."""
     cfg = tmp_path / "config"

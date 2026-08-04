@@ -202,9 +202,26 @@ real transform) is also fine as a **single module** — the shipped `IB_ACME_ADT
 non-trivial transform logic.
 
 A **router fans out** by returning multiple handler names (`return ["to_a", "to_b"]`); a **single
-handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`).
+handler fans out** by returning multiple `Send`s (`return [Send("OB_A", msg), Send("OB_B", msg)]`) —
+a list is the idiom shown throughout these docs, but **any non-`str` iterable** delivers the same
+`Send`s (a tuple, a set, or a generator that `yield`s them). An **empty** one (`return []` /
+`return ()`) is the filter: nothing is delivered and the message is logged `FILTERED`.
 Namespace router/handler names uniquely (e.g. by site/partner) — `messagefoundry check` flags a
 duplicate name (across **any** of these files) and an inbound that binds a router that doesn't exist.
+
+> **Prefer a list, tuple or generator — they have an order; a `set` does not.** Fan-out is delivered
+> in iteration order, and a `set`'s iteration order is not defined: it varies from process to process
+> (`Send` hashes on its fields, and string hashing is seeded per process). Two `Send`s to the **same**
+> outbound therefore queue in an arbitrary relative order, and a re-run after a crash — a different
+> process — can queue them in a different one, so a `set` gives up both FIFO order between siblings and
+> the identical-output-on-re-run property the staged pipeline leans on (CLAUDE.md §2). Which `Send`s
+> are delivered is unaffected. **Use an ordered container whenever order matters.**
+>
+> A **generator** Handler delivers exactly like a list, but its body runs *after* the execution tracer
+> behind `dryrun --trace` (and the Test Bench that reads it) has detached. That invocation's trace
+> record therefore carries no executed lines and no sends, marked `"lazy_result": true` so the omission
+> is declared rather than read as a handler that did nothing; the run's message-level `sends` are still
+> exact. Return a list or tuple if you want the handler's body traced line-by-line.
 
 > **Transforms & HL7 escaping.** Writing a **component/subcomponent** (`msg["PID-5.1"] = value`)
 > stores `value` as a literal: HL7 delimiters in it (`^ ~ & |`) are **escaped** so they stay data
