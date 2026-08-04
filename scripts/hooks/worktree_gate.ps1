@@ -635,7 +635,31 @@ What to do instead:
             # itself and any OTHER path inside it (`<primary>/.claude/hooks`) still match and still deny.
             $boundary = [regex]::Escape($r.Compare) +
                 '(?![a-z0-9_-])(?!\.[a-z0-9_-])(?!/\.claude/worktrees/)'
-            if ($normalized -match $boundary) { $root = $r; break }
+            # The mention must be a DIRECTORY-CHANGE ARGUMENT, not merely present in the command.
+            #
+            # Matching the path ANYWHERE made the verdict depend on what else the command happened to
+            # say. Measured 2026-08-04, three times in one session, all from a worktree and all safe:
+            # `git restore <two files>` denied as "would change the working tree of the SHARED PRIMARY"
+            # because a later `cat <primary>/.git/mefor-coord/...` in the same compound command named the
+            # primary. Isolating the identical git call was allowed instantly. Worse than the noise: the
+            # refusal TEXT was wrong about what the command did, so the operator reading it was told the
+            # primary was at risk when it never was -- and a gate that misdescribes the thing it blocked
+            # trains people to route around it. This is the same defect #308 fixed for the nested-worktree
+            # subpath, arriving through a different spelling.
+            #
+            # Narrowing is safe because the fallback has exactly one job. Every OTHER way of aiming a git
+            # verb at the primary is resolved STRUCTURALLY before this point and sets $root without it:
+            # the cwd, an explicit `-C`, and `--work-tree` / `--git-dir` (added to the candidate set
+            # above, which is why a RELATIVE `--work-tree=../../..` still denies -- it never reaches this
+            # text scan). The fallback exists solely for `cd <primary>; git checkout`, where the verb runs
+            # somewhere the hook cannot observe because the directory changes mid-command. So require the
+            # directory change, and the true positive is untouched while the false one disappears.
+            #
+            # Still deliberately conservative: `cd <primary>; cd <elsewhere>; git checkout` denies. Once a
+            # command has stepped into the primary this hook stops reasoning about where it stepped next.
+            $dirChange = '(?:^|[;&|(]|\s)(?:cd|chdir|pushd|set-location|sl)' +
+                '(?:\s+(?:/d|-path|-literalpath))?\s+["'']?' + $boundary
+            if ($normalized -match $dirChange) { $root = $r; break }
         }
     }
     if (-not $root) {

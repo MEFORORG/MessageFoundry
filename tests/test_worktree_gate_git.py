@@ -148,6 +148,59 @@ def test_a_nested_worktree_naming_its_own_path_is_allowed(tmp_path: Path, repos_
     assert run_gate(shell(f"git -C {nested} rebase origin/main", cwd=nested), repos_file) is None
 
 
+def test_naming_the_primary_in_an_unrelated_argument_is_allowed(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """The in-text fallback must match a DIRECTORY-CHANGE argument, not the path appearing anywhere.
+
+    Measured 2026-08-04, three times in one session: a safe `git restore <files>` in a worktree was
+    denied as *"would change the working tree of the SHARED PRIMARY"* because a later `cat` in the same
+    compound command happened to name ``<primary>/.git/mefor-coord/...``. Isolating the identical git
+    call was allowed instantly, so the verdict depended on what else the command said.
+
+    Worse than the noise: the refusal TEXT asserted the primary was at risk when it never was, and a gate
+    that misdescribes what it blocked teaches people to route around it. Same defect #308 fixed for the
+    nested-worktree subpath, arriving through a different spelling."""
+    primary = tmp_path / "Repo"
+    nested = primary / ".claude" / "worktrees" / "alerts"
+    # the exact shape that fired: a worktree-local git verb + an unrelated read under the primary
+    assert (
+        run_gate(
+            shell(
+                f'git restore a.py b.py && cat "{primary}/.git/mefor-coord/alloc/backlog/.mark"',
+                cwd=nested,
+            ),
+            repos_file,
+        )
+        is None
+    )
+    # a read of the primary's tree alongside a worktree verb is still not a write to it
+    assert (
+        run_gate(shell(f"git switch -c wip && ls {primary}/docs", cwd=nested), repos_file) is None
+    )
+
+
+def test_stepping_into_the_primary_still_denies_however_it_is_spelled(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """The narrowing must not cost the true positive the fallback exists for. Every directory-change
+    spelling that lands in the primary still denies, including the PowerShell aliases and `cd /d`."""
+    primary = tmp_path / "Repo"
+    for step in (
+        f"cd {primary} && git checkout main",
+        f"cd '{primary}' ; git reset --hard",
+        f'pushd "{primary}"; git checkout main',
+        f"Set-Location {primary}; git checkout main",
+        f"Set-Location -LiteralPath {primary}; git switch main",
+        f"sl {primary}; git checkout main",
+        f"chdir {primary} && git checkout main",
+        f"cd /d {primary} && git checkout main",
+        # already inside the primary, then wandering: still denied, deliberately conservative
+        f"cd {primary} && cd {tmp_path / 'Elsewhere'} && git checkout main",
+    ):
+        assert_denied(run_gate(shell(step, cwd=tmp_path), repos_file)), step
+
+
 def test_reaching_into_the_primary_is_still_denied_around_the_nested_exemption(
     tmp_path: Path, repos_file: Path
 ) -> None:
