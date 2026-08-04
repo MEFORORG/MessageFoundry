@@ -377,7 +377,7 @@ The Router name (`"adt_router"`) is what an inbound Connection binds to: `inboun
 
 ### 2. Write a Handler (`@handler`)
 
-A Handler receives the message from a Router, then **filters → transforms → returns `Send`(s)**. Return `None` to filter the message out (logged `FILTERED`); return one `Send` or a list to fan out to multiple outbound connections.
+A Handler receives the message from a Router, then **filters → transforms → returns `Send`(s)**. Return `None` to filter the message out (logged `FILTERED`); return one `Send`, or any non-`str` iterable of them, to fan out to multiple outbound connections.
 
 From [samples/config/adt.py](../samples/config/adt.py):
 
@@ -392,7 +392,9 @@ def archive(msg):
     return Send("FILE-OUT_Test_ADT", msg)
 ```
 
-The `Send` target (`"FILE-OUT_Test_ADT"`) names an `outbound(...)` Connection declared in the same config. To fan out, return a list — e.g. [samples/results_relay/results_relay.py](../samples/results_relay/results_relay.py) ends with `return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]`.
+The `Send` target (`"FILE-OUT_Test_ADT"`) names an `outbound(...)` Connection declared in the same config. To fan out, return a container of `Send`s — e.g. [samples/results_relay/results_relay.py](../samples/results_relay/results_relay.py) ends with `return [Send(OB_EHR, msg), Send(FILE_ARCHIVE, msg)]`. A **list** is the idiom used throughout these docs, but a tuple, a set, or a generator that `yield`s its `Send`s all deliver the same `Send`s; an **empty** container (`return []` / `return ()`) is the filter, exactly like `return None`.
+
+> **Two caveats on the less common shapes.** Fan-out is delivered in iteration order, and a **`set`** has no defined iteration order — it varies per process, so sibling `Send`s to the same outbound queue in an arbitrary order that a crash re-run can change. Use a list or tuple when order matters. And a **generator** Handler's body runs after the `dryrun --trace` execution tracer has detached, so its trace record shows no executed lines and no sends and is marked `"lazy_result": true` (the run's message-level `sends` are still exact) — return a list or tuple if you want it traced line-by-line. Both are documented in full in [CONNECTIONS.md](CONNECTIONS.md).
 
 ### 3. The `Message` operations you'll use
 

@@ -38,7 +38,7 @@ import os
 import re
 import sys
 import threading
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -2631,12 +2631,59 @@ class SetMeta:
 #: non-HL7 inbound (ADR 0004). The author knows which — a Router/Handler is bound to one inbound.
 Payload = Message | RawMessage
 RouterFn = Callable[[Payload], "list[str] | str | None"]
-#: A Handler returns deliveries and/or writes (ADR 0005 state, ADR 0081 metadata): a single
-#: :class:`Send`/:class:`SetState`/:class:`SetMeta`, a mixed list, or ``None`` (filtered). ``Send``-only
-#: returns are unchanged — backward compatible.
-HandlerFn = Callable[
-    [Payload], "Send | SetState | SetMeta | list[Send | SetState | SetMeta] | None"
-]
+#: What a Handler returns: deliveries and/or writes (ADR 0005 state, ADR 0081 metadata) — a single
+#: :class:`Send`/:class:`SetState`/:class:`SetMeta`, **any non-``str`` iterable** of them (list, tuple,
+#: set, generator — BACKLOG #341), or ``None`` (filtered). ``Send``-only returns are unchanged —
+#: backward compatible. ``Iterable`` is covariant, so a plain ``list[Send]`` is assignable here where
+#: the invariant ``list[Send | SetState | SetMeta]`` used to be required.
+HandlerResult = Send | SetState | SetMeta | Iterable[Send | SetState | SetMeta] | None
+HandlerFn = Callable[[Payload], HandlerResult]
+
+
+def handler_result_items(result: object) -> list[object] | None:
+    """The elements of a Handler's returned **container**, or ``None`` — "this is a single value".
+
+    The ONE materialization rule for a Handler return (BACKLOG #341). It lives here, beside
+    :class:`Send`/:class:`SetState`/:class:`SetMeta`, because **both** consumers already import this
+    module and neither gains a dependency: the in-process partitioner
+    (:func:`messagefoundry.pipeline.dryrun._partition`) and the sandbox child
+    (:mod:`messagefoundry.pipeline._sandbox_codec` / ``_sandbox_worker``). Sharing the rule is what
+    keeps ``[sandbox].mode`` from ever changing WHICH ``Send``\\ s a Handler delivers (ADR 0087).
+
+    A ``list``/``tuple``/``set``/generator of :class:`Send`\\ s all deliver the same ``Send``\\ s. The
+    Router half (``dryrun._handler_names``) has always accepted any iterable; narrowing the Handler half
+    to ``list`` made a returned tuple an **accept-and-drop** — the one thing CLAUDE.md §12 forbids
+    outright. An EMPTY container yields ``[]``, so the documented ``return []`` / ``return ()`` filter
+    idiom keeps filtering rather than delivering or raising.
+
+    **Order is the container's, and a ``set`` has none.** The returned order is preserved verbatim and
+    becomes the order the outbound rows are inserted in (``store.transform_handoff``) — i.e. the FIFO
+    order of two ``Send``\\ s to the SAME outbound. A ``set``'s iteration order is unspecified:
+    :class:`Send` is a frozen dataclass hashed on its fields and ``str`` hashing is seeded per process,
+    so it differs between processes — which means between ``[sandbox].mode=off`` and ``mode=subprocess``
+    (the child is a separate process) AND between a first pass and a **crash re-run**. Purity (CLAUDE.md
+    §2) survives in the sense that carries the reliability invariant — a re-run re-derives the identical
+    *multiset* of outbound rows, and each delivery is independent and idempotent — but their relative
+    order is not reproducible. Ordered containers carry no such caveat, and the user-facing docs steer
+    authors to them; a ``set`` is accepted so that the widen has no arbitrary hole, not recommended.
+
+    Two deliberate carve-outs:
+
+    * ``str``/``bytes``/``bytearray`` are iterable but are **not** containers of ``Send``\\ s —
+      iterating one would partition its characters/bytes. They are single values.
+    * The gate is ``isinstance(result, Iterable)`` — an explicit ``__iter__`` — **not** a duck-typed
+      ``try: list(result)``. A :class:`~messagefoundry.parsing.message.Message` defines
+      ``__getitem__(path: str)`` and no ``__iter__``, so ``list()`` would drive the legacy sequence
+      protocol with an *int* index and raise out of a Handler that merely returned its message by
+      mistake. That slip drops silently today, and this fix must not convert it into a new raise.
+    """
+    if isinstance(result, str | bytes | bytearray):
+        return None
+    if isinstance(result, Iterable):
+        return list(result)
+    return None
+
+
 #: An optional **router-stage** applicability predicate a Handler may declare (``@handler(name,
 #: accepts=...)``; ADR 0084). It is evaluated while the Router's selection is still being computed —
 #: *before* any routed row is materialized — so a handler that declines costs **0** transactions
@@ -4064,10 +4111,10 @@ def router(name: str) -> Callable[[RouterFn], RouterFn]:
 def handler(
     name: str, *, accepts: HandlerAccepts | None = None
 ) -> Callable[[HandlerFn], HandlerFn]:
-    """Register a Handler: ``def handle(msg) -> Send | SetState | SetMeta | list[...] | None``
-    (``None`` => filtered; :class:`SetState` declares a cross-message state write, ADR 0005;
-    :class:`SetMeta` attaches a per-message metadata key/value, ADR 0081 — both applied exactly-once in
-    the handoff).
+    """Register a Handler: ``def handle(msg) -> Send | SetState | SetMeta | Iterable[...] | None``
+    (``None`` => filtered; any non-``str`` iterable — list, tuple, set, generator — fans out, BACKLOG
+    #341; :class:`SetState` declares a cross-message state write, ADR 0005; :class:`SetMeta` attaches a
+    per-message metadata key/value, ADR 0081 — both applied exactly-once in the handoff).
 
     ``accepts`` (ADR 0084) is an optional **pure** router-stage predicate — ``(msg) -> bool`` — that
     lets this handler decline a message at *routing* time, before a routed row is materialized: a

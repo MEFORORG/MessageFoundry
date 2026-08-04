@@ -7,6 +7,7 @@ import {
   EditLoopGuard,
   INSERTABLE_ACTIONS,
   INSERT_ACTION_LABELS,
+  RerenderDebouncer,
   STRUCTURAL_OPS,
   TOOLBAR_INSERT_DEFAULTS,
   blockExtent,
@@ -30,6 +31,7 @@ import {
   opForcesReprojection,
   parseRewriteResult,
   physicalLines,
+  releaseEdit,
   renderRowHtml,
   renderStepsContextMenuHtml,
   resolveDrop,
@@ -461,6 +463,321 @@ suite("Steps edit — one-edit-at-a-time + update-loop guard", () => {
     guard.queue({ ...base, name: "src", value: "x" });
     guard.queue({ ...base, name: "dst", value: "y" });
     assert.strictEqual(guard.pendingCount, 2, "distinct fields each retain a pending edit");
+  });
+});
+
+// BACKLOG #234 — a document change the guard SUPPRESSES is deferred, not dropped. The provider's save
+// subscription returns early when `shouldReactToDocumentChange()` is false; before this, a user save that
+// landed inside an in-flight `lens rewrite` was discarded outright and the view would keep showing a
+// projection of the pre-save buffer until the next save. The guard now records the debt and
+// `releaseEdit` pays it when the slot frees.
+suite("Steps update-loop guard — a suppressed document change is DEFERRED, not dropped (#234)", () => {
+  test("noteSuppressedChange → releaseEdit runs the owed refresh exactly once (clear-on-read)", () => {
+    const guard = new EditLoopGuard();
+    let refreshes = 0;
+    assert.strictEqual(guard.beginEdit(), true);
+    assert.strictEqual(
+      guard.shouldReactToDocumentChange(),
+      false,
+      "the provider declines to re-project while our own WorkspaceEdit applies",
+    );
+    guard.noteSuppressedChange();
+    assert.strictEqual(guard.hasSuppressedChange, true, "the save is REMEMBERED, not discarded");
+
+    releaseEdit(guard, () => {
+      refreshes += 1;
+    });
+    assert.strictEqual(refreshes, 1, "the deferred re-projection runs when the slot frees");
+    assert.strictEqual(guard.isEditing, false, "releaseEdit still releases the slot");
+    assert.strictEqual(
+      guard.takeSuppressedChange(),
+      false,
+      "clear-on-read: the same suppressed save can never owe a second refresh",
+    );
+
+    // …and a SECOND release with nothing suppressed must not fire the callback again.
+    guard.beginEdit();
+    releaseEdit(guard, () => {
+      refreshes += 1;
+    });
+    assert.strictEqual(refreshes, 1, "no suppressed change → no refresh (the ordinary path is unchanged)");
+  });
+
+  test("many suppressed saves owe exactly ONE refresh (a re-projection is idempotent)", () => {
+    const guard = new EditLoopGuard();
+    let refreshes = 0;
+    guard.beginEdit();
+    guard.noteSuppressedChange();
+    guard.noteSuppressedChange();
+    guard.noteSuppressedChange();
+    releaseEdit(guard, () => {
+      refreshes += 1;
+    });
+    assert.strictEqual(refreshes, 1);
+  });
+
+  test("releaseEdit without a callback still clears the debt (no wedged flag)", () => {
+    const guard = new EditLoopGuard();
+    guard.beginEdit();
+    guard.noteSuppressedChange();
+    releaseEdit(guard);
+    assert.strictEqual(guard.hasSuppressedChange, false, "the flag is consumed even with no callback");
+  });
+
+  test("drainEdits pays the debt in its finally — including when apply REJECTS", async () => {
+    // The unexpected-rejection path already had to release the slot and keep draining; it must not
+    // swallow the owed refresh on the way out.
+    const guard = new EditLoopGuard();
+    const applied: string[] = [];
+    const errors: unknown[] = [];
+    let refreshes = 0;
+    const first: EditMessage = {
+      command: "edit",
+      handler: "h",
+      lineStart: 6,
+      lineEnd: 6,
+      name: "dst",
+      value: "A",
+    };
+    const second: EditMessage = { ...first, name: "src", value: "B" };
+
+    const apply = async (msg: EditMessage): Promise<void> => {
+      applied.push(msg.name);
+      if (msg.name === "dst") {
+        // A user save lands while the rewrite is in flight → the provider's subscription records it.
+        guard.noteSuppressedChange();
+        guard.queue(second);
+        throw new Error("applyEdit rejected");
+      }
+    };
+
+    await drainEdits(
+      guard,
+      first,
+      apply,
+      (e) => errors.push(e),
+      () => {
+        refreshes += 1;
+      },
+    );
+
+    assert.deepStrictEqual(applied, ["dst", "src"], "the queued edit still drains after the rejection");
+    assert.strictEqual(errors.length, 1, "the rejection is still surfaced");
+    assert.strictEqual(guard.isEditing, false, "the slot is still released");
+    assert.strictEqual(refreshes, 1, "the save suppressed mid-drain is re-projected, not lost");
+  });
+
+  test("drainEdits with NO suppressed change never schedules a refresh", async () => {
+    const guard = new EditLoopGuard();
+    let refreshes = 0;
+    await drainEdits(
+      guard,
+      { command: "edit", handler: "h", lineStart: 1, lineEnd: 1, name: "v", value: "x" },
+      async () => {
+        /* applies cleanly */
+      },
+      undefined,
+      () => {
+        refreshes += 1;
+      },
+    );
+    assert.strictEqual(refreshes, 0, "an edit that races nothing must not trigger an extra re-projection");
+  });
+});
+
+/** A deterministic stand-in for setTimeout/clearTimeout so the debounce can be driven without waiting
+ * 250 ms of wall clock (and without a timing-sensitive test). `advance` fires everything due. */
+class FakeClock {
+  private nextId = 1;
+  private now = 0;
+  private readonly timers = new Map<number, { fn: () => void; at: number }>();
+
+  readonly set = (fn: () => void, ms: number): number => {
+    const id = this.nextId++;
+    this.timers.set(id, { fn, at: this.now + ms });
+    return id;
+  };
+
+  readonly clear = (id: number): void => {
+    this.timers.delete(id);
+  };
+
+  advance(ms: number): void {
+    this.now += ms;
+    for (const [id, t] of [...this.timers]) {
+      if (t.at <= this.now) {
+        this.timers.delete(id);
+        t.fn();
+      }
+    }
+  }
+
+  get pending(): number {
+    return this.timers.size;
+  }
+}
+
+// BACKLOG #234 / ADR 0076 Amendment C AC-C2 — releasing the slot after a suppressed save must yield
+// EXACTLY ONE re-projection. That is a property of the guard and the debounce COMPOSED: three of the
+// provider's release sites force a full re-projection immediately after releasing, so without the
+// cancel-on-render half the deferred run fires 250 ms later as a SECOND whole-webview replacement.
+suite("Steps re-render debouncer — one re-projection per release (#234, AC-C2)", () => {
+  const DELAY = 250;
+
+  test("rapid schedules coalesce into ONE run", () => {
+    const clock = new FakeClock();
+    let runs = 0;
+    const d = new RerenderDebouncer<number>(() => (runs += 1), DELAY, clock.set, clock.clear);
+    d.schedule();
+    clock.advance(100);
+    d.schedule(); // a second save inside the window re-arms rather than stacking
+    assert.strictEqual(runs, 0, "nothing runs until the window closes");
+    clock.advance(DELAY);
+    assert.strictEqual(runs, 1, "two saves 100 ms apart coalesce to one re-projection");
+    assert.strictEqual(d.armed, false, "the channel disarms itself when it fires");
+  });
+
+  test("cancel() discharges an armed run instead of dropping it on the floor", () => {
+    const clock = new FakeClock();
+    let runs = 0;
+    const d = new RerenderDebouncer<number>(() => (runs += 1), DELAY, clock.set, clock.clear);
+    d.schedule();
+    assert.strictEqual(d.armed, true);
+    d.cancel();
+    assert.strictEqual(d.armed, false);
+    clock.advance(10_000);
+    assert.strictEqual(runs, 0, "a cancelled run must not fire later");
+    assert.strictEqual(clock.pending, 0, "and the underlying timer is really cleared, not just orphaned");
+  });
+
+  test("a save that lands DURING a re-projection still re-arms and is honoured", () => {
+    // render() cancels on entry, then awaits `lens parse`. A save arriving inside that await must not
+    // be swallowed by the cancel that already happened.
+    const clock = new FakeClock();
+    let runs = 0;
+    const d = new RerenderDebouncer<number>(() => (runs += 1), DELAY, clock.set, clock.clear);
+    d.cancel(); // render() enters
+    d.schedule(); // the user saves while `lens parse` is in flight
+    clock.advance(DELAY);
+    assert.strictEqual(runs, 1, "the mid-render save is still re-projected");
+  });
+
+  test("suppressed save → releaseEdit → forced render yields EXACTLY ONE re-projection", () => {
+    // The provider's applyStructural/applyPickedEdit/applyUndoRedo shape, modelled end to end:
+    // release the slot (which pays the deferred refresh through `scheduleRerender`), then force a full
+    // re-projection — and `render()` cancels the debounce on entry.
+    const clock = new FakeClock();
+    let reprojections = 0;
+    const d = new RerenderDebouncer<number>(
+      () => {
+        reprojections += 1;
+      },
+      DELAY,
+      clock.set,
+      clock.clear,
+    );
+    const render = (): void => {
+      d.cancel(); // ← the AC-C2 half under test
+      reprojections += 1;
+    };
+    const guard = new EditLoopGuard();
+
+    assert.strictEqual(guard.beginEdit(), true);
+    assert.strictEqual(guard.shouldReactToDocumentChange(), false);
+    guard.noteSuppressedChange(); // a user save lands mid-`lens rewrite`
+    releaseEdit(guard, () => d.schedule());
+    assert.strictEqual(d.armed, true, "the release armed the deferred refresh");
+    render(); // the structural op's forced re-projection, a few lines later
+    clock.advance(10_000);
+
+    assert.strictEqual(
+      reprojections,
+      1,
+      "AC-C2: a suppressed save around a forced re-projection owes ONE render, not two",
+    );
+  });
+
+  test("…and the assertion above is DISCRIMINATING: a render that does not cancel yields two", () => {
+    // Kept in the tree as the falsification of the test above. Before #234's cancel-on-render half,
+    // the provider's render() looked exactly like `bareRender` here: the forced pass ran, and the
+    // armed debounce then replaced the whole webview HTML a second time ~250 ms later.
+    const clock = new FakeClock();
+    let reprojections = 0;
+    const d = new RerenderDebouncer<number>(
+      () => {
+        reprojections += 1;
+      },
+      DELAY,
+      clock.set,
+      clock.clear,
+    );
+    const bareRender = (): void => {
+      reprojections += 1; // no d.cancel()
+    };
+    const guard = new EditLoopGuard();
+    guard.beginEdit();
+    guard.noteSuppressedChange();
+    releaseEdit(guard, () => d.schedule());
+    bareRender();
+    clock.advance(10_000);
+    assert.strictEqual(reprojections, 2, "without the cancel the deferred run is a SECOND re-projection");
+  });
+
+  test("a render INSIDE the drain discharges the debt, so the finally arms nothing (AC-C2 + AC-C4)", async () => {
+    // The one path where the forced render happens BEFORE the release: `drainEdits`' unexpected-
+    // rejection handler renders to revert the optimistic webview change, and only THEN does the
+    // `finally` release the slot. Cancelling the debounce cannot help there (nothing is armed yet), so
+    // `render()` also takes the guard's debt — otherwise the finally would arm a redundant second pass.
+    const clock = new FakeClock();
+    let reprojections = 0;
+    const d = new RerenderDebouncer<number>(
+      () => {
+        reprojections += 1;
+      },
+      DELAY,
+      clock.set,
+      clock.clear,
+    );
+    const guard = new EditLoopGuard();
+    const render = (): void => {
+      d.cancel();
+      guard.takeSuppressedChange(); // ← the second discharge route under test
+      reprojections += 1;
+    };
+    const errors: unknown[] = [];
+
+    await drainEdits(
+      guard,
+      { command: "edit", handler: "h", lineStart: 4, lineEnd: 4, name: "v", value: "x" },
+      async () => {
+        guard.noteSuppressedChange(); // a user save lands mid-rewrite
+        throw new Error("applyEdit rejected");
+      },
+      (e) => {
+        errors.push(e);
+        render(); // the provider's revert-to-true-projection render
+      },
+      () => d.schedule(),
+    );
+    clock.advance(10_000);
+
+    assert.strictEqual(errors.length, 1, "the rejection is still surfaced");
+    assert.strictEqual(guard.isEditing, false, "the slot is still released");
+    assert.strictEqual(
+      reprojections,
+      1,
+      "the revert render IS the owed re-projection — the finally must not arm a second one",
+    );
+  });
+
+  test("no suppressed change → the release arms nothing at all (AC-C3)", () => {
+    const clock = new FakeClock();
+    const d = new RerenderDebouncer<number>(() => undefined, DELAY, clock.set, clock.clear);
+    const guard = new EditLoopGuard();
+    guard.beginEdit();
+    releaseEdit(guard, () => d.schedule());
+    assert.strictEqual(d.armed, false, "the ordinary path schedules nothing");
+    assert.strictEqual(clock.pending, 0);
   });
 });
 
@@ -950,10 +1267,14 @@ suite("Steps toolbar — the top-of-lens INSERT toolbar (Corepoint-style Add)", 
 });
 
 // The right-click ROW CONTEXT MENU (ADR 0103) — the pure half: the explicit before/after insert mapping,
-// the item-enablement matrix, the server-rendered menu template, and the [blank] placeholder. The webview
-// WIRING (positioning, dismissal, keyboard) lives in media/stepsWebview.js and is NOT unit-tested here —
-// like the file's other webview mirrors (walkMove/captureBlock DnD), it is verified manually; these
+// the item-enablement matrix, the server-rendered menu template, and the [blank] placeholder. These
 // node-side tests cover the pure model + the rendered markup it consumes.
+//
+// The webview's MIRRORS of these pure functions — menu enablement, walkMove/blockExtent/captureBlock,
+// canDrop/resolveDrop/barAnchor/scopeLabel — are no longer "verified manually": `steps-mirror.test.ts`
+// (BACKLOG #233) loads media/stepsWebview.js under jsdom and asserts each one against its model
+// counterpart. What genuinely REMAINS manual is the menu's positioning/viewport clamping, submenu
+// flipping, dismissal and keyboard navigation (STEPS-76) — DOM behaviour with no pure counterpart.
 suite("Steps context menu — explicit before/after insert (right-click, ADR 0103)", () => {
   const anchor = {
     handler: "enrich",
@@ -1337,6 +1658,29 @@ suite("Steps cross-suite — canDropRow / resolveDrop / scopeLabel (the pure dro
     // A block cannot be dropped into its OWN span: drag the whole if block [6, 7] onto its body row A @7.
     const block = ctx({ lineStart: 6, lineEnd: 7, kind: "control", isControlHeader: true, suite: "5" });
     assert.strictEqual(canDropRow(block, bodyA), false, "a block can't be dropped into its own body");
+  });
+
+  test("canDropRow: a read-only CODE row is never a drop target, even though it is DRAGGABLE (#233)", () => {
+    // renderRowHtml marks a `code` row draggable="true" ON PURPOSE — solely so a drag ATTEMPT can be
+    // intercepted and answered with "edit it in the code editor" (stepsWebview.js:469-473). So
+    // `target.draggable` does NOT already exclude it, and the model's own contract ("never treats a code
+    // row as a drop target") needs an explicit rule. Before #233 the model returned true here while the
+    // CSP-isolated mirror (stepsWebview.js:388) returned false — a deploying site would have seen the
+    // insertion indicator refuse a code row while the model-side resolution accepted it.
+    const codeTarget = ctx({ lineStart: 3, lineEnd: 3, kind: "code", draggable: true });
+    assert.strictEqual(canDropRow(leafB, codeTarget), false, "a code row is not a drop target");
+    assert.strictEqual(
+      canDropRow(ifHeader, codeTarget),
+      false,
+      "dragging a whole block onto a code row is refused too",
+    );
+    // …and the refusal propagates through resolveDrop, which is what actually feeds `move_row`.
+    assert.strictEqual(resolveDrop(leafB, codeTarget, 0.1, [...ROWS, codeTarget]), null);
+    assert.strictEqual(resolveDrop(leafB, codeTarget, 0.9, [...ROWS, codeTarget]), null);
+    // A code row remains a legal drag SOURCE at this pure layer (the webview cancels the gesture at
+    // dragstart, which has no model counterpart) — so the rule is about the TARGET only.
+    const codeSource = ctx({ lineStart: 3, lineEnd: 3, kind: "code", draggable: true });
+    assert.strictEqual(canDropRow(codeSource, leafB), true, "the rule gates the target, not the source");
   });
 
   test("resolveDrop leaf: pointer half picks before/after; anchor = target, suite/depth = target's", () => {

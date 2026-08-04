@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -15,10 +16,13 @@ from messagefoundry.config.wiring import (
     OutboundConnection,
     Registry,
     Send,
+    SetMeta,
+    SetState,
 )
 from messagefoundry.parsing.message import Message, RawMessage
 from messagefoundry.pipeline.dryrun import (
     DeliveryPreview,
+    disposition_for,
     dry_run,
     route_message,
     route_only,
@@ -334,3 +338,103 @@ def test_route_only_honors_prebuilt_payload() -> None:
     prebuilt = Message.parse(ADT_A01)
     assert route_only(reg, reg.inbound["in"], ADT_A01, payload=prebuilt) == []
     assert seen == [id(prebuilt)]  # the router received the exact prebuilt object
+
+
+# --- a Handler may return ANY non-str iterable of Sends (BACKLOG #341) --------
+
+
+def _fanout_registry(handle: Any) -> Registry:
+    """One inbound → one handler → TWO outbounds, so a fan-out has somewhere to go."""
+    reg = Registry()
+    reg.add_inbound(
+        InboundConnection(
+            "in",
+            ConnectionSpec(ConnectorType.MLLP, {"host": "0.0.0.0", "port": 2575}),
+            router="r",
+        )
+    )
+    reg.add_outbound(
+        OutboundConnection("OB_A", ConnectionSpec(ConnectorType.FILE, {"directory": "./a"}))
+    )
+    reg.add_outbound(
+        OutboundConnection("OB_B", ConnectionSpec(ConnectorType.FILE, {"directory": "./b"}))
+    )
+    reg.add_router("r", lambda m: ["h"])
+    reg.add_handler("h", handle)
+    return reg
+
+
+def test_handler_returning_a_tuple_of_sends_delivers_both() -> None:
+    """The headline defect (#341). ``_partition`` narrowed with ``isinstance(result, list)``, so a
+    returned TUPLE became the single item, matched none of the three isinstance filters, and the
+    message finalized FILTERED — delivering nothing and erroring nothing, indistinguishable from a
+    handler deliberately declining it. That is the accept-and-drop CLAUDE.md §12 forbids outright."""
+
+    def handle(msg: Message) -> tuple[Send, Send]:
+        return (Send("OB_A", msg), Send("OB_B", msg))
+
+    deliveries, _, _, _ = transform_one(_fanout_registry(handle), "h", ADT_A01)
+    assert [d.to for d in deliveries] == ["OB_A", "OB_B"]  # both delivered, order preserved
+
+
+def test_handler_returning_a_set_of_sends_delivers_all() -> None:
+    """A ``set`` fans out too. Asserted as a SET: set iteration order is unspecified, so pinning a
+    list here would be a flake rather than a contract."""
+
+    def handle(msg: Message) -> set[Send]:
+        return {Send("OB_A", msg), Send("OB_B", msg)}
+
+    deliveries, _, _, _ = transform_one(_fanout_registry(handle), "h", ADT_A01)
+    assert {d.to for d in deliveries} == {"OB_A", "OB_B"}
+
+
+def test_handler_returning_a_generator_of_sends_delivers_all() -> None:
+    """A generator Handler fans out — the Router half (``_handler_names``) has always accepted one, so
+    this closes the internal inconsistency rather than inventing a new contract."""
+
+    def handle(msg: Message) -> Iterator[Send]:
+        yield Send("OB_A", msg)
+        yield Send("OB_B", msg)
+
+    deliveries, _, _, _ = transform_one(_fanout_registry(handle), "h", ADT_A01)
+    assert [d.to for d in deliveries] == ["OB_A", "OB_B"]
+
+
+@pytest.mark.parametrize("empty", [[], (), set(), None], ids=["list", "tuple", "set", "none"])
+def test_empty_container_returns_still_filter(empty: Any) -> None:
+    """THE acceptance criterion for #341. ``return []`` and ``return ()`` are the documented filter
+    idiom (recognized by the Steps lens, SHALL'd at ADR 0108 §6). Widening must turn neither into a
+    delivery NOR into an error: every empty container delivers nothing, raises nothing, and keeps the
+    honest FILTERED disposition."""
+    reg = _fanout_registry(lambda msg: empty)
+    outcome = route_message(reg, reg.inbound["in"], ADT_A01)
+    assert outcome.deliveries == []
+    assert outcome.routed  # a handler DID run — so this is FILTERED, not UNROUTED
+    assert disposition_for(outcome) is MessageStatus.FILTERED
+
+
+def test_a_mixed_tuple_partitions_exactly_like_the_equivalent_list() -> None:
+    """A tuple is partitioned by the SAME rule as a list — ``Send``\\ s, ``SetState``\\ s and
+    ``SetMeta``\\ s each land in their own bucket. The outcomes are compared to each other so the test
+    cannot drift from ``_partition``'s own definition of the buckets, and the counts are pinned so the
+    comparison cannot pass by both sides being empty."""
+
+    def _items(msg: Message) -> list[Any]:
+        return [Send("OB_A", msg), SetState("ns", "k", 1), SetMeta("mk", "mv")]
+
+    tup = transform_one(_fanout_registry(lambda m: tuple(_items(m))), "h", ADT_A01)
+    lst = transform_one(_fanout_registry(_items), "h", ADT_A01)
+    assert tup == lst
+    assert (len(tup.deliveries), len(tup.state_ops), len(tup.meta_ops)) == (1, 1, 1)
+
+
+def test_a_bare_message_return_still_drops_and_never_raises() -> None:
+    """A Handler that returns its ``Message`` by mistake still drops silently — the widen must not turn
+    that slip into a raise. This pins the ``isinstance(..., Iterable)`` GATE, not merely the outcome: a
+    duck-typed ``list(result)`` would drive ``Message.__getitem__`` (declared ``(path: str)``) through
+    the legacy sequence protocol with an *int* index and raise ``TypeError`` out of the handler."""
+
+    def handle(msg: Message) -> Any:
+        return msg
+
+    assert transform_one(_fanout_registry(handle), "h", ADT_A01) == ([], [], [], [])

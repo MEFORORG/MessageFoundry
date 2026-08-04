@@ -3,7 +3,10 @@
 """Traced dry-run (ADR 0072): the ADR gate tests + capture-semantics coverage.
 
 Gates asserted here (ADR 0072):
-  1. Byte-identical — a traced run's disposition + sends/routed_to equal the untraced run's.
+  1. Byte-identical — a traced run's disposition + sends/routed_to equal the untraced run's. Since the
+     2026-08-04 amendment the gate is stated by level: 1a (message level) is absolute; 1b (the
+     per-invocation mirror) carves out a generator Router/Handler, whose body has not run at record
+     time, and requires that invocation to declare `lazy_result` rather than look inert.
   2. Live-lookup identical — a handler hitting an unstubbed db_lookup/fhir_lookup yields the identical
      ERROR disposition with and without the tracer, plus a `live_lookup_skipped` annotation.
   3. Coverage-intact — a traced run restores the prior tracer (prev-tracer, not None), so a surrounding
@@ -15,6 +18,7 @@ from __future__ import annotations
 
 import json
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 from messagefoundry.__main__ import main
@@ -124,6 +128,64 @@ def test_gate_byte_identical_disposition_and_routing() -> None:
     # per-invocation routing/sends
     assert _router_invocation(traced)["routed_to"] == ["h"]
     assert _handler_invocation(traced)["sends"] == [{"outbound": "out"}]
+
+
+def _two_out_registry(handle) -> Registry:  # type: ignore[no-untyped-def]
+    """``_registry`` plus a second outbound, so a fan-out has two distinguishable destinations."""
+    reg = _registry(route_to_h, {"h": handle})
+    reg.add_outbound(
+        OutboundConnection("out2", ConnectionSpec(ConnectorType.FILE, {"directory": "./out2"}))
+    )
+    return reg
+
+
+def handle_generator(msg: Message) -> Iterator[Send]:
+    """A generator Handler: it delivers (BACKLOG #341) but its body runs *after* the tracer detaches."""
+    yield Send("out", msg)
+    yield Send("out2", msg)
+
+
+def test_gate_1a_a_generator_handler_traces_byte_identically_at_message_level() -> None:
+    """ADR 0072 gate 1a for the shape that most nearly broke it.
+
+    ``_sends_from`` mirrors ``_partition`` — but ``_partition``'s rule now materialises **any**
+    non-``str`` iterable, and materialising a generator CONSUMES it. Mirroring that rule literally
+    would leave the real ``_partition`` an exhausted iterator, so the *traced* run would deliver 0
+    where the untraced run delivers 2: a tracer that changes the disposition, which is the one thing
+    ADR 0072 forbids. The two-line ``isinstance(result, Iterator)`` guard in ``_sends_from`` is what
+    prevents it, and before this test nothing covered it — deleting the guard left the whole tracer
+    suite green while turning a traced generator Handler into an accept-and-drop.
+
+    The untraced side is asserted non-empty first, so this cannot pass by both runs delivering nothing
+    (which is exactly how it would have "passed" before #341 widened ``_partition``)."""
+    reg = _two_out_registry(handle_generator)
+    plain = dry_run(reg, ADT_A01)
+    traced = trace_dry_run(reg, ADT_A01)
+
+    assert [d.to for d in plain.deliveries] == ["out", "out2"]  # the untraced run really delivers
+    assert [s["outbound"] for s in traced["sends"]] == [d.to for d in plain.deliveries]
+    assert traced["disposition"] == plain.disposition.value
+    assert traced["handlers"] == plain.handlers == ["h"]
+
+
+def test_gate_1b_a_generator_invocation_declares_lazy_result() -> None:
+    """ADR 0072 gate 1b: the per-invocation mirror's declared carve-out.
+
+    A generator function returns without running its body, so this record legitimately has no line
+    events and no measurable sends. That under-report is honest only if it is *declared* — otherwise
+    the payload contradicts itself (top level: two sends; invocation: nothing ran) while ``trace_ok``
+    asserts the trace is trustworthy. The ``lazy_result`` flag is the declaration; the list Handler
+    below is the control, proving the flag is not simply always set."""
+    traced = trace_dry_run(_two_out_registry(handle_generator), ADT_A01)
+    inv = _handler_invocation(traced)
+    assert inv["lazy_result"] is True
+    assert inv["sends"] == [] and inv["events"] == []  # the documented under-report, pinned
+    assert traced["sends"] == [{"outbound": "out"}, {"outbound": "out2"}]  # 1a still holds
+
+    control = trace_dry_run(_registry(route_to_h, {"h": handle_transform}), ADT_A01)
+    control_inv = _handler_invocation(control)
+    assert "lazy_result" not in control_inv  # absent, not False — an eagerly-returning handler
+    assert control_inv["sends"] == [{"outbound": "out"}] and control_inv["events"]
 
 
 def test_gate_byte_identical_unrouted_and_filtered() -> None:
