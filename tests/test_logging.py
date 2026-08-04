@@ -19,9 +19,11 @@ import pytest
 from messagefoundry import __main__
 from messagefoundry.logging_setup import (
     ControlCharScrubFilter,
+    CredentialQueryScrubFilter,
     JsonFormatter,
     RedactionFilter,
     SyslogForward,
+    _make_formatter,
     configure_logging,
 )
 
@@ -246,6 +248,59 @@ def test_redaction_filter_residual_bare_name_not_caught() -> None:
     )
     out = _format_with_redaction(rec)
     assert "DOE^JANE" in out  # accepted residual: a single-delimiter bare name passes through
+
+
+# --- BACKLOG #335: the control-char scrub covers exc_text / stack_info -------
+
+#: A payload shaped exactly like a real record under ``_LOG_FORMAT`` (level padded to eight columns).
+_FORGED_RECORD = "2026-08-01T00:00:00Z INFO     messagefoundry.auth: FORGED admin login ok"
+#: Matches a line that OPENS with the production record prefix (a UTC stamp at column 0).
+_RECORD_PREFIX_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z ")
+
+
+def _production_lines(record: logging.LogRecord) -> list[str]:
+    """Render ``record`` the way a text sink does: the production filter chain, in the order
+    ``_install_phi_filters`` installs it, then the production text formatter."""
+    for scrub in (RedactionFilter(), CredentialQueryScrubFilter(), ControlCharScrubFilter()):
+        scrub.filter(record)
+    return _make_formatter("text").format(record).split("\n")
+
+
+def test_control_char_filter_scrubs_exception_traceback() -> None:
+    # ADR 0034 §1: ``Formatter.format`` appends exc_text VERBATIM, so a CR/LF inside an exception
+    # message used to land a forged record at column 0 on the text sink (stdout/NSSM, and a
+    # forward_format="text" collector). Exactly ONE line may open with the record prefix.
+    try:
+        raise ValueError(f"boom\n{_FORGED_RECORD}")
+    except ValueError:
+        rec = logging.LogRecord(
+            "mefor.demo", logging.ERROR, __file__, 1, "delivery failed", (), sys.exc_info()
+        )
+    lines = _production_lines(rec)
+    assert _RECORD_PREFIX_RE.match(lines[0])  # the real record — proves the matcher can SEE one
+    assert [ln for ln in lines[1:] if _RECORD_PREFIX_RE.match(ln)] == []
+    assert "FORGED admin login ok" in "\n".join(lines)  # neutralized, not dropped
+    assert len(lines) > 3, "the traceback must stay multi-line — readability is the deferred call"
+
+
+def test_control_char_filter_scrubs_stack_info() -> None:
+    # The same vector via stack_info, which the formatter also appends verbatim.
+    rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "stack dump", (), None)
+    rec.stack_info = f"Stack (most recent call last):\n{_FORGED_RECORD}"
+    lines = _production_lines(rec)
+    assert [ln for ln in lines[1:] if _RECORD_PREFIX_RE.match(ln)] == []
+
+
+def test_control_char_block_scrub_is_idempotent() -> None:
+    # Every handler carries its OWN chain, so a record dispatched to stdout AND the off-box forwarder
+    # is scrubbed twice; a second pass must not re-indent an already-indented block, or the two sinks
+    # would print different text for the same record.
+    rec = logging.LogRecord("t", logging.ERROR, __file__, 1, "x", (), None)
+    rec.exc_text = f"Traceback (most recent call last):\n{_FORGED_RECORD}"
+    ControlCharScrubFilter().filter(rec)
+    once = rec.exc_text
+    ControlCharScrubFilter().filter(rec)
+    assert rec.exc_text == once
 
 
 # --- C2: prod-DEBUG serve guard ----------------------------------------------

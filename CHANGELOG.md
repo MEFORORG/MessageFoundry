@@ -64,6 +64,17 @@ All notable changes to MessageFoundry are documented here. The format follows
   documenting the weakness without changing the gate.
 
 ### Fixed
+- **A CR/LF inside an exception message could forge a whole log line on the text sink.**
+  `ControlCharScrubFilter` escaped only the rendered message, and `logging.Formatter` appends a record's
+  traceback (`exc_text`) and stack dump (`stack_info`) **verbatim** — so a newline-bearing exception
+  string landed at column 0 on its own physical line, where a payload padded to the record layout was
+  byte-indistinguishable from a real entry to an operator or a line-oriented SIEM parser. Both fields
+  are now scrubbed too (ASVS 16.4.1; the residual ADR 0034 §1 disclosed, BACKLOG #335). **Visible
+  change:** a traceback is *not* collapsed onto one line — its line breaks are kept and every line is
+  indented with `    | `, so it stays readable while no line of it can start at column 0. A log parser
+  keyed on `Traceback (most recent call last):` at the start of a line needs that prefix added. The
+  JSON sink is unchanged in substance (`json.dumps` already escaped these fields); its `exception`
+  and `stack` values now carry the same indent.
 - **The DICOM C-STORE SCP's fail-closed refusal named a settings key that does not exist.** It told
   the operator to set `[inbound].source_ip_allowlist`; `InboundSettings` has no such field and section
   models ignore unknown keys, so an operator following the engine's **own error message** wrote a key
