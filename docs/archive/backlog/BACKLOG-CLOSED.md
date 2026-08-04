@@ -5215,3 +5215,64 @@ The `startswith(MARKER_PREFIX)` half stays in every case.
 **Related:** #349 (same module; this was found while fixing that).
 
 **Source:** adversarial review of #349, 2026-08-02 — an incidental finding, not the thing being looked for.
+
+## 335. Control-char scrub misses `exc_text`/`stack_info`
+
+> ✅ **DONE (2026-08-04).** `ControlCharScrubFilter.filter` now applies `_CTRL_TRANSLATION` to `record.exc_text` and `record.stack_info` as well as the rendered message, so a CR/LF-bearing traceback can no longer forge a record on the text sink. The readability call ADR 0034 §1 deferred was taken explicitly and amended there in the same commit: the traceback is **not** collapsed to one line — its line breaks are kept and every line is indented with `_CONTINUATION_PREFIX` (`"    | "`), so no traceback line starts at column 0 and none can impersonate `_LOG_FORMAT`. Pinned by the `test_control_char_*` tests in `tests/test_logging.py`. One residual stays open and is recorded in ADR 0034 §1: a handler carrying this filter *without* `RedactionFilter` would still hand the formatter an unrendered `exc_info` — no shipped handler is in that state. Scored **4/10** value · **3/10** difficulty when filed 2026-08-01.
+
+**Cluster:** Security / Logging. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+**What:** `ControlCharScrubFilter` ([logging_setup.py:81-87](../messagefoundry/logging_setup.py)) covers the rendered message and nothing else:
+
+```python
+def filter(self, record: logging.LogRecord) -> bool:
+    message = record.getMessage()
+    scrubbed = message.translate(_CTRL_TRANSLATION)
+    if scrubbed != message:
+        record.msg = scrubbed
+        record.args = ()
+    return True
+```
+
+`_CTRL_TRANSLATION` is defined at `logging_setup.py:65-69` and referenced exactly once more, at `:83` — nowhere else in the tree. `record.exc_text` and `record.stack_info` are touched only by `RedactionFilter` (`logging_setup.py:124-131`), which applies `redact()` — an HL7/date/name-shaped **span** rewriter, not a control-character escaper. `logging.Formatter.format` then appends `exc_text` verbatim, and `_LOG_FORMAT` (`:54`) is `"%(asctime)s %(levelname)-8s %(name)s: %(message)s"`, so a payload only has to pad the level to eight columns to be byte-indistinguishable from a real record.
+
+Reproduced at HEAD (worktree source on `sys.path[0]`, `configure_logging("INFO", fmt="text")`):
+
+```
+2026-08-01T15:29:08Z ERROR    messagefoundry.demo: delivery failed
+Traceback (most recent call last):
+  ...
+ValueError: boom
+2026-08-01T00:00:00Z INFO messagefoundry.auth: FORGED admin login ok
+2026-08-01T15:29:08Z INFO     messagefoundry.demo: arg path: boom\nFORGED-VIA-ARG
+```
+
+The forged line lands at column 0 on its own physical line; the identical payload passed as a `%`-arg in the same run comes out escaped. The filter order is already right for the fix — `_install_phi_filters` (`:309-311`) adds `RedactionFilter` → `CredentialQueryScrubFilter` → `ControlCharScrubFilter`, so `exc_text` is populated before the scrub filter runs.
+
+This is the residual [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) already discloses at `:131` and `:144-147` (*"Open hardening (not done)"*). The ADR is honest — its older register line at `:40` is superseded in place by the correction block opened at `:126` — so **the defect is what needs fixing, not the disclosure.**
+
+**Why:** it defeats the ASVS 16.4.1 control the project claims, on the sink an operator actually reads during an incident: a forged `… INFO messagefoundry.auth: …` line in the NSSM-captured stdout is indistinguishable from a real one, and a line-oriented SIEM parser ingests it as a record.
+
+Honestly bounded — this is **not**:
+
+- **Not the JSON sink.** `JsonFormatter` emits through `json.dumps(payload, ensure_ascii=False)` (`logging_setup.py:197`), which escapes C0 regardless of `ensure_ascii`. The off-box forwarder defaults to `fmt="json"` (`:215`).
+- **Not PHI exposure.** `RedactionFilter` runs first and rewrites HL7/date/name-shaped spans to `[redacted]`, which also neuters the obvious HL7-shaped forgery payload. The surviving vector is a *non*-HL7-shaped CR/LF-bearing string.
+- **Not widely reachable.** Contrary to ADR 0034:140-142's list, the router/transform **content**-fault catches log the exception **type only**, with no `exc_info` — `wiring_runner.py:4525-4531` and `:4541-4546` (docstring `:4521-4523`: *"the log emits the exception TYPE only"*), same shape in `_apply_transform_internal_error` at `:4550-4571`. `messagefoundry/transports/` contains **zero** `exc_info` sites. Of the 107 `log.exception(`/`exc_info=` sites engine-wide, the ones on the message path are the ADR 0054 built-ins-parser fallback guards (`parsing/peek.py:209`, `parsing/message.py:107`) and the respawn callbacks (`wiring_runner.py:2651`, `:2724`, `exc_info=task.exception()`); the rest are pollers and store/OS faults whose text is not peer-derived.
+- **Not remote-code/privilege anything.** It is log-record integrity only.
+
+One correction *widening* the bounding: the residual is not stdout/NSSM alone. `SyslogForward.fmt` accepts `"text"` (`logging_setup.py:215`) and `:401` honours it (`fwd_handler.setFormatter(_make_formatter(forward.fmt))`), so a `forward_format = "text"` collector receives the same unescaped `exc_text`.
+
+**Proposed:**
+
+1. Extend `ControlCharScrubFilter.filter` to apply `_CTRL_TRANSLATION` to `record.exc_text` and `record.stack_info` as well as the message. It runs last (`:309-311`), so both fields are already populated and redacted.
+2. **Make the readability call ADR 0034:146 defers.** A blanket translate collapses every traceback to one physical line, which is a real operator-facing regression — and is precisely why this few-line fix has been deferred. The cheaper option that keeps both properties: escape CR/LF **and** re-indent — split on newline, escape all other control chars, and rejoin with `"\n    | "` (or any fixed non-empty prefix). A continuation line can then never start at column 0, so it can never match `_LOG_FORMAT`, and the traceback stays readable. Pick one explicitly and record it as an ADR 0034 amendment rather than a drive-by edit.
+3. Add the missing tests. `tests/test_asvs_phase0.py:60-80` has three `ControlCharScrubFilter` tests and all three build records with `exc_info=None` (`_record` at `:56-57`); `tests/test_logging.py:231-237` covers PHI in `stack_info` but asserts nothing about control chars. Add a record carrying `exc_text`/`stack_info` with an embedded CRLF and assert the formatted output has no line matching the record prefix.
+4. Update ADR 0034 `:144-147` from "not done" to the shipped state in the same commit.
+
+**Related:** [`messagefoundry/logging_setup.py`](../messagefoundry/logging_setup.py) (`ControlCharScrubFilter`, `RedactionFilter`, `_install_phi_filters`, `JsonFormatter`, `SyslogForward`), [`messagefoundry/redaction.py`](../messagefoundry/redaction.py) (`redact`/`safe_text`/`safe_exc` — `:81-101`; these do not strip control chars either, but their output is a `%`-arg and so *is* covered), `tests/test_asvs_phase0.py`, `tests/test_logging.py`, [ADR 0034](adr/0034-static-analysis-triage-policy-accepted-risk-register.md) §"Class-rationale corrections" §1, [ADR 0080](adr/0080-tls-syslog-forwarding.md) (the off-box text-format sink), ASVS 5.0 16.4.1.
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: ADR 0034's prose is accurate and self-correcting and stays as written.
+
+---
+
+---
