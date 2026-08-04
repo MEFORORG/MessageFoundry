@@ -3,10 +3,19 @@
     UserPromptSubmit hook: tell the other sessions in THIS repo that you exist, and what you intend.
 
 .DESCRIPTION
-    WHY A PROMPT AND NOT AN ACTION. Announcing means the ccd_session_mgmt send_message MCP tool. Hooks
-    are shell commands and cannot call MCP at all, so this hook cannot send anything itself. What it CAN
-    do is put the instruction, the peer list and the id-resolution rule in front of the model at the one
+    WHY A PROMPT AND NOT AN ACTION. Announcing means the ccd_session_mgmt send_message MCP tool, so this
+    hook puts the instruction, the peer list and the id-resolution rule in front of the model at the one
     moment they are actionable. Everything below stdout is injected into the chat.
+
+    This used to say "hooks cannot call MCP at all". That is WRONG: type: "mcp_tool" is a documented hook
+    handler ("call a tool on an already-connected MCP server"), available on every hook event, and its
+    output is treated like command-hook stdout. The real blocker is narrower -- `server` must name an
+    already-CONNECTED, configured server, and ccd_session_mgmt is host-provided. Probed 2026-08-03: a
+    command control in the same hook array fired, while an mcp_tool naming ccd_session_mgmt AND one naming
+    a nonexistent server both produced nothing -- and with no MCP server connected on the box, "not
+    surfaced", "not addressable" and "errored invisibly" are the same bytes. So: UNTESTED, not impossible.
+    If it turns out to work, this whole design collapses to one hook entry and the model stops having to
+    write its own delivery receipt. See docs/WORKTREES.md, "Announcing yourself".
 
     WHY UserPromptSubmit AND NOT SessionStart. At SessionStart a session knows it exists and nothing
     else, so announcing then can only say "hello" -- the interrupt without the information. One prompt
@@ -573,7 +582,9 @@ try {
         $lines += '   different namespace: measured here, a registry id and an MCP id for ONE session'
         $lines += '   shared no characters. Branch does not join them either -- the two rosters'
         $lines += '   reported different branches for the same checkout. Only cwd joins. A registry id'
-        $lines += '   passed to send_message fails SILENTLY, which reads as the peer ignoring you.'
+        $lines += '   passed to send_message errors LOUDLY ("Session <id> not found.") and delivers'
+        $lines += '   nothing -- measured 2026-08-03. You do not have to detect a wrong id; you will'
+        $lines += '   see it. Do not retry a not-found id against another peer.'
         $lines += "4. Message at most $($targets.Count) peer(s) you actually reached, one message each,"
         $lines += '   this shape and nothing else:'
         $lines += "     [SESSION-ANNOUNCE] $top ($branch)"

@@ -106,9 +106,14 @@ writes when measured.
   commit-time: the peers of a new session learn nothing until someone trips a gate or writes a commit
   subject, which is too late for two sessions building the same *thing* in different files. This one
   hands the model its live peer roster plus the id-resolution rule at the first prompt that has intent
-  to report, and asks it to introduce itself. It cannot send anything by itself — hooks cannot call MCP
-  — so it is an instruction, and whether a message was actually delivered is recorded by the model in
-  `sent/<key>.tsv`, not by the hook. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
+  to report, and asks it to introduce itself. It is an *instruction* rather than an action, so whether a
+  message was actually delivered is recorded by the model in `sent/<key>.tsv`, not by the hook — the one
+  control whose audit trail is self-reported by the component being audited. The reason recorded for that
+  design ("hooks cannot call MCP") is **false**: `type: "mcp_tool"` is a documented handler on every hook
+  event. Whether it can reach the host-provided `ccd_session_mgmt` is **untested** — probed 2026-08-03 and
+  the answer was unreadable, because with no MCP server connected on the box "not surfaced", "not
+  addressable" and "errored invisibly" produce identical bytes. That is this section's own lesson landing
+  on the section itself. See [WORKTREES.md](WORKTREES.md), "Announcing yourself".
 
 > **A control that cannot distinguish "ran and resolved" from "ran and found nothing" is not
 > installed, however it looks.** The hook the one above replaced fired on every prompt, printed its
@@ -166,7 +171,7 @@ reading the emitted decision — not by reading source alone.
 | Selfheal — primary auto-repair | user (4 of 5 dirs) | LIVE |
 | Selfheal — hijack warning | user (4 of 5 dirs) | **LIVE and currently mis-firing** (§3, G4) |
 | `session-context.ps1` banner | project | LIVE where the branch carries the file |
-| Announce-on-join (`announce-session.ps1`) | user | **MERGED, NOT INSTALLED — inert by accident, 2026-08-02.** The only **push** control; asks, cannot send, and every decision leaves a receipt. It has never run. See below |
+| Announce-on-join (`announce-session.ps1`) | user | **LIVE** (re-verified 2026-08-03 by receipt *and* by `-Status`). The only **push** control; it asks rather than sends, and every decision leaves a receipt. Was inert-by-accident for ~13h after merge — see below, the lesson outlived the defect |
 | Announce wiring reaches a real script | test | **NEW** — `tests/test_announce_wiring.py`; nothing asserted this for *any* hook before, which is how a wired-but-inert shim survived weeks |
 | Announce missing-script notice | user | **NEW** — the one surface that still reports when the script itself fails to resolve |
 | Collision gate — unresolved notice | user | **NEW** — every fail-open path used to be indistinguishable from an all-clear; it now says which reason, once per 30 min, and still allows |
@@ -180,32 +185,38 @@ Rule 4 being inert is **deliberate and announced** — the commit that landed it
 nothing changes until `install-gate.ps1` is re-run." It is listed as INERT here because a control that
 has never been installed is a source artefact, not an enforcement.
 
-**Announce-on-join is inert too, and that one is an accident.** Measured 2026-08-02, hours after
-[#133](https://github.com/MEFORORG/MessageFoundry/pull/133) merged it to `main`:
+**Announce-on-join was inert too, and that one was an accident — now closed.** It merged in
+[#133](https://github.com/MEFORORG/MessageFoundry/pull/133) on 2026-08-01 at 21:18Z and was still unwired
+the next morning, roughly thirteen hours later:
 
-| Check | Result |
-|---|---|
-| `mefor-announce` UserPromptSubmit entry in any of the 5 config roots | **absent** |
-| The one UserPromptSubmit entry that *is* installed | `# mefor-web-announce`, resolving `scripts/hooks/announce.ps1` — **a different script in a different repo** |
-| `<git-common-dir>/mefor-coord/announce/` | **does not exist**, so there is not one receipt: it has never executed |
+| Check | 2026-08-02 (the defect) | 2026-08-03 (re-verified) |
+|---|---|---|
+| `mefor-announce` UserPromptSubmit entry in any of the 5 config roots | **absent** | **INSTALLED** per `install-coordination.ps1 -Status` |
+| The one UserPromptSubmit entry that *was* installed | `# mefor-web-announce`, resolving `scripts/hooks/announce.ps1` — **a different script in a different repo** | still present, and still nothing to do with this repo |
+| `<git-common-dir>/mefor-coord/announce/` | **did not exist**, so there was not one receipt: it had never executed | 47 markers, 28 receipt files, 23 delivery logs; newest line `out=ANNOUNCED peers=3 reach=3 sent=3 checks=2 ms=616` |
 
-`install-coordination.ps1` was last run before the announce row existed, and merging a hook does not
-install one. The two `mefor-coord` entries it wired then — the SessionStart banner and the collision
-gate — are present, which is exactly why nothing looked wrong.
+`install-coordination.ps1` had last been run before the announce row existed, and **merging a hook does
+not install one**. The two `mefor-coord` entries it wired then — the SessionStart banner and the collision
+gate — were present, which is exactly why nothing looked wrong.
 
-Two things this costs, both observed rather than predicted. A peer session announced itself **by hand**
-on 2026-08-02 and reported the hook as unavailable because it was "on an unmerged branch"; it had
-merged, so the correct diagnosis was never reached. And the missing-script notice listed below — the
-surface built precisely so this class cannot hide — **cannot fire when the hook is not wired at all**,
-because it lives inside the shim. That is this section's own lesson recurring one level up: the
-detector was still downstream of the failure. Re-arm from a plain terminal, then confirm by receipt
-rather than by reading the settings file:
+**Keep the lesson; the defect is the cheap part.** Two things it cost, both observed rather than
+predicted. A peer session announced itself **by hand** on 2026-08-02 and reported the hook as unavailable
+because it was "on an unmerged branch"; it had merged, so the correct diagnosis was never reached. And the
+missing-script notice listed above — the surface built precisely so this class cannot hide — **cannot fire
+when the hook is not wired at all**, because it lives inside the shim. That is this section's own lesson
+recurring one level up: the detector was still downstream of the failure.
+
+Which is why the status in the table above is stated **by receipt, not by reading a settings file** — and
+why re-checking it costs two commands. Reading `settings.json` would have shown the *web* entry and looked
+fine, which is the whole trap:
 
 ```powershell
-pwsh -NoProfile -File scripts\coord\install-coordination.ps1
-# then, after one prompt in any session in this repo:
+pwsh -NoProfile -File scripts\coord\install-coordination.ps1 -Status
+# and, after one prompt in any session in this repo — the load-bearing half:
 ls (Join-Path (git rev-parse --path-format=absolute --git-common-dir) 'mefor-coord/announce/receipts')
 ```
+
+A row in this table that has not been re-established that way is a claim about the past, not a status.
 
 ---
 
