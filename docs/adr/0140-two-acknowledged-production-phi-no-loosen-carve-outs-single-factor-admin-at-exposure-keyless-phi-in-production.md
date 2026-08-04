@@ -163,3 +163,82 @@ ack keeps its name). At the default (`enforce` × PHI) behaviour is **byte-ident
 non-production warn-and-start), so the two acks remain the **surgical stay-at-`enforce`, lift-exactly-one-
 control** alternative. The four floor items that stay hard-refused and the unconditional ePHI audit are
 unchanged. (This supersedes the original ack name in §Decision item 2 and the switch-2 discussion above.)
+
+## Amendment (2026-08-04) — the exposure predicate no longer reads the console flag (BACKLOG #326)
+
+The single-factor-admin-at-exposure carve-out above is keyed on `admin_exposed`. As shipped that was
+`not settings.api.is_loopback or ui_exposed`, and `ui_exposed` is derived from `settings.api.serve_ui`
+— a field the two [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)
+degrade arms rewrite **in place** earlier in the same `serve` call (soft-degrade when the console wheel
+is absent; auto-degrade when a default-on console meets an exposed bind). By the time this gate read it,
+`serve_ui` answered "is `/ui` mounted?" — a presentation fact — rather than "is the admin interface
+reachable from the network?", the exposure fact the carve-out is about.
+
+The consequence would have been visible on first deployment of the topology the runbooks **recommend**:
+a loopback bind behind a declared TLS terminator, with `[security].serve_web_console` left at its
+default. The auto-degrade clears the console flag, so `admin_exposed` evaluated `False`, so a production
+PHI instance under `enforcement = enforce` with `[security].require_mfa = false` would have started
+clean — with the JSON operator API reachable off-box through that proxy on a single admin factor, and
+with `allow_single_factor_admin_when_exposed` having nothing to lift. The same boot was simultaneously
+classified **exposed** by the ASVS 11.7.1 arm ([ADR 0152](0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md)),
+which already used the console-independent predicate. One startup, two contradictory answers to "is this
+instance exposed?".
+
+**Corrected keying.** `instance_exposed = not settings.api.is_loopback or
+settings.api.tls_terminated_upstream` is now defined **once**, above the first consumer, and both the
+MFA-at-exposure arm (`admin_exposed = instance_exposed`) and the ASVS 11.7.1 arm read that one
+definition. Neither reads `serve_ui`. `ui_exposed` survives, scoped to what it actually describes: the
+`/ui`-specific origin/TLS refusals and the browser-console advisories.
+
+**What changes.** The refusal now fires on at least three postures it did not reach before: a declared
+proxy with the console default-on (auto-degraded), a declared proxy with `serve_web_console = false`,
+and a declared proxy where the console wheel is simply not installed. An off-loopback bind behaved
+correctly before and is unchanged. A plain loopback bind with nothing declared is **not** exposed and
+is byte-identical — the property the loopback-quiet tests pin.
+
+**This is a tightening, and it is deliberate.** A configuration that starts today would refuse on first
+deployment of the corrected build. Per the owner ruling of 2026-08-04 it ships as a real refusal: no
+warning-first phase, no dated flip, and **no new opt-in gating it**. There are no deployments to protect
+from an upgrade, so the simple correct end state is what gets built. The refusal continues to ride the
+existing `[security].enforcement` refuse/warn split like every sibling gate.
+
+**The acknowledgment is unchanged.** `[security].allow_single_factor_admin_when_exposed` still lifts this
+one refusal to permitted-but-audited, with its WARNING-level `AUDIT:` line and its entry in
+`security_loosenings()`. The ruling forbade a *new* opt-in gating the corrected refusal; it did not
+retire this one. Its practical reach grows, because it now has the postures above to act on.
+
+**Residual, deliberately left open — an UNDECLARED proxy is still not "exposed", and it now has its own
+warning.** A set `[api].public_origin` (`[security].web_console_public_address`) with no
+`tls_terminated_upstream` on a loopback bind does not satisfy `instance_exposed`, so this refusal does
+not fire there. That is a choice: nothing has been declared, so exposure would be an *inference*, and
+the ruling that tightened this gate was about a **declared** proxy. Promoting an inference to a refusal
+is a different decision, and was not authorised here.
+
+An earlier draft of this amendment justified leaving it open by asserting the case "still warns",
+pointing at the ADR 0068 §8 undeclared-proxy heuristic. **That premise was false, and measurement is
+what showed it**, so it is corrected here rather than quietly dropped. §8's warning is about the `/ui`
+session cookie and HSTS — it says nothing about admin factors — and it is gated on
+`settings.api.serve_ui`, which the ADR 0143 auto-degrade clears in place for exactly this input (a
+default-on console plus a set `public_origin`). On the commonest shape of the posture it therefore did
+not print at all: the residual was not "warned rather than refused", it was **silent**. A compensating
+control must not rest on a false premise, so the control was built rather than the sentence softened —
+a dedicated arm now warns, naming single-factor admin, when `public_origin` is set, the instance is not
+`instance_exposed`, the declared data class is PHI, and `require_mfa` was explicitly opted out. A truly
+signal-less undeclared proxy — no `public_origin` either — remains undetectable in-engine and
+runbook-only, as ADR 0068 §8 records.
+
+**A second residual, NOT closed here — the auth-disabled refusal still keys on the bind alone.** The
+much earlier startup arm for `[auth] enabled = false` reads `not settings.api.is_loopback`, several
+hundred lines above where `instance_exposed` is defined, and this change does not touch it. So a PHI
+instance with authentication entirely off, on a loopback bind behind a declared terminator, would still
+start on first deployment — and the loosening text it prints still reads "loopback-only; a non-loopback
+bind refuses", which the corrected exposure model contradicts. That is the same
+two-answers-in-one-startup shape this amendment corrects, one arm over. It was left alone deliberately:
+the owner ruling named `admin_exposed`, and re-keying the auth-off arm needs its own hoist (it runs
+long before the current definition) plus its own adjudication, because it would convert that topology
+from starting to refusing. **Recorded here as an open item for the owner** so it is not rediscovered as
+a surprise.
+
+**Also amended:** [ADR 0143](0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md)
+carries a cross-reference noting that its in-place `serve_ui = False` flips no longer feed any exposure
+predicate.
