@@ -23,6 +23,10 @@ rendered as a bare ``sss.`` until this was fixed.
 
 Parity is asserted only when the source script is COMMITTED. Mid-change the two are *supposed* to differ,
 and a test that nagged on every edit would be re-run with ``-k`` until someone deleted it.
+
+Parity is compared as CONTENT, not as bytes -- see :func:`content_hash`. A byte-exact hash asked a
+question adjacent to the one this module exists to answer, and answered it wrongly on every Windows
+checkout.
 """
 
 from __future__ import annotations
@@ -50,6 +54,52 @@ OPT_IN_TOOLS = {"EnterWorktree"}
 
 TOOL_BRANCH = re.compile(r"\$tool\s+-(?:not)?in\s+@\(([^)]*)\)")
 QUOTED = re.compile(r'"([^"]+)"')
+
+
+def content_hash(data: bytes) -> str:
+    """SHA-256 of the script's CONTENT: raw bytes with CRLF folded to LF.
+
+    "Are these the same script?" and "are these the same bytes?" are different questions on Windows, and
+    this module wants the first. ``core.autocrlf=true`` materialises a checkout with CRLF while git's own
+    clean filter stores LF, and ``install-gate.ps1`` lays its copy down with ``Copy-Item``, which
+    translates nothing -- so the installed copy carries whatever form the checkout that installed it had.
+    A byte-exact hash therefore reported a difference that ``git status`` reported as clean, about one
+    file, with neither instrument mentioning the other.
+
+    Measured 2026-08-04: installed 51061 bytes / 0 CRLF / 805 LF, source 51866 bytes / 805 CRLF / 0 LF,
+    identical after folding, and ``git hash-object`` agreeing with ``HEAD`` on both. No rule had been
+    added, removed or changed -- there was nothing to report. The failure text nonetheless read "The
+    RUNNING gate is not this checkout's script" and prescribed a re-install, which would have rewritten a
+    machine-global file from whichever checkout happened to be current: the stale-checkout DOWNGRADE
+    hazard, fired to fix nothing.
+
+    WHY NOT ``git hash-object``, which would delegate "same content" to git and agree with ``git status``
+    by construction: it is CONFIGURATION-DEPENDENT, and reproducing the same defect one level up is not a
+    fix. Measured on this box, same file, same commit::
+
+        git -c core.autocrlf=false hash-object scripts/hooks/worktree_gate.ps1 -> f6f87adfc8e1
+        git -c core.autocrlf=true  hash-object scripts/hooks/worktree_gate.ps1 -> 58acc19367e0
+        git rev-parse HEAD:scripts/hooks/worktree_gate.ps1                     -> 58acc19367e0
+
+    It answers correctly here only because this box sets ``autocrlf=true``; under ``=false`` it reports
+    drift for a new non-reason. Making it config-independent needs a ``.gitattributes eol=lf`` pin, which
+    does not rewrite files already checked out -- so every one of the ~30 worktrees on this box would keep
+    failing, with this same message, until each was renormalised by hand. Folding CRLF here depends on no
+    configuration and no subprocess.
+
+    WHAT THIS GIVES UP, stated rather than left to be discovered: a difference of line endings ALONE
+    becomes invisible. That is not nothing. Eight ``-Reason @"`` here-strings (openers at 282, 377, 404,
+    477, 533, 675, 738, 783) carry their own line endings into the deny text a user sees, so the CRLF and
+    LF forms of the gate emit differently-whitespaced messages. Nothing reads those bytes today -- every
+    assertion against them is a substring that never spans a line break -- and PowerShell parses both
+    forms identically, so no rule can differ. If the gate ever grows an Authenticode block, an embedded
+    self-hash, or a consumer that line-anchors a regex on a deny reason, byte-exactness becomes
+    load-bearing and this function is where to revisit it.
+
+    ``test_the_parity_check_still_detects_a_content_difference`` is the negative control for exactly this
+    weakening; it is not decoration.
+    """
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
 def handled_tools(text: str) -> set[str]:
@@ -110,17 +160,77 @@ def test_the_installed_gate_matches_the_committed_source() -> None:
             f"installed copy is SUPPOSED to differ mid-edit. Re-run after committing."
         )
 
-    installed = hashlib.sha256(INSTALLED_GATE.read_bytes()).hexdigest()
-    source = hashlib.sha256(SOURCE_GATE.read_bytes()).hexdigest()
-    print(f"compared: installed={installed[:12]} source={source[:12]}")
+    installed_bytes = INSTALLED_GATE.read_bytes()
+    source_bytes = SOURCE_GATE.read_bytes()
+    installed = content_hash(installed_bytes)
+    source = content_hash(source_bytes)
+
+    # Print BOTH bases. The content hashes are what the assertion turns on; the raw byte shas and the
+    # eol-only flag are diagnostics that keep "differs in content" and "differs in line endings"
+    # distinguishable in the output. Collapsing them to one number is how the two got confused.
+    print(f"compared (content, CRLF folded): installed={installed[:12]} source={source[:12]}")
+    print(
+        f"diagnostic raw bytes: installed={hashlib.sha256(installed_bytes).hexdigest()[:12]} "
+        f"source={hashlib.sha256(source_bytes).hexdigest()[:12]} "
+        f"line-endings-only difference={installed_bytes != source_bytes and installed == source}"
+    )
 
     assert installed == source, (
-        f"The RUNNING gate is not this checkout's script.\n"
-        f"  installed: {INSTALLED_GATE}  sha={installed[:12]}\n"
-        f"  source   : {SOURCE_GATE}  sha={source[:12]}\n"
-        f"Until it is re-installed, rules added or removed in source have NO EFFECT and the rest of the "
-        f"suite still passes. Fix from a PLAIN terminal:\n"
+        f"CONTENT DRIFT: the RUNNING gate is not this checkout's script.\n"
+        f"  installed: {INSTALLED_GATE}  content={installed[:12]}\n"
+        f"  source   : {SOURCE_GATE}  content={source[:12]}\n"
+        f"Line endings are folded out of this comparison, so this is a real difference in rules or "
+        f"logic -- CRLF vs LF cannot produce it.\n"
+        f"Until the installed copy is replaced, rules added or removed in source have NO EFFECT and the "
+        f"rest of the suite still passes.\n"
+        f"WORK OUT WHICH COPY IS OLDER FIRST. Installing from a checkout older than the installed gate "
+        f"DOWNGRADES a machine-global file for every session on this box:\n"
+        f"    git log --oneline -5 -- {SOURCE_GATE.relative_to(ROOT).as_posix()}\n"
+        f"Only once THIS checkout is confirmed to be the newer of the two, from a PLAIN terminal:\n"
         f"    pwsh -NoProfile -File scripts\\worktree\\install-gate.ps1"
+    )
+
+
+def test_the_parity_check_still_detects_a_content_difference() -> None:
+    """NEGATIVE CONTROL for the assertion above, and the whole justification for weakening it.
+
+    Folding CRLF out of the comparison is precisely the edit that could turn a false RED into a false
+    GREEN -- a gate that is genuinely stale, reported in sync. So prove the weakened predicate still
+    detects what it exists to detect, and prove the tolerance is not vacuous while doing it.
+
+    Exercised against the REAL gate's bytes, and directly against the predicate rather than by mutating
+    the installed copy: that file is machine-global and every PreToolUse hook on this box reads it, so a
+    test may not take it out from under a concurrent session. Same reasoning, same shape as
+    ``test_installed_coord_hooks.test_the_resolution_check_can_detect_a_missing_script``.
+    """
+    body = SOURCE_GATE.read_bytes().replace(b"\r\n", b"\n")
+    crlf = body.replace(b"\n", b"\r\n")
+
+    # Guard the guard: if these two were the same bytes, the tolerance assertion below would hold for a
+    # trivial reason and prove nothing about newline folding.
+    assert crlf != body, "the CRLF and LF encodings are identical -- this control would be vacuous"
+    print(f"eol probes differ in bytes: LF={len(body)} CRLF={len(crlf)}")
+    assert content_hash(crlf) == content_hash(body), (
+        "re-encoding line endings changed the content hash -- the tolerance this module documents does "
+        "not actually hold"
+    )
+
+    # A rule addition is the exact drift the module exists to catch, and the case the owner named.
+    added_rule = body + b'\nif ($tool -in @("MFTestOnlyRule")) { Write-Deny -Rule "99" }\n'
+    assert content_hash(added_rule) != content_hash(body), (
+        "adding a rule did not change the content hash -- the parity check is decoration"
+    )
+
+    # And the subtle end of the range: one character inside an existing rule, no line added or removed.
+    flipped = body.replace(b'$tool -in @("EnterWorktree")', b'$tool -in @("EnterWorktreX")', 1)
+    assert flipped != body, (
+        "probe edit matched nothing -- the gate's rule syntax moved, fix this control"
+    )
+    assert content_hash(flipped) != content_hash(body), (
+        "a one-character rule edit did not change the content hash"
+    )
+    print(
+        "content differences still detected: rule added, and one character changed in an existing rule"
     )
 
 
