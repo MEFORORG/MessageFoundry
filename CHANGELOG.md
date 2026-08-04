@@ -6,7 +6,50 @@ All notable changes to MessageFoundry are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **`messagefoundry audit-anchor`, and `audit-verify --expected-anchor` / `--expected-anchor-file` to
+  check one back.** The audit hash chain links each row to its predecessor, so deleting the *newest*
+  rows leaves a shorter chain that still walks cleanly — `audit-verify` on its own reports OK after a
+  tail-truncation, which is the shape an attacker hiding what they just did leaves behind. The store
+  could always compare against an external anchor; nothing exposed it, so the capability was
+  unreachable. `audit-anchor` prints `COUNT:HEAD` (a row count plus a digest — no PHI, no secret, safe
+  to hold in a ticket or an object store); passing it back reports `truncated or rewritten` when the
+  live chain differs.
+  **Know what it is before you build a job on it: an EXACT point-in-time seal**, comparing the count
+  *and* the head hash. The head half is not redundant — an attacker who cuts the newest rows and forges
+  the same number of replacements restores the count and leaves a chain that walks cleanly, so the head
+  is the only thing that differs. The cost of that detection is that a chain which merely **grew** also
+  reports `truncated or rewritten`. So it seals a chain **at rest across a gap in custody**: quiesce the
+  engine, anchor, hold the value off-box, re-verify while the chain is still quiesced — around a
+  maintenance window, a database move, a backup/restore, a hand-off. Anchoring and immediately
+  re-verifying compares a value to itself; re-checking a held anchor against a **running** engine alarms
+  on every ordinary boot. For continuous coverage of a live engine the off-box log forward / tee remains
+  the control, and `[integrity].audit_verify_on_start` is unchanged — it is a bare walk and stays blind
+  to a truncated tail. ([BACKLOG #328](docs/BACKLOG.md))
+
 ### Changed
+- **A PHI instance reached through a declared reverse proxy with `[security].require_mfa` explicitly
+  off would refuse to start on first deployment, where it previously would not have.** The
+  MFA-at-exposure gate derived "is this instance exposed?" from `[api].serve_ui`, a field the ADR 0143
+  console degrade arms rewrite **in place** earlier in the same startup. On the topology the runbooks
+  recommend — a loopback bind behind a declared TLS terminator, with the web console left at its
+  default — the auto-degrade cleared that flag first, so the gate evaluated "not exposed" and the
+  refusal was unreachable, while the ASVS 11.7.1 arm in the same startup classified the identical boot
+  as exposed. The gate now reads a single console-independent predicate (an off-loopback bind **or**
+  `[api].tls_terminated_upstream`), so it also fires when the console is auto-degraded, when
+  `serve_web_console = false` disables it outright, and when the console package is simply not
+  installed: the surface authenticating with one factor is the JSON operator API, which the proxy
+  serves either way. The `#189` dual-control advisory reads the same predicate and gains the same reach
+  (still warn-only).
+  **Who this would bite:** a deploying site that has explicitly set `require_mfa = false` on a
+  PHI-carrying environment behind a declared TLS terminator, under `enforcement = enforce`. **Two
+  remedies, both existing:** set `[security].require_mfa = true`, or set the already-shipped
+  acknowledgment `[security].allow_single_factor_admin_when_exposed = true`, which downgrades the
+  refusal to a loud audited warning. A plain loopback bind with nothing declared is **not** exposed and
+  is byte-identical. An **undeclared** proxy (`web_console_public_address` set, no
+  `tls_terminated_upstream`) deliberately still does not refuse — exposure there would be an inference —
+  but it no longer passes in silence: a new warning names single-factor admin directly on a PHI instance
+  with `require_mfa` off. ([BACKLOG #326](docs/BACKLOG.md), [ADR 0140](docs/adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment)
 - **BREAKING — an `[[alerts.rules]]` block that routes to an unconfigured transport now refuses at
   startup instead of being silently ignored.** `notifier_from_settings` returned early when **no**
   transport was configured, *before* the loop that cross-checks each rule's `transports` against the

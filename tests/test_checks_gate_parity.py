@@ -202,6 +202,25 @@ _MATRIX: list[tuple[str, str, str, bool, int]] = [
         True,
         0,
     ),
+    # BACKLOG #326: the SAME refusal on the runbook's RECOMMENDED topology — a LOOPBACK bind
+    # (local_access_only left true) behind a DECLARED TLS-terminating proxy. This row is the one the
+    # old `admin_exposed = not is_loopback or ui_exposed` keying could not produce: the ADR 0143
+    # auto-degrade clears serve_ui first, so ui_exposed was False and a production PHI instance with
+    # single-factor admin on the network started clean. Driven through the REAL gate (`main(["serve",
+    # ...])`) because checks.py is not a second gate site for it — that mirror reads neither
+    # require_mfa nor is_loopback.
+    (
+        "mfa-off-loopback-behind-proxy-prod-phi-refuses",
+        "security.require_mfa = false\nsecurity.block_unlisted_outbound = true\n"
+        "security.delete_message_bodies_after_days = 30\n"
+        + _MEMORY_ENCRYPTION
+        + _PROXY
+        + _RETENTION_DL
+        + _ALERTS,
+        "prod",
+        True,
+        2,
+    ),
     # unbounded retention on a production PHI instance refuses.
     (
         "unbounded-retention-prod-phi-refuses",
