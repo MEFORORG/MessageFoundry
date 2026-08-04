@@ -316,3 +316,42 @@ a *verification* pass — including a false correction to a correct citation on 
 the plan. Re-measuring is not optional because the number came from a careful reader; it is required
 *because* it did. Every anchor in this document was measured against HEAD, and the ones that moved are
 named above rather than quietly fixed.
+
+---
+
+## The failure this plan keeps meeting: an instrument that is green *and blind*
+
+Every wave here is gated by something. So it is worth writing down what went wrong repeatedly on
+2026-08-03, because it was not a gate being **absent** — in each case a gate was present, well-formed,
+passing, and measuring something adjacent to the thing it claimed.
+
+`scripts/security/new_dependency_check.py:324` states the rule better than any summary of it. When the
+supply-chain gate could not reach PyPI it did **not** pass:
+
+> `dependency vetting could not reach PyPI (…). Treating this as a FAILURE: a supply-chain gate that goes green while blind is worse than no gate.`
+
+That is the whole distinction. **Blindness is a state a gate can detect about itself, and it gets to
+choose what to report.** Five instruments met that state in one day; one chose red.
+
+| Instrument | What it was blind to | What it reported |
+|---|---|---|
+| `new_dependency_check.py` | PyPI unreachable | 🔴 **failed closed, and said why** |
+| `backlog-hygiene.yml` two-dot diff | its own PR's changes vs main-side ones | 🟢 passed — crediting PRs for a file they never touched |
+| `alloc.ps1 -ShowFloor` | the guard it existed to preview | 🟢 printed a number the allocator would refuse |
+| `alloc.ps1` working-tree floor term | 0 of 277 headings (`^` without `Multiline`) | 🟢 silent, masked by a sibling term |
+| `.gitignore` in ci.yml's docs-only allowlist | its own guard could not run on a `.gitignore`-only PR | 🟢 skipped, on exactly the PR shape it polices |
+| PHI-at-rest substring assertions | confidentiality (checked 3 characters of a 146-char body) | 🟢 passed — and flaked ~1 CI run in 304 |
+
+**The practical rule for a session in any wave:** when a gate you rely on cannot see its input, make it
+say so. A caught exception that resolves to "pass", a preview that returns before the check, a scan
+scoped to a subset of what it claims, and a pattern that silently matches nothing are the same defect
+wearing four costumes — and none of them shows up as a red run.
+
+**And the corollary, which is why [#1000](../BACKLOG.md) exists:** a green gate is evidence only if that
+gate has been *watched* going red on the thing it guards. Four of the five above had never been. The one
+that had — because failing closed is unmissable the first time it fires — is the one that behaved.
+
+*(Two of the six rows were introduced by this session and found by the next reviewer of it, which is the
+argument for the adversarial pass above rather than a reason to trust the list. The `13.3.4` absence
+claim reported by a sibling session belongs in this table too; it is omitted only because this session
+did not verify it first-hand.)*
