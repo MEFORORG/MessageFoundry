@@ -75,11 +75,25 @@ BACKLOG_ARCHIVE_DIR = "docs/archive/backlog"
 # of check_backlog() computing a set and discarding it, i.e. unable to fail at all. A floor needs no
 # registry, no worktree, and no sight of the internal ledger (CI checks out origin only).
 #
-# KNOWN RESIDUAL, and where it is detected: this binds only the public side. Nothing here can stop the
-# internal ledger allocating past #1000. CI cannot see that -- but alloc.ps1 can, on any machine
-# holding those refs, and it warns at allocation time if the all-refs maximum ever reaches this
-# boundary. Raising this number is a one-line reviewable source change, deliberately not an allowlist
-# file that would rot out of sight.
+# KNOWN RESIDUAL, and it is NOT detected anywhere: this binds only the public side, and nothing in this
+# repository can stop -- or observe -- the maintainer-internal ledger allocating past #1000.
+#
+# This comment used to claim alloc.ps1 "warns at allocation time if the all-refs maximum ever reaches
+# this boundary". That was the wrong instrument twice over, and it was the defect written down:
+#   - The all-refs maximum has NO PROVENANCE. A public item legitimately allocated at the boundary and
+#     an internal breach are the same observation. That guard fired on BACKLOG #1000 -- correct input --
+#     and bricked every backlog allocation in the repo until 2026-08-03.
+#   - It claimed a liveness the ref store does not have. The vault-ish remote-tracking refs it would
+#     read are a FOSSIL: no configured refspec advances them, the newest is older than the partition
+#     itself, and a fresh clone has none at all.
+# alloc.ps1 now warns only on the highest number BELOW the boundary (which over-states the internal
+# high-water, so it warns early), and refuses only on a lowered boundary, which is locally observable.
+#
+# Raising this number is a one-line reviewable source change, deliberately not an allowlist file that
+# would rot out of sight. LOWERING it is the dangerous direction and is the one thing neither this gate
+# nor CI can catch -- both read only the current value and have no memory of the previous one -- so
+# alloc.ps1 keeps a `.boundary-highwater` ratchet beside its registry and refuses when the constant
+# drops beneath a value that clone has already allocated against.
 #
 # THIS LINE IS PARSED, not imported: scripts/coord/alloc.ps1 regex-matches it so the floor is defined
 # exactly once and the allocator can never emit a number this gate refuses. Keep the name and the
