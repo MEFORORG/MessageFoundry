@@ -16,7 +16,7 @@ stops matching the code, fix the doc.
 
 ## 0. Deployment status — read this before writing any severity claim
 
-> ⛔ **MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
+> **CRITICAL — MessageFoundry is a NOT-DEPLOYED beta. There are ZERO production instances. Nobody is
 > running it.** **Published to PyPI is *not* deployed** — a release artifact on an index is not a
 > running instance, and the two get conflated constantly. Distinguish **shipped** (on `main`, on
 > PyPI), **deployable**, and **deployed**: only the first two are true today.
@@ -38,7 +38,7 @@ across the repo. **Two consequences, and they pull in opposite directions — ap
    of a breaking change is currently **zero**. Prefer the simple, correct end state over a staged
    migration or compatibility shim; those are real costs paid to protect users who do not exist.
 
-⛔ **It cuts one way only — never cite "not deployed" to relax a rule.** It removes false urgency
+**IT CUTS ONE WAY ONLY — never cite "not deployed" to relax a rule.** It removes false urgency
 and vacuous costs. It does **not** downgrade a fix, justify skipping a gate, weaken a control, or
 make a finding unimportant. The security, PHI (§9) and leak-gate rules exist so the **first**
 deployment is safe; zero deployments is why there is still time to get them right, not permission
@@ -463,6 +463,10 @@ harness process only.)
   the user.** Say the word. `SHIPPED`, `BLOCKED`, `WARNING`, `DO NOT` all survive grep, copy-paste,
   a cp1252 terminal and a screen reader; a pictograph does none of those reliably.
 
+  **The one allowed use is QUOTING a glyph as a token, in backticks** — naming the thing under
+  discussion, as this rule does below. That is code, not decoration, and it is how you talk about the
+  banner alphabet without adopting it.
+
   **Why this is a correctness rule and not a style preference.** A glyph's meaning is *positional*, and
   that is invisible to anyone who learns it from examples rather than from its definition. Measured
   2026-08-04: the backlog's `✅` means "this item is closed" **only** in the leading blockquote — quoted
@@ -476,7 +480,7 @@ harness process only.)
   them, and they raise `UnicodeEncodeError` on a stock Windows cp1252 console — which cost four
   separate failures in one session.
 
-  ⚠️ **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
+  **ONE HOLDOUT, and it is a machine-parsed contract, not an exemption.** `docs/BACKLOG.md` and
   `docs/archive/backlog/BACKLOG-CLOSED.md` encode item status as a banner alphabet
   (`scripts/docs/backlog_status_check.py`: `_CLOSED = "✅⛔🪦"`, `_OPEN = "🔢🚧"`), and
   `.github/workflows/backlog-hygiene.yml` quotes it in its remediation text. **283 banners across the
