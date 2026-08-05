@@ -93,9 +93,13 @@
     },
     {
       "name": "side",
-      "kind": "str",
+      "kind": "enum",
       "required": false,
       "keyword_only": true,
+      "choices": [
+        "left",
+        "right"
+      ],
       "default": "left"
     }
   ],
@@ -128,9 +132,14 @@
     },
     {
       "name": "mode",
-      "kind": "str",
+      "kind": "enum",
       "required": true,
-      "keyword_only": false
+      "keyword_only": false,
+      "choices": [
+        "upper",
+        "lower",
+        "title"
+      ]
     }
   ],
   "arith_field": [
@@ -142,9 +151,15 @@
     },
     {
       "name": "op",
-      "kind": "str",
+      "kind": "enum",
       "required": true,
-      "keyword_only": false
+      "keyword_only": false,
+      "choices": [
+        "+",
+        "-",
+        "*",
+        "/"
+      ]
     },
     {
       "name": "operand",
@@ -204,9 +219,15 @@
     },
     {
       "name": "unit",
-      "kind": "str",
+      "kind": "enum",
       "required": false,
       "keyword_only": true,
+      "choices": [
+        "days",
+        "years",
+        "hours",
+        "minutes"
+      ],
       "default": "days"
     }
   ],

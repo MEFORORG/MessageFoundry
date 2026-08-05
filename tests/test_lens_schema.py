@@ -108,3 +108,21 @@ def test_ide_fixture_in_sync() -> None:
         "ide/src/test/fixtures/lens-schema/op-schema.json is stale — regenerate: "
         "python -m messagefoundry lens schema > ide/src/test/fixtures/lens-schema/op-schema.json"
     )
+
+
+def test_closed_set_param_becomes_enum() -> None:
+    # OQ1: the four closed-set args are typed Literal[...], so the schema emits kind 'enum' with the
+    # choice list -- the IDE renders a dropdown, not a text input (the item's headline widget). The
+    # runtime ValueError guards still stand for a dynamically-supplied bad value (two-layer, actions.py).
+    assert _param("convert_case", "mode") == {
+        "name": "mode",
+        "kind": "enum",
+        "required": True,
+        "keyword_only": False,
+        "choices": ["upper", "lower", "title"],
+    }
+    assert _param("arith_field", "op")["choices"] == ["+", "-", "*", "/"]
+    unit = _param("date_diff_field", "unit")
+    assert unit["kind"] == "enum" and unit["choices"] == ["days", "years", "hours", "minutes"]
+    assert unit["default"] == "days" and unit["required"] is False
+    assert _param("pad_field", "side")["choices"] == ["left", "right"]
