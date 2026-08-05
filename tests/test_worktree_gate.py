@@ -156,6 +156,146 @@ def test_read_is_never_gated(primary: Path, repos_file: Path) -> None:
     assert run_gate(payload, repos_file) is None
 
 
+# ------------------------------------------- rule 1's coordination-dir exemption, and rule 1b
+#
+# These pin BOTH halves of one decision, and the pair is the point: the exemption without the
+# narrowing is a hole, and the narrowing without the exemption is the false positive it replaced.
+# Splitting them across files is how one half gets deleted and the suite stays green.
+#
+# The defect: rule 1 says its subject is the primary's WORKING TREE but decided by prefix-matching
+# the primary's path string, and nothing under <primary>/.git/ is in the working tree at all
+# (git forbids a tracked path component named `.git`). So the coordination writes every session is
+# instructed to make -- announce delivery receipts, handoff documents, in the git COMMON dir all
+# worktrees share -- were refused. Measured from the gate's own deny log 2026-08-02..2026-08-05:
+# 9 of rule 1's 18 recorded firings were this one false positive, from 7 distinct worktrees.
+
+COORD = ".git/mefor-coord"
+
+
+def _coord(primary: Path, rest: str) -> Path:
+    return primary / Path(COORD) / rest
+
+
+# The writes the coordination protocol actually mandates. `announce-session.ps1` tells each session to
+# append to announce/sent/<session-id>.tsv and says "Nothing else records whether anything was
+# delivered", so a denied receipt is indistinguishable from an announce that never happened.
+@pytest.mark.parametrize(
+    "rest",
+    [
+        "announce/sent/4889b38d-4716-435b-8c79-b1ed68e0b3d7.tsv",
+        "announce/receipts/4889b38d-4716-435b-8c79-b1ed68e0b3d7.tsv",
+        "HANDOFF-vscode-mail.md",  # handoff docs land at the state root ...
+        "handoff/COORDINATOR-HANDOFF-2.md",  # ... and under handoff/ ...
+        "handoffs/RESUME-HERE.md",  # ... and under handoffs/
+        "handoffs/backfill-baseline.txt",  # not every document is .md
+        "alloc-notes.md",  # a DOCUMENT whose name merely begins with a registry's
+    ],
+)
+def test_coordination_writes_from_a_worktree_are_allowed(
+    tmp_path: Path, primary: Path, repos_file: Path, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert run_gate(edit(_coord(primary, rest), cwd=worktree), repos_file) is None
+
+
+def test_the_coordination_exemption_is_keyed_on_the_target_not_the_cwd(
+    primary: Path, repos_file: Path
+) -> None:
+    """Rule 1 is target-keyed everywhere else; the exemption must not quietly become cwd-keyed."""
+    target = _coord(primary, "announce/sent/s1.tsv")
+    assert run_gate(edit(target, cwd=primary), repos_file) is None
+
+
+# THE LOAD-BEARING HALF. The exemption was deliberately narrowed to mefor-coord/ rather than to the
+# whole common dir: core.hooksPath is unset in this repo, so <primary>/.git/hooks/ is the LIVE hook
+# directory for every worktree at once, and a Write to pre-commit disarms the commit-time ledger,
+# claim and secret-leak gates for every session on the machine. Rule 1's prefix is what blocks the
+# ordinary spelling of that write and no other rule blocks it at all, so if these ever start passing,
+# the exemption has been widened into the hole it was shaped to avoid.
+@pytest.mark.parametrize(
+    "rest",
+    [".git/hooks/pre-commit", ".git/config", ".git/HEAD", ".git/worktrees/wt-1/HEAD"],
+)
+def test_the_rest_of_the_shared_git_dir_is_still_denied(
+    primary: Path, repos_file: Path, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    assert_denied(run_gate(edit(primary / Path(rest), cwd=worktree), repos_file))
+
+
+# Rule 1b: the machine-read state INSIDE the exemption. Each of these is read as AUTHORITY by another
+# gate on this machine, and each decides from one field or from the file merely existing, so a
+# hand-written copy is indistinguishable from a real one. `alloc/` is the sharpest: ledger_check.py's
+# owns() compares the `worktree` field alone, so a written file IS an allocation -- and --ci skips
+# that rule entirely, so nothing downstream catches the forgery.
+@pytest.mark.parametrize(
+    "rest",
+    [
+        "alloc/adr/0162.json",  # forges an ADR allocation past the ledger gate
+        "alloc/backlog/1033.json",
+        "alloc/adr/.floor-highwater",  # a ONE-WAY ratchet; no later run can lower it
+        "alloc/backlog/.boundary-highwater",  # ... and this one refuses allocation repo-wide
+        "claims/1032.json",  # forges, and can TRANSFER, a live claim
+        "locks/alloc.lock",  # the cross-session mutex
+        "test-slots/0.lock",  # the pytest port-slot mutex
+        "gate-unresolved/wt.slug.stamp",  # suppresses the collision gate's own warning
+        "overlap-cache.json",  # makes the collision gate report a silent all-clear
+        "announce/OFF",  # a documented REPO-WIDE kill switch, one Write
+        # Found by listing the directory AFTER three adversarial readers had enumerated it, which is
+        # why rule 1b cannot rest on its named list alone: announce-session.ps1 exits outright when
+        # this marker's `state` is settled/exhausted, so writing one into a PEER's marker silences
+        # that peer permanently. The cwd stamp does it for thirty minutes.
+        "announce/4889b38d-4716-435b-8c79-b1ed68e0b3d7.json",
+        "announce/cwd-9f7755f4.stamp",
+        "lane-tips/x.json",  # named by no list; caught by shape alone
+        "somethingnew",  # the ninth registry, whatever it turns out to be
+    ],
+)
+def test_machine_read_coordination_state_is_denied(
+    tmp_path: Path, primary: Path, repos_file: Path, rest: str
+) -> None:
+    worktree = primary / ".claude" / "worktrees" / "wt-1"
+    reason = assert_denied(run_gate(edit(_coord(primary, rest), cwd=worktree), repos_file))
+    # Rule 1's remedy ("make a worktree and re-issue the edit there") is WRONG for these paths: they
+    # live in the common dir, so the same path is the same file from every worktree and the session
+    # would loop. Assert it got 1b's refusal and not rule 1's.
+    assert "new.ps1" not in reason
+    assert "AUTHORITY" in reason or "machine-read coordination state" in reason
+
+
+@pytest.mark.parametrize(
+    "rest",
+    [
+        ".git/mefor-coordX/y.tsv",  # the required trailing separator does its job
+        ".git/mefor-coord-old/y.tsv",
+        ".git/mefor-coord",  # the bare root is not a file anyone writes
+        # A collation-ignorable character. String.StartsWith(string) compares under the CURRENT
+        # CULTURE and skips these, so before the comparison was made ordinal this sibling -- a
+        # genuinely different directory -- matched the exemption and was ALLOWED.
+        f".git/mefor-coord{chr(0x200D)}/evil.tsv",
+    ],
+)
+def test_near_misses_of_the_coordination_prefix_are_denied(
+    primary: Path, repos_file: Path, rest: str
+) -> None:
+    assert_denied(run_gate(edit(primary / Path(rest), cwd=primary), repos_file))
+
+
+@pytest.mark.parametrize(
+    "rest",
+    [
+        "../hooks/pre-commit",  # the exemption must not become a tunnel to the rest of .git
+        "../../messagefoundry/api/app.py",  # ... nor into the working tree
+        "announce/../../config",
+    ],
+)
+def test_traversal_out_of_the_coordination_subtree_is_denied(
+    primary: Path, repos_file: Path, rest: str
+) -> None:
+    """The match runs on the CANONICALISED target, so `..` resolves before the prefix is compared."""
+    assert_denied(run_gate(edit(_coord(primary, rest), cwd=primary), repos_file))
+
+
 # --------------------------------------------------------------------------- rule 2: dispatch
 
 
