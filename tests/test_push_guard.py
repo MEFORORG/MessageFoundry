@@ -41,6 +41,11 @@ _REPO = Path(__file__).resolve().parents[1]
 _GUARD = _REPO / "scripts" / "hooks" / "push_guard.py"
 _INSTALLER = _REPO / "scripts" / "coord" / "install-git-hooks.ps1"
 
+# A sha that resolves to NOTHING. Since Guard B fails closed it is no longer usable as a stand-in for
+# "some ordinary commit": an unresolvable object is now itself a refusal, so a test that used it to
+# prove a PERMIT would be asserting the opposite of what it claims. It survives only where the ref is
+# being refused for a reason established before any tree is read, and where the assertion names that
+# reason. Every permit case uses `tree_repo`'s real clean commit instead.
 _SHA = "a" * 40
 _ZERO = "0" * 40
 
@@ -70,9 +75,15 @@ def _run(
 
 
 def test_a_direct_push_to_main_is_refused() -> None:
+    """Names the REASON, not just the exit code.
+
+    Since Guard B fails closed, a synthetic sha is refused on its own -- so an assertion on
+    ``returncode == 1`` plus the word REFUSED would now pass with the protected-branch guard deleted
+    entirely. Every refusal test in this section therefore names the refusal it means to prove.
+    """
     r = _run(f"refs/heads/x {_SHA} refs/heads/main {_ZERO}\n")
     assert r.returncode == 1, r.stderr
-    assert "REFUSED" in r.stderr
+    assert "direct push to refs/heads/main" in r.stderr
 
 
 def test_deleting_main_is_refused() -> None:
@@ -86,11 +97,18 @@ def test_the_cla_signature_branch_is_protected() -> None:
     """Written by the CLA Assistant action, never by a human — and every PR wedges if it is damaged."""
     r = _run(f"refs/heads/x {_SHA} refs/heads/cla-signatures {_ZERO}\n")
     assert r.returncode == 1, r.stderr
+    assert "direct push to refs/heads/cla-signatures" in r.stderr
 
 
-def test_an_ordinary_branch_push_is_allowed() -> None:
-    """The control. Without this, a guard that refused EVERYTHING would look identical to a working one."""
-    r = _run(f"refs/heads/x {_SHA} refs/heads/feature-y {_ZERO}\n")
+def test_an_ordinary_branch_push_is_allowed(tree_repo: tuple[Path, str, str]) -> None:
+    """The control. Without this, a guard that refused EVERYTHING would look identical to a working one.
+
+    Uses a REAL clean commit. It used to pass a synthetic sha, which permitted only because Guard B
+    could not read the object -- so the control asserted "the guard did not look" while reading as
+    "the guard looked and approved". Those are the two states this whole file exists to keep apart.
+    """
+    repo, clean, _dirty = tree_repo
+    r = _run(f"refs/heads/x {clean} refs/heads/feature-y {_ZERO}\n", cwd=repo)
     assert r.returncode == 0, r.stderr
     assert r.stderr.strip() == ""
 
@@ -112,17 +130,26 @@ def test_a_mixed_push_is_refused_because_one_ref_is_protected() -> None:
         f"refs/heads/b {_SHA} refs/heads/main {_ZERO}\n"
     )
     assert r.returncode == 1, r.stderr
+    assert "direct push to refs/heads/main" in r.stderr
 
 
-def test_the_escape_hatch_works_and_says_so() -> None:
+def test_the_escape_hatch_works_and_says_so(tree_repo: tuple[Path, str, str]) -> None:
     """Deliberately NOT --no-verify: a distinct variable is greppable in shell history, and cannot be
-    reached by the muscle memory that skips every other hook at once."""
+    reached by the muscle memory that skips every other hook at once.
+
+    It now permits the PROTECTED-BRANCH guard only, so the message must say which guards it skipped
+    and which still ran -- a hatch that reads as "ALLOWED" while two guards are still live invites the
+    belief that nothing is checking. See test_the_escape_hatch_does_NOT_disable_the_content_guard.
+    """
+    repo, clean, _dirty = tree_repo
     r = _run(
-        f"refs/heads/x {_SHA} refs/heads/main {_ZERO}\n",
+        f"refs/heads/x {clean} refs/heads/main {_ZERO}\n",
         {"MEFOR_ALLOW_DIRECT_PUSH": "1"},
+        cwd=repo,
     )
     assert r.returncode == 0, r.stderr
-    assert "ALLOWED" in r.stderr
+    assert "SKIPPED" in r.stderr
+    assert "still run" in r.stderr
 
 
 def test_malformed_stdin_does_not_crash_the_push() -> None:
@@ -169,14 +196,17 @@ def test_every_non_branch_non_tag_namespace_is_refused(remote_ref: str) -> None:
     assert r.returncode == 1, r.stderr
 
 
-def test_a_tag_push_is_permitted() -> None:
+def test_a_tag_push_is_permitted(tree_repo: tuple[Path, str, str]) -> None:
     """The other half of the allowlist, and a real workflow: release.yml fires on a tag push."""
-    r = _run(f"refs/tags/v9.9.9 {_SHA} refs/tags/v9.9.9 {_ZERO}\n")
+    repo, clean, _dirty = tree_repo
+    r = _run(f"refs/tags/v9.9.9 {clean} refs/tags/v9.9.9 {_ZERO}\n", cwd=repo)
     assert r.returncode == 0, r.stderr
     assert r.stderr.strip() == ""
 
 
-def test_an_all_shaped_push_of_ordinary_branches_is_permitted() -> None:
+def test_an_all_shaped_push_of_ordinary_branches_is_permitted(
+    tree_repo: tuple[Path, str, str],
+) -> None:
     """Guard A must NOT fire on ``git push --all``, and saying so is the honest half of the guard.
 
     ``--all`` sends every ref under ``refs/heads/`` and nothing else, so every line it produces is
@@ -184,9 +214,11 @@ def test_an_all_shaped_push_of_ordinary_branches_is_permitted() -> None:
     be a compensating-control claim resting on a false premise. What still catches an ``--all`` push
     is PROTECTED (main is in the set) and Guard B (the tip trees) -- see the mixed-push test above.
     """
+    repo, clean, _dirty = tree_repo
     r = _run(
-        f"refs/heads/a {_SHA} refs/heads/feature-a {_ZERO}\n"
-        f"refs/heads/b {_SHA} refs/heads/feature-b {_ZERO}\n"
+        f"refs/heads/a {clean} refs/heads/feature-a {_ZERO}\n"
+        f"refs/heads/b {clean} refs/heads/feature-b {_ZERO}\n",
+        cwd=repo,
     )
     assert r.returncode == 0, r.stderr
     assert r.stderr.strip() == ""
@@ -308,20 +340,32 @@ def test_deleting_an_unprotected_ref_is_still_permitted(tree_repo: tuple[Path, s
     assert r.stderr.strip() == ""
 
 
-def test_a_tip_tree_the_guard_cannot_read_is_treated_as_clean(
+def test_a_tip_tree_the_guard_cannot_read_is_REFUSED_not_assumed_clean(
     tree_repo: tuple[Path, str, str],
 ) -> None:
-    """FAIL-OPEN, pinned deliberately so the gap is a decision and not a discovery.
+    """FAIL-CLOSED. This test previously pinned the opposite, and the reversal is deliberate.
 
-    An object git cannot resolve reads as clean. git only ever hands a pre-push hook local objects, so
-    this is not a real push path -- it is the path the other tests in this file reach with ``_SHA``,
-    and pinning it here is what keeps THOSE tests honest: they permit because the guard could not
-    look, not because it looked and approved.
+    The earlier reasoning was that git only ever hands a pre-push hook local objects, so an
+    unreadable one "does not arise" outside tests. That holds for the OBJECT and not for the other
+    branch of the same failure: the guard resolves ``git`` through PATH while git invokes the hook by
+    absolute path, so a GUI client can run this in an environment where bare ``git`` does not resolve.
+    The old code returned ``[]`` there -- clean, permitted, nothing printed.
+
+    "There is nothing there" and "I could not look" are different facts. A guard that reports the
+    second as the first is the same defect as the shim that printed THE PUSH GUARD IS OFF and exited 0
+    (BACKLOG #1034), one layer down.
+
+    The refusal must also SAY which happened, or an operator cannot tell a real leak from a broken
+    environment.
     """
     repo, _clean, _dirty = tree_repo
     r = _run(f"refs/heads/wip {_SHA} refs/heads/wip {_ZERO}\n", cwd=repo)
-    assert r.returncode == 0, r.stderr
-    assert r.stderr.strip() == ""
+    assert r.returncode == 1, r.stderr
+    assert "could not inspect" in r.stderr
+    assert "UNJUDGED" in r.stderr, (
+        "the refusal does not distinguish 'unreadable' from 'carries private docs', so an operator "
+        "cannot tell a broken environment from a real leak"
+    )
 
 
 def test_guard_b_reads_the_tip_only_and_the_message_says_so(
@@ -354,15 +398,19 @@ def test_guard_b_reads_the_tip_only_and_the_message_says_so(
     )
 
 
-def test_the_escape_hatch_disables_the_content_guard_too(
+def test_the_escape_hatch_does_NOT_disable_the_content_guard(
     tree_repo: tuple[Path, str, str],
 ) -> None:
-    """Bypass surface, pinned as fact rather than left to be discovered.
+    """The narrowing this test's previous revision explicitly asked to be told about.
 
-    ``MEFOR_ALLOW_DIRECT_PUSH`` is named for the protected-branch case and returns before every guard,
-    so it switches off the content check as well. That is a guardrail's honest posture -- the hook's
-    own docstring calls it one -- but it must be an asserted property, not an assumption: if the
-    variable is ever narrowed to the protected-branch check alone, this test is what says so.
+    It used to pin the opposite and said so in as many words: "if the variable is ever narrowed to the
+    protected-branch check alone, this test is what says so." It has been narrowed, so this is that
+    notice -- the tripwire worked and is now re-aimed rather than deleted.
+
+    The variable's NAME carries the argument. "Allow direct push" is a claim about where a push LANDS;
+    letting it also decide what a push CARRIES is a bypass nobody asked for. One hatch must not grant
+    both, because the two decisions are not comparable: pushing to main is a judgement a human can
+    reasonably make, publishing the private security corpus is not.
     """
     repo, _clean, dirty = tree_repo
     r = _run(
@@ -370,8 +418,8 @@ def test_the_escape_hatch_disables_the_content_guard_too(
         {"MEFOR_ALLOW_DIRECT_PUSH": "1"},
         cwd=repo,
     )
-    assert r.returncode == 0, r.stderr
-    assert "ALLOWED" in r.stderr
+    assert r.returncode == 1, r.stderr
+    assert "private docs in the tip tree" in r.stderr
 
 
 # --------------------------------------------------------------------------------------------------
