@@ -703,10 +703,24 @@ def _candidate_files(argv: list[str]) -> list[tuple[Path, str]]:
     # repo-relative) or a --path snapshot in an arbitrary directory.
     if argv and argv[0] == "--path":
         if len(argv) < 2:
-            print("scan_forbidden: --path requires a directory", file=sys.stderr)
+            print("scan_forbidden: --path requires at least one file or directory", file=sys.stderr)
             sys.exit(2)
-        root = Path(argv[1])
-        return [(p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file()]
+        # EVERY path after --path is scanned, and a FILE is scanned as itself. Both used to be silent
+        # no-ops: only argv[1] was read, so trailing paths were dropped without a word, and rglob() on a
+        # non-directory yields nothing, so naming a file scanned exactly zero of it. The ZERO-files
+        # refusal below only fires when the TOTAL is zero, so mixing one real directory with dropped
+        # paths exited 0 and read as "all of these are clean". Measured 2026-08-04: a four-path audit
+        # reported clean having examined one of the four.
+        out: list[tuple[Path, str]] = []
+        for raw in argv[1:]:
+            root = Path(raw)
+            if root.is_file():
+                # rel is the bare name, matching the directory case's intent: components of the path the
+                # caller NAMED must not themselves trigger a SKIP_DIRS short-circuit.
+                out.append((root, root.name))
+                continue
+            out.extend((p, p.relative_to(root).as_posix()) for p in root.rglob("*") if p.is_file())
+        return out
     if argv:
         return [(Path(a), Path(a).as_posix()) for a in argv]
     return [(Path(p), Path(p).as_posix()) for p in _git_tracked()]
@@ -907,6 +921,16 @@ def main(argv: list[str]) -> int:
             continue
         scanned += 1
         hits.extend(scan_file(abs_path, rel, show_context=show_context))
+
+    # PRINT WHAT WAS SCANNED, not just what was loaded. Exit 0 plus a token-count line cannot tell a
+    # caller whether the files they named were examined -- and when --path silently dropped trailing
+    # paths, nothing in the output revealed it. A coverage number makes an under-scan visible without
+    # having to suspect it.
+    if path_mode:
+        print(
+            f"scan_forbidden: examined {scanned} file(s) across {len(rest) - 1} named path(s).",
+            file=sys.stderr,
+        )
 
     # A --path scan that examined ZERO files is not a pass: it means the whole tree was skipped (a
     # SKIP_DIRS component in the path, or an empty/wrong tree). Refuse rather than report a vacuous clean.

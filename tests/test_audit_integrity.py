@@ -5,9 +5,11 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -350,6 +352,383 @@ def test_audit_verify_cli_refuses_missing_db(
     assert main(["audit-verify", "--db", str(missing)]) == 2
     assert "no audit database" in capsys.readouterr().err
     assert not missing.exists()  # we refused before opening, so no empty DB was littered
+
+
+# --- BACKLOG #328: `audit-anchor` + `audit-verify --expected-anchor` -----------------------------
+#
+# The hash chain links each row to its predecessor, so deleting the NEWEST rows leaves a shorter chain
+# that still walks cleanly: a bare `audit-verify` reports OK on a truncated log. `audit_anchor()` and
+# `verify_audit_chain(expected_anchor=...)` already existed on the store protocol and all three
+# backends; nothing exposed them to an operator, so the capability was unreachable from the CLI.
+#
+# The anchor is an EXACT point-in-time seal (measured, not assumed — see
+# test_an_anchor_goes_stale_on_the_next_appended_row): it compares BOTH the row count and the head
+# hash, so it is checked against a quiesced chain, not carried across normal operation.
+
+
+def _seed_audit_rows(db: Path, n: int) -> None:
+    """Write ``n`` audit rows into a fresh store at ``db`` and close it."""
+
+    async def _run() -> None:
+        s = await MessageStore.open(db)
+        for i in range(n):
+            await s.record_audit(f"act{i}", actor="x")
+        await s.close()
+
+    asyncio.run(_run())
+
+
+def _truncate_audit_tail(db: Path, keep: int) -> None:
+    """Delete every audit row past the first ``keep`` — the attack the chain walk cannot see."""
+
+    async def _run() -> None:
+        s = await MessageStore.open(db)
+        await s._db.execute("DELETE FROM audit_log WHERE id > ?", (keep,))
+        await s._db.commit()
+        await s.close()
+
+    asyncio.run(_run())
+
+
+def test_audit_anchor_cli_prints_count_and_head(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    db = tmp_path / "anchor.db"
+    _seed_audit_rows(db, 2)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    assert re.fullmatch(r"2:[0-9a-f]{64}", anchor), anchor
+
+    # The printed form must be exactly what the verify flag consumes — a round-trip, not two shapes
+    # that merely look alike.
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_audit_anchor_cli_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    db = tmp_path / "anchor_json.db"
+    _seed_audit_rows(db, 2)
+
+    assert main(["audit-anchor", "--db", str(db), "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 2
+    assert re.fullmatch(r"[0-9a-f]{64}", payload["head"])
+    # `anchor` is the pre-joined COUNT:HEAD a job can hand straight back, so a caller never has to
+    # re-derive the separator convention from two fields.
+    assert payload["anchor"] == f"{payload['count']}:{payload['head']}"
+
+
+def test_audit_anchor_cli_refuses_missing_db(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # M-31 parity with the verify twin, and it bites harder here: opening a SQLite store CREATES it,
+    # so a typo'd --db would mint an empty DB and print `0:` — an anchor OF NOTHING, which a later
+    # verify against that same wrong database would confirm forever.
+    missing = tmp_path / "typo.db"
+    assert main(["audit-anchor", "--db", str(missing)]) == 2
+    assert "no audit database" in capsys.readouterr().err
+    assert not missing.exists()
+
+
+def test_expected_anchor_detects_a_truncated_tail(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The load-bearing case: the blindness, and the thing that closes it, in one test.
+
+    Half (a) pins the gap this feature exists for — a bare verify reports OK after the tail is cut.
+    If half (a) ever fails, the walk itself has changed and this whole subcommand needs re-reasoning.
+    Half (b) is the fix. Asserting only (b) would let someone "close" the finding by changing the
+    walk while nobody noticed the two halves had stopped describing the same system.
+    """
+    db = tmp_path / "trunc.db"
+    _seed_audit_rows(db, 4)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+
+    _truncate_audit_tail(db, keep=2)
+
+    # (a) the surviving prefix still chains cleanly — the bare walk cannot see the deletion.
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+    # (b) the anchor sees it.
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    out = capsys.readouterr().out
+    assert "truncated or rewritten" in out and "FAIL" in out
+
+
+def test_expected_anchor_rejects_a_malformed_value(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A silently-ignored anchor is worse than no anchor: the command still exits 0, so the compliance
+    # job reports green while checking nothing. It must refuse loudly and name the form.
+    db = tmp_path / "malformed.db"
+    _seed_audit_rows(db, 2)
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", "garbage"]) == 2
+    err = capsys.readouterr().err
+    assert "COUNT:HEAD" in err and "malformed audit anchor" in err
+
+
+def test_expected_anchor_accepts_the_empty_log_anchor(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # `audit_anchor()` returns (0, "") for an empty log, so `0:` must round-trip — otherwise a fresh
+    # instance is the one state that cannot be anchored, and the parser's strictness would have
+    # created a hole exactly where an operator starts.
+    db = tmp_path / "empty.db"
+    _seed_audit_rows(db, 0)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    assert capsys.readouterr().out.strip() == "0:"
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", "0:"]) == 0
+
+
+def test_expected_anchor_file_round_trips(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The real compliance-job shape: `audit-anchor > anchor.txt` now, `--expected-anchor-file` later.
+    db = tmp_path / "file.db"
+    anchor_file = tmp_path / "anchor.txt"
+    _seed_audit_rows(db, 4)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor_file.write_text(capsys.readouterr().out, encoding="utf-8")  # trailing newline included
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(anchor_file)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+    _truncate_audit_tail(db, keep=1)
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(anchor_file)]) == 1
+    assert "truncated or rewritten" in capsys.readouterr().out
+
+
+def test_expected_anchor_file_refuses_an_unreadable_path(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # A missing anchor file must not degrade to an unanchored verify: an attacker who can cut the
+    # audit tail can also delete the file that would prove it.
+    db = tmp_path / "nofile.db"
+    _seed_audit_rows(db, 2)
+
+    assert (
+        main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(tmp_path / "x")]) == 2
+    )
+    assert "cannot read --expected-anchor-file" in capsys.readouterr().err
+
+
+def test_expected_anchor_file_refuses_a_utf16_file_without_crashing(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A mis-encoded anchor file must exit 2, not raise — and above all not exit 1.
+
+    ``UnicodeDecodeError`` subclasses ``ValueError``, NOT ``OSError``, so a guard that catches only
+    ``OSError`` lets a decode error escape as an unhandled traceback whose exit code is **1** — the
+    same code ``audit-verify`` returns for a BROKEN CHAIN. A compliance job keying on exit codes would
+    read "your anchor file is UTF-16" as "the audit log was tampered with".
+
+    Not an exotic input: this product deploys as a Windows service, and PowerShell 5.1's ``>``
+    redirection writes UTF-16LE with a BOM.
+    """
+    db = tmp_path / "utf16.db"
+    anchor_file = tmp_path / "anchor-utf16.txt"
+    _seed_audit_rows(db, 3)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    anchor_file.write_bytes(anchor.encode("utf-16"))  # BOM + UTF-16LE: what PS 5.1 `>` writes
+    assert anchor_file.read_bytes()[:2] == b"\xff\xfe", "fixture is not the UTF-16LE BOM shape"
+
+    rc = main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(anchor_file)])
+    assert rc == 2, "a file-encoding problem must not share an exit code with a detected tamper"
+    err = capsys.readouterr().err
+    assert "cannot read --expected-anchor-file" in err
+    assert "UTF-8" in err  # names the actual requirement, not just the exception
+
+
+def test_expected_anchor_file_accepts_a_utf8_bom(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The other half of the same Windows reality: PS 5.1's `Out-File`/`Set-Content -Encoding utf8`
+    # writes UTF-8 WITH a BOM. Refusing that would leave a Windows operator with no working idiom, so
+    # the read is `utf-8-sig`, which absorbs it (and is a no-op on BOM-less UTF-8).
+    db = tmp_path / "utf8bom.db"
+    anchor_file = tmp_path / "anchor-bom.txt"
+    _seed_audit_rows(db, 3)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    anchor_file.write_bytes(anchor.encode("utf-8-sig"))
+    assert anchor_file.read_bytes()[:3] == b"\xef\xbb\xbf", "fixture is not the UTF-8 BOM shape"
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor-file", str(anchor_file)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_expected_anchor_accepts_an_uppercased_head(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """An upper-cased head is the SAME anchor and must verify, not raise a tamper alarm.
+
+    ``verify_audit_chain`` compares the head byte-exactly (``hmac.compare_digest`` over
+    ``audit_mac_bytes``), so a head differing only in case reports ``truncated or rewritten`` on a
+    chain nothing has touched. Anchors get copied through tickets, spreadsheets and change records,
+    which upper-case things; a control whose FAIL is supposed to mean something must not be able to
+    manufacture one out of its own input handling. The parser normalises instead.
+    """
+    db = tmp_path / "upper.db"
+    _seed_audit_rows(db, 3)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    count, _, head = capsys.readouterr().out.strip().partition(":")
+    assert head.islower() and len(head) == 64  # the shape being normalised away
+
+    rc = main(["audit-verify", "--db", str(db), "--expected-anchor", f"{count}:{head.upper()}"])
+    assert rc == 0
+    assert "OK" in capsys.readouterr().out
+
+
+def test_expected_anchor_refuses_a_truncated_head_as_malformed_not_tampering(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A short head is bad INPUT (rc 2), never a tamper detection (rc 1).
+
+    The trap is baited by the product itself: the FAIL message prints both heads truncated to 12
+    characters, so an operator retrying with the value they can see supplies a 12-character head. A
+    hex-only check accepts it, the byte-exact comparator cannot match it, and the operator gets
+    ``truncated or rewritten`` — with the message's own evidence line showing the two heads as
+    IDENTICAL, because it truncates the live one to the same 12 characters. Requiring the full digest
+    width turns that into an actionable input error.
+    """
+    db = tmp_path / "shorthead.db"
+    _seed_audit_rows(db, 3)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    count, _, head = capsys.readouterr().out.strip().partition(":")
+
+    rc = main(["audit-verify", "--db", str(db), "--expected-anchor", f"{count}:{head[:12]}"])
+    assert rc == 2
+    captured = capsys.readouterr()
+    assert "malformed audit anchor" in captured.err and "64-character digest" in captured.err
+    assert "truncated or rewritten" not in captured.out, (
+        "a 12-character head is malformed input, but the chain was reported as truncated or "
+        "rewritten — a false tamper alarm costs this control as much as a missed one"
+    )
+
+
+def test_parse_anchor_passes_an_isolated_module_mac_through() -> None:
+    """An ADR 0138 ``vault_transit`` head is NOT hex, and must round-trip anyway.
+
+    In that mode ``audit_row_hash`` delegates to ``TransitCipher.audit_hmac``, which returns Vault's
+    own opaque ``vault:v1:<base64>`` string; that string is what lands in ``audit_log.row_hash`` and
+    therefore what ``audit_anchor()`` prints. A hex-only head check refuses it — so the operator
+    control would have been unusable on the one store mode where the audit chain is keyed with no
+    in-heap key. Unit-level because reaching it end-to-end needs a live Transit backend.
+    """
+    from messagefoundry.__main__ import _parse_anchor
+
+    head = "vault:v1:" + base64.b64encode(b"\x01" * 32).decode("ascii")
+    assert not all(c in "0123456789abcdefABCDEF" for c in head)  # the reason this case exists
+    # The count/head split must survive the MAC's own internal colons (partition on the FIRST only).
+    assert _parse_anchor(f"7:{head}") == (7, head)
+
+
+def test_expected_anchor_and_file_are_mutually_exclusive(tmp_path: Path) -> None:
+    # Two transports for one value: argparse refuses both rather than letting one silently win.
+    db = tmp_path / "excl.db"
+    _seed_audit_rows(db, 1)
+    with pytest.raises(SystemExit) as exc:
+        main(
+            [
+                "audit-verify",
+                "--db",
+                str(db),
+                "--expected-anchor",
+                "1:" + "0" * 64,
+                "--expected-anchor-file",
+                str(tmp_path / "a.txt"),
+            ]
+        )
+    assert exc.value.code == 2
+
+
+def test_an_anchor_goes_stale_on_the_next_appended_row(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The anchor is an EXACT seal, not a monotonic-prefix check — pinned so nobody loosens it.
+
+    Measured against the shipped comparator: ``count < exp_count or not head_ok``, where ``head_ok``
+    compares the LAST row's hash. Appending one legitimate row therefore moves the head and the
+    anchor reports ``truncated or rewritten`` on a chain that merely GREW.
+
+    That is a real ergonomic sharp edge, and the docs say so — anchor against a quiesced chain. It is
+    pinned here because the obvious "fix" (drop the head compare, keep ``count < exp_count``) would
+    take a real detection with it: see
+    ``test_expected_anchor_detects_a_same_count_tail_replacement``, which a count-only comparator
+    would pass. The false alarm and that detection are the SAME check. If this test ever needs to
+    change, the comparator semantics are being changed with it.
+    """
+    db = tmp_path / "stale.db"
+    _seed_audit_rows(db, 4)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+
+    async def _append_one() -> None:
+        s = await MessageStore.open(db)
+        await s.record_audit("legitimate", actor="x")
+        await s.close()
+
+    asyncio.run(_append_one())
+
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    assert "truncated or rewritten" in capsys.readouterr().out
+
+
+def test_expected_anchor_detects_a_same_count_tail_replacement(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The case that makes the head compare load-bearing rather than merely strict.
+
+    An attacker who cuts the newest rows and forges the same number of replacements restores the row
+    COUNT and leaves a chain that walks cleanly (on a keyless store they can recompute it end to end).
+    Measured: the bare walk reports ``verified 4 audit row(s)``, and a hypothetical count-only
+    comparator would pass too, because ``4 < 4`` is false. Only the head hash differs.
+
+    So the head compare is not redundant with the row count, and the false alarm pinned by
+    ``test_an_anchor_goes_stale_on_the_next_appended_row`` is the price of THIS detection — not an
+    independent wart that can be filed off on its own.
+    """
+    db = tmp_path / "replaced.db"
+    _seed_audit_rows(db, 4)
+
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    anchor = capsys.readouterr().out.strip()
+    expected_count = int(anchor.split(":", 1)[0])
+
+    _truncate_audit_tail(db, keep=2)
+
+    async def _forge_two() -> None:
+        s = await MessageStore.open(db)
+        for i in range(2):
+            await s.record_audit(f"forged{i}", actor="attacker")
+        await s.close()
+
+    asyncio.run(_forge_two())
+
+    # The row count is back to where it started, so a count-only check has nothing to complain about.
+    assert main(["audit-anchor", "--db", str(db)]) == 0
+    assert int(capsys.readouterr().out.strip().split(":", 1)[0]) == expected_count
+
+    # And the chain itself walks cleanly — the forged rows chain correctly from their predecessor.
+    assert main(["audit-verify", "--db", str(db)]) == 0
+    assert "OK" in capsys.readouterr().out
+
+    # The head hash is what gives it away.
+    assert main(["audit-verify", "--db", str(db), "--expected-anchor", anchor]) == 1
+    assert "truncated or rewritten" in capsys.readouterr().out
 
 
 def test_rekey_audit_cli(

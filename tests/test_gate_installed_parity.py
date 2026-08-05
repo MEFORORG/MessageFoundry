@@ -102,9 +102,34 @@ def content_hash(data: bytes) -> str:
     return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
 
 
+def _code_lines(text: str) -> str:
+    """``text`` with whole-line ``#`` comments dropped, so a text scan reads CODE and not prose."""
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
 def handled_tools(text: str) -> set[str]:
+    """Tool names the gate BRANCHES on -- read from its code, never from a comment.
+
+    ``TOOL_BRANCH`` is a text scan, and worktree_gate.ps1 writes rule 4's condition verbatim inside a
+    comment as well as in the rule: ``$tool -in @("EnterWorktree")`` appears at :272 (deliberately, and
+    it says so at :272-274) and again at :281 as the actual ``if``. A scan over the raw text therefore
+    credits the gate with a rule on the strength of PROSE -- delete the ``if`` at :281 and this function
+    still reports EnterWorktree handled, so ``test_the_opt_in_list_only_names_tools_the_gate_actually_has``
+    goes on excusing an exemption for a rule that is gone. That test exists to make the exemption track
+    the script rather than outlive it, and a comment-satisfied match is exactly how it outlives it.
+
+    Measured 2026-08-04, source and installed copy alike: the returned set is unchanged by this filter
+    (the same 10 tools, EnterWorktree included), because :281 is code and carries it. The filter costs
+    nothing today; it removes the way this could lie tomorrow.
+
+    LIMIT, stated rather than left to be discovered: only whole-line ``#`` comments are dropped. A
+    ``<# ... #>`` block (the gate opens one at :1 and closes it at :33) and a trailing ``#`` after code
+    on the same line are both invisible here, so a tool branch quoted inside either would still count.
+    Neither holds one today -- the five ``$tool -in``/``-notin`` lines are 272, 281, 400, 435 and 701 --
+    and a regex taught to recognise PowerShell's comment forms would just be a second, worse parser.
+    """
     tools: set[str] = set()
-    for group in TOOL_BRANCH.findall(text):
+    for group in TOOL_BRANCH.findall(_code_lines(text)):
         tools.update(QUOTED.findall(group))
     return tools
 
@@ -179,8 +204,14 @@ def test_the_installed_gate_matches_the_committed_source() -> None:
         f"CONTENT DRIFT: the RUNNING gate is not this checkout's script.\n"
         f"  installed: {INSTALLED_GATE}  content={installed[:12]}\n"
         f"  source   : {SOURCE_GATE}  content={source[:12]}\n"
-        f"Line endings are folded out of this comparison, so this is a real difference in rules or "
-        f"logic -- CRLF vs LF cannot produce it.\n"
+        f"Line endings are folded out of this comparison, so CRLF vs LF alone cannot have produced it. "
+        f"That is the only difference the fold hides, which is NOT the same as this being a difference "
+        f"in rules or logic: the fold rewrites \\r\\n and nothing else, so at least three non-rule "
+        f"causes still trip this assertion -- a UTF-8 BOM on one side, a dropped final newline, and "
+        f"CR-only (lone \\r) line endings. A re-install would clear any of the three -- install-gate.ps1 "
+        f"copies the bytes verbatim -- but it clears a genuine rule difference the same way, so the fact "
+        f"that it worked tells you NOTHING about which one you had. Diff the two files and confirm the "
+        f"difference is in the rules before you treat this as staleness.\n"
         f"Until the installed copy is replaced, rules added or removed in source have NO EFFECT and the "
         f"rest of the suite still passes.\n"
         f"WORK OUT WHICH COPY IS OLDER FIRST. Installing from a checkout older than the installed gate "
@@ -222,15 +253,27 @@ def test_the_parity_check_still_detects_a_content_difference() -> None:
     )
 
     # And the subtle end of the range: one character inside an existing rule, no line added or removed.
-    flipped = body.replace(b'$tool -in @("EnterWorktree")', b'$tool -in @("EnterWorktreX")', 1)
-    assert flipped != body, (
-        "probe edit matched nothing -- the gate's rule syntax moved, fix this control"
+    #
+    # Anchor on the whole `if (...) {` line, not on the bare condition. The condition alone occurs TWICE
+    # in the gate -- :272 inside a comment that quotes it deliberately, :281 as the rule -- and
+    # `replace(..., 1)` takes the FIRST, so this probe used to mutate a comment while its own output
+    # called that "an existing rule". The hash moved either way, which is why the control passed and
+    # nothing said so. Appending `) {` makes the literal unique to the code, and the count below proves
+    # that rather than asserting it in prose.
+    rule = b'if ($tool -in @("EnterWorktree")) {'
+    occurrences = body.count(rule)
+    assert occurrences == 1, (
+        f"rule 4's `if` line occurs {occurrences} times in the gate, not once. At 0 the rule syntax "
+        f"moved and this probe now mutates nothing; above 1 it cannot say WHICH occurrence it hit, "
+        f"which is the ambiguity it was re-anchored to escape. Fix this control."
     )
+    flipped = body.replace(rule, b'if ($tool -in @("EnterWorktreX")) {', 1)
     assert content_hash(flipped) != content_hash(body), (
-        "a one-character rule edit did not change the content hash"
+        "a one-character edit to rule 4's `if` condition did not change the content hash"
     )
     print(
-        "content differences still detected: rule added, and one character changed in an existing rule"
+        "content differences still detected: rule added, and one character changed inside rule 4's "
+        "`if` condition line -- the code, not the comment that quotes it"
     )
 
 

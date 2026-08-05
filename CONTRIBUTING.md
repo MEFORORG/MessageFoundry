@@ -78,13 +78,23 @@ seeing nothing — the failure mode this project has hit more than once. Do not 
 `--require-tokens`, and do not reach for `--no-verify`.
 
 - **Outside contributors** cannot have the real list; it will never be distributable. Run
-  `setup-leak-gate.ps1 -Synthetic` to install the committed synthetic template. Your commits will
-  pass, and **CI runs the real detector set on your PR** — that is the authoritative check.
+  `setup-leak-gate.ps1 -Synthetic` to install the committed synthetic template. It is a DIFFERENT
+  detector set, not a weaker copy of the real one: its placeholders are the fictional customer and
+  partner names this project's own docs and samples use throughout, so staging one of those files
+  can block a commit that leaks nothing. Read the run banner to see which set is loaded, and judge
+  the hit on that. **CI runs the real detector set on your PR** — that is the authoritative check.
 - **Maintainers** install the real list: `setup-leak-gate.ps1 -From <path>`.
 
-The script always finishes by running the scanner and printing its per-section detector counts,
-because a green gate is evidence only if you confirmed it can see. The scanner labels its mode on
-every run, so a synthetic set can never be mistaken for a real one:
+**Writing a placeholder site code?** Use a non-numeric stand-in — `SITEA`, or the angle-bracket
+`<site>` form. The token list's `[site_prefix]` guidance is written for whoever fills that list *in*;
+read as advice for placeholder *values* it points you straight at a prefix this gate then detects in
+your tracked prose, and the hook blocks the commit.
+[`scripts/security/scan-tokens.local.txt.example`](scripts/security/scan-tokens.local.txt.example) is
+the source of record for the detail.
+
+`setup-leak-gate.ps1` always finishes by running the scanner and printing its per-section detector
+counts, because a green gate is evidence only if you confirmed it can see. The scanner labels its
+mode on every run, so a synthetic set can never be mistaken for a real one:
 
 ```
 loaded names=7, estate=13, estate_file_scanned=12, site_prefixes=1
