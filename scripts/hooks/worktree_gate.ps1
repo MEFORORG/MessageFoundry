@@ -58,7 +58,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.07.29.2"
+$GateVersion = "2026.08.05.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -753,7 +753,53 @@ turned off and I need you to do it." Do not disable it yourself.
 "@
 }
 
-$root = Test-Governed (Get-ComparablePath $target)
+# ---------------------------------------------------------------------------------------------------
+# Rule 1's ONE EXEMPTION -- <primary>/.git/mefor-coord/, the cross-session coordination state.
+#
+# Rule 1 says its subject is the primary's WORKING TREE, but it decides that by prefix-matching the
+# primary's path STRING, and for one whole subtree those are different questions with different answers:
+# nothing under <primary>/.git/ is in the working tree at all, because git forbids a tracked path
+# component named `.git`. So the sessions writing exactly where they are DESIGNED to write -- announce
+# delivery receipts at .git/mefor-coord/announce/sent/<session-id>.tsv, and the coordination handoff
+# documents beside them, in the git COMMON dir all 46 worktrees share -- were refused by the rule that
+# protects the tree those files are not in.
+#
+# Measured from this gate's own deny log (~/.claude/hooks/worktree-gate.log), 2026-08-02..2026-08-05:
+# 8 rule=1 Write denies on .git/mefor-coord/ paths, from 6 DISTINCT worktrees, against 17 rule=1 denies
+# in the whole log -- 47% of every rule-1 firing ever recorded was this false positive. A count, not an
+# intuition, the same way the 29% in the docstring above is what keyed this gate to the target path
+# instead of the cwd. And it was never only the receipts: 4 of the 8 were handoff documents, so the
+# entire state root was unreachable, not one filename inside it.
+#
+# NARROWED TO mefor-coord/ ALONE -- never the common dir, never all of .git/. core.hooksPath is UNSET in
+# this repo, which makes <primary>/.git/hooks/ the LIVE hook directory for every worktree at once: a
+# Write to .git/hooks/pre-commit disarms the commit-time ledger, claim and secret-leak gates for every
+# session on this machine, which is the exact blast radius rule 3c refuses for the `git config
+# core.hooksPath` spelling of the same move. Rule 1's over-broad prefix is CURRENTLY THE ONLY THING
+# blocking the direct-write route to those files, so exempting .git/ wholesale would trade a false
+# positive for a hole. .git/config and every other path under .git/ therefore stay denied, and the
+# trailing separator is required so a sibling named .git/mefor-coordX cannot match its way in.
+#
+# IT LIVES IN RULE 1 AND NOT IN Test-Governed, even though its shape is identical to the
+# .claude/worktrees/ exemption already sitting there. Rule 3 feeds the SESSION'S cwd through
+# Test-Governed, and `cd <primary>/.git/mefor-coord && git reset --hard` resolves GIT_DIR to the primary
+# and swaps the shared working tree -- exempting this path inside Test-Governed would open that bypass to
+# buy back a write. Rule 1 judges a WRITE TARGET, so only rule 1 gets the carve-out. The public fork of
+# this gate reached the same split from the other direction: it carries a separate Test-GovernedSharedDir
+# for rules 3c/3d precisely because the .claude/worktrees/ exemption gives the wrong answer once the blast
+# radius is the shared .git.
+#
+# Matched on the ALREADY-CANONICALISED target, so a traversal back out of the exempt subtree --
+# <primary>/.git/mefor-coord/../../messagefoundry/api/app.py -- resolves into the working tree and still
+# denies. Get-ComparablePath returns "" on a path it cannot resolve, which matches nothing here and falls
+# through to Test-Governed, i.e. to the behaviour this block did not exist to change.
+# ---------------------------------------------------------------------------------------------------
+$targetCmp = Get-ComparablePath $target
+foreach ($r in $roots) {
+    if ($targetCmp.StartsWith("$($r.Compare)/.git/mefor-coord/")) { exit 0 }
+}
+
+$root = Test-Governed $targetCmp
 if (-not $root) { exit 0 }
 
 $display = $root.Display
@@ -783,7 +829,10 @@ $worktreeHint = if ($worktrees.Count -gt 0) {
 Write-Deny -Rule "1" -Detail $target -Reason @"
 BLOCKED: this write targets the SHARED PRIMARY checkout ($display), where concurrent sessions collide.
 This is a hard gate. Re-issuing the same edit will fail again -- do not retry it, and do not route around
-it with a shell command; that only hides the collision.
+it with a shell command; that only hides the collision. That this gate inspects only Write/Edit/MultiEdit/
+NotebookEdit is its SCOPE and not its rule -- the rule is the CONJUNCTION of one of those tools and a
+target path inside the primary -- so a write that lands in the primary by any other route breaks the same
+rule and is simply unobserved, never permitted.
 
 You are NOT blocked from working. Writes to any linked worktree, to the scratchpad, or to any other repo
 are allowed FROM THIS SESSION -- you do not need to relocate, cd, or restart. Only the primary's own
