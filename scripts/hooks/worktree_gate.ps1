@@ -405,7 +405,23 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     # dies with "fatal: '$dest' is already checked out at ...". That is the same defect class this
     # remediation was just fixed for -- a printed command the receiving side rejects. `git checkout main`
     # from any linked worktree is the common shape. $list is the porcelain already read above.
-    if ($list -contains ("branch refs/heads/" + $dest)) { return }
+    #
+    # BUT ONLY WITH NO FLAGS AT ALL, and that is an ALLOWLIST on purpose. "git already refuses this" is
+    # a claim about a CONFIGURATION, not about git: a guard you do not own can be switched off by its
+    # own caller. Measured against a branch live in another worktree --
+    #     checkout/switch <b>                        -> fatal, git refuses      (deferring is sound)
+    #     checkout/switch --force / --discard-changes -> fatal                  (deferring is sound)
+    #     checkout/switch --ignore-other-worktrees <b> -> SWITCHES              (guard disabled)
+    #     checkout/switch --detach <b>, and -d <b>    -> SWITCHES               (never takes the lock,
+    #                                                    but still swaps the other session's files)
+    # -- and the dest scanner above skips '-'-prefixed tokens, so every one of those still resolves
+    # $dest normally. A denylist was written twice here and was wrong twice: --detach was missed while
+    # fixing --ignore-other-worktrees, and `-d` would have been missed while fixing --detach. Git may
+    # add a third tomorrow and the gate would silently reopen. So: any flag present means DENY. The cost
+    # is a needless deny on `git checkout --quiet main`, whose remediation line is then the imperfect
+    # one; that is strictly better than a missed hijack, and unlike a flag list it does not decay.
+    $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
+    if (-not $hasFlag -and ($list -contains ("branch refs/heads/" + $dest))) { return }
 
     $newHint = "$($gov.Display)\scripts\worktree\new.ps1"
     $destSlug = ConvertTo-WorktreeSlug $dest

@@ -263,6 +263,38 @@ def test_the_rule_3b_remediation_creates_a_sibling_worktree_on_the_real_branch(
     assert marker.read_text(encoding="utf-8").strip() == r.other
 
 
+@pytest.mark.parametrize("verb", ["checkout", "switch"])
+def test_a_branch_checked_out_elsewhere_is_left_to_gits_own_guard(
+    repo: SimpleNamespace, verb: str
+) -> None:
+    """`main` is checked out in the primary, so git refuses this switch without us.
+
+    Denying it anyway would print `new.ps1 -Branch main`, which dies with "already checked out at" --
+    another command the receiving side rejects, for the most ordinary shape there is.
+    """
+    assert run_gate(shell(f"git {verb} main", cwd=repo.wt), repo.repos) is None
+
+
+@pytest.mark.parametrize("verb", ["checkout", "switch"])
+def test_ignore_other_worktrees_still_denies(repo: SimpleNamespace, verb: str) -> None:
+    """The flag that turns git's native guard OFF must not inherit the pass given above.
+
+    Measured, for BOTH verbs -- `--[no-]ignore-other-worktrees` is accepted by checkout and switch
+    alike, so covering only one spelling would leave the hole open under the other word:
+
+        git <verb> main                            -> fatal: 'main' is already used by worktree at ...
+        git <verb> --ignore-other-worktrees main   -> Switched to branch 'main'
+
+    That is worse than the case rule 3b was written for: a LIVE worktree loses its branch mid-task,
+    rather than a free branch being grabbed. The general form of the bug is that deferring to a guard
+    you do not own is sound only while that guard is switched on, and its own caller can switch it off.
+    """
+    reason = assert_denied(
+        run_gate(shell(f"git {verb} --ignore-other-worktrees main", cwd=repo.wt), repo.repos)
+    )
+    assert "LINKED WORKTREE" in reason
+
+
 def test_the_emitted_name_is_derived_from_the_branch(repo: SimpleNamespace) -> None:
     """Two different branches must yield two different directories.
 
