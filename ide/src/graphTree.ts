@@ -17,7 +17,7 @@ import {
   type RuntimeMap,
   type VmNode,
 } from "./graphModel";
-import { buildSymbolIndex, matchSymbols, type SymbolDef, type SymbolKind } from "./symbolIndex";
+import { buildSymbolIndex, definitionsSection, matchSymbols, type SymbolDef } from "./symbolIndex";
 
 export type { Graph, GroupingMode, Perspective };
 
@@ -181,10 +181,11 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
         ? buildElementsView(g, this.filter, this.runtime)
         : buildFlowView(g, this.filter, this.grouping);
     const roots = vms.map((vm) => new Node(vm, undefined));
-    // While searching, append a "Definitions" section for handler/router/transform *symbols* matched by
-    // name (#228) — the graph view only reaches element names, so a transform (`def xform_…`) or a
-    // differently-named handler function inside a role-combined feed is otherwise unfindable. Names
-    // already shown as element rows are excluded so nothing double-lists.
+    // While searching, append a "Definitions" section for the source *symbols* matched by name (#228)
+    // — every SymbolKind, i.e. the handler/router/transform defs AND the `Send(…)` call sites. The
+    // graph view only reaches element names, so a transform (`def xform_…`) or a differently-named
+    // handler function inside a role-combined feed is otherwise unfindable. Names already shown as
+    // element rows are excluded so nothing double-lists (see collectElementNames for the one exemption).
     const f = this.filter.trim();
     if (f) {
       const defs = matchSymbols(this.symbols, f, collectElementNames(vms));
@@ -245,14 +246,16 @@ export class GraphProvider implements vscode.TreeDataProvider<Node> {
   }
 }
 
-const SYMBOL_ICON: Record<SymbolKind, string> = {
-  handler: "symbol-method",
-  router: "git-branch",
-  transform: "symbol-function",
-};
-
 /** Every graph-element name currently shown (any perspective), so the Definitions section can exclude
- *  names that already appear as element rows and not double-list them. */
+ *  names that already appear as element rows and not double-list them.
+ *
+ *  ONE deliberate exemption, recorded here because this is where the no-double-list rule is stated and
+ *  where a future reader will come looking: a `send` Definitions row is exempt (`matchSymbols`). It is
+ *  not a second rendering of the outbound — it is the CALL SITE that addresses it, at a different file
+ *  and line, described "sends to …" and carrying no element identity. ADR 0091 AC-4's "each element
+ *  under exactly one section exactly once" governs the element perspective's own rows and is not
+ *  weakened by it; without the exemption every send row would be filtered out (a send row's name is by
+ *  definition a connection name, so it is always in this set) and #228 remainder (b) would ship dead. */
 function collectElementNames(vms: VmNode[]): Set<string> {
   const names = new Set<string>();
   const walk = (n: VmNode): void => {
@@ -263,28 +266,4 @@ function collectElementNames(vms: VmNode[]): Set<string> {
   };
   vms.forEach(walk);
   return names;
-}
-
-/** The "Definitions" search section: one row per matched symbol, each opening its file at the def line.
- *  A handler/router row also carries its (kind, name) so reveal / open-wiring-map work on it; a
- *  transform is a pure jump (it is not a graph element). */
-function definitionsSection(defs: SymbolDef[]): VmNode {
-  return {
-    id: "section:definitions",
-    label: `Definitions (${defs.length})`,
-    kind: "section",
-    icon: "search",
-    collapsible: "expanded",
-    children: defs.map((d, i) => ({
-      id: `def:${d.kind}:${d.name}:${d.file}:${d.line}:${i}`,
-      label: d.name,
-      kind: "element",
-      description: `${d.kind} · ${path.basename(d.file)}`,
-      icon: SYMBOL_ICON[d.kind],
-      collapsible: "none",
-      children: [],
-      ...(d.kind === "transform" ? {} : { elementKind: d.kind, elementName: d.name }),
-      open: { file: d.file, line: d.line },
-    })),
-  };
 }
