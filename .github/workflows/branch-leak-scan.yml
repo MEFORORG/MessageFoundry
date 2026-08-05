@@ -62,6 +62,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # zizmor artipacked: checkout leaves the job token in .git/config unless told not to, and a
+          # later step or a packaged artifact can then carry it. This job only READS the tree and runs
+          # a scanner -- it pushes nothing and calls no API -- so it needs no persisted credential and
+          # the flag costs nothing. Fixed here rather than suppressed in .github/zizmor.yml: that file
+          # is for findings that are safe-by-design, and this one is simply fixable.
+          persist-credentials: false
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.14"
