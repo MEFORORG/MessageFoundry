@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -580,3 +581,170 @@ def test_the_installed_assertion_can_detect_an_absent_hook() -> None:
             f"the marker predicate matched {expected!r} in text that does not contain it ({shim})"
         )
     print(f"marker predicate rejects unmarked text for {sorted(SHIM_MARKERS)}")
+
+
+# --------------------------------------------------------------------------------------------------
+# WHAT HAPPENS WHEN THE GATE CANNOT RUN -- the fail-open the shims used to carry.
+#
+# Both shims resolved an interpreter and, finding none, printed "THE PUSH GUARD IS OFF for this push"
+# (or the claim-gate equivalent) and EXITED 0. Git reads 0 as permission, so the one condition in
+# which the guard is provably not evaluating anything was also the condition in which it waved
+# everything through. That is the worst possible pairing: silent, and biased toward permitting.
+#
+# It was not theoretical on this box -- the only `python` on PATH is a per-user Microsoft Store
+# app-execution alias, exactly the kind of entry that stops resolving after a profile or Store change.
+#
+# These are SOURCE-level tests of the generated shim text, so unlike everything above them they run on
+# CI too: the property belongs to the installer, not to any box's installed copy.
+# --------------------------------------------------------------------------------------------------
+
+# The shims are PowerShell here-strings (@'...'@). Captured by variable name so a test can say WHICH
+# shim it is asserting about, and so an added third shim is visible as a new key rather than silently
+# unchecked.
+HERE_STRINGS: dict[str, str] = dict(
+    re.findall(r"\$(\w+)\s*=\s*@'\r?\n(.*?)\r?\n'@", _HOOK_SRC, re.DOTALL)
+)
+SHIM_VARS = ("claimHook", "pushHook")
+
+
+def test_the_shim_bodies_were_parsed_from_the_installer() -> None:
+    """Guard the source. An empty parse makes every assertion below vacuously green."""
+    print(f"here-strings parsed from {HOOK_INSTALLER.name}: {sorted(HERE_STRINGS)}")
+    missing = [v for v in SHIM_VARS if v not in HERE_STRINGS]
+    assert not missing, (
+        f"no here-string parsed for {missing} -- the shim variables were renamed or the quoting "
+        f"changed, and the fail-closed assertions below would pass without reading any shim"
+    )
+
+
+@pytest.mark.parametrize("var", SHIM_VARS)
+def test_the_shim_refuses_rather_than_permits_when_no_interpreter_resolves(var: str) -> None:
+    """The no-interpreter branch must exit NONZERO and say how to proceed deliberately.
+
+    Asserting on the branch rather than on the file as a whole: ``exit 0`` is a perfectly ordinary
+    thing for a shell script to contain, so a blanket "no exit 0 anywhere" check would be both
+    fragile and wrong. What matters is which code the ``command -v`` failure path reaches.
+    """
+    body = HERE_STRINGS[var]
+    print(f"--- {var} ---\n{body}")
+
+    lines = body.splitlines()
+    starts = [i for i, ln in enumerate(lines) if ln.startswith("if ! command -v")]
+    assert len(starts) == 1, (
+        f"{var}: expected exactly one interpreter-resolution branch, found {len(starts)}. The shim "
+        f"changed shape and this assertion no longer knows which branch to read."
+    )
+    ends = [i for i, ln in enumerate(lines) if ln.strip() == "fi" and i > starts[0]]
+    assert ends, f"{var}: the `if ! command -v` branch is never closed by `fi`"
+    branch = lines[starts[0] : ends[0] + 1]
+    print("branch under test:\n" + "\n".join(branch))
+
+    exits = [ln.strip() for ln in branch if ln.strip().startswith("exit ")]
+    assert exits == ["exit 1"], (
+        f"{var}: the no-interpreter branch exits {exits or '(nothing)'}, not ['exit 1']. Exiting 0 "
+        f"there tells git the gate PASSED at the one moment it provably did not run -- silent, and "
+        f"biased toward permitting. If a deliberate bypass is wanted it belongs in an explicit "
+        f"--no-verify, not in the failure path of interpreter resolution."
+    )
+    assert "--no-verify" in "\n".join(branch), (
+        f"{var}: the refusal names no way forward. A fail-closed gate that does not say how to "
+        f"proceed deliberately gets 'fixed' by deleting the gate."
+    )
+
+
+@pytest.mark.parametrize("var", SHIM_VARS)
+def test_the_shim_actually_exits_nonzero_with_no_python_on_path(var: str, tmp_path: Path) -> None:
+    """BEHAVIOURAL control for the text assertion above -- run the real shim body with an empty PATH.
+
+    A text scan proves the source says ``exit 1``; it does not prove the branch is REACHED, which is
+    the part that decides whether a push is refused. Run it: an empty PATH means ``command -v python``
+    and ``command -v python3`` both fail, which is precisely the state the branch exists for.
+
+    Run against a COPY in tmp_path, never against the installed hook -- that file fires on every push
+    in every worktree on this box.
+    """
+    sh = shutil.which("sh") or shutil.which("bash")
+    print(f"POSIX shell: {sh or 'NONE FOUND'}")
+    if sh is None:
+        pytest.skip("SKIP (nothing executed): no sh/bash on PATH to run the shim body with")
+
+    script = tmp_path / "shim"
+    script.write_text(HERE_STRINGS[var].replace("\r\n", "\n"), encoding="utf-8", newline="")
+    empty = tmp_path / "emptybin"
+    empty.mkdir()
+
+    # PATH is the whole experiment: point it at a directory with nothing in it so neither interpreter
+    # resolves. SystemRoot is preserved because Windows process creation needs it (env var names are
+    # case-insensitive on Windows, so the capitalised spelling reaches the same variable).
+    env = {"PATH": str(empty)}
+    if sysroot := os.environ.get("SYSTEMROOT"):
+        env["SYSTEMROOT"] = sysroot
+
+    r = subprocess.run(
+        [sh, str(script)], input="", capture_output=True, text=True, env=env, check=False
+    )
+    print(f"exit={r.returncode}\nstderr:\n{r.stderr}")
+    assert r.returncode != 0, (
+        f"{var}: with no interpreter on PATH the shim exited {r.returncode}, which git reads as "
+        f"permission. The gate did not run and said everything was fine."
+    )
+    assert "REFUSING" in r.stderr, f"{var}: refused silently -- stderr does not say what happened"
+
+
+# Shim variable -> the hook filename the installer writes it to. The parity test below needs the
+# pairing; the here-string parse gives the body, and $prePush/$commitMsg give the destination.
+_SHIM_FILES = {"claimHook": "commit-msg", "pushHook": "pre-push"}
+
+
+@pytest.mark.parametrize("var", SHIM_VARS)
+def test_the_installed_shim_matches_the_installer_here_string(var: str) -> None:
+    """Is the SHIM that runs the one this checkout would install?
+
+    The payload parity test covers the ``.py`` files and the marker check covers "a hook of ours is
+    present". Neither reads the shim BODY -- so the interpreter-resolution branch, which is where the
+    fail-open lived, had no instrument pointed at it at all. Fixing that branch in source therefore
+    changed nothing on any box until someone re-ran the installer, and every check stayed green while
+    the old shim kept exiting 0. That is the same "never installed reads as installed" defect one
+    level over, so it gets the same treatment.
+
+    Compared on CONTENT with CRLF folded, the same basis as :func:`content_hash` and the installer's
+    ``Get-HookPayloadHash`` -- the installer writes the shim with LF explicitly, but a checkout's
+    line endings still vary, and three instruments that fold differently about one file is itself the
+    bug this repo has already been bitten by.
+    """
+    hooks_dir = installed_hooks_dir()
+    shim = _SHIM_FILES[var]
+    installed = hooks_dir / shim if hooks_dir else None
+    marker = ci_marker()
+    print(f"scanning: {installed or '(git named no hooks dir)'} vs {HOOK_INSTALLER.name}:${var}")
+    print(f"CI marker: {marker or 'none -- treating this as a working checkout'}")
+
+    if marker:
+        pytest.skip(f"SKIP (nothing compared): {marker} -- CI installs no hooks")
+    if installed is None:
+        pytest.skip("SKIP (nothing compared): git resolved no hooks directory from this checkout")
+    if not installed.is_file():
+        pytest.skip(
+            f"SKIP (nothing compared): no {shim} installed -- "
+            f"test_the_coordination_hooks_are_actually_installed is the assertion for that, and it "
+            f"fails off CI, so this skip cannot hide an absent hook"
+        )
+
+    expected = content_hash(HERE_STRINGS[var].encode("utf-8"))
+    actual = content_hash(installed.read_bytes())
+    print(f"compared (content, CRLF folded): installed={actual[:12]} generator={expected[:12]}")
+
+    assert actual == expected, (
+        f"SHIM DRIFT: the {shim} that RUNS is not what this checkout's installer generates.\n"
+        f"  installed: {installed}  content={actual[:12]}\n"
+        f"  generator: {HOOK_INSTALLER}  ${var}  content={expected[:12]}\n"
+        f"The shim is what decides whether the gate runs AT ALL -- it resolves the interpreter and, "
+        f"historically, exited 0 when it found none. An out-of-date shim can therefore be waving "
+        f"pushes through while every payload-parity and marker check in this file reports green.\n"
+        f"The hooks live in the COMMON git dir, so this one file governs every worktree on the box.\n"
+        f"WORK OUT WHICH COPY IS OLDER FIRST -- installing from a checkout older than the installed "
+        f"shim downgrades it for every worktree here:\n"
+        f"    git log --oneline -5 -- scripts/coord/install-git-hooks.ps1\n"
+        f"Only once THIS checkout is confirmed the newer of the two, from a plain terminal:\n"
+        f"    pwsh -NoProfile -File scripts\\coord\\install-git-hooks.ps1"
+    )
