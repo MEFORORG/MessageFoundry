@@ -335,6 +335,58 @@ def test_an_alternate_data_stream_cannot_disguise_a_registry_as_a_document(
     assert "new.ps1" not in reason  # 1b's refusal, not rule 1's wrong-remedy one
 
 
+@pytest.mark.parametrize(
+    ("spelling", "covered_by"),
+    [
+        ("announce/OFF", "the name itself"),
+        # No colon, so the stream strip cannot see these. They are safe because GetFullPath collapses a
+        # trailing dot or space during canonicalisation, which happens BEFORE rule 1b compares anything.
+        ("announce/OFF.", "canonicalisation"),
+        ("announce/OFF ", "canonicalisation"),
+        ("overlap-cache.json.", "canonicalisation"),
+        ("overlap-cache.json ", "canonicalisation"),
+        # GetFullPath leaves a stream suffix intact, but the two layers split it further than expected --
+        # measured by reverting the strip and seeing which cases survived. A stream whose NAME is not a
+        # document extension is already denied by the shape backstop, because GetExtension returns
+        # `.json::$data` (or nothing at all), and neither is in the allowlist.
+        ("announce/OFF::$DATA", "the shape backstop"),
+        ("overlap-cache.json::$DATA", "the shape backstop"),
+        # THE ONLY case the strip is load-bearing for: a stream named to end in a document extension.
+        # Revert the strip and this is the single spelling that flips to ALLOW.
+        ("announce/OFF:x.md", "the stream strip"),
+    ],
+)
+def test_every_spelling_that_resolves_to_a_registry_is_denied(
+    primary: Path, repos_file: Path, spelling: str, covered_by: str
+) -> None:
+    """Rule 1b compares strings; Win32 maps MANY spellings to ONE file. Pin the whole set, not the colon.
+
+    Measured on this box, each written into an empty directory: ``OFF.``, ``OFF`` with a trailing space,
+    ``OFF::$DATA`` and ``OFF:x.md`` all create the single file ``OFF``, which
+    ``announce-session.ps1`` treats as a repo-wide kill switch on existence alone.
+
+    THREE LAYERS cover them, not two, and the split was measured by reverting each rather than reasoned
+    about. ``GetFullPath`` collapses a trailing dot or space before rule 1b compares anything. The shape
+    backstop catches a stream whose name is not a document extension, since ``GetExtension`` then yields
+    ``.json::$data`` or nothing. And the explicit stream strip is load-bearing for exactly one shape: a
+    stream NAMED to end in ``.md``/``.txt``/``.tsv``, which is the only spelling that flips to ALLOW when
+    the strip is removed. ``::$DATA`` is the canonical NTFS default-stream alias and the most-tried filter
+    bypass there is, so it stays pinned here even though the backstop is what denies it.
+
+    Raised by a sibling session which predicted the two colon-free spellings would slip past the named
+    list. They do not, because canonicalisation runs first -- and the same measurement corrected this
+    module's first draft, which credited the strip with the ``::$DATA`` cases it does not actually cover.
+    """
+    # Build the string directly. Passing this through pathlib would strip the trailing dot or space and
+    # the test would silently assert nothing.
+    target = f"{primary}/.git/mefor-coord/{spelling}"
+    assert target.endswith(spelling), "the payload must carry the spelling verbatim"
+    reason = assert_denied(run_gate(edit(target, cwd=primary), repos_file))
+    assert "new.ps1" not in reason, (
+        f"{spelling} must get rule 1b's refusal, not rule 1's wrong remedy"
+    )
+
+
 def test_a_crafted_target_cannot_forge_an_instruction_in_the_deny_text(
     primary: Path, repos_file: Path
 ) -> None:

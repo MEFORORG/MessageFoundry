@@ -931,6 +931,33 @@ foreach ($r in $roots) {
     # be a stream separator. Strip from there and judge the base: a registry keeps its real extension and
     # denies, while a stream on a genuine document stays a document.
     #
+    # THE COLON IS ONE MEMBER OF A SET, AND THREE LAYERS COVER THE SET -- record which does what, because
+    # they fail independently and this line is only one of them. Win32 maps MANY spellings onto ONE file:
+    # measured on this box, `OFF.`, `OFF` with a trailing space, `OFF::$DATA` and `OFF:x.md` each create the
+    # single file `OFF`, and announce-session.ps1 arms its kill switch on that file's existence alone.
+    #
+    #   trailing dot / trailing space  Get-ComparablePath ran GetFullPath first and canonicalisation ALREADY
+    #                                  collapsed them -- `announce/OFF.` and `announce/OFF ` both arrive here
+    #                                  as `announce/off`. They never reach this line and need not.
+    #   a stream NOT named like a doc  the shape backstop below already denies it: GetExtension yields
+    #                                  `.json::$data`, or nothing at all, and neither is in the allowlist.
+    #                                  That covers `::$DATA`, the canonical default-stream alias.
+    #   a stream named like a doc      THIS LINE, and only this line. `OFF:x.md` is the one spelling that
+    #                                  flips to ALLOW when the strip is removed, because GetExtension then
+    #                                  reports `.md` and the backstop waves it through.
+    #
+    # The split was MEASURED by reverting each layer, not reasoned about, and the first draft of this comment
+    # got it wrong in the safe-looking direction: it credited the strip with the `::$DATA` cases, which it
+    # does not cover. A control whose comment overstates which mechanism protects what is the compensating
+    # control resting on a false premise that section 11 forbids -- doubly so when it flatters the code.
+    #
+    # So do NOT also trim trailing dots and spaces here. It would be dead code today and, worse, a SECOND
+    # definition of canonicalisation sitting beside the platform's -- the two would drift and the divergence
+    # would be invisible. Rely on GetFullPath for what it does, and handle only what it demonstrably leaves.
+    # Raised by a sibling session that predicted the colon-free spellings would slip past the named list;
+    # they do not, but nothing had recorded WHY, and an unstated premise under a security control is the
+    # thing section 11 forbids. tests/test_worktree_gate.py pins all four spellings against both layers.
+    #
     # This is "what turns off the thing I am deferring to" applied to GetExtension. The question came from a
     # sibling session that had just found `--ignore-other-worktrees` disabling the git guard its own rule
     # deferred to; the same question against this rule's classifier produced the spelling above.
