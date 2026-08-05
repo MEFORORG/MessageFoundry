@@ -5017,7 +5017,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 ## 1031. The STEP4 bench doc restates the stage_residency docstring in the glyphs its source shed, and carries emoji
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **1/10** · _fill-in_. `docs/benchmarks/STEP4-bracket-and-littles-law.md` §5.2 restates the N1 concurrency definition from `scripts/bench/stage_residency.py` and still spells it with U+2264, U+2212, U+2248 and U+03BB after the source moved to ASCII equivalents. The same block also carries a U+26A0 plus U+FE0F pair — the emoji removed from `scripts/asvs/scorecard.py:558` for propagating into `docs/`.
+> ✅ **SHIPPED 2026-08-05.** All 101 non-cp1252 characters removed from `docs/benchmarks/STEP4-bracket-and-littles-law.md` — the **whole file**, not just the §5.2 block enumerated below, which was written as a floor and was one. U+2264/U+2265/U+2212/U+2192/U+2190/U+2260/U+21D2 to their ASCII forms; U+03BB/U+03C3 to `lambda`/`sigma`; U+2261 to `==`; U+2227 to the word `AND`; the four U+26A0 + U+FE0F pairs to the word `WARNING`. U+2248 became the file's **own** bare-tilde idiom (`~62 ms`, `rho ~0.23`) rather than `~=` — `~=` is the PEP 440 compatible-release operator everywhere else in `docs/` and means NOT-EQUAL in MATLAB and Lua, which would have inverted the verdict rows at lines 373-375. U+00D7 deliberately KEPT (14 occurrences): it is cp1252-representable typography, not a glyph, and the source keeps 4.
 
 **Cluster:** Docs / consistency. **Priority:** P4. **Verdict:** build (trivial). **Severity:** none operationally. It is a documentation defect: a reader comparing the doc to the tool sees two renderings of one definition and cannot tell whether the difference is meaningful.
 
