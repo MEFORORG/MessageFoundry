@@ -23,13 +23,13 @@ run. The only failure mode is a run that *manufactures* a verdict.
 3. **NEVER quote a ceiling from an UNBRACKETED arm.** If `ceiling.bracketed == false`, the "ceiling" is
    merely the offered load. STEP 2 ran one rung, never collapsed, and its ~72 events/s is exactly this
    mistake. An arm with `first_collapse_ingress_rate == null` has measured no ceiling.
-4. **A failed manipulation check is VOID, not a refutation.** Void ≠ "the hypothesis is false". Re-run or
+4. **A failed manipulation check is VOID, not a refutation.** Void != "the hypothesis is false". Re-run or
    report as void.
 5. **A NULL is a SUCCESSFUL run.** Do not go looking for a different cut of the data that "shows
    something".
 6. **Same-session controls only.** Never compare against STEP 2 or any earlier session. Every arm you
    compare must run in ONE session with NO configuration change in between.
-7. **RAW ≠ PUBLISHABLE.** The publishable figure is half the raw ceiling. Do not put a raw number in a
+7. **RAW != PUBLISHABLE.** The publishable figure is half the raw ceiling. Do not put a raw number in a
    headline.
 8. **The pre-registration in §6 is FROZEN before you look at any number.** Compute and publish the
    manipulation checks (§7) *first*, then the primaries. A check evaluated after the primary is seen does
@@ -43,14 +43,14 @@ The programme's target is **520.83 events/s** (45M messages/day). We sustain **9
 **144 events/s** with SQL Server's memory-optimized tempdb metadata ON. Nine falsifiers have hunted a
 throughput lever and found nine nulls. The wall has never been named.
 
-At the bench shape (below), one message = **9 events**, so ~144 events/s ≈ **~16 messages/s**.
+At the bench shape (below), one message = **9 events**, so ~144 events/s is **~16 messages/s**.
 
 Here is the problem. **Every measurement to date was taken at ~8 msg/s — about HALF that ceiling — with
 every resource under 25% utilization:**
 
 | resource | at 8 msg/s | headroom to a 16 msg/s ceiling |
 |---|---|---|
-| store CPU | 24% | ~2x → ~48% |
+| store CPU | 24% | ~2x -> ~48% |
 | engine box CPU (max core) | 23.7% | ~47% |
 | load-gen box CPU | 0.9% | trivial |
 | store pool acquire-wait | 0.0135 ms | trivial |
@@ -59,14 +59,14 @@ every resource under 25% utilization:**
 
 **Nothing is saturated. Nothing would be saturated at the ceiling either.** So either:
 
-- **the ceiling is a STRUCTURAL bound** — by Little's law, `λ_max = concurrency / latency`. If concurrency
+- **the ceiling is a STRUCTURAL bound** — by Little's law, `lambda_max = concurrency / latency`. If concurrency
   is capped (the outbound stage has a **hard cap of 8 concurrent deliveries** — see §2) and latency is
   large, throughput is bounded *without any resource being busy*. **Then LATENCY IS THE THROUGHPUT
-  CURRENCY**, and cutting outbound latency raises throughput roughly proportionally. → **REGIME 2.**
+  CURRENCY**, and cutting outbound latency raises throughput roughly proportionally. -> **REGIME 2.**
 - **or latency is flat under load and concurrency simply grows with offered rate** — in which case the
   ceiling lives somewhere else entirely and **the whole outbound-latency line is a RED HERRING to be
-  abandoned.** → **REGIME 1.**
-- **or something actually saturates at the ceiling** and we name it. → **REGIME 3.**
+  abandoned.** -> **REGIME 1.**
+- **or something actually saturates at the ceiling** and we name it. -> **REGIME 3.**
 
 **NOBODY HAS EVER MEASURED RESIDENCY AS A FUNCTION OF OFFERED LOAD.** That is this run.
 
@@ -77,7 +77,7 @@ records as **currently REVERTED**, and — critically — **no measured quantity
 it**:
 
 - Outbound lane occupancy at 8 msg/s is **~23%**. Per-delivery lane occupancy is **~28.8 ms**
-  (claim 13.37 + send_ack 0.53 + mark_done 10.52 ≈ 24.4 ms of accounted service, plus claim slot
+  (claim 13.37 + send_ack 0.53 + mark_done 10.52 = ~24.4 ms of accounted service, plus claim slot
   reservation). With **8 lanes**, the hard structural cap is `8 / 0.0288 s` = **~277 deliveries/s =
   ~34.7 msg/s = ~312 events/s** — **2.2x ABOVE the assumed ceiling.**
 - The single pooled claimer (K=1) gives an independent bound of **~33.9 msg/s** — also above it.
@@ -94,7 +94,7 @@ client, the ceiling is the RIG's, and the rest of this run is meaningless. Stop 
 ### 1.2 A number to state OUT LOUD before the run, because it changes what a "win" means
 
 Even a **perfectly saturated** outbound stage in this shape yields **~312–369 events/s = 0.60–0.71x** of
-the 520.83 target. Under fan-out-to-all, `λ_max = lanes / (D × S_lane) = 1 / S_lane` — **independent of
+the 520.83 target. Under fan-out-to-all, `lambda_max = lanes / (D × S_lane) = 1 / S_lane` — **independent of
 the lane count** (doubling destinations doubles the lanes AND the work). **So the 45M/day target is
 UNREACHABLE in the c6-n4x2 shape regardless of this run's verdict.** That is worth knowing *before* the
 rig hours, not after. This run tells you **where the wall is**, not how to hit the target.
@@ -110,7 +110,7 @@ Shape **c6-n4x2**: 4 shard processes (`a,b,c,d`), 8 outbound destinations `OB_SH
 
 **The outbound stage has a HARD CAP of 8 concurrent deliveries, fleet-wide:**
 
-- the outbound lane key **is the destination name** (`wiring_runner.py` OUTBOUND lane_provider) → 8 lanes;
+- the outbound lane key **is the destination name** (`wiring_runner.py` OUTBOUND lane_provider) -> 8 lanes;
 - `per_lane_limit` is **hard-clamped to 1** at OUTBOUND (`stage_dispatcher.py:246`;
   `store/base.py:489` "OUTBOUND/RESPONSE are hard-1");
 - the dispatcher permits **at most one outstanding claim-or-processing episode per lane**.
@@ -145,7 +145,7 @@ $env:MEFOR_DELIVERY_PHASE_TIMING = "1"      # ENGINE box. HARD PREREQUISITE.
 $env:PYTHONUTF8 = "1"
 ```
 
-**Unset ⇒ `claim_timing` and `phase_timing` come back as the bland string
+**Unset => `claim_timing` and `phase_timing` come back as the bland string
 `(none captured — MEFOR_DELIVERY_PHASE_TIMING off ...)` — NOT an error.** You would complete the whole
 session and find the instrument blank. **The per-rung service time is the numerator of this run's PRIMARY
 statistic.** Verify it is `1` in the shell that launches the engine ladder.
@@ -218,8 +218,8 @@ the window.**
 
 ### 4.0a CLIMB A — bracket the ceiling (this is also the load ladder for §5)
 
-Ladder **`4:26:2`** → 4, 6, 8, …, 26 msg/s. The climb **stops at the first non-sustained rung**, so it
-self-brackets. Expected collapse somewhere in 14–20 ⇒ 6–9 sustained rungs.
+Ladder **`4:26:2`** -> 4, 6, 8, …, 26 msg/s. The climb **stops at the first non-sustained rung**, so it
+self-brackets. Expected collapse somewhere in 14–20 => 6–9 sustained rungs.
 
 **ENGINE box** (start first):
 
@@ -248,7 +248,7 @@ $env:PYTHONUTF8 = "1"
 Leave `--soak-hold-seconds` / `--soak-rate` **unset** (no soak in this arm). Leave
 `--soak-drain-timeout` **unset**.
 
-> ⚠️ `ladder_run.ps1` on the rig **hardcodes `--dests 8` / `--sink-count 8`** and never passes
+> WARNING: `ladder_run.ps1` on the rig **hardcodes `--dests 8` / `--sink-count 8`** and never passes
 > `--handlers`/`--delivering`. **Read the wrapper scripts before using them** — they can silently override
 > what you think you set.
 
@@ -282,12 +282,12 @@ Then **clear `message_events` again** (§3.5) before the next arm, and record th
 
 **This is the gate that can cancel the run, and it is the reason ARM 0 exists.**
 
-Take `λ_collapse` = `first_collapse_ingress_rate` from CLIMB A. Re-run **that one rung** — same rate, same
+Take `lambda_collapse` = `first_collapse_ingress_rate` from CLIMB A. Re-run **that one rung** — same rate, same
 everything — with **twice the DRIVER (sender) side**:
 
 ```powershell
 # ENGINE box: identical, except --run-id s4-attrib and --keep-logs-dir ...\s4-attrib
-#   --rate-ladder <λ_collapse>   --hold-seconds 120   --drain-timeout 240
+#   --rate-ladder <lambda_collapse>   --hold-seconds 120   --drain-timeout 240
 # LOAD-GEN box: identical, except
 #   --driver-count 8            (2x drivers; it must still divide shards x lanes = 16)
 #   --run-id s4-attrib          --report-json <OUT_LOADGEN>\s4-attrib.json
@@ -300,23 +300,23 @@ everything — with **twice the DRIVER (sender) side**:
 | observation | verdict |
 |---|---|
 | the rung **still collapses**, and achieved intake is within **5%** of the single-client run | the ceiling is the **ENGINE's**. **Proceed to §5.** |
-| the rung now **SUSTAINS**, or achieved intake moves by **≥5%** | the ceiling is the **RIG's**. **STOP.** |
+| the rung now **SUSTAINS**, or achieved intake moves by **>=5%** | the ceiling is the **RIG's**. **STOP.** |
 
 **RESULT (2026-07-13, run `s4-climbA`): GATE A2 = PASS — the ceiling is the ENGINE's.** Settled
 **a DIFFERENT way** than the 2×-client re-run above (the sink half of which is impossible — see below): by the
-**self-drain** evidence. At the **~16 msg/s ≈ 128 outbound-deliveries/s** plateau (16.122 × 8) the backlog
+**self-drain** evidence. At the **~16 msg/s = ~128 outbound-deliveries/s** plateau (16.122 × 8) the backlog
 accumulated **and self-drained inside the engine** (`stranded=0`, `in_pipeline_final=0`) while the **sinks ran
 at 12–19 % of their ~135/s cap** and the **load-gen box sat at ~1 % CPU** — the client tier was demonstrably
 not the limit, and engine CPU was only 5–10 % of 16 cores, so this is a software pacing/serialization
 plateau, not hardware. **Caveats:** it is a **SOFT** ceiling (`bracketed=false`, `first_collapse=null` — no
-hard collapse); the usable **low-latency** rate is **≈ 12 msg/s** (E2E climbs sharply above that); and
+hard collapse); the usable **low-latency** rate is **~12 msg/s** (E2E climbs sharply above that); and
 **which engine op caps the rate is NOT isolated here** (pooled claim + the 0.25 s sweep are the suspects) —
 that attribution is **ARM 1 (§5)**.
 
 > **Why the 2×-client test was not (and could not be) the sink half.** Doubling the **drivers** is legitimate
 > (a driver is a sender-side in-flight/ACK bound worth ruling out — `--driver-count` must still divide
 > `shards × lanes = 16`), but doubling the **sinks** is **impossible and moot**:
-> - **IMPOSSIBLE.** The harness caps `sink_count ≤ sink_ports == dests == 8`. `_partition_band`
+> - **IMPOSSIBLE.** The harness caps `sink_count <= sink_ports == dests == 8`. `_partition_band`
 >   (`harness/load/shardcert.py:2139`) raises `ValueError("sink_count (N) > sink_ports (W): a sink would
 >   bind no ports …")`, so `--sink-count 16` never starts.
 > - **MOOT.** The sinks never ran above **~19 %** of their **~135/s** cap, so more sink processes deliver
@@ -347,21 +347,21 @@ Also record, at the collapse rung:
 
 ### 5.0 S_lane — the LANE EPISODE, read DIRECTLY (no Little's law anywhere)
 
-GATE A2 passed: the ~16 msg/s ≈ 128 outbound-deliveries/s plateau is the **engine's**, and it is a
+GATE A2 passed: the ~16 msg/s = ~128 outbound-deliveries/s plateau is the **engine's**, and it is a
 **software pacing/serialization** limit (engine CPU 5–10% of 16 cores), not compute exhaustion. The open
 question is **which engine operation caps the rate**. `S_lane` answers it by **measuring the lane episode
-directly** — so `λ_max = 1/S_lane` is a **definition** (a lane is a single-server queue), not an application
-of `N = λ × W`. Little's law is an **identity** and cannot be used to test itself; an earlier design was
+directly** — so `lambda_max = 1/S_lane` is a **definition** (a lane is a single-server queue), not an application
+of `N = lambda × W`. Little's law is an **identity** and cannot be used to test itself; an earlier design was
 rejected for exactly that.
 
-**What it is.** One episode = a lane's processing slot being **RESERVED** (`READY→CLAIMING`, `_slots_free`
-decrements) → **RELEASED**. It spans the whole serialized per-lane cycle — claim round-trip + prefix drain —
+**What it is.** One episode = a lane's processing slot being **RESERVED** (`READY->CLAIMING`, `_slots_free`
+decrements) -> **RELEASED**. It spans the whole serialized per-lane cycle — claim round-trip + prefix drain —
 i.e. precisely the region neither `send_ack`/`mark_done` (inside the body) nor the claim timer (the claim
 only) can see.
 
 **Where to read it.** `messagefoundry/pipeline/phase_timing.py::LaneEpisodeTiming` emits one throttled INFO
 line per stage per ~5 s under `MEFOR_DELIVERY_PHASE_TIMING=1` (the rig **always** sets it). The harness
-aggregates it: `shardcert_ladder.aggregate_episode_timing` → `episode_timing` on `ENGINE_RUNG_REPORT` → the
+aggregates it: `shardcert_ladder.aggregate_episode_timing` -> `episode_timing` on `ENGINE_RUNG_REPORT` -> the
 ladder JSON. **Read `episode_timing.by_stage.outbound`, NEVER the flat blend** — the engine emits one line
 per stage and n-weighting all four into one number is an error this programme has already committed once
 (every `claim_mean` quoted before 2026-07-13 is a four-stage blend).
@@ -370,17 +370,17 @@ per stage and n-weighting all four into one number is an error this programme ha
 
 | `S_lane` (outbound) | Reading |
 |---|---|
-| **≈ 62 ms** | **CONFIRMS**: the lane episode IS the wall. Only ~24.4 ms is ACCOUNTED service (claim 13.37 + send_ack 0.53 + mark_done 10.52) — the **~38 ms gap** is the thing to attack. |
-| **≈ 25 ms** *and* `utilization` well below 1.0 | **REFUTES**: the lanes do not bind; the cap is elsewhere (the 0.25 s sweep is the next suspect). |
-| **≈ 25 ms** *but* `utilization` ≈ 1.0 | **The lanes bind anyway.** The slot time went to **empty claims** — see `dropped`. |
+| **~62 ms** | **CONFIRMS**: the lane episode IS the wall. Only ~24.4 ms is ACCOUNTED service (claim 13.37 + send_ack 0.53 + mark_done 10.52) — the **~38 ms gap** is the thing to attack. |
+| **~25 ms** *and* `utilization` well below 1.0 | **REFUTES**: the lanes do not bind; the cap is elsewhere (the 0.25 s sweep is the next suspect). |
+| **~25 ms** *but* `utilization` ~1.0 | **The lanes bind anyway.** The slot time went to **empty claims** — see `dropped`. |
 
-⚠️ **Do not quote `λ_max = rows / S_lane` without checking `utilization` first.** `S_lane` books only a
+WARNING: **Do not quote `lambda_max = rows / S_lane` without checking `utilization` first.** `S_lane` books only a
 **COMPLETED SERVICE**; a pause / claim-error / **empty** / **rearm** / RETRY / STOP release renders no
 delivery and is booked separately as `dropped`. That exclusion is right for the *mean* (empty releases are
 frequent and sub-millisecond — booking them as service would drag `S_lane` toward the bare claim time and
 **manufacture** the "lanes do not bind" verdict), but those releases still **OCCUPY the lane**: an
 empty-claim lane sits RESERVED across the whole shared claim round-trip and cannot serve. So
-`λ_max = rows / S_lane` is the ceiling of a lane that is *back-to-back busy with completed services* — an
+`lambda_max = rows / S_lane` is the ceiling of a lane that is *back-to-back busy with completed services* — an
 upper bound on an upper bound if `dropped`/`empty` is non-trivial. **`utilization` = (episode + dropped
 occupancy) / (window × lanes)** is on the same line, and cross-checking `empty=` / `rearm=` on the co-emitted
 **claim** line of the same window is part of the procedure. Without it the "lanes do not bind" branch is
@@ -413,17 +413,17 @@ Same flags, `--run-id s4-climbB`, its own `--keep-logs-dir` (identical log names
 
 **N1 — the EXACT counting process (zero code change; this is the one that matters).**
 `concurrency.n_outbound_rows` in the tool's JSON: the time-average of
-`N(t) = #transformed≤t − #delivered≤t` over the rung's steady window. A `transformed` row is the **birth**
-of an outbound row (the routed→outbound handoff produces them in the same committed transaction); a
+`N(t) = #transformed<=t - #delivered<=t` over the rung's steady window. A `transformed` row is the **birth**
+of an outbound row (the routed->outbound handoff produces them in the same committed transaction); a
 `delivered` row is its **death**. It needs **no pairing**, **no `claimed_at` column**, and **no Little's
 law** — it is a count.
 
-> ⚠️ **N1 is NOT capped at 8.** It counts **QUEUED + IN-SERVICE** outbound rows; only rows *in service* are
-> bounded by the 8 lanes. "N ≈ 8, therefore the lanes are saturated" is a **category error** — resident
+> WARNING: **N1 is NOT capped at 8.** It counts **QUEUED + IN-SERVICE** outbound rows; only rows *in service* are
+> bounded by the 8 lanes. "N is about 8, therefore the lanes are saturated" is a **category error** — resident
 > rows are unbounded. Lane saturation is read from **occupancy** (§5.3), never from N1.
 
-> ⚠️ **N1's time-average equals `λ × W` on this same data ALGEBRAICALLY.** It corroborates the arithmetic;
-> it **cannot validate Little's law**. Any "check" of the form *"is N ≈ λW?"* computed from this data is a
+> WARNING: **N1's time-average equals `lambda × W` on this same data ALGEBRAICALLY.** It corroborates the arithmetic;
+> it **cannot validate Little's law**. Any "check" of the form *"is N ~ lambda W?"* computed from this data is a
 > **tautology**, and a check that cannot fail is not a check. (An earlier design shipped exactly that as a
 > "free internal check". It is deleted — see §6.4.)
 
@@ -450,11 +450,11 @@ different things (N1 = outbound rows only; N2 = not-done rows across all stages)
 For each rung `r`:
 
 ```
-S_acc(r)  = claim_timing.by_stage.outbound.claim_mean_ms   ← leaf key is `claim_mean_ms`, NOT `mean_ms`
+S_acc(r)  = claim_timing.by_stage.outbound.claim_mean_ms   <- leaf key is `claim_mean_ms`, NOT `mean_ms`
           + phase_timing.send_ack_mean_ms
-          + phase_timing.mark_done_mean_ms            [ms]   ← MEASURED, per rung
+          + phase_timing.mark_done_mean_ms            [ms]   <- MEASURED, per rung
 
-rho(r)    = lane_stats.occupancy_accounted_max        [0..1] ← from the tool, run with --service-ms S_acc(r)
+rho(r)    = lane_stats.occupancy_accounted_max        [0..1] <- from the tool, run with --service-ms S_acc(r)
           = max over the 8 lanes of  (deliveries_in_window x S_acc) / window
 ```
 
@@ -473,8 +473,8 @@ rho_hat_ceiling = rho(top admitted rung) x ( lambda_collapse / lambda(top admitt
 
 This is exact if `S_acc` is flat, and **`S_acc` is measured per rung, so you will know if it is not.**
 
-> **The regime-2 mechanism, pre-registered.** From the S2 prior, `rho ≈ 0.23` at 8 msg/s and
-> `S_acc ≈ 24–29 ms`, which extrapolates to `rho_hat ≈ 0.46` at a 16 msg/s ceiling — **below the
+> **The regime-2 mechanism, pre-registered.** From the S2 prior, `rho ~0.23` at 8 msg/s and
+> `S_acc ~24–29 ms`, which extrapolates to `rho_hat ~0.46` at a 16 msg/s ceiling — **below the
 > regime-2 bar.** For the lanes to be the bound, **`S_acc` must INFLATE with load** (it is heavy-tailed:
 > `claim_max_ms = 133`, `mark_done_max_ms = 101` in the S2 soak). **So a REGIME 2 verdict MUST be
 > accompanied by a NAMED service term that grew.** A `rho` that climbs while the `S_acc` decomposition
@@ -512,42 +512,42 @@ the analyst chooses.**
 
 ### V0 — VOID
 Any of: a manipulation check in §7 fails · `ceiling.bracketed == false` · fewer than **4 admitted rungs**.
-→ **VOID. Not a refutation.** Re-run or report as void.
+-> **VOID. Not a refutation.** Re-run or report as void.
 
 ### V1 — THE CEILING IS THE RIG'S
-GATE A2 (§4.0b) failed. → **STOP. Report. HOLD the rig.** Nothing below is computed.
+GATE A2 (§4.0b) failed. -> **STOP. Report. HOLD the rig.** Nothing below is computed.
 
 ### V2 — REGIME 3: RESOURCE SATURATION
-At the **first collapsed** rung, **any** measured resource ≥ **90%**: store CPU · any engine per-PID
-`max_core%` · load-gen CPU or max-core · pool `acquire_wait` > 5 ms · any sink at ≥90% of its ~135/s cap.
-→ **NAME THE RESOURCE.** (Evaluated before V3 because a saturated resource explains the ceiling without
+At the **first collapsed** rung, **any** measured resource >= **90%**: store CPU · any engine per-PID
+`max_core%` · load-gen CPU or max-core · pool `acquire_wait` > 5 ms · any sink at >=90% of its ~135/s cap.
+-> **NAME THE RESOURCE.** (Evaluated before V3 because a saturated resource explains the ceiling without
 any structural story.)
 
 ### V3 — REGIME 2: STRUCTURAL BOUND. LATENCY IS THE CURRENCY.
 **ALL THREE:**
-- `rho_hat_ceiling` **≥ 0.85**, AND
-- the 95% CI **lower bound** of `b1` **≥ 0.70**, AND
+- `rho_hat_ceiling` **>= 0.85**, AND
+- the 95% CI **lower bound** of `b1` **>= 0.70**, AND
 - **a NAMED term of `S_acc` grew** across the admitted rungs (report which: claim / send_ack / mark_done).
 
-→ The outbound lane cap is the wall. Cutting outbound latency raises throughput roughly proportionally.
+-> The outbound lane cap is the wall. Cutting outbound latency raises throughput roughly proportionally.
 **But read §9 before celebrating: there may be no cheap lever.**
 
 ### V4 — REGIME 1: THE RED HERRING. THE LATENCY LINE IS DEAD.
 Either route qualifies (both are respectable; say which one you used):
 
 - **V4-F (flatness certified — needs both climbs):** the **ENTIRE 95% CI** of `b1` lies inside
-  **[−0.15, +0.15]** (a TOST equivalence test — a *point estimate* inside the band is **NOT** sufficient),
-  **AND** `rho_hat_ceiling` ≤ 0.50.
-- **V4-O (occupancy route — works on ONE climb):** `rho_hat_ceiling` **≤ 0.50** **AND** the 95% CI
+  **[-0.15, +0.15]** (a TOST equivalence test — a *point estimate* inside the band is **NOT** sufficient),
+  **AND** `rho_hat_ceiling` <= 0.50.
+- **V4-O (occupancy route — works on ONE climb):** `rho_hat_ceiling` **<= 0.50** **AND** the 95% CI
   **upper** bound of `b1` **< 0.70** (so REGIME 2 is excluded) **AND** the lane-bound prediction
-  `λ_max_pred = 1000 / S_acc(low rungs)` [msg/s] is **≥ 1.5x** the bracketed ceiling.
+  `lambda_max_pred = 1000 / S_acc(low rungs)` [msg/s] is **>= 1.5x** the bracketed ceiling.
 
-`λ_max_pred` is an **OUT-OF-SAMPLE** prediction: estimate `S_acc` at the three LOWEST rungs (far from the
+`lambda_max_pred` is an **OUT-OF-SAMPLE** prediction: estimate `S_acc` at the three LOWEST rungs (far from the
 cap, where service is cleanly measured), predict the lane-bound ceiling, and compare it to the ceiling you
-actually bracketed. **This test can FAIL** — that is what makes it worth doing. (Prior: `S_acc ≈ 28.8 ms`
-⇒ `λ_max_pred ≈ 34.7 msg/s`, ~2.2x above the assumed ceiling ⇒ the lanes do **not** explain it.)
+actually bracketed. **This test can FAIL** — that is what makes it worth doing. (Prior: `S_acc ~28.8 ms`
+=> `lambda_max_pred ~34.7 msg/s`, ~2.2x above the assumed ceiling => the lanes do **not** explain it.)
 
-→ **The outbound latency line is KILLED.** The wake gap is a latency tax, not a throughput lever. Stop
+-> **The outbound latency line is KILLED.** The wake gap is a latency tax, not a throughput lever. Stop
 spending rig hours on it. **This is a successful, valuable run.**
 
 ### V5 — NULL
@@ -563,10 +563,10 @@ which threshold was not met. **Do not re-cut the data.**
 
 | deleted | why |
 |---|---|
-| `b2 = 1 + b1` "free internal Little's-law check" | **TAUTOLOGY.** If N is derived as λ×W, this holds algebraically with zero residual. It cannot fail. It also made REGIME 1's "two independent conditions" **one condition counted twice**. |
-| `8 / median(per-lane inter-delivery gap) == delivery rate` | **FLOW CONSERVATION.** Under fan-out-to-all each lane takes exactly one delivery per message, so the mean gap **is** `1/λ` for any engine, any service time, any bottleneck. Zero information. (It "agreed to 6%" in S2 because it *must*.) |
+| `b2 = 1 + b1` "free internal Little's-law check" | **TAUTOLOGY.** If N is derived as lambda×W, this holds algebraically with zero residual. It cannot fail. It also made REGIME 1's "two independent conditions" **one condition counted twice**. |
+| `8 / median(per-lane inter-delivery gap) == delivery rate` | **FLOW CONSERVATION.** Under fan-out-to-all each lane takes exactly one delivery per message, so the mean gap **is** `1/lambda` for any engine, any service time, any bottleneck. Zero information. (It "agreed to 6%" in S2 because it *must*.) |
 | `rows_per_message = 17` cross-check | Rows-per-**resident**-message is **load-dependent**, not a constant (a message holds 1 ingress row, *then* H routed rows, *then* D outbound rows — never 17 at once). It would fire a FALSE inconsistency and void a good run. |
-| "no-poll control rung at a SUSTAINED rate, gated on throughput" | **Cannot fail by construction:** at a sustained rung, achieved ≡ offered whether you poll or not. If you want an observer-effect control, run it at the **collapsed** rung, or gate it on the **latency distribution**. |
+| "no-poll control rung at a SUSTAINED rate, gated on throughput" | **Cannot fail by construction:** at a sustained rung, achieved == offered whether you poll or not. If you want an observer-effect control, run it at the **collapsed** rung, or gate it on the **latency distribution**. |
 
 ---
 
@@ -577,15 +577,15 @@ seen the primary does not count.
 
 - **M1 — RUNG SEGMENTATION.** From `--list-rungs`: the **rung count** must equal the number of rungs
   actually armed, and **each rung's `received` count must equal that rung's `acked`** in the drive report
-  JSON (exact match — the S2 precedent matched exactly: 480 and 7200). A mismatch ⇒ re-segment with
-  `--rung-gap` ⇒ otherwise every per-rung number is **VOID**. *(Failure mode this catches: at the collapse
+  JSON (exact match — the S2 precedent matched exactly: 480 and 7200). A mismatch => re-segment with
+  `--rung-gap` => otherwise every per-rung number is **VOID**. *(Failure mode this catches: at the collapse
   rung, an intake stall > 10 s splits one rung into two, and you analyse half a rung as a rung.)*
 - **M2 — STEADY STATE, per rung.** Split the rung's steady cohort in half by received-ts and re-run the
-  tool on each half. Require **|median E2E(2nd half) − median E2E(1st half)| / median E2E(rung) ≤ 0.10**
+  tool on each half. Require **|median E2E(2nd half) - median E2E(1st half)| / median E2E(rung) <= 0.10**
   and the same for `n_outbound_rows`. A **filling** rung is not a Little's-law point. A rung failing M2 is
   **EXCLUDED and REPORTED as excluded** — never silently dropped. *(A near-ceiling rung will legitimately
   fail M2: filling IS what collapse is. That rung **brackets**; it does not regress.)*
-- **M3 — THE RUNGS REALLY DIFFERED.** Achieved λ (from the tool, engine-side) must be **strictly
+- **M3 — THE RUNGS REALLY DIFFERED.** Achieved lambda (from the tool, engine-side) must be **strictly
   increasing** across admitted rungs and within **2%** of offered. Regress on **ACHIEVED**, never offered.
 - **M4 — SAME SESSION.** Both climbs, the attribution rung, tempdb, MAXDOP and instance state in ONE
   session with **NO** SQL-side change in between. **Do not use STEP 2 as a control.**
@@ -604,8 +604,8 @@ seen the primary does not count.
 
 **The harness's own sustain bar, as it actually stands (2026-07-13).** On the **two-box** ladder — the path
 this document runs — a rung is scored by `shardcert_ladder.classify_rung`: **drained clean (engine
-store-truth) ∧ lossless (sink socket-truth) ∧ the two observers agree**. Intake shortfall is tolerated up to
-`achieved < offered × (1 − 0.05)`. **There is NO "still filling" term.** So a rung **passes as sustained with
+store-truth) AND lossless (sink socket-truth) AND the two observers agree**. Intake shortfall is tolerated up to
+`achieved < offered × (1 - 0.05)`. **There is NO "still filling" term.** So a rung **passes as sustained with
 up to a 5% intake shortfall, and with its in-flight backlog still GROWING** — it drained only because the
 offer stopped. In a log-log OLS the top rung is the **highest-leverage** point, so the single most suspect
 rung would dominate the slope — and it drags it **UP**, toward the favoured hypothesis. That is exactly why
@@ -629,7 +629,7 @@ the admission bar below is stricter than the harness's.
 > **Naming:** the ladder's ratio is `fill_ratio`, deliberately **not** "M2". It is a **different quantity**
 > from §7's **M2** validity check above — different source (drive socket latency vs the store's `E2E_complete`), different
 > split key (sink receipt vs engine received-ts), different bar (ratio > 1.5 vs symmetric relative
-> difference ≤ 0.10), and the opposite purpose (**lower a ceiling** vs **exclude a rung from the fit**). A
+> difference <= 0.10), and the opposite purpose (**lower a ceiling** vs **exclude a rung from the fit**). A
 > rung the ladder passes at `fill_ratio` = 1.4 can still legitimately FAIL §7's M2. Never conflate them.
 >
 > **Comparability:** the ladder JSON now stamps `ceiling_gate_version` (v2 = the `filling` term exists).
@@ -637,7 +637,7 @@ the admission bar below is stricter than the harness's.
 > (the term abstains), so the ~16 msg/s plateau **remains directly comparable** to every prior two-box run.
 
 A rung enters the fit **iff**: harness `result` = sustained (the **field**, never `exit_code`) **AND**
-`achieved/offered ≥ 0.98` **AND** M2 passes **AND** M6 passes.
+`achieved/offered >= 0.98` **AND** M2 passes **AND** M6 passes.
 **Report leverage and Cook's D per rung.** Pre-register: **if removing any single rung moves `b1` by more
 than the null-band width (0.30), the slope is declared UNIDENTIFIED, not reported.**
 
@@ -647,9 +647,9 @@ than the null-band width (0.30), the slope is declared UNIDENTIFIED, not reporte
 
 - **The PRIMARY (`rho`) is a WITHIN-rung time-average.** It does not depend on the number of rungs, and
   **one climb is enough for it.** The REGIME 1 vs REGIME 2 call rests on it (plus the out-of-sample
-  `λ_max_pred`), and both survive a single climb intact. **This is why the one-climb plan works at all.**
+  `lambda_max_pred`), and both survive a single climb intact. **This is why the one-climb plan works at all.**
 - **The REGRESSION is under-powered on one climb.** With ~6 admitted rungs and a plausible residual
-  σ ≈ 0.08 on log W, the 95% CI on `b1` is roughly **±0.21** — **wider than the ±0.15 null band.** So on
+  sigma ~0.08 on log W, the 95% CI on `b1` is roughly **±0.21** — **wider than the ±0.15 null band.** So on
   ONE climb you **cannot certify** "W is flat" (V4-F). Two climbs roughly halve it (**±0.12**), which
   fits. **That is the entire justification for CLIMB B.**
 - **REGIME 2 vs REGIME 3 is NOT separable by the slope** (b1 = 1.0 vs 1.15 is <2 SEs on one climb, <3 on
@@ -664,7 +664,7 @@ than the null-band width (0.30), the slope is declared UNIDENTIFIED, not reporte
    primary and the V4-O route are **completely unaffected**. Saves ~40 min. **Take this cut first.**
 2. **Cut the optional ARM 2** (§9.2). Cost: no causal intervention; the run stays observational.
 3. **DO NOT coarsen the ladder** (e.g. `4:24:4`). With a collapse at 16 you would get only 3 sustained
-   rungs ⇒ 1 df ⇒ the regression is **dead** and its CIs are meaningless.
+   rungs => 1 df => the regression is **dead** and its CIs are meaningless.
 4. **DO NOT skip ARM 0's attribution rung (§4.0b).** Without it you may spend the whole session
    characterising a wall that belongs to the load generator.
 
@@ -678,7 +678,7 @@ than the null-band width (0.30), the slope is declared UNIDENTIFIED, not reporte
   ("the OUTBOUND/delivery claim is NEVER batched (its skip-and-complete dedup must stay atomic)",
   `settings.py:265-276`). And ingress/routed are **already fast** (20.7 / 22.3 ms) — they are not the wall.
 - **Per-lane FIFO forbids per-lane parallelism**, and FIFO-always is an owner hard requirement.
-- **Under fan-out-to-all, `λ_max = 1/S_lane` is INDEPENDENT of the lane count.** Adding destinations adds
+- **Under fan-out-to-all, `lambda_max = 1/S_lane` is INDEPENDENT of the lane count.** Adding destinations adds
   lanes *and* work.
 
 So a REGIME 2 verdict **names the wall and hands over no config-only fix.** The lever would be a genuine
@@ -686,20 +686,20 @@ store/claim-path rewrite (the outbound per-delivery cost is **two serial DB roun
 mark_done 10.5 ms = 23.9 of the 24.4 ms accounted; `send_ack` is 0.5 ms — **the partner is free**). Do not
 let a REGIME 2 result be over-sold as an easy win.
 
-### 9.2 OPTIONAL ARM 2 — the only TRUE causal test (≈3 lines, if you have the time)
+### 9.2 OPTIONAL ARM 2 — the only TRUE causal test (~3 lines, if you have the time)
 
 Everything in §5–§6 is **observational**. There is exactly one cheap intervention that decouples the lane
 count from the work, and it is worth more than CLIMB B if you can only do one:
 
 `harness/config/shardcert/_shape.py` maps `delivers_to(j) = j if j < delivering else None`, and
-`graph.py:136` wires handler *j* → destination *j*. **That 3-line accident is the only reason active lanes
-≡ deliveries-per-message.** Add a **per-shard destination OFFSET** (or stride) to `delivers_to`, then run
+`graph.py:136` wires handler *j* -> destination *j*. **That 3-line accident is the only reason active lanes
+== deliveries-per-message.** Add a **per-shard destination OFFSET** (or stride) to `delivers_to`, then run
 `dests=16, delivering=8, handlers=8` with each shard's 8 handlers mapped onto a shard-dependent window of
 the 16 destinations:
 
 - **active lanes = 16** (double), **work per message UNCHANGED** at 8 deliveries.
-- **Pre-registered prediction:** if the 8-lane cap binds, **`λ_max` roughly DOUBLES**. If it does not,
-  **`λ_max` is UNCHANGED.**
+- **Pre-registered prediction:** if the 8-lane cap binds, **`lambda_max` roughly DOUBLES**. If it does not,
+  **`lambda_max` is UNCHANGED.**
 
 That discriminates REGIME 1 from REGIME 2 **with no Little's-law arithmetic at all**. Remember to widen
 `MEFOR_SHARDCERT_SINK_PORTS` / `--sink-count` to match.
@@ -716,10 +716,10 @@ wall, which is the world the programme has already named.
 
 If you instrument, instrument **one** of these:
 
-- `N_occupied = max_processing_lanes − slots_free` (= CLAIMING **+** PROCESSING, by the dispatcher's own
+- `N_occupied = max_processing_lanes - slots_free` (= CLAIMING **+** PROCESSING, by the dispatcher's own
   conservation law at `stage_dispatcher.py:28`), exposed per stage; **or**
 - **better and cheaper:** a **lane-EPISODE stopwatch** in `messagefoundry/pipeline/phase_timing.py` (the
-  bench-gated `_PhaseWindow` pattern is already there) timing **claim_start → slot release**. That yields
+  bench-gated `_PhaseWindow` pattern is already there) timing **claim_start -> slot release**. That yields
   `S_lane` **directly** — one number, no Little's law, no polling, no observer effect — and its difference
   from (claim + send_ack + mark_done) **localizes the unaccounted residual**, which is the largest
   unexplained quantity in the whole programme.

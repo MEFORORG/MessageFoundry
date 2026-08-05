@@ -271,7 +271,7 @@ def render_summary(violations: list[dict[str, str]], accepted: list[dict[str, An
             lines.append(f"| `{v['signal']}` | {v['message']} |")
         lines.append("")
     else:
-        lines += ["Every gate that ran proved it measured something. ✅", ""]
+        lines += ["Every gate that ran proved it measured something. PASS", ""]
 
     if accepted:
         lines += ["| Signal | Status | Examined | Evidence |", "| --- | --- | --- | --- |"]
