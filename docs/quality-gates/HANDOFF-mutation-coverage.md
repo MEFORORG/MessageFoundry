@@ -308,6 +308,6 @@ someone is already looking at the test that failed to kill them.
 
 ---
 
-*Drafted 2026-07-13 by the session that shipped the complexity + clone gates (#1028) but could not run a local
+*Drafted 2026-07-13 by the session that shipped the complexity + clone gates (PR #1028) but could not run a local
 venv. If `mutmut` / `diff-cover` behave differently than drafted, trust the local run — these are a
 verified-shape starting point, not an untested paste.*
