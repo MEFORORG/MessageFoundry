@@ -25,12 +25,15 @@ updates:
     open-pull-requests-limit: 10
     # Supply-chain cooldown: age a fresh release before opening a ROUTINE update PR, to dodge a
     # package compromised shortly after publish. Security updates ignore cooldown (Dependabot
-    # behavior), so a real advisory fix still arrives immediately. Pairs with the auto-merge
-    # workflow: routine patches auto-merge AFTER aging; security patches auto-merge now.
+    # behavior), so a real advisory fix still opens as a PR immediately. Aging is a PRECONDITION for
+    # an unattended merge, never a sufficient one — dependabot-auto-merge.yml's allow-set decides
+    # eligibility, and THIS ecosystem's allow row ships EMPTY, so no uv bump auto-merges on either
+    # track; every one goes to human review. That workflow owns the decision, so read it there.
     cooldown:
       # ~5-day aging window (DEPENDENCY-POSTURE-REVIEW.md) lengthens the malicious-fresh-publish
       # dodge on the routine VERSION track; the SECURITY track still bypasses cooldown (Dependabot
-      # design), now backstopped by the published-GHSA gate in dependabot-auto-merge.yml (SEC-007 #2).
+      # design) and is aged workflow-side instead, behind the published-GHSA gate (SEC-007 #2) and
+      # the release-age gate (#4) in dependabot-auto-merge.yml.
       default-days: 5
       semver-major-days: 7
     # Dependabot WIDENS a declared cap instead of respecting it, so a load-bearing upper bound in
@@ -78,7 +81,9 @@ updates:
     # stops tag mutation, not a malicious new release — Dependabot just bumps the pin to the new SHA.
     # Only default-days is honored here (this ecosystem does not support the semver-*-days knobs) and
     # it ages off the tag's commit date rather than the release date, so treat 5 as approximate.
-    # Security updates bypass cooldown, so an advisory fix is unaffected. Watch codeql-action — a
+    # Security updates bypass cooldown, so an advisory fix still opens as a PR unaffected — but it
+    # reaches main by human review rather than unattended, because dependabot-auto-merge.yml's
+    # advisory gate is pip-keyed and therefore never confirms an action. Watch codeql-action — a
     # frequent releaser — for stalls after this lands.
     cooldown:
       default-days: 5
