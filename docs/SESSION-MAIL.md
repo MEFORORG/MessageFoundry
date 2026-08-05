@@ -393,13 +393,29 @@ worth either.
 
 ## What still blocks wiring
 
-**1. It is unknown whether the `Stop` hook fires in the VS Code extension.** The public issue record
-contradicts itself: `claude-code#40029` reports that it does not, and was closed as not planned;
-`claude-code#59718` reports the opposite. This is not a detail -- it decides whether the pull path
-works on **the exact surface this channel exists for**. If `Stop` does not fire there, delivery to a VS
-Code session collapses to `SessionStart` only, which for a long-lived session can mean never. Settle it
-by measurement on the target version before wiring anything, and record the version measured; a
-behaviour that moved once can move again.
+**1. SETTLED BY MEASUREMENT, 2026-08-05: `Stop` DOES fire in the VS Code extension.** The public issue
+record contradicts itself -- `claude-code#40029` reports that it does not and was closed as not
+planned, `claude-code#59718` reports the opposite -- so it was measured rather than argued, against a
+throwaway repo carrying only project-level `.claude/settings.json` hooks.
+
+A message queued **during** a turn was delivered **at the turn boundary**: the drain wrote a receipt
+carrying `byHookEvent: Stop`, and `Stop` fired twice across two turns. `SessionStart` and
+`UserPromptSubmit` fire too, so project-level hooks run on this surface generally. The evidence is the
+receipt, not a model's account of its own context: it is written by the drain process at the moment it
+emits. **#59718 is right; #40029 is wrong or stale.**
+
+A behaviour that moved once can move again, so record the version when re-measuring.
+
+**1b. THE REAL DEFECT THIS SURFACE HAS, and it is worse than a missing `Stop`.** The extension fired
+`SessionStart` **twice, with two different session ids, 43 seconds apart** -- and the queued message
+was consumed by the **first**, which the operator never interacted with. The prompt came from the
+second. The message was delivered, receipted and moved to `seen/` while the human saw nothing, and
+every instrument reported success. **From the operator's side that is indistinguishable from the
+channel being broken.** A box drained by a session nobody is looking at is a silent loss that the
+receipt actively conceals, because the receipt is honest: it records what was emitted, and it was
+emitted. Mitigating it needs a delivery model that does not treat "shown to some session in this
+worktree" as "shown", and that is unsolved -- it is the strongest remaining argument against wiring
+this on `SessionStart` alone.
 
 **2. The delivery hook must never live in a plugin.** Hooks declared in `.claude/settings.json` **do**
 run under the VS Code extension; **plugin** hooks do **not** (`claude-code#18547`). Wiring the drain

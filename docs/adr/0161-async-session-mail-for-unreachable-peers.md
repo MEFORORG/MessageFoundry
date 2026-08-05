@@ -337,6 +337,24 @@ they are; no config root has been installed from them, so nothing is live in any
 separate, owner-approved step, and it is gated on the work tracked as
 [BACKLOG #1028](../BACKLOG.md).
 
+**Measured against the target surface, 2026-08-05.** The channel was tested from a real VS Code
+extension session, against a throwaway repo carrying only project-level `.claude/settings.json` hooks.
+Two results, and the second is the one that matters:
+
+- **`Stop` fires in the extension.** A message queued *during* a turn was delivered *at the turn
+  boundary*, with the drain writing a receipt carrying `byHookEvent: Stop`; `Stop` fired on two
+  consecutive turns, and `SessionStart` and `UserPromptSubmit` fire too. So the pull path works on the
+  surface this channel exists for. `claude-code#59718` is right and `#40029`, closed as not planned, is
+  wrong or stale.
+- **The extension fires `SessionStart` more than once, with different session ids, and that breaks the
+  delivery model.** Two `SessionStart` events arrived 43 seconds apart under different ids; the queued
+  message was consumed by the first, which the operator never interacted with, while the prompt came
+  from the second. Delivered, receipted, moved to `seen/` -- and invisible to the human. Every
+  instrument reported success, which is precisely why it is dangerous: the receipt is honest about what
+  was emitted and says nothing about who read it. **This is now the strongest argument against wiring
+  the drain on `SessionStart`, and it is unsolved.** A delivery model that equates "shown to some
+  session in this worktree" with "shown" cannot fix it.
+
 ## To resolve on acceptance
 
 - [x] The eight findings are closed in the scripts, with the tests the Acceptance Criteria name.
