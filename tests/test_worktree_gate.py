@@ -366,7 +366,10 @@ def test_every_spelling_that_resolves_to_a_registry_is_denied(
     ``announce-session.ps1`` treats as a repo-wide kill switch on existence alone.
 
     THREE LAYERS cover them, not two, and the split was measured by reverting each rather than reasoned
-    about. ``GetFullPath`` collapses a trailing dot or space before rule 1b compares anything. The shape
+    about. ``GetFullPath`` collapses a trailing dot or space before rule 1b compares anything -- PLATFORM
+    behaviour, measured on pwsh 7.6.3 / .NET 10.0.9. .NET has changed trailing dot/space handling across
+    versions, so these cases are the protection and not the comment: if the runtime stops collapsing, they
+    fail here and the failure is diagnosable as the platform moving rather than as the gate breaking. The shape
     backstop catches a stream whose name is not a document extension, since ``GetExtension`` then yields
     ``.json::$data`` or nothing. And the explicit stream strip is load-bearing for exactly one shape: a
     stream NAMED to end in ``.md``/``.txt``/``.tsv``, which is the only spelling that flips to ALLOW when

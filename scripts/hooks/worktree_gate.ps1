@@ -938,7 +938,13 @@ foreach ($r in $roots) {
     #
     #   trailing dot / trailing space  Get-ComparablePath ran GetFullPath first and canonicalisation ALREADY
     #                                  collapsed them -- `announce/OFF.` and `announce/OFF ` both arrive here
-    #                                  as `announce/off`. They never reach this line and need not.
+    #                                  as `announce/off`. They never reach this line and need not. This is
+    #                                  PLATFORM behaviour, not ours, and .NET has changed trailing dot/space
+    #                                  handling across versions: measured on pwsh 7.6.3 / .NET 10.0.9, twice,
+    #                                  by two sessions independently. That is why the eight spelling tests
+    #                                  exist rather than this comment alone -- if the runtime ever stops
+    #                                  collapsing, they fail loudly and the failure reads as "the platform
+    #                                  moved", which is diagnosable, instead of "the gate broke".
     #   a stream NOT named like a doc  the shape backstop below already denies it: GetExtension yields
     #                                  `.json::$data`, or nothing at all, and neither is in the allowlist.
     #                                  That covers `::$DATA`, the canonical default-stream alias.
