@@ -134,11 +134,148 @@ def handled_tools(text: str) -> set[str]:
     return tools
 
 
+# The NAME shape of a launcher config dir: ~/.claude is the Desktop app, and every VS Code launcher on
+# this box points CLAUDE_CONFIG_DIR at ~/.claude-account-<N> with N decimal. That is not inferred from the
+# directory listing -- it is how the launchers BUILD the path: ~/claude-launchers/Launch-Claude-{1,2,3,4}
+# .ps1 each assign a literal `.claude-account-<N>`, and Setup-GitHub-SignIn.ps1 assigns
+# "...\.claude-account-$Account". A suffix after the number is therefore not an account, because nothing
+# can launch from one.
+#
+# \A and \Z are IN THE PATTERN, not left to the call site. The end anchor is the entire predicate here --
+# unanchored, `.match()` accepts ".claude-account-2.lock" on its prefix and `.search()` accepts it
+# anywhere -- so a later call site written with `match` or `search` instead of `fullmatch` would silently
+# re-admit the artifact this filter exists to exclude, and every test would stay green while it did.
+# Anchoring here makes all three methods agree; test_the_launcher_name_predicate_* asserts that they do.
+_ACCOUNT_DIR_NAME = re.compile(r"\A\.claude-account-\d+\Z")
+
+# What a dir a session has actually launched from carries. Claude Code writes both on first use, so their
+# presence is evidence of a LOGIN as opposed to a directory that merely has the right name. Measured
+# 2026-08-04: ~/.claude and .claude-account-1/2/3/4 all carry both; .claude-account-2.lock carries
+# NEITHER -- its entire contents are settings.json and settings.json.bak.
+_LOGIN_MARKERS = (".claude.json", ".credentials.json")
+
+
+def _account_candidates() -> list[Path]:
+    """Everything the ``.claude-account-*`` glob turns up, before any judgement about what it is."""
+    return sorted(Path.home().glob(".claude-account-*"))
+
+
 def config_dirs() -> list[Path]:
-    """Every Claude config dir on this box: ~/.claude plus the ~/.claude-account-* VS Code launchers."""
+    """Config dirs a session can LAUNCH from: ~/.claude plus the ~/.claude-account-<N> VS Code launchers.
+
+    The glob alone was too wide, and the directory it over-matched was manufactured by this machinery
+    itself. Measured 2026-08-04 on this box, ``.claude-account-2.lock``:
+
+    * the directory itself was created 07-22 20:09, with nothing inside it predating 07-24 -- so it was
+      PROBABLY created empty, which is an inference from the absence of older contents, not a reading;
+    * its ``settings.json.bak`` was created 07-24 14:44, so the dir was already being wired at or before
+      then. The ``settings.json`` file object dates from 07-29 13:32 and CANNOT date the first write:
+      ``Write-Settings`` writes a temp and ``Move-Item``s it into place, replacing the file object on
+      every run, so its creation time is always the LAST run. The ``.bak`` is overwritten in place, so
+      its creation time is the FIRST run that found a settings.json to back up. The two writes still
+      visible are 07-29 13:07 (carried by the ``.bak``'s mtime, which ``Copy-Item`` takes from the
+      source) and 13:32 -- the same pair ``.claude-account-2`` carries, because ``install-gate.ps1``
+      globs ``.claude-account-*`` too (:91) and wires both dirs in lockstep. Account-2 also holds a
+      ``.bak`` from 07-17, so there were earlier runs than the visible pair on both sides;
+    * it is 1079 bytes against account-2's 2072, and holds the three gate matcher entries and NOTHING
+      else -- no ``.claude.json``, no ``.credentials.json``, no ``sessions/``, no ``projects/``, and no
+      SessionStart selfheal hook (``install-selfheal.ps1`` takes ``-ConfigDir`` as a mandatory single
+      value, so it never globbed and never reached this dir).
+
+    So the gate wiring the tests were reading back out of it was written INTO it by the installer's own
+    glob, and matched only because both globs are wrong in the same way. It passes today; it is a stale
+    snapshot the moment real wiring changes, and the suite would then go red pointing at a directory
+    nobody launches from -- the reader's next move being a re-install, i.e. the stale-checkout DOWNGRADE
+    hazard :func:`content_hash` documents, fired to fix nothing.
+
+    WHY A NAME SHAPE AND NOT ``not name.endswith(".lock")``: a blocklist excludes the one artifact that
+    happens to exist and lets the next one through -- ``.bak``, ``.old``, ``.disabled``, ``-copy``, a
+    dated backup. The launcher name shape is a positive rule that can be checked against the launchers.
+
+    RISK, stated rather than left to be discovered. Excluding a directory from a wiring check means a
+    genuinely UN-WIRED launcher can hide behind a name this filter rejects, and it would hide silently --
+    an un-wired gate is exactly the condition this module exists to surface. AT LEAST these shapes are at
+    risk -- a named account (``.claude-account-alpha``), a suffixed one (``.claude-account-2b``,
+    ``.claude-account-2-work``), or a config dir off the pattern entirely (``.claude-work``, or any
+    ``CLAUDE_CONFIG_DIR`` pointing outside ``~``, which neither this predicate nor the glob before it
+    ever saw).
+
+    AND ONE MORE THAT IS LIVE ON THIS BOX RIGHT NOW, which is why the enumeration above is written as
+    "at least": a RIGHT-shaped name carrying no ``settings.json`` at all. The trailing filter on the
+    return below drops it before either instrument here sees it, and that filter predates this change.
+    ``.claude-account-4`` is in exactly that state -- both login markers written 2026-08-04 19:37, built
+    by ``~/claude-launchers/Launch-Claude-4.ps1``, and NO settings.json, so no gate wiring whatsoever.
+    It is a live launcher with no gate, and nothing in this module reports it. :func:`unwired_launchers`
+    exists to make that loud rather than leaving it to this docstring.
+
+    That risk is guarded, not just admitted, in two places -- because a shrinking config-dir list makes
+    ``test_every_non_optional_rule_is_wired_in_every_config_dir`` vacuously easier to pass, which is the
+    green-because-we-stopped-looking failure this suite exists to prevent:
+
+    1. :func:`excluded_config_dirs` is PRINTED by both tests that scan, so an exclusion appears in the
+       output of the very run it changed rather than being inferred from a count that got smaller.
+    2. ``test_nothing_excluded_from_the_wiring_scan_is_a_live_login`` asserts every exclusion made BY
+       NAME is inert, by a signal INDEPENDENT of that name (:data:`_LOGIN_MARKERS`). A wrongly-excluded
+       dir that anything actually logs in from fails that test by the evidence it cannot help leaving
+       behind. Scoped deliberately: it does NOT cover the settings.json filter above, which is why
+       :func:`unwired_launchers` is reported separately.
+    """
     home = Path.home()
-    found = [home / ".claude"] + sorted(home.glob(".claude-account-*"))
+    found = [home / ".claude"] + [
+        d for d in _account_candidates() if _ACCOUNT_DIR_NAME.fullmatch(d.name)
+    ]
     return [d for d in found if (d / "settings.json").is_file()]
+
+
+def excluded_config_dirs() -> list[Path]:
+    """Dirs the glob found, that carry a settings.json, and that :func:`config_dirs` refuses to judge.
+
+    Only the ones with a ``settings.json`` -- a name-shape reject with no settings file was never in the
+    scanned set and dropping it changes nothing. These are precisely the dirs whose wiring stopped being
+    checked, which is the set a reader has to see to audit the exclusion.
+    """
+    return [
+        d
+        for d in _account_candidates()
+        if not _ACCOUNT_DIR_NAME.fullmatch(d.name) and (d / "settings.json").is_file()
+    ]
+
+
+def unwired_launchers() -> list[Path]:
+    """Launcher-shaped dirs something LOGS IN from that carry no ``settings.json`` -- so no gate at all.
+
+    This is the gap the name-shape filter does NOT cause and does NOT cover. :func:`config_dirs` has
+    always ended with ``(d / "settings.json").is_file()``, which silently drops a dir that has every
+    other mark of a live launcher. Such a dir is not merely unjudged: with no settings.json there is no
+    ``PreToolUse`` wiring, so the gate does not run there AT ALL, which is a strictly worse condition
+    than the stale-snapshot case this module was changed to fix.
+
+    Measured 2026-08-04: ``.claude-account-4`` is in this state -- ``.claude.json`` and
+    ``.credentials.json`` both written 19:37, ``~/claude-launchers/Launch-Claude-4.ps1`` builds it, and
+    no settings.json.
+
+    REPORTED, NOT ASSERTED, deliberately. Whether a launcher should be wired is the box owner's decision
+    -- an unused profile is a legitimate reason to leave one alone -- and a test that goes red over a
+    machine-configuration choice is the crying-wolf failure this suite exists to avoid. Printing it in
+    the run that scans makes it impossible to not-know, which is the part that was missing. Promote this
+    to an assertion the moment "every launcher is wired" becomes a rule rather than an observation.
+    """
+    return [
+        d
+        for d in _account_candidates()
+        if _ACCOUNT_DIR_NAME.fullmatch(d.name)
+        and not (d / "settings.json").is_file()
+        and looks_like_a_live_login(d)
+    ]
+
+
+def looks_like_a_live_login(d: Path) -> bool:
+    """Is this a dir something actually launches Claude Code from, judged WITHOUT reference to its name?
+
+    The name is what the exclusion turns on, so re-using the name here would make the guard agree with
+    the thing it is guarding by construction. These files are written by Claude Code itself on first use.
+    """
+    return any((d / marker).is_file() for marker in _LOGIN_MARKERS)
 
 
 def wired_matchers(settings: Path) -> set[str]:
@@ -282,6 +419,14 @@ def test_every_wired_matcher_names_a_tool_the_gate_handles() -> None:
     and -- worse -- reads as coverage that does not exist."""
     dirs = config_dirs()
     print(f"scanning {len(dirs)} config dir(s) against {INSTALLED_GATE}")
+    print(
+        f"  not judged (not a launcher name): {[d.name for d in excluded_config_dirs()] or 'none'}"
+    )
+    # A DIFFERENT gap from the one above, printed beside it so the two are never conflated: these carry
+    # no settings.json at all, so the gate does not run there. Not caused by the name filter.
+    print(
+        f"  LAUNCHER WITH NO GATE (no settings.json): {[d.name for d in unwired_launchers()] or 'none'}"
+    )
     if not dirs:
         pytest.skip("SKIP (nothing scanned): no Claude config dirs on this box -- nothing is wired")
     if not INSTALLED_GATE.is_file():
@@ -309,6 +454,16 @@ def test_every_non_optional_rule_is_wired_in_every_config_dir() -> None:
     print(
         f"scanning {len(dirs)} config dir(s); opt-in (absence is not drift): {sorted(OPT_IN_TOOLS)}"
     )
+    # An exclusion makes this assertion easier to pass, so it is printed in the same breath as the count
+    # it reduced. A number that got smaller looks like an improvement; the names say what was dropped.
+    print(
+        f"  not judged (not a launcher name): {[d.name for d in excluded_config_dirs()] or 'none'}"
+    )
+    # A DIFFERENT gap from the one above, printed beside it so the two are never conflated: these carry
+    # no settings.json at all, so the gate does not run there. Not caused by the name filter.
+    print(
+        f"  LAUNCHER WITH NO GATE (no settings.json): {[d.name for d in unwired_launchers()] or 'none'}"
+    )
     if not dirs:
         pytest.skip("SKIP (nothing scanned): no Claude config dirs on this box -- nothing is wired")
     if not INSTALLED_GATE.is_file():
@@ -328,6 +483,77 @@ def test_every_non_optional_rule_is_wired_in_every_config_dir() -> None:
         f"rules implemented by the installed gate but wired in no matcher, so they never fire: {unwired}. "
         f"Re-run install-gate.ps1 from a plain terminal, or add the tool to OPT_IN_TOOLS with a reason."
     )
+
+
+def test_nothing_excluded_from_the_wiring_scan_is_a_live_login() -> None:
+    """GUARD ON THE EXCLUSION. Narrowing :func:`config_dirs` shrinks the set the two assertions above
+    scan, and a smaller set is easier to pass -- so prove every dir dropped is one nothing launches from.
+
+    The check deliberately does not consult the NAME, which is what the exclusion turns on; it reads the
+    files Claude Code writes into a config dir on first use. A dir excluded by name that is nonetheless
+    logged into fails here, which is the only way a wrongly-excluded launcher gets to announce itself.
+
+    Passes vacuously when nothing is excluded, and says so in its output rather than leaving a bare dot.
+    """
+    excluded = excluded_config_dirs()
+    print(f"excluded from the wiring scan: {[d.name for d in excluded] or 'none'}")
+    print(f"judged as launchers: {[d.name for d in config_dirs()]}")
+
+    live = {d.name: sorted(m for m in _LOGIN_MARKERS if (d / m).is_file()) for d in excluded}
+    for name, markers in live.items():
+        print(f"  {name}: login markers {markers or '(none -- inert)'}")
+
+    suspects = {name: markers for name, markers in live.items() if markers}
+    assert not suspects, (
+        f"a directory excluded from the wiring scan by NAME carries the files Claude Code writes into a "
+        f"config dir it is logged into: {suspects}. Something may launch from it, in which case its gate "
+        f"wiring stopped being checked the moment it was excluded and nothing else looks at it. Either "
+        f"it is a real launcher -- widen _ACCOUNT_DIR_NAME to admit its shape -- or it is a stale copy "
+        f"of one, in which case say which and delete it. Do NOT relax this assertion to make it quiet."
+    )
+
+
+def test_the_launcher_name_predicate_accepts_launchers_and_rejects_the_artifact() -> None:
+    """NEGATIVE CONTROL for the name shape, and the record of what it gives up.
+
+    A filter is only evidence if it has been shown to reject the class it was written for AND to keep the
+    class it must not touch. Exercised against name strings, not against ~ -- the real directories are
+    machine-global and a test may not create or remove one to make its point.
+
+    The rejected group's second half is the RISK from :func:`config_dirs` written down as a fact instead
+    of as prose: these are launcher-ish names this predicate drops. If one of them ever becomes a real
+    config dir, this test is the thing that names it, and widening the regex is then the fix -- not
+    deleting the case.
+    """
+    accepted = [".claude-account-1", ".claude-account-2", ".claude-account-3", ".claude-account-42"]
+    rejected = [
+        ".claude-account-2.lock",  # the measured artifact -- an empty dir the installer's glob wired
+        ".claude-account-2.bak",  # the next artifact shape, which a `.lock` blocklist would have missed
+        ".claude-account-2-old",
+        ".claude-account-alpha",  # KNOWN COST: a named account would be wrongly excluded
+        ".claude-account-2b",  # KNOWN COST: a suffixed account would be wrongly excluded
+    ]
+
+    for name in accepted:
+        assert _ACCOUNT_DIR_NAME.fullmatch(name), f"{name} is a launcher shape and must be judged"
+    for name in rejected:
+        assert not _ACCOUNT_DIR_NAME.fullmatch(name), f"{name} must not be judged as a launcher"
+
+    # GUARD THE GUARD. Everything above applies the pattern with fullmatch, so it proves nothing about
+    # what happens if a future call site reaches for match or search instead -- and on an unanchored
+    # pattern both would readmit the artifact through its launcher-shaped prefix. The \A and \Z live in
+    # the pattern precisely so the method cannot matter; assert the three agree rather than trust it.
+    artifact = ".claude-account-2.lock"
+    for method in (_ACCOUNT_DIR_NAME.fullmatch, _ACCOUNT_DIR_NAME.match, _ACCOUNT_DIR_NAME.search):
+        assert not method(artifact), (
+            f"{method.__name__}({artifact!r}) matched: the pattern lost an anchor, so applying it any "
+            f"way other than fullmatch now readmits the artifact on its prefix"
+        )
+    # And prove that agreement is not the trivial kind, where the pattern matches nothing at all.
+    assert _ACCOUNT_DIR_NAME.search(".claude-account-1"), (
+        "the pattern matches no launcher name under search either -- the check above is vacuous"
+    )
+    print(f"accepted {accepted}; rejected {rejected} (last two are the documented cost)")
 
 
 def test_the_opt_in_list_only_names_tools_the_gate_actually_has() -> None:
