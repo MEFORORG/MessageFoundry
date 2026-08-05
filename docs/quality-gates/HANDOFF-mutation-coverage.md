@@ -8,7 +8,7 @@ working venv needs is here: **environment setup → the exact jobs/configs → l
 
 They are **advisory / non-required**, exactly like the already-shipped complexity + clone gates in
 [`.github/workflows/quality-advisory.yml`](../../.github/workflows/quality-advisory.yml) (PR #1028). A job
-here can show a red ✗ on its own PR but **can never block a merge**.
+here can show a red FAIL on its own PR but **can never block a merge**.
 
 ---
 
@@ -24,7 +24,7 @@ here can show a red ✗ on its own PR but **can never block a merge**.
 
 ---
 
-## 1. Set up the environment (do this first) 🧰
+## 1. Set up the environment (do this first)
 
 These gates exercise the real engine, so you need the same full test env CI uses.
 
@@ -241,13 +241,29 @@ Add the cron to the workflow's `on:` block, then the job:
 > **NOW ACTIONABLE — and done (2026-07-27).** `docs/Code_Quality_Standards.md` had never existed in this
 > repo's git history despite being cited by `quality-advisory.yml`'s header and `pyproject.toml:246`. It was
 > restored from the maintained copy at **v0.10**, which also carries the corrections this cycle produced:
-> signal 7 had been scored ✅ Built since v0.8 while its tool crashed before generating a mutant, signal 11's
+> signal 7 had been scored Built since v0.8 while its tool crashed before generating a mutant, signal 11's
 > "85 functions over C901>10" is now 122 across 43 files, and signal 8 now emits inline PR annotations. The
 > citations resolve again.
 
-Update [Code_Quality_Standards.md](../Code_Quality_Standards.md) exactly as #10/#8 were flipped in v0.3:
-signals 6 + 7 go from *deferred* → ✅ **Built (advisory)** in **§5** (status column), **Appendix A.2** (rows
-6/7), **A.3**, and the **A.1** verdict. Bump the rubric **Version** + add a history row.
+Update [Code_Quality_Standards.md](../Code_Quality_Standards.md) the way clone and complexity were flipped in
+v0.3: **signal 7 (mutation) + signal 8 (diff-coverage)** go from *deferred* → **Built (advisory)** in at least
+**§5** (the gate table's last column, headed **Taxonomy** — not "status"), **Appendix A.2** (those two rows),
+**A.3**, and the **A.1** verdict. Bump the rubric **Version** + add a history row.
+
+> **Two corrections before you copy any of that verbatim.**
+>
+> **(a) The signal numbers moved.** Rubric **v0.6** renumbered contiguously by tier: mutation 6 → 7 and
+> diff-coverage 7 → 8 (the v0.3 pair moved too — clone 8 → 9, complexity 10 → 11). This handoff's title,
+> section headings and drafted job comments still carry the pre-v0.6 numbers it was written against, so read
+> "#6" here as **signal 7** and "#7" here as **signal 8** whenever you write into the rubric.
+>
+> **(b) Write the word, never a status glyph.** `Code_Quality_Standards.md` carries **no status glyph as of
+> v0.12** — the words (`Built`, `Strong`, `Failing`) stand alone, per the project
+> [`CLAUDE.md`](../../CLAUDE.md) §11. Type `Built (advisory)` and put nothing beside it; a check mark added
+> here would reintroduce exactly the vocabulary v0.12 removed.
+
+*(Both signals were in fact restatused in v0.8 (#1040), and mutation repaired on `mutmut==3.6.0` in v0.10 — so
+the list above is the record of what such a flip touches, not work still outstanding.)*
 
 ## 6. Update — how these signals now surface (2026-07-27)
 
