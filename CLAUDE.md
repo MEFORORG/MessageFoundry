@@ -543,10 +543,15 @@ harness process only.)
 - Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
   field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
   differentiator ([`docs/BACKLOG.md`](docs/BACKLOG.md) #26). *Narrow carve-out (2026-07-10, #26
-  amendment):* a **structured Steps view** over real Python Handlers via a typed action
-  vocabulary (BACKLOG #222, ADR-gated) is permitted — plain `.py` stays the only artifact and
-  execution path; declarative logic execution, declarative field-mapping, and drag-drop canvas
-  logic authoring remain declined.
+  amendment; widened to Routers 2026-08-05 per ADR 0076 Amendment D, BACKLOG #232):* a
+  **structured Steps view** over real Python Handlers **and Routers** via a typed action
+  vocabulary (BACKLOG #222; the router `route` row kind is #232, ADR-gated) is permitted — the
+  carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
+  and that property holds identically for a `@router` (a byte-splice Steps view over a real
+  `@router` projects destination selection from reviewable Python; it introduces no declarative
+  artifact and no second execution path), so naming Routers does not cross the #26 line;
+  declarative logic execution, declarative field-mapping, and drag-drop canvas logic authoring
+  remain declined.
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
   ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
