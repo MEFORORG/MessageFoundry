@@ -5485,3 +5485,78 @@ Nothing caught it because `ide/src/test/suite/ai-policy.test.ts:31-40` tests the
 **Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; confirmed by direct execution of `_partition`.
 
 ---
+
+## 322. Synthetic leak-gate placeholders can collide with the real gate's own guards
+
+> ✅ **BUILT 2026-08-04 — the guidance half only; the “optionally…” half is deliberately NOT built.** Value **2/10** · Difficulty **1/10** · _fill-in_. **Shipped:** a `PLACEHOLDERS IN TRACKED CONTENT` block in the header region of `scan-tokens.local.txt.example`, mirrored in `CONTRIBUTING.md` and `scripts/dev/setup-leak-gate.ps1` — the script now prints the stand-in warning on **both** installs, not just `-Synthetic`, because with the real list a placeholder built from a listed prefix is an actual disclosure rather than a false positive. Three guards in `tests/test_scan_tokens_source.py`, each falsified against a planted defect: the two pure-prose files must be COMPLETELY clean under the synthetic set (not merely site-code-free — naming the synthetic placeholders outright to explain them would block a fork contributor on the very files that document the gate); the `.example` free of both site-code classes, behind a precondition that the detectors are ARMED so the emptiness cannot pass vacuously through the `_NEVER` sentinel; and the header's stated counts must equal what it compiles to **with nothing dropped by the parser** — counts alone are blind to a line that fails to compile and is discarded with only a stderr warning, verified by removing that half and watching an unbalanced-paren line inserted into `[names]` pass every test in the tree. **Three facts in the body below are wrong; the shipped text corrects them rather than copying them.** (1) “a site-code hit, twice” is two OCCURRENCES of ONE detector — `_SITE_CODE_FILE` requires four LITERAL digits and `_SITE_CODE_PATTERN_LITERAL` a quantifier or an x-run, so no single string is both; measured, a placeholder value gives exactly one `site code` hit. The useful consequence is the inverse of the one implied: fixing one form does **not** clear the other, which is the ADR 0030 miss the scanner already records. (2) `<site>` is safe because it is **non-numeric**, not because `_HOME_PATH`'s `(?!<` lookahead exempts it — that lookahead is positional to a `/Users/`-style segment and never reaches the site-code detectors; measured, an angle-bracketed code and an angle-bracketed x-run both fire. (3) Nothing scans a commit message — the hook passes staged FILES and CI runs `--path .` — so the guidance says the opposite: there is no net behind you in a subject line. **NOT built, by lane ruling:** the per-hit reason string naming the loaded set. It would collide with a later wave on `scan_forbidden.py`, which this lane leaves untouched, and the three-state load banner the scanner already prints before any refusal covers the diagnostic need. **Corrected in passing:** `CONTRIBUTING.md` told a synthetic-set contributor their “commits will pass” — measured 2026-08-04 that set produces 649 hits across 120 tracked files, because its placeholders are the fictional customer/partner names the project's own docs and samples use throughout; the bullet now says it is a DIFFERENT detector set and to judge a hit against the run banner. _(was 4/10 · 2/10; the re-score rationale is unchanged and stands in the ranked-table row above.)_
+
+**Cluster:** Security / DX. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+> **This item deliberately does not spell out the offending value.** Writing the prefix, or the prefix followed by four digits, would trip the very detector described — `[site_prefix]` builds *two* patterns from its entry: the prefix plus four digits, **and** the pattern written out as an x-run or quantifier. That recursion is the whole point of the item, so it is demonstrated rather than described.
+
+**What:** while redacting the #321 tokens, the first replacement chosen followed `scripts/security/scan-tokens.local.txt.example`'s own stated convention — that file designates a specific non-real numeric prefix for synthetic use, and the replacement was built from it. Under the **real** token set that value is clean. Under the **synthetic** set it is a site-code hit, twice, and the scan exits 1:
+
+```
+MEFOR_FORBIDDEN_TOKENS=scripts/security/scan-tokens.local.txt.example \
+  python scripts/security/scan_forbidden.py --path $T
+# -> docs/BACKLOG.md:<line>: site code  (x2), exit 1
+```
+
+`scripts/dev/setup-leak-gate.ps1 -Synthetic` is a **documented, supported contributor setup** (the example file calls it so in its own header), and the pre-commit hook passes `--require-tokens`, so it blocks *every* commit — not just ones touching that file. A contributor with no access to the real token list would hit an unexplained hard block on unrelated work. The final commit uses the non-numeric `SITEA` instead, which cannot collide with any numeric detector.
+
+**Why:** the example file's synthetic-prefix guidance is written for the person filling in the **token list**, where it is correct and necessary. But it reads as general guidance for *placeholder values*, and a placeholder written into tracked prose is then scanned by the gate that list configures. The convention is self-colliding for its second audience, and nothing warns you. The same trap caught [#325](BACKLOG.md), whose worked examples had to be rewritten to the exempt `<name>` form for exactly this reason.
+
+**Proposed:** state in `scan-tokens.local.txt.example` (and in the redaction guidance) that a placeholder written **into tracked content** must not use any prefix appearing in `[site_prefix]` in *either* the real or the example set — prefer a non-numeric stand-in (`SITEA`, `<site>`), matching the `<…>` convention `_HOME_PATH` already exempts. Optionally have the scanner's hit message name the loaded set, so a synthetic-set false positive is self-diagnosing rather than reading as a real leak.
+
+**Related:** `scripts/security/scan-tokens.local.txt.example`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml` (the `--require-tokens` arm), #321.
+
+**Source:** public-repo disclosure audit, 2026-08-01; found by testing the redaction under both token sets before committing `f3c6d348`.
+
+
+---
+
+---
+
+## 334. semgrep, a required blocking gate, scans a two-directory allow-list
+
+> ✅ **Status CLOSED (built 2026-08-04).** `semgrep --config .semgrep --error --metrics off messagefoundry tee` is now `semgrep --config .semgrep --error --metrics off --exclude … .` carrying bandit's exclude set from the same file, name-for-name, so the project's own dangerous-sink rules now cover **59** tracked `.py` files they never saw: `messagefoundry_webconsole/` (33), `scripts/` (24), `docker/` (2). **The body's "56 / 32 / 22" is a stale measurement, not a different scope** — re-measured 2026-08-04 at **339** in-scope files, up from 280. Clean at that bar (0 findings, AST emulation of all five rules); **not run with real semgrep, which has no supported Windows install** — the first CI run on the PR is the real check. `tests/test_lint_scope_parity.py` carries the parity arm the item asked for, plus three assertions it did not: no `--include` (it re-narrows the scan behind a positional `.`, so a targets-only check reads green on this very regression), no `./` prefix on a semgrep `--exclude` (a glob, not a path — and the set comparison normalises `./` off both sides), and `--error` still present (without it the widened gate prints every finding and exits 0). **Every `security.yml:NNN` anchor in the body below has moved** — the command is now at `:449`; the job still starts at `:393`. Two claims elsewhere rested on this item's old state and were corrected in the same commit: ADR 0034's residual row mitigated an unpinned `pip` bootstrap with *"semgrep is **not** a required context"* (it is — `.github/required-contexts.txt:78`), and `docs/Secure_Build_Scorecard_MEFOR.md:56` carried a now-resolved nit about the `.semgrep` header still calling the rules "advisory".
+
+**Cluster:** Security / CI gates. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** `.github/workflows/security.yml:413` runs the project SAST gate as an allow-list:
+
+```
+semgrep --config .semgrep --error --metrics off messagefoundry tee
+```
+
+It is a **required merge context** (`.github/required-contexts.txt:78`) and **blocking** (`security.yml:396`). Its sibling on the same file was moved off that shape deliberately — `security.yml:359-360` is `bandit -r .` minus an explicit `--exclude` list, and the rationale at `:348-352` names the failure by name: *"It was `-r messagefoundry tee` while the hook scanned everything except tests/harness/samples — so scripts/ (security tooling, subprocess-heavy) was gated locally and by nothing in CI."* semgrep was never given the same treatment.
+
+Taking bandit's exclude set as the project's own declaration of what SAST is supposed to cover, the delta is **56 tracked `.py` files**: `messagefoundry_webconsole/` (32 files, which ships as its own separately-versioned wheel — `packaging/messagefoundry-webconsole/pyproject.toml:17`, force-included at `:55-58`), `scripts/` (22 — the security tooling the bandit comment was written about), and `docker/` (2). `packaging/`'s 14 files are all tests and are excluded on both sides.
+
+`tests/test_lint_scope_parity.py` is cited at `security.yml:358` as the control that stops this ("fails if this and the hook drift apart again"), and it does hold that line for ruff and bandit — `test_ci_bandit_scans_the_repo_not_an_allow_list` (`:119-125`) asserts `bandit\s+-r\s+\.` against the workflow directly. **The string "semgrep" does not appear anywhere in that file.** There is no semgrep pre-commit hook either, so semgrep is CI-only and that CI-only assertion at `:119` is the exact template a semgrep arm would follow.
+
+**Why:** the honest blast radius is **drift, not exposure** — three things bound it, and the item is worth filing anyway:
+
+1. **Nothing is being missed today.** Grepping `messagefoundry_webconsole/` for every sink the five rules match (`shell=True`, `os.system`, `eval(`, `exec(`, `pickle.`, `marshal.`, `yaml.load(`, `verify=False`) returns **zero** hits. The console makes no outbound HTTP calls of its own — `routes/oidc.py` delegates code redemption to `messagefoundry.auth.oidc`, which *is* scanned.
+2. **bandit is a real compensating control on the same PR.** It is also required (`required-contexts.txt:74`), it does scan all 56 files, and its built-in checks for `exec`/`eval`, pickle/marshal, `yaml.load` and `shell=True` are **not** in the `--skip` list at `:359` (that list is only `B101,B110,B311,B404,B608`). So four of the five rules have overlapping enforcement. *(Confirm the specific bandit check-id mapping before leaning on this in review; the skip list is what was read, not bandit's plugin source.)*
+3. **CodeQL also covers it** — `codeql.yml:55` analyses python repo-wide with `security-extended` (`:66`) and has no paths filter. But it is **deliberately not a required context** (`required-contexts.txt:108-110`: fork-PR tokens lack `security-events: write`), so it is a detector, not a gate.
+
+What is *not* covered is the thing that will grow: `.semgrep/messagefoundry.yml` is where **project-specific** rules land — rules bandit will never ship. A future rule written because of something an operator hit in the console would silently not run on the console. The second step in the same job (`security.yml:414-424`, the ADR 0144 handler-taint rules) is scoped to `samples/config` only, so it does not close this either.
+
+**Correcting the audit that produced this item:** the source finding claimed the five rules "cover exactly the sinks that matter in an HTML-rendering console." They do not — `.semgrep/messagefoundry.yml:5-53` contains no HTML, template, escaping or XSS rule at all. The rules are generic dangerous-sink rules (`:6`, `:14`, `:21`, `:30`, `:43`). The finding also named only the web console; `scripts/` is out of scope on the same line and is the directory the bandit widening was specifically about.
+
+**Proposed:**
+
+1. Change `security.yml:413` to scan the tree the way bandit does — `semgrep --config .semgrep --error --metrics off --exclude … .` — mirroring bandit's `--exclude` set exactly so the two gates cannot disagree about what "the project" is. **Verify the tree is clean at that bar in the same PR**: `--error` is blocking, and `tests/` (563 files) very plausibly contains `pickle`/`yaml.load`/`eval` test idioms, which is presumably why `tests`/`harness`/`samples` are excluded on the bandit side too.
+2. Add `test_ci_semgrep_scans_the_repo_not_an_allow_list` to `tests/test_lint_scope_parity.py`, modelled on `:119-125`, so the next narrowing has to be deliberate. This is the durable half — without it, step 1 can rot again exactly as bandit's did.
+3. If a full widening is rejected, the fallback is appending `messagefoundry_webconsole scripts docker` to the argument list — but note that this is the allow-list shape `:348-352` explicitly retired, and it will go stale the next time a directory is added.
+
+**Related:** `.github/workflows/security.yml:348-360` (the bandit precedent) and `:393-424` (the semgrep job), `.semgrep/messagefoundry.yml`, `tests/test_lint_scope_parity.py`, `.github/required-contexts.txt:74`/`:78`/`:108-110`, `.github/workflows/codeql.yml`, `packaging/messagefoundry-webconsole/pyproject.toml`, [ADR 0065](adr/0065-web-ops-dashboard.md) (the console is a distinct distribution), [ADR 0144](adr/0144-handler-config-taint-rules.md) Inc 3 (the second, `samples/config`-scoped semgrep step).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+---
