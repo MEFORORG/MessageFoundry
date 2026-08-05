@@ -912,6 +912,31 @@ foreach ($r in $roots) {
     if (-not $targetCmp.StartsWith($coordRoot, [System.StringComparison]::Ordinal)) { continue }
     $rest = $targetCmp.Substring($coordRoot.Length)
 
+    # CLASSIFY THE FILE THE WRITE LANDS ON, NOT THE SPELLING. `foo.json:bar.md` names an NTFS ALTERNATE
+    # DATA STREAM of foo.json, and every classifier below would otherwise read the STREAM's name instead of
+    # the file's: the single-file entries compare the whole remainder (`overlap-cache.json:x.md` is not
+    # equal to `overlap-cache.json`, so the named list misses it) and GetExtension returns `.md`, so the
+    # shape backstop then reads a registry as a document. The DIRECTORY entries (alloc/, claims/) survived
+    # only because they match a path PREFIX, which a suffix does not disturb -- so the two spellings anyone
+    # would test first were the two that looked fine.
+    #
+    # Measured, and not inert: `announce/OFF:x.md` and `overlap-cache.json:x.md` were both ALLOWED, and an
+    # ADS write to a MISSING base CREATES the base with an empty default stream. announce-session.ps1 arms
+    # its repo-wide kill switch on `Test-Path .../OFF` alone, so that one spelling silenced every session
+    # in the repo through the rule added to prevent exactly that. What it could NOT do is forge alloc/ or
+    # claims/ CONTENT, because an ADS write leaves the default stream untouched -- the reachable harm is
+    # arming an existence-checked switch and squatting a name against an exclusive-create allocator.
+    #
+    # $rest is a REMAINDER, never a rooted path, so it carries no drive letter and the first colon can only
+    # be a stream separator. Strip from there and judge the base: a registry keeps its real extension and
+    # denies, while a stream on a genuine document stays a document.
+    #
+    # This is "what turns off the thing I am deferring to" applied to GetExtension. The question came from a
+    # sibling session that had just found `--ignore-other-worktrees` disabling the git guard its own rule
+    # deferred to; the same question against this rule's classifier produced the spelling above.
+    $colon = $rest.IndexOf(':')
+    if ($colon -ge 0) { $rest = $rest.Substring(0, $colon) }
+
     # Name is matched as the WHOLE remainder or as a prefix ending in a separator, so `alloc` catches
     # alloc/adr/0162.json without catching a document called alloc-notes.md. Both sides are already
     # casefolded by Get-ComparablePath, which is why `announce/off` matches the real `announce/OFF`; the

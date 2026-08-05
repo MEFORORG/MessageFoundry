@@ -296,6 +296,45 @@ def test_traversal_out_of_the_coordination_subtree_is_denied(
     assert_denied(run_gate(edit(_coord(primary, rest), cwd=primary), repos_file))
 
 
+@pytest.mark.parametrize(
+    "rest",
+    [
+        # The two that were measured ALLOWED, and the reason they are the dangerous pair: the named list
+        # compares the WHOLE remainder for a single-file entry, and `overlap-cache.json:x.md` is not equal
+        # to `overlap-cache.json`, so the list misses it -- then GetExtension returns `.md` and the shape
+        # backstop reads a registry as a document.
+        "announce/OFF:x.md",
+        "overlap-cache.json:x.md",
+        # These two were already denied, because a DIRECTORY entry matches a path PREFIX and a stream
+        # suffix does not disturb it. Pinned anyway: they are why the defect was invisible in the cases
+        # anyone would try first, so a future refactor must not quietly swap prefix matching for equality.
+        "alloc/adr/0162.json:evil.md",
+        "claims/1032.json:x.tsv",
+    ],
+)
+def test_an_alternate_data_stream_cannot_disguise_a_registry_as_a_document(
+    primary: Path, repos_file: Path, rest: str
+) -> None:
+    """Rule 1b classifies by extension, and an NTFS stream suffix is what turns that classifier off.
+
+    ``foo.json:bar.md`` names an alternate data stream OF ``foo.json``, so every classifier that reads the
+    tail of the string sees the stream's name rather than the file's. Measured against the real hook:
+    ``announce/OFF:x.md`` was ALLOWED, and an ADS write to a MISSING base CREATES the base with an empty
+    default stream -- while ``announce-session.ps1`` arms its repo-wide kill switch on ``Test-Path .../OFF``
+    alone. One spelling silenced every session in the repo, through the rule added to prevent that.
+
+    It could not forge ``alloc/`` or ``claims/`` CONTENT: an ADS write leaves the default stream untouched.
+    The reachable harm is arming an existence-checked switch, and squatting a name against an
+    exclusive-create allocator.
+
+    Found by asking what disables the thing rule 1b defers to -- a question handed over by a sibling
+    session that had just found ``--ignore-other-worktrees`` switching off the git guard its own rule
+    relied on.
+    """
+    reason = assert_denied(run_gate(edit(_coord(primary, rest), cwd=primary), repos_file))
+    assert "new.ps1" not in reason  # 1b's refusal, not rule 1's wrong-remedy one
+
+
 def test_a_crafted_target_cannot_forge_an_instruction_in_the_deny_text(
     primary: Path, repos_file: Path
 ) -> None:
