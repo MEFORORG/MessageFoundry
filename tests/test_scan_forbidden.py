@@ -253,3 +253,93 @@ def test_no_token_source_is_absent_rather_than_synthetic(monkeypatch: pytest.Mon
     mod = _scanner_with_tokens(monkeypatch, None)
     assert mod.TOKENS_PRESENT is False
     assert mod.is_synthetic_token_set() is False
+
+
+# --- --path coverage: every named path is scanned, and a file is scanned as itself -------------------
+# Regression tests for a gate that reported CLEAN over content it never opened. These drive `main()`
+# end-to-end rather than `_candidate_files` directly, because the defect was only observable through the
+# exit code: the ZERO-files refusal fires on the TOTAL, so one real directory masked every dropped path.
+
+
+@pytest.fixture
+def sf_main(sf, monkeypatch: pytest.MonkeyPatch):
+    """``sf`` patches the detection globals, but ``main()`` calls ``reload_tokens()`` as its first act and
+    would overwrite them with the externalized real set (or an empty one on a fork). Neutralise the
+    reload so ``main()`` is exercised against the SYNTHETIC tokens.
+
+    Without this the tests below would silently assert nothing: on a box with real tokens loaded the
+    synthetic "ACME" is not forbidden, so a dirty tree would exit 0 and the test would fail for a reason
+    unrelated to what it is checking. The require/floor env vars are cleared for the same reason -- an
+    inherited MEFOR_REQUIRE_TOKENS would make every call below return 2."""
+    monkeypatch.setattr(sf, "reload_tokens", lambda: None)
+    monkeypatch.delenv("MEFOR_REQUIRE_TOKENS", raising=False)
+    monkeypatch.delenv("MEFOR_MIN_DETECTORS", raising=False)
+    return sf
+
+
+def _clean_and_dirty(tmp_path: Path) -> tuple[Path, Path]:
+    """A clean directory, and a separate directory holding one file with a synthetic forbidden token."""
+    clean = tmp_path / "clean"
+    (clean / "sub").mkdir(parents=True)
+    (clean / "sub" / "ok.md").write_text("nothing to see here\n", encoding="utf-8")
+    dirty = tmp_path / "dirty"
+    dirty.mkdir()
+    (dirty / "leak.md").write_text("contact ACME about this\n", encoding="utf-8")
+    return clean, dirty
+
+
+def test_a_forbidden_token_in_the_SECOND_named_path_is_still_caught(
+    sf_main, tmp_path: Path
+) -> None:
+    """The defect, stated as a test. Only ``argv[1]`` was read, so every path after the first was dropped
+    with no message. Measured 2026-08-04: a four-path audit reported clean having examined ONE of the
+    four, and nothing in the output revealed it.
+
+    A leak gate whose green means "the first argument was clean" is worse than no gate: the caller reads
+    it as "all of these are clean" and stops looking."""
+    clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean), str(dirty)]) == 1
+
+
+def test_a_forbidden_token_in_a_named_FILE_is_caught(sf_main, tmp_path: Path) -> None:
+    """``rglob()`` on a non-directory yields nothing, so naming a file scanned exactly zero of it. Alone
+    that surfaced as the ZERO-files refusal (exit 2), which at least fails closed; mixed with a scannable
+    directory it disappeared into a clean exit 0."""
+    _clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(dirty / "leak.md")]) == 1
+
+
+def test_a_named_FILE_mixed_with_a_clean_DIRECTORY_is_not_swallowed(
+    sf_main, tmp_path: Path
+) -> None:
+    """The exact invocation shape that produced the false clean."""
+    clean, dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean), str(dirty / "leak.md")]) == 1
+
+
+def test_all_clean_named_paths_still_pass(sf_main, tmp_path: Path) -> None:
+    """The control. Without it, a fix that returned 1 unconditionally would satisfy every test above."""
+    clean, _dirty = _clean_and_dirty(tmp_path)
+    other = tmp_path / "other"
+    other.mkdir()
+    (other / "fine.md").write_text("all good\n", encoding="utf-8")
+    assert sf_main.main(["--path", str(clean), str(other), str(other / "fine.md")]) == 0
+
+
+def test_the_run_reports_how_many_files_it_examined(
+    sf_main, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Coverage has to be visible without suspecting an under-scan. Exit 0 plus a token-count line could
+    not distinguish "scanned what you named" from "scanned one of the four you named"."""
+    clean, _dirty = _clean_and_dirty(tmp_path)
+    assert sf_main.main(["--path", str(clean)]) == 0
+    err = capsys.readouterr().err
+    assert "examined 1 file(s)" in err
+    assert "1 named path(s)" in err
+
+
+def test_zero_examined_still_refuses_rather_than_reporting_clean(sf_main, tmp_path: Path) -> None:
+    """The pre-existing fail-closed behaviour must survive the fix: an empty tree is not a pass."""
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert sf_main.main(["--path", str(empty)]) == 2
