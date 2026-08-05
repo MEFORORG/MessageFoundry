@@ -262,7 +262,8 @@ v0.3: **signal 7 (mutation) + signal 8 (diff-coverage)** go from *deferred* → 
 > [`CLAUDE.md`](../../CLAUDE.md) §11. Type `Built (advisory)` and put nothing beside it; a check mark added
 > here would reintroduce exactly the vocabulary v0.12 removed.
 
-*(Both signals were in fact restatused in v0.8 (#1040), and mutation repaired on `mutmut==3.6.0` in v0.10 — so
+*(Both signals were in fact restatused in v0.8 (PR #1044 — PR #1040 built the gates), and mutation
+repaired on `mutmut==3.6.0` in v0.10 — so
 the list above is the record of what such a flip touches, not work still outstanding.)*
 
 ## 6. Update — how these signals now surface (2026-07-27)
