@@ -17,7 +17,7 @@
     the worktree gate inspects tool arguments, so a file written by a shell command is invisible to it.
     This is that backstop.
 
-    ⭐ WHY THE LEDGER GATE MOVED OUT OF HERE (2026-07-27). It used to be installed as a standalone
+    WHY THE LEDGER GATE MOVED OUT OF HERE (2026-07-27). It used to be installed as a standalone
     .git/hooks/pre-commit. Two tools cannot both own that file: this script refused to overwrite a
     foreign hook, and `pre-commit install` responded by renaming ours to pre-commit.legacy and calling
     it from its own shim. That works on POSIX and FAILS ON WINDOWS -- pre-commit invokes the legacy hook
