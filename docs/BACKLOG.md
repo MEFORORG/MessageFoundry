@@ -2392,7 +2392,9 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 228. Steps / config search finds handlers, routers, and transforms by name (not just connections)
 
-> 🔢 **Logged 2026-07-11 (unscored).** Value **4/10** · Difficulty **2/10** · _fill-in_. Preview-driven UX gap; to be value/difficulty-scored at the next backlog pass.
+> ✅ **CLOSED 2026-08-05 — both 2026-07-28 remainders built.** Value **4/10** · Difficulty **2/10**. **(a)** Definitions rows now carry a `contextValue` of their own — `meforSymbolHandler` on a handler row — gating the inline **View as Steps** action, which resolves through the row's *file*. They deliberately do **not** borrow `graphModel`'s `meforElementHandler` / `meforElement`, and no row claims an `elementKind` / `elementName`: a row's name is the Python **function** name (`def handle`) while the graph is keyed by the registered **decorator** name (`@handler("acme_adt_handler")`), and every `samples/config/` module makes the two differ — so the element vocabulary would render a **Show in Wiring Map** action that could only ever land on "the focused element no longer exists in the graph". Router / transform / send rows carry no action. **(b)** `SymbolKind` gains `send`: a separate extraction pass (a `Send(…)` sits inside a def body, out of reach of the column-0 def regex) indexes the connection each call addresses, at the call-site line; its comment guard is quote-aware, so a *trailing* `# was Send("OB_OLD", …)` is not a call site while a `#` inside a string literal does not truncate the line. **This is a bound, not a completeness claim:** at least quoted-literal targets and module-level `NAME = "literal"` constants are indexed; at least a computed, imported, or f-string target — and a ruff-wrapped call whose target is not on the `Send(` line — is dropped rather than guessed. **That is NOT the `graph --json` bound:** that extractor marks an unresolvable target `dynamic` and *surfaces* it ([ADR 0091](adr/0091-element-centric-connections-view.md) AC-3), and its module-constant rule validates against the whole module, neither of which this flat text scan does. The graph views remain the authority on resolved wiring. Twenty-one new tests, all node-side (so they run on every `ide` CI leg, not only the Windows Extension Host leg), each falsified.
+
+> **AMENDED 2026-08-05 — both remainders described below are now BUILT; the 2026-07-28 block that follows is the historical record, not current state.** Read it as the finding that scoped this work, not as a live gap. The one correction worth carrying forward: remainder (a)'s diagnosis named `viewItem == meforElementHandler` as the gate to satisfy, and adopting that value verbatim is precisely what the close had to avoid — see the CLOSED banner above.
 
 > **AMENDED 2026-07-28 — the index IS built; two clauses of the Proposed line are not.** Adversarial verification refuted a full close. **BUILT:** `ide/src/symbolIndex.ts` scans and surfaces handlers / routers / transforms **by name** in the MEFOR view's Definitions section, unit-tested — which fixes the item's headline complaint (a transform is a Python symbol inside a file named for the *connection*, so neither the sidebar search nor Ctrl+P could find it).
 >
@@ -5001,3 +5003,73 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 **Related:** [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md) (the decision, the measurements, and the ten EARS acceptance criteria), ADR 0158 (silent controls — a green signal that means nothing; findings 4, 5 and 8 are instances), #1018 (guards that go quiet).
 
 **Source:** adversarial review of the prototype by a red-team pass on 2026-08-05, before any wiring. The `File.Move` behaviour was measured in response to that pass rather than inferred from it, and the measurement retired the fix the review itself had proposed.
+## 1030. Non-cp1252 characters in source are gated one file at a time, so the class keeps recurring
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. At least two gates exist and each covers exactly one thing: `tests/test_cli.py:43-58` asserts one string (`messagefoundry --help`) is cp1252-encodable, and `tests/test_announce_hook.py:810` asserts one file (`scripts/hooks/announce-session.ps1`) is ASCII-only. Neither generalises, so a glyph reaching `print()` from any other script is caught only by a human reading the diff.
+
+**Cluster:** Tooling / verification integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect — the affected surfaces are `scripts/`, not the engine. The defect is that CLAUDE.md §11 states a correctness rule whose enforcement is per-file and hand-placed, so coverage decays between sweeps and each recurrence costs a fresh manual audit.
+
+**The mechanism, measured — and the usual statement of it is wrong.** `sys.stdout` carries `errors='surrogateescape'`, **not** `'strict'` (Python 3.14.6 on this box, `PYTHONIOENCODING` unset, confirmed under `-I`). `surrogateescape` only round-trips lone surrogates in `DC80`-`DCFF`; every other unencodable codepoint still raises. `sys.stderr` carries `errors='backslashreplace'`, which never raises. That asymmetry — not a strict/non-strict split — is why the same text survives on stderr and aborts on stdout. Anyone building the gate should measure this rather than repeat the strict claim, which is stated in at least one commit message in this repo's history.
+
+**Prior recurrences, and the fixes were per-surface.** `tests/test_cli.py:46-49` records the first: *"`messagefoundry --help` crashed with UnicodeEncodeError on a cp1252/charmap console because of a U+2192 arrow in the adr-analyze subparser help"*. That fix was not only the test — `messagefoundry/__main__.py:42-56` hardens `sys.stdout` and `sys.stderr` for the whole CLI, and its comment names the same failure. `harness/__main__.py:97-101` and `harness/acceptance/__main__.py:39` carry the same remedy, as does `scripts/bench/stage_residency.py:1057-1059`. The second recurrence is the sweep this item comes from: 43 non-cp1252 characters across four `scripts/` files, one of which (`scripts/kerberos_epa_spike.py`) had 11 string literals that raise on a cp1252 stdout.
+
+**Measured 2026-08-05: the backlog gate's own `--help` crashes.** `python scripts/docs/backlog_status_check.py --help` raises `UnicodeEncodeError: 'charmap' codec can't encode character '\u2705'`. Its argparse description is the module docstring, which carries the banner-alphabet table, so five non-cp1252 codepoints (U+2705, U+26D4, U+1FAA6, U+1F522, U+1F6A7) reach stdout. U+2014 is in that help text too and is cp1252-representable, so it is not part of the failure.
+
+**That case also shows why the naive gate is wrong.** Those five are the sanctioned machine-parsed alphabet CLAUDE.md §11 protects, and the remediation text must quote them to be actionable — an author told to add a closed banner without being shown the character cannot comply. So the fix there is a stdout reconfigure in that one script, **not** removing the characters. A gate that cannot express that exemption would either fire on correct code or be switched off.
+
+**Difficulty 4 is the scope decision, not the scanner.** The scanner is thirty lines — encode each character to cp1252 and report the failures. The design questions are: which paths (source only, or docs too, where `docs/BACKLOG.md` is a deliberate holdout); whether to gate on *encodability* or on *reaching an unguarded stream*, since those give different answers for a file that reconfigures; and how the exemption is declared so it is auditable rather than a hardcoded filename list. `tests/test_announce_hook.py:810` is the precedent worth copying — it gates source bytes, states its reason, and the guarded file declares its own constraint at `announce-session.ps1:54`.
+
+**Three properties to keep.** Print what was scanned — a filtered scan that skips a file type reads as clean when it never looked. Check the whole file, not line by line: `splitlines()` consumes U+2028/U+2029, so a line-oriented scan is structurally blind to them. Do not silently drop files that fail to decode as UTF-8.
+
+**Related:** #1018 (guards that go quiet), #1027 (a green that is not evidence), #1031, ADR 0158.
+
+**Source:** raised by the `scripts/` glyph sweep on 2026-08-05, then rewritten after an adversarial pass refuted the first draft's "exactly one gate exists" and its `errors='strict'` mechanism. The `--help` crash and the stream-handler values were measured, not inferred.
+
+## 1031. The STEP4 bench doc restates the stage_residency docstring in the glyphs its source shed, and carries emoji
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **1/10** · _fill-in_. `docs/benchmarks/STEP4-bracket-and-littles-law.md` §5.2 restates the N1 concurrency definition from `scripts/bench/stage_residency.py` and still spells it with U+2264, U+2212, U+2248 and U+03BB after the source moved to ASCII equivalents. The same block also carries a U+26A0 plus U+FE0F pair — the emoji removed from `scripts/asvs/scorecard.py:558` for propagating into `docs/`.
+
+**Cluster:** Docs / consistency. **Priority:** P4. **Verdict:** build (trivial). **Severity:** none operationally. It is a documentation defect: a reader comparing the doc to the tool sees two renderings of one definition and cannot tell whether the difference is meaningful.
+
+**Where — lines 414-425, and at least these.** U+2264 twice and U+2212 once on line 416 (`N(t) = #transformed<=t - #delivered<=t`, which the source now writes in ASCII, matching what `stage_residency.py:557` already used); U+2192 on 417; U+2248 on 422, in the sentence the source now reads as "N is about 8, therefore the lanes are saturated"; U+03BB on 425; and U+26A0 + U+FE0F on 421 and 425. Enumerated by scan rather than by eye, but treat it as a floor and re-scan the range.
+
+**Do not "fix" U+00D7 — the source keeps it.** `stage_residency.py` still contains four multiplication signs, including on the same sentence as doc line 425. It is cp1252-representable and out of scope for §11. Converting the doc's copy would *create* a divergence rather than remove one.
+
+**The source is cp1252-safe, not ASCII.** It retains 70 em dashes and those four multiplication signs. Em dashes, ellipses and section signs in the doc are cp1252-representable typography and stay.
+
+**Nothing machine-compares them, which is the point.** No gate reads both, so this did not go red and will not. It is the shape #1030 exists to catch, and if #1030 lands with docs in scope this closes as a side effect — check that before doing it by hand.
+
+**Related:** #1030 (the missing gate that would have caught this), #1027.
+
+**Source:** found by the completeness pass over the `scripts/` glyph sweep on 2026-08-05; the codepoint enumeration was corrected by an adversarial pass that caught the first draft claiming U+00D7 as a divergence and missing the U+26A0/U+FE0F pair entirely.
+
+## 1032. `worktree_gate` Rule 3b prints a `new.ps1` command that `new.ps1` rejects
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **3/10** · _fill-in_. The Rule 3b deny's escape hatch cannot be executed for the case that triggers it: it interpolates a slash-bearing branch name into a parameter that forbids slashes. Reproduced by running it, not by reading it.
+
+**What.** `scripts/hooks/worktree_gate.ps1:388`, inside the Rule 3b deny ("BLOCKED: would switch a LINKED WORKTREE onto the existing branch"), tells the caller to give the branch its own worktree with:
+
+```
+pwsh -NoProfile -File $newHint -Name $dest
+```
+
+`$dest` is the **branch** name. `scripts/worktree/new.ps1:26` validates `-Name` against `^[A-Za-z0-9._-]+$`, which every slash-bearing branch fails. Measured 2026-08-05: a branch of the form `claude/<task>-<suffix>` is REJECTED while the bare `<task>` component is accepted, and **140 of 193 local branches carry a slash**. The gate's motivating case is a branch that already exists — which is exactly why it carries a `claude/` prefix — so the escape hatch fails in the default case, not an edge case.
+
+**Why it survived.** The other three sites (`:411`, `:685`, `:794`) print the placeholder `-Name <short-kebab-task-name>`, which is valid. `:388` is the only interpolating one, so a grep for the common form finds three healthy instances and misses the defect. Two independent readers hit exactly that; the one who found it had run the command and held the failure in hand first.
+
+**DO NOT fix this by relaxing the ValidatePattern.** `$Name` does two jobs and the pattern is load-bearing for the first:
+
+| line | use |
+|---|---|
+| `new.ps1:43` | `Join-Path $Parent "$RepoName-$Name"` — a **path component** |
+| `new.ps1:58`, `:72`, `:86`, `:97` | `git branch --list` / `worktree add` / the `mefor-home-branch` marker — a **ref** |
+
+A slash satisfies git as a refname but makes `Join-Path` build a nested directory. Measured: a `claude/<task>` branch yields `MessageFoundry-claude\<task>` instead of a sibling `MessageFoundry-<name>`, so the worktree lands one level deeper than every other one. Loosening the pattern alone converts a **loud correct failure into a quiet wrong success** — the worse direction of error.
+
+**Preferred fix.** Add a `-Branch` parameter distinct from `-Name` (name = directory component, branch = ref), defaulting `-Branch` to `-Name` so every existing caller is unchanged; then `:388` emits `-Branch $dest -Name <sanitized>`. **Fallback** if a new parameter is unwanted: stop printing a command that cannot work, and print the supported procedure instead.
+
+**Verification this item must demand.** A test that **executes the string the gate prints**, not one that asserts a copy of it — a test hard-coding the expected hint passes throughout this defect, which is the "guard tests a copy of the rule" trap and is how it survived. It must also assert the resulting worktree directory is a **sibling**, since that is the regression the current validation prevents and that a naive fix would introduce.
+
+**Related:** #1030 (the missing general gate), #1027.
+
+**Source:** found by session `sleepy-villani-df328d` while gate-blocked twice, correctly, from another session's branch; reproduced independently by the coordinator against `new.ps1:26` and `Join-Path`. A Claude Code task chip (`task_fb78da2c`) covers the same defect but carries no allocated number and will not survive the session, so this ledger entry is the durable record.
