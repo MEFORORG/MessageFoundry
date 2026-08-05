@@ -4973,6 +4973,26 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 **Source:** found by the #324 lane on 2026-08-04 when it named both pytest paths for a webconsole-touching change; the CI-coverage half was flagged by that lane as an inference and verified against `ci.yml` before filing.
 
+## 1029. `/simplify` shipped as a local skill with no entry in the quality-standards record, so the one review tool that edits the tree had no written placement or scope
+
+> ✅ **SHIPPED 2026-08-05 — the documentation is the whole deliverable.** Value **3/10** · Difficulty **1/10** · _quick win_. `/simplify` is now recorded in [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) §5.1 as a local, human-invoked **advisory** review that **applies** its fixes, ordered before the `ruff` / `mypy` / `pytest` quartet, with the justified-duplication carve-outs written down. A new §5.1, a scoping clause in §5's intro, a mapping row in §6, and a `Before you verify` heading in `CLAUDE.md` §5.
+
+**Cluster:** Documentation / quality-control record. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect and no security effect. The gap was in the record: the quality-standards document enumerated five measurement gates and named no review tool that rewrites code, so the one ordering constraint that matters and the scope limits that already follow from earlier decisions were unwritten and uncitable.
+
+**What the record now says.** §5.1 is a new subsection and the single home for the tool. §5's placement table is **unchanged at five rows** — an earlier draft added a sixth and was reverted, because a row declaring itself "not a gate" contradicted both that table's `Gate` column and the §5 heading, and forced the same caveat into three other places. §5's intro instead gains one scoping clause naming §5.1 as a review tool deliberately not among the five. §6's companion-mapping table lists it in the same local, human-invoked, advisory tier as `/code-review` and `/security-review`, with the one difference that separates them stated **once**: those two report findings a human arbitrates, this one applies edits.
+
+**No status is claimed for it, and that is deliberate.** Every other entry in this document names a tracked artifact and a pull request. `/simplify` ships with Claude Code rather than with this project, so there is no `.claude/` entry, pin, or other artifact in the checkout to score — **Built** is therefore a claim the document explicitly declines to make, citing the Appendix A honesty taxonomy. §4.0's liveness rule does not reach it either, because there is no green check to trust.
+
+**The ordering is a consequence of the report-versus-apply difference, not a convention.** A tool that applies fixes, run after the quartet, would mutate the tree the quartet had just certified. `CLAUDE.md` carries it as a `Before you verify` heading placed *ahead of* the verification-expectations list rather than inside it — it is a mandated pre-step, not a gate, and "a task isn't done until these pass" cannot govern something that emits no pass or fail.
+
+**The carve-outs are the part most easily lost, and they are an open class.** §5.1 records **at least** these deliberately-justified duplications as out of scope: the SQL Server / Postgres store-backend parity that signal 9's clone detection already whitelists, and the `messagefoundry/anon/` package vendored to `tee/anon/` under [ADR 0030](adr/0030-anonymization-test-harness-tee.md), which signal 9 cannot see at all because its `jscpd` scan covers `messagefoundry/` only. The defensive branching tolerant HL7 parsing requires (`CLAUDE.md` §8) is recorded separately as a signal 11 *complexity* concern rather than a duplication one. Nothing the tool produces certifies quality (§4.1); the maintainer owns every applied edit under the *reject code you cannot explain* floor.
+
+**Difficulty 1 because nothing was built.** The skill already existed and is unchanged; the deliverable is a subsection, a table row, a heading and a clause. It is filed closed rather than skipped so the placement decision has a number to cite.
+
+**Related:** #1027 (the quartet this ordering sits in front of, and the same class of defect — a verification instruction that does not say what it actually covers), #1006 (an advisory gate from the same rubric), #1000 (gate liveness, the rule §5.1 explicitly records as not reaching a non-gate).
+
+**Source:** filed alongside the documentation change itself, 2026-08-05, and rewritten before filing because the first draft described a structure that was subsequently reverted. Every claim above was read from the working tree at commit `17c52129` rather than recalled: §5.1 at line 221, the five-row gate table, the §6 row at line 242, `CLAUDE.md`'s heading at line 288, and both `Built` mentions confirmed to be negations. The same change removed all 41 status glyphs from that document (rubric v0.12) and marked its pull-request citations as `PR #N`, the bare form having already resolved to the wrong item for `#1020`.
+
 ## 1030. Non-cp1252 characters in source are gated one file at a time, so the class keeps recurring
 
 > 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. At least two gates exist and each covers exactly one thing: `tests/test_cli.py:43-58` asserts one string (`messagefoundry --help`) is cp1252-encodable, and `tests/test_announce_hook.py:810` asserts one file (`scripts/hooks/announce-session.ps1`) is ASCII-only. Neither generalises, so a glyph reaching `print()` from any other script is caught only by a human reading the diff.
@@ -5043,3 +5063,53 @@ A slash satisfies git as a refname but makes `Join-Path` build a nested director
 **Related:** #1030 (the missing general gate), #1027.
 
 **Source:** found by session `sleepy-villani-df328d` while gate-blocked twice, correctly, from another session's branch; reproduced independently by the coordinator against `new.ps1:26` and `Join-Path`. A Claude Code task chip (`task_fb78da2c`) covers the same defect but carries no allocated number and will not survive the session, so this ledger entry is the durable record.
+
+## 1033. The rubric cites its own signals as `#N`, and six of those numbers are real backlog items
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) refers to its own eleven rubric signals as `#6`, `#7`, `#9`, `#10`, `#11`. In this corpus a bare `#N` reads as a backlog item, and six of those numbers **are** backlog items. Owner ruled 2026-08-05 that they get disambiguated. The four-digit PR citations in the same file were already fixed (PR #209); this is the short-number half that was deliberately left out of scope there.
+
+**What.** Ten citations on four lines, measured against `origin/main` at 780ee1d9:
+
+| Line | Tokens |
+|---|---|
+| L282 | `#10` |
+| L299 | `#7`, `\#8`, `\#9`, `\#11`, `\#10` |
+| L319 | `#10` |
+| L420 | `#6`, `#7`, `#9` |
+
+Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item today**; `#6`, `#7`, `#8`, `#10` and `#11` are closed items; only `#9` does not exist in the namespace. So six of the seven distinct numbers already resolve to something real and unrelated.
+
+**This is not inventing a convention.** L219 already reads *"Complexity (11) and clone (9) shipped first"* and *"the ruff-breadth expansion (signal 10, PR \#1047)"* — the word form and the bare-parenthesis form both appear in the file already, and L420 carries a `signal N` phrasing and a bare `(#N)` on the same line. The change makes the file self-consistent rather than imposing something new. `signal 7` is the target form; `PR #NNNN` is already the settled form for pull requests.
+
+**Two traps, both of which have already caught a reader.**
+
+1. **`#3` at L120 is a markdown ANCHOR FRAGMENT, not a citation:**
+   `[Secure AI-Assisted Development Standards §3](Secure_AI_Development_Standards.md#3-the-problem-this-standard-attacks)`.
+   Converting it silently breaks the link. It must be left alone, and a census that counts tokens without printing context will not see the difference. A prior census listed it as *"#3 x1 rubric signal"* and was wrong.
+2. **L299 and L319 use backslash-escaped forms** (`\#8`, `\#9`, `\#11`, `\#10`). A pattern requiring a literal space or paren before `#` misses them, and a `grep -oE` attempt during this triage returned **zero matches on a file that demonstrably contains them** — the pattern silently matched nothing and was believed. Prove the pattern fires on a known string before trusting a count from it.
+
+**Verification bar for whoever does it.** Print the token list with line numbers, not a count. Confirm zero bare one-or-two-digit `#N` remain outside link targets, that the L120 anchor is untouched, that the forty four-digit citations are still forty marked and zero bare, and that every markdown link still resolves — the anchor is the one that breaks silently.
+
+**Related:** PR #209 (the four-digit half, and the source of the `PR #NNNN` convention), \#1029 (the same document), \#1032 (same class: a census that counted without printing context).
+
+**Source:** raised by session `sleepy-villani-df328d` while sweeping the four-digit citations, and correctly kept out of that PR's scope. Owner ruled on it 2026-08-05. Counts here were re-measured against 780ee1d9 with a self-tested pattern after an unverified one reported zero.
+
+
+## 1034. The pre-push shim fails OPEN when python is not on PATH, so the push guard silently does not run
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **7/10** · Difficulty **3/10** · _fill-in_. `.git/hooks/pre-push` exits **0** with *"THE PUSH GUARD IS OFF for this push"* when python does not resolve. Since `enforce_admins` is OFF, [`scripts/hooks/push_guard.py`](../scripts/hooks/push_guard.py) is the only thing refusing an admin's direct push to `main` — and this repository IS the published artifact, so that push is publication. The one control has a silent off switch that depends on an environment variable.
+
+**What.** The shim is generated by `scripts/coord/install-git-hooks.ps1` and shared by every worktree through `core.hooksPath`. When it cannot find python it prints its notice to stderr and returns 0, allowing the push. That is the correct posture for a *workflow* guard that should not wedge a developer, and the wrong one for the only remaining control on a publication path — the same fail-open-versus-fail-closed distinction the security standards already draw between the git-staging guard and the engine's bind guard.
+
+**Why it matters more since 2026-08-05.** `push_guard.py` gained two further checks that day: a namespace allowlist (refusing a `--mirror`-shaped push) and a tip-tree check (refusing a ref carrying `docs/security`). Both are defeated by the same fail-open, so the shim now switches off three guards rather than one, and the failure is silent in the noisiest possible place — a terminal line above a successful push.
+
+**Two adjacent gaps in the same class**, worth deciding together rather than separately:
+
+- A **fresh clone or a newly created worktree has no hook at all** until `install-git-hooks.ps1` runs. Nothing prompts for it.
+- `git push --no-verify` and `MEFOR_ALLOW_DIRECT_PUSH=1` skip every check by design, and the latter returns 0 before any guard runs despite reading like it permits one specific thing.
+
+**A client-side hook cannot be the sole control, and that is the real finding.** Any fix here reduces the likelihood of an accident; it does not close the path. The durable answer is server-side — re-enabling `enforce_admins`, or a push ruleset — with the shim hardened as defence in depth rather than as the boundary. Whatever is decided, no prose may describe the hook as a security boundary; its own docstring already refuses that framing and should keep refusing it.
+
+**Related:** \#1032 (same file family, and the same shape of a remediation that cannot execute), PR #209.
+
+**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: session `nice-payne-4dcee0` has it as analysis only, with no build decision taken.

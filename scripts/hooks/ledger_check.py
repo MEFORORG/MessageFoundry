@@ -105,10 +105,11 @@ PUBLIC_BACKLOG_FLOOR = 1000
 
 def git(*args: str) -> str:
     # encoding= is REQUIRED, not cosmetic: `text=True` alone decodes with the LOCALE default, which is
-    # cp1252 on a stock Windows box. docs/BACKLOG.md and docs/adr/README.md are UTF-8 (em-dashes, ✅, ⚠️),
-    # so the decode raised inside subprocess's reader thread, `proc.stdout` came back **None**, and the
-    # caller died on `findall(None)` — blocking every commit that touched either ledger file. The gate's
-    # own failure mode was the one it exists to prevent: silent, and worst on the files it guards.
+    # cp1252 on a stock Windows box. docs/BACKLOG.md and docs/adr/README.md are UTF-8 (em-dashes,
+    # U+2705, U+26A0), so the decode raised inside subprocess's reader thread, `proc.stdout` came back
+    # **None**, and the caller died on `findall(None)` — blocking every commit that touched either
+    # ledger file. The gate's own failure mode was the one it exists to prevent: silent, and worst on
+    # the files it guards.
     proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell, no caller-supplied executable
         ["git", *args], capture_output=True, text=True, encoding="utf-8", errors="replace"
     )
