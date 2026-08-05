@@ -52,6 +52,13 @@ elseif ($PSCmdlet.ParameterSetName -eq 'Synthetic') {
     Write-Host "  This gate cannot see real customer tokens. CI runs the real set on your PR." -ForegroundColor Yellow
 }
 
+# Printed for BOTH installs, not just the synthetic one. Either list arms the site-code detectors, and
+# with the REAL list a placeholder built from a listed prefix is an actual disclosure rather than a
+# false positive -- so the maintainer arm is the one that needs this more, not less.
+if ($PSCmdlet.ParameterSetName -ne 'Status') {
+    Write-Host "  Writing a placeholder site code? Use a NON-NUMERIC stand-in (SITEA, or <site>) -- one built from a prefix in the installed list is a hit here." -ForegroundColor Yellow
+}
+
 # The token file must never become committable. Verify rather than assume -- this is the one mistake
 # that would publish the very list the gate protects.
 if (Test-Path -LiteralPath $local) {
@@ -79,7 +86,8 @@ if ($loaded -match 'STRUCTURAL-ONLY') {
 }
 if ($loaded -match 'SYNTHETIC') {
     Write-Host ''
-    Write-Host 'CONFIGURED (synthetic). Commits will pass; real customer tokens are NOT detected locally.' -ForegroundColor Yellow
+    Write-Host 'CONFIGURED (synthetic). Real customer tokens are NOT detected locally.' -ForegroundColor Yellow
+    Write-Host '  It also flags the fictional customer/partner names this project uses in its own docs, so a hit here is not by itself a leak. CI is authoritative.' -ForegroundColor Yellow
     exit 0
 }
 Write-Host ''
