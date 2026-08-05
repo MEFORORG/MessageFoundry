@@ -497,7 +497,8 @@ async def test_reauth_rejects_cross_site_post(engine: Engine) -> None:
 # uncovered: the GET editor PAGE markup (a COPY textarea + Modified badge + Revert + data-original),
 # the form-POST mode routing (reroute → 303 to the child, direct → 303 back to the origin), the
 # stale-step-up reauth_next that points a body-carrying POST at the /edit FORM (never the POST path),
-# the MESSAGES_EDIT gate, same-origin CSRF defense, cookie-confinement, and the generic 400 reject
+# the MESSAGES_EDIT + MESSAGES_VIEW_RAW gate and its per-actor PHI-read budget (BACKLOG #324, both
+# verbs), same-origin CSRF defense, cookie-confinement, and the generic 400 reject
 # that never leaks pydantic's structured echo. The /ui routes mount on the real engine app
 # (create_app(serve_ui=True)) and call the shared "core" handlers in-process over an ASGI transport.
 
@@ -553,6 +554,100 @@ async def test_message_edit_requires_edit_permission(engine: Engine) -> None:
         await _cookie_login(c, "viewer")
         r = await c.get(f"/ui/messages/{mid}/edit")
         assert r.status_code == 403
+
+
+# BACKLOG #324. The editor DISPLAYS the body it edits, so both verbs require MESSAGES_VIEW_RAW
+# alongside MESSAGES_EDIT. The case above (a VIEWER) holds NEITHER and so cannot see the pair come
+# apart; these four hold `messages:edit` WITHOUT `messages:view_raw` — the custom role that ADR 0045
+# still permits — and pin the refusal, the positive control, and the PHI-read budget on both verbs.
+
+
+async def test_edit_editor_refused_to_a_custom_role_without_view_raw(engine: Engine) -> None:
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="Resubmit Only",
+        description=None,
+        permissions=["messages:edit", "messages:read"],
+        actor="test",
+    )
+    await _add_with_role_ids(service, "resubmitter", [role.id])
+    mid = await _seed(engine)
+    before = len(await engine.store.list_messages(limit=50))
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "resubmitter")  # a fresh login counts as a recent step-up
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 403
+        # Not just the status: the seeded synthetic body and the pristine Revert copy must be absent.
+        assert "DOE^JANE" not in r.text
+        assert "data-original" not in r.text
+        # The POST's REJECT arm re-renders the pristine stored body too, so it needs the same gate.
+        # Sec-Fetch-Site is set deliberately: a 403 here can then only come from the permission gate,
+        # never from assert_same_origin.
+        r = await c.post(
+            f"/ui/messages/{mid}/edit-resend",
+            data={"raw": "", "idempotency_key": "k1", "mode": "reroute"},
+            headers={"Sec-Fetch-Site": "same-origin"},
+        )
+        assert r.status_code == 403
+        assert "DOE^JANE" not in r.text
+        assert "data-original" not in r.text
+    assert len(await engine.store.list_messages(limit=50)) == before  # no child was minted
+
+
+async def test_edit_editor_opens_for_a_custom_role_holding_both(engine: Engine) -> None:
+    # Positive control: the fix must be a TIGHTENING, not a lockout. Without this, the refusal test
+    # above passes just as well if the gate were broken to deny everyone.
+    service = await _service(engine)
+    role = await service.create_custom_role(
+        display_name="Resubmit And Read",
+        description=None,
+        permissions=["messages:edit", "messages:view_raw", "messages:read"],
+        actor="test",
+    )
+    await _add_with_role_ids(service, "editor", [role.id])
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "editor")
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 200
+        assert 'id="edit-raw"' in r.text
+
+
+async def test_edit_editor_charges_the_phi_read_budget(engine: Engine) -> None:
+    # The `phi=` thread through require_ui_step_up: this route puts a body on the wire, so it charges
+    # the same per-actor anti-automation budget the sibling raw views do (WP-8, ASVS 2.4.1).
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=1)
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        assert (await c.get(f"/ui/messages/{mid}/edit")).status_code == 200
+        r = await c.get(f"/ui/messages/{mid}/edit")
+        assert r.status_code == 429
+        assert r.headers["Retry-After"]
+
+
+async def test_edit_resend_reject_path_charges_the_phi_read_budget(engine: Engine) -> None:
+    # The POST's reject arm re-reads and re-ships the PRISTINE stored body, so it charges the budget
+    # too — otherwise it is an unthrottled channel for re-reading what the GET throttles.
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=1)
+    )
+    await service.initialize()
+    await _add(service, "op", Role.OPERATOR)
+    mid = await _seed(engine)
+    async with _client(engine, service) as c:
+        await _cookie_login(c, "op")
+        body = {"raw": "", "idempotency_key": "k1", "mode": "reroute"}
+        same_origin = {"Sec-Fetch-Site": "same-origin"}
+        r = await c.post(f"/ui/messages/{mid}/edit-resend", data=body, headers=same_origin)
+        assert r.status_code == 400  # the reject re-render — one token spent
+        r = await c.post(f"/ui/messages/{mid}/edit-resend", data=body, headers=same_origin)
+        assert r.status_code == 429
+        assert r.headers["Retry-After"]
 
 
 async def test_edit_resend_reroute_redirects_to_child(engine: Engine) -> None:

@@ -83,7 +83,17 @@ _UI_NO_GATE_ROUTES = frozenset(
 )
 
 #: Every route requiring MORE THAN ONE permission, across both planes. Each fails closed on either.
-_MULTI_PERMISSION_ROUTES = frozenset({("GET", "/messages/export"), ("GET", "/ui/alerts")})
+_MULTI_PERMISSION_ROUTES = frozenset(
+    {
+        ("GET", "/messages/export"),
+        ("GET", "/ui/alerts"),
+        # BACKLOG #324: the console editor DISPLAYS the body it edits (textarea + `data-original`),
+        # and the POST's reject arm re-ships the pristine stored copy — so both verbs require
+        # `messages:view_raw` alongside `messages:edit`.
+        ("GET", "/ui/messages/{message_id}/edit"),
+        ("POST", "/ui/messages/{message_id}/edit-resend"),
+    }
+)
 
 #: ``/ui`` routes on plain ``require_ui`` while a JSON route with the same method and the same
 #: permission set carries a stronger wrapper. Reviewed and disclosed, one reason each, in the doc's

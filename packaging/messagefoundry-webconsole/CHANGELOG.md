@@ -26,6 +26,17 @@ the engine compatibility range.
   `SUPPORTED_ENGINE_SEAMS = {2, 3}`: seam `2` is retained because the new field has a default, so a
   seam-`2` engine (whose `/status` omits `kpis`) still renders here with default (zeroed) KPI values.
 
+### Security
+- **The message editor now requires `messages:view_raw` alongside `messages:edit`** (BACKLOG #324).
+  `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` gated on `messages:edit`
+  alone, but the editor *displays* the body it edits (the textarea plus the pristine `data-original`
+  copy behind Revert) and the POST's rejection arm re-renders that pristine copy — so a custom role
+  holding `messages:edit` without `messages:view_raw` would have read raw PHI here on a deployed
+  instance. Both verbs now fail closed on **either** permission. **Operator-visible change:** such a
+  role gets `403` on the editor (it can still resubmit through the JSON API); no built-in role is
+  affected, since `ADMINISTRATOR` and `OPERATOR` grant both. Both verbs additionally charge the
+  per-actor PHI-read budget now, so either can return `429` + `Retry-After` under automation.
+
 ## [0.2.15] — 2026-07-06 — Early Access
 
 Initial release of the web console as a standalone distribution. **Supported engine UI seam: `1`.**
