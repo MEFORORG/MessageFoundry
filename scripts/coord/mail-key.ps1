@@ -1,9 +1,10 @@
 <#
 .SYNOPSIS
-    The worktree -> mailbox key function. ONE definition, dot-sourced by everything that needs it.
+    The worktree -> mailbox key function AND the message-id shape. ONE definition of each,
+    dot-sourced by everything that needs them.
 
 .DESCRIPTION
-    Dot-source this; it defines a function and does nothing on its own.
+    Dot-source this; it defines functions and does nothing on its own.
 
         . "$PSScriptRoot\mail-key.ps1"
         $key = ConvertTo-BoxKey -Path $cwd
@@ -26,6 +27,19 @@
     paths can sanitise to the same slug, and the failure mode is one worktree silently reading
     another's mail. The hash is computed over the NORMALISED path and is what carries injectivity. The
     slug exists only so a human can tell boxes apart in a directory listing.
+
+    THE MESSAGE ID IS ALSO A SHARED CONTRACT, AND IT FAILS THE SAME WAY THE BOX KEY DOES. The drain
+    treats the ON-DISK NAME as the message's identity -- the JSON 'id' field inside a message is body
+    content and is never read -- so if the minter and the validator ever disagree about the shape, the
+    drain delivers NOTHING while the sender keeps reporting messages queued. Silent on both ends,
+    exactly the failure this file already exists to prevent. New-MessageId and Test-MailStem therefore
+    sit next to each other here, not one in the sender and one in the reader.
+
+    WHAT THIS FILE DOES NOT OWN. An on-disk mail filename is <stem>--<claim token>.json, and the
+    CLAIM TOKEN half belongs to mail-claim.ps1. The two halves are joined in exactly one place,
+    Split-MailFileName, which lives there with the token regex. Do not add a whole-filename validator
+    here: that would be a second definition of the join, and the copy that drifts is the one nobody is
+    testing.
 #>
 
 function ConvertTo-BoxKey {
@@ -44,4 +58,40 @@ function ConvertTo-BoxKey {
     if (-not $slug) { $slug = 'root' }
 
     return "$slug-$short"
+}
+
+function New-MessageId {
+    # Sortable-by-time, unique, and filename-safe. The time prefix is what makes an `ls` of the inbox
+    # readable in arrival order without opening anything, and it is why the drain's Sort-Object Name
+    # still yields arrival order after the claim token is appended to the filename.
+    #
+    # Test-MailStem below is the ONLY validator of what this mints. Change one and you must change the
+    # other in the same commit.
+    #
+    # Get-Random is adequate HERE and is not adequate for a claim token: this value only has to not
+    # collide with another message from the same millisecond, whereas a claim token has to be
+    # unmintable by a concurrent claimer. See mail-claim.ps1 for why that one uses
+    # RandomNumberGenerator instead.
+    $t = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfff')
+    $r = -join ((1..6) | ForEach-Object { '0123456789abcdefghijklmnopqrstuvwxyz'[(Get-Random -Maximum 36)] })
+    return "$t-$r"
+}
+
+function Test-MailStem {
+    # THE FILENAME IS THE ONLY TRUSTWORTHY IDENTITY A READER HAS. It is what the OS holds, it cannot
+    # contain a path separator, and -- unlike the JSON 'id' field -- nothing inside the message can
+    # influence it. The drain derives its id, and the path it writes a receipt to, from the name only.
+    #
+    # \A and \z, NOT ^ and $: in .NET '$' also matches immediately before a trailing newline. A Windows
+    # filename cannot carry one, so this is belt and braces here -- but the shape is meant to be
+    # liftable into a test fixture or onto another platform, where it would not be.
+    #
+    # -cmatch, NOT -match: PowerShell's -match is case-INSENSITIVE by default and New-MessageId emits
+    # lowercase only. One minted shape, one accepted shape.
+    #
+    # This validates the STEM, not the whole filename -- the extension and the claim-token half are
+    # checked by Split-MailFileName in mail-claim.ps1, which is the one place the two shapes meet.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Stem)
+    return ($Stem -cmatch '\A[0-9]{8}T[0-9]{9}-[0-9a-z]{6}\z')
 }
