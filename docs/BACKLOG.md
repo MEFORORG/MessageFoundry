@@ -5035,7 +5035,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 ## 1032. `worktree_gate` Rule 3b prints a `new.ps1` command that `new.ps1` rejects
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **3/10** · _fill-in_. The Rule 3b deny's escape hatch cannot be executed for the case that triggers it: it interpolates a slash-bearing branch name into a parameter that forbids slashes. Reproduced by running it, not by reading it.
+> 🚧 **In progress 2026-08-05 — fixed in PR #214, NOT yet merged.** Value **6/10** · Difficulty **3/10** · _fill-in_. The Rule 3b deny's escape hatch cannot be executed for the case that triggers it: it interpolates a slash-bearing branch name into a parameter that forbids slashes. Reproduced by running it, not by reading it. `new.ps1` gained a `-Branch` parameter distinct from `-Name` and the rule now emits both. The same work closed a refname **command injection** in that deny text (#1040) and a hijack **bypass** the first attempt introduced (#1039). This banner moves to closed on merge, not before.
 
 **What.** `scripts/hooks/worktree_gate.ps1:388`, inside the Rule 3b deny ("BLOCKED: would switch a LINKED WORKTREE onto the existing branch"), tells the caller to give the branch its own worktree with:
 
@@ -5113,3 +5113,103 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 **Related:** \#1032 (same file family, and the same shape of a remediation that cannot execute), PR #209.
 
 **Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: session `nice-payne-4dcee0` has it as analysis only, with no build decision taken.
+
+## 1035. Gate remediations interpolate an unquoted `-File` path into a command the reader is told to run
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. Every `pwsh -NoProfile -File $x` the gate prints interpolates a governed-root path with no quoting. A root whose path contains a space produces a command that cannot run. Latent today only because the single allowlist entry has no space in it.
+
+**What.** `scripts/hooks/worktree_gate.ps1` emits remediation commands of the form `pwsh -NoProfile -File <interpolated path>`. At least six such sites exist across five rules. One of them (Rule 3b's) was quoted while fixing #1032; the rest were left, deliberately, as untouched code in rules that change was not opening.
+
+**Measured, not reasoned.** With a primary at `<tmp>/Pri mary`, the emitted line exits **64** with a usage dump and the message `The argument 'C:\...\Pri' is not recognized as the name of a script file`. Quoted, the identical line exits 0. This is pinned in `tests/test_worktree_gate_hijack.py`, whose execution test is parametrised over a plain and a space-bearing primary precisely so the quoting is under test rather than assumed.
+
+**Why it is worth doing despite being latent.** It is the same defect class as #1032 — a remediation the receiving side rejects — and #1032 demonstrated that the class is not caught by review: three healthy placeholder sites hid one broken interpolating site, and two independent readers missed it. The condition that makes this live is a user choosing a checkout path with a space, which is an ordinary thing to do and not something the repo controls.
+
+**Scope note.** Two categories must NOT be swept up. Relative file *references* with trailing prose (Rule 1a telling a human where the source lives) are deliberately not runnable command forms. Comment-based help inside a `.NOTES` block is never emitted at runtime. Both look similar to grep and neither is a defect.
+
+**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in).
+
+**Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
+
+## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _quick win_. The `EnterWorktree` deny hardcodes the first governed root when building the command it tells the session to run. Rule 4 computes no root of its own and fires for every session regardless of repo, so with a second governed primary in the allowlist it would point the reader at the wrong repository's script.
+
+**What.** Rule 4 denies the `EnterWorktree` tool and prints a remediation naming `sessions.ps1` under the first allowlist entry. Unlike the path-scoped rules, Rule 4 never resolves which governed root the session belongs to — it fires on the tool name alone.
+
+**Why it is latent.** The allowlist currently holds one entry, so the first entry is trivially the right repo. The defect appears the moment a second primary is governed, and it appears as a remediation pointing into an unrelated checkout — which is worse than no remediation, because the path exists and the command runs.
+
+**Severity.** No product effect and no security effect; the gate still denies correctly. The failure is in the instruction, not the decision.
+
+**Related:** #1035 and #1032 (remediations that cannot be acted on as printed), #1040.
+
+**Source:** identified 2026-08-05 during the #1032 work, from reading every remediation site in the file rather than only the one being fixed.
+
+## 1037. `remove.ps1` cannot be execution-tested, because it hardcodes its repo root
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **3/10** · _fill-in_. `scripts/worktree/remove.ps1` derives its repo root from its own script location with no override, so no test can drive it against a synthetic repository. Its sibling `prune-merged.ps1` accepts a root and IS execution-tested; that is the whole difference.
+
+**What.** `remove.ps1` computes its repo root from where it lives. A test therefore cannot point it at a fixture repo, and the only way to exercise it is against the real checkout — which no test may do, since the script removes worktrees and can delete branches.
+
+**Why it matters now.** `remove.ps1` gained real behaviour on 2026-08-05: `-DeleteBranch` stopped assuming the branch equals the directory name and adopted `prune-merged.ps1`'s lossless discipline (`-d` first, `-D` only after re-verifying the branch carries nothing beyond `origin/main`). That logic is covered by **review only**. It is the code path that force-deletes refs, and the one place in `scripts/worktree/` where getting it wrong loses commits reachable from no ref and no reflog.
+
+**The shape of the fix** is already in the repo: `prune-merged.ps1` takes a root parameter and has an execution test. Adding the same override is mechanical; the value is that it converts the most destructive script in the directory from review-covered to test-covered.
+
+**Related:** #1032 (the change that gave `remove.ps1` behaviour worth testing), and `tests/test_worktree_prune_merged.py` as the pattern to copy.
+
+**Source:** identified 2026-08-05 while changing `remove.ps1`, and stated in that change's own commit as covered by review rather than test.
+
+## 1038. Rule 3b's remediation names `new.ps1` siblings while most live worktrees are harness-created and nested
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **4/10** · _fill-in_. Two mechanisms create worktrees here and they use different layouts. `new.ps1` makes siblings at `<repo-parent>/<repo-name>-<Name>`; the Claude Code harness makes nested ones under `<primary>/.claude/worktrees/<slug>`. Rule 3b fires for both and its remediation only ever names the first.
+
+**What.** A session blocked by Rule 3b is told to run `new.ps1`, which produces a sibling worktree. If that session is itself harness-created and nested, the remediation hands it a worktree in a different layout from the one it lives in — functional, but not what the reader expects, and not made by the mechanism that made theirs.
+
+**Both layouts are live.** Measured 2026-08-05: sibling and nested worktrees both exist in quantity against this one `.git`. Two source comments asserted that `new.ps1` creates the *nested* layout; both were false and were corrected during the #1032 work, in `worktree_gate.ps1` and `scripts/coord/occupancy.ps1`. That the same false premise had been independently written twice is the reason this is worth settling rather than leaving to be re-derived a third time.
+
+**The open question, which is design and not a bug.** Should Rule 3b name the harness path first, name both, or keep naming `new.ps1` and say why? #1032 deliberately did not settle it — that change made the command it already printed runnable, and nothing more. Whichever way it goes, the answer belongs in one place with the other site linking to it.
+
+**Related:** #1032 (made the printed command work without settling which command is right), #1035.
+
+**Source:** identified 2026-08-05 during the #1032 investigation, when the sibling-versus-nested contradiction surfaced from reading `git worktree list` rather than the comments.
+
+## 1039. `git worktree add --force` also defeats the already-checked-out guard, so "git will refuse this" must be written as conditional
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. At least three git flags defeat the guard that stops a branch being checked out in two worktrees. Any code or comment reasoning that "git already refuses this" is making a claim about a **configuration**, not about git, and must say so.
+
+**Measured 2026-08-05**, against a branch live in another worktree:
+
+| command | result |
+| --- | --- |
+| `checkout`/`switch <b>` | `fatal: already used by worktree at ...` |
+| `checkout`/`switch --force <b>`, `switch --discard-changes <b>` | `fatal` — do NOT bypass |
+| `switch --no-ignore-other-worktrees <b>` | `fatal` — correctly does NOT bypass |
+| `checkout`/`switch --ignore-other-worktrees <b>` | **switches** |
+| `checkout`/`switch --detach <b>`, and `-d <b>` | **switches** |
+
+`--detach` bypasses by never taking the branch lock, yet it still swaps the other session's files to that commit, which is the harm. `-d` is a live short form on **both** verbs.
+
+**Not yet measured, and the reason for this item:** `git worktree add --force` overrides the same guard. Nothing in the gate is known to depend on that today, but the assumption "git will refuse a second checkout" appears in reasoning about worktrees generally, and it should be recorded as conditional wherever it appears.
+
+**This is a documentation-and-audit item, not a code fix.** #1032's fix already handles the checkout/switch path, and it does so with an **allowlist** — the early return fires only when there are no flags at all — precisely because a denylist was written twice there and was wrong twice. The work here is to find every other place that defers to a guard it does not own, and write down what switches that guard off.
+
+**Related:** #1032 (where the bypass was introduced and closed), #1040.
+
+**Source:** the bypass was found 2026-08-05 by a session auditing its own change after a peer noted that `ledger_check.py`'s ownership model depends on the worktree gate; `--detach` and `-d` were then found by asking the same question a second time rather than patching the first flag.
+
+## 1040. Hook deny text is attacker-influenceable output that an agent is instructed to act on, and nothing treats it as such
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **8/10** · Difficulty **5/10** · _do it_. Two separate injections into gate deny text were found independently on the same file within hours, by two sessions, through different values. The general form is bigger than either instance and bigger than the gate: a deny reason is **output built from attacker-influenceable input**, and it carries a command block a model is told to run.
+
+**Instance one — a refname into a command.** `git check-ref-format` accepts `;`, `$`, `|`, `"` and `'` in a refname. A legal, creatable branch carrying a quote and a comment marker made Rule 3b emit a line that parses as **two statements**, the second arbitrary, with the comment marker hiding the remainder. A branch with a bare interior quote emitted an unparseable line. Fixed by doubling the quotes in the single-quoted emission.
+
+**Instance two — a file path into prose.** A `Write` whose `file_path` carried embedded newlines produced a reason with **two** `Do this instead:` blocks, the forged one **first**, so a model reading top-down reaches the injected command before the real remedy. This one needed nothing on disk — only the JSON field — so no other gate saw it.  Fixed with a shared fold helper.
+
+**The two fixes are different, and the wrong one at either site would look like it worked.** Quote-doubling is for a value entering a **command**; folding CR/LF/TAB is for a value entering **prose**. Both produce output that reads fine to a human skimming it.
+
+**Why this is the most valuable item in this group.** The repo already knew half of it: `Write-Deny` has always folded its **log** line, with a note that a crafted path could otherwise forge records in a log whose purpose is counting. The **reason** never got the same treatment, in the same function. And every hook in `scripts/hooks/` that emits a remediation an agent is told to run has this shape — the gate is where it was noticed, not where it is confined.
+
+**What the work is.** Enumerate every deny and remediation surface across `scripts/hooks/`, classify each interpolated value as command-bound or prose-bound, and apply the matching treatment through one shared helper per class rather than at each site. The audit is the deliverable; the individual fixes are small.
+
+**Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039.
+
+**Source:** the two instances were found independently on 2026-08-05 by sessions `trusting-wu-c2e6d5` (refname, in Rule 3b) and `sharp-chatelet-f33072` (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
