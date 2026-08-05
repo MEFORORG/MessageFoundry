@@ -495,6 +495,7 @@ def _reauth_redirect(request: Request, next_path: str | None = None) -> HTTPExce
 
 def require_ui_step_up(
     *permissions: Permission,
+    phi: bool = False,
     reauth_next: Callable[[Request], str] | None = None,
 ) -> Callable[[Request], Awaitable[Identity]]:
     """Authenticate a /ui request, assert ``permissions``, AND require a fresh step-up — the cookie-world
@@ -513,12 +514,30 @@ def require_ui_step_up(
     page** (e.g. ``POST /ui/users`` → ``/ui/users/new``): after re-verification the browser is GET-
     redirected to the form, which re-opens inside a fresh window for a clean re-submit. The mapped value
     gets no trust: ``/ui/reauth`` still validates it against the write-action registry (fail-closed).
+
+    ``phi=True`` forwards to :func:`require_ui`'s ``phi`` arm, so a step-up route that PUTS PHI ON THE
+    WIRE also charges the per-actor anti-automation budget (``allow_phi_read``; 429 + ``Retry-After``
+    when exhausted) — the same throttle the plain ``require_ui(..., phi=True)`` browse routes and the
+    JSON ``require_phi_read`` routes charge. It defaults **False** because most routes riding this
+    factory are admin writes (user/role management, replay, purge, config reload) that emit no message
+    body: charging a PHI budget there would throttle administration on a quota that measures PHI reads.
+    Set it on a step-up route only when the route's own response carries PHI. It is **not** yet set on
+    every such route: at least ``GET /ui/messages/search``, ``GET /ui/messages/search/layered`` and
+    ``GET /ui/uploaded-logs/file/{file_id}`` would still skip this budget on a deployed instance.
+    BACKLOG #324 gated the edit pair only, by owner ruling, and deliberately left those — a gap stated
+    here, not an accepted posture. That list is a **sample, not a census**: to know which routes charge
+    the budget today, read the gates, not this docstring.
+
+    ORDERING, deliberate: the budget is charged inside ``base``, i.e. BEFORE the step-up freshness
+    check below — so a request that ends in a 303 to ``/ui/reauth`` has already spent a token. That is
+    the fail-safe direction (an attacker cannot probe the route for free by letting the window go
+    stale) and is immaterial at the shipped 120-reads/60s default.
     """
     # allow_mfa_pending: the base must NOT fire the 6.3.3 redirect for a step-up route. This
     # factory runs its OWN mfa_satisfied check below, which 303s to /ui/reauth *carrying the
     # next= continuation*; letting the base pre-empt it would drop that continuation and land the
     # operator on /ui instead of the action they clicked. Same refusal, better destination.
-    base = require_ui(*permissions, allow_mfa_pending=True)
+    base = require_ui(*permissions, phi=phi, allow_mfa_pending=True)
 
     async def dependency(request: Request) -> Identity:
         identity = await base(request)  # cookie auth + permission (+ must-change gate)

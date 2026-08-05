@@ -96,8 +96,14 @@ class CoreHandlers:
     """The ``create_app``-nested JSON handlers the moved ``/ui`` routes call directly.
 
     Each is the exact in-process handler the JSON API registers, reached by reference so the console
-    reuses the single audited PHI path (its own ``Depends`` gate is skipped — the ``/ui`` route
-    re-asserts the equivalent permission via ``require_ui*``). Async unless noted.
+    reuses the single audited PHI path. Calling it as a plain function SKIPS its own ``Depends`` gate,
+    so the ``/ui`` route standing in front of it must re-assert **at least** the permissions that gate
+    carries — re-asserting a *different* one is this seam's failure mode, and it is silent, because
+    the skipped gate never runs to disagree. Measured instance: ``GET /ui/messages/{id}/edit`` reached
+    ``get_message`` (``require_phi_read(MESSAGES_VIEW_RAW)``) while itself asserting only
+    ``messages:edit``, so a custom role holding ``messages:edit`` alone would have read the raw body on
+    a deployed instance; both edit verbs now assert ``messages:edit`` **and** ``messages:view_raw``
+    (BACKLOG #324). Async unless noted.
     """
 
     list_connections: Callable[..., Awaitable[Any]]
