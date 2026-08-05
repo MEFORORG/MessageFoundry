@@ -5276,3 +5276,212 @@ One correction *widening* the bounding: the residual is not stdout/NSSM alone. `
 ---
 
 ---
+
+## 233. Steps view move-drop logic implemented twice (model + webview)
+
+> ✅ **SHIPPED 2026-08-04 — option (c) ONLY, by owner ruling: the divergence class is now GATED by a differential test, not eliminated.** Value **6/10** · Difficulty **3/10** · _quick win_. `ide/src/test/suite/steps-mirror.test.ts` loads the real `ide/media/stepsWebview.js` under jsdom (a new `ide/` devDependency, lock re-locked in the same commit) and asserts all ten mirrors against their `stepsModel` counterparts on **every** `ide` CI leg — 2,000 seeded generated row sets for the five pure row-array mirrors, and four hand-authored adversarial cases across all ordered (drag, target) pairs and five pointer fractions for the four DOM-bound ones. It found exactly **one** live divergence and closed it: `canDropRow` accepted a read-only `code` row as a drop target while the webview refused it, contradicting the model's own stated contract. **NOT built: options (a) and (b).** Both implementations still exist, so what closes is the *silent* half of the divergence class, not the duplication; #237's "sequenced behind #233" dependency is met by the gate rather than by de-duplication. **Stale anchors:** the `stepsModel.ts:1767` / `:1861` / `:1531` and `stepsView.ts:917` line numbers in the table and prose below are as-filed on 2026-07-30 and have since moved to `:1779` / `:1873` / `:1540` and `:957`.
+
+**Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (de-duplicate). **Severity:** medium — a silent-divergence class, not a visible bug.
+
+**What:** the row move/drop semantics exist in **two independent implementations** that must agree and are not mechanically kept in agreement:
+
+| Function | Tested TS model | CSP-isolated webview |
+|---|---|---|
+| `blockExtent` | `ide/src/stepsModel.ts:1767` | `ide/media/stepsWebview.js:68` |
+| `walkMove` | `ide/src/stepsModel.ts:1861` | `ide/media/stepsWebview.js:126` |
+| `resolveDrop` | `ide/src/stepsModel.ts:1531` | `ide/media/stepsWebview.js:404` |
+
+The webview cannot import from `src/` (it is loaded as a plain script into a `default-src 'none'` webview, `stepsView.ts:917`), so the drag/drop *preview* the user sees is computed by the webview copy while the *committed* splice is computed by the model copy. They can drift, and the fixture tests only cover the model side — so a divergence shows up as "the drop landed somewhere other than where the indicator said", with green tests.
+
+**Why it matters beyond tidiness:** these functions decide the line ranges handed to `lens rewrite`. ADR 0076 §5's byte-stability guarantee is only as good as the extent computation that feeds it, and ADR 0089 §6 already records that "each native form is a new corruption-risk class — the ADR 0076 review history shows this is where bugs hide".
+
+**Options (pick at build time):** (a) build the shared pure functions into a small bundled module the webview loads as a local resource (esbuild already runs — `ide/esbuild.js`); (b) move the preview computation into the extension host and post results to the webview; (c) keep both but add a differential test that runs the same fixture corpus through **both** implementations and asserts identical output. (c) is the cheapest guard and could land first regardless of which structural fix is chosen.
+
+**Related:** #222, [ADR 0103](adr/0103-steps-view-row-context-menu.md) (row context menu — move/paste entry points), ADR 0076 §5 (byte-stable splice).
+
+**Source:** Windmill/Kestra evaluation (2026-07-30); duplication verified by direct read of both files.
+
+## 326. MFA-at-exposure refusal reads `serve_ui` after it is flipped off
+
+> ✅ **SHIPPED 2026-08-04.** `admin_exposed` is now `instance_exposed` — an off-loopback bind **or** `[api].tls_terminated_upstream` — defined ONCE above its first consumer, from two fields no earlier arm reassigns, and shared with the ASVS 11.7.1 arm that already used it. It reads no console flag, so the ADR 0143 in-place `serve_ui = False` degrades can no longer clear an exposure refusal: the MFA-at-exposure refusal and the #189 dual-control advisory now reach a declared-proxy instance whose console is auto-degraded, explicitly disabled, or absent (arms C/D in `tests/test_cli.py`, a real-gate row in `tests/test_checks_gate_parity.py`, a shape guard in `tests/test_security_doc_drift.py`). Both `exposure_desc` else-branches name the proxy instead of `[api].serve_ui`. **Built to REFUSE, per the owner ruling of 2026-08-04 — the WARN-FIRST blockquote below is SUPERSEDED** and is being amended by a separate session, so do not read it as the shipped behaviour: there is no warning-first phase, no dated flip and no new opt-in, the refusal rides the existing `[security].enforcement` split, and the pre-existing `allow_single_factor_admin_when_exposed` acknowledgment is unchanged (with more postures to act on). A plain loopback bind with nothing declared is byte-identical. The UNDECLARED-proxy residual is deliberately still not refused — nothing was declared, so exposure would be an inference — but it is no longer silent: the ADR 0068 §8 heuristic was **measured** not to cover it (it is about the /ui cookie, and the ADR 0143 auto-degrade suppresses it in the same posture), so a dedicated arm now warns, naming single-factor admin. **Two stale claims in the body below are corrected here rather than rewritten:** the arm table's arm-A string is now `admin interface reached through a declared reverse proxy ([api].tls_terminated_upstream)`, and the `docs/CONFIGURATION.md:1437`/`:1439` citations are wrong anchors — the opt-in scoping rule lives on the `require_memory_encryption_declaration` row and the `enforcement` refuse/warn split at `:88`/`:1020`. **Two residuals are left OPEN for the owner**, recorded in the [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) amendment: the `[auth] enabled = false` startup arm still keys on the bind alone (same two-answers-in-one-startup shape, one arm over, and it needs its own hoist plus its own adjudication), and the vault-only `OFF-LOOPBACK-DEPLOYMENT.md` runbook still carries blind-spot wording this fix invalidates.
+
+> **OWNER RULING 2026-08-04 — REFUSE OUTRIGHT. Supersedes an earlier ruling on this item that said
+> WARN-FIRST with a dated flip.** No warn-first, no dated flip, no opt-in flag. The corrected
+> `admin_exposed` gate refuses, as it was written to.
+>
+> ⚠️ **Why the first ruling was reversed.** It deferred the refusal because the fix *"makes a currently-
+> starting configuration refuse on upgrade"*, citing `docs/CONFIGURATION.md:1475` — *"a new refusal fires
+> only on a new opt-in"*. That rule exists **in as many words** to protect *working dev/staging/prod
+> deployments from booting on upgrade*. **There are none: MessageFoundry is a not-deployed beta with zero
+> production instances** (owner-confirmed 2026-08-04). Nothing starts today that would stop starting.
+>
+> **An afternoon was then spent distinguishing two mechanisms that were both solving this non-problem** —
+> a bespoke dated flip versus the house `[security].enforcement` split (`:88`, `:1020`) versus the opt-in
+> flag pattern (`:1475`, ADR 0152 rung 2 / ADR 0151). That analysis is preserved below for whoever
+> revisits it **if an adopter ever goes live**; it is not a live design question now. When there is no
+> installed base, the cost of a breaking change is zero and the simple correct end state wins.
+>
+> **The fix itself is unchanged:** re-key `admin_exposed` off the `serve_ui`-independent predicate that
+> already exists in that file, and correct both `exposure_desc` else-branches (`__main__.py:1883` and
+> `approvals_exposure_desc` at `:1939`).
+
+**Cluster:** Security & Compliance. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** the `serve` startup ladder derives its admin-exposure predicate from a field an earlier arm has already mutated. In [`messagefoundry/__main__.py`](../messagefoundry/__main__.py):
+
+```python
+console_exposed = (                                             # :1741
+    not settings.api.is_loopback
+    or settings.api.tls_terminated_upstream
+    or bool(settings.api.public_origin)
+)
+if settings.api.serve_ui and not settings.api.serve_ui_explicit and console_exposed:
+    ...
+    settings.api.serve_ui = False                               # :1755  (ADR 0143 auto-degrade)
+
+ui_exposed = settings.api.serve_ui and (                        # :1834  reads the flipped field
+    not settings.api.is_loopback or settings.api.tls_terminated_upstream
+)
+admin_exposed = not settings.api.is_loopback or ui_exposed      # :1879
+```
+
+`serve_ui` defaults to `True` and `serve_ui_explicit` to `False` (`messagefoundry/config/settings.py:674`, `:680`), so on a **loopback bind behind a declared terminator** — the topology the gate's own comment at `:1874-1878` names as the one it exists to cover, *"the runbook's RECOMMENDED topology (loopback bind BEHIND a declared proxy, `ui_exposed`)"* — an operator who never touches `serve_web_console` gets `serve_ui=False` at `:1755`, `ui_exposed=False` at `:1834`, and `admin_exposed=False` at `:1879`. The MFA refusal at `:1888` and the #189 dual-control warning at `:1936` are both gated on that flag and never evaluate.
+
+Measured 2026-08-01 against HEAD (`prod`, PHI, `enforcement=enforce`, loopback bind, `[api].tls_terminated_upstream` + `trusted_proxies`, `[security].require_mfa = false`, retention/alerts pre-satisfied):
+
+| arm | `serve_web_console` | result |
+|---|---|---|
+| A | explicit `true` | **rc=2** — `error: browser console exposed through a declared reverse proxy … require_mfa off; refusing to start` |
+| B | default, `web_console_public_address` set | MFA refusal **absent**; rc=2 only from the unrelated ASVS 12.1.1 TLS-floor probe (`:1978-2009`) |
+| C | default, no `web_console_public_address` | **rc=0 — starts.** MFA refusal absent, #189 approvals warning absent |
+
+Arm C is the load-bearing one: the TLS-floor probe is itself gated on `settings.api.public_origin` (`:1982`), and once the console degrades nothing requires that key (the `:1779` refusal only applies while `serve_ui` is on), so a JSON-only proxied deployment skips it. In that same rc=0 run the ADR 0152 arm printed `warning: EXPOSED PHI instance ('prod') …` — because it computes the predicate this gate wants, `instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream` (`:2223`). The engine calls one instance *exposed* for ASVS 11.7.1 and *not exposed* for ASVS 6.3.3 in a single boot.
+
+Test coverage never caught it because the only test of this arm, `tests/test_cli.py:1230-1252` `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, sets `security.serve_web_console = true` **explicitly** — the one input that keeps the refusal reachable. [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) does not mention `require_mfa`, `admin_exposed`, or single-factor admin anywhere, so the interaction was introduced rather than adjudicated.
+
+**Why:** ASVS 6.3.3's admin-MFA backstop is inert in the deployment shape the project recommends, and the operator gets no signal — arm C starts clean with the Administrator role single-factor over a network-facing proxy. **Bounded, and the bound matters.** `require_mfa` still **defaults on** (`settings.py:1696`), so this is only reachable after an operator has *explicitly* written `require_mfa = false`; `security_loosenings()` names that opt-out on every boot (`settings.py:4044-4050`, seen in the arm-C log) and `GET /security/posture` reports it. **The blast radius is NOT** a default deployment, **NOT** an off-loopback bind (`admin_exposed` is `True` from the `not is_loopback` arm regardless of `serve_ui` — arm A's non-loopback sibling is pinned at `tests/test_cli.py:768`), **NOT** an authentication bypass, and **NOT** a way in for an unauthenticated attacker: it removes a *refusal to start*, not a credential check. What is lost is the hard stop that was supposed to make the explicit opt-out impossible to combine with exposure — i.e. exactly the case ADR 0140 built `allow_single_factor_admin_when_exposed` to force an operator to acknowledge. The same flag also silences the #189 dual-control warning (`:1936`) in the same topology, so a second control degrades with it. Finally, the docs at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182` currently have to carry a *"the gate will not catch you"* caveat; closing the defect is what lets that prose go.
+
+**Proposed:** stop deriving admin exposure from a mutated presentation flag.
+
+1. Key `:1879` on a `serve_ui`-independent predicate. The house-consistent one **already exists in this file**: reuse/hoist `instance_exposed` from `:2223` (`not settings.api.is_loopback or settings.api.tls_terminated_upstream`), which is precisely the intent stated at `:1874-1878`. Keying on `console_exposed` (`:1741`) also works but is **wider** — its `bool(public_origin)` branch would turn the undeclared-proxy heuristic, today a warning at `:1811`, into a hard refusal. Pick the narrow predicate unless the owner wants that widening.
+2. Fix `exposure_desc` at `:1881-1886`: its else-branch hardcodes *"browser console exposed through a declared reverse proxy (`[api].serve_ui` + `tls_terminated_upstream`)"*, which becomes false as soon as the gate fires without a served console. Same for the `:1937-1942` twin.
+3. Owner fork to settle before building — this makes a currently-starting configuration **refuse on upgrade**, against the repo's own rule at `docs/CONFIGURATION.md:1439` (*"a new refusal fires only on a new opt-in"*). The rule is weaker here than in its ADR 0152 precedent: the affected population is only deployments that explicitly disabled MFA, and the remedy is one line they already know (`require_mfa = true`, or the existing audited `allow_single_factor_admin_when_exposed = true`). Refuse-on-upgrade is defensible; warn-first-then-refuse is the conservative alternative.
+4. Tests: add the arm-C case (declared proxy, console left at default, no `public_origin`) to `tests/test_cli.py` beside `test_serve_ui_declared_proxy_requires_mfa_on_prod_phi`, plus a `serve_web_console = false` variant — an operator who *explicitly disables* the console is in the same exposure posture and must also be caught.
+5. Docs to update once it lands: strike the blind-spot sentences at `docs/CONFIGURATION.md:1437` and `docs/REMOTE-CONSOLE.md:182`, and re-state the two `admin_exposed` decision-table rows at `docs/SECURITY.md:1083-1084`.
+
+**Related:** [`messagefoundry/__main__.py`](../messagefoundry/__main__.py) `:1741`/`:1755`/`:1834`/`:1879`/`:1936`/`:2223`, [`messagefoundry/config/settings.py`](../messagefoundry/config/settings.py) `:674`/`:680`/`:1696`/`:4044`, [ADR 0143](adr/0143-web-console-on-by-default-disableable-with-loopback-secure-context-browser-hardening.md) (introduced the in-place flip; silent on this gate), [ADR 0140](adr/0140-two-acknowledged-production-phi-no-loosen-carve-outs-single-factor-admin-at-exposure-keyless-phi-in-production.md) (the refusal + its acknowledged escape), [ADR 0068](adr/0068-browser-webauthn-passkeys-offloopback.md) §8 (the exposure ladder), [ADR 0152](adr/0152-in-use-data-protection-for-phi-platform-memory-encryption-attestation-asvs-11-7-1.md) (source of the correct predicate at `:2223`), `tests/test_cli.py:1230-1252`, `tests/test_checks_gate_parity.py:185-194` (its MFA row uses a non-loopback bind, so it is unaffected), `docs/SECURITY-LOOSENING.md` §`allow_single_factor_admin_when_exposed`, #187 (the `require_mfa` default), #189 (the dual-control arm that shares the flag).
+
+**Source:** public-repo disclosure audit, 2026-08-01 — classified close-the-weakness-instead: the disclosure at `docs/CONFIGURATION.md:1437` / `docs/REMOTE-CONSOLE.md:182` is honest and stays until the defect is fixed.
+
+---
+
+---
+
+## 330. The IDE's `ai:assist` gate can never fire
+
+> ✅ **FIXED 2026-08-04 — ADR 0035 AC-7/AC-8 added, ADR 0110 amended.** Both defects are closed, in the load-bearing order. **(1) The guard landed first:** the write to `LAST_POLICY_KEY` now goes through a pure `mergeAuthoritativePolicy` (`ide/src/aiPolicyModel.ts`, zero imports so it is asserted node-side on every CI leg), so an answer that does not carry an evaluable `assist_permitted` can no longer overwrite a cached `false`. "Not evaluable" is deliberately wider than the literal `null`: `AiPolicyWire` is a compile-time claim `JSON.parse` does not enforce, so a 200 that OMITS the field arrives as `undefined` — which a `=== null` guard would let through, and which is not `false` either, so the cache would be poisoned past recovery. The bit is narrowed at the boundary (`evaluatedPermission`) on both authoritative paths, the engine read and the CLI fallback. The retention is one-way by design — a cached `true` is **not** sticky (fabricating a permit is the fail-open direction), an evaluable `true`/`false` always wins outright, and `mode` always comes fresh so a central `off`→`byo` re-enable still propagates. **(2) Then the bearer:** `resolveAiPolicy` attaches the cached token via `peekToken` (never `ensureToken` — a chat turn must not pop a sign-in modal) behind the SEC-005 `assertTargetAllowed` gate, so the engine can resolve the identity-dependent `assist_permitted` and the `ai:assist` deny branch can fire at all. The two orderings are not equivalent: attaching the bearer first would open a window in which an authenticated-but-degrading read poisons the cache. **`statusBar.ts`'s `/ai/policy` read stays TOKENLESS** — the two readers are now the named constants `ENVIRONMENT_PLAN` (`authenticated: false`, timer-driven, wants the identity-independent `environment`) and `ASSIST_GATE_PLAN` (`authenticated: true`, user-initiated only), same route and opposite answer, both asserted in CI so a later reader cannot "unify" them into the CWE-613 bug. 20 new tests (`ai-policy-model.test.ts`, `ai-policy.test.ts`, `engine-doctor.test.ts`, `engine-client.test.ts`), each falsified against a planted defect. **Residuals, deliberately not closed here:** (a) nothing constructs `EngineStatusBar`, so the status bar's tokenlessness is asserted on the plan CONSTANT, not on `readEnvironment`'s use of it — rewiring that call site would type-check and stay green (recorded in ADR 0035 AC-8); (b) the cache is one global key while the bearer is keyed per engine URL, so a deny observed against one engine also suppresses assistance against another (fail-closed, recorded in AC-7); and (c) the bearer is looked up under `engineUrl()`, but sign-in happens against the status-bar/promote target, which is `environments()[0].url` whenever `messagefoundry.environments` is configured — so for a user whose only session is against a named environment URL the read is still unattributed and the gate still cannot fire for them. Retargeting `resolveAiPolicy` changes WHICH engine the policy is read from, a behaviour change this item does not ask for; it needs its own number.
+
+**Cluster:** Security & Compliance / IDE & Authoring. **Priority:** P2. **Verdict:** build. **Severity:** medium.
+
+**What:** `resolveAiPolicy` reads the authoritative policy **without attaching the session bearer** it already holds:
+
+```ts
+// ide/src/aiPolicy.ts:78
+const policy = fromWire(await getJson<AiPolicyWire>(engineUrl(), "/ai/policy"));
+```
+
+`getJson`'s third parameter is the token (`ide/src/engineClient.ts:128`), and the header is attached only when it is present — `const headers: Record<string, string> = token ? { Authorization: \`Bearer ${token}\` } : {};` (`engineClient.ts:141`). With no bearer, `optional_identity` returns `None` under enabled auth (`messagefoundry/api/security.py:708`), so the endpoint computes `permitted = None if identity is None else identity.has(Permission.AI_ASSIST)` (`messagefoundry/api/app.py:1372`) and answers `assist_permitted: null` **on every IDE read**.
+
+The consequence is that `assistantState`'s deny branches take an input the engine path can never produce:
+
+```ts
+// ide/src/aiPolicy.ts:128-131
+if (p.mode === "byo" && p.assistPermitted === false) {
+  return { enabled: false, message: "Your role does not include the ai:assist permission." };
+}
+// BYO with assistPermitted true OR null (RBAC not evaluable offline) — allowed.
+```
+
+The same holds for the `managed_endpoint` arm at `aiPolicy.ts:116`. **This is wider than the originating audit described.** The audit framed it as an operator defeating org intent *by never signing in*; in fact signing in changes nothing, because the token is never sent on this route. The two remaining sources of a policy are also incapable of returning `false`: `allow_no_auth` yields `_SYSTEM_IDENTITY` holding every role (`security.py:56-58`, `:707`) → `true`, and the CLI fallback hard-codes `"assist_permitted": None` (`messagefoundry/__main__.py:3771`). So no code path in the shipped extension can produce the `false` the gate tests for.
+
+**A second, latent defect in the same function.** The cache write at `aiPolicy.ts:79` is unconditional:
+
+```ts
+await ctx.globalState.update(LAST_POLICY_KEY, policy); // remember the authoritative answer
+```
+
+This does **not** currently clobber anything: line 79 is the sole writer of `LAST_POLICY_KEY` (`aiPolicy.ts:29`/`:79`/`:84` are its only occurrences in `ide/`), and its input is always the same tokenless read — so a cached `false` can never exist to be overwritten. The missing guard is real and must be fixed, but it is **latent**: it becomes live the moment the bearer is attached, not before. SEC-022's primary purpose is also intact — `mode` is identity-independent, so a central `mode:"off"` still caches and still survives going offline exactly as `docs/adr/0035-ide-extension-workspace-trust-and-scope.md:49-51` intends.
+
+**Why:** ADR 0035's SEC-022 entry names the control this breaks — the cache exists so that *"a central `mode='off'` (or `ai:assist` deny)"* cannot be re-enabled by stopping the engine (`0035-…:28-32`). The `mode` half works; the `ai:assist` half was never wired, so an org that assigns a role without `ai:assist` gets no enforcement at the IDE at all. `docs/AI.md:188` publishes the deny row as live behavior, which makes the gap a documentation-vs-code divergence as well as a control gap.
+
+Honestly bounded — this is a **governance-enforcement** defect, not a data or privilege defect:
+
+- **No PHI is at risk, by construction.** BYO attaches `code_only` context only, capped unconditionally in `chat.ts:122-130`; ADR 0035 makes the same concession about the original SEC-022 (*"No PHI was ever at risk … but it defeats a governance control"*).
+- **The brokered path is correctly gated server-side.** `POST /ai/chat` carries `Depends(require(Permission.AI_ASSIST))` (`app.py:1388`), so `managed_endpoint` egress is enforced at the engine regardless of the IDE. The inert client-side branch there costs a clean local message, not authorization — the user gets a 403 instead.
+- **Nothing on the engine becomes reachable, and no credential is exposed.** The whole payoff is "use the BYO assistant your org told you not to, against your own model provider, with your own source code."
+- **No privilege is needed to hit it** — it is the default state under the default fail-closed posture (`security.py:153-155`), not an attack.
+
+Nothing caught it because `ide/src/test/suite/ai-policy.test.ts:31-40` tests the **pure predicate** (`assistantState({assistPermitted:false}) → disabled`) with a hand-built object. The predicate is correct; it is the input that never arrives. `resolveAiPolicy`'s fetch-and-cache is untested, which is exactly where both defects live.
+
+**Proposed:**
+1. Guard the cache write at `:79` **first**, so a null can never downgrade a known-negative once step 2 lands: preserve a cached `assistPermitted === false` when the fresh answer is `null`, or skip the write entirely when the fetch carried no bearer.
+2. Attach the cached bearer in `resolveAiPolicy` — `peekToken` (`ide/src/auth.ts:93`), never `ensureToken`, so a chat turn cannot pop a sign-in modal. Gate it on `assertTargetAllowed(url).ok` first, following the SEC-005 precedent at `ide/src/liveStatus.ts:79-81`, so a bearer never goes in clear to a non-loopback `http://` target.
+3. **Leave `statusBar.ts:312` tokenless.** That is a second `/ai/policy` reader (`POLICY_ROUTE`, `engineStatusModel.ts:159`) that only wants the environment name and runs on the status-bar path, where the CWE-613 idle-clock rule at `engineStatusModel.ts:17-20`/`:146-148` forbids a bearer — a naive "add the token to the `/ai/policy` call" fix would make the engine's idle timeout unreachable. `resolveAiPolicy` is user-initiated (`chat.ts:110`, `showAiPolicy` at `aiPolicy.ts:137`), so a bearer there is honest activity under that module's own `VERIFY_PLAN` rationale (`:151-155`). Worth expressing the distinction as a plan constant rather than a comment, matching how `POLL_PLAN`/`VERIFY_PLAN` already make it CI-assertable data.
+4. Test `resolveAiPolicy` itself with an injected fetch + fake `globalState`: (a) a bearer is attached when a session exists, (b) a `null` response does not overwrite a cached `false`, (c) the tokenless status-bar probe is unaffected.
+5. Once the gate can actually fire, re-check `docs/AI.md:188-191` — the trust note's reasoning is sound, but the "`assist_permitted == false` → Disabled" row only becomes true after this change.
+
+**Related:** [`../ide/src/aiPolicy.ts`](../ide/src/aiPolicy.ts), [`../ide/src/engineClient.ts`](../ide/src/engineClient.ts), [`../ide/src/chat.ts`](../ide/src/chat.ts), [`../ide/src/statusBar.ts`](../ide/src/statusBar.ts), [`../ide/src/engineStatusModel.ts`](../ide/src/engineStatusModel.ts), [`../ide/src/auth.ts`](../ide/src/auth.ts), [`../ide/src/test/suite/ai-policy.test.ts`](../ide/src/test/suite/ai-policy.test.ts), `messagefoundry/api/app.py` (`/ai/policy`, `/ai/chat`), `messagefoundry/api/security.py` (`optional_identity`), [ADR 0035](adr/0035-ide-extension-workspace-trust-and-scope.md) (SEC-022 — the control this completes; note its own Related line miscites "ADR 0024 (AI policy)", which is the SMART token provider), [ADR 0135](adr/0135-engine-brokered-ai-assistance-customer-managed-llm-egress-with-per-use-audit.md) (the brokered path, server-gated), [`AI.md`](AI.md), #95.
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+## 341. Handler returning a tuple or set of Sends delivers nothing, silently
+
+> ✅ **Status CLOSED (built 2026-08-04) — WIDEN, not raise.** `_partition` no longer narrows on `isinstance(result, list)`: a Handler may return **any non-`str` iterable** of `Send`/`SetState`/`SetMeta` — list, tuple, set or generator — and it partitions element-wise. **The body's "Fix direction (not yet decided) … failing loud is probably right" is settled the other way**, by owner ruling. THE acceptance criterion holds: `return []` and `return ()` still **filter** (deliver nothing, raise nothing), and a value that is not a container — a bare `int`, a `Message` returned by mistake — still drops silently rather than newly raising, because the gate is `isinstance(…, Iterable)` and never a duck-typed `list(result)` (`Message` has `__getitem__(path: str)` and no `__iter__`, so `list()` would raise out of the handler). **The body's "Fixing `_partition` fixes both modes at once" is FALSE and was the most dangerous sentence in this item** — acting on it would have shipped a MODE-DEPENDENT disposition (in-process delivers, `[sandbox].mode=subprocess` still drops), worse than the bug it closes. One shared rule (`wiring.handler_result_items`) is now applied in three places: the parent's `_partition`, `_sandbox_codec.enc_result`, and `_sandbox_worker` **inside** `with run_contexts(…)` — the last because a generator Handler's body runs lazily, and materialising it at describe time would execute it with no run context, so a `code_set(…)` inside one would raise under subprocess while working under off. **Two author-visible facts the body does not carry.** (1) A **`set` delivers but has no defined fan-out order** — `Send` is hashed on its fields and `str` hashing is seeded per process, so order differs between processes (parent vs sandbox child) and across a crash re-run, i.e. a set gives up FIFO order between sibling `Send`s to one outbound; mode parity is over the delivered **multiset** plus an *ordered* container's order, and the docs steer authors to a list/tuple. (2) A **generator Handler is not execution-traced** — its body runs after the ADR 0072 tracer detaches, so that invocation reports no lines and no sends, now declared as `"lazy_result": true` rather than left to read as an inert handler; **this change opened that gap** (before it, a generator delivered nothing, so the trace's `[]` was exact). ADR 0072 §6 gate 1 is split by level and amended accordingly; ADR 0087's parity bullet + AC-11 rescoped; ADR 0108's §2 invariant and §7 tuple rationale corrected (its refusal **stands**, on conservative scope — nothing 0108 built changed); `checks.py`'s `accepts=` advisory widened to recognize `return ()`, which `lens.py` already did. **`pipeline/dryrun.py:112`, the anchor cited below, no longer holds that line.**
+
+> **OWNER RULING 2026-08-04 — WIDEN. Supersedes an earlier ruling on this item that said RAISE.**
+> A Handler returning a tuple, set or generator of `Send`s is **accepted**, like a list. It does not raise.
+>
+> ⚠️ **Why the first ruling was reversed, because the reasoning is the point.** It rested on: *"widening
+> would start delivering messages the engine drops today — every live Handler returning a tuple would
+> begin flowing on upgrade, including PHI currently being dropped."* That argument requires **live
+> Handlers to exist**. **MessageFoundry is a not-deployed beta with zero production instances**
+> (owner-confirmed 2026-08-04). There is no installed base, so the cost the first ruling priced is
+> **vacuous**. The same defect this backlog keeps recording — a conclusion resting on a premise nobody
+> checked — committed in a ruling other sessions were building from.
+>
+> **Three arguments for widening that never touch deployment, and would have carried it anyway:**
+> 1. **It removes an internal inconsistency.** `_handler_names` (`pipeline/dryrun.py:96-99`) already does
+>    `return [result] if isinstance(result, str) else list(result)` — so a **Router** returning a tuple,
+>    set or generator works **today**. Only the **Handler** path rejects it. Widening makes the two agree;
+>    raising entrenches a split with no stated rationale.
+> 2. **`return ()` is a documented filter idiom** (`lens.py:678`, SHALL'd at ADR 0108:60). It composes
+>    naturally under widen; under raise it needs a carve-out for the empty case.
+> 3. **It does what the author plainly meant.** A Handler that returns a container of `Send`s intended
+>    them to be sent.
+>
+> **Neutral either way, so not a tiebreaker:** both options need the subprocess-codec fix below, and both
+> falsify ADR 0108:37's *"No engine runtime change"*.
+>
+> ⚠️ **Build constraint, unchanged by the reversal.** `pipeline/_sandbox_codec.py` preserves the container
+> shape on purpose, and `tests/test_sandbox_codec.py::test_partition_parity_table` pins the current
+> `[0,0,0]` for both modes. In-process and subprocess must agree on the new behaviour or the fix creates a
+> **mode-dependent disposition**, which is worse than the bug. That test is rewritten under this ruling and
+> its docstring rationale replaced, not extended around.
+
+**Cluster:** Correctness / data loss. **Priority:** P1. **Verdict:** build (small). **Severity:** high (silent PHI non-delivery, no operator signal), medium (likelihood: `return (Send(...), Send(...))` is a natural idiom and a one-character difference from the working form).
+
+**Why it is not merely cosmetic:** the disposition is not `ERROR` and not `UNROUTED` — it is `FILTERED`, a *legitimate* outcome. So the count-and-log invariant is satisfied on paper (the message is counted and logged) while the operator is told the handler chose to drop it. Nothing in the store, the console, or an alert distinguishes this from intent.
+
+**Fix direction (not yet decided):** accept any non-`str` iterable in `_partition`, **or** fail loud on a non-`list` container. Failing loud is probably right — silently accepting a tuple widens the contract, whereas a `ValueError` routes to `ERROR`/dead-letter and tells the author exactly what happened. Whichever is chosen, `SetState`/`SetMeta` must behave identically, and `HandlerFn`'s type hint should be widened or tightened to match so mypy catches it at authoring time.
+
+**Pre-existing, not introduced by #339.** ADR 0087's MFW2 codec **deliberately preserves** this behaviour rather than changing routing semantics inside a security fix: it describes such an item as `{"o": "other"}` and rebuilds an inert `Ignored()`, so `_partition` stays the sole filter and `mode=off` / `mode=subprocess` agree. Fixing `_partition` fixes both modes at once.
+
+**Related:** #339 (found during its adversarial review), ADR 0005 / ADR 0081 (`SetState` / `SetMeta`), CLAUDE.md §12.
+
+**Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; confirmed by direct execution of `_partition`.
+
+---

@@ -408,9 +408,49 @@ jobs:
           # (1.172.0 is what `~=1.90` resolved to on 2026-07-29, so this pin is a no-op today.)
           python -m pip install --upgrade pip "semgrep==1.172.0"
           # --error: any finding fails the step — and the job, now that this gate is blocking.
-          # Includes `tee/` (in-tree vendored SOUP) so the standalone relay is held to the same
-          # dangerous-sink rules as the engine.
-          semgrep --config .semgrep --error --metrics off messagefoundry tee
+          #
+          # SCOPE = the whole repo minus the excludes below, which is the bandit exclude set in this
+          # same file EXACTLY. It was the allow-list `messagefoundry tee`, which never covered
+          # scripts/ (the security tooling itself), messagefoundry_webconsole/ (the operator UI) or
+          # docker/ — 59 tracked .py files that the sibling bandit gate already scans, held to none of
+          # this project's own dangerous-sink rules. An allow-list cannot be kept in step with "the
+          # project" by hand; `.` minus explicit excludes cannot go stale when a package is added.
+          # `tee/` (in-tree vendored SOUP) stays in scope for the reason it always was: the standalone
+          # relay is held to the SAME bar as the engine. Widening cost nothing — clean at this bar.
+          #   tests/harness/samples — intentional non-production idioms. This exclude is here for
+          #                           PARITY WITH BANDIT — which is what the parity test enforces —
+          #                           NOT as a prediction about findings. semgrep's own default
+          #                           .semgrepignore already excludes tests/: that is the recorded
+          #                           fact scripts/ci/assert_semgrep_handler_taint.py:41 depends on,
+          #                           and the reason that step copies its fixture to a temp dir to
+          #                           get it analysed at all. So this flag is explicit and probably
+          #                           redundant, stated that way on purpose — a gate's scope must be
+          #                           readable from its own argv, never inherited from a tool default
+          #                           a version bump can change. (The only two sinks in the whole
+          #                           tree that match these rules do sit under tests/: an `eval`
+          #                           taint fixture and a `pickle.loads` sandbox test.)
+          #   packaging/messagefoundry-webconsole/tests — the same, one directory deeper
+          #   ide/                  — TypeScript; no Python to scan
+          #   docs/benchmarks/results — archived measurement artifacts, not maintained source
+          # The `./` prefix bandit uses is DROPPED on purpose: semgrep matches --exclude as a GLOB,
+          # not a path, so `./tests` matches nothing and the flag would be inert — copying bandit's
+          # string byte-for-byte yields an exclude list that excludes nothing. (Whether tests/ would
+          # then actually be SCANNED is the separate question the default .semgrepignore above
+          # answers; the point is that this gate's scope must not rest on that answer.)
+          # Whether those globs are root-anchored or match a bare directory NAME at any depth is not
+          # settled here, and is not load-bearing — measured over the WHOLE tracked tree, which is
+          # the population this scan now covers: the only nested directory matching any of these
+          # names is packaging/messagefoundry-webconsole/tests, excluded explicitly on both sides
+          # anyway (2026-08-04).
+          # tests/test_lint_scope_parity.py fails if this scope and bandit's drift apart again. It
+          # also asserts, separately, that no --exclude here carries the `./` prefix (its normalised
+          # set comparison would otherwise call `./tests` and `tests` identical), that no `--include`
+          # re-narrows the scan behind the positional `.`, and that `--error` survives.
+          semgrep --config .semgrep --error --metrics off \
+            --exclude tests --exclude harness --exclude samples --exclude ide \
+            --exclude docs/benchmarks/results --exclude packaging/messagefoundry-webconsole/tests \
+            --exclude .venv --exclude node_modules \
+            .
       - name: Handler-config taint rules — validate, regression gate, scan samples (ADR 0144 Inc 3)
         run: |
           # semgrep is already installed by the step above (same job). This is why the packaged rules

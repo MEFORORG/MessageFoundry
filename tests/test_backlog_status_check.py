@@ -218,3 +218,69 @@ def test_the_scanned_namespace_has_not_silently_narrowed() -> None:
         f"found {total} items across {[p.name for p in _SOURCES if p.exists()]}, below the floor of "
         f"{_MIN_TOTAL_ITEMS}. Items were deleted, or a file holding them left DEFAULT_SOURCES."
     )
+
+
+# --- the banner block's END is the load-bearing part, and it is what a paraphrase gets wrong -------
+#
+# `parse_items` ends an item's banner block at the first line that is neither blank nor a blockquote.
+# So a closed glyph quoted in an item's PROSE is narrative, not that item's status.
+#
+# That rule is invisible to anyone who learns the format from examples. On 2026-08-04 two independent
+# scans of docs/BACKLOG.md disagreed on exactly it -- one asking "does a closed glyph appear anywhere
+# in this item", the other "does this item DECLARE closed status" -- and they agreed on the real file
+# ANYWAY, because no item currently has the discriminating shape. A hand-rolled census got 93, the
+# right answer, by luck. Another session's hand-rolled checker got three different WRONG answers the
+# same day, including calling three open items closed.
+#
+# `test_banner_after_prose_does_not_count` above ALSO separates the two definitions -- measured, a
+# whole-range scan calls that fixture "closed" where `parse_items` says "no status". So the boundary
+# was not unguarded, and claiming it was would have been the overclaim this file exists to prevent.
+#
+# What the fixture below adds is the shape that actually OCCURS: a legitimately OPEN item whose prose
+# quotes a sibling's closed banner. The old test's item has no status at all, which is a malformed
+# item nobody writes on purpose; this one is well-formed, realistic, and asserts the item keeps the
+# CORRECT status rather than merely lacking one.
+
+
+def test_an_open_item_may_quote_a_closed_banner_in_its_prose() -> None:
+    """The discriminating fixture. A whole-range scan fails this; `parse_items` passes it.
+
+    Batch-filing narrative routinely quotes a sibling's status ("the sweep that filed this also closed
+    #499"). That must not make THIS item closed, and must not read as a self-contradiction either.
+    """
+    text = (
+        "## 500. An open item whose prose quotes a closed banner\n\n"
+        "> 🔢 **Filed.** Value **5/10** · Difficulty **3/10** · _fill-in_.\n\n"
+        "**Why:** the batch that filed this also closed its siblings, recorded for context:\n\n"
+        "> ✅ **SHIPPED.** #499 landed in the same sweep.\n\n"
+        "**Source:** a filing note.\n"
+    )
+    errors, _ = _scan(text)
+    assert errors == [], f"a quoted closed banner was treated as this item's status: {errors}"
+
+    item = bsc.parse_items(text)[0]
+    assert item.is_open is True, "the item must remain OPEN — the ✅ is narrative, not its status"
+    assert item.closed == [], f"the prose ✅ leaked into the status block: {item.closed}"
+
+
+def test_nothing_else_in_the_repo_re_derives_item_status() -> None:
+    """`parse_items` DEFINES item status. A second implementation is a second definition.
+
+    Same single-source discipline `ledger_check.py` states for `PUBLIC_BACKLOG_FLOOR`, and the same
+    reason: two copies of one rule do not fail when they drift, they just quietly disagree. The
+    2026-08-04 divergence was a scratch script, so it never reached the repo — this keeps it that way.
+    """
+    banner_alphabet = "🔢🚧"
+    offenders = []
+    for path in sorted(_ROOT.glob("scripts/**/*.py")) + sorted(_ROOT.glob("tests/**/*.py")):
+        if path.name in {"backlog_status_check.py", Path(__file__).name}:
+            continue
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if any(g in text for g in banner_alphabet):
+            offenders.append(path.relative_to(_ROOT).as_posix())
+    assert not offenders, (
+        "these files reference the OPEN-banner alphabet and may be re-deriving item status: "
+        f"{offenders}. Import parse_items from scripts/docs/backlog_status_check.py instead — it "
+        "defines where an item's banner block ENDS, and a hand-rolled scan is a second, silently "
+        "different definition of 'closed'."
+    )
