@@ -73,14 +73,33 @@ material because it mentions a tool, and it is not operator material because it 
 
 **Phase 1 — `docs/releases/` (101 files).** Predominantly multisession plans: work breakdowns, wave
 schedules, per-session briefs. No operator or reviewer reads these. **Proposed: remove from the public
-repo, preserving them in the vault.** Two constraints on the commit that does it:
+repo, preserving them in the vault.**
 
-- `FEATURE-MAP.md:5` and `:13` cite this directory and must be fixed **in the same commit**, or the
-  removal lands a dangling reference.
-- ⛔ **The PR must not be docs-only.** Every doc-drift guard in this repo lives in pytest gated on
-  `code == 'true'`, so a docs-only PR is the **blind** mode, not the cheap one. This is already
-  recorded as BACKLOG #327 for `.gitignore`. Include a code-touching change, or the guards that would
-  catch a broken citation do not run at all.
+⚠️ **The inbound-citation surface is 23 files, and a single grep finds at most two thirds of it.**
+Measured at `c90dcb5f`, excluding the directory itself:
+
+| Citation form | Files | Note |
+|---|--:|---|
+| `docs/releases/...` | 12 | the form most people grep for |
+| relative `(releases/...` or `../releases/...` | 15 | **invisible to the grep above** |
+| **union** | **23** | neither form alone is sufficient |
+
+This is not a footnote about method — it is the constraint. An earlier draft of this ADR named
+**one** file, `docs/FEATURE-MAP.md:5` and `:13`, because that is what the notes carried. Those two
+citations are real (`[v0.1 Release Plan](releases/v0.1-PLAN.md)` and a `[plan](...)` table cell) and
+they use the **relative** form, so a `docs/releases` grep does not see them — while 22 other files
+do cite the directory. **Grep both forms, or the removal lands dangling references in files nobody
+checked.** `docs/README.md` is among them, so the docs front door breaks.
+
+⛔ **Phase 1 CANNOT be docs-only, and that is structural rather than a discipline rule.** Three
+non-doc files cite the path: `tests/test_cutover_slug_rot.py:53` carries `"docs/releases/"` as a
+literal **scan-scope entry**, `tests/test_lint_scope_parity.py:22` cites a plan by name, and
+`harness/load/profiles/closed-loop.toml:7` cites an execution plan. So the PR necessarily touches
+code, which happens to satisfy the separate rule that a doc migration must not be docs-only — every
+doc-drift guard here lives in pytest gated on `code == 'true'`, making docs-only the **blind** mode
+rather than the cheap one (already recorded as BACKLOG #327 for `.gitignore`). **Do not treat that as
+luck to rely on:** confirm the guards actually ran, because the reason they would run is a test file
+this phase happens to touch, not a property of the phase.
 
 **Phase 2 — the individually-tracked process docs.** `docs/WORKTREES.md`,
 `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`, `docs/STEERING.md`. Each needs its inbound
