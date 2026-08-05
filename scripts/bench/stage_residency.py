@@ -44,19 +44,19 @@ which is how an earlier version printed 151 ms for a life that was really 479 ms
 
 first-delivery basis (kept ONLY for continuity with STEP 2 — it is NOT the message's life)::
 
-    A          = routed − received
-    B          = transformed_min − routed
-    C_first    = delivered_min − transformed_min
-    E2E_first  = delivered_min − received                (identity: A + B + C_first)
+    A          = routed - received
+    B          = transformed_min - routed
+    C_first    = delivered_min - transformed_min
+    E2E_first  = delivered_min - received                (identity: A + B + C_first)
 
 completion basis (the actual life; every fan-out row in existence)::
 
-    B_last         = transformed_max − routed
-    W_last         = delivered_max − transformed_max     ← the clean outbound wait (SIGNED)
-    E2E_complete   = delivered_max − received            (identity: A + B_last + W_last)
-    transform_span = transformed_max − transformed_min
-    delivery_span  = delivered_max − delivered_min
-    L_s3a          = delivered_min − transformed_max     ← STEP 3a's signed L, kept for continuity
+    B_last         = transformed_max - routed
+    W_last         = delivered_max - transformed_max     <- the clean outbound wait (SIGNED)
+    E2E_complete   = delivered_max - received            (identity: A + B_last + W_last)
+    transform_span = transformed_max - transformed_min
+    delivery_span  = delivered_max - delivered_min
+    L_s3a          = delivered_min - transformed_max     <- STEP 3a's signed L, kept for continuity
 
 **E2E_complete is the only strictly-positive, reference-free latency in the set.** It has a true zero and
 no arbitrary origin, so it — not ``W_last`` — is what belongs in a log-log regression against offered
@@ -84,11 +84,11 @@ averaged in as an 8-way fan-out that happened to have 9 rows.
 ------------------------------------------------------------------------
 Under the fan-out-to-all shape every message hits every destination, and the outbound lane key IS the
 destination name. So each lane receives EXACTLY ONE delivery per message and the mean per-lane
-inter-delivery gap is IDENTICALLY ``1/λ`` at steady state — for any engine, any service time, any
+inter-delivery gap is IDENTICALLY ``1/lambda`` at steady state — for any engine, any service time, any
 bottleneck. ``lanes / mean_gap == delivery_rate`` is FLOW CONSERVATION, not a measurement, and any
 "confirmation" built on it is an identity, not evidence.
 
-What IS informative is lane OCCUPANCY: ``rho = λ_deliveries × S_lane / lanes``. This tool cannot measure
+What IS informative is lane OCCUPANCY: ``rho = lambda_deliveries × S_lane / lanes``. This tool cannot measure
 ``S_lane`` (``message_events`` has no claim boundary — there is no ``claimed_at`` stamp), so it reports
 ``occupancy_accounted`` = ``n_deliveries × --service-ms / window``: a LOWER BOUND on rho built from an
 externally-supplied service time. **Feed it the rung's OWN measured service** (the harness report's
@@ -100,13 +100,13 @@ re-arm compressing a swept-discovered backlog.
 
 7. THE CONCURRENCY NUMERATOR IS COUNTED, NOT DERIVED
 ----------------------------------------------------
-``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed≤t − #delivered≤t`` — an
+``concurrency.n_outbound_rows`` is the time-average of ``N(t) = #transformed<=t - #delivered<=t`` — an
 EXACT counting process over the rung's full event streams. No pairing, no ``claimed_at``, no Little's
 law. Two things it is NOT:
 
 * it is NOT capped at 8. It counts QUEUED **plus** IN-SERVICE outbound rows; only rows in service are
-  bounded by the 8 destination lanes. "N ≈ 8, therefore the lanes are saturated" is a category error.
-* its time-average EQUALS ``λ × W`` on this same data ALGEBRAICALLY. It corroborates the arithmetic; it
+  bounded by the 8 destination lanes. "N is about 8, therefore the lanes are saturated" is a category error.
+* its time-average EQUALS ``lambda × W`` on this same data ALGEBRAICALLY. It corroborates the arithmetic; it
   cannot validate Little's law. A check that cannot fail is not a check — cross it against an
   INDEPENDENT gauge (the engine's sampled ``in_pipeline`` queue depth) if you want one that can.
 
@@ -295,7 +295,7 @@ class _Agg:
 
     @property
     def retried(self) -> bool:
-        """More ``delivered`` rows than distinct destinations ⇒ at least one redelivery attempt."""
+        """More ``delivered`` rows than distinct destinations means at least one redelivery attempt."""
         return self.n_delivered > self.n_dest
 
 
@@ -392,7 +392,7 @@ def _census(aggs: list[_Agg], expect_t: int | None, expect_d: int | None) -> dic
     * CENSORED — the message never routed / never transformed / never delivered. NOT a fan-out problem:
       a COMPLETION problem. Near a collapse rung these are systematically the SLOW messages, so dropping
       them biases latency DOWN exactly where it matters.
-    * MODAL MISMATCH — the typical message's fan-out is not the topology's ⇒ the SHAPE is not what you
+    * MODAL MISMATCH — the typical message's fan-out is not the topology's => the SHAPE is not what you
       think it is (wiring, or a wrong ``--expect``).
     * PARTIAL — right modal, but some complete-path messages are missing fan-out rows. In COHORT mode a
       window CANNOT clip a delivery, so a partial is genuinely in flight or dead-lettered.
@@ -554,7 +554,7 @@ def _build_lanes(rows: list[tuple[Any, ...]]) -> list[_Lane]:
 
 
 def _counting_n(births: list[float], deaths: list[float], lo: float, hi: float) -> dict[str, float]:
-    """Time-average and peak of the EXACT counting process ``N(t) = #births<=t − #deaths<=t`` over
+    """Time-average and peak of the EXACT counting process ``N(t) = #births<=t - #deaths<=t`` over
     ``[lo, hi]``.
 
     This is the concurrency numerator, and it is measured, not derived. It needs NO pairing of a birth to
@@ -693,7 +693,7 @@ async def _window_report(
         "lambda_msg_per_s": round(n_recv_win / window_s, 4) if window_s > 0 else 0.0,
         "lambda_del_per_s": round(n_del_win / window_s, 4) if window_s > 0 else 0.0,
         "concurrency": {
-            "n_outbound_rows": n_out,  # EXACT count: transformed(born) − delivered(died)
+            "n_outbound_rows": n_out,  # EXACT count: transformed(born) - delivered(died)
             "n_messages_in_flight": n_e2e,
             "note": (
                 "n_outbound_rows counts QUEUED + IN-SERVICE outbound rows. It has NO cap of 8 — the "
@@ -901,7 +901,7 @@ def _render_census(c: dict[str, Any], population: str) -> list[str]:
                 f"  ##  RETRIES: {c['retried_messages']} messages have more `delivered` rows than "
                 "distinct destinations. Their",
                 "  ##  delivered_max is a REDELIVERY, which INFLATES W_last / E2E_complete. Retry rate",
-                "  ##  plausibly rises with load ⇒ a load-dependent UPWARD bias on latency.",
+                "  ##  plausibly rises with load => a load-dependent UPWARD bias on latency.",
             ]
         if population == "full-fan-out only":
             out += [
@@ -968,7 +968,7 @@ def _render_concurrency(c: dict[str, Any]) -> list[str]:
     o, e = c["n_outbound_rows"], c["n_messages_in_flight"]
     return [
         "",
-        "CONCURRENCY — the EXACT counting process (births − deaths), not lambda x W",
+        "CONCURRENCY — the EXACT counting process (births - deaths), not lambda x W",
         f"  N_outbound_rows   time-avg={o['time_avg']:.3f}  peak={o['peak']:.0f}   "
         f"(transformed = born, delivered = died)",
         f"  N_messages_in_flight time-avg={e['time_avg']:.3f}  peak={e['peak']:.0f}",
@@ -1052,7 +1052,7 @@ def _gate_failures(d: dict[str, Any]) -> list[str]:
 
 
 def main() -> int:
-    # This report carries U+2014/U+2265. On Windows a REDIRECTED stdout defaults to the ANSI codepage, so
+    # This report carries U+2014 EM DASH. On Windows a REDIRECTED stdout defaults to the ANSI codepage, so
     # `... > out.txt` would die with UnicodeEncodeError at exactly the moment the artifact is banked.
     for stream in (sys.stdout, sys.stderr):
         if isinstance(stream, io.TextIOWrapper):
