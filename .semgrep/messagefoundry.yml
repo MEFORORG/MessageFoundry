@@ -1,7 +1,14 @@
 # MessageFoundry SAST rules — high-signal patterns for a PHI-handling HL7 engine. These complement
-# bandit; each targets a sink that untrusted HL7/config data must never reach unguarded. All rules
-# have ZERO matches in the current tree (verified at authoring), so the gate starts clean; the
-# security.yml job runs them advisory for one cycle, then flips to blocking (CI-1).
+# bandit; each targets a sink that untrusted HL7/config data must never reach unguarded.
+#
+# These rules are BLOCKING. The security.yml `semgrep` job runs them with --error, and that job is a
+# required context (.github/required-contexts.txt:78, asserted by tests/test_security_posture.py's
+# _BLOCKING_SECURITY_JOBS), so a single match fails the build. Stated from those two checkable facts
+# rather than dated: this file's history was squashed, so "advisory until <date>" is not something a
+# reader can verify here, and the previous header's "runs them advisory for one cycle" outlived the
+# flip it described. Scope is the WHOLE REPO minus that job's excludes — deliberately not an
+# allow-list. This header deliberately makes no claim that the tree is currently clean: the gate is
+# what keeps it clean, and the gate is the only thing that can still say so at a later date.
 rules:
   - id: mf-no-shell-true
     languages: [python]

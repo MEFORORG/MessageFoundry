@@ -408,6 +408,19 @@ Full references: **[SECURITY.md](SECURITY.md)**, **[PHI.md](PHI.md)**, and **[DE
       surface in `last_error`/`detail`).
 - [ ] Run **`messagefoundry audit-verify`** periodically (the audit log is tamper-*evident*, not
       tamper-*proof*), and set `[retention]` windows — they are **off by default (kept forever)**.
+- [ ] **Seal the audit DB across any gap in custody, with an anchor.** A bare `audit-verify` is clean
+      after the *newest* rows are deleted — the surviving prefix still chains — so on its own it is
+      blind to the attack it is run for. **`messagefoundry audit-anchor`** prints `COUNT:HEAD` (no PHI,
+      no secret) and **`messagefoundry audit-verify --expected-anchor COUNT:HEAD`** (or
+      `--expected-anchor-file`) checks it back. It is an **exact point-in-time seal**, and that fixes
+      how to use it: **stop or quiesce the engine, take the anchor, hold it somewhere the engine's
+      operator cannot rewrite, and re-verify while the chain is still quiesced** — around a maintenance
+      window, a database move, a backup/restore, or a hand-off between custodians. Whatever happened to
+      the DB in that gap is what it detects. **Two ways to get a useless answer:** taking the anchor and
+      verifying it in the same breath compares a value to itself, and re-checking a held anchor against
+      a **running** engine reports `truncated or rewritten` on every ordinary boot, because a running
+      engine writes audit rows. This is **not** a periodic control against a live engine — for that, an
+      off-box log forward / tee is still the answer, and it is the stronger one regardless.
 
 ---
 

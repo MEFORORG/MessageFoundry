@@ -223,6 +223,17 @@ trail.
   factor over the network. This ack **downgrades that refusal to a loud, audited warning** (the same
   warn-and-start `enforcement = warn` takes, but scoped to this one control), so the instance boots
   single-factor while staying at `enforce`.
+- **Scope correction ([BACKLOG #326](BACKLOG.md)):** "a declared reverse proxy" above means exactly
+  `[api].tls_terminated_upstream` — the bind-and-proxy posture, **independent of the browser console**. The
+  shipped predicate additionally required the console to be *served*, which the ADR 0143 auto-degrade had
+  already turned off, so a loopback-behind-a-declared-proxy instance would not have reached this refusal at
+  all on first deployment and this ack would have had nothing to lift there. The wording in this section was
+  already the intended scope; the code now matches it, and the ack itself is unchanged. An **undeclared**
+  proxy (a set `web_console_public_address` with no `tls_terminated_upstream`) stays outside the predicate
+  — nothing was declared, so exposure there is an inference, and an inference must not refuse. It has its
+  own startup **warning**, which names single-factor admin directly on a PHI instance with `require_mfa`
+  off; read that arm, not the ADR 0068 §8 undeclared-proxy warning, as the control for this case (§8 is
+  about the `/ui` cookie and HSTS, and the ADR 0143 auto-degrade suppresses it in the same posture).
 - **When acceptable:** a production exposure where the second factor is supplied by a **compensating control
   outside MessageFoundry** — an authenticating reverse proxy / mTLS admin gateway, or AD/Kerberos MFA
   delegated to the directory (this flag gates only local Administrator accounts).
