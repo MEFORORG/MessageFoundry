@@ -2456,7 +2456,7 @@ def route_demo_oru(msg):
 
 ## 235. Generate Steps view parameter forms from Python type hints
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
+> 🚧 **In progress 2026-08-05 -- engine-emitted param schema (`lens schema` CLI) + schema-driven IDE renderer built; the int-to-number widget and the retype-trap fix are live, enum-to-dropdown is built but dormant pending owner OQ1 (narrow the closed-set params to Literal); not closed.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
 
