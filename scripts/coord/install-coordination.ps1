@@ -69,8 +69,20 @@ param(
     # own event, so `-Only UserPromptSubmit -Uninstall` removes it WITHOUT disarming the collision gate
     # or the SessionStart banner. Without this the only 2am remedy is a hand-edit of the user settings.
     [string[]]$Only,
-    [string[]]$Except
-)
+    [string[]]$Except,
+    # Limit to the rows whose Script matches. -Only filters by EVENT, and an event can carry more than
+    # one row: SessionStart carries BOTH the coordination banner and the mail drain. So
+    # `-Only SessionStart` silently installs the banner too, which is a different hook with a different
+    # blast radius, and there was no way to ask for one tier of one event.
+    #
+    # That matters because wiring this channel ONE TIER AT A TIME is the deliberate pattern -- the mail
+    # drain went live on Stop alone while SessionStart stayed out, for a measured reason (see
+    # docs/SESSION-MAIL.md). A switch that cannot express the thing you are actually doing pushes you
+    # toward a hand-edit of the user settings file, which is exactly what this script exists to avoid.
+    #
+    # Substring match, because the rows carry repo-relative paths and 'mail-drain' is what an operator
+    # actually types. It composes with -Only and -Except rather than replacing them.
+    [string[]]$Script)
 
 $ErrorActionPreference = "Stop"
 
@@ -194,6 +206,12 @@ $WIRING = @(
 
 if ($Only) { $WIRING = @($WIRING | Where-Object { $Only -contains $_.Event }) }
 if ($Except) { $WIRING = @($WIRING | Where-Object { $Except -notcontains $_.Event }) }
+if ($Script) {
+    $WIRING = @($WIRING | Where-Object {
+            $row = $_
+            @($Script | Where-Object { $row.Script -like "*$_*" }).Count -gt 0
+        })
+}
 if (-not $WIRING) { Write-Host "No wiring rows selected."; exit 0 }
 
 function Read-Settings([string]$Path) {

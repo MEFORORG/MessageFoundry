@@ -15,19 +15,33 @@ hook.
 
 ---
 
-## Status: wired on `Stop` only, on the default config root
+## Status: wired on `SessionStart` and `Stop`, on the default config root -- and INERT until the scripts reach `main`
 
 **Read the config, not this line, before relying on it** -- a status sentence in a document is exactly
 the observation that goes stale without saying so. As last verified against `~/.claude/settings.json`:
-the drain is registered on **`Stop` and on `Stop` only**, and **`SessionStart` is not wired**, for the
-reason in ["What still blocks wiring"](#what-still-blocks-wiring) 1b. The wiring rows in
-[`scripts/coord/install-coordination.ps1`](../scripts/coord/install-coordination.ps1) still carry
-**both** events, so an install from those rows would wire more than what is live. The urgent tier
-([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and registered
-nowhere.
+the drain is registered on **both `SessionStart` and `Stop`**, on the default root only. No
+`~/.claude-account-N` carries it. The coordination banner
+(`scripts/worktree/session-context.ps1`) is a *different* hook that shares the `SessionStart` event and
+is deliberately still absent; install one tier at a time with
+`-Only <event> -Script mail-drain`, because `-Only SessionStart` alone would wire the banner too. The
+urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
+registered nowhere.
 
-The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) makes
-wiring `SessionStart` **safe**; it does not wire it, and it did not change any installer row.
+> **THE ROWS ARE LIVE AND THE HOOK STILL DOES NOTHING, IN ALMOST EVERY WORKTREE.** The installed shim
+> resolves `scripts/hooks/mail-drain.ps1` from the **primary checkout first**, falling back to the
+> session's own worktree. These scripts are not on `main` yet, so the primary does not carry them:
+> measured, both bases probed, primary `False` and the branch worktree `True`. Every session outside a
+> worktree holding this branch therefore fires the hook, resolves nothing, and exits 0 -- which is
+> **byte-identical to a healthy hook with no mail**, the exact defect
+> [observability rule 1](#three-observability-rules) exists to prevent.
+>
+> It becomes live everywhere the moment the scripts land on `main`, in every session started after
+> that, with no further action and no announcement. **Re-test on the target surface at that point**;
+> do not treat the wiring as verified because the rows are present. A row in a settings file is not a
+> hook that fired, which is what the installer prints on every run.
+
+The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) is what
+makes wiring `SessionStart` safe: a discarded session can display mail but cannot consume it.
 
 The open questions that still block wiring further are in ["What still blocks
 wiring"](#what-still-blocks-wiring) at the end.
