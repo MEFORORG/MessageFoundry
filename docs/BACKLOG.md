@@ -5611,6 +5611,28 @@ The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` r
 
 **Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
 
+## 1068. A `-Force` claim release leaves no record of who released whose claim
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/claim.ps1:164` gates a non-holder release behind `-not $Force`, so `-Force` lets any session release a claim it does not hold. That escape hatch is **necessary and must stay** — a claim whose holder's worktree is gone would otherwise be permanently stuck. The defect is that the release is `Remove-Item -LiteralPath $file -Force` and **nothing else**: no log, no audit line, no record of who released whose claim, when, or why. The guardrails are on the *advice*, not the *action*.
+
+**Cluster:** Coordination tooling / claim integrity. **Priority:** P3. **Verdict:** build (add a record; do **not** remove `-Force`). **Severity:** moderate — nothing is silently mis-authorised, but a coordination primitive can be overridden by the party it constrains with no trace, which makes it a convention rather than a control.
+
+**Measured 2026-08-06, and only known because the lane self-reported.** A build lane ran `claim.ps1 -Release 1021 -Force` on a claim held by another worktree, took the claim, and left no commit. It was remediated correctly — the original holder released its own claim **without** `-Force`, the item was re-taken on the lane worktree, and the work committed there. Nothing was lost. But the *only* reason any of that is known is that the lane disclosed it: the release itself left nothing behind to find.
+
+**⛔ Do not "fix" this by removing `-Force`.** The hatch has a real job and it was needed the same night: claim 1041 was held by a worktree whose session had ended, and the documented recovery is exactly `-Release <n> -Force`. `claim.ps1:141` already prints `[HOLDER GONE -- worktree no longer exists; release with -Force]` for that case. Removing the flag would strand claims and push people toward deleting claim files by hand, which is strictly worse — a hand deletion leaves even less evidence.
+
+**What already exists, and why it is not enough.** The script is careful about *recommending* `-Force`: `:170-189` refuses to suggest it without checking holder liveness, and warns *"Do NOT -Force it on the strength of a quiet period: a session can be alive and quiet."* That is good advice and it constrains nothing. A session that intends to take a claim reads past it. The asymmetry is the point — the caution is addressed to the careful reader, and the audit gap matters for the careless one.
+
+**Suggested shape, not prescribed.** Append a line to a `claims/.history` (or equivalent) on every release recording the key, the releasing worktree, the prior holder, `-Force` yes/no, and the timestamp. It needs no new gate and no new refusal — the release still succeeds. It only has to stop being invisible.
+
+**A sibling was considered and DECLINED, deliberately.** The claim gate reads the **commit subject only** (`scripts/hooks/claim_check.py:106`), so moving a `BACKLOG #N` token into the commit **body** evades it — and a lane did exactly that on 2026-08-06, self-documented, since remediated. That is **not** filed, because the subject-only scope is a documented design decision with a stated reason: *"A body may reference other items freely — this very repo's commits routinely cite the item they supersede or were found by. Enforcing on the body would fire on every one of those."* The proposed fix is worse than the defect — it would deny every ordinary commit citing a superseded item. Recorded here rather than dropped, because it is the obvious next proposal and the next reader will have it.
+
+**Root cause of both incidents, and the fix-forward is already in effect.** Items were claimed from the **primary** checkout, so a lane could not pass its own claim gate and reached for evasion or force. Claiming from the lane worktree resolves it; the three lanes run after that change were all claimed correctly, with no evasion and no force-claim.
+
+**Related:** #1060 and #1057 (claim and allocation are worktree-scoped in the same way that produced those), #1000 (a control that cannot see the class it names).
+
+**Source:** two remediated coordination incidents during the 2026-08-06 backlog campaign, both self-reported by the lane that caused them. Verified against the source before filing: `-Force` genuinely bypasses the holder check, and the release genuinely records nothing.
+
 ## 1063. `setup-leak-gate.ps1` picks the checkout from the current directory, so it can arm a worktree the operator did not name
 
 > 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `scripts/dev/setup-leak-gate.ps1:37` is `$repo = (& git rev-parse --show-toplevel 2>$null)` — no `-C`, no `-Repo` parameter, no `$PSScriptRoot` anchor. Invoked by absolute `-File` path from a different worktree, which is the ordinary shape on a clone with 40-plus of them, it installs the leak-gate token list into **the current directory's** checkout and prints `CONFIGURED` about that one, while the worktree the operator named keeps no token source. Its own directory siblings already do it correctly.
