@@ -840,9 +840,11 @@ poll/write shape against a remote server, selected by an internal `protocol` set
   (`pip install 'messagefoundry[sftp]'`, lazily imported so an install that never uses SFTP skips it).
   **Host-key verification is ON by default** (the system host keys plus an optional extra `known_hosts`,
   paramiko `RejectPolicy`); an unknown key is **refused** unless `MEFOR_ALLOW_INSECURE_TLS` is set (and
-  loudly logged when it is). **This one cell reads the raw escape and is *not* clamped** — unlike the
-  `tls_verify` / `encrypt` cells elsewhere in this document, the variable still works here on a
-  production-PHI enforcing instance, so it is the SFTP setting to audit for rather than assume inert.
+  loudly logged when it is). **Since #329 this cell routes the escape through the clamped
+  `weakened_tls_escape_permitted_here()`** — like the `tls_verify` / `encrypt` cells elsewhere in this
+  document, so on a production-PHI enforcing instance the escape is inert and an unknown host key stays
+  refused (`RejectPolicy`) even with the variable set; it takes effect only on a non-enforcing / non-PHI
+  instance.
 - **`Ftp(...)`** — stdlib `ftplib`, **no extra**: `tls=False` is plain FTP, `tls=True` is **FTPS**
   (explicit TLS + `PROT P`, encrypting the control *and* data channels). FTPS **verifies the server
   certificate and hostname by default** (a verifying `SSLContext`, not ftplib's no-verify fallback).

@@ -61,6 +61,7 @@ from messagefoundry.auth.tokens import hash_bytes, hash_token, mint_token
 from messagefoundry.config.models import SignatureAlgorithm
 from messagefoundry.config.secretprovider import SecretProvider, resolve_connector_secret
 from messagefoundry.config.settings import AuthSettings
+from messagefoundry.config.tls_policy import HopPosture
 from messagefoundry.store.base import AdminStore
 from messagefoundry.store.store import SessionRecord, UserRecord, WebAuthnCredential
 
@@ -239,6 +240,7 @@ class AuthService:
         security_notifier: SecurityNotifier | None = None,
         secret_provider: SecretProvider | None = None,
         enforcing: bool = True,
+        hop_posture: HopPosture | None = None,
     ) -> None:
         self._store = store
         self._settings = settings
@@ -271,8 +273,12 @@ class AuthService:
             self._ldap: LdapAuthenticator | None = ldap
         elif settings.ad_enabled:
             # Thread the connector SecretProvider (ADR 0019 §5) so an ad_bind_password_secret reference
-            # resolves the bind password from the external backend (fail-closed) at construction.
-            self._ldap = LdapAuthenticator(settings, secret_provider=secret_provider)
+            # resolves the bind password from the external backend (fail-closed) at construction. #329:
+            # thread the instance hop posture too — LDAPS is built out of the connector-construction gate,
+            # so its ad_tls_verify=false escape clamp is inert unless the posture arrives explicitly here.
+            self._ldap = LdapAuthenticator(
+                settings, secret_provider=secret_provider, posture=hop_posture
+            )
         else:
             self._ldap = None
         # Instance-scoped (one event loop per AuthService) so it never crosses loops in tests.
