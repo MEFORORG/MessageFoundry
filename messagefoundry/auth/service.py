@@ -1965,7 +1965,8 @@ class AuthService:
         """Confirm a staged enrollment by proving a live TOTP code. On success: activate MFA, mint the
         single-use recovery codes (returned **once**, plaintext, for the user to save), mark the
         current session MFA-verified, audit + notify. Returns the recovery codes, or ``None`` when the
-        code was wrong. Raises :class:`ValueError` if no enrollment is staged / the user isn't local."""
+        code was wrong or its time-step was already consumed (single-use, BACKLOG #1021). Raises
+        :class:`ValueError` if no enrollment is staged / the user isn't local."""
         user = await self._store.get_user(identity.user_id)
         if user is None or user.auth_provider != AuthProvider.LOCAL.value:
             raise ValueError("only local users can enroll a TOTP authenticator")
@@ -1975,8 +1976,19 @@ class AuthService:
         # Verify the enrollment proof under the SAME configured clock-skew window as a login (BACKLOG
         # #187): default 0 = strict current-step only. Enrolling under the same window a login uses
         # avoids the trap of a skewed-clock authenticator that confirms enrollment yet then fails every
-        # login (the mismatch surfaces at enroll time instead).
-        if not totp.verify_totp(secret, code.strip(), window=self._settings.totp_skew_steps):
+        # login (the mismatch surfaces at enroll time instead). The matched step is then CONSUMED
+        # (BACKLOG #1021), single-use per ASVS 6.5.1, mirroring _verify_second_factor's verify-then-
+        # consume so the activating code can't be replayed on POST /auth/mfa-verify inside its step
+        # window (verify_totp alone discarded the step, which would leave a second-factor replay window
+        # at enrollment on first deployment). Consume BEFORE minting recovery codes / enable_totp keeps
+        # enable atomic: a step that no longer advances the high-water mark fails on the same
+        # phase=enroll branch and MFA is not enabled.
+        matched_step = totp.verify_totp_step(
+            secret, code.strip(), window=self._settings.totp_skew_steps
+        )
+        if matched_step is None or not await self._store.consume_totp_step(
+            identity.user_id, matched_step
+        ):
             await self._audit(
                 "auth.mfa_failed",
                 actor=identity.username,
