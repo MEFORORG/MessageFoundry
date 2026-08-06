@@ -29,16 +29,29 @@ registered nowhere.
 
 > **THE ROWS ARE LIVE AND THE HOOK STILL DOES NOTHING, IN ALMOST EVERY WORKTREE.** The installed shim
 > resolves `scripts/hooks/mail-drain.ps1` from the **primary checkout first**, falling back to the
-> session's own worktree. These scripts are not on `main` yet, so the primary does not carry them:
-> measured, both bases probed, primary `False` and the branch worktree `True`. Every session outside a
-> worktree holding this branch therefore fires the hook, resolves nothing, and exits 0 -- which is
-> **byte-identical to a healthy hook with no mail**, the exact defect
-> [observability rule 1](#three-observability-rules) exists to prevent.
+> session's own worktree. Measured from two vantage points, which is the only way to see it:
 >
-> It becomes live everywhere the moment the scripts land on `main`, in every session started after
-> that, with no further action and no announcement. **Re-test on the target surface at that point**;
-> do not treat the wiring as verified because the rows are present. A row in a settings file is not a
-> hook that fired, which is what the installer prints on every run.
+> | probed from | primary base | own-worktree fallback | resolves |
+> |---|---|---|---|
+> | a worktree holding this branch | `False` | `True` | yes -- **but only because that branch carries the file** |
+> | any other worktree | `False` | `False` | **nothing** |
+>
+> Every session outside a worktree holding this branch fires the hook, resolves nothing, and exits 0 --
+> **byte-identical to a healthy hook with no mail**, the exact defect
+> [observability rule 1](#three-observability-rules) exists to prevent. Probing from the branch worktree
+> alone reports `True` and looks healthy, so **a single-vantage check cannot see this**.
+>
+> ⚠️ **MERGING TO `main` IS NOT WHAT MAKES IT LIVE, and an earlier draft of this section said it was.**
+> Measured immediately after PR #210 landed: `mail-drain.ps1` was on `origin/main` and **still absent
+> from the primary checkout's working tree**, which was three commits behind. The shim resolves a
+> **working tree**, not a ref. Nothing pulls the primary automatically, so the channel stays inert
+> across the whole machine until somebody does -- and the merge notification is exactly the moment an
+> operator is most likely to believe it went live.
+>
+> **The activating action is `git pull` in the primary checkout, not the merge.** Re-test on the target
+> surface after that, from a worktree that does **not** carry this branch, so the fallback cannot mask a
+> broken primary resolution. A row in a settings file is not a hook that fired, which is what the
+> installer prints on every run.
 
 The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) is what
 makes wiring `SessionStart` safe: a discarded session can display mail but cannot consume it.
