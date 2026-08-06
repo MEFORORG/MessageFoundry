@@ -23,7 +23,9 @@ from messagefoundry.config.wiring import (
     InboundConnection,
     OutboundConnection,
     Registry,
+    Soap,
     connector_secret_env_values,
+    env,
 )
 from messagefoundry.pipeline.secret_rotation import (
     SecretRotationRunner,
@@ -293,6 +295,31 @@ def test_connector_secret_env_values_skips_unresolved_and_empty() -> None:
         ),
     )
     assert connector_secret_env_values(reg, {"present": "V", "blank": ""}) == {"present": "V"}
+
+
+def test_connector_secret_env_values_includes_a_soap_body_secret() -> None:
+    # BACKLOG #1009 (ADR 0015): a SOAP ``body_secrets={token: env(...)}`` desugars to a top-level
+    # ``body_secret_value_<i>`` EnvRef that reaches secrecy only through the prefix branch of
+    # ``_is_secret_setting`` -- it is NOT a literal ``_SECRET_SETTING_KEYS`` member. The fingerprinter
+    # must resolve it (a rotation of a SOAP injected body secret would otherwise go undetected while
+    # every sibling connector credential is tracked). Built from a real ``Soap()`` factory so the
+    # factory -> _hoist_body_secrets -> body_secret_value_0 -> fingerprint path is exercised end to end.
+    reg = Registry()
+    # Synthetic placeholder matching the .gitleaks.toml ``MF_IIS_<ROLE>_<hex>`` allowlist (ADR 0015
+    # amendment): a body-secret TOKEN is public by design -- it sits in committed Handler source and the
+    # transport swaps in the real env() credential at send time -- not a credential. >=16 chars to satisfy
+    # ``_BODY_SECRET_TOKEN_RE``.
+    token = "MF_IIS_BODY_9f2c41ab3d7e"
+    reg.outbound["OB_IIS"] = OutboundConnection(
+        name="OB_IIS",
+        spec=Soap(
+            url="https://api.example.com/svc",
+            body_secrets={token: env("iis_body_pw")},
+        ),
+    )
+    assert connector_secret_env_values(reg, {"iis_body_pw": "SYNTH-VAL"}) == {
+        "iis_body_pw": "SYNTH-VAL"
+    }
 
 
 # --- live-by-default: DEK tracked via the stamp when operator date unset -----
