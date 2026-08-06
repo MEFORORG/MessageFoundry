@@ -5228,6 +5228,101 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Source:** the two instances were found independently on 2026-08-05 by sessions `trusting-wu-c2e6d5` (refname, in Rule 3b) and `sharp-chatelet-f33072` (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
 
+## 1042. The `[vault]` key/secret/transit providers build a redirect-following HTTP client, so a diverted 3xx could carry `X-Vault-Token` off-path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. Every shipped HTTP egress routes through a no-redirect urllib opener (`transports/rest.py` `_NO_REDIRECT_OPENER`), except the `[vault]` provider clients, which build a `requests`-based hvac client with no redirect policy. A deploying site on `messagefoundry[vault]` would carry `X-Vault-Token` over a redirect-following client to the operator-set `VAULT_ADDR`.
+
+**Cluster:** Egress / secret handling. **Priority:** P3. **Verdict:** build (small). **Severity:** conditional, not an exposure on the shipping config. The vault provider is behind an optional pip extra and off by default; when selected it points at operator-trusted infrastructure. On first deployment, an on-path 3xx (absent TLS integrity) or a spoofed Vault could divert the bearer token, while every default egress refuses redirects.
+
+**The fix.** Set a no-redirect policy on the hvac session (or wrap the three vault clients: `store/keyprovider_vault.py`, `config/secretprovider_vault.py`, and `store/crypto_transit.py` via `_build_client`), OR document redirect-following-to-Vault as intended per the verb's "unless it is intended functionality" clause.
+
+**Related:** ASVS 15.3.2 (the re-verification that surfaced it), 1.3.6 (SSRF).
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Full file:line detail is in the maintainer-internal ASVS V15 chapter report (`docs/security/`, withheld per SECURITY-DOCS-POLICY.md).
+
+## 1043. The threat-model drift guard's doc-content assertions go inert when the vault doc is absent, so on the public tree they enforce nothing
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **3/10** · _fill-in_. `tests/test_threat_model_doc_drift.py` skips every doc-content assertion (heading-enumeration, planted-omission) when `docs/security/THREAT-MODEL.md` is absent, which it is on the public tree (the doc is deny-listed from the OSS mirror). The compensating control's enforced half lives outside the tree it runs in; the code-only assertions (subprocess-site inventory, default-value locks) still fire.
+
+**Cluster:** Measurement / doc-drift integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect. The defect is a green that is not evidence: on the assessed public tree, the identification of resource-demanding and dangerous functionality (which several ASVS 15.1.x verdicts lean on) has zero drift enforcement, and nothing announces the skip.
+
+**The fix, and its constraint.** Make the doc-absent skip loud rather than silent (the project's own standard, ADR 0158's class), or ship a public-tree stand-in the content assertions can run against. A skip that reads as a pass is the failure being fixed; do not trade a silent skip for another.
+
+**Related:** #1027 (a documented gate that silently covers less than it appears to), ADR 0158, ASVS 15.1.3 / 15.1.5.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1044. There is no request-timeout on HTTP handlers, so the "response within the consumer's timeout" limb has no server-side enforcement
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. The only `asyncio.wait_for` in `api/` is the connection-test probe; there is no request-timeout middleware. ASVS 15.1.3's limb "avoid building a response that takes longer than the consumer's timeout" has no server-side enforcement (properly 15.2.2 territory, surfaced during the 15.1.3 re-verification).
+
+**Cluster:** Availability. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping config (localhost + auth, single worker). On first deployment a slow handler holds a worker for as long as it runs, with nothing bounding the response time from the server side.
+
+**The fix.** Add a request-timeout middleware (or per-route deadline) that returns a bounded error rather than building unboundedly.
+
+**Related:** ASVS 15.1.3 / 15.2.2, #1042.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1045. `redact_unauthorized` fails open, so a future PHI route that forgets the call returns every field unmasked
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `api/field_authz.py` `redact_unauthorized` fails open: field masking happens only where the call is made, and coverage is pinned only by an enumerated test (`tests/test_field_authz_enforcement_sites.py`). A new PHI-returning route added without the call, and not added to the test, would return the whole model unmasked.
+
+**Cluster:** Defensive coding / field authorization. **Priority:** P3. **Verdict:** build (small). **Severity:** not an exposure today, verified rather than assumed: every documented PHI surface at HEAD is covered (which is why ASVS 15.3.1 still grades pass). A latent defensive-coding weakness, not a live leak.
+
+**The fix.** A fail-closed default (mask unless explicitly allowed) or app-level enforcement middleware, so a forgotten call denies rather than exposes.
+
+**Related:** ASVS 15.3.1, #1043 (the same enumerated-test coverage shape).
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1046. The inbound archive move uses a non-atomic exists-check instead of the `O_EXCL` claim used on the delivery path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. `transports/file.py` `_move` relocates via `_unique`, which uses a non-atomic `if not target.exists()` rather than the `O_EXCL` claim (`_claim_unique`) the delivery path uses. A check-then-act TOCTOU window exists on the archive move.
+
+**Cluster:** Concurrency. **Priority:** P3. **Verdict:** build (small). **Severity:** no integrity consequence on the default config, verified: the canonical raw message is already durable in the store at ingress (ACK-on-receipt), and the default is one poller per source over an engine-owned `processed_dir`. It would only race under a non-default config where two FileSources share one `processed_dir`, worst case a benign archived-copy name collision.
+
+**The fix.** Route the archive move through `_claim_unique` (the same `O_EXCL` claim as the delivery path).
+
+**Related:** ASVS 15.4.4.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1047. The apiclient measures URL length before the query string is appended, so a query-bearing GET can exceed the limit unchecked
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `apiclient/client.py` measures only `len(base_url) + len(path)` against `MAX_REQUEST_URL_LEN`, then `_request` hands `params=` to httpx, which appends the query AFTER the check (the `Authorization` header IS bounded). A query-bearing GET can construct a URI over the limit with nothing refusing it. The apiclient is the frontend ASVS 4.2.5 explicitly names.
+
+**Cluster:** Outbound length bounding / DoS. **Priority:** P3. **Verdict:** build (small). **Severity:** the primary attacker-influenced message-derived HTTP family (REST/SOAP/FHIR) IS bounded at construction + send-time; this is the residual under the 4.2.5 `partial`. On first deployment an operator action (tray/harness/monitor) producing a long query could build an over-long URI the receiving component rejects with a persistent error status.
+
+**The fix.** Measure the resolved URL including the query (or reuse `transports/rest.py` `enforce_send_time_length_limits`). Note `test_apiclient_length_bounds_match_the_transport_constants` keeps the constants in step but does not cover this query-string gap.
+
+**Related:** #1048 (the sibling 4.2.5 gap), ASVS 4.2.5.
+
+**Source:** ASVS 5.0.0 V4 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V4 chapter report.
+
+## 1048. The OIDC token-exchange outbound request has no send-time length guard
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. `messagefoundry/auth` carries zero `enforce_send_time_length_limits` / `MAX_REQUEST_URL_LEN` calls; the token-exchange `urllib.request.Request` at `auth/oidc/flow.py` has no send-time length guard.
+
+**Cluster:** Outbound length bounding. **Priority:** P3. **Verdict:** build (small). **Severity:** the weaker limb of the two 4.2.5 gaps: `token_endpoint` is operator-static config (validated https at load), not attacker-influenced, so the 4.2.5 `partial` does not depend on it.
+
+**The fix.** Add a send-time length check on the token-exchange request line + headers.
+
+**Related:** #1047 (the primary 4.2.5 gap), ASVS 4.2.5.
+
+**Source:** ASVS 5.0.0 V4 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V4 chapter report.
+
+## 1049. `XmlMessage` exposes only string-expression XPath, so a Handler interpolating tainted data has no framework-provided safe path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `XmlMessage.find` / `get` / `get_all` / `exists` / `set` all take an `expression: str` into the sole sink `self._root.xpath(...)`; there is zero `etree.XPath()` / `XPathEvaluator` / `$`-bound XPath tree-wide. No first-party dynamic XPath from taint ships today, but `XmlMessage` is exported to code-first Handlers (`parsing/__init__`), so a Handler interpolating HL7/request data into an XPath expression would, on first deployment, have an injection vector with no framework-provided safe alternative.
+
+**Cluster:** Injection hardening / defensive API. **Priority:** P3. **Verdict:** build (small). **Severity:** not a shipped vulnerability (nothing in-tree reaches `.xpath()` with tainted data); a hardening item for the code-first authoring surface, unlike SQL where the driver binds values regardless of the author's statement.
+
+**The fix.** Add a `$var`-parameterized or precompiled `XmlMessage` XPath API so a Handler has a safe option. Separately, the ASVS scorecard record for 1.2.7 was corrected in the same re-verification (a prior `na` on a false "no XPath anywhere" premise moved to `needs-review`); that record correction is already done and is not part of this code item.
+
+**Related:** ASVS 1.2.7, 1.3.4 (the structurally parallel SVG cell).
+
+**Source:** ASVS 5.0.0 V1 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V1 chapter report.
 ## 1051. Async-delivery `retry_max_attempts=None` (retry forever) contradicts the engine's own documented sync-HTTP guidance
 
 > 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2240` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2242` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
