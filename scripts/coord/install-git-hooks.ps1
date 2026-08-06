@@ -148,7 +148,8 @@ if ($Status) {
             Write-Host "             ^ NOT INSTALLED at $dstPy." -ForegroundColor Yellow
             Write-Host "               If the matching hook above reads INSTALLED, its shim execs this missing" -ForegroundColor Yellow
             Write-Host "               file; where python resolves it exits nonzero and fails closed, blocking" -ForegroundColor Yellow
-            Write-Host "               every worktree. Where python does NOT resolve the shim exits 0 instead." -ForegroundColor Yellow
+            Write-Host "               every worktree. Where python does NOT resolve the shim now refuses too" -ForegroundColor Yellow
+            Write-Host "               (it used to exit 0 and let the push through unchecked)." -ForegroundColor Yellow
         } elseif (-not $sSha) {
             Write-Host "             ^ no source at $srcPy -- the installed copy cannot be judged." -ForegroundColor Yellow
         } elseif ($iSha -eq $sSha) {
@@ -292,8 +293,11 @@ HOOK_DIR=$(dirname "$0")
 PY=python
 command -v python >/dev/null 2>&1 || PY=python3
 if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "MessageFoundry: python not found -- THE CLAIM GATE IS OFF for this commit." >&2
-  exit 0
+  echo "MessageFoundry: neither python nor python3 resolves, so the claim gate cannot run." >&2
+  echo "REFUSING this commit rather than allowing it unchecked -- a gate that cannot run" >&2
+  echo "must not report success. Fix PATH so python resolves, then commit again." >&2
+  echo "To commit without the gate, deliberately:  git commit --no-verify" >&2
+  exit 1
 fi
 exec "$PY" "$HOOK_DIR/claim_check.py" "$1"
 '@ -replace "`r`n", "`n"
@@ -318,8 +322,13 @@ HOOK_DIR=$(dirname "$0")
 PY=python
 command -v python >/dev/null 2>&1 || PY=python3
 if ! command -v "$PY" >/dev/null 2>&1; then
-  echo "MessageFoundry: python not found -- THE PUSH GUARD IS OFF for this push." >&2
-  exit 0
+  echo "MessageFoundry: neither python nor python3 resolves, so the push guard cannot run." >&2
+  echo "REFUSING this push rather than allowing it unchecked -- a guard that cannot run" >&2
+  echo "must not report success. This repo IS the published artifact: a push to main is" >&2
+  echo "publication, and nothing downstream would catch it." >&2
+  echo "Fix PATH so python resolves, then push again." >&2
+  echo "To push without the guard, deliberately:  git push --no-verify" >&2
+  exit 1
 fi
 exec "$PY" "$HOOK_DIR/push_guard.py" "$@"
 '@ -replace "`r`n", "`n"
