@@ -34,11 +34,26 @@
          waiting is not the fix either.
 
     THE VERDICT IS AN EXCLUSIVE OPEN, which stale metadata cannot answer: Exists, and then a real
-    open of that path with FileShare::None. See Move-Claimed for the retry and for why ceding is the
-    safe failure direction.
+    open of that path with FileShare::None. See Test-FilePresent for the retry and Move-Claimed for why
+    ceding is the safe failure direction.
+
+    THAT VERDICT IS ALSO THE ONLY ACCEPTABLE "DOES THIS FILE REALLY EXIST" PROBE IN THIS CHANNEL.
+    Test-FilePresent is the verdict with the move removed, and the drain asks it about shown-markers
+    too. File.Exists is not an acceptable answer there for the same measured reason it is
+    not one here: a false "yes, this was already shown" would suppress a display while the turn-boundary
+    drain consumed the message, which is a silent loss. Test-FilePresent's failure direction is "could
+    not prove it exists" -> show it again -> a duplicate, never a loss.
 
     A THROW IS A REPORT, NOT A VERDICT. The move can throw and still have happened, and it can return
     silently and not have happened, so `Won` is never inferred from whether an exception was raised.
+
+    THE SESSION-ID SHAPES ARE HERE, AND mail-key.ps1 IS WHERE THEY BELONG. Test-SessionId,
+    ConvertTo-SessionKey and Split-ShownMarkerName validate a hook-payload session id BEFORE the drain
+    builds a shown-marker path out of it -- exactly the duty mail-key.ps1 states for the message stem,
+    and exactly the lowercasing rationale it already records for the box key. They sit here rather than
+    there for a scoping reason that has nothing to do with the design. Relocating them next to
+    Test-MailStem is a mechanical change, and it must be a MOVE, never a copy: two definitions of a
+    shape a path is built from is the drift this whole file exists to prevent.
 
     ASCII-only, pwsh 7. Nothing here throws to its caller: a hook consumer must be able to fail open.
 #>
@@ -146,6 +161,124 @@ function Get-ClaimTokenOwnerState {
     }
 }
 
+function Test-FilePresent {
+    # PROVEN PRESENCE, NOT REPORTED PRESENCE. This is the claim verdict with the move removed, extracted
+    # so the drain's shown-marker probe asks the same question the claim asks rather than a weaker one
+    # that looks identical in a code review.
+    #
+    # WHY EXISTS IS NOT THE ANSWER -- and this is the correction that cost the most to find.
+    # File.Exists returns a TRANSIENT FALSE POSITIVE for a path that was never created, and it does so
+    # only ACROSS PROCESSES: a 16-thread, 500-round measurement inside ONE process saw exactly one
+    # winner every round and concluded the verdict was sound. Re-measured 2026-08-05 with 16 separate
+    # pwsh processes over 800 rounds -- the configuration the drain actually runs in -- the same verdict
+    # reported a win to MORE THAN ONE racer in 46 of 800 rounds (5.75%), on 49 destinations that did not
+    # exist in the final listing. A re-probe 3ms later cleared only 38 of those 49, so waiting is not a
+    # fix. An EXCLUSIVE OPEN is the question stale metadata cannot answer -- the file is either really
+    # there to be opened or it is not. In the same run it refused all 49 phantoms and gave exactly one
+    # opener in 800 of 800 rounds.
+    #
+    # WHY THE RETRY, AND WHICH DIRECTION THE FAILURE POINTS. The open is very slightly over-strict: in 3
+    # of 800 rounds a true winner's own open failed transiently. A few short retries recover most of
+    # that; when they do not, this returns FALSE, and false is the safe answer at every call site. For a
+    # claim it means cede rather than deliver on an unproven claim. For the drain's marker probe it
+    # means "could not prove it exists" -> show the message again -> a duplicate display,
+    # which is accepted, rather than a suppressed display over a message that is then consumed, which
+    # would be a silent loss.
+    #
+    # THE EXISTS GATE KEEPS THE CHEAP PATH CHEAP. The retry loop is entered only when Exists is already
+    # true, so a path that is not there costs one metadata call and no sleeps. The drain runs on every
+    # turn boundary in every worktree; a change that put those sleeps on the negative path would put
+    # them on the hot path.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Path)
+    if (-not [System.IO.File]::Exists($Path)) { return $false }
+    foreach ($attempt in 1..4) {
+        try {
+            $fs = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open,
+                [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
+            $fs.Dispose()
+            return $true
+        }
+        catch { Start-Sleep -Milliseconds (2 * $attempt) }
+    }
+    return $false
+}
+
+function Test-SessionId {
+    # The session id shape, validated BEFORE any path is built from it. A hook payload is input from
+    # outside this script, and a shown-marker filename is built out of it, so this is the same duty
+    # Test-MailStem carries for the message stem -- and skipping it would be the same traversal defect
+    # the drain already fixed once.
+    #
+    # \A and \z, NOT ^ and $: in .NET '$' also matches immediately before a trailing newline, so '^...$'
+    # would accept an id with one appended. Same reason mail-key.ps1 states.
+    #
+    # -cmatch with BOTH cases spelled into the class, so the regex states its own case policy rather
+    # than inheriting -match's case- and culture-sensitive default. TOLERANT IN, CANONICAL OUT: an
+    # uppercase id from some future client is accepted here and lowercased by ConvertTo-SessionKey,
+    # because rejecting it would degrade that surface to "unmarkable" for no benefit.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$SessionId)
+    return ($SessionId -cmatch '\A[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\z')
+}
+
+function ConvertTo-SessionKey {
+    # The canonical spelling of a session id, or $null if it is not one. $null is the caller's signal
+    # that the session is UNMARKABLE -- never a licence to build a path from the raw value.
+    #
+    # LOWERCASED FOR THE REASON ConvertTo-BoxKey RECORDS: VS Code records a lowercase drive letter where
+    # the Desktop app records an uppercase one, and the same normalisation argument applies to any id
+    # that reaches this channel spelled two ways. ONE MINTED SPELLING, so a marker's name is predictable
+    # from an id however the client happened to case it.
+    #
+    # The rationale this replaced -- "two spellings would mint two markers" -- cannot hold on the
+    # platform this runs on: NTFS resolves both spellings to ONE file, so a second spelling collides
+    # with the first rather than duplicating it. That mattered, because Split-ShownMarkerName was
+    # written to the false version and rejected a case variant as foreign while the filesystem handed
+    # the drain the same file. See its header.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$SessionId)
+    if (-not (Test-SessionId -SessionId $SessionId)) { return $null }
+    return $SessionId.ToLowerInvariant()
+}
+
+function Split-ShownMarkerName {
+    # The shown-marker name, <stem>--<sessionKey>.marker. Returns $null for anything this channel did
+    # not mint, and a $null return is the caller's signal to LEAVE THE FILE ALONE -- never to build a
+    # path out of it. Same contract as Split-MailFileName, and the same reason.
+    #
+    # Splitting on the FIRST '--' is unambiguous because neither half can contain one: a stem is
+    # <yyyyMMddTHHmmssfff>-<6 base36> with single hyphens only, and a UUID has single hyphens only.
+    #
+    # The extension is checked here rather than by the caller because Get-ChildItem -Filter '*.marker'
+    # is a Windows wildcard, not a suffix test.
+    #
+    # THE SESSION HALF IS MATCHED CASE-INSENSITIVELY, AND IT USED TO BE MATCHED WITH -cne. That was a
+    # SPLIT BRAIN, not a strictness choice: this function decided ownership case-SENSITIVELY while every
+    # consumer of the answer -- CreateNew, Test-FilePresent, Remove-Item -- reaches the file through a
+    # filesystem that resolves the two spellings to ONE file. Measured: writing <stem>--<UPPER>.marker
+    # then opening <stem>--<lower>.marker CreateNew fails with IOException and File.Exists on the
+    # lowercase spelling returns true. So the drain reported the file as "a name this channel did not
+    # mint, left alone", exempted it from both sweeps, and then used it as this session's marker --
+    # suppressing a display on the strength of a file it had just told the reader it was ignoring.
+    #
+    # Accepting the variant is the side that makes the report true: it IS the file this channel would
+    # mint for that id, by path identity on this platform. It is returned CANONICALISED so no caller can
+    # build a second spelling back out of the answer.
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+    if (-not $Name.EndsWith('.marker', [StringComparison]::Ordinal)) { return $null }
+    $base = $Name.Substring(0, $Name.Length - 7)
+    $i = $base.IndexOf('--', [StringComparison]::Ordinal)
+    if ($i -lt 1) { return $null }
+    $stem = $base.Substring(0, $i)
+    $sk = $base.Substring($i + 2)
+    if (-not (Test-MailStem -Stem $stem)) { return $null }
+    $canon = ConvertTo-SessionKey -SessionId $sk
+    if ($null -eq $canon) { return $null }
+    return [pscustomobject]@{ Stem = $stem; SessionKey = $canon }
+}
+
 function Move-Claimed {
     # THE call site for every move in the mail system. Do not open-code [System.IO.File]::Move
     # anywhere else under scripts/coord or scripts/hooks; the reason is the whole header of this file.
@@ -171,38 +304,13 @@ function Move-Claimed {
     # It must NOT consult Exists($Source): that post-condition was measured true for winners and
     # losers alike and cannot discriminate. See this file's header.
     #
-    # AND EXISTS($dst) ALONE IS NOT ENOUGH EITHER -- this is the correction that cost the most to find.
-    # File.Exists returns a TRANSIENT FALSE POSITIVE for a destination that was never created, and it
-    # does so only ACROSS PROCESSES: a 16-thread, 500-round measurement inside ONE process saw exactly
-    # one winner every round and concluded the verdict was sound. Re-measured 2026-08-05 with 16
-    # separate pwsh processes over 800 rounds, the same verdict reported a win to MORE THAN ONE racer
-    # in 46 of 800 rounds (5.75%), on 49 destinations that did not exist in the final listing. A
-    # re-probe 3ms later cleared only 38 of those 49, so waiting is not a fix. In the drain a false win
-    # is a DOUBLE DELIVERY: two claimers render the same body and write the same receipt path.
-    #
-    # An EXCLUSIVE OPEN is the question that cannot be answered by stale metadata -- the file is either
-    # really there to be opened or it is not. In the same run it refused all 49 phantoms and gave
-    # exactly one opener in 800 of 800 rounds.
-    #
-    # WHY THE RETRY, AND WHY CEDING IS THE SAFE FAILURE. The open is very slightly over-strict: in 3 of
-    # 800 rounds the TRUE winner's own open failed transiently and nobody claimed the message. That
-    # direction is the acceptable one -- an unclaimed message stays in claiming/ under this token, is
-    # never delivered twice, and is reported by mail.ps1 -Status and by the dead-owner sweep once this
-    # process exits. A few short retries recover most of it; if they do not, we cede rather than
-    # deliver on an unproven claim.
-    $won = $false
-    if ([System.IO.File]::Exists($dst)) {
-        foreach ($attempt in 1..4) {
-            try {
-                $fs = [System.IO.File]::Open($dst, [System.IO.FileMode]::Open,
-                    [System.IO.FileAccess]::Read, [System.IO.FileShare]::None)
-                $fs.Dispose()
-                $won = $true
-                break
-            }
-            catch { Start-Sleep -Milliseconds (2 * $attempt) }
-        }
-    }
+    # AND EXISTS($dst) ALONE IS NOT ENOUGH EITHER. The verdict -- Exists, then an EXCLUSIVE OPEN, with a
+    # short retry -- is Test-FilePresent above, where the measurement that forced it is recorded. It is
+    # a function rather than an inline block because the drain now asks the identical question about
+    # shown-markers and receipts, and one definition is what stops the second call site drifting back to
+    # a bare Exists. In the drain a false win here is a DOUBLE DELIVERY: two claimers render the same
+    # body and write the same receipt path. Ceding is the safe failure direction; a false win is not.
+    $won = Test-FilePresent -Path $dst
 
     return [pscustomobject]@{ Won = $won; Path = $dst; Token = $Token; Threw = $threw; Error = $err }
 }

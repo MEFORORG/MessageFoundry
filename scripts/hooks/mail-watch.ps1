@@ -41,6 +41,13 @@
     output. One definition of consume-and-receipt, not two -- if this rendered its own copy, the two
     would drift and the copy that drifts is the one nobody tests.
 
+    WHAT IT WAITS FOR IS "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "A NON-EMPTY INBOX". Those were the
+    same condition until the drain stopped consuming at SessionStart. Now a shown message STAYS in the
+    inbox until the session's turn boundary, so a non-empty inbox is the steady state and the old test
+    fired on it repeatedly -- a blocking mid-turn rewake carrying "Nothing is being shown to you". The
+    shown-marker under box/<key>/shown/ is what distinguishes them, and reading it is not rendering:
+    delivery still happens in exactly one place.
+
     FAIL OPEN. Any error exits 0, which means "no rewake" and costs nothing.
 #>
 [CmdletBinding()]
@@ -66,9 +73,14 @@ try {
     if ($LASTEXITCODE -ne 0 -or -not $common) { exit 0 }
     $root = Join-Path $common.Trim() 'mefor-coord/mail'
 
-    . "$PSScriptRoot\..\coord\mail-key.ps1"
+    # mail-claim.ps1 dot-sources mail-key.ps1, so this takes both halves of the contract at once and
+    # cannot end up holding only the box key. What is needed from it is the SHOWN-MARKER name shape.
+    . "$PSScriptRoot\..\coord\mail-claim.ps1"
     $key = ConvertTo-BoxKey -Path $cwd
     $inboxDir = Join-Path $root "box/$key/inbox"
+    $shownDir = Join-Path $root "box/$key/shown"
+    # Validated before any path is built from it, exactly as the drain does; $null means UNMARKABLE.
+    $sessionKey = ConvertTo-SessionKey -SessionId ([string]$hook.session_id)
 
     $deadline = [DateTime]::UtcNow.AddSeconds($MaxWaitSeconds)
     while ([DateTime]::UtcNow -lt $deadline) {
@@ -77,7 +89,28 @@ try {
         if (Test-Path -LiteralPath (Join-Path $root 'OFF')) { exit 0 }
 
         if (Test-Path -LiteralPath $inboxDir) {
-            $pending = @(Get-ChildItem -LiteralPath $inboxDir -Filter *.json -EA SilentlyContinue)
+            # "MAIL THIS SESSION HAS NOT BEEN SHOWN", NOT "THE INBOX IS NON-EMPTY". Those were the same
+            # question until the drain stopped consuming at SessionStart: mail it shows now STAYS in the
+            # inbox until the session's next turn boundary, so a non-empty inbox is the steady state
+            # rather than the arrival signal. Measured against the earlier form: a re-armed watcher fired
+            # immediately on held mail, ran the drain, got its zero-delivery injection, and rewoke the
+            # session MID-TURN with "Nothing is being shown to you" -- a blocking interruption carrying
+            # no content, repeatable for as long as the mail sat there.
+            #
+            # This is not a second copy of the drain's delivery logic: it asks only "is there anything
+            # new for me", and the drain remains the one place a message is rendered, receipted and
+            # consumed. An UNMARKABLE session falls back to the inbox test, which is the old behaviour
+            # and the old cost -- the drain has already told that session it cannot record displays for
+            # it, and a one-shot watcher fires at most once anyway.
+            $pending = @(Get-ChildItem -LiteralPath $inboxDir -Filter *.json -File -EA SilentlyContinue |
+                Where-Object {
+                    if (-not $sessionKey) { return $true }
+                    $p = Split-MailFileName -Name $_.Name
+                    if (-not $p) { return $false }   # a name we did not mint; the drain will not show it
+                    # Test-FilePresent, not File.Exists -- this channel's one probe, for the reason its
+                    # header gives. Its failure direction here is an extra wake, never a missed one.
+                    -not (Test-FilePresent -Path (Join-Path $shownDir "$($p.Stem)--$sessionKey.marker"))
+                })
             if ($pending.Count -gt 0) {
                 # Hand the same stdin straight through, so the drain resolves the identical box, applies
                 # the identical session filter, and writes the identical receipt.

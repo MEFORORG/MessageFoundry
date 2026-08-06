@@ -15,16 +15,22 @@ hook.
 
 ---
 
-## Status: prototype, deliberately NOT wired
+## Status: wired on `Stop` only, on the default config root
 
-Nothing here is installed into any config root. The wiring rows exist in
-[`scripts/coord/install-coordination.ps1`](../scripts/coord/install-coordination.ps1) and are not
-applied; the urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed
-in code and registered nowhere. Sending works, and delivery works when the drain is run by hand, but
-no session receives mail automatically today.
+**Read the config, not this line, before relying on it** -- a status sentence in a document is exactly
+the observation that goes stale without saying so. As last verified against `~/.claude/settings.json`:
+the drain is registered on **`Stop` and on `Stop` only**, and **`SessionStart` is not wired**, for the
+reason in ["What still blocks wiring"](#what-still-blocks-wiring) 1b. The wiring rows in
+[`scripts/coord/install-coordination.ps1`](../scripts/coord/install-coordination.ps1) still carry
+**both** events, so an install from those rows would wire more than what is live. The urgent tier
+([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and registered
+nowhere.
 
-This document is the precondition for wiring it, not a record that it was wired. The open questions
-that still block wiring are in ["What still blocks wiring"](#what-still-blocks-wiring) at the end.
+The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) makes
+wiring `SessionStart` **safe**; it does not wire it, and it did not change any installer row.
+
+The open questions that still block wiring further are in ["What still blocks
+wiring"](#what-still-blocks-wiring) at the end.
 The design decision and its rejected alternatives are in
 [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md); the defects this pass closes are
 BACKLOG #1028.
@@ -255,9 +261,12 @@ unbounded body would.
   2,000-byte message is over half a complete document. Anything larger is a document: write it to a
   file in your worktree and mail the path. That is the same answer the content rule above gives, so
   the two rules pull in the same direction.
-- **5 messages** because the drain runs at `SessionStart` and every `Stop`, so a box accumulates only
-  between two consecutive turn boundaries. The asymmetry decides the exact number: an over-tight cap
-  costs one turn of delay, an over-loose one spends the recipient's context with no undo.
+- **5 messages** because it caps ONE INJECTION, and an injection is what a reader pays for in context.
+  The asymmetry decides the exact number: an over-tight cap costs one turn of delay, an over-loose one
+  spends the recipient's context with no undo. (The rationale this replaced -- "a box accumulates only
+  between two consecutive turn boundaries" -- stopped holding when showing and consuming were split:
+  held mail stays in the inbox until a turn boundary is actually reached, so the inbox is no longer a
+  measure of what one drain will render. The cap is unaffected; the argument for it had to change.)
 
 **Overflow is deferred, never dropped.** A message that does not fit the batch is **not claimed, not
 moved and not receipted** -- it stays in the inbox and is shown at the next drain. A single body that
@@ -319,6 +328,74 @@ message makes its own counter line state a number that is wrong in the direction
 Its mutual exclusion is an exclusive `CreateNew`, and its `Move` targets a per-PID-unique temporary
 name with overwrite semantics, so no two processes ever contend on one source. The defect above is
 specific to two claimers racing a single source onto a single destination.
+
+---
+
+## Showing is not consuming
+
+**The drain renders mail at every event it runs on, and removes it from the inbox at `Stop` only.**
+Those are two separate acts, and keeping them separate is what stops a session nobody is looking at
+swallowing the mail. The mechanism:
+
+- **At `Stop`** (the only consuming event): render anything this session has not already been shown,
+  then **consume** -- claim, receipt, move to `seen/` -- everything this session has been shown,
+  including what it was shown earlier at `SessionStart`.
+- **At `SessionStart`, and at any other event**: render the mail and **leave it in the inbox**. A
+  marker file `box/<key>/shown/<stem>--<session-key>.marker` records that this session has seen it, so
+  the same session is not shown it a second time.
+
+**Why**, and it is the defect measured in ["What still blocks wiring"](#what-still-blocks-wiring) 1b: a
+`SessionStart` hook that CONSUMES state can lose that state to a session that never existed. A hook
+that only READS is safe. Gating on `transcript_path` cannot discriminate, because at `SessionStart`
+neither a phantom's nor a real session's transcript exists yet -- so the answer is to stop consuming at
+that event rather than to try to detect the phantom. A discarded session never reaches `Stop`, so mail
+it displayed stays in the inbox and the next real session is shown it again.
+
+**The accepted tradeoff, owner-approved:** if two REAL sessions start before either finishes a turn,
+**both display the message**. Duplicate display is accepted; silent loss is not. Never trade toward
+loss to avoid a duplicate.
+
+**The mitigation has two preconditions and neither is a property of the design.** Both were measured
+true on the client that motivated this, and both must be re-measured on any other: the discarded
+session must not reach `Stop` (what was measured is that it never became a conversation, so it never
+took a turn -- not what events its teardown emits), and its session id must **differ** from the
+surviving session's (a phantom reusing the id is indistinguishable by construction, because every
+artefact here is keyed by it).
+
+**The marker is the per-session record of a display, and the receipt is not.** A receipt is named
+`<stem>.json` -- one slot per **message**, last writer wins -- so it can say *some* session was shown
+that text, never *which* sessions. An earlier form of the drain treated "a marker naming me, plus a
+receipt for this message" as proof that I had been shown it, and a phantom's receipt satisfied the
+second half for everybody: measured end to end, a second session's `Stop` then moved a message to
+`seen/` having rendered nothing. The marker is therefore written **after** the emit, by the process
+that emitted, and it is the only thing consulted.
+
+**What that costs, stated rather than papered over.** A marker file placed in `shown/` by anything else
+running as this user suppresses one display and lets the next `Stop` consume the message. That is
+inside this channel's trust boundary -- the same writer could delete the message outright, see ["The
+write side is unauthenticated"](#the-write-side-is-unauthenticated-the-trust-boundary-is-the-os-account)
+-- and it is **not** a defence
+against a local writer. What a marker cannot do is cause a consume at a **non-`Stop`** event: consuming
+is gated by an event allowlist with one member, and no marker outcome reaches that decision.
+
+**The receipt carries a `disposition`** so it stops implying a finality it no longer has:
+`shown-held` (emitted; the message is still in `inbox/`, awaiting a turn boundary) or `shown-consumed`
+(emitted, and moved to `seen/`). A `shown-held` receipt is a **hint** that some session displayed the
+mail and never reached a turn boundary, not a fingerprint of one -- the next session to display the
+same message overwrites the single slot with its own id. Its `observedUtc` is read out of that
+session's own marker, so the id and the timestamp always name the same display.
+
+**Two caps and one residue** follow from the split, and each defers rather than drops:
+
+| Bound | Value | What happens past it |
+|---|---|---|
+| Held messages consumed per drain | 50 (`MAX_HELD_CONSUME`) | keeps its marker, stays in the inbox, consumed at the next turn boundary |
+| Held message whose receipt cannot be rewritten | -- | reported as "could NOT be consumed this pass", left where it is, swept to `stranded/` |
+
+**`mail.ps1 -Status` reports held mail separately** from undelivered mail, because "in the inbox" and
+"nobody has seen it" stopped being the same statement. It counts markers whose message is still in the
+inbox, so it is a marker count and not a message count: one message shown to two sessions carries two
+markers.
 
 ---
 
@@ -413,9 +490,14 @@ second. The message was delivered, receipted and moved to `seen/` while the huma
 every instrument reported success. **From the operator's side that is indistinguishable from the
 channel being broken.** A box drained by a session nobody is looking at is a silent loss that the
 receipt actively conceals, because the receipt is honest: it records what was emitted, and it was
-emitted. Mitigating it needs a delivery model that does not treat "shown to some session in this
-worktree" as "shown", and that is unsolved -- it is the strongest remaining argument against wiring
-this on `SessionStart` alone.
+emitted.
+
+**Addressed by the show/consume split**, which is the answer to "a delivery model that does not treat
+'shown to some session in this worktree' as 'shown'": see ["Showing is not
+consuming"](#showing-is-not-consuming) for the mechanism, the accepted duplicate-display tradeoff, and
+the **two preconditions** the mitigation rests on that this measurement does not prove. **It does not
+by itself wire `SessionStart`** -- it makes wiring it safe, and whether to wire it is a separate
+decision.
 
 **2. The delivery hook must never live in a plugin.** Hooks declared in `.claude/settings.json` **do**
 run under the VS Code extension; **plugin** hooks do **not** (`claude-code#18547`). Wiring the drain

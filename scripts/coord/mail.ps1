@@ -151,10 +151,10 @@ $MAIL_CAP_TOTAL_BYTES = 8000
 
 function Initialize-Box {
     param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Key)
-    # claiming/ and stranded/ are the drain's, but they are created HERE because Initialize-Box is the
-    # one place a box comes into existence -- a drain must be able to claim from a box an older sender
-    # created without first having to invent the directory layout for itself.
-    foreach ($sub in @('inbox', 'seen', 'done', 'expired', 'claiming', 'stranded')) {
+    # claiming/, stranded/ and shown/ are the drain's, but they are created HERE because Initialize-Box
+    # is the one place a box comes into existence -- a drain must be able to claim from, or mark in, a
+    # box an older sender created without first having to invent the directory layout for itself.
+    foreach ($sub in @('inbox', 'seen', 'done', 'expired', 'claiming', 'stranded', 'shown')) {
         $p = Join-Path $Root "box/$Key/$sub"
         if (-not (Test-Path -LiteralPath $p)) { New-Item -ItemType Directory -Path $p -Force | Out-Null }
     }
@@ -244,6 +244,51 @@ function Get-BoxMessages {
         }
     }
     return $out
+}
+
+function Get-BoxShownCount {
+    # SHOWN-AND-HELD MARKERS, counted as PLAIN FILES. Deliberately not Get-BoxMessages: that parses JSON
+    # messages, and a marker is not a message -- it is a name, and the name is the whole fact.
+    #
+    # IT IS A MARKER COUNT, NOT A MESSAGE COUNT, and the two differ by design. Under the accepted
+    # duplicate, one message shown to two sessions carries two markers, so this can exceed the inbox
+    # count. Reporting it as a message count would be an instrument answering a question one step to the
+    # side of the one asked.
+    #
+    # ONLY NAMES THIS CHANNEL MINTED ARE COUNTED. -Filter '*.marker' is a Windows wildcard, not a suffix
+    # test, and a file in shown/ that this channel did not write is not evidence about this channel --
+    # counting it would let anything able to write into the box inflate a number an operator reads as
+    # "mail already shown". The drain reports such files separately and leaves them alone; so does this.
+    #
+    # AND ONLY MARKERS WHOSE MESSAGE IS STILL HERE. A marker outlives its message by design: the session
+    # that consumes a message removes only ITS OWN marker, so under the accepted duplicate the other
+    # session's marker survives until the next drain's orphan sweep. Counting those produced a reading
+    # that contradicted itself in the same sentence -- "In the inbox: 0, of which 1 have already been
+    # shown ... and are held" -- and the parenthetical offered on the next line explained it with a
+    # cause that was not the one operating.
+    #
+    # inbox/ ONLY, and NOT the drain's live set, which also spans claiming/. The number this feeds is
+    # read inside the sentence "in the inbox, of which N have been shown", and a claimed message has
+    # LEFT the inbox. Counting it there would put the same contradiction back one case narrower. The
+    # cost is that a message mid-consume is under-reported for the length of one claim, which is a
+    # transient understatement rather than a false statement.
+    param([Parameter(Mandatory)][string]$Root, [Parameter(Mandatory)][string]$Key)
+    $dir = Join-Path $Root "box/$Key/shown"
+    if (-not (Test-Path -LiteralPath $dir)) { return 0 }
+    $live = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $inboxD = Join-Path $Root "box/$Key/inbox"
+    if (Test-Path -LiteralPath $inboxD) {
+        foreach ($f in @(Get-ChildItem -LiteralPath $inboxD -Filter *.json -File -EA SilentlyContinue)) {
+            $p = Split-MailFileName -Name $f.Name
+            if ($p) { [void]$live.Add($p.Stem) }
+        }
+    }
+    $n = 0
+    foreach ($f in @(Get-ChildItem -LiteralPath $dir -Filter *.marker -File -EA SilentlyContinue)) {
+        $mp = Split-ShownMarkerName -Name $f.Name
+        if ($mp -and $live.Contains($mp.Stem)) { $n++ }
+    }
+    return $n
 }
 
 # --- Entry points --------------------------------------------------------------------------------
@@ -345,6 +390,10 @@ if ($List) {
                 # visible from inbox/seen alone -- a claimed message is in NEITHER.
                 Claiming = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'claiming').Count
                 Stranded = @(Get-BoxMessages -Root $root -Key $d.Name -Sub 'stranded').Count
+                # Shown-and-held: in the inbox, already displayed to some session, awaiting that
+                # session's next turn boundary. Invisible from inbox/seen alone, exactly as claiming/
+                # and stranded/ are.
+                Shown    = (Get-BoxShownCount -Root $root -Key $d.Name)
                 AsOfUtc  = [DateTime]::UtcNow.ToString('o')
             }
         }
@@ -354,8 +403,8 @@ if ($List) {
     Write-Host "Mail boxes under $root  (as of $([DateTime]::UtcNow.ToString('o')))"
     if ($boxes.Count -eq 0) { Write-Host "  (none)" }
     foreach ($b in $boxes) {
-        Write-Host ("  {0,-52} inbox={1} seen={2} done={3} claiming={4} stranded={5}" -f `
-                $b.Key, $b.Inbox, $b.Seen, $b.Done, $b.Claiming, $b.Stranded)
+        Write-Host ("  {0,-52} inbox={1} shown={2} seen={3} done={4} claiming={5} stranded={6}" -f `
+                $b.Key, $b.Inbox, $b.Shown, $b.Seen, $b.Done, $b.Claiming, $b.Stranded)
     }
     Write-Host ""
     exit 0
@@ -368,6 +417,12 @@ $inbox = @(Get-BoxMessages -Root $root -Key $key -Sub 'inbox')
 $seen = @(Get-BoxMessages -Root $root -Key $key -Sub 'seen')
 $claiming = @(Get-BoxMessages -Root $root -Key $key -Sub 'claiming')
 $stranded = @(Get-BoxMessages -Root $root -Key $key -Sub 'stranded')
+# SHOWING IS NOT CONSUMING, so "Undelivered: <inbox count>" would be a lie. The drain renders mail at
+# SessionStart and LEAVES IT IN THE INBOX, consuming it only at that session's next turn boundary --
+# see docs/SESSION-MAIL.md, "Showing is not consuming". Counting held mail as undelivered would put the
+# defect this whole channel exists to make visible ("queued is not delivered") back at the reporting
+# layer, one rung up.
+$shownHeld = Get-BoxShownCount -Root $root -Key $key
 
 # What the NEXT drain will actually show. A sender who queues twenty messages otherwise sees twenty
 # queued and has no way to learn that four drains will pass before the last one is read -- which would
@@ -390,6 +445,7 @@ foreach ($row in $inbox) {
 if ($Json) {
     ([pscustomobject]@{
             Worktree = $here; Key = $key; Inbox = $inbox.Count; Seen = $seen.Count
+            ShownHeld = $shownHeld
             Claiming = $claiming.Count; Stranded = $stranded.Count
             NextDrainShowsAtLeast = $fits
             MailRoot = $root; AsOfUtc = [DateTime]::UtcNow.ToString('o')
@@ -399,7 +455,15 @@ if ($Json) {
 Write-Host ""
 Write-Host "This worktree: $here"
 Write-Host "Box key:       $key"
-Write-Host "Undelivered:   $($inbox.Count)   already shown: $($seen.Count)"
+Write-Host "In the inbox:  $($inbox.Count), of which $shownHeld have already been shown to a session and are"
+Write-Host "               held until its next turn boundary.  Consumed into seen/: $($seen.Count)"
+Write-Host "               (Held is a MARKER count: one message shown to two sessions carries two markers,"
+Write-Host "               so it can exceed the inbox count. Duplicate display is accepted; loss is not.)"
+Write-Host "               Held mail is consumed at that session's next turn boundary. While the OFF switch"
+Write-Host "               is present nothing is shown OR consumed, so held mail is consumed at the first"
+Write-Host "               turn boundary after OFF is removed."
+# NextDrainShowsAtLeast keeps its meaning deliberately: this runs in a worktree and cannot know which
+# session will read next, and a session that has not been shown the mail is shown all of it.
 Write-Host ("Next drain shows: at least {0} of {1} (caps: {2} messages / {3} bytes); {4} deferred to later drains." -f `
         $fits, $inbox.Count, $MAIL_CAP_MESSAGES, $MAIL_CAP_TOTAL_BYTES, [Math]::Max(0, $inbox.Count - $fits))
 Write-Host "In flight:     $($claiming.Count) claimed by a drain that has not finished"
