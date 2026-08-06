@@ -3922,13 +3922,21 @@ record and the cell's current score live in the vault scorecard and are not rest
 
 ## 1006. A mutation that matches is not a mutation that bites: the absence-claim gate proves syntax, never behaviour
 
-> 🔢 **Filed 2026-08-04 — not started. Scored 2026-08-04 → P2.** Value **6/10** · Difficulty
-> **3/10** · _quick win_. `check_absences` admits an ASVS absence claim on `re.search(a.pattern,
-> a.mutation)` (`scripts/asvs/scorecard.py:395`) — one string field of a TOML row matched against
-> another — so a well-formed reintroduction that would change nothing if applied passes all three
-> of the gate's failure modes and certifies a non-control into the compliance record; the
-> remainder is a required per-claim observable plus a mode that applies the mutation and requires
-> that observable to go red, in one stdlib script and its fixture tests.
+> ✅ **SHIPPED 2026-08-06 — a new opt-in mode can prove an absence claim BITES, which the pattern
+> check structurally cannot.** Value **6/10** · Difficulty **3/10** · _quick win_.
+> `scripts/asvs/scorecard.py` gains a `--prove-absences` mode: per claim it applies the `mutation` to
+> a scratch copy of the tree and requires a named `observable` (a pytest node id) to go RED, failing
+> closed on any exit code that is not an honest test failure (an already-red baseline, an
+> uncollectable node, or a mutation that only breaks import is a PROVE-ERROR, never a proof). So a
+> well-formed reintroduction that would change nothing if applied CAN be caught the moment its claim
+> carries an `observable` — but the default `verify` path is byte-unchanged and no authored claim
+> carries one yet, so nothing new is blocked by this alone today. Two optional `Absence` fields
+> (`mutation_path`, `observable`) feed it, a coarse same-file static backstop screens claims that
+> carry no observable, the scratch copy refuses secrets / the store / `docs/security` (defence for the
+> eventual vault run), and fixture negative controls plus a CLI exit-code test prove the mode itself
+> can go red. Public repo script + fixtures only; wiring the mode over the vault's ~81 existing
+> absence claims (untouched) and backfilling their observables is the owner's follow-up
+> (`scorecard.py:14-16`, ADR 0156 §7).
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium —
 the defect is in the instrument, not the engine, and a green instrument that cannot go red is the
