@@ -1,7 +1,7 @@
 # ADR 0002 — Phase 2: transport security & strong authentication (off-loopback exposure)
 
 - **Status:** **Accepted (2026-06-14) — build authorized for the v0.1 transport-TLS subset.** The
-  off-loopback trigger has fired: the [v0.1 Release Plan](../releases/v0.1-PLAN.md) makes **native
+  off-loopback trigger has fired: the v0.1 Release Plan makes **native
   off-loopback TLS a hard release gate (Gate #4)**, so **WP-13a (API/WSS TLS), WP-13b (MLLP-over-TLS),
   and WP-15 (reverse-proxy / forwarded headers) are authorized for v0.1**. **WP-14 (TOTP MFA) is now
   BUILT (2026-06-17)** — native RFC 6238 TOTP for local accounts, enforced for the Administrator role

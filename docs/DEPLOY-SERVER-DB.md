@@ -321,4 +321,4 @@ update the pin in lockstep — pin the **CA**, not the leaf, to keep rotations m
 
 *Companion: [`CONFIGURATION.md`](CONFIGURATION.md) (`[store]`/`[cluster]`), [`CLUSTERING.md`](CLUSTERING.md)
 (HA topology + failover), [`DEPLOYMENT.md`](DEPLOYMENT.md) (channel × TLS), and the v0.1 plan
-([`releases/v0.1-EXECUTION-PLAN.md`](releases/v0.1-EXECUTION-PLAN.md)).*
+(`releases/v0.1-EXECUTION-PLAN.md`).*

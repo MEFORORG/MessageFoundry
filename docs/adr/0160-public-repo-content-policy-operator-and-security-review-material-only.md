@@ -1,7 +1,11 @@
 # ADR 0160 — Public-repo content policy: operator and security-review material only
 
-- **Status:** **Proposed (2026-08-04)** — the RULING in D1 is owner-stated and already in force; the
-  APPLICATION in D2/D3 is proposed and needs ratification before any file moves.
+- **Status:** **Accepted for Phase 1 (2026-08-05); Phases 2-3 remain Proposed and are now BLOCKED on a
+  measured finding — see D5.** The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the
+  vault as the destination (resolving open question 3), and set a governing rule for the work:
+  **do not break anything**, applied per item as *prove the mechanism or leave the item alone*.
+  Phase 1 is executed. Phase 2 is held, not deferred by preference: the gate its tests depend on
+  does not currently exist anywhere.
   <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-08-04
 - **Supersedes nothing.** Records a policy that has been in force, and enforced, while being written
@@ -71,9 +75,20 @@ material because it mentions a tool, and it is not operator material because it 
 
 ### D2 — Application, proposed, in phases, and each phase is separately reversible
 
-**Phase 1 — `docs/releases/` (101 files).** Predominantly multisession plans: work breakdowns, wave
-schedules, per-session briefs. No operator or reviewer reads these. **Proposed: remove from the public
-repo, preserving them in the vault.**
+**Phase 1 — `docs/releases/` (101 files). EXECUTED 2026-08-05.** Predominantly multisession plans:
+work breakdowns, wave schedules, per-session briefs. No operator or reviewer reads these. Removed
+from the public repo and preserved in the vault.
+
+Scope grew by **two files** during execution: `HANDOFF-344-instance-2.md` and `HANDOFF-ha-recheck.md`
+were tracked in the **repository root** — session handoffs in the project's front door. They are
+covered by a `/HANDOFF-*.md` rule rather than by their two filenames, so the next one fails closed
+instead of waiting to be noticed. **103 files** in total.
+
+**Order of operations, and it is the load-bearing part.** Custody moved to the vault
+(`wshallwshall/MessageFoundry`) and was committed there **before** anything left the public tree.
+Gitignoring alone would have left 103 files as single **unversioned** copies — no history, no
+backup, erased by `git clean -xdf`. "Move to the vault" and "gitignore" are not alternatives: the
+first provides durability, the second keeps the paths working in place. Both were done.
 
 ⚠️ **The inbound-citation surface is 23 files, and a single grep finds at most two thirds of it.**
 Measured at `c90dcb5f`, excluding the directory itself:
@@ -91,15 +106,42 @@ they use the **relative** form, so a `docs/releases` grep does not see them — 
 do cite the directory. **Grep both forms, or the removal lands dangling references in files nobody
 checked.** `docs/README.md` is among them, so the docs front door breaks.
 
-⛔ **Phase 1 CANNOT be docs-only, and that is structural rather than a discipline rule.** Three
-non-doc files cite the path: `tests/test_cutover_slug_rot.py:53` carries `"docs/releases/"` as a
-literal **scan-scope entry**, `tests/test_lint_scope_parity.py:22` cites a plan by name, and
-`harness/load/profiles/closed-loop.toml:7` cites an execution plan. So the PR necessarily touches
-code, which happens to satisfy the separate rule that a doc migration must not be docs-only — every
-doc-drift guard here lives in pytest gated on `code == 'true'`, making docs-only the **blind** mode
-rather than the cheap one (already recorded as BACKLOG #327 for `.gitignore`). **Do not treat that as
-luck to rely on:** confirm the guards actually ran, because the reason they would run is a test file
-this phase happens to touch, not a property of the phase.
+**Re-measured at execution (2026-08-05), and the shape held but the numbers did not.** The union is
+**25 files / 52 citation lines**, of which **37 are markdown links** — the ones that actually 404.
+The rest are bare path mentions in prose. Only the links were rewritten (to the document's plain
+name); bare mentions in archived records were left alone, because there they narrate where a plan
+lived at the time, and rewriting archived history is the worse defect. `docs/README.md`'s
+directory row was **deleted** rather than unlinked — the directory is gone, so an unlinked row would
+have described something absent.
+
+⛔ **Phase 1 CANNOT be docs-only — and the recorded reason was the weak one.** The earlier draft
+rested this on three non-doc files citing the path. Two of those three are **comments**
+(`tests/test_lint_scope_parity.py:22`, `harness/load/profiles/closed-loop.toml:7`), and the third
+behaves opposite to how it was described: `tests/test_cutover_slug_rot.py:53` carries
+`"docs/releases/"` in `_HISTORICAL`, which is an **exclusion** list, so those 101 files were never
+scanned and the prose ratchet (54) cannot move when they leave. That draft would have had the PR
+depend on comment edits it might reasonably have dropped.
+
+The real cause is structural and cannot be dropped: **the removal mechanism IS a `.gitignore`
+change**, and `.gitignore` is deliberately excluded from ci.yml's docs-only allowlist (BACKLOG #327,
+because `tests/test_private_paths_stay_ignored.py` is the guard for exactly those rules and runs
+only under pytest). So `code=true` follows from the mechanism itself, not from which incidental
+files a phase happens to touch. **Confirmed on this PR rather than assumed.**
+
+⚠️ **`tests/test_feature_map_claims.py` is the guard for dangling links, and gitignore-in-place makes
+it BLIND LOCALLY.** It resolves each relative link against the **filesystem**. Under this decision the
+removed files are still **on disk** (ignored, not deleted), so in any working tree the targets still
+`exist()` and the check passes on links that would 404 for a reader. Measured while executing Phase 1:
+a `releases/` link re-introduced into `docs/FEATURE-MAP.md` **passed** in the working tree and
+**failed** — correctly, naming file and line — when the same tree was exported with `git archive`
+(tracked files only, which is what CI checks out).
+
+The gate is not broken and needs no change; its scope is now narrower than it looks. **Do not read a
+local green on this test as evidence.** Verify a link-affecting change against a tracked-files-only
+export, which is a two-command check:
+`git archive $(git write-tree) | tar -x -C <tmp>` then run the test there. The same caveat applies to
+any future guard that tests *existence* rather than *trackedness* — after this decision, presence on
+disk and presence in the repository are different facts.
 
 **Phase 2 — the individually-tracked process docs.** `docs/WORKTREES.md`,
 `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`, `docs/STEERING.md`. Each needs its inbound
@@ -108,6 +150,47 @@ error text, so it is not a delete-and-go.
 
 **Phase 3 — in-file references.** Strip Claude-Code process prose from documents that otherwise stay
 (`docs/AI.md`, `docs/ARCHITECTURE.md`, `docs/Code_Quality_Standards.md`). Surgical edits, not removals.
+
+### D5 — the process TOOLING is held, because moving it would silently retire ~20 tests
+
+The obvious next step after Phase 1 is `scripts/coord/` (9), `scripts/worktree/` (11) and
+`scripts/hooks/` (8, excluding `ledger_check.py`), with the four Phase 2 docs that describe them.
+**Held**, on a measurement taken while planning that removal:
+
+⛔ **The vault's CI is off.** `gh workflow list --all` on `wshallwshall/MessageFoundry` reports every
+workflow except `ASVS scorecard` as `disabled_manually`; `ci.yml` last ran **2026-07-27** and failed.
+The last 50 runs are 42 `ASVS scorecard` plus 8 Dependabot. So "move the tooling to the vault, where
+its tests keep running" is **false**, and it is false in the most dangerous way: the vault *contains*
+a `ci.yml`, so the claim survives inspection and fails only in fact. That is precisely
+[ADR 0158](0158-silent-controls-green-signals-that-mean-nothing-and-shape-over-detection.md)'s
+second sub-class — a control that cannot observe its own failure.
+
+**~20 test files** exercise this tooling (`test_worktree_gate*`, `test_coord_*`, `test_announce_*`,
+`test_collision_gate`, `test_session_registry`, `test_installed_coord_hooks`, and siblings) and they
+run today inside the **required** `test` legs. Untracking the scripts without the tests turns those
+legs red; untracking both retires the gate. Neither is acceptable under the owner's rule.
+
+**Two conditions gate Phase 2, and each must be demonstrated, not argued:**
+
+1. **A live gate for the moved tests** — the vault's `ci.yml` re-enabled (it bills private-repo
+   minutes, and its full matrix is far more than these tests need, so a lean Linux-only workflow
+   scoped to them is the cheaper shape), *and* proven able to **fail** on a deliberately broken
+   test. A green run on a suite that silently skipped is the same defect in a new place: many of
+   these tests are Windows/`pwsh`-shaped, so a Linux leg must be checked for **skips**, not just
+   for green.
+2. **Delivery into fresh worktrees** — `.worktreeinclude` copies gitignored files into worktrees
+   Claude Code creates, but that is a first-party mechanism covering `--worktree`, desktop sessions
+   and `isolation: worktree` subagents, and it is **untested for these paths**. It must be shown to
+   deliver them before they are untracked, because `CLAUDE.md` instructs sessions to run
+   `scripts/coord/alloc.ps1` from their own worktree, and a missing `alloc.ps1` means no ADR/BACKLOG
+   number can be allocated — which the ledger gate then turns into a **refused commit**.
+
+⚠️ **A third hazard applies to any phase and was live during Phase 1: `git rm --cached` spares only
+the tree it runs in.** When the removal reaches `main`, checkout **deletes** those paths from every
+other worktree and from the primary — 45 worktrees were active on this machine at the time. For
+Phase 1 that is acceptable (the content is documents, and the vault holds them). For the tooling it
+is not: the files would vanish from the machine that runs them. Any Phase 2 lands with a restore
+step, or it does not land.
 
 ### D3 — `CLAUDE.md` is a genuine conflict between the policy and the tooling, and it stays tracked
 
@@ -142,10 +225,9 @@ cutover and its removal fixed a class of self-contradictory code (memory `mf-pub
 the slug-rewrite damage). Re-introducing a second tree to keep in sync trades a clear rule for a
 synchronisation problem.
 
-**Move process material to the separate public repository.** Partially applicable and **not decided
-here.** A `claude-multisession` repository exists and is owner-authorised for the *tooling*
-(`scripts/coord|hooks|worktree` and their tests). Whether the process **documents** follow it is a
-separate decision, and the tooling move itself is recorded in no ruling — treat it as context.
+**Move process material to the separate public repository.** ⛔ **Rejected on 2026-08-05** — the
+owner ruled directly that this material is not to go to `claude-multisession`. The vault is the
+destination. This closes what the earlier draft left open as context.
 
 ## Consequences
 
@@ -166,10 +248,13 @@ separate decision, and the tooling move itself is recorded in no ruling — trea
 1. **Does `docs/BACKLOG.md` stay?** It is process material by D1 and it is also **CI-load-bearing**:
    `scripts/docs/backlog_status_check.py` and `.github/workflows/backlog-hygiene.yml` both read it,
    and the second is a required merge context. Removing it is not a doc edit; it retires a gate.
-   **This one blocks Phase 2 and is the owner's call.**
-2. **Ratify or reject the phase scoping in D2**, and confirm Phase 1's 101 files are the right set.
-3. **Confirm the vault is the destination** for what leaves, versus deletion with git history as the
-   only record.
+   **Still open, and still the owner's call** — though it is no longer the *first* thing blocking
+   Phase 2, since D5 blocks the tooling on a separate and unmet condition.
+2. **RESOLVED 2026-08-05 — D2 ratified and Phase 1 executed** at 103 files: the 101 measured here
+   plus the two root handoffs found during execution.
+3. **RESOLVED 2026-08-05 — the vault is the destination**, and custody transfers *before* removal,
+   never after. Deletion-with-git-history-as-the-only-record was rejected: `git log` is a recovery
+   path, not a home, and it is not a place anyone will look for a plan they need.
 4. **`docs/Secure_Development_Standards.md`** is tracked, scans clean, and was deliberately pulled
    from the public PyPI sdist. Decide whether it is reviewer material that stays, or process material
    that goes — the sdist exclusion suggests the question was already asked once and answered

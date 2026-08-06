@@ -158,3 +158,23 @@ scripts/security/scan-tokens.local.txt
 #    not exist. Published from the newest copy, de-branded back to the generic lineage its own
 #    revision history names.)
 /docs/CI-TOPOLOGY.md
+
+# --- Development-process material (ADR 0160 Phase 1) ----------------------------------------------
+# Subject test, from ADR 0160 D1: a tracked file must be something an OPERATOR running MessageFoundry
+# needs, or something a SECURITY REVIEWER assessing it needs. Material whose subject is how this
+# project is DEVELOPED -- session orchestration, wave schedules, per-session briefs -- fails both.
+#
+# Custody moved to the vault (wshallwshall/MessageFoundry) BEFORE these left the tracked tree, so
+# this rule is not the only copy. That ordering is the point: gitignoring alone would have left 103
+# files as single unversioned copies that `git clean -xdf` erases.
+#
+# NOT a confidentiality control, and must never be described as one -- `git log` still contains all
+# of it, and none of it was ever secret. It is process noise, not sensitive content. Anything
+# genuinely sensitive belongs in the vault and always did (see the blanket rules above).
+#
+# HANDOFF-*.md is anchored to the ROOT and deliberately a PATTERN rather than the two filenames it
+# currently matches: session handoffs kept landing in the repo's front door, and a pattern fails
+# closed on the next one instead of waiting for somebody to notice. A handoff that genuinely must
+# ship can still be force-added (`git add -f`).
+/docs/releases/
+/HANDOFF-*.md
