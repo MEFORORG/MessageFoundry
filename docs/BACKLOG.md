@@ -3427,6 +3427,14 @@ The repo has now recorded this class at least four separate times, each found by
 
 Each was filed as its own defect, which is right. What none of them establishes is the property that would have caught all four **before** they shipped: a green run is evidence only if the gate has been shown it can go red on that class. That is a different artifact from any of the individual fixes, and it is the one thing this item builds.
 
+**At least five further instances landed on 2026-08-05 alone, across three sessions, every one found by hand and none by CI.** They are recorded here because the rate is the argument: this is not a backlog of four historical mistakes, it is an ongoing yield.
+
+- **A guard that did not enforce its own stated shape.** `new.ps1`'s `-Name` was validated `^[A-Za-z0-9._-]+$`, and `"abc" + newline` **matches** it — .NET's `$` also matches before a final newline. The pattern that an entire defect (#1032) rested on admitted a newline into a directory name. Fixed to `\A..\z` in all four copies of the literal.
+- **A test that rendered the broken output and asserted a substring of it.** `tests/test_worktree_gate_hijack.py` asserted `"new.ps1" in reason`, with a fixture branch that already had the defect's shape. It passed for the whole life of #1032 while producing a command that could not run. A test hard-coding the expected hint would have been equally blind: the emitted string was never wrong, the *receiving contract* rejected it.
+- **An exit code that masked the failure being asserted.** Running an emitted command via `pwsh -File script.ps1` returns **0** even when the script inside died at parameter binding. Without an explicit `exit $LASTEXITCODE`, every execution assertion built on the return code is vacuously green. Found only by writing a control that had to fail and watching it pass.
+- **A probe that could not tell "found nothing" from "did not look".** A coordinator's PR-drain passed `--arg` to `gh --jq`; the call errored, printed usage, and the script read the **empty output** as "nothing eligible" for two minutes with two PRs sitting eligible. The generalisable remedy is the useful part: a probe must **validate the shape of its own output** — the fixed drain asserts every `gh` probe returned a number before branching on it — rather than treating an empty result as a negative answer.
+- **A control that was too uniform to locate the layer doing the work.** See the asymmetry rule below; this one is a finding about negative controls themselves.
+
 **Nearest existing mechanism:** partial and uneven. Some gates already carry a canary — `dast.yml` has two, and `alloc.ps1`'s floor now has a documented plant-and-observe procedure. `tests/test_lint_scope_parity.py` guards *scope drift* between ruff, bandit and the pre-commit hook, which is adjacent but different: it proves two tools agree on what they scan, not that either can fail. Nothing enumerates the required-context list and asserts a control exists per entry, so a context added to branch protection tomorrow starts life unproven and nothing says so.
 
 **Proposed:**
@@ -3435,6 +3443,12 @@ Each was filed as its own defect, which is right. What none of them establishes 
 2. Add the missing fixtures. Prefer the cheapest form that actually exercises the gate: a planted file for a scanner, a crafted diff shape for a workflow-logic gate like `backlog-hygiene.yml`, an inverted assertion for a test-suite context.
 3. Add a CI job that fails when a required context has no registered control. Without this the set decays the moment a new context is added, which is the same decay mode as every item above.
 4. Run each control **against the pre-fix gate where one exists**, so the record shows the observed failure rather than an assertion that it would have failed.
+
+**A NEGATIVE CONTROL MUST BE ASYMMETRIC, and this is the part most likely to be skipped by whoever starts this item.** It is not enough that neutering the rule turns the control red. The control must fail for exactly the shapes that rule covers and **keep passing** for the shapes some other layer catches — otherwise it cannot tell you *which layer does the work*, and it cannot distinguish "the other cases are safe by design" from "safe by luck".
+
+Measured 2026-08-05, and this is why the rule is stated rather than assumed. A rule-1b fix was believed to protect two NTFS alternate-data-stream spellings. With the fix reverted, its eight-case control failed on **one** of them, not both: the `::$DATA` forms were already refused by a *different* layer (an extension backstop), and the new code was load-bearing for exactly one shape — a stream named to end in a document extension. The author's first draft of the accompanying comment credited the new code with both, **an overstatement in the direction that flatters one's own code**, which is the worst direction for it to be wrong in. A control that failed on all eight would have looked stronger, confirmed the overstatement, and taught nothing.
+
+So the registered control for a context should record **what it does not break**, not only what it does. A uniform red is a weaker result than a specific one.
 
 **Trigger:** none — this is not demand-gated. The trigger already fired four times.
 

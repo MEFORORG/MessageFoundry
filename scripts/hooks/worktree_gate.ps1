@@ -163,6 +163,30 @@ function Get-SafeForMessage([string]$Value) {
     return $t
 }
 
+# A git BRANCH name -> a legal worktree DIRECTORY component. Rule 3b hands back a REAL ref, and most of
+# this repo's local branches contain a '/', which scripts\worktree\new.ps1's -Name can never carry (it is
+# a PATH component: a slash there creates a NESTED directory, not the intended sibling). So the rule
+# prints BOTH: -Branch gets the ref verbatim, -Name gets this slug.
+#
+# It lives HERE, not in scripts\worktree\, because install-gate.ps1 copies this hook OUTSIDE every
+# working tree, so it can dot-source nothing from a checkout. No rule is duplicated: the gate SANITIZES,
+# new.ps1 VALIDATES. Every output is inside new.ps1's accepted character class by construction, so this
+# function never needs to know that pattern. new.ps1 must never sanitize, or a typo'd -Name would
+# silently become a different directory -- the class this whole fix exists to remove.
+#
+# Total: the hash fallback covers a legal refname that reduces to nothing (all non-ASCII, or all
+# separators). Deterministic, so one branch always maps to one directory name -- a re-run then fails
+# loudly on the existing path rather than quietly creating a second worktree for the same branch.
+function ConvertTo-WorktreeSlug([string]$Branch) {
+    if (-not $Branch) { return "" }
+    $s = $Branch -replace '[^A-Za-z0-9._-]', '-'
+    $s = $s -replace '-{2,}', '-'
+    $s = $s.Trim('-', '.')
+    if ($s) { return $s }
+    $h = [System.Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Branch))
+    return "wt-" + (($h[0..3] | ForEach-Object { $_.ToString('x2') }) -join "")
+}
+
 # Which working tree does a git command act on? ONE resolver, shared by rules 3 and 3b, because they used
 # to have two and a real tree swap fell between them: rule 3 read only `-C` and cwd, so `cd <primary> &&
 # git reset --hard` spelled relatively resolved to the session's own (ungoverned) worktree and it handed
@@ -401,7 +425,41 @@ function Test-WorktreeHijack([string]$Verb, [string]$Cmd, [string]$WtRaw) {
     $head = "$(& git -C $wtRaw rev-parse --abbrev-ref HEAD 2>$null)".Trim()
     if ($dest -eq $head) { return }
 
+    # And only a branch that is checked out NOWHERE. The deny text below asserts exactly that ("git
+    # allowed it because '$dest' was not checked out anywhere") -- an assertion this rule never actually
+    # made, which is a compensating control resting on an unverified premise. Two things follow from
+    # checking it. If the branch IS checked out somewhere, git's own guard refuses the switch without
+    # us, so there is nothing to protect; and the remediation would print `new.ps1 -Branch $dest`, which
+    # dies with "fatal: '$dest' is already checked out at ...". That is the same defect class this
+    # remediation was just fixed for -- a printed command the receiving side rejects. `git checkout main`
+    # from any linked worktree is the common shape. $list is the porcelain already read above.
+    #
+    # BUT ONLY WITH NO FLAGS AT ALL, and that is an ALLOWLIST on purpose. "git already refuses this" is
+    # a claim about a CONFIGURATION, not about git: a guard you do not own can be switched off by its
+    # own caller. Measured against a branch live in another worktree --
+    #     checkout/switch <b>                        -> fatal, git refuses      (deferring is sound)
+    #     checkout/switch --force / --discard-changes -> fatal                  (deferring is sound)
+    #     checkout/switch --ignore-other-worktrees <b> -> SWITCHES              (guard disabled)
+    #     checkout/switch --detach <b>, and -d <b>    -> SWITCHES               (never takes the lock,
+    #                                                    but still swaps the other session's files)
+    # -- and the dest scanner above skips '-'-prefixed tokens, so every one of those still resolves
+    # $dest normally. A denylist was written twice here and was wrong twice: --detach was missed while
+    # fixing --ignore-other-worktrees, and `-d` would have been missed while fixing --detach. Git may
+    # add a third tomorrow and the gate would silently reopen. So: any flag present means DENY. The cost
+    # is a needless deny on `git checkout --quiet main`, whose remediation line is then the imperfect
+    # one; that is strictly better than a missed hijack, and unlike a flag list it does not decay.
+    $hasFlag = @($after -split '\s+' | Where-Object { $_ -and $_.StartsWith('-') }).Count -gt 0
+    if (-not $hasFlag -and ($list -contains ("branch refs/heads/" + $dest))) { return }
+
     $newHint = "$($gov.Display)\scripts\worktree\new.ps1"
+    $destSlug = ConvertTo-WorktreeSlug $dest
+    # Doubled for the SINGLE-quoted emission below. A refname is not a safe shell token: `git
+    # check-ref-format` accepts ';', '$', '|', '"' and "'" (all measured exit 0), and line ~349 trims
+    # quotes only at the ENDS, so an interior one survives. Without the doubling, a legal branch named
+    # `x';calc;#` emits a line that PARSES AS TWO STATEMENTS -- the second being whatever follows the
+    # quote, with '#' commenting out the remainder. That is command injection into text this very
+    # message tells an agent to run. $destSlug needs no such care: it is [A-Za-z0-9._-]+ by construction.
+    $destQ = $dest -replace "'", "''"
     Write-Deny -Rule "3b" -Detail "git $Verb -> $selfTopRaw" -Reason @"
 BLOCKED: 'git $Verb $dest' would switch a LINKED WORKTREE ($selfTopRaw) onto the existing branch '$dest'.
 
@@ -412,8 +470,9 @@ hypothetical: it is exactly the hijack that happened here. A session with no wor
 
 What to do instead:
   * To BUILD on '$dest', give it its OWN worktree -- git then refuses to check that branch out twice,
-    which is the protection you actually want. The branch already exists, so reuse it by name:
-        pwsh -NoProfile -File $newHint -Name $dest
+    which is the protection you actually want. The branch already EXISTS, so this REUSES it rather than
+    forking. -Branch is the git ref; -Name is only the DIRECTORY, which cannot contain '/':
+        pwsh -NoProfile -File "$newHint" -Branch '$destQ' -Name $destSlug
   * To READ '$dest' without touching any working tree, use the plumbing:
         git -C "$selfTopRaw" show $dest`:<path>        git -C "$selfTopRaw" diff HEAD..$dest
   * If you genuinely OWN this worktree and must switch it, do it from a PLAIN terminal -- the gate governs
@@ -656,7 +715,9 @@ What to do instead:
             # Test-Governed already applies. A linked worktree living UNDER the primary is not the
             # primary -- a git verb there swaps only its own tree -- but a path separator clears both
             # lookaheads above, so `<primary>/.claude/worktrees/<name>` matched and DENIED. That is
-            # exactly where new.ps1 puts every worktree, so `cd <own worktree> && git rebase ...` -- the
+            # exactly where the Claude Code harness puts a worktree (new.ps1 makes SIBLINGS at
+            # <repo-parent>\<repo-name>-<Name>; BOTH layouts are live here), so `cd <own worktree> &&
+            # git rebase ...` -- the
             # most ordinary thing a session does -- was refused as if it were swapping the shared tree,
             # while the identical command with the path omitted was allowed: the block depended on how the
             # command was SPELLED, not on what it touched. Only this one subpath is exempt; the primary
