@@ -5532,3 +5532,49 @@ The literal spellings are all caught, including the newline form. Only the indir
 **Related:** #1059 (the gate instance, and the severe one), #1057 (the occupancy instance), #1000 (all three are green because they cannot see).
 
 **Source:** found 2026-08-05 while filing #1059, when the ledger gate refused a commit whose number had just been allocated successfully. Filed as the concrete defect rather than as the pattern, on the argument that a near-duplicate of an already-owned class dilutes the ledger — the same argument this session used earlier to decline filing a sibling to #1000.
+
+## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **9/10** · Difficulty **3/10** · _do it_. `git -C <primary-absolute> config core.hooksPath /dev/null` is DENIED. `git -C ../../.. config core.hooksPath /dev/null` is **ALLOWED** — same command, same target, relative spelling. That disarms `core.hooksPath` for the **shared clone**, i.e. the ledger, claim and secret-leak commit gates for every worktree at once, which is verbatim what rule 3c's own deny text says it exists to prevent. It requires no shell variable and no intent: `../../..` is the natural way to name the repo root from `<primary>/.claude/worktrees/<x>`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live fail-open in an enforcement control**, measured on the installed hook, and it is the highest-severity gate defect found to date.
+
+**Verified independently by two sessions against the same installed hook** (`~/.claude/hooks/worktree_gate.ps1`, sha256 `be113c20cde5…`). Neither session executed any `git config` command; only read-only primitives and the hook itself were run.
+
+| from a linked worktree | verdict |
+| --- | --- |
+| `git -C <primary-absolute> config core.hooksPath /dev/null` | DENIED |
+| `git -C ../../.. config core.hooksPath /dev/null` | **ALLOWED** |
+| `cd ../../.. && git config core.hooksPath /dev/null` | **ALLOWED** |
+
+**The mechanism, both primitives measured:**
+
+```
+git -C <primary> rev-parse --git-common-dir   ->  ".git"                      RELATIVE
+git -C <linked>  rev-parse --git-common-dir   ->  "C:/.../MessageFoundry/.git"  absolute
+[IO.Path]::GetFullPath('.git','../../..')     ->  THROWS  "Basepath argument is not fully qualified"
+[IO.Path]::GetFullPath('.git',<abs primary>)  ->  "C:\...\MessageFoundry\.git"  (control: works)
+```
+
+`worktree_gate.ps1:557` calls `Get-ComparablePath $common $where[0]` — passing the **target token as written** as the canonicalisation base. With a relative target the base is non-rooted, `GetFullPath` throws, the catch returns `""`, `$commonCmp` is empty, neither branch of the roots loop matches, and `if (-not $govCfg) { continue }` falls through to ALLOW.
+
+**Scoped to the PRIMARY by construction**, because only the primary's common dir comes back relative — a linked worktree returns an absolute path and denies correctly. That narrows the hole without redeeming it: the primary is the one checkout whose hooks protect everybody.
+
+**This is a miss, not a design choice, and the function's own header proves it.** `Get-ComparablePath`'s comment at `:128-133` states the principle correctly — a relative path must resolve against the **session's** cwd — names `../../..` from `<primary>/.claude/worktrees/<x>` as the exact spelling, records that it was already measured once, and even says *"GetFullPath throws on a non-rooted base, which the catch turns into 'not governed'"*. The sibling call at `:680` applies it correctly using `$cwdRaw`. Line 557 is the one call site that did not get the fix.
+
+**DO NOT APPLY THE OBVIOUS ONE-TOKEN FIX — it is wrong and it looks right.** Changing `:557` to `Get-ComparablePath $common $cwdRaw` fails: `$common` is `.git` relative to the **target directory**, not to the session's cwd. Resolving it against `$cwdRaw` yields `<session-worktree>/.git` — a real path that is *not* the primary's common dir — so the roots comparison still misses and the result is still ALLOW, now for a second and harder-to-see reason. The gate would appear fixed and stay open.
+
+**The correct shape is two steps: canonicalise the TARGET first, then the common dir against it.**
+
+```powershell
+$targetAbs = Get-ComparablePath $where[0] $cwdRaw    # relative target -> absolute, vs the SESSION cwd
+$commonCmp = Get-ComparablePath $common $targetAbs   # ".git" -> absolute, vs the TARGET
+```
+
+The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` returns exactly the primary's `.git`. **And it must FAIL CLOSED when `$targetAbs` is empty.** An unresolvable path currently means "not governed", which is precisely how this got through; the fix must not preserve that property.
+
+**No test covers it, and the test gap is the same shape as the defect.** The three rule-3c cases in `tests/test_worktree_gate_control_plane.py` all issue a bare `git config …` with **no path token**, so none of them can fail on a path-token defect. Green, and blind to the class. Any fix needs a case per spelling — absolute (denies today), relative (must deny after), and a linked-worktree target (must keep denying, so the fix is not merely a widening).
+
+**Related:** #1059 (the shell-variable bypass of the same resolver — **distinct**, because #1059's proposed fix of refusing on `$` in a target position leaves a literal `../../..` untouched), #1060 and #1057 (the cwd-is-not-the-caller cluster; this one is *not* an ambient-cwd defect — the hook process cwd was measured equal to the payload cwd), #1000 (a gate green because its tests cannot see the class).
+
+**Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
