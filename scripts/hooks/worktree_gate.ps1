@@ -583,9 +583,21 @@ What to do instead:
     # Rule 3d -- `git worktree remove` / `move`, which DESTROYS OR RELOCATES ANOTHER SESSION'S CHECKOUT.
     # Every rule above protects a tree from being swapped; this one protects it from being deleted, which
     # is strictly worse and was entirely unguarded. The verb list could never have caught it: `worktree`
-    # is two tokens (`worktree remove`) where every other entry is one, and git refuses to remove the
-    # worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed
-    # at somebody else's.
+    # is two tokens (`worktree remove`) where every other entry is one.
+    #
+    # THIS RULE ONCE JUSTIFIED HAVING NO CWD CHECK WITH "git refuses to remove the worktree you are
+    # STANDING in, so a remove that reaches git is aimed at somebody else's". THAT INFERENCE IS
+    # UNREACHABLE FROM HERE (BACKLOG #1041). A PreToolUse hook decides whether anything reaches git at
+    # all, so git's refusal never happens and the premise is never tested -- a rule cannot defer to a
+    # guard that runs only after it has already decided. Reproduced: a session standing in a linked
+    # worktree ran `git worktree remove <that same path>` and was told the tree belonged to ANOTHER
+    # SESSION, then sent to confirm with a colleague who does not exist.
+    #
+    # So the cwd check is now made rather than argued for, just below. It is narrow on purpose: it
+    # establishes "this IS the tree you are standing in", which is the one ownership fact available
+    # here. It does NOT establish the converse -- a worktree that is not yours to stand in may still be
+    # nobody's, and this rule has no occupancy or authorship signal to tell those apart. The deny text
+    # below says only what is checked.
     #
     # The target is the PATH ARGUMENT, not the cwd, and it cannot be judged with Test-Governed: a linked
     # worktree is exempt there (correctly, for tree swaps) and a sibling worktree falls outside the roots
@@ -617,12 +629,50 @@ What to do instead:
         }
         if (-not $govWt) { continue }
 
-        Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
-BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that belongs to
-ANOTHER SESSION -- git refuses to remove the worktree you are standing in, so this one is not yours.
+        # Is the victim the tree THIS session is standing in? $victimCmp above is the shared COMMON git
+        # dir -- every worktree of one repo reports the same value, so it cannot answer this. Resolve
+        # both TOPLEVELS instead. A git failure leaves $isSelf false, which keeps the pre-existing text.
+        #
+        # $cwdRaw, NEVER $cwd. $cwd is the Get-ComparablePath form, which is LOWERCASED, and this file
+        # already warns at the top of the rule-3b resolver that every `git -C` must take the raw path:
+        # on a case-sensitive filesystem `git -C /tmp/.../primary-wt` misses the real `.../Primary-wt`.
+        # Written with $cwd first, it passed on Windows (case-insensitive) and failed on the Linux CI
+        # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
+        # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
+        # against. Platform-masked, and caught only because that test compares the two denies.
+        $victimTop = Get-ComparablePath "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
+        $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
 
-Removing it deletes that session's working tree and its branch, along with any uncommitted work in them.
-There is no undo, and the session using it finds out when its next file read fails.
+        if ($isSelf) {
+            Write-Deny -Rule "3d" -Detail "git worktree $wtVerb (own worktree)" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimRaw' acts on THE WORKTREE THIS SESSION IS RUNNING IN.
+
+This is not somebody else's tree and nothing here says it is. git would refuse it too -- you cannot remove
+the worktree you are standing in -- but this gate runs BEFORE git, so you would have got a confusing
+failure from the hook rather than a clear one from git.
+
+There is no version of this you can run from here. Removing your own checkout mid-session deletes the
+files you are working on, and the removal has to happen from OUTSIDE this tree, after the session ends.
+
+What to do instead:
+  * Finish and COMMIT anything you still want. A commit survives the tree being deleted; a dirty tree
+    does not.
+  * Then ask the user, in these words: "I am finished in $victimRaw and it can be removed once this
+    session ends." Removal is theirs to run from the main checkout:
+        pwsh -NoProfile -File $($govWt.Display)\scripts\worktree\remove.ps1 -Name <directory-name>
+  * If you only wanted to leave it, just stop using it -- an unused worktree costs disk, not correctness.
+"@
+        }
+        else {
+            Write-Deny -Rule "3d" -Detail "git worktree $wtVerb" -Reason @"
+BLOCKED: 'git worktree $wtVerb $victimRaw' acts on a worktree of $($govWt.Display) that is NOT the tree
+this session is running in. This gate cannot tell whether another session is using it -- it has no
+occupancy or authorship signal -- so it refuses rather than guess.
+
+If it IS in use, removing it deletes that session's working tree and its branch, along with any
+uncommitted work in them. There is no undo, and the session using it finds out when its next file read
+fails. That asymmetry is why the default is refusal even though the tree may well be abandoned.
 
 What to do instead:
   * Cleaning up merged worktrees is a maintenance job with its own dry-run-by-default tool. Run it and
@@ -633,6 +683,7 @@ What to do instead:
   * If you are certain it is abandoned and must go now, that is the user's call, not yours. Say so:
     "I want to remove the worktree $victimRaw and I need you to confirm it is not in use."
 "@
+        }
     }
 
     # The verb must be a whole SUBCOMMAND. `\bmerge\b` is not enough: a hyphen counts as a word boundary,

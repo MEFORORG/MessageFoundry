@@ -1,8 +1,8 @@
 # MessageFoundry — Feature Map
 
 A capability catalog across every area of the engine, with status. The companion **execution**
-view (workstreams, gates, sequencing for the next release) is the
-[v0.1 Release Plan](releases/v0.1-PLAN.md); this is the **capability** view.
+view (workstreams, gates, sequencing for the next release) is the v0.1 release plan, a
+maintainer-internal document; this is the **capability** view.
 
 **Status legend**
 
@@ -10,7 +10,7 @@ view (workstreams, gates, sequencing for the next release) is the
 |------|---------|
 | ✅ | **Shipped** — on `main` today |
 | 🔬 | **Shipped but experimental** — present, not yet production-labeled |
-| 🔨 | **v0.1** — planned for the `0.1.0` release ([plan](releases/v0.1-PLAN.md)) |
+| 🔨 | **v0.1** — planned for the `0.1.0` release |
 | ⏭️ | **0.2+** — deferred (see the plan's *Out of scope*) |
 | 🧭 | **Later** — on the long-term vision, not yet scheduled |
 
