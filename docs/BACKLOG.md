@@ -5431,3 +5431,29 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 
 **Source:** surfaced 2026-08-05 when the owner ran the ruleset call drafted for #1034's server-side remedy and it returned 422. The session that had twice recommended AGAINST adding branch-push detection reversed on that evidence, since detection stops being the weaker option once prevention is unavailable. Filed so the reversal's premise is recorded rather than living only in a session transcript.
 
+
+## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **5/10** · _fill-in_. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
+
+**Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (medium). **Severity:** no data loss, and no security effect — the rule fails *closed*. The cost is a correct refusal the reader cannot act on, and the standing invitation to route around a guard that says no to legitimate work.
+
+**Reproduced 2026-08-05, and the authorship makes it unambiguous.** The coordinator session created a throwaway worktree, committed in it, opened a PR from it, then minutes later ran `git worktree remove <that path>` from its own session and was refused. It was not standing in the worktree, so #1041's toplevel comparison does not fire and is not meant to — that fix establishes *"this IS the tree you are standing in"* and deliberately claims nothing about the converse. Here the caller **created** the tree in the same conversation, so the refusal is not merely unproven, it is acting on a worktree with no other user at all. The worktree was still on disk at the time of filing, because the session correctly declined to route around the deny.
+
+**The signal already exists and is already trusted for a more destructive operation.** `scripts/coord/occupancy.ps1` provides `Get-WorktreeOccupancy`, `Get-WorktreeOccupants` (with `-IncludeNested`), `Get-NestedWorktrees` and `Get-ContainingWorktrees`. `scripts/worktree/prune-merged.ps1` already uses them as a *fence* before removing worktrees, re-reading occupancy immediately before acting because a session can arrive inside the decision window. So the project already accepts this signal as sufficient to gate a deletion — rule 3d is the one place making the same decision without it.
+
+**Why this is difficulty 5 and not 2, which is the whole reason it is a separate item.** The gate cannot simply dot-source that file. `install-gate.ps1` copies `scripts/hooks/worktree_gate.ps1` to `%USERPROFILE%\.claude\hooks\`, **outside every working tree**, precisely so a session cannot edit the thing enforcing against it. An installed hook can therefore load nothing from a checkout — the same constraint that forced `ConvertTo-WorktreeSlug` to be gate-local rather than shared. So the options are all structural, and none is free:
+
+1. **Vendor the occupancy read into the gate.** Fastest, and creates a second definition of what "occupied" means that can drift from `occupancy.ps1` silently — the hazard this repo already records for its banner alphabet and for two-parsers-of-one-rule generally.
+2. **Have the installer copy `occupancy.ps1` alongside the hook.** Keeps one source, but widens the installed surface that rule 1a must protect, and introduces a version skew between an installed helper and the checkout it came from.
+3. **Read a materialised occupancy artifact** rather than compute one — the registry the roster already writes under `.git/mefor-coord/`. No code shared, but it is a cache, and a stale cache that reports *unoccupied* fails **open** on the one decision where failing open deletes someone's work.
+
+Option 3's failure direction is the deciding constraint and should be stated before anyone starts: **whatever is built must fail CLOSED.** If occupancy cannot be determined, the answer is refuse, not allow. `prune-merged.ps1` already encodes exactly this — it skips a candidate when its fence becomes unavailable rather than proceeding.
+
+**Scope, so this does not quietly become "rewrite rule 3d".** The decision to refuse an occupied worktree does not change. What changes is that an **unoccupied** one becomes actionable — either allowed, or refused with a remedy the caller can actually execute rather than "ask the user". Nothing here touches rules 1, 1a, 1b, 3, 3b or 3c.
+
+**A cheaper interim, if the structural work is not wanted yet:** have the deny name the specific command that answers the question for the reader, rather than the general `worktree list`. `prune-merged.ps1` is already dry-run-by-default and already consults occupancy, so pointing at it with the exact invocation turns an unactionable refusal into a two-step one. That is a text change of the kind #1041 just made, and it does not pretend to be the fix.
+
+**Related:** #1041 (the false premise in the same rule, fixed — this is the gap it deliberately left), #1039 (the same shape one level up: deferring to a guard whose availability was never checked), #1000 (whatever is built here needs a negative control proving it can still refuse), #308.
+
+**Source:** identified 2026-08-05 while building #1041, from noticing that the reported third sighting was **not** an instance of what #1041 fixes. Filed separately rather than folded in, because citing it as evidence for the toplevel comparison would have claimed coverage that fix does not have — the same defect class the item was about, inside its own fix.
