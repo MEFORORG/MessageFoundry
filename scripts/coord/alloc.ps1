@@ -173,6 +173,16 @@ function Get-Floor {
     # DANGEROUS: `git remote prune <name>` / `git remote remove <name>` for a non-origin remote,
     #            deleting refs/<vault-ish>/*, or an aggressive `gc` / `reflog expire` that drops
     #            unreachable objects. Those are what this ratchet defends against.
+    # MEASURED 2026-08-05, and it narrows the alarm without retiring the rule: those 489 vault-ish refs
+    #            WERE deleted (refs/remotes/vaultall/** 466, refs/remotes/vault/** 20, refs/vault/** 3;
+    #            manifest kept outside the repo, every tip still addressable here and present in the
+    #            separate vault clone). Floor 1032 and sub-floor max 353 were unchanged before and after:
+    #            the #1000 partition clamps every new number above the internal band, and internal 314
+    #            was already masked by public 353 (reason (d) below). So the hazard is still real in
+    #            general -- a clone whose high numbers live ONLY on non-origin refs still loses them --
+    #            and it no longer binds HERE. The ratchet stays: it is the one term that survives a clone
+    #            that never had those refs at all. Provenance and full measurement:
+    #            docs/LEDGER-GATE.md "The ref store, and the cleanup of 2026-08-05".
     $watermark = Join-Path $alloc ".floor-highwater"
     $computed = [int](($seen | Measure-Object -Maximum).Maximum)
     $previous = 0
@@ -297,21 +307,25 @@ if ($Kind -eq "backlog") {
     # was not detecting a breach; it was detecting the partition being used exactly as designed.
     #
     # It is NOT that this clone cannot see internal numbers -- that was suspected and is false.
-    # Measured 2026-08-03: 490 vault-ish remote-tracking refs are present, 489 carry docs/BACKLOG.md,
-    # and 67 item numbers live ONLY there, including the #242-#246 band ADR 0115 cites. The sweep does
-    # reach them, and that is exactly why the floor is trustworthy.
+    # Measured 2026-08-03, while the vault-ish refs were still here: 490 present, 489 carrying
+    # docs/BACKLOG.md, and 67 item numbers living ONLY there, including the #242-#246 band ADR 0115
+    # cites. The sweep did reach them, and that is exactly why the floor was trustworthy. (Those 489
+    # refs were DELETED on 2026-08-05 -- docs/LEDGER-GATE.md has the provenance and the manifest's
+    # whereabouts -- so this clone is now case (c) below. Floor 1032 and sub-floor max 353 were measured
+    # unchanged across the deletion, for reason (d).)
     #
     # The premise fails for four other reasons, any ONE of them fatal:
     #   (a) NO PROVENANCE. An integer does not say which sequence issued it. "Internal reached the
     #       boundary" and "public was legitimately allocated at the boundary" are the SAME observation
     #       -- which is why #1000, on origin/main and holding a registry claim, read as a breach.
-    #   (b) FOSSIL. The newest vault-ish ref here is 2026-07-26 and the only configured refspec is
-    #       +refs/heads/*:refs/remotes/origin/*, so nothing can advance them. The partition landed
-    #       eight days later. (Measured: these refs say 314 while the real vault is at 315 -- the
-    #       fossil is already stale by one item.)
-    #   (c) CLONE-LOCAL. A fresh public clone has zero vault refs, so the term is absent entirely.
-    #   (d) MASKED. Internal 314 < public 353, so the internal term does not even determine the
-    #       sub-boundary maximum today.
+    #   (b) FOSSIL. The newest vault-ish ref was 2026-07-26 and the only configured refspec is
+    #       +refs/heads/*:refs/remotes/origin/*, so nothing could advance them. The partition landed
+    #       eight days later. (Measured: those refs said 314 while the real vault was at 315 -- the
+    #       fossil was already stale by one item.)
+    #   (c) CLONE-LOCAL. A fresh public clone has zero vault refs, so the term is absent entirely --
+    #       and since the 2026-08-05 deletion, so does this one.
+    #   (d) MASKED. Internal 314 < public 353, so the internal term never determined the sub-boundary
+    #       maximum -- which is why deleting those refs moved neither number.
     #
     # So the refusal moved to a trigger that IS observable and IS reachable -- the boundary ratchet
     # above, which fires when PUBLIC_BACKLOG_FLOOR is lowered beneath a value this clone has already

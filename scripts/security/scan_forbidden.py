@@ -89,9 +89,10 @@ _ALLOWED_IP = re.compile(
 # A worktree/branch slug is whatever the task happened to be CALLED, so it can name a prospect segment,
 # a customer engagement, or a competitor study. That is unbounded: the leak is the project name itself,
 # and there is no list to add it to. Matching the shape is the only control that scales. It is
-# case-folded whole: agent slugs are lowercase by convention, but scripts/worktree/new.ps1
-# validates -Name as ^[A-Za-z0-9._-]+$ and hands it to `git worktree add -b` verbatim, so an
-# upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
+# case-folded whole: agent slugs are lowercase by convention, but nothing on the path lowercases them --
+# scripts/worktree/new.ps1 hands -Branch to `git worktree add -b` after validating it with
+# `git check-ref-format` (which permits mixed case), and -Name reaches the worktree DIRECTORY verbatim.
+# So an upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
 _WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")
 # An absolute user-home path carries the OS account name, and inside a worktree path the slug as well.
 # Exempt: bracket/env placeholders (<you>, $HOME, %USERPROFILE%, {home}), the well-known shared and CI
@@ -163,6 +164,44 @@ def _is_skipped(posix: str) -> bool:
     # this is an EXACT path match, never a suffix match. A suffix test would skip a same-named file at a
     # different path, which must still be scanned.
     return posix in SKIP_PATHS
+
+
+# --------------------------------------------------------------------------------------------------
+# LOCATION detectors. Everything else in this file judges a file by its BYTES; these judge it by where
+# it sits, and a file matching one is a hit whatever it contains.
+#
+# Why this class needs its own detector, measured 2026-08-05: the private security corpus is prose
+# about THIS repo -- threat models, ASVS assessments, remediation plans -- so it carries no customer
+# name, no site code, no IP, and no secret. A token scanner is the wrong instrument for it and reports
+# clean by working correctly. Against the 89-document vault corpus the content detectors would have
+# missed 55 of them.
+#
+# ``docs/security/`` is gitignored (.gitignore:144) and lives only in the private vault clone, so on
+# the ordinary path nothing here ever fires. It is aimed at the path .gitignore cannot cover: a branch
+# created from a fetched vault ref delivers those files inside a commit TREE, never through the index,
+# so no ignore rule is ever consulted and the working tree ends up carrying them legitimately-tracked.
+#
+# Deliberately narrow. ``docs/reviews/`` and ``docs/marketing/`` are gitignored too, but they are
+# gitignored for tidiness rather than because publishing them would hand an attacker a map, and a
+# detector that cries wolf gets deleted. Add an entry here only with the reason it is a LEAK.
+FORBIDDEN_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?:^|/)docs/security/"),
+        "private security document -- docs/security/ is vault-only and must never reach the public repo",
+    ),
+)
+
+
+def forbidden_path_reason(posix: str) -> str | None:
+    """Why this PATH is forbidden, or ``None``.
+
+    Matched unanchored on purpose: a vendored or relocated copy (``ide/docs/security/x.md``) is the
+    same leak as the top-level one, and anchoring to ``^`` would wave it through.
+    """
+    for pattern, reason in FORBIDDEN_PATHS:
+        if pattern.search(posix):
+            return reason
+    return None
 
 
 # --------------------------------------------------------------------------------------------------
@@ -746,6 +785,13 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     posix = rel_posix if rel_posix is not None else path.as_posix()
     if _is_skipped(posix):
         return []
+    # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
+    # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
+    # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
+    # the path itself and there is no line to point at -- the reason names the file, not a location
+    # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
+    if reason := forbidden_path_reason(posix):
+        return [f"{path}:0: {reason}"]
     text = _read_text(path)
     if text is None:
         return []

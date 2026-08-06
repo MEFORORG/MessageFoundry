@@ -238,14 +238,14 @@ def _markdown(new: list[Change], increased: list[Change], decreased: list[Change
     lines = ["## Cyclomatic complexity (C901) — changed by this PR", ""]
 
     if not new and not increased:
-        lines.append("No function was introduced over the threshold or made more complex. ✅")
+        lines.append("No function was introduced over the threshold or made more complex. PASS")
     else:
         lines += ["| Function | File | Complexity | Threshold |", "| --- | --- | --- | --- |"]
         for change in new + increased:
             before = "new" if change.before is None else str(change.before)
             lines.append(
                 f"| `{change.key.function}` | `{change.key.path}`:{change.line} "
-                f"| {before} → **{change.after}** | {change.threshold} |"
+                f"| {before} -> **{change.after}** | {change.threshold} |"
             )
 
     if decreased:
@@ -254,7 +254,7 @@ def _markdown(new: list[Change], increased: list[Change], decreased: list[Change
         for change in decreased:
             lines.append(
                 f"| `{change.key.function}` | `{change.key.path}`:{change.line} "
-                f"| {change.before} → **{change.after}** |"
+                f"| {change.before} -> **{change.after}** |"
             )
 
     lines += [
@@ -314,7 +314,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         summary = (
             "## Cyclomatic complexity (C901) — not comparable\n\n"
-            f"This PR changes the mccabe threshold ({base_threshold} → {head_threshold}), so a "
+            f"This PR changes the mccabe threshold ({base_threshold} -> {head_threshold}), so a "
             "before/after delta would report pre-existing functions as new. Skipped deliberately.\n"
         )
         if args.summary_file:

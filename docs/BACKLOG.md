@@ -2392,7 +2392,9 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 228. Steps / config search finds handlers, routers, and transforms by name (not just connections)
 
-> 🔢 **Logged 2026-07-11 (unscored).** Value **4/10** · Difficulty **2/10** · _fill-in_. Preview-driven UX gap; to be value/difficulty-scored at the next backlog pass.
+> ✅ **CLOSED 2026-08-05 — both 2026-07-28 remainders built.** Value **4/10** · Difficulty **2/10**. **(a)** Definitions rows now carry a `contextValue` of their own — `meforSymbolHandler` on a handler row — gating the inline **View as Steps** action, which resolves through the row's *file*. They deliberately do **not** borrow `graphModel`'s `meforElementHandler` / `meforElement`, and no row claims an `elementKind` / `elementName`: a row's name is the Python **function** name (`def handle`) while the graph is keyed by the registered **decorator** name (`@handler("acme_adt_handler")`), and every `samples/config/` module makes the two differ — so the element vocabulary would render a **Show in Wiring Map** action that could only ever land on "the focused element no longer exists in the graph". Router / transform / send rows carry no action. **(b)** `SymbolKind` gains `send`: a separate extraction pass (a `Send(…)` sits inside a def body, out of reach of the column-0 def regex) indexes the connection each call addresses, at the call-site line; its comment guard is quote-aware, so a *trailing* `# was Send("OB_OLD", …)` is not a call site while a `#` inside a string literal does not truncate the line. **This is a bound, not a completeness claim:** at least quoted-literal targets and module-level `NAME = "literal"` constants are indexed; at least a computed, imported, or f-string target — and a ruff-wrapped call whose target is not on the `Send(` line — is dropped rather than guessed. **That is NOT the `graph --json` bound:** that extractor marks an unresolvable target `dynamic` and *surfaces* it ([ADR 0091](adr/0091-element-centric-connections-view.md) AC-3), and its module-constant rule validates against the whole module, neither of which this flat text scan does. The graph views remain the authority on resolved wiring. Twenty-one new tests, all node-side (so they run on every `ide` CI leg, not only the Windows Extension Host leg), each falsified.
+
+> **AMENDED 2026-08-05 — both remainders described below are now BUILT; the 2026-07-28 block that follows is the historical record, not current state.** Read it as the finding that scoped this work, not as a live gap. The one correction worth carrying forward: remainder (a)'s diagnosis named `viewItem == meforElementHandler` as the gate to satisfy, and adopting that value verbatim is precisely what the close had to avoid — see the CLOSED banner above.
 
 > **AMENDED 2026-07-28 — the index IS built; two clauses of the Proposed line are not.** Adversarial verification refuted a full close. **BUILT:** `ide/src/symbolIndex.ts` scans and surfaces handlers / routers / transforms **by name** in the MEFOR view's Definitions section, unit-tested — which fixes the item's headline complaint (a transform is a Python symbol inside a file named for the *connection*, so neither the sidebar search nor Ctrl+P could find it).
 >
@@ -3425,6 +3427,14 @@ The repo has now recorded this class at least four separate times, each found by
 
 Each was filed as its own defect, which is right. What none of them establishes is the property that would have caught all four **before** they shipped: a green run is evidence only if the gate has been shown it can go red on that class. That is a different artifact from any of the individual fixes, and it is the one thing this item builds.
 
+**At least five further instances landed on 2026-08-05 alone, across three sessions, every one found by hand and none by CI.** They are recorded here because the rate is the argument: this is not a backlog of four historical mistakes, it is an ongoing yield.
+
+- **A guard that did not enforce its own stated shape.** `new.ps1`'s `-Name` was validated `^[A-Za-z0-9._-]+$`, and `"abc" + newline` **matches** it — .NET's `$` also matches before a final newline. The pattern that an entire defect (#1032) rested on admitted a newline into a directory name. Fixed to `\A..\z` in all four copies of the literal.
+- **A test that rendered the broken output and asserted a substring of it.** `tests/test_worktree_gate_hijack.py` asserted `"new.ps1" in reason`, with a fixture branch that already had the defect's shape. It passed for the whole life of #1032 while producing a command that could not run. A test hard-coding the expected hint would have been equally blind: the emitted string was never wrong, the *receiving contract* rejected it.
+- **An exit code that masked the failure being asserted.** Running an emitted command via `pwsh -File script.ps1` returns **0** even when the script inside died at parameter binding. Without an explicit `exit $LASTEXITCODE`, every execution assertion built on the return code is vacuously green. Found only by writing a control that had to fail and watching it pass.
+- **A probe that could not tell "found nothing" from "did not look".** A coordinator's PR-drain passed `--arg` to `gh --jq`; the call errored, printed usage, and the script read the **empty output** as "nothing eligible" for two minutes with two PRs sitting eligible. The generalisable remedy is the useful part: a probe must **validate the shape of its own output** — the fixed drain asserts every `gh` probe returned a number before branching on it — rather than treating an empty result as a negative answer.
+- **A control that was too uniform to locate the layer doing the work.** See the asymmetry rule below; this one is a finding about negative controls themselves.
+
 **Nearest existing mechanism:** partial and uneven. Some gates already carry a canary — `dast.yml` has two, and `alloc.ps1`'s floor now has a documented plant-and-observe procedure. `tests/test_lint_scope_parity.py` guards *scope drift* between ruff, bandit and the pre-commit hook, which is adjacent but different: it proves two tools agree on what they scan, not that either can fail. Nothing enumerates the required-context list and asserts a control exists per entry, so a context added to branch protection tomorrow starts life unproven and nothing says so.
 
 **Proposed:**
@@ -3433,6 +3443,12 @@ Each was filed as its own defect, which is right. What none of them establishes 
 2. Add the missing fixtures. Prefer the cheapest form that actually exercises the gate: a planted file for a scanner, a crafted diff shape for a workflow-logic gate like `backlog-hygiene.yml`, an inverted assertion for a test-suite context.
 3. Add a CI job that fails when a required context has no registered control. Without this the set decays the moment a new context is added, which is the same decay mode as every item above.
 4. Run each control **against the pre-fix gate where one exists**, so the record shows the observed failure rather than an assertion that it would have failed.
+
+**A NEGATIVE CONTROL MUST BE ASYMMETRIC, and this is the part most likely to be skipped by whoever starts this item.** It is not enough that neutering the rule turns the control red. The control must fail for exactly the shapes that rule covers and **keep passing** for the shapes some other layer catches — otherwise it cannot tell you *which layer does the work*, and it cannot distinguish "the other cases are safe by design" from "safe by luck".
+
+Measured 2026-08-05, and this is why the rule is stated rather than assumed. A rule-1b fix was believed to protect two NTFS alternate-data-stream spellings. With the fix reverted, its eight-case control failed on **one** of them, not both: the `::$DATA` forms were already refused by a *different* layer (an extension backstop), and the new code was load-bearing for exactly one shape — a stream named to end in a document extension. The author's first draft of the accompanying comment credited the new code with both, **an overstatement in the direction that flatters one's own code**, which is the worst direction for it to be wrong in. A control that failed on all eight would have looked stronger, confirmed the overstatement, and taught nothing.
+
+So the registered control for a context should record **what it does not break**, not only what it does. A uniform red is a weaker result than a specific one.
 
 **Trigger:** none — this is not demand-gated. The trigger already fired four times.
 
@@ -4970,3 +4986,595 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 **Related:** #1018 (guards that go quiet), #344 (the two test steps sharing one budget), ADR 0158.
 
 **Source:** found by the #324 lane on 2026-08-04 when it named both pytest paths for a webconsole-touching change; the CI-coverage half was flagged by that lane as an inference and verified against `ci.yml` before filing.
+
+## 1029. `/simplify` shipped as a local skill with no entry in the quality-standards record, so the one review tool that edits the tree had no written placement or scope
+
+> ✅ **SHIPPED 2026-08-05 — the documentation is the whole deliverable.** Value **3/10** · Difficulty **1/10** · _quick win_. `/simplify` is now recorded in [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) §5.1 as a local, human-invoked **advisory** review that **applies** its fixes, ordered before the `ruff` / `mypy` / `pytest` quartet, with the justified-duplication carve-outs written down. A new §5.1, a scoping clause in §5's intro, a mapping row in §6, and a `Before you verify` heading in `CLAUDE.md` §5.
+
+**Cluster:** Documentation / quality-control record. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect and no security effect. The gap was in the record: the quality-standards document enumerated five measurement gates and named no review tool that rewrites code, so the one ordering constraint that matters and the scope limits that already follow from earlier decisions were unwritten and uncitable.
+
+**What the record now says.** §5.1 is a new subsection and the single home for the tool. §5's placement table is **unchanged at five rows** — an earlier draft added a sixth and was reverted, because a row declaring itself "not a gate" contradicted both that table's `Gate` column and the §5 heading, and forced the same caveat into three other places. §5's intro instead gains one scoping clause naming §5.1 as a review tool deliberately not among the five. §6's companion-mapping table lists it in the same local, human-invoked, advisory tier as `/code-review` and `/security-review`, with the one difference that separates them stated **once**: those two report findings a human arbitrates, this one applies edits.
+
+**No status is claimed for it, and that is deliberate.** Every other entry in this document names a tracked artifact and a pull request. `/simplify` ships with Claude Code rather than with this project, so there is no `.claude/` entry, pin, or other artifact in the checkout to score — **Built** is therefore a claim the document explicitly declines to make, citing the Appendix A honesty taxonomy. §4.0's liveness rule does not reach it either, because there is no green check to trust.
+
+**The ordering is a consequence of the report-versus-apply difference, not a convention.** A tool that applies fixes, run after the quartet, would mutate the tree the quartet had just certified. `CLAUDE.md` carries it as a `Before you verify` heading placed *ahead of* the verification-expectations list rather than inside it — it is a mandated pre-step, not a gate, and "a task isn't done until these pass" cannot govern something that emits no pass or fail.
+
+**The carve-outs are the part most easily lost, and they are an open class.** §5.1 records **at least** these deliberately-justified duplications as out of scope: the SQL Server / Postgres store-backend parity that signal 9's clone detection already whitelists, and the `messagefoundry/anon/` package vendored to `tee/anon/` under [ADR 0030](adr/0030-anonymization-test-harness-tee.md), which signal 9 cannot see at all because its `jscpd` scan covers `messagefoundry/` only. The defensive branching tolerant HL7 parsing requires (`CLAUDE.md` §8) is recorded separately as a signal 11 *complexity* concern rather than a duplication one. Nothing the tool produces certifies quality (§4.1); the maintainer owns every applied edit under the *reject code you cannot explain* floor.
+
+**Difficulty 1 because nothing was built.** The skill already existed and is unchanged; the deliverable is a subsection, a table row, a heading and a clause. It is filed closed rather than skipped so the placement decision has a number to cite.
+
+**Related:** #1027 (the quartet this ordering sits in front of, and the same class of defect — a verification instruction that does not say what it actually covers), #1006 (an advisory gate from the same rubric), #1000 (gate liveness, the rule §5.1 explicitly records as not reaching a non-gate).
+
+**Source:** filed alongside the documentation change itself, 2026-08-05, and rewritten before filing because the first draft described a structure that was subsequently reverted. Every claim above was read from the working tree at commit `17c52129` rather than recalled: §5.1 at line 221, the five-row gate table, the §6 row at line 242, `CLAUDE.md`'s heading at line 288, and both `Built` mentions confirmed to be negations. The same change removed all 41 status glyphs from that document (rubric v0.12) and marked its pull-request citations as `PR #N`, the bare form having already resolved to the wrong item for `#1020`.
+
+## 1030. Non-cp1252 characters in source are gated one file at a time, so the class keeps recurring
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. At least two gates exist and each covers exactly one thing: `tests/test_cli.py:43-58` asserts one string (`messagefoundry --help`) is cp1252-encodable, and `tests/test_announce_hook.py:810` asserts one file (`scripts/hooks/announce-session.ps1`) is ASCII-only. Neither generalises, so a glyph reaching `print()` from any other script is caught only by a human reading the diff.
+
+**Cluster:** Tooling / verification integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect — the affected surfaces are `scripts/`, not the engine. The defect is that CLAUDE.md §11 states a correctness rule whose enforcement is per-file and hand-placed, so coverage decays between sweeps and each recurrence costs a fresh manual audit.
+
+**The mechanism, measured — and the usual statement of it is wrong.** `sys.stdout` carries `errors='surrogateescape'`, **not** `'strict'` (Python 3.14.6 on this box, `PYTHONIOENCODING` unset, confirmed under `-I`). `surrogateescape` only round-trips lone surrogates in `DC80`-`DCFF`; every other unencodable codepoint still raises. `sys.stderr` carries `errors='backslashreplace'`, which never raises. That asymmetry — not a strict/non-strict split — is why the same text survives on stderr and aborts on stdout. Anyone building the gate should measure this rather than repeat the strict claim, which is stated in at least one commit message in this repo's history.
+
+**Prior recurrences, and the fixes were per-surface.** `tests/test_cli.py:46-49` records the first: *"`messagefoundry --help` crashed with UnicodeEncodeError on a cp1252/charmap console because of a U+2192 arrow in the adr-analyze subparser help"*. That fix was not only the test — `messagefoundry/__main__.py:42-56` hardens `sys.stdout` and `sys.stderr` for the whole CLI, and its comment names the same failure. `harness/__main__.py:97-101` and `harness/acceptance/__main__.py:39` carry the same remedy, as does `scripts/bench/stage_residency.py:1057-1059`. The second recurrence is the sweep this item comes from: 43 non-cp1252 characters across four `scripts/` files, one of which (`scripts/kerberos_epa_spike.py`) had 11 string literals that raise on a cp1252 stdout.
+
+**Measured 2026-08-05: the backlog gate's own `--help` crashes.** `python scripts/docs/backlog_status_check.py --help` raises `UnicodeEncodeError: 'charmap' codec can't encode character '\u2705'`. Its argparse description is the module docstring, which carries the banner-alphabet table, so five non-cp1252 codepoints (U+2705, U+26D4, U+1FAA6, U+1F522, U+1F6A7) reach stdout. U+2014 is in that help text too and is cp1252-representable, so it is not part of the failure.
+
+**That case also shows why the naive gate is wrong.** Those five are the sanctioned machine-parsed alphabet CLAUDE.md §11 protects, and the remediation text must quote them to be actionable — an author told to add a closed banner without being shown the character cannot comply. So the fix there is a stdout reconfigure in that one script, **not** removing the characters. A gate that cannot express that exemption would either fire on correct code or be switched off.
+
+**Difficulty 4 is the scope decision, not the scanner.** The scanner is thirty lines — encode each character to cp1252 and report the failures. The design questions are: which paths (source only, or docs too, where `docs/BACKLOG.md` is a deliberate holdout); whether to gate on *encodability* or on *reaching an unguarded stream*, since those give different answers for a file that reconfigures; and how the exemption is declared so it is auditable rather than a hardcoded filename list. `tests/test_announce_hook.py:810` is the precedent worth copying — it gates source bytes, states its reason, and the guarded file declares its own constraint at `announce-session.ps1:54`.
+
+**Three properties to keep.** Print what was scanned — a filtered scan that skips a file type reads as clean when it never looked. Check the whole file, not line by line: `splitlines()` consumes U+2028/U+2029, so a line-oriented scan is structurally blind to them. Do not silently drop files that fail to decode as UTF-8.
+
+**Related:** #1018 (guards that go quiet), #1027 (a green that is not evidence), #1031, ADR 0158.
+
+**Source:** raised by the `scripts/` glyph sweep on 2026-08-05, then rewritten after an adversarial pass refuted the first draft's "exactly one gate exists" and its `errors='strict'` mechanism. The `--help` crash and the stream-handler values were measured, not inferred.
+
+## 1031. The STEP4 bench doc restates the stage_residency docstring in the glyphs its source shed, and carries emoji
+
+> ✅ **SHIPPED 2026-08-05.** All 101 non-cp1252 characters removed from `docs/benchmarks/STEP4-bracket-and-littles-law.md` — the **whole file**, not just the §5.2 block enumerated below, which was written as a floor and was one. U+2264/U+2265/U+2212/U+2192/U+2190/U+2260/U+21D2 to their ASCII forms; U+03BB/U+03C3 to `lambda`/`sigma`; U+2261 to `==`; U+2227 to the word `AND`; the four U+26A0 + U+FE0F pairs to the word `WARNING`. U+2248 became the file's **own** bare-tilde idiom (`~62 ms`, `rho ~0.23`) rather than `~=` — `~=` is the PEP 440 compatible-release operator everywhere else in `docs/` and means NOT-EQUAL in MATLAB and Lua, which would have inverted the verdict rows at lines 373-375. U+00D7 deliberately KEPT (14 occurrences): it is cp1252-representable typography, not a glyph, and the source keeps 4.
+
+**Cluster:** Docs / consistency. **Priority:** P4. **Verdict:** build (trivial). **Severity:** none operationally. It is a documentation defect: a reader comparing the doc to the tool sees two renderings of one definition and cannot tell whether the difference is meaningful.
+
+**Where — lines 414-425, and at least these.** U+2264 twice and U+2212 once on line 416 (`N(t) = #transformed<=t - #delivered<=t`, which the source now writes in ASCII, matching what `stage_residency.py:557` already used); U+2192 on 417; U+2248 on 422, in the sentence the source now reads as "N is about 8, therefore the lanes are saturated"; U+03BB on 425; and U+26A0 + U+FE0F on 421 and 425. Enumerated by scan rather than by eye, but treat it as a floor and re-scan the range.
+
+**Do not "fix" U+00D7 — the source keeps it.** `stage_residency.py` still contains four multiplication signs, including on the same sentence as doc line 425. It is cp1252-representable and out of scope for §11. Converting the doc's copy would *create* a divergence rather than remove one.
+
+**The source is cp1252-safe, not ASCII.** It retains 70 em dashes and those four multiplication signs. Em dashes, ellipses and section signs in the doc are cp1252-representable typography and stay.
+
+**Nothing machine-compares them, which is the point.** No gate reads both, so this did not go red and will not. It is the shape #1030 exists to catch, and if #1030 lands with docs in scope this closes as a side effect — check that before doing it by hand.
+
+**Related:** #1030 (the missing gate that would have caught this), #1027.
+
+**Source:** found by the completeness pass over the `scripts/` glyph sweep on 2026-08-05; the codepoint enumeration was corrected by an adversarial pass that caught the first draft claiming U+00D7 as a divergence and missing the U+26A0/U+FE0F pair entirely.
+
+## 1032. `worktree_gate` Rule 3b prints a `new.ps1` command that `new.ps1` rejects
+
+> ✅ **SHIPPED 2026-08-05 — merged as PR #214 (`fdaf53f7`).** Value **6/10** · Difficulty **3/10** · _fill-in_. The Rule 3b deny's escape hatch could not be executed for the case that triggers it: it interpolated a slash-bearing branch name into a parameter that forbids slashes, which is 143 of 196 local branches. Reproduced by running it, not by reading it. `new.ps1` gained a `-Branch` parameter distinct from `-Name` and the rule now emits both. The same work closed a refname **command injection** in that deny text (#1040) and a hijack **bypass** the first attempt introduced — rule 3b deferred to a git guard that `--ignore-other-worktrees`, `--detach` and `-d` all switch off, on both `checkout` and `switch`, so the fix is an allowlist (deny on ANY flag) rather than a list of known bypasses (#1039). Verified in main: `ConvertTo-WorktreeSlug` present in `scripts/hooks/worktree_gate.ps1`.
+
+**What.** `scripts/hooks/worktree_gate.ps1:388`, inside the Rule 3b deny ("BLOCKED: would switch a LINKED WORKTREE onto the existing branch"), tells the caller to give the branch its own worktree with:
+
+```
+pwsh -NoProfile -File $newHint -Name $dest
+```
+
+`$dest` is the **branch** name. `scripts/worktree/new.ps1:26` validates `-Name` against `^[A-Za-z0-9._-]+$`, which every slash-bearing branch fails. Measured 2026-08-05: a branch of the form `claude/<task>-<suffix>` is REJECTED while the bare `<task>` component is accepted, and **140 of 193 local branches carry a slash**. The gate's motivating case is a branch that already exists — which is exactly why it carries a `claude/` prefix — so the escape hatch fails in the default case, not an edge case.
+
+**Why it survived.** The other three sites (`:411`, `:685`, `:794`) print the placeholder `-Name <short-kebab-task-name>`, which is valid. `:388` is the only interpolating one, so a grep for the common form finds three healthy instances and misses the defect. Two independent readers hit exactly that; the one who found it had run the command and held the failure in hand first.
+
+**DO NOT fix this by relaxing the ValidatePattern.** `$Name` does two jobs and the pattern is load-bearing for the first:
+
+| line | use |
+|---|---|
+| `new.ps1:43` | `Join-Path $Parent "$RepoName-$Name"` — a **path component** |
+| `new.ps1:58`, `:72`, `:86`, `:97` | `git branch --list` / `worktree add` / the `mefor-home-branch` marker — a **ref** |
+
+A slash satisfies git as a refname but makes `Join-Path` build a nested directory. Measured: a `claude/<task>` branch yields `MessageFoundry-claude\<task>` instead of a sibling `MessageFoundry-<name>`, so the worktree lands one level deeper than every other one. Loosening the pattern alone converts a **loud correct failure into a quiet wrong success** — the worse direction of error.
+
+**Preferred fix.** Add a `-Branch` parameter distinct from `-Name` (name = directory component, branch = ref), defaulting `-Branch` to `-Name` so every existing caller is unchanged; then `:388` emits `-Branch $dest -Name <sanitized>`. **Fallback** if a new parameter is unwanted: stop printing a command that cannot work, and print the supported procedure instead.
+
+**Verification this item must demand.** A test that **executes the string the gate prints**, not one that asserts a copy of it — a test hard-coding the expected hint passes throughout this defect, which is the "guard tests a copy of the rule" trap and is how it survived. It must also assert the resulting worktree directory is a **sibling**, since that is the regression the current validation prevents and that a naive fix would introduce.
+
+**Related:** #1030 (the missing general gate), #1027.
+
+**Source:** found by session `sleepy-villani-df328d` while gate-blocked twice, correctly, from another session's branch; reproduced independently by the coordinator against `new.ps1:26` and `Join-Path`. A Claude Code task chip (`task_fb78da2c`) covers the same defect but carries no allocated number and will not survive the session, so this ledger entry is the durable record.
+
+## 1033. The rubric cites its own signals as `#N`, and six of those numbers are real backlog items
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) refers to its own eleven rubric signals as `#6`, `#7`, `#9`, `#10`, `#11`. In this corpus a bare `#N` reads as a backlog item, and six of those numbers **are** backlog items. Owner ruled 2026-08-05 that they get disambiguated. The four-digit PR citations in the same file were already fixed (PR #209); this is the short-number half that was deliberately left out of scope there.
+
+**What.** Ten citations on four lines, measured against `origin/main` at 780ee1d9:
+
+| Line | Tokens |
+|---|---|
+| L282 | `#10` |
+| L299 | `#7`, `\#8`, `\#9`, `\#11`, `\#10` |
+| L319 | `#10` |
+| L420 | `#6`, `#7`, `#9` |
+
+Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item today**; `#6`, `#7`, `#8`, `#10` and `#11` are closed items; only `#9` does not exist in the namespace. So six of the seven distinct numbers already resolve to something real and unrelated.
+
+**This is not inventing a convention.** L219 already reads *"Complexity (11) and clone (9) shipped first"* and *"the ruff-breadth expansion (signal 10, PR \#1047)"* — the word form and the bare-parenthesis form both appear in the file already, and L420 carries a `signal N` phrasing and a bare `(#N)` on the same line. The change makes the file self-consistent rather than imposing something new. `signal 7` is the target form; `PR #NNNN` is already the settled form for pull requests.
+
+**Two traps, both of which have already caught a reader.**
+
+1. **`#3` at L120 is a markdown ANCHOR FRAGMENT, not a citation:**
+   `[Secure AI-Assisted Development Standards §3](Secure_AI_Development_Standards.md#3-the-problem-this-standard-attacks)`.
+   Converting it silently breaks the link. It must be left alone, and a census that counts tokens without printing context will not see the difference. A prior census listed it as *"#3 x1 rubric signal"* and was wrong.
+2. **L299 and L319 use backslash-escaped forms** (`\#8`, `\#9`, `\#11`, `\#10`). A pattern requiring a literal space or paren before `#` misses them, and a `grep -oE` attempt during this triage returned **zero matches on a file that demonstrably contains them** — the pattern silently matched nothing and was believed. Prove the pattern fires on a known string before trusting a count from it.
+
+**Verification bar for whoever does it.** Print the token list with line numbers, not a count. Confirm zero bare one-or-two-digit `#N` remain outside link targets, that the L120 anchor is untouched, that the forty four-digit citations are still forty marked and zero bare, and that every markdown link still resolves — the anchor is the one that breaks silently.
+
+**Related:** PR #209 (the four-digit half, and the source of the `PR #NNNN` convention), \#1029 (the same document), \#1032 (same class: a census that counted without printing context).
+
+**Source:** raised by session `sleepy-villani-df328d` while sweeping the four-digit citations, and correctly kept out of that PR's scope. Owner ruled on it 2026-08-05. Counts here were re-measured against 780ee1d9 with a self-tested pattern after an unverified one reported zero.
+
+
+## 1034. The pre-push shim fails OPEN when python is not on PATH, so the push guard silently does not run
+
+> ✅ **SHIPPED 2026-08-05 — merged as PR #215 (`09c6fe8e`) and PR #217 (`e75cff02`).** Value **7/10** · Difficulty **3/10** · _fill-in_. The headline defect and both "adjacent gaps" below are fixed. #215: both generated shims now refuse instead of exiting 0 when neither `python` nor `python3` resolves, and name `--no-verify` so a fail-closed gate does not get "fixed" by deleting it. #217: `MEFOR_ALLOW_DIRECT_PUSH` is scoped to the protected-branch guard alone, so it no longer disarms the namespace and content guards it was never named for; and a tip tree the guard cannot READ is refused rather than assumed clean, because "there is nothing there" and "I could not look" are different facts. Proven against the pre-fix code rather than asserted: the old shims exit 0 with no interpreter on PATH, and the old guard permits both a branch and a tag carrying `docs/security`. **What did NOT ship is this item's own prescription** — "the durable answer is server-side" is measured DEAD on both halves (a push ruleset returns `422 Source public repos cannot have push rules`; `enforce_admins` governs protected branches and so cannot see a feature branch). That residual, and the fact that no server-side content control exists here at all, is **#1056** — this item is closed on its title, not on that finding.
+
+**What.** The shim is generated by `scripts/coord/install-git-hooks.ps1` and shared by every worktree through `core.hooksPath`. When it cannot find python it prints its notice to stderr and returns 0, allowing the push. That is the correct posture for a *workflow* guard that should not wedge a developer, and the wrong one for the only remaining control on a publication path — the same fail-open-versus-fail-closed distinction the security standards already draw between the git-staging guard and the engine's bind guard.
+
+**Why it matters more since 2026-08-05.** `push_guard.py` gained two further checks that day: a namespace allowlist (refusing a `--mirror`-shaped push) and a tip-tree check (refusing a ref carrying `docs/security`). Both are defeated by the same fail-open, so the shim now switches off three guards rather than one, and the failure is silent in the noisiest possible place — a terminal line above a successful push.
+
+**Two adjacent gaps in the same class**, worth deciding together rather than separately:
+
+- A **fresh clone or a newly created worktree has no hook at all** until `install-git-hooks.ps1` runs. Nothing prompts for it.
+- `git push --no-verify` and `MEFOR_ALLOW_DIRECT_PUSH=1` skip every check by design, and the latter returns 0 before any guard runs despite reading like it permits one specific thing.
+
+**A client-side hook cannot be the sole control, and that is the real finding.** Any fix here reduces the likelihood of an accident; it does not close the path. The durable answer is server-side — re-enabling `enforce_admins`, or a push ruleset — with the shim hardened as defence in depth rather than as the boundary. Whatever is decided, no prose may describe the hook as a security boundary; its own docstring already refuses that framing and should keep refusing it.
+
+**Related:** \#1032 (same file family, and the same shape of a remediation that cannot execute), PR #209.
+
+**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: session `nice-payne-4dcee0` has it as analysis only, with no build decision taken.
+
+## 1035. Gate remediations interpolate an unquoted `-File` path into a command the reader is told to run
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. Every `pwsh -NoProfile -File $x` the gate prints interpolates a governed-root path with no quoting. A root whose path contains a space produces a command that cannot run. Latent today only because the single allowlist entry has no space in it.
+
+**What.** `scripts/hooks/worktree_gate.ps1` emits remediation commands of the form `pwsh -NoProfile -File <interpolated path>`. At least six such sites exist across five rules. One of them (Rule 3b's) was quoted while fixing #1032; the rest were left, deliberately, as untouched code in rules that change was not opening.
+
+**Measured, not reasoned.** With a primary at `<tmp>/Pri mary`, the emitted line exits **64** with a usage dump and the message `The argument 'C:\...\Pri' is not recognized as the name of a script file`. Quoted, the identical line exits 0. This is pinned in `tests/test_worktree_gate_hijack.py`, whose execution test is parametrised over a plain and a space-bearing primary precisely so the quoting is under test rather than assumed.
+
+**Why it is worth doing despite being latent.** It is the same defect class as #1032 — a remediation the receiving side rejects — and #1032 demonstrated that the class is not caught by review: three healthy placeholder sites hid one broken interpolating site, and two independent readers missed it. The condition that makes this live is a user choosing a checkout path with a space, which is an ordinary thing to do and not something the repo controls.
+
+**Scope note.** Two categories must NOT be swept up. Relative file *references* with trailing prose (Rule 1a telling a human where the source lives) are deliberately not runnable command forms. Comment-based help inside a `.NOTES` block is never emitted at runtime. Both look similar to grep and neither is a defect.
+
+**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in).
+
+**Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
+
+## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _quick win_. The `EnterWorktree` deny hardcodes the first governed root when building the command it tells the session to run. Rule 4 computes no root of its own and fires for every session regardless of repo, so with a second governed primary in the allowlist it would point the reader at the wrong repository's script.
+
+**What.** Rule 4 denies the `EnterWorktree` tool and prints a remediation naming `sessions.ps1` under the first allowlist entry. Unlike the path-scoped rules, Rule 4 never resolves which governed root the session belongs to — it fires on the tool name alone.
+
+**Why it is latent.** The allowlist currently holds one entry, so the first entry is trivially the right repo. The defect appears the moment a second primary is governed, and it appears as a remediation pointing into an unrelated checkout — which is worse than no remediation, because the path exists and the command runs.
+
+**Severity.** No product effect and no security effect; the gate still denies correctly. The failure is in the instruction, not the decision.
+
+**Related:** #1035 and #1032 (remediations that cannot be acted on as printed), #1040.
+
+**Source:** identified 2026-08-05 during the #1032 work, from reading every remediation site in the file rather than only the one being fixed.
+
+## 1037. `remove.ps1` cannot be execution-tested, because it hardcodes its repo root
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **3/10** · _fill-in_. `scripts/worktree/remove.ps1` derives its repo root from its own script location with no override, so no test can drive it against a synthetic repository. Its sibling `prune-merged.ps1` accepts a root and IS execution-tested; that is the whole difference.
+
+**What.** `remove.ps1` computes its repo root from where it lives. A test therefore cannot point it at a fixture repo, and the only way to exercise it is against the real checkout — which no test may do, since the script removes worktrees and can delete branches.
+
+**Why it matters now.** `remove.ps1` gained real behaviour on 2026-08-05: `-DeleteBranch` stopped assuming the branch equals the directory name and adopted `prune-merged.ps1`'s lossless discipline (`-d` first, `-D` only after re-verifying the branch carries nothing beyond `origin/main`). That logic is covered by **review only**. It is the code path that force-deletes refs, and the one place in `scripts/worktree/` where getting it wrong loses commits reachable from no ref and no reflog.
+
+**The shape of the fix** is already in the repo: `prune-merged.ps1` takes a root parameter and has an execution test. Adding the same override is mechanical; the value is that it converts the most destructive script in the directory from review-covered to test-covered.
+
+**Related:** #1032 (the change that gave `remove.ps1` behaviour worth testing), and `tests/test_worktree_prune_merged.py` as the pattern to copy.
+
+**Source:** identified 2026-08-05 while changing `remove.ps1`, and stated in that change's own commit as covered by review rather than test.
+
+## 1038. Rule 3b's remediation names `new.ps1` siblings while most live worktrees are harness-created and nested
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **4/10** · _fill-in_. Two mechanisms create worktrees here and they use different layouts. `new.ps1` makes siblings at `<repo-parent>/<repo-name>-<Name>`; the Claude Code harness makes nested ones under `<primary>/.claude/worktrees/<slug>`. Rule 3b fires for both and its remediation only ever names the first.
+
+**What.** A session blocked by Rule 3b is told to run `new.ps1`, which produces a sibling worktree. If that session is itself harness-created and nested, the remediation hands it a worktree in a different layout from the one it lives in — functional, but not what the reader expects, and not made by the mechanism that made theirs.
+
+**Both layouts are live.** Measured 2026-08-05: sibling and nested worktrees both exist in quantity against this one `.git`. Two source comments asserted that `new.ps1` creates the *nested* layout; both were false and were corrected during the #1032 work, in `worktree_gate.ps1` and `scripts/coord/occupancy.ps1`. That the same false premise had been independently written twice is the reason this is worth settling rather than leaving to be re-derived a third time.
+
+**The open question, which is design and not a bug.** Should Rule 3b name the harness path first, name both, or keep naming `new.ps1` and say why? #1032 deliberately did not settle it — that change made the command it already printed runnable, and nothing more. Whichever way it goes, the answer belongs in one place with the other site linking to it.
+
+**Related:** #1032 (made the printed command work without settling which command is right), #1035.
+
+**Source:** identified 2026-08-05 during the #1032 investigation, when the sibling-versus-nested contradiction surfaced from reading `git worktree list` rather than the comments.
+
+## 1039. `git worktree add --force` also defeats the already-checked-out guard, so "git will refuse this" must be written as conditional
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. At least three git flags defeat the guard that stops a branch being checked out in two worktrees. Any code or comment reasoning that "git already refuses this" is making a claim about a **configuration**, not about git, and must say so.
+
+**Measured 2026-08-05**, against a branch live in another worktree:
+
+| command | result |
+| --- | --- |
+| `checkout`/`switch <b>` | `fatal: already used by worktree at ...` |
+| `checkout`/`switch --force <b>`, `switch --discard-changes <b>` | `fatal` — do NOT bypass |
+| `switch --no-ignore-other-worktrees <b>` | `fatal` — correctly does NOT bypass |
+| `checkout`/`switch --ignore-other-worktrees <b>` | **switches** |
+| `checkout`/`switch --detach <b>`, and `-d <b>` | **switches** |
+
+`--detach` bypasses by never taking the branch lock, yet it still swaps the other session's files to that commit, which is the harm. `-d` is a live short form on **both** verbs.
+
+**Not yet measured, and the reason for this item:** `git worktree add --force` overrides the same guard. Nothing in the gate is known to depend on that today, but the assumption "git will refuse a second checkout" appears in reasoning about worktrees generally, and it should be recorded as conditional wherever it appears.
+
+**This is a documentation-and-audit item, not a code fix.** #1032's fix already handles the checkout/switch path, and it does so with an **allowlist** — the early return fires only when there are no flags at all — precisely because a denylist was written twice there and was wrong twice. The work here is to find every other place that defers to a guard it does not own, and write down what switches that guard off.
+
+**Related:** #1032 (where the bypass was introduced and closed), #1040.
+
+**Source:** the bypass was found 2026-08-05 by a session auditing its own change after a peer noted that `ledger_check.py`'s ownership model depends on the worktree gate; `--detach` and `-d` were then found by asking the same question a second time rather than patching the first flag.
+
+## 1040. Hook deny text is attacker-influenceable output that an agent is instructed to act on, and nothing treats it as such
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **8/10** · Difficulty **5/10** · _do it_. Two separate injections into gate deny text were found independently on the same file within hours, by two sessions, through different values. The general form is bigger than either instance and bigger than the gate: a deny reason is **output built from attacker-influenceable input**, and it carries a command block a model is told to run.
+
+**Instance one — a refname into a command.** `git check-ref-format` accepts `;`, `$`, `|`, `"` and `'` in a refname. A legal, creatable branch carrying a quote and a comment marker made Rule 3b emit a line that parses as **two statements**, the second arbitrary, with the comment marker hiding the remainder. A branch with a bare interior quote emitted an unparseable line. Fixed by doubling the quotes in the single-quoted emission.
+
+**Instance two — a file path into prose.** A `Write` whose `file_path` carried embedded newlines produced a reason with **two** `Do this instead:` blocks, the forged one **first**, so a model reading top-down reaches the injected command before the real remedy. This one needed nothing on disk — only the JSON field — so no other gate saw it.  Fixed with a shared fold helper.
+
+**The two fixes are different, and the wrong one at either site would look like it worked.** Quote-doubling is for a value entering a **command**; folding CR/LF/TAB is for a value entering **prose**. Both produce output that reads fine to a human skimming it.
+
+**Why this is the most valuable item in this group.** The repo already knew half of it: `Write-Deny` has always folded its **log** line, with a note that a crafted path could otherwise forge records in a log whose purpose is counting. The **reason** never got the same treatment, in the same function. And every hook in `scripts/hooks/` that emits a remediation an agent is told to run has this shape — the gate is where it was noticed, not where it is confined.
+
+**What the work is.** Enumerate every deny and remediation surface across `scripts/hooks/`, classify each interpolated value as command-bound or prose-bound, and apply the matching treatment through one shared helper per class rather than at each site. The audit is the deliverable; the individual fixes are small.
+
+**Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039.
+
+**Source:** the two instances were found independently on 2026-08-05 by sessions `trusting-wu-c2e6d5` (refname, in Rule 3b) and `sharp-chatelet-f33072` (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
+
+## 1042. The `[vault]` key/secret/transit providers build a redirect-following HTTP client, so a diverted 3xx could carry `X-Vault-Token` off-path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. Every shipped HTTP egress routes through a no-redirect urllib opener (`transports/rest.py` `_NO_REDIRECT_OPENER`), except the `[vault]` provider clients, which build a `requests`-based hvac client with no redirect policy. A deploying site on `messagefoundry[vault]` would carry `X-Vault-Token` over a redirect-following client to the operator-set `VAULT_ADDR`.
+
+**Cluster:** Egress / secret handling. **Priority:** P3. **Verdict:** build (small). **Severity:** conditional, not an exposure on the shipping config. The vault provider is behind an optional pip extra and off by default; when selected it points at operator-trusted infrastructure. On first deployment, an on-path 3xx (absent TLS integrity) or a spoofed Vault could divert the bearer token, while every default egress refuses redirects.
+
+**The fix.** Set a no-redirect policy on the hvac session (or wrap the three vault clients: `store/keyprovider_vault.py`, `config/secretprovider_vault.py`, and `store/crypto_transit.py` via `_build_client`), OR document redirect-following-to-Vault as intended per the verb's "unless it is intended functionality" clause.
+
+**Related:** ASVS 15.3.2 (the re-verification that surfaced it), 1.3.6 (SSRF).
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Full file:line detail is in the maintainer-internal ASVS V15 chapter report (`docs/security/`, withheld per SECURITY-DOCS-POLICY.md).
+
+## 1043. The threat-model drift guard's doc-content assertions go inert when the vault doc is absent, so on the public tree they enforce nothing
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **3/10** · _fill-in_. `tests/test_threat_model_doc_drift.py` skips every doc-content assertion (heading-enumeration, planted-omission) when `docs/security/THREAT-MODEL.md` is absent, which it is on the public tree (the doc is deny-listed from the OSS mirror). The compensating control's enforced half lives outside the tree it runs in; the code-only assertions (subprocess-site inventory, default-value locks) still fire.
+
+**Cluster:** Measurement / doc-drift integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect. The defect is a green that is not evidence: on the assessed public tree, the identification of resource-demanding and dangerous functionality (which several ASVS 15.1.x verdicts lean on) has zero drift enforcement, and nothing announces the skip.
+
+**The fix, and its constraint.** Make the doc-absent skip loud rather than silent (the project's own standard, ADR 0158's class), or ship a public-tree stand-in the content assertions can run against. A skip that reads as a pass is the failure being fixed; do not trade a silent skip for another.
+
+**Related:** #1027 (a documented gate that silently covers less than it appears to), ADR 0158, ASVS 15.1.3 / 15.1.5.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1044. There is no request-timeout on HTTP handlers, so the "response within the consumer's timeout" limb has no server-side enforcement
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. The only `asyncio.wait_for` in `api/` is the connection-test probe; there is no request-timeout middleware. ASVS 15.1.3's limb "avoid building a response that takes longer than the consumer's timeout" has no server-side enforcement (properly 15.2.2 territory, surfaced during the 15.1.3 re-verification).
+
+**Cluster:** Availability. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping config (localhost + auth, single worker). On first deployment a slow handler holds a worker for as long as it runs, with nothing bounding the response time from the server side.
+
+**The fix.** Add a request-timeout middleware (or per-route deadline) that returns a bounded error rather than building unboundedly.
+
+**Related:** ASVS 15.1.3 / 15.2.2, #1042.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1045. `redact_unauthorized` fails open, so a future PHI route that forgets the call returns every field unmasked
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `api/field_authz.py` `redact_unauthorized` fails open: field masking happens only where the call is made, and coverage is pinned only by an enumerated test (`tests/test_field_authz_enforcement_sites.py`). A new PHI-returning route added without the call, and not added to the test, would return the whole model unmasked.
+
+**Cluster:** Defensive coding / field authorization. **Priority:** P3. **Verdict:** build (small). **Severity:** not an exposure today, verified rather than assumed: every documented PHI surface at HEAD is covered (which is why ASVS 15.3.1 still grades pass). A latent defensive-coding weakness, not a live leak.
+
+**The fix.** A fail-closed default (mask unless explicitly allowed) or app-level enforcement middleware, so a forgotten call denies rather than exposes.
+
+**Related:** ASVS 15.3.1, #1043 (the same enumerated-test coverage shape).
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1046. The inbound archive move uses a non-atomic exists-check instead of the `O_EXCL` claim used on the delivery path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. `transports/file.py` `_move` relocates via `_unique`, which uses a non-atomic `if not target.exists()` rather than the `O_EXCL` claim (`_claim_unique`) the delivery path uses. A check-then-act TOCTOU window exists on the archive move.
+
+**Cluster:** Concurrency. **Priority:** P3. **Verdict:** build (small). **Severity:** no integrity consequence on the default config, verified: the canonical raw message is already durable in the store at ingress (ACK-on-receipt), and the default is one poller per source over an engine-owned `processed_dir`. It would only race under a non-default config where two FileSources share one `processed_dir`, worst case a benign archived-copy name collision.
+
+**The fix.** Route the archive move through `_claim_unique` (the same `O_EXCL` claim as the delivery path).
+
+**Related:** ASVS 15.4.4.
+
+**Source:** ASVS 5.0.0 V15 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V15 chapter report.
+
+## 1047. The apiclient measures URL length before the query string is appended, so a query-bearing GET can exceed the limit unchecked
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `apiclient/client.py` measures only `len(base_url) + len(path)` against `MAX_REQUEST_URL_LEN`, then `_request` hands `params=` to httpx, which appends the query AFTER the check (the `Authorization` header IS bounded). A query-bearing GET can construct a URI over the limit with nothing refusing it. The apiclient is the frontend ASVS 4.2.5 explicitly names.
+
+**Cluster:** Outbound length bounding / DoS. **Priority:** P3. **Verdict:** build (small). **Severity:** the primary attacker-influenced message-derived HTTP family (REST/SOAP/FHIR) IS bounded at construction + send-time; this is the residual under the 4.2.5 `partial`. On first deployment an operator action (tray/harness/monitor) producing a long query could build an over-long URI the receiving component rejects with a persistent error status.
+
+**The fix.** Measure the resolved URL including the query (or reuse `transports/rest.py` `enforce_send_time_length_limits`). Note `test_apiclient_length_bounds_match_the_transport_constants` keeps the constants in step but does not cover this query-string gap.
+
+**Related:** #1048 (the sibling 4.2.5 gap), ASVS 4.2.5.
+
+**Source:** ASVS 5.0.0 V4 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V4 chapter report.
+
+## 1048. The OIDC token-exchange outbound request has no send-time length guard
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. `messagefoundry/auth` carries zero `enforce_send_time_length_limits` / `MAX_REQUEST_URL_LEN` calls; the token-exchange `urllib.request.Request` at `auth/oidc/flow.py` has no send-time length guard.
+
+**Cluster:** Outbound length bounding. **Priority:** P3. **Verdict:** build (small). **Severity:** the weaker limb of the two 4.2.5 gaps: `token_endpoint` is operator-static config (validated https at load), not attacker-influenced, so the 4.2.5 `partial` does not depend on it.
+
+**The fix.** Add a send-time length check on the token-exchange request line + headers.
+
+**Related:** #1047 (the primary 4.2.5 gap), ASVS 4.2.5.
+
+**Source:** ASVS 5.0.0 V4 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V4 chapter report.
+
+## 1049. `XmlMessage` exposes only string-expression XPath, so a Handler interpolating tainted data has no framework-provided safe path
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `XmlMessage.find` / `get` / `get_all` / `exists` / `set` all take an `expression: str` into the sole sink `self._root.xpath(...)`; there is zero `etree.XPath()` / `XPathEvaluator` / `$`-bound XPath tree-wide. No first-party dynamic XPath from taint ships today, but `XmlMessage` is exported to code-first Handlers (`parsing/__init__`), so a Handler interpolating HL7/request data into an XPath expression would, on first deployment, have an injection vector with no framework-provided safe alternative.
+
+**Cluster:** Injection hardening / defensive API. **Priority:** P3. **Verdict:** build (small). **Severity:** not a shipped vulnerability (nothing in-tree reaches `.xpath()` with tainted data); a hardening item for the code-first authoring surface, unlike SQL where the driver binds values regardless of the author's statement.
+
+**The fix.** Add a `$var`-parameterized or precompiled `XmlMessage` XPath API so a Handler has a safe option. Separately, the ASVS scorecard record for 1.2.7 was corrected in the same re-verification (a prior `na` on a false "no XPath anywhere" premise moved to `needs-review`); that record correction is already done and is not part of this code item.
+
+**Related:** ASVS 1.2.7, 1.3.4 (the structurally parallel SVG cell).
+
+**Source:** ASVS 5.0.0 V1 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V1 chapter report.
+## 1051. Async-delivery `retry_max_attempts=None` (retry forever) contradicts the engine's own documented sync-HTTP guidance
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2240` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2242` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
+
+**Cluster:** Availability / delivery. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping config (localhost + auth, single worker). On first deployment a forever-retrying FIFO lane head would block its lane until an operator purges it -- a behavioural DoS residual, honestly disclosed in-tree (the doc discloses the default and instructs the safe override), which is why it does not lower the ASVS 13.1.x documentation cells.
+
+**The fix.** Ship a finite `retry_max_attempts` default (or a per-connection cap with dead-lettering on exhaustion) so the shipped default matches the documented sync-HTTP posture.
+
+**Related:** ASVS 13.1.3 / 13.2.6, #1052 (the sibling unbounded-acquire residual).
+
+**Source:** ASVS 5.0.0 V13 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V13 chapter report (`docs/security/`, withheld per SECURITY-DOCS-POLICY.md).
+
+## 1052. Three services have an unbounded connector-tier / store pool acquire (no acquire timeout)
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `CONNECTIONS.md:2330` names "the one remaining unbounded connector-tier pool acquire"; the store SQL-Server / Postgres acquire and the DatabaseRef throwaway pool acquire have no hard cap. Documented (so the ASVS 13.1.x doc cells pass) but a behavioural residual.
+
+**Cluster:** Availability / resource management. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping SQLite config. On first deployment on a server backend, a pool-exhausted or unresponsive DB could block an acquiring task indefinitely with no bounding timeout, unlike the DATABASE connector acquire which is bounded by `acquire_timeout` 30s.
+
+**The fix.** Apply a bounded acquire timeout (and a documented behaviour-at-limit) to the store SS/PG and DatabaseRef pool acquires, matching the connector-tier `acquire_timeout`.
+
+**Related:** ASVS 13.2.6, #1051 (the sibling retry-forever residual).
+
+**Source:** ASVS 5.0.0 V13 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V13 chapter report.
+
+## 1053. `SERVICE.md` calls structured JSON + off-box logging "planned" while both are built and default-wired
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **1/10** · _quick win_. `docs/SERVICE.md:370` still describes structured JSON logging and off-box syslog/SIEM forwarding as "planned", but both ship at HEAD: `JsonFormatter` (`logging_setup.py`), `[logging].format=json`, and the `SyslogForward` off-box forwarder with `forward_format` defaulting to JSON. A doc claiming a built feature is planned is stale.
+
+**Cluster:** Documentation / built-vs-planned accuracy. **Priority:** P3. **Verdict:** build (trivial). **Severity:** no product effect; a doc-drift correction. It does not lower ASVS 16.1.1 -- `docs/PHI.md`'s logging inventory is the accurate inventory of record, and this drift is quarantined from scoring.
+
+**The fix.** Update `SERVICE.md` to describe JSON logging and off-box forwarding as built (with their `[logging]` settings), removing the "planned" framing.
+
+**Related:** ASVS 16.1.1 / 16.2.4 / 16.4.3.
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1054. The opt-in subprocess sandbox child logs through an unfiltered root logger, bypassing the redaction + log-injection scrub
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. The ADR 0087 subprocess sandbox child calls a bare `basicConfig`, so its log records do not pass through the three PHI/redaction/control-char filters that `_install_phi_filters` attaches unconditionally to the engine's stdout handler and off-box forwarder.
+
+**Cluster:** Logging / PHI redaction. **Priority:** P3. **Verdict:** build (small). **Severity:** off by default (`[sandbox].mode="off"`), so the default posture's redaction/scrub coverage (ASVS 16.4.1 / 16.2.5) is intact. On a deploying site that opts into `mode="subprocess"`, a child log line carrying message-derived content would reach the inherited stderr without redaction or CR/LF neutralization.
+
+**The fix.** Install the same `_install_phi_filters` chain on the sandbox child's logging setup (or route the child's records through the parent's filtered handlers).
+
+**Related:** ASVS 16.4.1 / 16.2.5, ADR 0087, #1055 (the sibling sandbox last-resort gap).
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1055. `threading.excepthook` is unreplaced on the raw sandbox-reader engine thread, so a non-`OSError` traceback there reaches the stdlib hook unredacted
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. The engine replaces the asyncio loop exception handler (the last-resort handler for the event loop) but does NOT replace `threading.excepthook`, so a non-`OSError` exception in the raw sandbox-reader daemon thread reaches the stdlib default hook, which prints an unredacted traceback to stderr.
+
+**Cluster:** Error handling / PHI redaction. **Priority:** P3. **Verdict:** build (small). **Severity:** a 16.2.5-class redaction-quality gap, not a missing last-resort handler -- both stated purposes of ASVS 16.5.4 still hold (the details reach NSSM-captured stderr rather than being lost, and a dead daemon thread does not take down the process). On a deploying site an unexpected non-`OSError` in that thread could emit a traceback that skips the redaction filters.
+
+**The fix.** Replace `threading.excepthook` with a handler that routes through the engine's filtered logging (the same redaction chain as the loop exception handler).
+
+**Related:** ASVS 16.5.4 / 16.2.5, #1054 (the sibling sandbox-logging gap).
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1041. Rule 3d tells a session removing its OWN worktree that it belongs to another session
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `scripts/hooks/worktree_gate.ps1:528` justifies rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
+
+**Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss — the deny is *correct as a decision* and it does prevent an accidental self-deletion. The defect is entirely in what the text tells the reader to do next, which CLAUDE.md §11 treats as a correctness property: *"a gate that misdescribes the thing it blocked trains people to route around it"* (recorded at `worktree_gate.ps1:646` for the sibling case #308 already fixed).
+
+**Reproduced first-hand on 2026-08-05, not reasoned from source.** A session standing in a linked worktree under `<primary>/.claude/worktrees/` ran `git worktree remove <that same path>` and received rule 3d's refusal verbatim: *"acts on a worktree of `<primary>` that belongs to ANOTHER SESSION -- git refuses to remove the worktree you are standing in, so this one is not yours."* Both clauses are false in that run. Nothing was deleted, because the hook denied the whole command before git executed — which is also precisely why the premise cannot hold.
+
+**Why the inference fails, stated once.** The premise is a claim about what reaches git. A PreToolUse hook decides *whether anything reaches git at all*, so it can never observe the state its own premise depends on. Any rule that defers to a downstream layer's guard has this shape; here the deferral is unconditional and the guard is unreachable.
+
+**The remedy text compounds it.** The refusal closes with *"I want to remove the worktree `<path>` and I need you to confirm it is not in use."* For the caller's own worktree that sends the operator to verify a fact that is false by construction — the worktree is in use by the session asking. The other two suggestions (`prune-merged.ps1`, `git worktree list`) stay correct.
+
+**The fix is local and the value is already computed.** Rule 3d resolves `$victimCmp` at `:554` for its governed-root test at `:557`. Comparing it against the session's own toplevel — `git -C $cwdRaw rev-parse --show-toplevel`, the same call rule 3b already makes — splits the two cases: a peer's worktree keeps the current text, and the caller's own gets an accurate one (git will refuse this itself; if you mean to discard the worktree, that is the user's call from a plain terminal). Difficulty 2: one comparison, one branch, and a regression test per branch. Do not simply *allow* the self case — the deny is the right decision, and blocking an accidental self-deletion is worth keeping.
+
+**Do not fix by deleting the premise sentence.** It is load-bearing documentation of *why* rule 3d has no cwd check, so removing it leaves the missing check unexplained. Replace it with what is actually true: git's guard is unreachable from here, therefore the rule must decide ownership itself.
+
+**Related:** #308 (the same defect class — a refusal describing something the reader cannot act on — fixed for the nested-worktree subpath), #1018 (guards that go quiet), ADR 0158.
+
+**Source:** reported by a concurrent session while it was fixing rule 3b's remediation text, verified independently against the source rather than relayed, then reproduced live by accident when a second session ran the command against its own worktree. Filed by the session that verified it, which is not building it; the reporting session offered to take it if the owner scopes it there.
+
+## 1056. No server-side content control exists for this repo, so the client-side push guard is the only prevention
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **7/10** · Difficulty **6/10** · _decide_. Successor to #1034, which is closed on its title. That item's stated remedy — "the durable answer is server-side" — is **unavailable**, measured rather than inferred. So the only thing preventing `docs/security` from reaching the public remote is a client-side hook that `git push --no-verify` skips and a fresh clone does not have until an installer is run by hand. That is the posture; the question is whether it is acceptable.
+
+**The measurement, stated once here so nobody re-derives it.** Both halves of #1034's server-side answer are dead:
+
+```
+gh api -X POST repos/MEFORORG/MessageFoundry/rulesets -f name='block-private-docs' \
+  -f target='push' -f enforcement='active' \
+  -f 'rules[][type]=file_path_restriction' \
+  -f 'rules[][parameters][restricted_file_paths][]=docs/security/**'
+-> 422  "Source public repos cannot have push rules"
+```
+
+and `enforce_admins` governs **protected branches**. Re-enabling it would refuse an admin's direct push to `main` — worth doing on its own merits, and orthogonal to this — but branch protection never sees an ordinary feature branch, which is the ref a leak actually rides on. GitHub offers this repository no way to refuse a push by its CONTENT.
+
+**What therefore stands, and what each layer can and cannot do.** State this precisely, because the failure mode is a reader assuming the stack is stronger than it is:
+
+- **Prevention, client-side only.** `scripts/hooks/push_guard.py` refuses a pushed tip tree carrying `docs/security`, on every namespace including tags. It is bypassed by `--no-verify`, and absent entirely in any clone or worktree where `scripts/coord/install-git-hooks.ps1` has not been run. A client hook is advisory by construction and no prose may describe it as a boundary.
+- **Detection, post-hoc.** PR #221 (OPEN at filing) adds a branch-push leak scan, because the leak gate in `security.yml` triggers on `pull_request`, push to `main`, and cron — so a branch pushed with no PR is scanned by none of them. It cannot prevent: on a public repo the content is public the instant the push completes.
+- **Commit-time.** `scripts/security/scan_forbidden.py` gained a path detector for `docs/security` (#215), which catches a staged file. It does NOT catch the realistic vector, where files arrive inside a commit TREE taken from another ref and never pass through the index.
+
+**The open question, which is the deliverable.** Is "bypassable prevention plus post-hoc detection" the accepted posture for the private security corpus on a public repo? Reasonable answers include: accept it and say so in `docs/SECURITY.md` so no later document overstates it; make the vault corpus unable to reach this repo's object store at all (it arrived once, via a direct-URL `git fetch` on 2026-07-28 — see #1034's lineage); or move to a hosting arrangement where push rules exist. **Do not answer it by hardening the hook further** — that raises the cost of an accident and changes nothing about `--no-verify`.
+
+**Related:** #1034 (closed; the shim fail-open and its two adjacent gaps), #1040 (deny text as attacker-influenceable output — the `ls-tree`-fed surface was measured NOT injectable, because git C-quotes control characters in path output independently of `core.quotePath`), PR #221.
+
+**Source:** surfaced 2026-08-05 when the owner ran the ruleset call drafted for #1034's server-side remedy and it returned 422. The session that had twice recommended AGAINST adding branch-push detection reversed on that evidence, since detection stops being the weaker option once prevention is unavailable. Filed so the reversal's premise is recorded rather than living only in a session transcript.
+
+
+## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **5/10** · _fill-in_. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
+
+**Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (medium). **Severity:** no data loss, and no security effect — the rule fails *closed*. The cost is a correct refusal the reader cannot act on, and the standing invitation to route around a guard that says no to legitimate work.
+
+**Reproduced 2026-08-05, and the authorship makes it unambiguous.** The coordinator session created a throwaway worktree, committed in it, opened a PR from it, then minutes later ran `git worktree remove <that path>` from its own session and was refused. It was not standing in the worktree, so #1041's toplevel comparison does not fire and is not meant to — that fix establishes *"this IS the tree you are standing in"* and deliberately claims nothing about the converse. Here the caller **created** the tree in the same conversation, so the refusal is not merely unproven, it is acting on a worktree with no other user at all. The worktree was still on disk at the time of filing, because the session correctly declined to route around the deny.
+
+**A signal exists, but NOT the one this item first claimed — read this before designing anything.** `scripts/coord/occupancy.ps1` provides `Get-WorktreeOccupancy`, `Get-WorktreeOccupants` (with `-IncludeNested`), `Get-NestedWorktrees` and `Get-ContainingWorktrees`, and `scripts/worktree/prune-merged.ps1` uses them as a *fence* before removing worktrees, re-reading immediately before acting. The first version of this item concluded from that: *"the project already accepts this signal as sufficient to gate a deletion"*. **That is true of the COMBINATION and false of the occupancy lookup alone, and the difference is the whole design.**
+
+Measured on a live `-Apply` run, 2026-08-05: of 24 candidates, **signal 1 (occupancy) vetoed 0**. All 16 skips came from signal 2, the git-metadata age rule — 14 *"recently active"*, 2 *"not merged"*. Measured independently from the session that filed this item, at the same time: the fence reported `Available = True`, reported 5 of 42 worktrees occupied, and placed **0** occupants in `MessageFoundry-gate-deferrals` — the worktree that session was demonstrably live in, having committed to it a minute earlier. That is the script's own disclosed blind spot: *a session writing into a worktree by absolute path from elsewhere*, which it puts at 29% of writes on this repo.
+
+**So the load-bearing half is the 36-hour age rule, not the occupancy lookup.** A design that vendors only `Get-WorktreeOccupancy` inherits the half that measured 0 of 24, and under the fail-closed constraint below that is the worse half to choose: it returns a confident *"unoccupied"* for a tree that was being written to a minute ago. Whatever is built must carry the age rule too, or the fail-closed requirement is carried by nothing. Rule 3d remains the one place making this decision with neither.
+
+**Why this is difficulty 5 and not 2, which is the whole reason it is a separate item.** The gate cannot simply dot-source that file. `install-gate.ps1` copies `scripts/hooks/worktree_gate.ps1` to `%USERPROFILE%\.claude\hooks\`, **outside every working tree**, precisely so a session cannot edit the thing enforcing against it. An installed hook can therefore load nothing from a checkout — the same constraint that forced `ConvertTo-WorktreeSlug` to be gate-local rather than shared. So the options are all structural, and none is free:
+
+1. **Vendor the occupancy read into the gate.** Fastest, and creates a second definition of what "occupied" means that can drift from `occupancy.ps1` silently — the hazard this repo already records for its banner alphabet and for two-parsers-of-one-rule generally.
+2. **Have the installer copy `occupancy.ps1` alongside the hook.** Keeps one source, but widens the installed surface that rule 1a must protect, and introduces a version skew between an installed helper and the checkout it came from.
+3. **Read a materialised occupancy artifact** rather than compute one — the registry the roster already writes under `.git/mefor-coord/`. No code shared, but it is a cache, and a stale cache that reports *unoccupied* fails **open** on the one decision where failing open deletes someone's work.
+
+Option 3's failure direction is the deciding constraint and should be stated before anyone starts: **whatever is built must fail CLOSED.** If occupancy cannot be determined, the answer is refuse, not allow. `prune-merged.ps1` already encodes exactly this — it skips a candidate when its fence becomes unavailable rather than proceeding.
+
+**Scope, so this does not quietly become "rewrite rule 3d".** The decision to refuse an occupied worktree does not change. What changes is that an **unoccupied** one becomes actionable — either allowed, or refused with a remedy the caller can actually execute rather than "ask the user". Nothing here touches rules 1, 1a, 1b, 3, 3b or 3c.
+
+**A cheaper interim was proposed here and WITHDRAWN, because it fails on this item's own reproduction case.** The proposal was to have the deny name `prune-merged.ps1`'s exact invocation rather than the general `worktree list`, on the grounds that it is dry-run-by-default and already consults occupancy. Measured: `prune-merged.ps1` builds its candidate set by a **literal prefix on the repo root** (`$_.Path.StartsWith("$RepoRootFwd-")`), so a candidate must live at `<repo-parent>/<repo-name>-<something>`. The worktree this item cites as its evidence is at `<repo-parent>/mf-banner1032` — a registered worktree of the same `.git`, confirmed present in `git worktree list --porcelain`, but carrying no such prefix (the repo directory is not named `mf`), so it is **not in the candidate set at all**. The refused caller would be sent to a tool that reports nothing about their tree: an unactionable refusal replaced by a different unactionable refusal, failing precisely on the case that motivated the item.
+
+Anyone reviving an interim must therefore either state the prefix precondition out loud, pass the leaf explicitly, or pick a different tool. Recorded rather than deleted because the proposal is the obvious one and the next reader will have the same idea.
+
+**Related:** #1041 (the false premise in the same rule, fixed — this is the gap it deliberately left), #1039 (the same shape one level up: deferring to a guard whose availability was never checked), #1000 (whatever is built here needs a negative control proving it can still refuse), #308.
+
+**Source:** identified 2026-08-05 while building #1041, from noticing that the reported third sighting was **not** an instance of what #1041 fixes. Filed separately rather than folded in, because citing it as evidence for the toplevel comparison would have claimed coverage that fix does not have — the same defect class the item was about, inside its own fix.
+
+## 1059. Shell variable indirection defeats the worktree gate's path resolution, so the primary is reachable
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **8/10** · Difficulty **6/10** · _do it_. The gate resolves paths **as literal strings**. A path that arrives through a shell variable cannot be resolved, so the rule falls back to the session's own cwd — a linked worktree, which is correctly exempt — and **allows** a command that will act on the shared primary. `cd <primary> && git reset --hard` is denied; `D=<primary>; cd $D && git reset --hard` is allowed. Same target, same effect, one variable.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development, not anything shipped. But it is a **live control**: measured against the INSTALLED hook that governs every worktree on this machine, not only against source.
+
+**Measured 2026-08-05 against the installed gate** at `~/.claude/hooks/worktree_gate.ps1`, sha256 `BE113C20CDE5`, `GateVersion 2026.08.05.2` — the copy actually enforcing at the time of filing. Payloads were fed to the hook directly; **none of these git commands were executed.**
+
+| command (session cwd = a linked worktree) | verdict |
+| --- | --- |
+| `cd <primary> && git reset --hard` | DENIED |
+| `cd <primary> ; git reset --hard` | DENIED |
+| `cd <primary>` newline `git reset --hard` | DENIED |
+| `D=<primary>; cd $D && git reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C $D reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C ${D} checkout main` | **ALLOWED** |
+
+The literal spellings are all caught, including the newline form. Only the indirection escapes, and it escapes in the direction that matters.
+
+**This is the exact scenario rule 3 was written for.** Its own comment records that a sibling session ran a tree-swapping command in the shared primary and *"every other session's files silently became a different commit's files"*. The rule closes the spelling that caused it and not the class.
+
+**Found by accident, which is the part that raises the priority.** It surfaced while a session ran ordinary cleanup — `D=<path>` then `cd "$D"` then a `git checkout` — and got a deny naming the WRONG worktree: the rule resolved the target to the session's cwd because it could not expand `$D`. So the same defect already produces confusing false positives in the benign direction. No adversarial intent is required to reach it; `cd "$VAR"` is how shell is ordinarily written, and an agent composing a multi-step command will hit it.
+
+**Scope: the SHELL rules only.** Rules 3, 3b, 3c and 3d read a command string and must infer which tree it touches. Rule 1 / 1a / 1b take `file_path` from the tool input, which is a real path and never a shell expression, so they are unaffected. Any fix belongs at the shared resolver (`Get-GitTargetCandidatesRaw` / `Get-ComparablePath`), not in each rule.
+
+**Why difficulty 6 rather than 2: a hook cannot evaluate shell.** It receives a string before execution and has no interpreter, no environment, and no way to know what `$D` holds — it may be set in an earlier line, exported by a profile, or computed. Chasing expansion is a losing game, so the options are all uncomfortable:
+
+1. **Fail closed on unresolvable path positions.** If a git command's target position contains `$`, backtick or `%…%`, refuse and say why. Simple, auditable, and consistent with the day's other conclusion that a needless deny beats a missed hijack. Cost is real: `cd "$D"` is idiomatic, so this will fire on legitimate work and must therefore say precisely what to do instead (use a literal path), or it will be routed around.
+2. **Resolve simple same-command assignments.** Parse `NAME=value` earlier in the same string and substitute. Catches the common case and gives a **false sense of coverage** for every other case — the worst property a guard can have, and the one #1000 exists to name.
+3. **Judge after expansion instead of before.** Not available to a PreToolUse hook by construction. Recorded so nobody spends time rediscovering it.
+
+**Recommendation, offered not decided: option 1, and it deserves an ADR rather than a patch,** because it trades measurable friction for closure and that is a judgement about how the gate is lived with, not a correctness question. Whatever is chosen needs a negative control per #1000 — the control must show the guard going red on the variable spelling, and **staying green** on a literal path inside the session's own worktree, or it will have been made unusable rather than safe.
+
+**Do not fix by widening the deny to any command containing `$`.** Rule 3 already scopes tightly to verbs that swap or discard a tree, and the gate's own comments record that over-broad rules get routed around and then guard nothing.
+
+**Related:** #1000 (a green that is not evidence — this one is green because it cannot see), #1039 ("git will refuse this" is a claim about a configuration; here the gate's claim is about a *spelling*), #1041 and #1057 (same rule family, refusal accuracy), #308.
+
+**Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
+
+## 1060. `alloc.ps1` records the owning worktree from the current directory, so an absolute-path invocation misattributes it
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/alloc.ps1:51` takes the owner from `git rev-parse --show-toplevel`, which resolves against the **current directory** rather than the script's location. Invoke it by absolute `-File` path from a different worktree — which is how a session with several worktrees naturally calls it — and the allocation is recorded to the caller's worktree while the commit comes from another. The ledger gate then refuses that commit correctly, but far away from the cause and with a message about the wrong thing.
+
+**Cluster:** Session coordination / ledger integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss and no security effect — the ledger gate **fails closed**, which is why this is a friction defect and not a correctness one. Nothing invalid lands; a valid commit is refused.
+
+**Reproduced 2026-08-05, twice, by accident.** A session ran `pwsh -NoProfile -File <abs>/scripts/coord/alloc.ps1 -Kind backlog` from worktree A while intending to commit from worktree B. `alloc/backlog/1058.json` recorded `"worktree": "<...>/trusting-wu-c2e6d5"`. The commit from `MessageFoundry-gate-deferrals` was then refused: *"BACKLOG item #1058 was not allocated to this worktree"* — true, unhelpful, and pointing at the allocator rather than at the invocation. Re-running with the shell actually inside the target worktree produced `1059.json` with the right owner and the commit went through. **#1058 is an abandoned hole**, which is the sanctioned outcome (`alloc.ps1`'s own docstring: *holes are free, collisions are not*).
+
+**The fix is small and there are two defensible shapes.** Either derive the repo from `$PSScriptRoot` so the allocator is anchored to the checkout it lives in — matching what `new.ps1` and `remove.ps1` already do — or keep the cwd behaviour and **say so at the point of use**, printing the recorded worktree in the `ALLOCATED` output so the mismatch is visible immediately rather than at commit time. The second is weaker but nearly free, and the two compose. Prefer anchoring: an allocator invoked by absolute path is being told which checkout to act on, and it should not then consult a different one.
+
+**Do not fix by making the ledger gate more lenient.** Its refusal is correct and is the only reason this was noticed at all. The defect is that ownership was recorded wrongly, not that it was enforced.
+
+---
+
+**THE SHARED PREMISE, which is larger than this item and is why it is worth reading here.** Three independent mechanisms in this repo assume, silently, that **where a command runs is where the caller is**:
+
+- **This item.** `alloc.ps1` resolves the owner from the current directory, not from the path it was handed.
+- **#1059.** The worktree gate resolves a command's target as a literal string against the session's cwd, so a path arriving through a shell variable falls back to the caller's own worktree — and a command aimed at the shared primary is allowed.
+- **#1057.** `occupancy.ps1` places sessions by cwd, so it cannot see a session writing into a worktree by absolute path from elsewhere. Measured on this repo: **0 occupants reported for a worktree that had been committed to a minute earlier.**
+
+`occupancy.ps1` already discloses the rate: **a session acting on a worktree by absolute path from elsewhere is 29% of writes on this repo**, by the project's own measurement. So the premise is not merely unstated, it is false about one write in three.
+
+**All three fail silently, and all three fail in the benign-looking direction** — a deny naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a worktree in active use. None raises. Each looks like a working answer.
+
+**All three were found by accident, none by looking**, which is the part that should not be trusted. Three instances is a coincidence-sized sample, and the honest next step is a targeted sweep for the shape — anything resolving a target from `--show-toplevel`, `getcwd`, or an unqualified relative path *when it was handed an explicit one* — which either produces a fourth concrete instance or shows three was the whole set. That is deliberately **not** filed as a theme item: "three mechanisms share a premise" has no fix and no closing condition, and would sit open describing something true. The premise is also recorded in [`docs/WORKTREES.md`](WORKTREES.md), so it outlives this item's closure.
+
+**Related:** #1059 (the gate instance, and the severe one), #1057 (the occupancy instance), #1000 (all three are green because they cannot see).
+
+**Source:** found 2026-08-05 while filing #1059, when the ledger gate refused a commit whose number had just been allocated successfully. Filed as the concrete defect rather than as the pattern, on the argument that a near-duplicate of an already-owned class dilutes the ledger — the same argument this session used earlier to decline filing a sibling to #1000.
+
+## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **9/10** · Difficulty **3/10** · _do it_. `git -C <primary-absolute> config core.hooksPath /dev/null` is DENIED. `git -C ../../.. config core.hooksPath /dev/null` is **ALLOWED** — same command, same target, relative spelling. That disarms `core.hooksPath` for the **shared clone**, i.e. the ledger, claim and secret-leak commit gates for every worktree at once, which is verbatim what rule 3c's own deny text says it exists to prevent. It requires no shell variable and no intent: `../../..` is the natural way to name the repo root from `<primary>/.claude/worktrees/<x>`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live fail-open in an enforcement control**, measured on the installed hook, and it is the highest-severity gate defect found to date.
+
+**Verified independently by two sessions against the same installed hook** (`~/.claude/hooks/worktree_gate.ps1`, sha256 `be113c20cde5…`). Neither session executed any `git config` command; only read-only primitives and the hook itself were run.
+
+| from a linked worktree | verdict |
+| --- | --- |
+| `git -C <primary-absolute> config core.hooksPath /dev/null` | DENIED |
+| `git -C ../../.. config core.hooksPath /dev/null` | **ALLOWED** |
+| `cd ../../.. && git config core.hooksPath /dev/null` | **ALLOWED** |
+
+**The mechanism, both primitives measured:**
+
+```
+git -C <primary> rev-parse --git-common-dir   ->  ".git"                      RELATIVE
+git -C <linked>  rev-parse --git-common-dir   ->  "C:/.../MessageFoundry/.git"  absolute
+[IO.Path]::GetFullPath('.git','../../..')     ->  THROWS  "Basepath argument is not fully qualified"
+[IO.Path]::GetFullPath('.git',<abs primary>)  ->  "C:\...\MessageFoundry\.git"  (control: works)
+```
+
+`worktree_gate.ps1:557` calls `Get-ComparablePath $common $where[0]` — passing the **target token as written** as the canonicalisation base. With a relative target the base is non-rooted, `GetFullPath` throws, the catch returns `""`, `$commonCmp` is empty, neither branch of the roots loop matches, and `if (-not $govCfg) { continue }` falls through to ALLOW.
+
+**Scoped to the PRIMARY by construction**, because only the primary's common dir comes back relative — a linked worktree returns an absolute path and denies correctly. That narrows the hole without redeeming it: the primary is the one checkout whose hooks protect everybody.
+
+**This is a miss, not a design choice, and the function's own header proves it.** `Get-ComparablePath`'s comment at `:128-133` states the principle correctly — a relative path must resolve against the **session's** cwd — names `../../..` from `<primary>/.claude/worktrees/<x>` as the exact spelling, records that it was already measured once, and even says *"GetFullPath throws on a non-rooted base, which the catch turns into 'not governed'"*. The sibling call at `:680` applies it correctly using `$cwdRaw`. Line 557 is the one call site that did not get the fix.
+
+**DO NOT APPLY THE OBVIOUS ONE-TOKEN FIX — it is wrong and it looks right.** Changing `:557` to `Get-ComparablePath $common $cwdRaw` fails: `$common` is `.git` relative to the **target directory**, not to the session's cwd. Resolving it against `$cwdRaw` yields `<session-worktree>/.git` — a real path that is *not* the primary's common dir — so the roots comparison still misses and the result is still ALLOW, now for a second and harder-to-see reason. The gate would appear fixed and stay open.
+
+**The correct shape is two steps: canonicalise the TARGET first, then the common dir against it.**
+
+```powershell
+$targetAbs = Get-ComparablePath $where[0] $cwdRaw    # relative target -> absolute, vs the SESSION cwd
+$commonCmp = Get-ComparablePath $common $targetAbs   # ".git" -> absolute, vs the TARGET
+```
+
+The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` returns exactly the primary's `.git`. **And it must FAIL CLOSED when `$targetAbs` is empty.** An unresolvable path currently means "not governed", which is precisely how this got through; the fix must not preserve that property.
+
+**No test covers it, and the test gap is the same shape as the defect.** The three rule-3c cases in `tests/test_worktree_gate_control_plane.py` all issue a bare `git config …` with **no path token**, so none of them can fail on a path-token defect. Green, and blind to the class. Any fix needs a case per spelling — absolute (denies today), relative (must deny after), and a linked-worktree target (must keep denying, so the fix is not merely a widening).
+
+**Related:** #1059 (the shell-variable bypass of the same resolver — **distinct**, because #1059's proposed fix of refusing on `$` in a target position leaves a literal `../../..` untouched), #1060 and #1057 (the cwd-is-not-the-caller cluster; this one is *not* an ambient-cwd defect — the hook process cwd was measured equal to the payload cwd), #1000 (a gate green because its tests cannot see the class).
+
+**Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
