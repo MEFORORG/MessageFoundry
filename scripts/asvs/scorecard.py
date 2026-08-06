@@ -19,8 +19,12 @@ public repo can unit-test it against a fixture while the vault runs it against t
 from __future__ import annotations
 
 import argparse
+import ast
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import tomllib
 from collections import Counter
 from dataclasses import dataclass, field
@@ -102,11 +106,43 @@ class Absence:
     Do NOT derive ``mutation`` from ``pattern``. A value generated from the thing it validates
     satisfies the check by construction, which would make this the most authoritative-looking vacuous
     gate in the file — the same defect class it exists to close, arriving through the fix.
+
+    ``mutation_path`` and ``observable`` feed the ``--prove-absences`` mode (:func:`prove_absences`),
+    which closes a mode the pattern check cannot see: a ``mutation`` that matches its pattern, whose
+    control speaks and whose corpus is quiet, yet **changes nothing observable when applied** — a
+    reintroduction raised into a swallowing handler, a field nobody reads, a flag nobody branches on.
+    ``re.search(pattern, mutation)`` proves the mutation is *well-formed*; it never proves it *bites*.
+
+    - ``mutation_path`` — the file the reintroduction lands in, relative to ``root``.
+    - ``observable`` — the named artifact that must go red when the mutation is applied: a
+      ``tests/test_x.py::test_y`` pytest node id. When both fields are set the mode PROVES the claim
+      by execution — it runs the observable on a scratch copy of the tree (baseline must be green),
+      applies the mutation, and requires the observable to FAIL (and to fail as a test failure, not a
+      collection/usage error, which fails closed). When only ``mutation_path`` is set the mode falls
+      back to a coarse static backstop.
+
+    Both fields default empty, and their absence means **"not yet proven by execution"** — never
+    "proven vacuous". They are opt-in per claim because a live proof spawns a pytest subprocess per
+    claim; a claim with neither field is reported as SKIPPED, not failed.
+
+    Honest limits of the proving mode, stated so they are not overclaimed:
+
+    - Application is **append-based**: the mutation text is appended to the scratch target, so it
+      breaks a fixture by *redefinition shadowing*. That faithfully reddens a well-formed
+      reintroduction in a fixture; it does not reproduce every in-function reintroduction a real claim
+      might describe.
+    - The static backstop is a **coarse same-file heuristic** — a ``raise`` in the mutation landing
+      lexically in a ``try`` whose every handler swallows (bare/``Exception``, log-only body). It
+      proves **nothing** in general: it cannot see a swallow in a *caller* rather than at the landing
+      site, so it would miss the very cross-file instance that motivated this item. It is a screen,
+      not a proof, and must not be written up as one.
     """
 
     pattern: str
     positive_control: str
     mutation: str
+    mutation_path: str = ""
+    observable: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,6 +179,13 @@ class Findings:
     checked_anchors: int = 0
     checked_absences: int = 0
     skipped_anchors: int = 0
+    #: Populated only by :func:`prove_absences`. ``proved_absences`` counts claims whose observable
+    #: went red under the applied mutation (a live proof); ``static_screened`` counts claims that took
+    #: the static backstop (a screen, not a proof); ``skipped_absences`` counts claims carrying no
+    #: ``mutation_path`` (nothing to apply). UNPROVEN and PROVE-ERROR outcomes go into ``problems``.
+    proved_absences: int = 0
+    static_screened: int = 0
+    skipped_absences: int = 0
 
     @property
     def ok(self) -> bool:
@@ -271,6 +314,12 @@ def load_scorecard(path: Path) -> list[Cell]:
                         # No default. A missing mutation must be authored, not inferred — see the
                         # Absence docstring on why deriving one from the pattern is worse than none.
                         mutation=str(a["mutation"]),
+                        # Optional, and deliberately NOT refused at load. A hard requirement here would
+                        # void every already-authored absence claim (none carry these yet), and their
+                        # re-authoring is out of this script's reach (ADR 0156 §7). Absent means "not
+                        # yet proven by execution", surfaced by --prove-absences, not "proven vacuous".
+                        mutation_path=str(a.get("mutation_path", "")),
+                        observable=str(a.get("observable", "")),
                     )
                     for a in raw.get("absence", [])
                 ),
@@ -429,6 +478,244 @@ def _python_sources(root: Path) -> list[Path]:
 def _grep_count(pattern: str, files: list[Path]) -> int:
     rx = re.compile(pattern)
     return sum(1 for f in files if rx.search(f.read_text(encoding="utf-8", errors="replace")))
+
+
+# --- proving an absence by mutation (--prove-absences) --------------------------------------------
+#
+# check_absences proves a mutation is well-formed (its pattern fires on it). It cannot prove the
+# mutation BITES: applied, does anything observable go red? A reintroduction raised into a swallowing
+# handler passes every check in check_absences and changes nothing. This mode closes that hole by
+# EXECUTING the claim — mutate a scratch copy of the tree, run the named observable, require it to go
+# red — and it fails closed on every code that is not an honest test failure, so a typo'd node or an
+# already-red observable can never masquerade as "the control bit". The whole pass runs inside a
+# TemporaryDirectory scratch copy, so it never mutates `root` and never trips the committed-tree scan
+# on itself.
+
+
+def _scratch_ignore(dirpath: str, names: list[str]) -> set[str]:
+    """Names to skip when copying `root` into the scratch tree. Beyond the usual VCS/venv/cache noise
+    this refuses secrets and posture data — ``.env*``, ``*.db`` and its WAL sidecars (the local
+    store), and the vault's ``docs/security`` tree (ADR 0156 §7). The vault runs this module against
+    the REAL tree, so a scratch copy carrying those would spill them into a world-default temp dir,
+    which CLAUDE.md §9 forbids this module reading at all. Public-repo runs never see them (no
+    committed ``.env``/``*.db``, ``docs/security`` absent), so this is defence for the vault run."""
+    ignored = set(
+        shutil.ignore_patterns(
+            ".git",
+            ".venv",
+            "__pycache__",
+            "node_modules",
+            ".env",
+            ".env.*",
+            "*.db",
+            "*.db-wal",
+            "*.db-shm",
+        )(dirpath, names)
+    )
+    # `docs/security` is path-specific, not a basename glob: skip a `security` entry only directly
+    # under `docs`, leaving any unrelated `security` elsewhere in the tree copied.
+    if Path(dirpath).name == "docs" and "security" in names:
+        ignored.add("security")
+    return ignored
+
+
+def _copy_scratch(root: Path, dest: Path) -> Path:
+    """Copy `root` into `dest`, skipping VCS/venv/cache dirs and — defensively, for the vault run —
+    secrets, the local store, and vault posture data (:func:`_scratch_ignore`). Never writes to
+    `root`."""
+    shutil.copytree(root, dest, ignore=_scratch_ignore)
+    return dest
+
+
+def _is_within_tree(rel: str) -> bool:
+    """True only for a repo-relative path with no anchor and no ``..`` component — one that cannot
+    escape the scratch copy when joined onto it. ``mutation_path`` comes from the authored scorecard,
+    so it is untrusted for this purpose: an absolute or ``..``-bearing value is refused, not resolved."""
+    p = Path(rel)
+    if p.is_absolute() or p.anchor:
+        return False
+    return ".." not in p.parts
+
+
+def _apply_mutation(scratch: Path, mutation_path: str, mutation: str) -> None:
+    """Append the reintroduction to the scratch target — redefinition shadowing is what makes a
+    well-formed reintroduction actually break an observable. Never called against `root`."""
+    target = scratch / mutation_path
+    with target.open("a", encoding="utf-8") as fh:
+        fh.write("\n" + mutation + "\n")
+
+
+def _run_node(scratch: Path, node_id: str, python: str, timeout: float) -> int:
+    """Run one pytest node inside the scratch copy and return its exit code.
+
+    Invoked with ``--rootdir <scratch>`` and ``cwd=scratch`` and ``-o addopts=`` so no repo
+    ``conftest``/``pyproject``/addopts leaks into the child run, and ``-p no:cacheprovider`` so it
+    writes nothing back. A timeout is treated as a non-{0,1} code — fail closed, never a proof.
+    """
+    try:
+        proc = subprocess.run(  # nosec B603 B607 - fixed argv, no shell; python is sys.executable, node id is scorecard-authored not shell-interpreted
+            [
+                python,
+                "-m",
+                "pytest",
+                "-q",
+                "--rootdir",
+                str(scratch),
+                "-p",
+                "no:cacheprovider",
+                "-o",
+                "addopts=",
+                node_id,
+            ],
+            cwd=scratch,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124  # non-zero and non-1: fails closed as a PROVE-ERROR, never counted as a proof
+    return proc.returncode
+
+
+def _handler_swallows(handler: ast.ExceptHandler) -> bool:
+    """A handler that catches broadly (bare or ``Exception``/``BaseException``) with a log-only/``pass``
+    body and no re-raise — the shape that eats a reintroduced exception."""
+    caught = handler.type
+    if not (
+        caught is None
+        or (isinstance(caught, ast.Name) and caught.id in {"Exception", "BaseException"})
+    ):
+        return False
+    if any(isinstance(n, ast.Raise) for stmt in handler.body for n in ast.walk(stmt)):
+        return False  # a re-raise is not a swallow
+    return all(isinstance(stmt, (ast.Pass, ast.Expr)) for stmt in handler.body)
+
+
+def _landing_swallows(source: str) -> bool:
+    """True if `source` contains a ``try`` whose EVERY handler swallows (see :func:`_handler_swallows`).
+
+    A coarse same-file heuristic — it proves nothing in general and cannot see a swallow in a caller.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(
+        isinstance(node, ast.Try)
+        and bool(node.handlers)
+        and all(_handler_swallows(h) for h in node.handlers)
+        for node in ast.walk(tree)
+    )
+
+
+def _prove_one(
+    a: Absence,
+    cell_id: str,
+    root: Path,
+    scratch_dir: Path,
+    findings: Findings,
+    *,
+    python: str,
+    timeout: float,
+) -> None:
+    if not a.mutation_path:
+        # Nothing to apply. Reported, not failed: opt-in per claim (a live proof spawns a subprocess).
+        findings.skipped_absences += 1
+        return
+    if not _is_within_tree(a.mutation_path):
+        # mutation_path is authored data. An absolute path or a `..` escape would let _apply_mutation
+        # write outside the scratch copy (and the is_file probe below read outside `root`), defeating
+        # the 'never touches root' guarantee. Refuse it rather than resolve it.
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — mutation_path {a.mutation_path!r} is not a "
+            "repo-relative path inside the tree (it is absolute or contains '..'), so applying the "
+            "mutation could escape the scratch copy"
+        )
+        return
+    target_in_root = root / a.mutation_path
+    if not target_in_root.is_file():
+        findings.problems.append(
+            f"{cell_id}: absence claim PROVE-ERROR — mutation_path {a.mutation_path!r} is not a file "
+            "in the tree, so the mutation cannot be applied"
+        )
+        return
+
+    if a.observable:
+        scratch = _copy_scratch(root, scratch_dir)
+        baseline = _run_node(scratch, a.observable, python, timeout)
+        if baseline != 0:
+            # An already-red or uncollectable observable cannot attribute its red to the mutation.
+            findings.problems.append(
+                f"{cell_id}: absence claim PROVE-ERROR — observable {a.observable!r} is not green on "
+                f"the pristine tree (pytest exit {baseline}); a red or uncollectable baseline cannot "
+                "be attributed to the mutation"
+            )
+            return
+        _apply_mutation(scratch, a.mutation_path, a.mutation)
+        mutated = _run_node(scratch, a.observable, python, timeout)
+        if mutated == 1:
+            findings.proved_absences += 1  # live proof: the control bit
+        elif mutated == 0:
+            findings.problems.append(
+                f"{cell_id}: absence claim UNPROVEN — applying the mutation to {a.mutation_path} left "
+                f"observable {a.observable!r} green (pytest exit 0); the mutation changes nothing the "
+                "control catches, so this claim is syntax without behaviour"
+            )
+        else:
+            # exit 2/3/4/5/...: collection or usage error. NEVER a proof — a typo'd node or a mutation
+            # that merely breaks import must not masquerade as the control biting.
+            findings.problems.append(
+                f"{cell_id}: absence claim PROVE-ERROR — mutated run of {a.observable!r} errored "
+                f"(pytest exit {mutated}) rather than failing; a collection or usage error must not "
+                "count as the control biting"
+            )
+        return
+
+    # Static backstop: mutation_path but no observable. A screen, not a proof (see Absence docstring).
+    findings.static_screened += 1
+    if re.search(r"\braise\b", a.mutation) and _landing_swallows(
+        target_in_root.read_text(encoding="utf-8", errors="replace")
+    ):
+        findings.problems.append(
+            f"{cell_id}: absence claim SUSPECT (static heuristic) — its reintroduction raises into "
+            f"{a.mutation_path}, which has a try/except that swallows (bare or Exception, log-only "
+            "body), so a live raise there may be caught and prove nothing. Supply an `observable` to "
+            "prove it by execution"
+        )
+
+
+def prove_absences(
+    cells: list[Cell],
+    root: Path,
+    *,
+    python: str = sys.executable,
+    timeout: float = 120.0,
+) -> Findings:
+    """Prove each absence claim BITES: apply its mutation to a scratch copy and require its observable
+    to go red. Fails closed on anything that is not an honest baseline-green / mutated-fail pair.
+
+    This is separate from :func:`verify` and opt-in (``--prove-absences``) because it spawns a pytest
+    subprocess per provable claim. It never touches `root`.
+    """
+    findings = Findings()
+    resolved_root = root.resolve()
+    with tempfile.TemporaryDirectory(prefix="asvs_prove_") as td_base:
+        base = Path(td_base)
+        i = 0
+        for c in cells:
+            for a in c.absence:
+                i += 1
+                _prove_one(
+                    a,
+                    c.id,
+                    resolved_root,
+                    base / f"scratch_{i}",
+                    findings,
+                    python=python,
+                    timeout=timeout,
+                )
+    return findings
 
 
 def _sort_key(cell_id: str) -> tuple[int, ...]:
@@ -596,19 +883,58 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     return chr(10).join(lines) + chr(10)
 
 
+def _run_prove_absences(scorecard: Path, root: Path) -> int:
+    """The ``--prove-absences`` entry point: execute-prove every absence claim (see
+    :func:`prove_absences`). Needs no corpus — it applies mutations, it does not grep for patterns."""
+    try:
+        cells = load_scorecard(scorecard)
+    except ScorecardError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2  # could not measure — never 0, never confused with "clean"
+    findings = prove_absences(cells, root)
+    print(
+        f"prove-absences: proved {findings.proved_absences} by mutation; "
+        f"{findings.static_screened} static-screened; {findings.skipped_absences} skipped; "
+        f"{len(findings.problems)} problem(s)"
+    )
+    for p in findings.problems:
+        print(f"  FAIL {p}", file=sys.stderr)
+    return 0 if findings.ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="Verify or render the ASVS scorecard (ADR 0156).")
     ap.add_argument("--scorecard", type=Path, required=True)
-    ap.add_argument("--corpus", type=Path, required=True)
+    # Not required: --prove-absences applies mutations and never greps for patterns, so it needs no
+    # corpus. Verify mode still does; that is enforced after parsing, not by argparse.
+    ap.add_argument("--corpus", type=Path, required=False)
     ap.add_argument(
         "--root", type=Path, default=Path.cwd(), help="tree the evidence anchors point into"
     )
     ap.add_argument("--render", type=Path, help="write the generated CURRENT.md here")
+    # A separate, opt-in mode: prove each absence claim BITES by applying its mutation to a scratch
+    # copy and requiring its observable to go red. Opt-in because it spawns a pytest subprocess per
+    # provable claim; kept out of the default verify path, which stays purely static.
+    ap.add_argument(
+        "--prove-absences",
+        action="store_true",
+        help="execute-prove absence claims (apply mutation to a scratch tree, require observable red)",
+    )
     # NO --anchor-sha injected by CI. The anchor is the commit the EVIDENCE was read on — a property
     # of the assessment, recorded in [scorecard].anchor_commit. Passing ${{ github.sha }} made the
     # rendered file differ on every run, so the drift check could never pass: a gate that cannot go
     # green is as useless as one that cannot go red, and this one shipped that way.
     args = ap.parse_args(argv)
+
+    if args.prove_absences:
+        return _run_prove_absences(args.scorecard, args.root)
+
+    if args.corpus is None:
+        print(
+            "error: --corpus is required to verify the scorecard (only --prove-absences may omit it)",
+            file=sys.stderr,
+        )
+        return 2
 
     try:
         findings = verify(args.scorecard, args.corpus, args.root)
