@@ -17,7 +17,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
+    [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
     [string]$Base = "origin/main",  # forwarded to new.ps1; matches its fetched-remote-tip default
     [string]$Python = "python",

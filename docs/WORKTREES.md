@@ -21,6 +21,10 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with `pip install -e ".[dev,harness]"`.
 Options:
 
+- `-Branch <ref>` — the git branch to reuse or create, when it should differ from `-Name`. `-Name` is
+  the **directory** component and can never contain `/`; `-Branch` is a real refname and can, so a
+  namespaced branch needs both: `-Name my-task -Branch claude/my-task`. Defaults
+  to `-Name`, which is the ordinary case. Validated by `git check-ref-format`, not by a character class.
 - `-Base <ref>` — branch off something other than `origin/main`. If you point it at a local branch
   that lags its upstream, you get a loud warning (it would start the worktree from stale code).
 - `-Sqlserver` — also install the `[sqlserver]` extra.
@@ -54,6 +58,12 @@ scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracke
 
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
+
+`-Name` always names the **directory**. `-DeleteBranch` deletes whichever branch that worktree
+actually has checked out — read from git, not assumed from the directory name, since `-Branch` lets
+the two differ. It deletes losslessly: `git branch -d` first, and the forceful `-D` only after
+re-verifying at that moment that the branch has nothing beyond `origin/main`. A branch holding
+unmerged commits is **kept** and named, with its tip printed so you can act on it deliberately.
 
 ## Prune the finished ones — `prune-merged.ps1`
 
@@ -357,6 +367,21 @@ armed PR is queued against the same files, the first question stops predicting t
 `mf-*.md` files) lives outside the repo and is shared by all sessions. Reads are fine; if two chats
 **write** memory at the same time the last write wins, so coordinate memory updates (or let one chat
 own them).
+
+**WHERE A COMMAND RUNS IS NOT WHERE THE CALLER IS, and tooling here keeps assuming it is.** Much of
+this repo's coordination machinery resolves "which worktree is this about?" from the **current
+directory** — `git rev-parse --show-toplevel`, `getcwd`, an unqualified relative path — even when it
+was handed an explicit path. That assumption is false about **one write in three**: `occupancy.ps1`
+measures a session acting on a worktree by absolute path from elsewhere at **29% of writes on this
+repo**. So `pwsh -File <abs>/scripts/coord/alloc.ps1` run from worktree A while you intend to commit
+from worktree B records A, and `cd "$D" && git ...` is resolved against your session's cwd rather
+than `$D`, because a hook cannot expand a shell variable.
+
+The failure mode is the dangerous one: these read as working answers rather than raising. A refusal
+naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a
+worktree in active use — none of them errors. **So run these tools with the shell actually inside the
+worktree they are about, and prefer literal paths over variables in any command a hook has to
+judge.** Instances: BACKLOG #1057, #1059, #1060.
 
 ## Automatic coordination context (SessionStart hook)
 

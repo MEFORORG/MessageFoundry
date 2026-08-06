@@ -555,7 +555,7 @@ def render_current(cells: list[Cell], *, anchor_sha: str) -> str:
     ]
     if inherited:
         lines += [
-            f"⚠️ **{inherited} cell(s) carry a decided verdict with no `last_verified` date** — "
+            f"WARNING: **{inherited} cell(s) carry a decided verdict with no `last_verified` date** — "
             "inherited from an earlier assessment and never re-verified against the requirement text. "
             "Treat as not-yet-re-verified.",
             "",
