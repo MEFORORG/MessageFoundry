@@ -632,8 +632,16 @@ What to do instead:
         # Is the victim the tree THIS session is standing in? $victimCmp above is the shared COMMON git
         # dir -- every worktree of one repo reports the same value, so it cannot answer this. Resolve
         # both TOPLEVELS instead. A git failure leaves $isSelf false, which keeps the pre-existing text.
+        #
+        # $cwdRaw, NEVER $cwd. $cwd is the Get-ComparablePath form, which is LOWERCASED, and this file
+        # already warns at the top of the rule-3b resolver that every `git -C` must take the raw path:
+        # on a case-sensitive filesystem `git -C /tmp/.../primary-wt` misses the real `.../Primary-wt`.
+        # Written with $cwd first, it passed on Windows (case-insensitive) and failed on the Linux CI
+        # leg, where the lookup returned nothing, $isSelf went false, and BOTH branches emitted the
+        # generic deny -- byte-identical, which is exactly what the non-vacuity test below asserts
+        # against. Platform-masked, and caught only because that test compares the two denies.
         $victimTop = Get-ComparablePath "$(& git -C $victimRaw rev-parse --show-toplevel 2>$null)".Trim()
-        $selfTop = Get-ComparablePath "$(& git -C $cwd rev-parse --show-toplevel 2>$null)".Trim()
+        $selfTop = Get-ComparablePath "$(& git -C $cwdRaw rev-parse --show-toplevel 2>$null)".Trim()
         $isSelf = $victimTop -and $selfTop -and ($victimTop -eq $selfTop)
 
         if ($isSelf) {
