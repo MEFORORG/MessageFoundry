@@ -125,15 +125,28 @@ class Refusal(NamedTuple):
     line: str  # the already-formatted one-line report
 
 
-def _private_paths_in_tip(local_sha: str) -> list[str]:
-    """Paths under a `PRIVATE_TREES` prefix in the tree at `local_sha`; empty if there are none.
+def _private_paths_in_tip(local_sha: str) -> list[str] | None:
+    """Paths under a `PRIVATE_TREES` prefix in the tree at `local_sha`.
 
-    FAILS OPEN, and the two ways it can are worth separating. If git is missing or unusable, or if the
-    object does not resolve, the ref reads as clean -- the guard cannot inspect what it cannot read,
-    and going red on an unreadable object would block every push from any environment where this hook
-    runs outside a work tree. git only ever hands a pre-push hook objects that exist locally, so in
-    the real invocation the unresolvable case does not arise; it is the one tests reach with a
-    synthetic sha.
+    Empty list if there are none; ``None`` if the question could not be ANSWERED. The caller refuses
+    on ``None``.
+
+    FAILS CLOSED, reversing an earlier decision, and the reversal is the point. "There is nothing
+    there" and "I could not look" are different facts, and returning ``[]`` for both is how a guard
+    reports clean without having looked -- the same shape as the shim that printed "THE PUSH GUARD IS
+    OFF" and exited 0 (BACKLOG #1034).
+
+    The previous docstring argued the unreadable case "does not arise" because git only hands a
+    pre-push hook objects that exist locally. That holds for the OBJECT, and it does not cover the
+    other branch: this resolves ``git`` through PATH, while the hook itself is invoked by git through
+    an absolute path. A GUI client (VS Code, GitHub Desktop) can therefore run this hook in an
+    environment where bare ``git`` does not resolve -- ``OSError``, ``[]``, clean, push allowed,
+    nothing printed. That is a realistic silent-off, not a test artifact.
+
+    The cost is real and is stated rather than left to be discovered: a genuinely unreadable object
+    or an environment with no ``git`` on PATH now BLOCKS the push instead of waving it through. The
+    refusal says which of the two happened and names ``--no-verify``, so the stoppage is recoverable
+    in the one situation where it is spurious.
 
     No `-C <dir>`: git runs a pre-push hook from the top of the work tree, so the inherited cwd is
     already the right repository. One `ls-tree` per ref makes this O(refs) subprocesses -- measured on
@@ -152,9 +165,9 @@ def _private_paths_in_tip(local_sha: str) -> list[str]:
             check=False,
         )
     except (OSError, subprocess.SubprocessError):
-        return []
+        return None
     if proc.returncode != 0:
-        return []
+        return None
     return [ln.strip() for ln in proc.stdout.splitlines() if ln.strip()]
 
 
@@ -166,12 +179,21 @@ def _describe(paths: list[str]) -> str:
 
 def main(argv: list[str]) -> int:
     # Escape hatch for the rare legitimate case, distinct from --no-verify so it is greppable in
-    # history and cannot be set by muscle memory. It returns BEFORE every guard, not just the
-    # protected-branch one -- the variable is named for the case that first needed it and disables the
-    # whole hook, which is worth knowing before reaching for it to push one branch.
-    if os.environ.get("MEFOR_ALLOW_DIRECT_PUSH") == "1":
-        print("push_guard: MEFOR_ALLOW_DIRECT_PUSH=1 -- direct push ALLOWED.", file=sys.stderr)
-        return 0
+    # history and cannot be set by muscle memory.
+    #
+    # SCOPED to the protected-branch guard. It used to return here, before every guard, and the
+    # comment said so -- but documenting a fail-open is not closing one, and BACKLOG #1034 lists this
+    # among the adjacent gaps. The variable's NAME is the argument: "allow direct push" is a claim
+    # about where a push lands, so letting it also decide what a push CARRIES is a bypass nobody
+    # asked for. "I mean to push to main" is a decision a human can sensibly make; "I mean to publish
+    # the private security corpus" is not, and one variable must not silently grant both.
+    allow_direct = os.environ.get("MEFOR_ALLOW_DIRECT_PUSH") == "1"
+    if allow_direct:
+        print(
+            "push_guard: MEFOR_ALLOW_DIRECT_PUSH=1 -- protected-branch guard SKIPPED. "
+            "The namespace and content guards still run.",
+            file=sys.stderr,
+        )
 
     refusals: list[Refusal] = []
     for line in sys.stdin:
@@ -181,7 +203,7 @@ def main(argv: list[str]) -> int:
         local_sha, remote_ref = parts[1], parts[2]
         deleting = local_sha.strip("0") == ""
 
-        if remote_ref in PROTECTED:
+        if remote_ref in PROTECTED and not allow_direct:
             what = "DELETE" if deleting else "direct push"
             refusals.append(Refusal("protected", f"{what} to {remote_ref}"))
 
@@ -193,7 +215,16 @@ def main(argv: list[str]) -> int:
         # GUARD B. A deletion has no local tip to inspect, and removing a ref cannot publish anything.
         if not deleting:
             hits = _private_paths_in_tip(local_sha)
-            if hits:
+            if hits is None:
+                refusals.append(
+                    Refusal(
+                        "content",
+                        f"could not inspect the tip tree of {remote_ref} ({local_sha[:12]}) -- "
+                        f"git was unusable or the object did not resolve, so this ref is UNJUDGED "
+                        f"rather than clean",
+                    )
+                )
+            elif hits:
                 refusals.append(
                     Refusal(
                         "content",

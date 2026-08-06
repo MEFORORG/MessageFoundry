@@ -15,6 +15,8 @@ these tests build REAL repos + worktrees.
 
 from __future__ import annotations
 
+import os
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -51,30 +53,86 @@ def shell(command: str, cwd: Path | str, tool: str = "Bash") -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> SimpleNamespace:
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _make_repo(tmp_path: Path, leaf: str) -> SimpleNamespace:
     """A real GOVERNED primary + a linked worktree (on `wt-branch`) + a second branch to hijack onto.
 
     Layout:
-        <tmp>/Primary            main worktree, branch `main`   (listed in repos.txt -> governed)
-        <tmp>/Primary-wt         linked worktree, branch `wt-branch`
+        <tmp>/<leaf>             main worktree, branch `main`   (listed in repos.txt -> governed)
+        <tmp>/<leaf>-wt          linked worktree, branch `wt-branch`
         branch `claude/other-branch` exists but is checked out NOWHERE -- the grabbable "free" branch.
+
+    `leaf` is a parameter because one test needs a primary whose path contains a SPACE: that is what
+    makes the `-File "<path>"` quoting in rule 3b's remediation load-bearing rather than cosmetic.
+
+    The REAL scripts/worktree/new.ps1 and scripts/coord/lock.ps1 are copied in, so the `-File` path
+    the gate prints resolves to the actual script under test rather than a stand-in. lock.ps1 anchors
+    on `git -C $Repo rev-parse --git-common-dir`, so it uses THIS fixture's .git and touches nothing real.
     """
-    primary = tmp_path / "Primary"
+    primary = tmp_path / leaf
     git("init", "-b", "main", str(primary))
     git("config", "user.email", "t@example.com", cwd=primary)
     git("config", "user.name", "t", cwd=primary)
     (primary / "seed.txt").write_text("seed\n", encoding="utf-8")
     git("add", "-A", cwd=primary)
     git("commit", "-m", "seed", cwd=primary)
-    # A branch that exists but is checked out nowhere -- the exact shape of claude/asvs-handoff.
+    # Branches that exist but are checked out nowhere -- the exact shape of claude/asvs-handoff.
     git("branch", "claude/other-branch", cwd=primary)
-    wt = tmp_path / "Primary-wt"
+    git("branch", "claude/second-branch", cwd=primary)
+    wt = tmp_path / f"{leaf}-wt"
     git("worktree", "add", "-b", "wt-branch", str(wt), cwd=primary)
 
-    repos = tmp_path / "repos.txt"
+    for rel in ("scripts/worktree/new.ps1", "scripts/coord/lock.ps1"):
+        dst = primary / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(_REPO_ROOT / rel, dst)
+
+    # Per-leaf, so two fixtures in one tmp_path cannot clobber each other's allowlist -- an unlisted
+    # root makes the gate fail OPEN, which would let a test pass for entirely the wrong reason.
+    repos = tmp_path / f"repos-{leaf.replace(' ', '_')}.txt"
     repos.write_text(f"{primary}\n", encoding="utf-8")
-    return SimpleNamespace(primary=primary, wt=wt, repos=repos, other="claude/other-branch")
+    tip = subprocess.run(
+        ["git", "rev-parse", "claude/other-branch"],
+        cwd=str(primary),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    return SimpleNamespace(
+        primary=primary,
+        wt=wt,
+        repos=repos,
+        other="claude/other-branch",
+        second="claude/second-branch",
+        tip=tip,
+        new_ps1=primary / "scripts/worktree/new.ps1",
+    )
+
+
+@pytest.fixture
+def repo(tmp_path: Path) -> SimpleNamespace:
+    return _make_repo(tmp_path, "Primary")
+
+
+def _run_emitted(line: str, tmp_path: Path) -> subprocess.CompletedProcess[str]:
+    """Run a command the gate PRINTED, verbatim, and report how it actually exited.
+
+    The `exit $LASTEXITCODE` is load-bearing, not tidiness: without it `pwsh -File` returns 0 even
+    when the script it ran died with a parameter-binding error, so every assertion built on the exit
+    code would be vacuously green. `test_the_emitted_command_harness_can_see_a_failure` is the control
+    that keeps this honest -- if someone deletes the exit line, that control goes red rather than the
+    real tests going quietly green.
+    """
+    script = tmp_path / "remediation.ps1"
+    script.write_text(line + " -NoInstall\nexit $LASTEXITCODE\n", encoding="utf-8")
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(script)],
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
 
 
 # ------------------------------------------------------------------ the hijack, in every spelling
@@ -87,6 +145,227 @@ def test_checkout_onto_existing_branch_in_a_linked_worktree_is_denied(
     assert "LINKED WORKTREE" in reason
     assert repo.other in reason
     assert "new.ps1" in reason  # must tell the model how to proceed, not just refuse
+
+
+# --------------------------------------------------- the remediation must RUN, not merely be NAMED
+#
+# The test directly above is why this section exists. It asserts `"new.ps1" in reason` -- and its
+# fixture branch is already `claude/other-branch` -- so it RENDERED the broken command and passed
+# anyway, for the defect's whole life. A test that hard-coded the expected hint string would have been
+# just as blind: the string was never wrong, the RECEIVING CONTRACT rejected it. So nothing about the
+# string can be the assertion. These tests EXECUTE what the gate printed and assert on EFFECTS.
+
+
+_WINDOWS_ONLY = pytest.mark.skipif(
+    os.name != "nt",
+    reason=(
+        "new.ps1 resolves its repo root with Join-Path $PSScriptRoot '..\\..'; PowerShell on Linux "
+        "treats the backslash as a literal filename character, so the script cannot locate itself "
+        "there. Same gate as tests/test_worktree_prune_merged.py."
+    ),
+)
+
+
+def _emitted_new_ps1_line(reason: str) -> str:
+    lines = [ln.strip() for ln in reason.splitlines() if "new.ps1" in ln]
+    assert len(lines) == 1, f"expected exactly one new.ps1 command to test, got {lines}\n{reason}"
+    return lines[0]
+
+
+@_WINDOWS_ONLY
+def test_the_emitted_command_harness_can_see_a_failure(
+    repo: SimpleNamespace, tmp_path: Path
+) -> None:
+    """CONTROL: prove `_run_emitted` reports a non-zero exit before trusting it to report zero.
+
+    A green gate is evidence only if you have shown it can see the failing class. Measured: without
+    the helper's `exit $LASTEXITCODE`, this returns 0 and every execution test below is vacuous.
+    """
+    line = _emitted_new_ps1_line(
+        assert_denied(run_gate(shell(f"git checkout {repo.other}", cwd=repo.wt), repo.repos))
+    )
+    # Replace whatever -Name the gate chose with a value new.ps1 must refuse: a '/' makes it more than
+    # one path component. Done by TOKEN INDEX, so this control neither knows nor restates the slug rule
+    # -- and so it works identically before and after the fix.
+    tokens = shlex.split(line, posix=False)
+    assert "-Name" in tokens, tokens
+    tokens[tokens.index("-Name") + 1] = "has/slash"
+    broken = " ".join(tokens)
+    assert broken != line, f"could not construct the negative case from: {line}"
+    assert _run_emitted(broken, tmp_path).returncode != 0, (
+        "the harness reported success for a command that must fail -- every execution assertion "
+        "in this module is vacuous until this passes"
+    )
+
+
+@_WINDOWS_ONLY
+@pytest.mark.parametrize("leaf", ["Primary", "Pri mary"])
+def test_the_rule_3b_remediation_creates_a_sibling_worktree_on_the_real_branch(
+    tmp_path: Path, leaf: str
+) -> None:
+    """Run the command rule 3b prints, verbatim, and assert what it actually did.
+
+    Both leaves matter and each isolates one defect. `Primary` pins the -Name/-Branch split: against
+    the unfixed gate it dies with "Cannot validate argument on parameter 'Name'". `Pri mary` pins the
+    `-File "<path>"` quoting: an unquoted path with a space makes pwsh exit 64 before -Name is ever
+    bound, so without this leaf the quoting is untested.
+
+    The only token added to the emitted line is ` -NoInstall`, which skips the venv build (minutes of
+    I/O) and touches no argument under test. Every token the gate emitted is executed exactly as
+    emitted, in its emitted order and quoting -- PowerShell's own tokenizer is the receiving parser.
+    """
+    r = _make_repo(tmp_path, leaf)
+    reason = assert_denied(run_gate(shell(f"git checkout {r.other}", cwd=r.wt), r.repos))
+    line = _emitted_new_ps1_line(reason)
+
+    proc = _run_emitted(line, tmp_path)
+    assert proc.returncode == 0, (
+        f"the gate printed a command that FAILS:\n{line}\n{proc.stdout}{proc.stderr}"
+    )
+
+    # Find what was created from git, never from a hard-coded slug.
+    porcelain = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=str(r.primary),
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    paths = [
+        Path(ln[len("worktree ") :].strip())
+        for ln in porcelain.splitlines()
+        if ln.startswith("worktree ")
+    ]
+    created = [p for p in paths if p.resolve() not in (r.primary.resolve(), r.wt.resolve())]
+    assert len(created) == 1, f"expected exactly one new worktree, got {created}\n{porcelain}"
+    made = created[0]
+
+    # SAFETY FENCE, asserted before any other result is trusted: nothing outside tmp_path was touched.
+    assert tmp_path.resolve() in made.resolve().parents, f"{made} escaped tmp_path"
+
+    # SIBLING, not nested -- asserted both ways.
+    assert made.resolve().parent == r.primary.resolve().parent
+    assert r.primary.resolve() not in made.resolve().parents
+
+    def _git(*args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=str(made), check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    # It REUSED the branch rather than forking a new one off origin/main. This is the quiet wrong
+    # success a sanitized -Name would produce: same directory, same exit code, different branch.
+    assert _git("rev-parse", "--abbrev-ref", "HEAD") == r.other
+    assert _git("rev-parse", "HEAD") == r.tip
+
+    # The drift-detector's marker must carry the BRANCH. A directory slug here mismatches the real
+    # HEAD by construction and fires a false hijack warning at every SessionStart, forever.
+    marker = Path(_git("rev-parse", "--absolute-git-dir")) / "mefor-home-branch"
+    assert marker.read_text(encoding="utf-8").strip() == r.other
+
+
+@pytest.mark.parametrize("verb", ["checkout", "switch"])
+def test_a_branch_checked_out_elsewhere_is_left_to_gits_own_guard(
+    repo: SimpleNamespace, verb: str
+) -> None:
+    """`main` is checked out in the primary, so git refuses this switch without us.
+
+    Denying it anyway would print `new.ps1 -Branch main`, which dies with "already checked out at" --
+    another command the receiving side rejects, for the most ordinary shape there is.
+    """
+    assert run_gate(shell(f"git {verb} main", cwd=repo.wt), repo.repos) is None
+
+
+@pytest.mark.parametrize("verb", ["checkout", "switch"])
+def test_ignore_other_worktrees_still_denies(repo: SimpleNamespace, verb: str) -> None:
+    """The flag that turns git's native guard OFF must not inherit the pass given above.
+
+    Measured, for BOTH verbs -- `--[no-]ignore-other-worktrees` is accepted by checkout and switch
+    alike, so covering only one spelling would leave the hole open under the other word:
+
+        git <verb> main                            -> fatal: 'main' is already used by worktree at ...
+        git <verb> --ignore-other-worktrees main   -> Switched to branch 'main'
+
+    That is worse than the case rule 3b was written for: a LIVE worktree loses its branch mid-task,
+    rather than a free branch being grabbed. The general form of the bug is that deferring to a guard
+    you do not own is sound only while that guard is switched on, and its own caller can switch it off.
+    """
+    reason = assert_denied(
+        run_gate(shell(f"git {verb} --ignore-other-worktrees main", cwd=repo.wt), repo.repos)
+    )
+    assert "LINKED WORKTREE" in reason
+
+
+def test_the_emitted_name_is_derived_from_the_branch(repo: SimpleNamespace) -> None:
+    """Two different branches must yield two different directories.
+
+    A gate that emitted a CONSTANT -Name would satisfy every other test here -- the worktree still
+    lands in the right place on the right branch -- while making two concurrent denies collide on one
+    directory, at which point the second session's remediation throws "Worktree path already exists".
+    That is another printed command that cannot run, which is the class this change exists to close.
+    """
+    names = []
+    for branch in (repo.other, repo.second):
+        reason = assert_denied(run_gate(shell(f"git checkout {branch}", cwd=repo.wt), repo.repos))
+        tokens = shlex.split(_emitted_new_ps1_line(reason), posix=False)
+        assert "-Name" in tokens, tokens
+        names.append(tokens[tokens.index("-Name") + 1])
+    assert names[0] != names[1], f"both branches emitted the same -Name: {names}"
+
+
+def test_the_emitted_name_is_always_one_new_ps1_accepts(repo: SimpleNamespace) -> None:
+    """Totality guard that restates NO rule: both halves are read out of the sources themselves.
+
+    The slug function is extracted from the gate via the PowerShell AST; the accept pattern is read
+    off new.ps1's own ValidatePattern via Get-Command (which does not execute the body). Neither is
+    hand-copied here, so this cannot drift out of agreement with what it guards.
+    """
+    gate = _REPO_ROOT / "scripts/hooks/worktree_gate.ps1"
+    probe = r"""
+param([string]$Gate, [string]$NewPs1)
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Gate, [ref]$null, [ref]$null)
+$fn = $ast.Find({
+    param($n)
+    $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'ConvertTo-WorktreeSlug'
+}, $true)
+if (-not $fn) { Write-Error 'ConvertTo-WorktreeSlug not found in the gate'; exit 2 }
+. ([ScriptBlock]::Create($fn.Extent.Text))
+$pat = ((Get-Command $NewPs1).Parameters['Name'].Attributes |
+        Where-Object { $_ -is [System.Management.Automation.ValidatePatternAttribute] }).RegexPattern
+if (-not $pat) { Write-Error 'no ValidatePattern on new.ps1 -Name'; exit 3 }
+$inputs = @('claude/other-branch','a/b/c','---','///','...','.lock','-lead','trail.',"nl`n",
+            [char]0x4E2D + [char]0x6587)
+$inputs += @(git branch --format='%(refname:short)')
+$bad = @()
+foreach ($b in $inputs) {
+    if (-not $b) { continue }
+    $s = ConvertTo-WorktreeSlug $b
+    if ($s -notmatch $pat) { $bad += "$b -> $s" }
+}
+if ($bad) { Write-Output ("NONCONFORMING: " + ($bad -join '; ')); exit 1 }
+Write-Output "checked $($inputs.Count) inputs against $pat"
+"""
+    script = repo.primary / "totality.ps1"
+    script.write_text(probe, encoding="utf-8")
+    proc = subprocess.run(
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(script),
+            "-Gate",
+            str(gate),
+            "-NewPs1",
+            str(repo.new_ps1),
+        ],
+        cwd=str(_REPO_ROOT),
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert proc.returncode == 0, f"{proc.stdout}{proc.stderr}"
+    # Non-vacuity: a pass must mean "checked", not "found nothing to check".
+    assert "checked" in proc.stdout, proc.stdout
 
 
 def test_switch_onto_existing_branch_in_a_linked_worktree_is_denied(repo: SimpleNamespace) -> None:

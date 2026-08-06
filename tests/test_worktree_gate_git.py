@@ -180,6 +180,35 @@ def test_naming_the_primary_in_an_unrelated_argument_is_allowed(
     )
 
 
+def test_a_git_verb_inside_the_coordination_dir_still_swaps_the_primary(
+    tmp_path: Path, repos_file: Path
+) -> None:
+    """Why rule 1's coordination exemption lives in rule 1 and NOT in ``Test-Governed``.
+
+    ``<primary>/.git/mefor-coord/`` is exempt from rule 1, because a write there lands in the shared
+    git dir and not in the primary's working tree. The obvious refactor is to put that exemption in
+    ``Test-Governed`` beside the ``.claude/worktrees/`` one, whose shape is identical. That would open a
+    real bypass: rule 3 feeds the SESSION'S cwd through the same helper, and a git verb run from inside
+    the coordination directory resolves GIT_DIR to the primary and swaps the tree every other session is
+    standing in. Rule 1 judges a write TARGET; only rule 1 may exempt this path.
+
+    The ``-C`` spelling is the one that proves the deny is STRUCTURAL rather than a lucky hit from the
+    in-text fallback: an explicit ``-C`` is authoritative about which repository git acts on, so it sets
+    ``$anyInferredTarget`` false and disables that fallback entirely."""
+    primary = tmp_path / "Repo"
+    coord = f"{primary}/.git/mefor-coord"
+    nested = primary / ".claude" / "worktrees" / "alerts"
+
+    # resolved from a `cd` in the prefix ...
+    assert_denied(run_gate(shell(f"cd {coord} && git reset --hard", cwd=nested), repos_file))
+    # ... from the session's cwd ...
+    assert_denied(run_gate(shell("git reset --hard", cwd=coord), repos_file))
+    # ... and with the fallback switched off, which is the load-bearing case
+    assert_denied(run_gate(shell(f'git -C "{coord}" reset --hard', cwd=nested), repos_file))
+    # a read from there is still fine, as everywhere else
+    assert run_gate(shell("git status", cwd=coord), repos_file) is None
+
+
 def test_stepping_into_the_primary_still_denies_however_it_is_spelled(
     tmp_path: Path, repos_file: Path
 ) -> None:

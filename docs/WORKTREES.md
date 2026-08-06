@@ -21,6 +21,10 @@ a new branch `alerts` (off `origin/main`, the freshly fetched remote tip — so 
 can't seed it), then bootstraps `..\MessageFoundry-alerts\.venv` with `pip install -e ".[dev,harness]"`.
 Options:
 
+- `-Branch <ref>` — the git branch to reuse or create, when it should differ from `-Name`. `-Name` is
+  the **directory** component and can never contain `/`; `-Branch` is a real refname and can, so a
+  namespaced branch needs both: `-Name my-task -Branch claude/my-task`. Defaults
+  to `-Name`, which is the ordinary case. Validated by `git check-ref-format`, not by a character class.
 - `-Base <ref>` — branch off something other than `origin/main`. If you point it at a local branch
   that lags its upstream, you get a loud warning (it would start the worktree from stale code).
 - `-Sqlserver` — also install the `[sqlserver]` extra.
@@ -54,6 +58,12 @@ scripts\worktree\remove.ps1 -Name alerts -Force     # discard uncommitted tracke
 
 The untracked `.venv` / `node_modules` are expected and removed automatically; only uncommitted
 **tracked** changes block removal (unless `-Force`).
+
+`-Name` always names the **directory**. `-DeleteBranch` deletes whichever branch that worktree
+actually has checked out — read from git, not assumed from the directory name, since `-Branch` lets
+the two differ. It deletes losslessly: `git branch -d` first, and the forceful `-D` only after
+re-verifying at that moment that the branch has nothing beyond `origin/main`. A branch holding
+unmerged commits is **kept** and named, with its tip printed so you can act on it deliberately.
 
 ## Prune the finished ones — `prune-merged.ps1`
 
