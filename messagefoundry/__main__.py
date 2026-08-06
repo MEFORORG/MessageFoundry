@@ -1107,12 +1107,31 @@ def _serve(args: argparse.Namespace) -> int:
     if effective_root is not None and not Path(settings.store.path).is_absolute():
         settings.store.path = str(effective_root / settings.store.path)
 
-    # Fail closed: with auth disabled the API answers as a full-privilege system identity, so a
-    # non-loopback bind would publish admin access to the network. Loopback is the only no-auth posture.
-    if not settings.auth.enabled and not settings.api.is_loopback:
+    # THE SINGLE DEFINITION of "this instance is exposed" (BACKLOG #326): an off-loopback bind OR a
+    # declared upstream TLS terminator. Hoisted here so its earliest consumer — the auth-off arm just
+    # below (BACKLOG #1013) — can read it; the full rationale (why not `serve_ui`, why deliberately
+    # narrow) sits at the MFA-at-exposure gate that was its original first consumer. Defined ONCE: a
+    # second copy is exactly how the ASVS 11.7.1 and 6.3.3 arms once disagreed about the same boot (#326).
+    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
+
+    # Fail closed: with auth disabled the API would answer as a full-privilege system identity, so any
+    # exposed instance would publish admin access to the network with no authentication at all. Exposure
+    # is EITHER a non-loopback bind OR a declared upstream TLS terminator on a loopback bind — the same
+    # `instance_exposed` the MFA-at-exposure gate consults (BACKLOG #1013: this arm previously keyed on
+    # the bind alone, so an auth-off PHI instance behind a declared terminator would have started
+    # silently on first deployment). A true loopback posture with no declared terminator is the only
+    # place no-auth may run.
+    if not settings.auth.enabled and instance_exposed:
+        exposure_desc = (
+            f"non-loopback host {settings.api.host!r}"
+            if not settings.api.is_loopback
+            else "loopback host behind a declared TLS-terminating reverse proxy "
+            "([api].tls_terminated_upstream)"
+        )
         print(
-            "error: refusing to serve with [auth] enabled=false on non-loopback host "
-            f"{settings.api.host!r}; enable auth or bind 127.0.0.1",
+            f"error: refusing to serve with [auth] enabled=false on {exposure_desc}; the API would "
+            "answer as a full-privilege system identity with no authentication. Enable auth or bind a "
+            "loopback host with no declared terminator.",
             file=sys.stderr,
         )
         return 2
@@ -1891,9 +1910,10 @@ def _serve(args: argparse.Namespace) -> int:
                 file=sys.stderr,
             )
 
-    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326). Derived here, above the first
-    # consumer, from two fields no earlier arm reassigns — `is_loopback` and `tls_terminated_upstream`
-    # are read straight off the loaded config and are never mutated in place, unlike `serve_ui`.
+    # THE SINGLE DEFINITION OF "this instance is exposed" (BACKLOG #326) is derived above, before the
+    # auth-off arm (BACKLOG #1013) that also consumes it, from two fields no earlier arm reassigns —
+    # `is_loopback` and `tls_terminated_upstream` are read straight off the loaded config and are never
+    # mutated in place, unlike `serve_ui`.
     #
     # WHY IT CANNOT READ `settings.api.serve_ui`: that field is flipped to False IN PLACE twice above —
     # the ADR 0143 soft-degrade when the console wheel is absent, and the ADR 0143 auto-degrade when a
@@ -1914,7 +1934,6 @@ def _serve(args: argparse.Namespace) -> int:
     # cleared for exactly this input — a DEFAULT-on console plus a set `public_origin` — so on the
     # commonest shape of this posture it does not print at all. Citing it as the compensating control
     # would have rested that control on a premise measurement contradicts.
-    instance_exposed = not settings.api.is_loopback or settings.api.tls_terminated_upstream
 
     # MFA-at-exposure posture (sec-mfa-on; WP-14, ASVS 6.3.3): an off-loopback bind serving local
     # accounts puts admin authentication on the network, where a single password factor is far weaker.
