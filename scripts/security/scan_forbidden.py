@@ -167,6 +167,44 @@ def _is_skipped(posix: str) -> bool:
 
 
 # --------------------------------------------------------------------------------------------------
+# LOCATION detectors. Everything else in this file judges a file by its BYTES; these judge it by where
+# it sits, and a file matching one is a hit whatever it contains.
+#
+# Why this class needs its own detector, measured 2026-08-05: the private security corpus is prose
+# about THIS repo -- threat models, ASVS assessments, remediation plans -- so it carries no customer
+# name, no site code, no IP, and no secret. A token scanner is the wrong instrument for it and reports
+# clean by working correctly. Against the 89-document vault corpus the content detectors would have
+# missed 55 of them.
+#
+# ``docs/security/`` is gitignored (.gitignore:144) and lives only in the private vault clone, so on
+# the ordinary path nothing here ever fires. It is aimed at the path .gitignore cannot cover: a branch
+# created from a fetched vault ref delivers those files inside a commit TREE, never through the index,
+# so no ignore rule is ever consulted and the working tree ends up carrying them legitimately-tracked.
+#
+# Deliberately narrow. ``docs/reviews/`` and ``docs/marketing/`` are gitignored too, but they are
+# gitignored for tidiness rather than because publishing them would hand an attacker a map, and a
+# detector that cries wolf gets deleted. Add an entry here only with the reason it is a LEAK.
+FORBIDDEN_PATHS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (
+        re.compile(r"(?:^|/)docs/security/"),
+        "private security document -- docs/security/ is vault-only and must never reach the public repo",
+    ),
+)
+
+
+def forbidden_path_reason(posix: str) -> str | None:
+    """Why this PATH is forbidden, or ``None``.
+
+    Matched unanchored on purpose: a vendored or relocated copy (``ide/docs/security/x.md``) is the
+    same leak as the top-level one, and anchoring to ``^`` would wave it through.
+    """
+    for pattern, reason in FORBIDDEN_PATHS:
+        if pattern.search(posix):
+            return reason
+    return None
+
+
+# --------------------------------------------------------------------------------------------------
 # Token authority (EXTERNALIZED -- never committed). These module globals are (re)computed by
 # ``reload_tokens()`` and read by the anonymizer leak-check bridges (messagefoundry/anon/leak.py and
 # tee/anon/leak.py) as the single source of truth, so their names/shapes are a stable public contract.
@@ -747,6 +785,13 @@ def scan_file(path: Path, rel_posix: str | None = None, *, show_context: bool = 
     posix = rel_posix if rel_posix is not None else path.as_posix()
     if _is_skipped(posix):
         return []
+    # LOCATION before content, and deliberately before the binary/unreadable early-return below: a
+    # forbidden path is a hit whatever its bytes are, and a PDF or an image under docs/security/ is
+    # exactly as much of a leak as the markdown beside it. Reported at line 0 because the finding is
+    # the path itself and there is no line to point at -- the reason names the file, not a location
+    # inside it. Scanning stops here; content hits on a file that must not exist add nothing.
+    if reason := forbidden_path_reason(posix):
+        return [f"{path}:0: {reason}"]
     text = _read_text(path)
     if text is None:
         return []
