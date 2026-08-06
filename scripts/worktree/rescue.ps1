@@ -20,7 +20,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[A-Za-z0-9._-]+$')]
+    # \A..\z for the reason given in new.ps1's param block; keep all four copies identical.
+    [ValidatePattern('\A[A-Za-z0-9._-]+\z')]
     [string]$Name,
     [switch]$NoInstall,
     [switch]$Sqlserver

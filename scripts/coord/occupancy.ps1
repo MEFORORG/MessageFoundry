@@ -55,7 +55,8 @@
     every surface (the Desktop app's own session tooling lists just what it spawned). The match is
     purely path-based, so the launching surface is irrelevant to it.
 
-    NESTED WORKTREES. `EnterWorktree`/new.ps1 put worktrees at <checkout>/.claude/worktrees/<slug>, so
+    NESTED WORKTREES. `EnterWorktree` puts worktrees at <checkout>/.claude/worktrees/<slug> (new.ps1
+    makes SIBLINGS, <repo-parent>/<repo-name>-<Name>), so
     a worktree can live INSIDE another one. Get-WorktreeOccupancy attributes a session to the LONGEST
     matching worktree, which is right for a roster (report the innermost checkout) and wrong for a
     destructive caller: a session in the nested tree does not then veto its ANCESTOR, whose --force
