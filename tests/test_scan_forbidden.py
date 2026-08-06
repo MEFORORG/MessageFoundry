@@ -174,6 +174,75 @@ def test_scan_file_clean_text_has_no_hits(sf, tmp_path: Path) -> None:
     assert sf.scan_file(p) == []  # bare competitor name is intentionally allowed
 
 
+# --- LOCATION detector: a file judged by where it sits, not by its bytes -----------------------------
+# The private security corpus is prose ABOUT this repo -- threat models, ASVS assessments, remediation
+# plans -- so it carries no customer name, no site code, no IP and no secret. Every content detector
+# above reports it clean by working correctly. These tests cover the only rule that can see it.
+
+
+def test_a_file_under_docs_security_is_flagged_by_its_path_alone(sf, tmp_path: Path) -> None:
+    """Content is deliberately innocuous: the PATH is the entire finding."""
+    p = tmp_path / "threat-model.md"
+    p.write_text("A generic engine doc about HL7 routing.\n", "utf-8")
+    assert sf.scan_file(p) == []  # same bytes, ordinary location -> clean
+
+    hits = sf.scan_file(p, "docs/security/threat-model.md")
+    assert len(hits) == 1, hits
+    assert "docs/security/" in hits[0]
+    assert ":0:" in hits[0], "a path-level finding has no line to point at and must say so"
+
+
+def test_the_path_detector_fires_on_a_binary_file_too(sf, tmp_path: Path) -> None:
+    """The interaction with ``test_scan_file_skips_binary``, which is why the check runs BEFORE the read.
+
+    A PDF or a diagram under docs/security/ is exactly as much of a leak as the markdown beside it, and
+    the content scanner drops binaries unread. Ordering the location rule after that read would have
+    made every non-text file in the corpus invisible -- the widest possible hole in a leak gate.
+    """
+    p = tmp_path / "diagram.pdf"
+    p.write_bytes(b"\x00\x01\x02 not text at all")
+    assert sf.scan_file(p) == []  # binary in an ordinary location is still skipped
+    assert len(sf.scan_file(p, "docs/security/diagram.pdf")) == 1
+
+
+def test_a_relocated_copy_under_docs_security_is_still_flagged(sf, tmp_path: Path) -> None:
+    """Unanchored by design: a vendored or moved copy is the same leak as the top-level one."""
+    p = tmp_path / "x.md"
+    p.write_text("clean\n", "utf-8")
+    assert len(sf.scan_file(p, "ide/docs/security/x.md")) == 1
+
+
+def test_the_path_detector_does_not_flag_ordinary_paths(sf, tmp_path: Path) -> None:
+    """NEGATIVE CONTROL. A rule that flagged everything would pass every test above and be useless.
+
+    ``scripts/security/`` is the sharp one: the scanner's own source and this test file both live
+    under a directory whose name contains "security", and a rule written as a bare substring would
+    flag the gate itself on every run -- the kind of self-trip that gets a detector deleted.
+    """
+    p = tmp_path / "x.md"
+    p.write_text("clean\n", "utf-8")
+    for rel in (
+        "scripts/security/scan_forbidden.py",
+        "tests/test_scan_forbidden.py",
+        "docs/SECURITY.md",
+        "docs/securityish/x.md",
+        "docs/reviews/x.md",
+        "messagefoundry/auth/security.py",
+    ):
+        assert sf.scan_file(p, rel) == [], f"{rel} must not be flagged by the location rule"
+        assert sf.forbidden_path_reason(rel) is None, rel
+
+
+def test_the_location_rule_list_is_not_empty(sf) -> None:
+    """Guard the rule source. An empty FORBIDDEN_PATHS makes every assertion above vacuous, and unlike
+    the token list this one is NOT externalized -- it ships in the file, so absence is a defect."""
+    print(f"location rules: {[p.pattern for p, _ in sf.FORBIDDEN_PATHS]}")
+    assert sf.FORBIDDEN_PATHS, "no location rules compiled -- the path detector is decoration"
+    assert sf.forbidden_path_reason("docs/security/x.md"), (
+        "the shipped rule set does not flag docs/security, which is the class it exists for"
+    )
+
+
 # --- reasons-only in-memory scan (the importable scan_text contract) ---------------------------------
 
 

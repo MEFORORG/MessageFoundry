@@ -389,15 +389,31 @@ def test_the_installer_wires_the_push_guard() -> None:
     assert "Remove-Item -LiteralPath $prePush" in src, "-Uninstall must remove the push guard"
 
 
-def test_the_shim_fails_open_when_python_is_absent_and_says_so() -> None:
-    """NOT a change request -- a pinned statement of the widest bypass in the whole mechanism.
+def test_the_shim_fails_CLOSED_when_python_is_absent() -> None:
+    """This test previously pinned the OPPOSITE, and the reversal is the point of this branch.
 
-    The installed ``.git/hooks/pre-push`` exits 0 with a message when neither ``python`` nor
-    ``python3`` resolves. Every guard in push_guard.py is off in that state, and the only evidence is
-    one line on stderr in the middle of git's own push output. Naming it here keeps "the push guard
-    ran and permitted this" distinguishable from "the push guard did not run", which is the
-    distinction a green result silently collapses.
+    It read: "NOT a change request -- a pinned statement of the widest bypass in the whole mechanism",
+    and it was right about the bypass. The installed ``.git/hooks/pre-push`` exited 0 when neither
+    ``python`` nor ``python3`` resolved, so every guard in push_guard.py was off and the only evidence
+    was one line on stderr in the middle of git's own push output. That is BACKLOG #1034, and pinning
+    it is what made it a decision rather than a discovery -- this test did its job and is now
+    collecting on it.
+
+    Naming the bypass kept "the push guard ran and permitted this" distinguishable from "the push
+    guard did not run". Failing closed removes the need to distinguish them: the second state no
+    longer permits anything.
+
+    Asserted here as a STRING property of the generator, which is all this module can see. The real
+    coverage is in tests/test_installed_coord_hooks.py, which parses the here-string, reads the
+    interpreter-resolution branch specifically, and EXECUTES the shim body under sh with an empty PATH
+    to check the exit code git would actually act on -- a text scan proves the source says exit 1, not
+    that the branch is reached.
     """
     src = _INSTALLER.read_text(encoding="utf-8")
-    assert "THE PUSH GUARD IS OFF for this push" in src
-    assert "exit 0" in src
+    assert "THE PUSH GUARD IS OFF for this push" not in src, (
+        "the fail-open notice is back in the generated shim -- BACKLOG #1034 has regressed"
+    )
+    assert "the push guard cannot run" in src, "the shim no longer explains why it is refusing"
+    assert "REFUSING this push" in src, "the shim does not refuse when it cannot run"
+    # The way forward has to be named, or a fail-closed gate gets "fixed" by deleting it.
+    assert "--no-verify" in src
