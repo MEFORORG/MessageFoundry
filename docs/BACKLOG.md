@@ -5639,3 +5639,25 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 **Related:** #1057, #1059, #1060 (the cwd-is-not-the-caller cluster — this is its fourth instance and the only one on product code), #1000 (a required check green because it read the wrong directory), ADR 0050 AC-6, ADR 0092.
 
 **Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
+
+## 1064. Rule 3d assumes its target is a linked worktree, but the primary is a registered worktree too, so removing it by a relative path is allowed
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _do it_. Rule 3d resolves its victim's common dir with `Get-ComparablePath $victimCommon $victimRaw` (`worktree_gate.ps1:625`) — the **same construct, against the same kind of base**, that #1061 has just been fixed for in rule 3c. `$victimRaw` is the path token as written, so a relative target makes `GetFullPath` throw on a non-fully-qualified base, the catch returns `""`, no governed root matches, and the rule falls through to ALLOW.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development.
+
+**What is VERIFIED, by reading the code:** `worktree_gate.ps1:623-625` builds `$victimCmp` exactly as rule 3c built `$commonCmp` before #1061, and the same base-is-not-a-base mechanism applies. `rev-parse --git-common-dir` answers relative to the target, so a target that reports `.git` combined with a non-fully-qualified `$victimRaw` cannot resolve. This is a code fact, not an inference about behaviour.
+
+**What is RELAYED, NOT CONFIRMED:** the #1061 implementation pass reported measuring `git worktree remove <relative-primary>` as **ALLOW**. This filing does **not** restate that as measured. An attempt to reproduce it here was refused by the permission layer with the owner away, and it was not retried or routed around. **Confirm it before acting on the severity**, and treat the number above as provisional until then.
+
+**The rule's own premise is what is wrong, and that part needs no measurement.** The rule was written believing its target is always a *linked* worktree — which is why the relative-path hole looked scoped away, exactly as #1061's did. **The primary is itself a registered worktree**: it is the first row of `git worktree list`. So "the target is a linked worktree, and linked worktrees report an absolute common dir" is false as a general statement about what can arrive here.
+
+**Do not close this by arguing git would refuse anyway.** git does refuse to remove a main working tree — and #1041 is precisely the precedent for why that is not a defence: *a rule cannot defer to a guard that runs only after it has already decided.* A PreToolUse hook decides whether anything reaches git at all, so git's refusal never happens and the premise is never tested. #1041 was filed and fixed for that exact reasoning in this same rule. Reinstating it one line down would be the same error twice.
+
+**The fix is the shape #1061 already landed**, and it should reuse the helper rather than grow a second one: root the victim against `$cwdRaw` with `Get-FullPathRaw` first, hand **that** to `git -C`, then resolve the common dir against the rooted absolute path — and distinguish "the target could not be resolved" (deny) from "git says this is not a repository" (allow), which is the substance of #1061 rather than its arithmetic.
+
+**Tests must assert the asymmetry, per #1000, or they cannot tell which layer does the work.** Three cases minimum: an absolute target that denies today and must keep denying; a relative target that must deny after; and a linked-worktree target that must **keep** denying, proving a correction rather than a widening. Note that every existing rule 3d test supplies an absolute path, which is why none of them can fail on a path-token defect — the identical blind spot that let #1061 ship.
+
+**Related:** #1061 (the same construct in rule 3c, fixed — this is its sibling), #1041 (the *"git will refuse it"* premise in this very rule, already retired once), #1057 (rule 3d's missing occupancy signal), #1000 (a control green because it cannot see the class it covers), #1059/#1060/#1063 (the cwd-is-not-the-caller cluster).
+
+**Source:** found 2026-08-06 while fixing #1061, by the implementation pass checking whether the defect it was closing had siblings. Filed separately rather than folded into #1061 so the fix carries its own asymmetry tests and its own measurement, and so the unconfirmed half is visible rather than inherited.
