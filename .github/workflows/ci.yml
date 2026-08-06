@@ -139,9 +139,69 @@ jobs:
       # contradictions, no duplicates — is satisfied just as easily by scanning a remnant of the corpus
       # as the whole of it. Without a floor, a change that stopped the archive being read would go green.
       # Raise the number when the total legitimately grows; it must never be lowered to make CI pass.
+      # ⚠️ THE FLOOR LIVES IN TWO PLACES AND NOTHING COMPARES THEM: here, and `_MIN_TOTAL_ITEMS` in
+      # tests/test_backlog_status_check.py. Raise BOTH, or the lower one becomes the only floor that
+      # binds. Found on 2026-08-05 at 277 against a corpus of 300 — 23 items of accumulated slack, in a
+      # guard whose entire purpose is to notice the corpus shrinking.
       - name: Backlog status invariant (ungated — see above)
         if: runner.os == 'Linux'
-        run: python scripts/docs/backlog_status_check.py --min-items 277
+        run: python scripts/docs/backlog_status_check.py --min-items 300
+
+      # THE SAME ARGUMENT, ONE STEP FURTHER — and the evidence is from 2026-08-04.
+      #
+      # Ten `*_doc_drift` / `docs_*` modules exist to police documents, and every one of them is
+      # reachable ONLY through pytest, which is gated on `code == 'true'` two steps below. So on a
+      # docs-only PR — the exact shape they exist to check — none of them runs. That is the same defect
+      # the status invariant above was added to fix, at ten times the surface.
+      #
+      # It is not hypothetical. On 2026-08-04 four docs-only PRs merged (#197, #198, #200, #201) and the
+      # doc guards ran on none of them. Two carried citation errors found only by reading: an ADR named
+      # ONE inbound citation of `docs/releases/` where there are 23 (12 via `docs/releases/...`, 15 via
+      # relative `(releases/...`, and neither grep form alone finds them all), and a `docs/SECURITY.md`
+      # route-table row asserted a refusal `DELETE /me/mfa` does not make.
+      #
+      # WHY A SEPARATE MINIMAL INSTALL instead of ungating the install below. Unlike the status
+      # invariant, these modules import the package (`config.settings`, `config.models`,
+      # `parsing.binary`, `auth.service`) and one imports `fastapi.routing`, so they cannot run on
+      # stdlib alone. But they need NO extras — fhir/dicom/x12/xml are irrelevant to a doc scan — so a
+      # docs-only PR pays a base editable install and ~5s of tests rather than the full extras install.
+      # The gated steps below are deliberately UNTOUCHED, so a code PR is byte-identical to before.
+      #
+      # ⚠️ 89 of these tests SKIP here and that is structural, not a gap to fix in this step:
+      # `tests/test_threat_model_doc_drift.py` asserts against `docs/security/THREAT-MODEL.md`, which is
+      # vault-only and absent from this tree. ADR 0156 records that class (six `*_doc_drift` modules
+      # assert against documents `git ls-files docs/security/` shows are not present) and ASVS 15.1.3 is
+      # open on it. 152 assertions DO run, which is the point; do not read the skips as coverage.
+      # `[dev]` and not a bare `pip install pytest`, and this is NOT belt-and-braces. pyproject sets
+      # `asyncio_mode = "auto"` (needs pytest-asyncio) and `addopts = "--timeout=60
+      # --timeout-method=thread"` (needs pytest-timeout), so a bare pytest ERRORS on an unknown option
+      # before collecting anything — a step that could never pass, reding every docs-only PR. `[dev]` is
+      # the canonical "can run this suite" extra and pins both plugins; it is still far lighter than the
+      # gated install below, which adds console + fhir + dicom + x12 + xml that no doc scan touches.
+      # `--constraint constraints.lock` for the same DEP-1 reason every other install here carries it.
+      - name: Install (minimal — for the doc guards on a docs-only PR)
+        if: runner.os == 'Linux' && needs.changes.outputs.code != 'true' && github.event_name == 'pull_request'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]" --constraint constraints.lock
+
+      - name: Doc guards (ungated — the docs-only blind spot; see above)
+        if: runner.os == 'Linux' && needs.changes.outputs.code != 'true' && github.event_name == 'pull_request'
+        run: |
+          # PRINT WHAT IS SCANNED BEFORE RUNNING IT. A list that silently shrinks is how this class of
+          # guard goes quiet, and `-rs` names every skip rather than letting one read as a pass.
+          echo "doc guards, docs-only PR — scanning these modules:"
+          printf '  %s\n' tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
+            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
+            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
+            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
+            tests/test_backlog_status_check.py
+          pytest -q -rs \
+            tests/test_asvs_file_surface_doc_drift.py tests/test_cloud_phi_hipaa_doc_drift.py \
+            tests/test_crit2_inline_doc_drift.py tests/test_doc_ref_handle.py tests/test_docs_db_grants.py \
+            tests/test_docs_runbooks.py tests/test_docs_security_pathways.py tests/test_security_doc_drift.py \
+            tests/test_security_doc_rate_limits.py tests/test_threat_model_doc_drift.py \
+            tests/test_backlog_status_check.py
 
       # PySide6's offscreen platform plugin needs a few system libraries even
       # headless. Linux-only; Windows runners need no equivalent.

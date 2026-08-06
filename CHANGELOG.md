@@ -106,6 +106,21 @@ All notable changes to MessageFoundry are documented here. The format follows
   Tracked as **BACKLOG #316**. Options considered and declined: an audited opt-out switch, and
   documenting the weakness without changing the gate.
 
+### Security
+- **The web console's message editor would have opened the raw body to a custom role holding
+  `messages:edit` without `messages:view_raw`.** `GET /ui/messages/{id}/edit` and
+  `POST /ui/messages/{id}/edit-resend` gated on `messages:edit` alone, while the JSON handler they
+  call in-process (`GET /messages/{id}`, `require_phi_read(messages:view_raw)`) has its own gate
+  skipped by that direct call — so the console re-asserted a *different* permission than the one it
+  stood in for. Both verbs now require **both** permissions and fail closed on either, and both charge
+  the per-actor PHI-read budget (`require_ui_step_up` gained `phi=`). Custom-role minting is
+  deliberately unchanged: `messages:edit` is still not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a
+  role meaning "may resubmit, must not read" remains mintable — it simply cannot open an editor that
+  displays the body it edits. **Who this would bite:** a deploying org whose admin had minted such a
+  custom role; that role would have exceeded its stated scope (HIPAA minimum-necessary) on first
+  deployment. No built-in role reaches it — `ADMINISTRATOR` and `OPERATOR` grant both permissions —
+  and every such read was already audited. ([BACKLOG #324](docs/BACKLOG.md))
+
 ### Fixed
 - **A CR/LF inside an exception message could forge a whole log line on the text sink.**
   `ControlCharScrubFilter` escaped only the rendered message, and `logging.Formatter` appends a record's

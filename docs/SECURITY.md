@@ -210,7 +210,7 @@ under `create_app()` (they sum to 88, not 87, because `GET /messages/export` req
 | `MESSAGES_VIEW_RAW` | `messages:view_raw` | **PHI** | 4 | the whole message body: `GET /messages/{id}`, `/attachments/{id}`, `/outbound`, `/messages/export`; also the per-property switch for the captured-reply `body` |
 | `MESSAGES_REPLAY` | `messages:replay` | | 2 | `POST /dead-letters/replay`, `POST /messages/{id}/replay` |
 | `MESSAGES_RESEND` | `messages:resend` | | 1 | `POST /messages/{id}/resend` — resend a stored body to an **alternate** outbound (ADR 0090) |
-| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 1 | `POST /messages/{id}/edit-resend`. The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. That implication is a convention, **not enforced**: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role may hold it alone, and `GET /ui/messages/{id}/edit` renders the raw body on that permission |
+| `MESSAGES_EDIT` | `messages:edit` | **PHI** | 1 | `POST /messages/{id}/edit-resend`. The edited body **is** PHI, so it **implies** `messages:view_raw` **for the built-in roles** — every built-in role granting it also grants view_raw. **Minting** does not enforce that implication and deliberately still does not: `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role holding it alone stays mintable. The **console editor** enforces it at the gate instead (BACKLOG #324) — `GET /ui/messages/{id}/edit` and `POST /ui/messages/{id}/edit-resend` require `messages:view_raw` **as well**, and fail closed on either, because the editor displays the body it edits |
 | `MESSAGES_EXPORT` | `messages:export` | **PHI** | 1 | `GET /messages/export` — the **largest PHI egress surface**; a capability distinct from `view_raw` (bulk ≠ opening one message), and the route requires **both** plus step-up |
 | `MESSAGES_PURGE` | `messages:purge` | | 1 | `POST /connections/{name}/purge` |
 | `CONNECTIONS_CONTROL` | `connections:control` | | 3 | `POST /connections/{name}/start`, `/stop`, `/restart` |
@@ -253,8 +253,9 @@ inheritance — where a permission came from is invisible downstream.
 
 An Operator therefore reaches **five PHI-marked capabilities beyond viewing one message** — counted
 straight off the catalogue's PHI column, minus the two that *are* viewing one message
-(`messages:view_summary`, `messages:view_raw`): edit-and-resubmit (`messages:edit`, which renders the
-full raw body at `GET /ui/messages/{id}/edit` on that permission alone), bulk raw export
+(`messages:view_summary`, `messages:view_raw`): edit-and-resubmit (`messages:edit`, whose console
+editor renders the full raw body at `GET /ui/messages/{id}/edit` — a route that requires
+`messages:view_raw` alongside it, so the grant does not reach the body on its own), bulk raw export
 (`messages:export`), the redacted log tail (`logs:view`), and the two PHI-touching uploaded-file
 capabilities (`files:upload`, `files:browse`). `files:delete` is **not** in that count: it destroys
 PHI, it does not emit it, and the catalogue leaves its PHI column empty. A Viewer holds no PHI-field
@@ -326,7 +327,7 @@ tuple: they act only on the caller's own account.
 | `GET` | `/me/mfa` | `require` | |
 | `POST` | `/me/mfa/enroll` | `require_reauth_only_action` (action `mfa_enroll`) | password-only step-up — the MFA gate is skipped so a required-but-unenrolled user cannot deadlock |
 | `POST` | `/me/mfa/confirm` | `require_reauth_only_action` (action `mfa_confirm`) | per-actor ceremony limiter; password-only step-up |
-| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | refused when it would remove the last factor while MFA is required |
+| `DELETE` | `/me/mfa` | `require_step_up_action` (action `mfa_disable`) | step-up bound to the disable action (current factor + a fresh password). ⚠️ **No last-factor guard** — this is the TOTP path (`disable_mfa`), and it does **not** refuse when it would leave the account with zero enrolled factors. The passkey removal path does refuse; see BACKLOG #1022 for the asymmetry |
 | `GET` | `/me/sessions` | `require` | |
 | `GET` | `/me/security-events` | `require` | |
 | `DELETE` | `/me/sessions/{session_id}` | `require_reauth_only` | password-only step-up |
@@ -422,7 +423,7 @@ tuple: they act only on the caller's own account.
 |---|---|---|---|---|
 | `GET` | `/messages` | `messages:read` | `require_phi_read` | per-property redaction; `messages:view_summary` unlocks `summary`/`error`/`metadata`; per-channel scope |
 | `GET` | `/messages/search` | `messages:read` | `require_step_up` | explicit `enforce_phi_read_hop` + `enforce_phi_read_pacing` (a bulk-selecting GET) |
-| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the only two-permission route **on the JSON plane** (`GET /ui/alerts` is the console's); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
+| `GET` | `/messages/export` | `messages:export` **+** `messages:view_raw` | `require_step_up` | the only two-permission route **on the JSON plane** (the console plane has its own — see the [`/ui` route map](#the-ui-console-plane-serve_uitrue)); explicit PHI-read hop + pacing; streams NDJSON, bypassing the response models |
 | `GET` | `/messages/{message_id}` | `messages:view_raw` | `require_phi_read` | per-property redaction of the wrapper **and** each nested `OutboxInfo`/`EventInfo` |
 | `GET` | `/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_phi_read` | raw attachment bytes |
 | `GET` | `/messages/{message_id}/responses` | `messages:read` | `require_phi_read` | the reply **body** additionally needs `messages:view_raw`, enforced inline at the route |
@@ -467,14 +468,17 @@ PHI on the wire: the twelve message/search rows above marked PHI (`/messages`, `
 them carry an explicit PHI-read hop refusal + per-actor budget; the other four (`/search/presets` × 3
 and `POST /uploads/{id}/resend`) return no body content of their own.
 
-**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **nine more** emit PHI:
+**With the console served** (`serve_ui=True` — the deployed posture for a console-served instance) **at least ten more** emit PHI. ⚠️ **This is deliberately not a closed enumeration**, per CLAUDE.md §11: a fixed count is a liability that the next PHI-emitting route silently falsifies, and this one already was — it read "nine more" and omitted `POST /ui/messages/{id}/edit-resend`, whose `_reject` arm re-renders both the pristine `core.get_message` detail and the operator's edited `raw_value`. **The authority is the code, not this list:** a `/ui` route emits PHI if it renders a message body, and the ones that charge the per-actor read budget are exactly those passing `phi=True` to `require_ui` or `require_ui_step_up` (`messagefoundry_webconsole/_auth.py`). Known today:
 `GET /ui/messages`, `/ui/messages/{id}`, `/ui/messages/{id}/parse-tree`,
-`/ui/messages/{id}/attachments/{id}`, `/ui/messages/{id}/edit`, `/ui/messages/search`,
-`/ui/messages/search/layered`, `/ui/dead-letters` and `/ui/uploaded-logs/file/{file_id}`. Note
-`GET /ui/messages/{message_id}/edit`: it gates on `messages:edit` **alone** and renders the full
-message detail. The catalogue's "implies `messages:view_raw`" for `messages:edit` is a **built-in-role
-convention, not an enforced rule** — `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so
-a custom role may hold it without `messages:view_raw` and still read the raw body through that route.
+`/ui/messages/{id}/attachments/{id}`, `/ui/messages/{id}/edit`, `POST /ui/messages/{id}/edit-resend`,
+`GET /ui/messages/search`, `/ui/messages/search/layered`, `/ui/dead-letters` and
+`/ui/uploaded-logs/file/{file_id}` — of which the three search/upload routes carry **no** read budget (BACKLOG #1025). Note
+`GET /ui/messages/{message_id}/edit`: it renders the full message detail, so it requires
+`messages:view_raw` **as well as** `messages:edit` and fails closed on either (BACKLOG #324). The
+catalogue's "implies `messages:view_raw`" for `messages:edit` remains a **built-in-role convention,
+not a minting rule** — `messages:edit` is not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`, so a custom role
+holding it alone is still mintable; on a deploying instance that role would be refused the editor
+rather than shown a body its permission set does not authorize.
 
 #### The `/ui` console plane (`serve_ui=True`)
 
@@ -543,8 +547,8 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/messages/search/presets/{preset_id}/delete` | `messages:read` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}` | `messages:view_raw` | `require_ui` |
 | `GET` | `/ui/messages/{message_id}/attachments/{attachment_id}` | `messages:view_raw` | `require_ui` |
-| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit` | `require_ui_step_up` |
-| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit` | `require_ui_step_up` |
+| `GET` | `/ui/messages/{message_id}/edit` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
+| `POST` | `/ui/messages/{message_id}/edit-resend` | `messages:edit`**+**`messages:view_raw` | `require_ui_step_up` |
 | `GET` | `/ui/messages/{message_id}/parse-tree` | `messages:view_raw` | `require_ui` |
 | `POST` | `/ui/messages/{message_id}/replay` | `messages:replay` | `require_ui_step_up` |
 | `GET` | `/ui/monitoring` | `monitoring:read` | `require_ui` |
@@ -582,8 +586,15 @@ inferred — `POST /ui/connections/bulk-control`, `POST /ui/connections/purge-bu
 | `POST` | `/ui/users/{user_id}/roles` | `users:manage` | `require_ui_step_up` |
 | `POST` | `/ui/users/{user_id}/update` | `users:manage` | `require_ui_step_up` |
 
-`GET /ui/alerts` requires **both** `monitoring:read` and `monitoring:diagnose` — the page renders the
-active-alert census next to the diagnose-only controls, and it fails closed on either.
+**The two-permission `/ui` routes**, each failing closed on either permission:
+
+- `GET /ui/alerts` requires **both** `monitoring:read` and `monitoring:diagnose` — the page renders
+  the active-alert census next to the diagnose-only controls.
+- `GET /ui/messages/{message_id}/edit` and `POST /ui/messages/{message_id}/edit-resend` require
+  **both** `messages:edit` and `messages:view_raw` (BACKLOG #324) — the editor *displays* the body it
+  edits (the textarea, plus the pristine `data-original` copy behind Revert), and the POST's rejection
+  arm re-renders that pristine copy. Reading the body is part of what the editor exercises, not an
+  adjacent capability, so the read permission is required outright rather than implied.
 
 Rows showing *(authenticated session only)* carry no permission: they are the caller's **own**
 account surface (`/ui/account*`, `/ui/security-events`), authorized by session ownership rather than
@@ -619,13 +630,16 @@ else would need its own authorization rule stated here.
    a multipart body cannot survive the re-auth redirect. So a PHI-at-rest write and a PHI
    re-injection are gated on `files:upload` / `files:browse` alone on this plane.
 4. **The ADR 0092 PHI-read hop refusal does not apply on the `/ui` browse routes.**
-   `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; `require_ui(..., phi=True)`
-   applies only the per-actor throttle. So `GET /ui/messages`, `/ui/messages/{message_id}`,
+   `enforce_phi_read_hop` appears nowhere in `messagefoundry_webconsole/`; the console's own gates —
+   `require_ui(..., phi=True)` and `require_ui_step_up(..., phi=True)` — apply only the per-actor
+   throttle. So `GET /ui/messages`, `/ui/messages/{message_id}`,
    `/ui/messages/{message_id}/parse-tree`,
-   `/ui/messages/{message_id}/attachments/{attachment_id}` and `/ui/dead-letters` charge
-   the PHI-read budget but not the posture-keyed refusal that the JSON `require_phi_read` adds. The
-   four inline `enforce_phi_read_hop(request)` call sites (search, export, uploads-browse, layered) DO
-   carry over, so the difference is exactly those five browse routes.
+   `/ui/messages/{message_id}/attachments/{attachment_id}`, `/ui/dead-letters` and the edit pair
+   (`GET /ui/messages/{message_id}/edit`, `POST /ui/messages/{message_id}/edit-resend`) charge
+   the PHI-read budget but not the posture-keyed refusal that the JSON `require_phi_read` adds — at
+   least those; the set is whichever console gates pass `phi=True`, not a fixed list. Where a console
+   route reaches a JSON handler that calls `enforce_phi_read_hop(request)` inline (search, export,
+   uploads-browse, layered), that refusal DOES carry over.
 5. **Three further console routes are weaker than a permission-equivalent JSON route**, each for a
    stated reason: `GET /ui/uploaded-logs` is plain `require_ui` — it mirrors `GET /uploads` (also
    plain `require`), a metadata-only listing, not the step-up'd `GET /uploads/{file_id}/messages`;

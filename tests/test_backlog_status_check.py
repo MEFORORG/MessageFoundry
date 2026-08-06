@@ -170,7 +170,15 @@ _SOURCES = [_ROOT / p for p in bsc.DEFAULT_SOURCES]
 # below) but never deleted. So a total below the count at the time this floor was set means either an
 # item was dropped or — the failure this exists for — a file holding items stopped being scanned.
 # Both are bugs; neither is visible from `errors == []`, which passes happily over a smaller corpus.
-_MIN_TOTAL_ITEMS = 277
+#
+# ⚠️ THIS FLOOR EXISTS IN TWO PLACES AND THEY ARE NOT CROSS-CHECKED. The other is the
+# `--min-items` argument in `.github/workflows/ci.yml`'s "Backlog status invariant" step. Raise BOTH or
+# the lower one silently becomes the only floor that binds — on 2026-08-05 this copy was found at 277
+# while the corpus had reached 300, so 23 items of slack had accumulated unnoticed. That is the same
+# duplicated-constant shape as BACKLOG #1018 (three copies of one scan, nothing comparing them); it is
+# noted rather than mechanised here because a test parsing a workflow YAML to compare an integer is a
+# new coupling, and the honest fix belongs with #1018's helper rather than beside it.
+_MIN_TOTAL_ITEMS = 300
 
 
 @pytest.mark.skipif(

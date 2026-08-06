@@ -5485,3 +5485,197 @@ Nothing caught it because `ide/src/test/suite/ai-policy.test.ts:31-40` tests the
 **Source:** adversarial review of the ADR 0087 sandbox codec, 2026-08-01; confirmed by direct execution of `_partition`.
 
 ---
+
+## 322. Synthetic leak-gate placeholders can collide with the real gate's own guards
+
+> ✅ **BUILT 2026-08-04 — the guidance half only; the “optionally…” half is deliberately NOT built.** Value **2/10** · Difficulty **1/10** · _fill-in_. **Shipped:** a `PLACEHOLDERS IN TRACKED CONTENT` block in the header region of `scan-tokens.local.txt.example`, mirrored in `CONTRIBUTING.md` and `scripts/dev/setup-leak-gate.ps1` — the script now prints the stand-in warning on **both** installs, not just `-Synthetic`, because with the real list a placeholder built from a listed prefix is an actual disclosure rather than a false positive. Three guards in `tests/test_scan_tokens_source.py`, each falsified against a planted defect: the two pure-prose files must be COMPLETELY clean under the synthetic set (not merely site-code-free — naming the synthetic placeholders outright to explain them would block a fork contributor on the very files that document the gate); the `.example` free of both site-code classes, behind a precondition that the detectors are ARMED so the emptiness cannot pass vacuously through the `_NEVER` sentinel; and the header's stated counts must equal what it compiles to **with nothing dropped by the parser** — counts alone are blind to a line that fails to compile and is discarded with only a stderr warning, verified by removing that half and watching an unbalanced-paren line inserted into `[names]` pass every test in the tree. **Three facts in the body below are wrong; the shipped text corrects them rather than copying them.** (1) “a site-code hit, twice” is two OCCURRENCES of ONE detector — `_SITE_CODE_FILE` requires four LITERAL digits and `_SITE_CODE_PATTERN_LITERAL` a quantifier or an x-run, so no single string is both; measured, a placeholder value gives exactly one `site code` hit. The useful consequence is the inverse of the one implied: fixing one form does **not** clear the other, which is the ADR 0030 miss the scanner already records. (2) `<site>` is safe because it is **non-numeric**, not because `_HOME_PATH`'s `(?!<` lookahead exempts it — that lookahead is positional to a `/Users/`-style segment and never reaches the site-code detectors; measured, an angle-bracketed code and an angle-bracketed x-run both fire. (3) Nothing scans a commit message — the hook passes staged FILES and CI runs `--path .` — so the guidance says the opposite: there is no net behind you in a subject line. **NOT built, by lane ruling:** the per-hit reason string naming the loaded set. It would collide with a later wave on `scan_forbidden.py`, which this lane leaves untouched, and the three-state load banner the scanner already prints before any refusal covers the diagnostic need. **Corrected in passing:** `CONTRIBUTING.md` told a synthetic-set contributor their “commits will pass” — measured 2026-08-04 that set produces 649 hits across 120 tracked files, because its placeholders are the fictional customer/partner names the project's own docs and samples use throughout; the bullet now says it is a DIFFERENT detector set and to judge a hit against the run banner. _(was 4/10 · 2/10; the re-score rationale is unchanged and stands in the ranked-table row above.)_
+
+**Cluster:** Security / DX. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
+
+> **This item deliberately does not spell out the offending value.** Writing the prefix, or the prefix followed by four digits, would trip the very detector described — `[site_prefix]` builds *two* patterns from its entry: the prefix plus four digits, **and** the pattern written out as an x-run or quantifier. That recursion is the whole point of the item, so it is demonstrated rather than described.
+
+**What:** while redacting the #321 tokens, the first replacement chosen followed `scripts/security/scan-tokens.local.txt.example`'s own stated convention — that file designates a specific non-real numeric prefix for synthetic use, and the replacement was built from it. Under the **real** token set that value is clean. Under the **synthetic** set it is a site-code hit, twice, and the scan exits 1:
+
+```
+MEFOR_FORBIDDEN_TOKENS=scripts/security/scan-tokens.local.txt.example \
+  python scripts/security/scan_forbidden.py --path $T
+# -> docs/BACKLOG.md:<line>: site code  (x2), exit 1
+```
+
+`scripts/dev/setup-leak-gate.ps1 -Synthetic` is a **documented, supported contributor setup** (the example file calls it so in its own header), and the pre-commit hook passes `--require-tokens`, so it blocks *every* commit — not just ones touching that file. A contributor with no access to the real token list would hit an unexplained hard block on unrelated work. The final commit uses the non-numeric `SITEA` instead, which cannot collide with any numeric detector.
+
+**Why:** the example file's synthetic-prefix guidance is written for the person filling in the **token list**, where it is correct and necessary. But it reads as general guidance for *placeholder values*, and a placeholder written into tracked prose is then scanned by the gate that list configures. The convention is self-colliding for its second audience, and nothing warns you. The same trap caught [#325](BACKLOG.md), whose worked examples had to be rewritten to the exempt `<name>` form for exactly this reason.
+
+**Proposed:** state in `scan-tokens.local.txt.example` (and in the redaction guidance) that a placeholder written **into tracked content** must not use any prefix appearing in `[site_prefix]` in *either* the real or the example set — prefer a non-numeric stand-in (`SITEA`, `<site>`), matching the `<…>` convention `_HOME_PATH` already exempts. Optionally have the scanner's hit message name the loaded set, so a synthetic-set false positive is self-diagnosing rather than reading as a real leak.
+
+**Related:** `scripts/security/scan-tokens.local.txt.example`, `scripts/dev/setup-leak-gate.ps1`, `.pre-commit-config.yaml` (the `--require-tokens` arm), #321.
+
+**Source:** public-repo disclosure audit, 2026-08-01; found by testing the redaction under both token sets before committing `f3c6d348`.
+
+
+---
+
+---
+
+## 334. semgrep, a required blocking gate, scans a two-directory allow-list
+
+> ✅ **Status CLOSED (built 2026-08-04).** `semgrep --config .semgrep --error --metrics off messagefoundry tee` is now `semgrep --config .semgrep --error --metrics off --exclude … .` carrying bandit's exclude set from the same file, name-for-name, so the project's own dangerous-sink rules now cover **59** tracked `.py` files they never saw: `messagefoundry_webconsole/` (33), `scripts/` (24), `docker/` (2). **The body's "56 / 32 / 22" is a stale measurement, not a different scope** — re-measured 2026-08-04 at **339** in-scope files, up from 280. Clean at that bar (0 findings, AST emulation of all five rules); **not run with real semgrep, which has no supported Windows install** — the first CI run on the PR is the real check. `tests/test_lint_scope_parity.py` carries the parity arm the item asked for, plus three assertions it did not: no `--include` (it re-narrows the scan behind a positional `.`, so a targets-only check reads green on this very regression), no `./` prefix on a semgrep `--exclude` (a glob, not a path — and the set comparison normalises `./` off both sides), and `--error` still present (without it the widened gate prints every finding and exits 0). **Every `security.yml:NNN` anchor in the body below has moved** — the command is now at `:449`; the job still starts at `:393`. Two claims elsewhere rested on this item's old state and were corrected in the same commit: ADR 0034's residual row mitigated an unpinned `pip` bootstrap with *"semgrep is **not** a required context"* (it is — `.github/required-contexts.txt:78`), and `docs/Secure_Build_Scorecard_MEFOR.md:56` carried a now-resolved nit about the `.semgrep` header still calling the rules "advisory".
+
+**Cluster:** Security / CI gates. **Priority:** P2. **Verdict:** build. **Severity:** low.
+
+**What:** `.github/workflows/security.yml:413` runs the project SAST gate as an allow-list:
+
+```
+semgrep --config .semgrep --error --metrics off messagefoundry tee
+```
+
+It is a **required merge context** (`.github/required-contexts.txt:78`) and **blocking** (`security.yml:396`). Its sibling on the same file was moved off that shape deliberately — `security.yml:359-360` is `bandit -r .` minus an explicit `--exclude` list, and the rationale at `:348-352` names the failure by name: *"It was `-r messagefoundry tee` while the hook scanned everything except tests/harness/samples — so scripts/ (security tooling, subprocess-heavy) was gated locally and by nothing in CI."* semgrep was never given the same treatment.
+
+Taking bandit's exclude set as the project's own declaration of what SAST is supposed to cover, the delta is **56 tracked `.py` files**: `messagefoundry_webconsole/` (32 files, which ships as its own separately-versioned wheel — `packaging/messagefoundry-webconsole/pyproject.toml:17`, force-included at `:55-58`), `scripts/` (22 — the security tooling the bandit comment was written about), and `docker/` (2). `packaging/`'s 14 files are all tests and are excluded on both sides.
+
+`tests/test_lint_scope_parity.py` is cited at `security.yml:358` as the control that stops this ("fails if this and the hook drift apart again"), and it does hold that line for ruff and bandit — `test_ci_bandit_scans_the_repo_not_an_allow_list` (`:119-125`) asserts `bandit\s+-r\s+\.` against the workflow directly. **The string "semgrep" does not appear anywhere in that file.** There is no semgrep pre-commit hook either, so semgrep is CI-only and that CI-only assertion at `:119` is the exact template a semgrep arm would follow.
+
+**Why:** the honest blast radius is **drift, not exposure** — three things bound it, and the item is worth filing anyway:
+
+1. **Nothing is being missed today.** Grepping `messagefoundry_webconsole/` for every sink the five rules match (`shell=True`, `os.system`, `eval(`, `exec(`, `pickle.`, `marshal.`, `yaml.load(`, `verify=False`) returns **zero** hits. The console makes no outbound HTTP calls of its own — `routes/oidc.py` delegates code redemption to `messagefoundry.auth.oidc`, which *is* scanned.
+2. **bandit is a real compensating control on the same PR.** It is also required (`required-contexts.txt:74`), it does scan all 56 files, and its built-in checks for `exec`/`eval`, pickle/marshal, `yaml.load` and `shell=True` are **not** in the `--skip` list at `:359` (that list is only `B101,B110,B311,B404,B608`). So four of the five rules have overlapping enforcement. *(Confirm the specific bandit check-id mapping before leaning on this in review; the skip list is what was read, not bandit's plugin source.)*
+3. **CodeQL also covers it** — `codeql.yml:55` analyses python repo-wide with `security-extended` (`:66`) and has no paths filter. But it is **deliberately not a required context** (`required-contexts.txt:108-110`: fork-PR tokens lack `security-events: write`), so it is a detector, not a gate.
+
+What is *not* covered is the thing that will grow: `.semgrep/messagefoundry.yml` is where **project-specific** rules land — rules bandit will never ship. A future rule written because of something an operator hit in the console would silently not run on the console. The second step in the same job (`security.yml:414-424`, the ADR 0144 handler-taint rules) is scoped to `samples/config` only, so it does not close this either.
+
+**Correcting the audit that produced this item:** the source finding claimed the five rules "cover exactly the sinks that matter in an HTML-rendering console." They do not — `.semgrep/messagefoundry.yml:5-53` contains no HTML, template, escaping or XSS rule at all. The rules are generic dangerous-sink rules (`:6`, `:14`, `:21`, `:30`, `:43`). The finding also named only the web console; `scripts/` is out of scope on the same line and is the directory the bandit widening was specifically about.
+
+**Proposed:**
+
+1. Change `security.yml:413` to scan the tree the way bandit does — `semgrep --config .semgrep --error --metrics off --exclude … .` — mirroring bandit's `--exclude` set exactly so the two gates cannot disagree about what "the project" is. **Verify the tree is clean at that bar in the same PR**: `--error` is blocking, and `tests/` (563 files) very plausibly contains `pickle`/`yaml.load`/`eval` test idioms, which is presumably why `tests`/`harness`/`samples` are excluded on the bandit side too.
+2. Add `test_ci_semgrep_scans_the_repo_not_an_allow_list` to `tests/test_lint_scope_parity.py`, modelled on `:119-125`, so the next narrowing has to be deliberate. This is the durable half — without it, step 1 can rot again exactly as bandit's did.
+3. If a full widening is rejected, the fallback is appending `messagefoundry_webconsole scripts docker` to the argument list — but note that this is the allow-list shape `:348-352` explicitly retired, and it will go stale the next time a directory is added.
+
+**Related:** `.github/workflows/security.yml:348-360` (the bandit precedent) and `:393-424` (the semgrep job), `.semgrep/messagefoundry.yml`, `tests/test_lint_scope_parity.py`, `.github/required-contexts.txt:74`/`:78`/`:108-110`, `.github/workflows/codeql.yml`, `packaging/messagefoundry-webconsole/pyproject.toml`, [ADR 0065](adr/0065-web-ops-dashboard.md) (the console is a distinct distribution), [ADR 0144](adr/0144-handler-config-taint-rules.md) Inc 3 (the second, `samples/config`-scoped semgrep step).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+---
+
+## 336. Dependabot auto-merge shields review with a deny-list
+
+> ✅ **SHIPPED 2026-08-04 — guardrail #3 inverted from a 16-name deny-list to an ecosystem-qualified ALLOW-SET (hold unless named); a fail-closed release-age gate added as #4.** Value **5/10** · Difficulty **3/10** · _fill-in_. §1 `.github/workflows/dependabot-auto-merge.yml` now holds any PR whose dependencies are not on their own ecosystem's allow row — `actions/`/`github/`/`dependabot/` for `github-actions`, deliberately EMPTY for `uv` and `npm`, and an unrecognised ecosystem token holds rather than merges — preserving the fail-safe whole-group denial (measured: PR #75's five-bump batch carried `pypa/gh-action-pypi-publish`, so that batch would now HOLD). §4 a new `id: age` step requires every SECURITY-track candidate version to have been published at least 24h, failing closed on an API error, an absent/unparseable upload timestamp, an unexpected name or version shape, or an ecosystem with no publish-date source wired. ⚠️ **#4 is a FORWARD guard and is INERT with respect to the merge decision as shipped** — `age_ok=true` is reachable only for `uv`/`pip`, `eligible=true` only for `github-actions`, and the merge `if` requires both, so the two sets are disjoint. It is recorded that way in the workflow header rather than as an operating control, and gated on the allow-set so it makes no unauthenticated outbound request from the `contents: write` job for a PR that holds regardless; it becomes load-bearing the day a Python allow row is populated (an owner decision) or the advisory gate is made ecosystem-aware. §3 `tests/test_dependabot_automerge_guardrails.py` now asserts a cooldown on EVERY configured ecosystem behind a vacuity floor, and executes the shipped `run:` bodies under `bash -e` — the shell GitHub Actions actually applies — rather than only reading the YAML. §5 the false-premise backstop clause is corrected rather than merely deleted: no REQUIRED check reads a dependency's shipped bytes, and `trivy`, which does read the built image's bytes, is advisory (`continue-on-error`) and cron/dispatch-only, so it never runs on a Dependabot PR at all. **§2 was ALREADY SHIPPED** by the 2026-08-03 amendment (`.github/dependabot.yml` sets `cooldown.default-days: 5` on `github-actions`) and was NOT rebuilt; **§6 is discharged by DELETING the deny-list** rather than pruning it, which removes `python-jose`/`pyjwt`/`passlib` — all three absent from `requirements.lock`'s 98 pinned distributions — along with it.
+
+> ⚠️ **AMENDED 2026-08-03 — the `github-actions` cooldown SHIPPED, discharging Proposed §2 in substance and half the false-premise finding with it.** The second measured-at-HEAD bullet asserts that ecosystem *"carries `schedule` + `groups` only; there is no `cooldown:` key"*, but `.github/dependabot.yml:83-84` now sets `default-days: 5` for it, with the rationale at `:75-82` (#75 took two of five bumps to `main` under 24h from publish; `codeql-action` v4.37.4 was 7h old). So the *"Bounding this honestly"* line **"Only `github-actions` is unaged"** no longer holds, and each of the three configured ecosystems now has a cooldown behind the header's claim (now at `.github/workflows/dependabot-auto-merge.yml:22-24`, not `:16-18`). ⚠️ **Read §2 as discharged in substance, not to the letter** — `.github/dependabot.yml:79-80` records that this ecosystem honors `default-days` alone and ages off the **tag's commit date**, "so treat 5 as approximate", which is why §2's *"matching uv's 5/7"* could not be met.
+>
+> **The deny-list itself is untouched, so the rest of the item stands:** 16 Python names at `:84-85` gating every ecosystem behind an author-only job condition (`:64`) with no ecosystem qualifier, a merge gate still keying on `version-update:semver-patch` (`:184`), `tests/test_dependabot_automerge_guardrails.py:107-108` still asserting a cooldown for `uv` alone, and `python-jose` / `pyjwt` / `passlib` still absent from `requirements.lock` — so §§1, 3, 4, 5 and 6 are unaffected, as is the Why's other leg (`.github/workflows/security.yml:261-262` still describes pip-audit as *lockfile only* and bandit/semgrep as *source only*). ⚠️ **At least four `dependabot-auto-merge.yml` citations above (`:16-18`, `:58`, `:78-79`, `:155-161`) and all four `dependabot.yml` ones now point at different lines** — re-measure before quoting one; the `tests/` and `security.yml` citations are still exact.
+
+> **AMENDED 2026-08-04 — one clause of the 2026-08-03 note above is superseded by the SHIPPED banner; the dated measurement itself stands and is deliberately left as written.** *"The deny-list itself is untouched, so the rest of the item stands … §§1, 3, 4, 5 and 6 are unaffected"* was accurate when measured. It is not now: the deny-list no longer exists — guardrail #3 is an allow-set — so §6 is discharged by deletion rather than annotation, and §§1, 3, 4 and 5 are built rather than merely unaffected. The 16 names survive only as a PROPERTY under test (`_DENY_PACKAGES` in `tests/test_dependabot_automerge_guardrails.py` asserts none of them reaches any allow row), not as a mechanism.
+
+
+**Cluster:** Security / Supply chain. **Priority:** P3. **Verdict:** build. **Severity:** low.
+
+**What:** `.github/workflows/dependabot-auto-merge.yml` decides unattended merges by exclusion. Guardrail #3 is a hard-coded shield list at `.github/workflows/dependabot-auto-merge.yml:78-79`:
+
+```
+denylist="cryptography argon2-cffi argon2-cffi-bindings paramiko ldap3 pyspnego \
+  fastapi starlette uvicorn pydantic pydantic-core python-jose pyjwt passlib bcrypt cffi"
+```
+
+Anything not on that list, on any ecosystem, auto-merges if it is a patch — the merge gate at `:155-161` keys only on `update-type == 'version-update:semver-patch'` (plus dev-only minors), with no ecosystem or dependency-type qualifier. The workflow itself already names the residual at `:31-34`: "a malicious patch that BOTH rides a real concurrent published advisory AND is not on the deny-list would still auto-merge."
+
+Two things measured at HEAD make the exposed set **wider than that comment implies**:
+
+1. **All 16 names are Python distributions, but the job has no ecosystem filter.** The only gate is `if: github.event.pull_request.user.login == 'dependabot[bot]'` (`:58`), so the npm (`/ide`) and `github-actions` ecosystems configured in `.github/dependabot.yml` run this same path with **zero** deny-list coverage — no npm or action name can ever match a Python token.
+2. **The `github-actions` ecosystem has no cooldown.** `.github/dependabot.yml:42-56` carries `schedule` + `groups` only; there is no `cooldown:` key, unlike uv (`default-days: 5`, `:26-30`) and npm (`default-days: 3`, `:66-68`). That falsifies the compensating-control claim in the workflow header at `.github/workflows/dependabot-auto-merge.yml:16-18` — "Fresh-release supply-chain poisoning is handled upstream by the dependabot.yml `cooldown`" — for the one ecosystem whose artifacts execute inside CI. Actions are SHA-pinned (e.g. `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1`, `.github/workflows/release.yml:73`), and a Dependabot patch bump rewrites that SHA with no aging and no shield.
+
+Two smaller corrections to the record. The deny-list is 16 names but only **13** are real dependencies: `python-jose`, `pyjwt` and `passlib` do not appear in `requirements.lock` (98 pinned distributions), so the shield covers 13 of 98. And `tests/test_dependabot_automerge_guardrails.py:97-108` asserts a cooldown only for `package-ecosystem == "uv"` — nothing tests that the other two ecosystems have one, which is why the gap is invisible to CI.
+
+**Why:** this is the "compensating control resting on a false premise" rule (CLAUDE.md §11) firing on a supply-chain gate. The header's stated backstop is weaker than it reads in a second way too: `.github/workflows/security.yml:261` says in the repo's own words that "pip-audit (lockfile only) and bandit/semgrep (source only)" never see a dependency's contents — semgrep targets `messagefoundry tee` (`security.yml:413`) — and the required contexts `pip-audit (dependency vulnerabilities)` / `npm-audit (ide dependency vulnerabilities)` (`.github/required-contexts.txt`) are known-advisory scanners, which by construction cannot flag a package that was malicious at publish time. So "main's required CI backstops both" (`.yml:33-34`) does not hold against the specific threat the deny-list exists to cover.
+
+**Bounding this honestly — the blast radius is NOT what it first looks like:**
+
+- **The attacker must already own an upstream publisher account.** That is a capability with worse uses than this repo; nothing here is a privilege escalation for a lesser attacker.
+- **On the security track the GHSA gate is real and fails closed** (`:136-145`): an API error or a no-matching-advisory result routes to manual review. Because it queries `ecosystem=pip` (`:132-135`), npm and actions security PRs can never match and always fall to manual — a false negative in the *safe* direction.
+- **On the version track the uv and npm ecosystems are cooldown-aged** (5 and 3 days). Only `github-actions` is unaged.
+- **Merging to main is not publication.** `.github/workflows/release.yml:30-41` gates PyPI on a `vX.Y.Z` tag push, and `workflow_dispatch` explicitly does not publish (`release.yml:5-8`), so reaching a downstream install still requires the owner to cut a tag. The sharpest theoretical path — a poisoned action riding in `release.yml`, whose job holds `id-token: write` for Trusted Publishing (`release.yml:70`) — needs that same owner tag push to execute at all.
+- **This is hardening, not an incident.** No evidence of exploitation; the item is that the control's stated premise and its configuration disagree.
+
+**Proposed:**
+
+1. **Invert guardrail #3 to an allow-set.** Replace the 16-name deny-list at `:78-79` with an explicit list of packages eligible for unattended patch merge; everything else routes to manual review. The current default is "merge unless named"; it should be "hold unless named." Keep the fail-safe whole-group denial semantics (`:81-92`).
+2. **Add a `cooldown:` to the `github-actions` ecosystem** in `.github/dependabot.yml:42-56`, matching uv's 5/7. This is the one-line change that makes the header's claim at `:16-18` true instead of aspirational.
+3. **Extend `tests/test_dependabot_automerge_guardrails.py:97-108` to assert a cooldown on every ecosystem**, not just `uv` — the test's narrowness is why item 2 was invisible.
+4. **Security-track aging must be workflow-side, not dependabot-side.** "Extend the cooldown to the security track" is *not* implementable in `.github/dependabot.yml`: that file records at `:22-25` that security updates ignore cooldown by Dependabot design. The equivalent is a release-age check in the workflow — require the candidate version to have been published for N hours before auto-merging — placed alongside the GHSA step and failing closed the same way.
+5. **Correct the header comment.** `:33-34` should stop citing pip-audit/bandit/semgrep as a backstop against a fresh malicious publish, since `security.yml:261` already states they cannot see it. Either drop the clause or scope it to "known-CVE regressions."
+6. **Prune or annotate the three non-dependency deny-list entries** (`python-jose`, `pyjwt`, `passlib` are absent from `requirements.lock`) so the list's apparent breadth matches its effective breadth. If they are deliberately prophylactic, say so in the comment.
+
+**Related:** `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml`, `.github/workflows/security.yml`, `.github/workflows/release.yml`, `.github/required-contexts.txt`, `requirements.lock`, `tests/test_dependabot_automerge_guardrails.py`, `.github/workflows/dependabot-lock-resync.yml`; #321, #322, and the unhashed release-toolchain item from this same audit (a different file and a different fix).
+
+**Source:** public-repo disclosure audit, 2026-08-01.
+
+---
+
+---
+
+---
+
+## 324. Custom role with `messages:edit` alone reads raw PHI via the `/ui` editor
+
+> ✅ **Status CLOSED (built 2026-08-04).** Both console edit verbs — `GET /ui/messages/{message_id}/edit` and `POST /ui/messages/{message_id}/edit-resend` (`messagefoundry_webconsole/routes/core.py`) — now gate on `messages:edit` **and** `messages:view_raw` and fail closed on either, and both charge the per-actor PHI-read budget through a new keyword-only `phi=` on `require_ui_step_up` that forwards to `require_ui`'s existing throttle arm. **Both verbs, not just the GET:** the POST's `_reject` arm re-reads the origin and re-ships the *pristine stored* body through `data_original`, so gating only the GET would have left the rejection path as an unauthorized — and unthrottled — read of exactly the body the GET refuses. **Custom-role minting is deliberately unchanged** per the owner ruling: `messages:edit` is still not in `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS` (no ADR 0045 D1 amendment), so a role meaning "may resubmit, must not read" stays mintable — it simply cannot open an editor that displays the body it edits. Four regression tests in `packaging/messagefoundry-webconsole/tests/test_webui.py` pin the refusal (custom role, both verbs, asserting the synthetic needle and `data-original` are absent), a positive control that the change is a tightening rather than a lockout, and the budget on each verb; `tests/test_security_doc_drift.py`'s `_MULTI_PERMISSION_ROUTES` gained both routes and `docs/SECURITY.md` rode the same commit. **The body below cites `routes/core.py:602` for the old one-permission gate — that anchor has moved.** **Not fixed here, out of scope by owner ruling and reported to the coordinator to file as its own item — no such item existed when this closed, so do not read this as already-tracked:** at least three further `require_ui_step_up` PHI routes still pass no `phi=` and so charge no per-actor budget — `GET /ui/messages/search`, `GET /ui/messages/search/layered` and `GET /ui/uploaded-logs/file/{file_id}`.
+
+**Cluster:** Security / RBAC. **Priority:** P1. **Verdict:** build. **Severity:** medium.
+
+**What:** four links, each individually reasonable, compose into a PHI read that no permission authorizes.
+
+1. A custom role may hold `messages:edit` alone. The carve-out set is three permissions wide — [`auth/permissions.py:178-180`](../messagefoundry/auth/permissions.py):
+
+```python
+CUSTOM_ROLE_FORBIDDEN_PERMISSIONS: frozenset[Permission] = frozenset(
+    {Permission.USERS_MANAGE, Permission.APPROVALS_APPROVE, Permission.DR_OPERATE}
+)
+```
+
+and `permissions.py:212` (`forbidden = perms & CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`) is the only capability check `validate_custom_role_permissions` applies, so `{"messages:edit"}` is an accepted role set.
+
+2. The `/ui` editor gates on that permission and nothing else — [`messagefoundry_webconsole/routes/core.py:597-604`](../messagefoundry_webconsole/routes/core.py):
+
+```python
+@app.get("/ui/messages/{message_id}/edit", response_class=HTMLResponse)
+async def ui_message_edit(
+    ...
+    identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_EDIT)),
+) -> HTMLResponse:
+    detail = await core.get_message(message_id, request, engine=engine, identity=identity)
+```
+
+3. The JSON twin's own gate does not fire. `api/app.py:3150` declares `Depends(require_phi_read(Permission.MESSAGES_VIEW_RAW))`, but the console calls the handler as a plain function with `identity=` supplied, so the default is never evaluated. That skip is deliberate and documented at [`api/_ui_seam.py:92`](../messagefoundry/api/_ui_seam.py) — the `/ui` route "re-asserts the equivalent permission via `require_ui*`". Here it re-asserts a *different* one.
+
+4. No per-property backstop catches it. `MessageDetail`'s entry in `PHI_FIELDS` ([`api/field_authz.py:64-68`](../messagefoundry/api/field_authz.py)) lists `summary`/`error`/`metadata` only — `raw` is deliberately left to the route gate ("The raw body stays on this route's view_raw gate"). So `redact_unauthorized` (`field_authz.py:89-95`) returns the body untouched and [`pages/messages.py:440,454`](../messagefoundry_webconsole/pages/messages.py) renders it: `original = detail.raw` → `data_original=original` in the editor textarea.
+
+**Two details beyond the original write-up.** The `POST /ui/messages/{id}/edit-resend` rejection path (`routes/core.py:637-644`) re-calls `core.get_message` and re-renders `pages.message_edit(detail, ...)`, so the **pristine stored** body ships again via `data_original` — the same leak on a second verb. And `require_ui_step_up` builds its base as `require_ui(*permissions, allow_mfa_pending=True)` (`_auth.py:521`) with no `phi=`, so the `_auth.py:260` `allow_phi_read` per-actor throttle never runs here, while the sibling `/ui/messages/{id}`, `/parse-tree` and `/attachments` routes all pass `phi=True` (`routes/core.py:473,483,501`). That second point is **not unique to this route** — `/ui/messages/search`, `/ui/messages/search/layered` and `/ui/uploaded-logs/file/{id}` ride `require_ui_step_up` too — so it may warrant its own item rather than being fixed only here.
+
+**Why:** it is a least-privilege failure, not a privilege boundary an attacker crosses unaided — and the blast radius is narrower than "PHI exposure" sounds:
+
+- **No shipped configuration is affected.** Only `ADMINISTRATOR` and `OPERATOR` grant `messages:edit` (`permissions.py:111,129-152`) and both also grant `messages:view_raw`. Reaching the gap requires an administrator holding `users:manage` to have deliberately minted and assigned a custom role — and that administrator could grant `view_raw` outright anyway, so **no one gains PHI they could not otherwise obtain**. The victim is the *org's stated intent*, not the trust boundary.
+- **`/ui` only.** The JSON plane is clean: `GET /messages/{id}` gates on `view_raw`, and `EditResendResult` "Carries ids only, never a body" (`api/models.py:198-209`). An engine run with `serve_ui=False` does not have this route.
+- **Every read is audited.** `core.get_message` fires `record_view` + `record_audit("message_view")` (`api/app.py:3162-3163`), so this is a silent *authorization* gap, not a silent *access* gap — an auditor sees it after the fact.
+- **What it does cost:** a custom role is exactly the mechanism an org reaches for to build "resubmit-only, must not read" for lower-trust or outsourced staff (and an AD group map delivers it — `auth/service.py:1103-1111` feeds the same `_custom_permissions_for_ids` into `Identity.build`). The role is accepted without warning and silently exceeds its stated scope, which is a HIPAA minimum-necessary problem for the deploying org. `docs/SECURITY.md:213` and `:474-477` already state this honestly in both the catalogue row and the PHI-route list, so the doc is not the defect — the code is.
+
+**Proposed:** pick one of two, not both blindly.
+
+1. *Preferred — enforce the implication at the gate.* Change `routes/core.py:602` (and the `/edit-resend` gate at `:609-620`, which re-renders the same body) to `require_ui_step_up(Permission.MESSAGES_EDIT, Permission.MESSAGES_VIEW_RAW)`. This makes the catalogue's "implies `view_raw`" true by construction, is local, and leaves the permission assignable so a future write-only edit surface stays possible.
+2. *Alternative — forbid the combination.* Add `Permission.MESSAGES_EDIT` to `CUSTOM_ROLE_FORBIDDEN_PERMISSIONS`. Blunter: it also blocks legitimate custom roles that pair edit *with* view_raw, and it is an [ADR 0045](adr/0045-custom-rbac-roles.md) D1 amendment (that set is scoped to escalation primitives, which `messages:edit` is not). Prefer 1.
+
+Either way: add `phi=True` equivalence for this route (a `phi` parameter threaded through `require_ui_step_up` into its `require_ui` base at `_auth.py:521`), and add the missing regression test. `packaging/messagefoundry-webconsole/tests/test_webui.py:546-555` only exercises `Role.VIEWER`, which holds *neither* permission — nothing today asserts what an edit-without-view_raw identity gets. The new test must mint a `custom:` role holding `messages:edit` alone and assert 403.
+
+**Fix ordering:** `tests/test_security_doc_drift.py:1167-1196` derives the Operator PHI-capability sentence from the catalogue's PHI column and specifically names `messages:edit` as PHI-marked "and it renders the raw body". Fixing the gate makes `docs/SECURITY.md:213` and `:474-477` false, so the doc edit and the code edit must land in the **same commit** or that guard reds.
+
+**Related:** [`messagefoundry_webconsole/routes/core.py`](../messagefoundry_webconsole/routes/core.py), [`messagefoundry_webconsole/_auth.py`](../messagefoundry_webconsole/_auth.py), [`messagefoundry/auth/permissions.py`](../messagefoundry/auth/permissions.py), [`messagefoundry/api/field_authz.py`](../messagefoundry/api/field_authz.py), [`messagefoundry/api/_ui_seam.py`](../messagefoundry/api/_ui_seam.py), [ADR 0045](adr/0045-custom-rbac-roles.md) (custom roles), [ADR 0090](adr/0090-resend-a-stored-message-to-an-alternate-outbound-connection.md) §9 (edit-and-resubmit), [ADR 0065](adr/0065-mount-the-web-console-in-process.md) (the `/ui` mount that creates the gate-skip seam), `docs/SECURITY.md` (catalogue row + PHI-route list), `packaging/messagefoundry-webconsole/tests/test_webui.py`, `tests/test_security_doc_drift.py`, #153 (shipped edit-and-resubmit — the origin of the unenforced "implying `messages:view_raw`" phrasing; closed, do not amend), #177 (effective-permission inspector — would surface such a role).
+
+**Source:** public-repo disclosure audit, 2026-08-01. Classified close-the-weakness-instead: the doc is honest and stays; the code is what changes.
+
+---
+
+---
+
+---
