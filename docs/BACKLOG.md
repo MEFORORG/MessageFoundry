@@ -5227,3 +5227,63 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 **Related:** #1032 and #1035 (the same output surface, viewed as runnability rather than injection), #1039.
 
 **Source:** the two instances were found independently on 2026-08-05 by sessions `trusting-wu-c2e6d5` (refname, in Rule 3b) and `sharp-chatelet-f33072` (file path, in Rule 1b), the second after the first asked whether the new rule interpolated an attacker-influenceable value into a command form. Filed separately from the five deferrals it was grouped with, because the general form is a different and larger item than any of them.
+
+## 1051. Async-delivery `retry_max_attempts=None` (retry forever) contradicts the engine's own documented sync-HTTP guidance
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2240` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2242` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
+
+**Cluster:** Availability / delivery. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping config (localhost + auth, single worker). On first deployment a forever-retrying FIFO lane head would block its lane until an operator purges it -- a behavioural DoS residual, honestly disclosed in-tree (the doc discloses the default and instructs the safe override), which is why it does not lower the ASVS 13.1.x documentation cells.
+
+**The fix.** Ship a finite `retry_max_attempts` default (or a per-connection cap with dead-lettering on exhaustion) so the shipped default matches the documented sync-HTTP posture.
+
+**Related:** ASVS 13.1.3 / 13.2.6, #1052 (the sibling unbounded-acquire residual).
+
+**Source:** ASVS 5.0.0 V13 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V13 chapter report (`docs/security/`, withheld per SECURITY-DOCS-POLICY.md).
+
+## 1052. Three services have an unbounded connector-tier / store pool acquire (no acquire timeout)
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `CONNECTIONS.md:2330` names "the one remaining unbounded connector-tier pool acquire"; the store SQL-Server / Postgres acquire and the DatabaseRef throwaway pool acquire have no hard cap. Documented (so the ASVS 13.1.x doc cells pass) but a behavioural residual.
+
+**Cluster:** Availability / resource management. **Priority:** P3. **Verdict:** build (small). **Severity:** no exposure on the shipping SQLite config. On first deployment on a server backend, a pool-exhausted or unresponsive DB could block an acquiring task indefinitely with no bounding timeout, unlike the DATABASE connector acquire which is bounded by `acquire_timeout` 30s.
+
+**The fix.** Apply a bounded acquire timeout (and a documented behaviour-at-limit) to the store SS/PG and DatabaseRef pool acquires, matching the connector-tier `acquire_timeout`.
+
+**Related:** ASVS 13.2.6, #1051 (the sibling retry-forever residual).
+
+**Source:** ASVS 5.0.0 V13 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V13 chapter report.
+
+## 1053. `SERVICE.md` calls structured JSON + off-box logging "planned" while both are built and default-wired
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **1/10** · _quick win_. `docs/SERVICE.md:370` still describes structured JSON logging and off-box syslog/SIEM forwarding as "planned", but both ship at HEAD: `JsonFormatter` (`logging_setup.py`), `[logging].format=json`, and the `SyslogForward` off-box forwarder with `forward_format` defaulting to JSON. A doc claiming a built feature is planned is stale.
+
+**Cluster:** Documentation / built-vs-planned accuracy. **Priority:** P3. **Verdict:** build (trivial). **Severity:** no product effect; a doc-drift correction. It does not lower ASVS 16.1.1 -- `docs/PHI.md`'s logging inventory is the accurate inventory of record, and this drift is quarantined from scoring.
+
+**The fix.** Update `SERVICE.md` to describe JSON logging and off-box forwarding as built (with their `[logging]` settings), removing the "planned" framing.
+
+**Related:** ASVS 16.1.1 / 16.2.4 / 16.4.3.
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1054. The opt-in subprocess sandbox child logs through an unfiltered root logger, bypassing the redaction + log-injection scrub
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. The ADR 0087 subprocess sandbox child calls a bare `basicConfig`, so its log records do not pass through the three PHI/redaction/control-char filters that `_install_phi_filters` attaches unconditionally to the engine's stdout handler and off-box forwarder.
+
+**Cluster:** Logging / PHI redaction. **Priority:** P3. **Verdict:** build (small). **Severity:** off by default (`[sandbox].mode="off"`), so the default posture's redaction/scrub coverage (ASVS 16.4.1 / 16.2.5) is intact. On a deploying site that opts into `mode="subprocess"`, a child log line carrying message-derived content would reach the inherited stderr without redaction or CR/LF neutralization.
+
+**The fix.** Install the same `_install_phi_filters` chain on the sandbox child's logging setup (or route the child's records through the parent's filtered handlers).
+
+**Related:** ASVS 16.4.1 / 16.2.5, ADR 0087, #1055 (the sibling sandbox last-resort gap).
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1055. `threading.excepthook` is unreplaced on the raw sandbox-reader engine thread, so a non-`OSError` traceback there reaches the stdlib hook unredacted
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **2/10** · Difficulty **2/10** · _fill-in_. The engine replaces the asyncio loop exception handler (the last-resort handler for the event loop) but does NOT replace `threading.excepthook`, so a non-`OSError` exception in the raw sandbox-reader daemon thread reaches the stdlib default hook, which prints an unredacted traceback to stderr.
+
+**Cluster:** Error handling / PHI redaction. **Priority:** P3. **Verdict:** build (small). **Severity:** a 16.2.5-class redaction-quality gap, not a missing last-resort handler -- both stated purposes of ASVS 16.5.4 still hold (the details reach NSSM-captured stderr rather than being lost, and a dead daemon thread does not take down the process). On a deploying site an unexpected non-`OSError` in that thread could emit a traceback that skips the redaction filters.
+
+**The fix.** Replace `threading.excepthook` with a handler that routes through the engine's filtered logging (the same redaction chain as the loop exception handler).
+
+**Related:** ASVS 16.5.4 / 16.2.5, #1054 (the sibling sandbox-logging gap).
+
+**Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
