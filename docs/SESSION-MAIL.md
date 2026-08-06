@@ -439,12 +439,30 @@ tracking by hook id. A watcher that re-spawned itself would produce a grandchild
 is listening to, so self-re-arming does not work and is not attempted. After one delivery the watcher
 is done and the session falls back to the `SessionStart`/`Stop` drain until the next arming event.
 
-**Re-arming is therefore a hook's job, not the watcher's.** No re-arming design has been chosen, and
-this is not solved here; it is written down so nobody rediscovers it as a bug. Two further traps are
-recorded in the script's own header and repeated here only as pointers, not restated: the rewake fires
-on exit code 2 and only on exit code 2 (a nested PowerShell invocation reports 1 and the payload is
-discarded silently), and `async: true` must be set alongside `asyncRewake: true` because the
-"implies async" behaviour is conditional on the run being interactive.
+**Re-arming is therefore a hook's job, not the watcher's.** Two further traps are recorded in the
+script's own header and repeated here only as pointers, not restated: the rewake fires on exit code 2
+and only on exit code 2 (a nested PowerShell invocation reports 1 and the payload is discarded
+silently), and `async: true` must be set alongside `asyncRewake: true` because the "implies async"
+behaviour is conditional on the run being interactive.
+
+### Decided 2026-08-06: NOT wired, and the rebuild path, so it is not rediscovered
+
+**The tier is not wired and is not in the installer's wiring table** -- turning it on needs a new row,
+not a command. That is deliberate. The default tier has not yet delivered mail in real use, so building
+a second tier to cut a latency nobody has measured would be optimising against a guess.
+
+**If it is ever rebuilt, arm it on `UserPromptSubmit`, not `SessionStart`.** The phantom measurement
+makes this concrete, and it fixes both objections at once:
+
+| armed on | watchers per launch | re-arms? |
+|---|---|---|
+| `SessionStart` | **six** -- five belonging to sessions that never become conversations, each polling every 3 s for up to 15 minutes | no; one-shot |
+| `UserPromptSubmit` | **one per real turn**, none for phantoms -- measured, only the prompting session emits it | **yes, automatically**, every turn |
+
+Arming on the event that only a real session emits spawns no phantom watchers, and because it fires
+every turn it re-arms by construction -- so the one-shot limitation above stops being a limitation
+rather than being worked around. Neither property was designable before the phantom events were
+measured, which is why this is written down rather than left to be re-derived.
 
 ---
 

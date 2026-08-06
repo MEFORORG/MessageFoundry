@@ -376,6 +376,12 @@ Two results, and the second is the one that matters:
       asserted.
 - [ ] The content rule (D10) is stated in [SESSION-MAIL.md](../SESSION-MAIL.md) and referenced from
       [PHI.md](../PHI.md), in one place each.
-- [ ] Owner decision on whether the urgent `asyncRewake` tier is wired at all, given D11.
+- [x] Owner decision on whether the urgent `asyncRewake` tier is wired at all, given D11.
+      **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.** The default tier has never delivered
+      mail in real use -- everything to date is rig-verified and the code is unmerged -- so building a
+      second tier to cut a latency nobody has measured is a demand-gate item, not a gap. The rebuild
+      path is recorded in [SESSION-MAIL.md](../SESSION-MAIL.md) so it is not rediscovered: arm on
+      `UserPromptSubmit` rather than `SessionStart`. Revisit only if someone hits the latency in
+      practice.
 - [ ] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
       every session in this repo.
