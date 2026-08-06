@@ -63,7 +63,7 @@ param(
 # the drift, but a stamp that disagrees with the verdict beside it is the exact ambiguity this machinery
 # exists to remove. -Status now prints the SHA prefix on both lines, so agreement is visible rather than
 # asserted, and this label can never again be the only thing a reader compares.
-$GateVersion = "2026.08.05.2"
+$GateVersion = "2026.08.06.1"
 
 # Fail OPEN: any unhandled error must let the tool call through, never block it.
 $ErrorActionPreference = "SilentlyContinue"
@@ -122,7 +122,20 @@ function Write-Deny([string]$Reason, [string]$Rule = "?", [string]$Detail = "") 
 
 # Canonicalize before comparing. Without GetFullPath, `...\MessageFoundry-tpA\..\MessageFoundry\x.md`
 # does not string-match the primary's prefix and walks straight through the gate.
-function Get-ComparablePath([string]$Path, [string]$Base) {
+#
+# SPLIT IN TWO (BACKLOG #1061) so there is exactly ONE definition of "resolve this path", with two views
+# of the result. Rule 3c needs this resolution but must NOT have the lowercasing tail: it hands the result
+# to `git -C`, and this file warns at the top of the rule-3b resolver and again inside rule 3d that a
+# lowercased path works on Windows and silently misses the real directory on a case-sensitive filesystem.
+# A second resolver written beside this one would be two definitions that drift invisibly, so the raw form
+# IS the shared core and Get-ComparablePath is a fold on top of it.
+#
+# The non-fully-qualified base is now REJECTED explicitly rather than thrown and caught. Same answer --
+# GetFullPath demands a FULLY QUALIFIED base and threw otherwise -- but stating it makes "" mean exactly
+# one thing, "I could not resolve this", which rule 3c distinguishes from "git says this is not a repo".
+# IsPathFullyQualified, not IsPathRooted: on Windows `IsPathRooted("/tmp")` is true while
+# `GetFullPath(x, "/tmp")` still throws, and that throw is what the old catch was absorbing.
+function Get-FullPathRaw([string]$Path, [string]$Base) {
     if (-not $Path) { return "" }
     try {
         # A RELATIVE path must resolve against the SESSION's cwd, not this hook process's. `../../..` is
@@ -130,13 +143,18 @@ function Get-ComparablePath([string]$Path, [string]$Base) {
         # GetFullPath($Path) alone resolved it against wherever pwsh happened to be started -- so
         # `cd ../../.. && git reset --hard` did not look like it touched the primary and was ALLOWED
         # (measured, along with six other spellings). Callers that already have an absolute path may omit
-        # $Base; GetFullPath throws on a non-rooted base, which the catch turns into "not governed".
-        $full = if ($Base -and -not [System.IO.Path]::IsPathRooted($Path)) {
-            [System.IO.Path]::GetFullPath($Path, $Base)
-        } else {
-            [System.IO.Path]::GetFullPath($Path)
+        # $Base.
+        if ($Base -and -not [System.IO.Path]::IsPathRooted($Path)) {
+            if (-not [System.IO.Path]::IsPathFullyQualified($Base)) { return "" }
+            return [System.IO.Path]::GetFullPath($Path, $Base)
         }
+        return [System.IO.Path]::GetFullPath($Path)
     } catch { return "" }
+}
+
+function Get-ComparablePath([string]$Path, [string]$Base) {
+    $full = Get-FullPathRaw $Path $Base
+    if (-not $full) { return "" }
     ($full -replace '\\', '/').TrimEnd('/').ToLowerInvariant()
 }
 
@@ -552,9 +570,73 @@ if ($tool -in @("Bash", "PowerShell")) {
         $where = @(Get-GitTargetCandidatesRaw $seg.Raw $pfx $cwdRaw)
         if ($where.Count -eq 0) { continue }
 
-        $common = "$(& git -C $where[0] rev-parse --git-common-dir 2>$null)".Trim()
+        # ROOT THE TARGET AGAINST THE SESSION CWD BEFORE ASKING GIT ANYTHING (BACKLOG #1061). This block
+        # used to read `& git -C $where[0]` and `Get-ComparablePath $common $where[0]`, and with a
+        # RELATIVE target it failed OPEN. Measured on the installed hook by two sessions independently:
+        #     git -C <primary-absolute> config core.hooksPath /dev/null   -> DENIED
+        #     git -C ../../..           config core.hooksPath /dev/null   -> ALLOWED
+        #     cd ../../.. && git        config core.hooksPath /dev/null   -> ALLOWED
+        # `../../..` is simply how a session in <primary>/.claude/worktrees/<x> names the repo root. It
+        # needs no variable and no intent, and it disarms the ledger, claim and secret-leak commit gates
+        # for every worktree at once -- verbatim what the deny text below says this rule exists to stop.
+        #
+        # THE MECHANISM IS A BASE THAT IS NOT A BASE. `rev-parse --git-common-dir` answers RELATIVE TO
+        # THE TARGET: from the PRIMARY it returns the bare string ".git"; from a linked worktree it
+        # returns an absolute path. Get-ComparablePath then resolved ".git" against $where[0] -- the
+        # target token AS WRITTEN -- and GetFullPath demands a fully qualified base, so it threw, the
+        # catch returned "", no root matched "", and `if (-not $govCfg) { continue }` allowed. The hole
+        # was scoped to the primary precisely BECAUSE only the primary answers relatively, which is also
+        # why the crux test (disarming FROM a linked worktree) stayed green straight over it.
+        #
+        # DO NOT "FIX" THIS WITH ONE TOKEN. `Get-ComparablePath $common $cwdRaw` still ALLOWS: ".git" is
+        # relative to the TARGET, not to the session, so it resolves to <session-worktree>/.git -- a real
+        # path that is not the primary's common dir. The gate would read as fixed and stay open for a
+        # second, harder-to-see reason. Two steps are required: root the TARGET against the session cwd,
+        # then root the common dir against THAT.
+        #
+        # AND THE ROOTED PATH GOES TO `git -C` TOO, not only into the comparison. `& git -C <relative>`
+        # resolved against THIS HOOK PROCESS's cwd, which is not the session's -- so a relative target
+        # naming a LINKED worktree made git exit 128 and fall through to ALLOW as well. Measured with the
+        # two cwds deliberately diverged, `git -C .` and a relative sibling-worktree path both flipped
+        # DENY -> ALLOW; the pytest harness does not set the subprocess cwd, so that divergence is the
+        # condition under test, not a hypothetical. Get-FullPathRaw and NOT Get-ComparablePath, because a
+        # Get-ComparablePath value is LOWERCASED and this file warns twice (the rule-3b resolver, and
+        # inside rule 3d) that a lowercased path handed to `git -C` passes on Windows and silently misses
+        # the real directory on a case-sensitive filesystem.
+        #
+        # THE TWO FAILURE CONDITIONS ARE DIFFERENT AND ARE ANSWERED DIFFERENTLY:
+        #   * THE TARGET CANNOT BE RESOLVED AT ALL -- DENY. Nothing has been asked of git yet, so there is
+        #     no evidence either way about which repository this writes to; "unresolvable means not
+        #     governed" is exactly how this defect shipped, and reinstating it here would leave the fix
+        #     one malformed cwd away from the hole it closes. It takes a payload whose cwd is itself
+        #     non-absolute, so it costs an ordinary session nothing.
+        #   * GIT FAILS ON A RESOLVED TARGET -- ALLOW, unchanged. That is git ANSWERING: the path is not a
+        #     repository. test_a_non_repo_cwd_fails_open pins it, and the reason it pins it is that a
+        #     guardrail which wedges on an unexpected shape gets uninstalled.
+        $whereRaw = Get-FullPathRaw $where[0] $cwdRaw
+        if (-not $whereRaw) {
+            Write-Deny -Rule "3c" -Detail "git config $badKey (unresolvable target)" -Reason @"
+BLOCKED: this sets '$badKey', and the gate cannot tell WHICH repository it would set it in.
+
+The target path '$(Get-SafeForMessage $where[0])' could not be resolved to an absolute path from this
+session's working directory ('$(Get-SafeForMessage $cwdRaw)'), so the check that would normally answer
+"is this the shared configuration of a governed checkout?" cannot run at all.
+
+'$badKey' is on the disarm list: setting it in a governed repository turns off the ledger, claim and
+secret-leak commit gates for every worktree of it at once. An unanswerable question about that key is
+refused rather than assumed safe.
+
+What to do instead:
+  * Re-run it with an ABSOLUTE path for the target (`git -C "<full path>" config ...`). Then the gate can
+    see which repository is being configured, and an ordinary non-governed repo is allowed as usual.
+  * Ordinary per-user config (user.email, user.name, and anything not on the disarm list) is untouched by
+    this rule in any spelling.
+"@
+        }
+
+        $common = "$(& git -C $whereRaw rev-parse --git-common-dir 2>$null)".Trim()
         if ($LASTEXITCODE -ne 0 -or -not $common) { continue }
-        $commonCmp = Get-ComparablePath $common $where[0]
+        $commonCmp = Get-ComparablePath $common $whereRaw
         $govCfg = $null
         foreach ($r in $roots) {
             if ($commonCmp -eq $r.Compare -or $commonCmp.StartsWith("$($r.Compare)/")) { $govCfg = $r; break }
