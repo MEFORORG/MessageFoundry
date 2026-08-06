@@ -1,11 +1,13 @@
 # ADR 0160 — Public-repo content policy: operator and security-review material only
 
-- **Status:** **Accepted for Phase 1 (2026-08-05); Phases 2-3 remain Proposed and are now BLOCKED on a
-  measured finding — see D5.** The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the
-  vault as the destination (resolving open question 3), and set a governing rule for the work:
-  **do not break anything**, applied per item as *prove the mechanism or leave the item alone*.
-  Phase 1 is executed. Phase 2 is held, not deferred by preference: the gate its tests depend on
-  does not currently exist anywhere.
+- **Status:** **Accepted (2026-08-06). Phase 1 EXECUTED; Phase 2 DECLINED; Phase 3 still Proposed.**
+  The owner ratified the D1 test and Phase 1 on 2026-08-05, chose the vault as the destination
+  (resolving open question 3), and set a governing rule for the work: **do not break anything**,
+  applied per item as *prove the mechanism or leave the item alone*. On 2026-08-06 the owner
+  **declined Phase 2** — the process tooling and the documents describing it stay tracked, on the
+  cost measurement in D5. That is a decision, not a deferral: nothing is pending that would reopen
+  it. Phase 3 (stripping process prose from documents that stay) is untouched by this and remains
+  proposed.
   <!-- Proposed (no code yet) → Accepted (build may start) → Superseded by NNNN / Rejected -->
 - **Date:** 2026-08-04
 - **Supersedes nothing.** Records a policy that has been in force, and enforced, while being written
@@ -143,19 +145,24 @@ export, which is a two-command check:
 any future guard that tests *existence* rather than *trackedness* — after this decision, presence on
 disk and presence in the repository are different facts.
 
-**Phase 2 — the individually-tracked process docs.** `docs/WORKTREES.md`,
-`docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`, `docs/STEERING.md`. Each needs its inbound
-references audited first; `docs/LEDGER-GATE.md` in particular is cited by `CLAUDE.md` and by hook
-error text, so it is not a delete-and-go.
+⛔ **Phase 2 — DECLINED 2026-08-06 (owner). The process tooling and its documentation stay tracked.**
+The proposed set was `docs/WORKTREES.md`, `docs/SESSION-DRIFT-CONTROLS.md`, `docs/LEDGER-GATE.md`
+and `docs/STEERING.md`, plus — added during Phase 1 planning — the tooling those documents describe.
+**None of it moves.** The reasoning is in D5, and it is a cost decision resting on a measurement, not
+a deferral waiting on someone. Keeping the documents with the tooling they describe is the coherent
+half: relocating the rationale for a control that stays is the defect the Consequences section below
+already names.
 
 **Phase 3 — in-file references.** Strip Claude-Code process prose from documents that otherwise stay
 (`docs/AI.md`, `docs/ARCHITECTURE.md`, `docs/Code_Quality_Standards.md`). Surgical edits, not removals.
 
-### D5 — the process TOOLING is held, because moving it would silently retire ~20 tests
+### D5 — the process TOOLING stays tracked: DECLINED on measured cost, not blocked on someone
 
 The obvious next step after Phase 1 is `scripts/coord/` (9), `scripts/worktree/` (11) and
 `scripts/hooks/` (8, excluding `ledger_check.py`), with the four Phase 2 docs that describe them.
-**Held**, on a measurement taken while planning that removal:
+**Owner decision, 2026-08-06: it stays.** Moving it is affordable only by paying for a second CI or
+by losing coverage, and the gain is cosmetic. The measurements that produced that decision follow —
+they are recorded because the *next* person to propose this move will re-derive them otherwise:
 
 ⛔ **The vault's CI is off.** `gh workflow list --all` on `wshallwshall/MessageFoundry` reports every
 workflow except `ASVS scorecard` as `disabled_manually`; `ci.yml` last ran **2026-07-27** and failed.
@@ -170,27 +177,51 @@ second sub-class — a control that cannot observe its own failure.
 run today inside the **required** `test` legs. Untracking the scripts without the tests turns those
 legs red; untracking both retires the gate. Neither is acceptable under the owner's rule.
 
-**Two conditions gate Phase 2, and each must be demonstrated, not argued:**
+⛔ **The cheap gate does not work, and the split is exactly even.** The tempting fix is a Linux-only
+workflow in the vault, since hosted ubuntu ships `pwsh`. Measured across the 26 test files on
+2026-08-06 by reading each file's `pytestmark`:
 
-1. **A live gate for the moved tests** — the vault's `ci.yml` re-enabled (it bills private-repo
-   minutes, and its full matrix is far more than these tests need, so a lean Linux-only workflow
-   scoped to them is the cheaper shape), *and* proven able to **fail** on a deliberately broken
-   test. A green run on a suite that silently skipped is the same defect in a new place: many of
-   these tests are Windows/`pwsh`-shaped, so a Linux leg must be checked for **skips**, not just
-   for green.
-2. **Delivery into fresh worktrees** — `.worktreeinclude` copies gitignored files into worktrees
-   Claude Code creates, but that is a first-party mechanism covering `--worktree`, desktop sessions
-   and `isolation: worktree` subagents, and it is **untested for these paths**. It must be shown to
-   deliver them before they are untracked, because `CLAUDE.md` instructs sessions to run
-   `scripts/coord/alloc.ps1` from their own worktree, and a missing `alloc.ps1` means no ADR/BACKLOG
-   number can be allocated — which the ledger gate then turns into a **refused commit**.
+| Skip predicate | Files | On a Linux-only leg |
+|---|--:|---|
+| `shutil.which("pwsh") is None` | 13 | run |
+| `shutil.which("pwsh") is None or os.name != "nt"` | **13** | **silently skip** |
 
-⚠️ **A third hazard applies to any phase and was live during Phase 1: `git rm --cached` spares only
-the tree it runs in.** When the removal reaches `main`, checkout **deletes** those paths from every
-other worktree and from the primary — 45 worktrees were active on this machine at the time. For
-Phase 1 that is acceptable (the content is documents, and the vault holds them). For the tooling it
-is not: the files would vanish from the machine that runs them. Any Phase 2 lands with a restore
-step, or it does not land.
+So a Linux-only vault leg covers **half the suite and reports green**. That is not a cheaper version
+of the gate; it is the same silent-control defect relocated. A correct gate needs **ubuntu plus
+windows**, and the vault is **private**, so the Windows leg bills at **2x**. The suite is also slow:
+three of the 26 files alone ran **94 tests in 64 seconds** locally, dominated by `pwsh` process
+spawns, and the full set exceeded a two-minute timeout — the total was **not** measured, so treat
+"several minutes per run" as an estimate and nothing firmer.
+
+**A second unknown was never closed:** `.worktreeinclude` copies gitignored files into worktrees
+Claude Code creates, but that is a first-party mechanism (`--worktree`, desktop sessions,
+`isolation: worktree` subagents) and it is **untested for these paths** — `git worktree add` does not
+exercise it, so the check requires creating a real Claude Code worktree. It matters because
+`CLAUDE.md` instructs sessions to run `scripts/coord/alloc.ps1` from their own worktree, and a
+missing `alloc.ps1` means no ADR/BACKLOG number can be allocated — which the ledger gate turns into
+a **refused commit**.
+
+⚠️ **A third hazard applies to any phase, and Phase 1 CONFIRMED it rather than predicting it.**
+`git rm --cached` spares only the tree it runs in. Rebasing the Phase 1 branch onto `main` **deleted
+`docs/releases/` and both root handoffs from the working tree** — the same thing that happens to the
+primary and to every active worktree (52 at the time) when the removal lands. For documents that is
+acceptable: the vault holds them, pushed first. For the tooling it is not — it would vanish from the
+machine that runs it, so any such move needs a restore step that does not exist.
+
+**Why that adds up to declined rather than deferred.** Phase 1 removed 103 files that actively
+*misrepresented the project*: a public `docs/` whose largest directory was session plans and wave
+schedules. The tooling is different — a reader correctly identifies it as this project's development
+tooling, and it is not mistakable for product. Against that, moving it costs a second paid CI in
+perpetuity, an unproven delivery mechanism, and a restore path. **The benefit is cosmetic and the
+cost is structural, so it is not worth doing.** Recording it as *blocked* would have been the
+dishonest shape: nothing is coming to unblock it, and a permanently-blocked item reads to the next
+session as work someone still owes.
+
+**If this is ever reopened**, the bar is unchanged and stated here so it is not re-litigated from
+scratch: a gate on **both** operating systems, proven able to **fail** on a deliberately broken test
+and audited for **skips** (`-rs`) rather than trusted on green, plus `.worktreeinclude` demonstrated
+on these paths, plus a restore step. Absent all three, the move trades a working control for a
+silent one.
 
 ### D3 — `CLAUDE.md` is a genuine conflict between the policy and the tooling, and it stays tracked
 
@@ -245,11 +276,16 @@ destination. This closes what the earlier draft left open as context.
 
 ## To resolve on acceptance
 
-1. **Does `docs/BACKLOG.md` stay?** It is process material by D1 and it is also **CI-load-bearing**:
-   `scripts/docs/backlog_status_check.py` and `.github/workflows/backlog-hygiene.yml` both read it,
-   and the second is a required merge context. Removing it is not a doc edit; it retires a gate.
-   **Still open, and still the owner's call** — though it is no longer the *first* thing blocking
-   Phase 2, since D5 blocks the tooling on a separate and unmet condition.
+1. **Does `docs/BACKLOG.md` stay? STILL OPEN, and still the owner's call.** It is process material by
+   D1 and it is also **CI-load-bearing**: `scripts/docs/backlog_status_check.py` and
+   `.github/workflows/backlog-hygiene.yml` both read it, and the second is a **required merge
+   context**. Removing it is not a doc edit; it retires a gate.
+
+   It no longer "blocks Phase 2" — that framing died with the Phase 2 decline. Note the question is
+   now shaped by D5 rather than independent of it: D5 declined a move whose cost was *rebuilding* a
+   gate elsewhere, and removing `BACKLOG.md` would retire one outright with no replacement proposed.
+   That is the same trade on worse terms. **Recorded as an observation, not a decision** — the owner
+   has not been asked this one, and D5's ruling does not answer it by implication.
 2. **RESOLVED 2026-08-05 — D2 ratified and Phase 1 executed** at 103 files: the 101 measured here
    plus the two root handoffs found during execution.
 3. **RESOLVED 2026-08-05 — the vault is the destination**, and custody transfers *before* removal,
