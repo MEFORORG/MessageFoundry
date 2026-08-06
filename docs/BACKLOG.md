@@ -5578,3 +5578,27 @@ The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` r
 **Related:** #1059 (the shell-variable bypass of the same resolver — **distinct**, because #1059's proposed fix of refusing on `$` in a target position leaves a literal `../../..` untouched), #1060 and #1057 (the cwd-is-not-the-caller cluster; this one is *not* an ambient-cwd defect — the hook process cwd was measured equal to the payload cwd), #1000 (a gate green because its tests cannot see the class).
 
 **Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
+
+## 1063. `setup-leak-gate.ps1` picks the checkout from the current directory, so it can arm a worktree the operator did not name
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `scripts/dev/setup-leak-gate.ps1:37` is `$repo = (& git rev-parse --show-toplevel 2>$null)` — no `-C`, no `-Repo` parameter, no `$PSScriptRoot` anchor. Invoked by absolute `-File` path from a different worktree, which is the ordinary shape on a clone with 40-plus of them, it installs the leak-gate token list into **the current directory's** checkout and prints `CONFIGURED` about that one, while the worktree the operator named keeps no token source. Its own directory siblings already do it correctly.
+
+**Cluster:** Developer tooling / configuration anchoring. **Priority:** P4. **Verdict:** build (trivial). **Severity:** **low, and the low severity is load-bearing** — every failure direction here is loud or fail-closed, which is why this is filed at 3 rather than alongside its siblings. Nothing is silently ungated and no wrong authorisation is granted.
+
+**Why it is nearly harmless, stated so nobody escalates it on the family resemblance.** The named worktree's pre-commit leak gate keeps failing **closed** — it passes `--require-tokens` deliberately, so a missing token source blocks commits loudly rather than letting content through. And if the destination is not git-ignored, the script deletes the file it just wrote and throws rather than risk committing the token list. The wrong tree genuinely gets a working gate; the right tree keeps refusing. The cost is a confusing `CONFIGURED` and a second run, not an exposure.
+
+**The fix is one line and the pattern is already in the same directory.** `scripts/dev/postgres.ps1:37` and `scripts/dev/sqlserver.ps1:56` both use:
+
+```powershell
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+```
+
+Anchoring on `$PSScriptRoot` binds the script to the checkout it lives in, which is what an absolute `-File` invocation is asking for. `-From` names the token **source**, not the checkout, so it does not already cover this.
+
+**Same construct as #1060.** `alloc.ps1:51` is byte-equivalent (`git rev-parse --show-toplevel` with no anchor) and produces the same class of wrong answer — there, a misattributed ledger allocation; here, a token list installed into the wrong tree. Fixing them together is reasonable; filing them together was not, because their severities differ by two priority bands and folding this into #1060 would have inflated it.
+
+**How it was found, and why that matters more than the defect.** A repo-wide sweep for the cwd-as-identity shape assigned five surfaces and left `scripts/dev` and `scripts/service` in **no** surface at all — seven `.ps1` files in the seam. This was found only because the synthesising agent went outside its brief and swept the unassigned region. A measuring apparatus with a blind spot, hunting mechanisms with blind spots. Worth remembering when the next sweep is designed: **state the unassigned regions, or the result reads as completeness.**
+
+**Related:** #1060 (the same construct, and the cwd-is-not-the-caller premise recorded in `docs/WORKTREES.md`), #1057, #1059, #1062 (the rest of that cluster), #1000 (the sweep's own coverage gap is that item's shape in a measuring tool rather than a gate).
+
+**Source:** found 2026-08-05 during the sweep that produced #1062, held unfiled overnight as explicitly marginal, and filed 2026-08-06 on the judgement that a real defect with a known one-line fix is worth a number even at P4 — a low severity is a priority statement, not a filing criterion, and unfiled findings get dropped.
