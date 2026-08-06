@@ -5602,3 +5602,40 @@ Anchoring on `$PSScriptRoot` binds the script to the checkout it lives in, which
 **Related:** #1060 (the same construct, and the cwd-is-not-the-caller premise recorded in `docs/WORKTREES.md`), #1057, #1059, #1062 (the rest of that cluster), #1000 (the sweep's own coverage gap is that item's shape in a measuring tool rather than a gate).
 
 **Source:** found 2026-08-05 during the sweep that produced #1062, held unfiled overnight as explicitly marginal, and filed 2026-08-06 on the judgement that a real defect with a known one-line fix is worth a number even at P4 — a low severity is a priority statement, not a filing criterion, and unfiled findings get dropped.
+
+## 1062. `check` validates the env value file under `--project-root` then reads the values from the current directory
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **7/10** · Difficulty **2/10** · _quick win_. `messagefoundry check --project-root R` anchors `--config` under `R` and **hard-fails** if `R/<env_dir>/<env>.toml` is absent — then drops `R`. `run_checks` takes no project root, so the build check re-derives the value anchor from `Path.cwd()`. The gate therefore **verifies the file under the root you supplied and reads the values from wherever your shell happens to be.** `serve` does not have this defect, in the same file, by one line.
+
+**Cluster:** Configuration anchoring / gate integrity. **Priority:** P2. **Verdict:** build (small). **Severity:** would mis-decide a **required, blocking** check on a deploying site. Nothing is deployed (§0), so this is what a deploying site would hit on first use, not something happening today. It is also the only finding in this cluster on **product code** rather than developer tooling.
+
+**Verified by reading the chain end to end, 2026-08-06.** Not inferred from a grep:
+
+```
+__main__.py:832    root = resolve_project_root(args.project_root, cwd=cwd)
+__main__.py:833-4  config_dir / service_config anchored under root
+__main__.py:848-52 EXPLICIT root + --env  ->  hard-fail if <root>/<env_dir>/<env>.toml is absent
+__main__.py:853    return config_dir, service_config          <-- root is DROPPED here
+__main__.py:4263+  run_checks(config_dir, ..., service_config=...)   <-- no root parameter exists
+checks.py:1304     resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd())
+environments.py:79 `if not base_dir: return cwd`              <-- and base_dir is unset by default
+```
+
+**`serve` gets it right one screen away.** `__main__.py:1086` does `cli.setdefault("environments", {})["base_dir"] = args.project_root` *before* `load_settings`, and the comment at `:1095` records that this is exactly why. `check` never sets it, so `settings.environments.base_dir` stays empty and `resolve_values_base_dir` falls back to the process directory.
+
+**The comment above the defect claims the parity that is missing**, which is the sharpest evidence it is an oversight rather than a decision. `checks.py:1300-1302` reads: *"Resolve env() against the active environment **the same way serve does**, so a hop's host/scheme (an env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference."* Serve's way **is** the `base_dir` assignment. The comment states the goal and the code omits the step that achieves it.
+
+**Consequence, in the conditional.** `build-check` is a required blocking check whose stated job is the ADR 0092 posture-keyed insecure-hop refusal, and the hosts and schemes it judges are `env()`-supplied. Run as `check --project-root R --env prod` from a directory `W`:
+
+- **If `W` holds its own `environments/prod.toml`** — the refusal is decided against **W's** values while the operator was told `R` was validated. A cleartext egress hop that `R` forbids could pass with exit 0. No diagnostic names which directory was read: `_emit_anchor_diagnostics`, including the AC-4 "cwd differs from root" warning, is **serve-only**.
+- **If `W` holds no `environments/`** — a spurious blocking failure reporting a missing value file, which is loud but points at the wrong directory.
+
+**Reachability, stated honestly.** Nothing in this repo's CI, hooks or scripts passes `--project-root` to `check`; the shape is the documented consumer / config-repo invocation, which ADR 0050 AC-6 ratifies. So it is **supported but not exercised here** — which is also why no test caught it. Do not write this up as "unreachable": the invocation is the one a config repo is told to use.
+
+**The fix is the line `serve` already has.** Either give `run_checks` an explicit project-root parameter and thread it to the anchor, or have `check` set `[environments].base_dir` from `--project-root` before settings load, exactly as `serve` does at `:1086`. The second is smaller and makes the two paths converge rather than diverge further; the first is more explicit about what `run_checks` depends on. Either way `_check_build` must stop consulting `Path.cwd()` when a root was supplied.
+
+**Test it by the divergence, not by the happy path.** The case that matters is `--project-root R` run from a `W` that holds a *different* `environments/<env>.toml`, asserting the value actually used comes from `R`. A test run from inside `R` passes with the bug in — the same shape as the Windows-versus-Linux masking that hid the rule 3d defect, and per #1000 a control needs the case that can distinguish.
+
+**Related:** #1057, #1059, #1060 (the cwd-is-not-the-caller cluster — this is its fourth instance and the only one on product code), #1000 (a required check green because it read the wrong directory), ADR 0050 AC-6, ADR 0092.
+
+**Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
