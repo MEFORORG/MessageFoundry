@@ -5382,3 +5382,24 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 **Related:** ASVS 16.5.4 / 16.2.5, #1054 (the sibling sandbox-logging gap).
 
 **Source:** ASVS 5.0.0 V16 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V16 chapter report.
+
+## 1041. Rule 3d tells a session removing its OWN worktree that it belongs to another session
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `scripts/hooks/worktree_gate.ps1:528` justifies rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
+
+**Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss — the deny is *correct as a decision* and it does prevent an accidental self-deletion. The defect is entirely in what the text tells the reader to do next, which CLAUDE.md §11 treats as a correctness property: *"a gate that misdescribes the thing it blocked trains people to route around it"* (recorded at `worktree_gate.ps1:646` for the sibling case #308 already fixed).
+
+**Reproduced first-hand on 2026-08-05, not reasoned from source.** A session standing in a linked worktree under `<primary>/.claude/worktrees/` ran `git worktree remove <that same path>` and received rule 3d's refusal verbatim: *"acts on a worktree of `<primary>` that belongs to ANOTHER SESSION -- git refuses to remove the worktree you are standing in, so this one is not yours."* Both clauses are false in that run. Nothing was deleted, because the hook denied the whole command before git executed — which is also precisely why the premise cannot hold.
+
+**Why the inference fails, stated once.** The premise is a claim about what reaches git. A PreToolUse hook decides *whether anything reaches git at all*, so it can never observe the state its own premise depends on. Any rule that defers to a downstream layer's guard has this shape; here the deferral is unconditional and the guard is unreachable.
+
+**The remedy text compounds it.** The refusal closes with *"I want to remove the worktree `<path>` and I need you to confirm it is not in use."* For the caller's own worktree that sends the operator to verify a fact that is false by construction — the worktree is in use by the session asking. The other two suggestions (`prune-merged.ps1`, `git worktree list`) stay correct.
+
+**The fix is local and the value is already computed.** Rule 3d resolves `$victimCmp` at `:554` for its governed-root test at `:557`. Comparing it against the session's own toplevel — `git -C $cwdRaw rev-parse --show-toplevel`, the same call rule 3b already makes — splits the two cases: a peer's worktree keeps the current text, and the caller's own gets an accurate one (git will refuse this itself; if you mean to discard the worktree, that is the user's call from a plain terminal). Difficulty 2: one comparison, one branch, and a regression test per branch. Do not simply *allow* the self case — the deny is the right decision, and blocking an accidental self-deletion is worth keeping.
+
+**Do not fix by deleting the premise sentence.** It is load-bearing documentation of *why* rule 3d has no cwd check, so removing it leaves the missing check unexplained. Replace it with what is actually true: git's guard is unreachable from here, therefore the rule must decide ownership itself.
+
+**Related:** #308 (the same defect class — a refusal describing something the reader cannot act on — fixed for the nested-worktree subpath), #1018 (guards that go quiet), ADR 0158.
+
+**Source:** reported by a concurrent session while it was fixing rule 3b's remediation text, verified independently against the source rather than relayed, then reproduced live by accident when a second session ran the command against its own worktree. Filed by the session that verified it, which is not building it; the reporting session offered to take it if the owner scopes it there.
+
