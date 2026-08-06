@@ -2414,7 +2414,7 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 232. Steps view for routers
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR-first: a `route` row kind widens the ADR 0076 §3 grammar, so the amendment lands before any build.
+> 🚧 **Filed 2026-07-30; ADR gate discharged 2026-08-05.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR 0076 Amendment D widens the grammar with a `route` row kind (§3 row enum + §4 recognition grammar), and CLAUDE.md §12's carve-out now names Routers; build handed off (`docs/releases/HANDOFF-232-router-steps.md`), not yet built.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
 
@@ -5417,7 +5417,7 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 ## 1041. Rule 3d tells a session removing its OWN worktree that it belongs to another session
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `scripts/hooks/worktree_gate.ps1:528` justifies rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
+> ✅ **SHIPPED 2026-08-05 — the false premise is gone and the cwd check is now made rather than argued for.** Value **4/10** · Difficulty **2/10** · _fill-in_. Rule 3d resolves the victim's toplevel and the session's own and compares them, so a session acting on the tree it is standing in gets a deny that says exactly that, instead of being blamed on a session that does not exist. **Scope, stated because the item's title is broader than the fix:** this establishes *"this IS the tree you are standing in"*, which is the only ownership fact available here. It does **not** establish the converse — a worktree that is not yours to stand in may still be nobody's, and the rule still has no occupancy or authorship signal to tell an abandoned tree from a live one. The sibling deny therefore still refuses, and now says it cannot tell rather than claiming it knows. A caller who *created* a worktree and removes it from elsewhere is still refused; that case is unaddressed and needs an occupancy signal, not a text change. Three regression tests, each confirmed failing against the pre-fix gate first — the sharpest being that the two denies were previously **byte-identical**, which is the defect in one line. Original filing follows. `scripts/hooks/worktree_gate.ps1:528` justified rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
 
 **Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss — the deny is *correct as a decision* and it does prevent an accidental self-deletion. The defect is entirely in what the text tells the reader to do next, which CLAUDE.md §11 treats as a correctness property: *"a gate that misdescribes the thing it blocked trains people to route around it"* (recorded at `worktree_gate.ps1:646` for the sibling case #308 already fixed).
 
@@ -5463,3 +5463,150 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 
 **Source:** surfaced 2026-08-05 when the owner ran the ruleset call drafted for #1034's server-side remedy and it returned 422. The session that had twice recommended AGAINST adding branch-push detection reversed on that evidence, since detection stops being the weaker option once prevention is unavailable. Filed so the reversal's premise is recorded rather than living only in a session transcript.
 
+
+## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **5/10** · _fill-in_. #1041 fixed rule 3d's *false* claim; this is the *missing* one underneath it. The rule refuses every governed worktree that is not the caller's own, because it has no way to ask whether anyone is actually using it. The refusal is right by default — a needless refusal costs a message, a wrong allow deletes a live session's work — but it is unactionable for a caller cleaning up a worktree it created itself, who must escalate to a human for something it was entitled to do.
+
+**Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (medium). **Severity:** no data loss, and no security effect — the rule fails *closed*. The cost is a correct refusal the reader cannot act on, and the standing invitation to route around a guard that says no to legitimate work.
+
+**Reproduced 2026-08-05, and the authorship makes it unambiguous.** The coordinator session created a throwaway worktree, committed in it, opened a PR from it, then minutes later ran `git worktree remove <that path>` from its own session and was refused. It was not standing in the worktree, so #1041's toplevel comparison does not fire and is not meant to — that fix establishes *"this IS the tree you are standing in"* and deliberately claims nothing about the converse. Here the caller **created** the tree in the same conversation, so the refusal is not merely unproven, it is acting on a worktree with no other user at all. The worktree was still on disk at the time of filing, because the session correctly declined to route around the deny.
+
+**A signal exists, but NOT the one this item first claimed — read this before designing anything.** `scripts/coord/occupancy.ps1` provides `Get-WorktreeOccupancy`, `Get-WorktreeOccupants` (with `-IncludeNested`), `Get-NestedWorktrees` and `Get-ContainingWorktrees`, and `scripts/worktree/prune-merged.ps1` uses them as a *fence* before removing worktrees, re-reading immediately before acting. The first version of this item concluded from that: *"the project already accepts this signal as sufficient to gate a deletion"*. **That is true of the COMBINATION and false of the occupancy lookup alone, and the difference is the whole design.**
+
+Measured on a live `-Apply` run, 2026-08-05: of 24 candidates, **signal 1 (occupancy) vetoed 0**. All 16 skips came from signal 2, the git-metadata age rule — 14 *"recently active"*, 2 *"not merged"*. Measured independently from the session that filed this item, at the same time: the fence reported `Available = True`, reported 5 of 42 worktrees occupied, and placed **0** occupants in `MessageFoundry-gate-deferrals` — the worktree that session was demonstrably live in, having committed to it a minute earlier. That is the script's own disclosed blind spot: *a session writing into a worktree by absolute path from elsewhere*, which it puts at 29% of writes on this repo.
+
+**So the load-bearing half is the 36-hour age rule, not the occupancy lookup.** A design that vendors only `Get-WorktreeOccupancy` inherits the half that measured 0 of 24, and under the fail-closed constraint below that is the worse half to choose: it returns a confident *"unoccupied"* for a tree that was being written to a minute ago. Whatever is built must carry the age rule too, or the fail-closed requirement is carried by nothing. Rule 3d remains the one place making this decision with neither.
+
+**Why this is difficulty 5 and not 2, which is the whole reason it is a separate item.** The gate cannot simply dot-source that file. `install-gate.ps1` copies `scripts/hooks/worktree_gate.ps1` to `%USERPROFILE%\.claude\hooks\`, **outside every working tree**, precisely so a session cannot edit the thing enforcing against it. An installed hook can therefore load nothing from a checkout — the same constraint that forced `ConvertTo-WorktreeSlug` to be gate-local rather than shared. So the options are all structural, and none is free:
+
+1. **Vendor the occupancy read into the gate.** Fastest, and creates a second definition of what "occupied" means that can drift from `occupancy.ps1` silently — the hazard this repo already records for its banner alphabet and for two-parsers-of-one-rule generally.
+2. **Have the installer copy `occupancy.ps1` alongside the hook.** Keeps one source, but widens the installed surface that rule 1a must protect, and introduces a version skew between an installed helper and the checkout it came from.
+3. **Read a materialised occupancy artifact** rather than compute one — the registry the roster already writes under `.git/mefor-coord/`. No code shared, but it is a cache, and a stale cache that reports *unoccupied* fails **open** on the one decision where failing open deletes someone's work.
+
+Option 3's failure direction is the deciding constraint and should be stated before anyone starts: **whatever is built must fail CLOSED.** If occupancy cannot be determined, the answer is refuse, not allow. `prune-merged.ps1` already encodes exactly this — it skips a candidate when its fence becomes unavailable rather than proceeding.
+
+**Scope, so this does not quietly become "rewrite rule 3d".** The decision to refuse an occupied worktree does not change. What changes is that an **unoccupied** one becomes actionable — either allowed, or refused with a remedy the caller can actually execute rather than "ask the user". Nothing here touches rules 1, 1a, 1b, 3, 3b or 3c.
+
+**A cheaper interim was proposed here and WITHDRAWN, because it fails on this item's own reproduction case.** The proposal was to have the deny name `prune-merged.ps1`'s exact invocation rather than the general `worktree list`, on the grounds that it is dry-run-by-default and already consults occupancy. Measured: `prune-merged.ps1` builds its candidate set by a **literal prefix on the repo root** (`$_.Path.StartsWith("$RepoRootFwd-")`), so a candidate must live at `<repo-parent>/<repo-name>-<something>`. The worktree this item cites as its evidence is at `<repo-parent>/mf-banner1032` — a registered worktree of the same `.git`, confirmed present in `git worktree list --porcelain`, but carrying no such prefix (the repo directory is not named `mf`), so it is **not in the candidate set at all**. The refused caller would be sent to a tool that reports nothing about their tree: an unactionable refusal replaced by a different unactionable refusal, failing precisely on the case that motivated the item.
+
+Anyone reviving an interim must therefore either state the prefix precondition out loud, pass the leaf explicitly, or pick a different tool. Recorded rather than deleted because the proposal is the obvious one and the next reader will have the same idea.
+
+**Related:** #1041 (the false premise in the same rule, fixed — this is the gap it deliberately left), #1039 (the same shape one level up: deferring to a guard whose availability was never checked), #1000 (whatever is built here needs a negative control proving it can still refuse), #308.
+
+**Source:** identified 2026-08-05 while building #1041, from noticing that the reported third sighting was **not** an instance of what #1041 fixes. Filed separately rather than folded in, because citing it as evidence for the toplevel comparison would have claimed coverage that fix does not have — the same defect class the item was about, inside its own fix.
+
+## 1059. Shell variable indirection defeats the worktree gate's path resolution, so the primary is reachable
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **8/10** · Difficulty **6/10** · _do it_. The gate resolves paths **as literal strings**. A path that arrives through a shell variable cannot be resolved, so the rule falls back to the session's own cwd — a linked worktree, which is correctly exempt — and **allows** a command that will act on the shared primary. `cd <primary> && git reset --hard` is denied; `D=<primary>; cd $D && git reset --hard` is allowed. Same target, same effect, one variable.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development, not anything shipped. But it is a **live control**: measured against the INSTALLED hook that governs every worktree on this machine, not only against source.
+
+**Measured 2026-08-05 against the installed gate** at `~/.claude/hooks/worktree_gate.ps1`, sha256 `BE113C20CDE5`, `GateVersion 2026.08.05.2` — the copy actually enforcing at the time of filing. Payloads were fed to the hook directly; **none of these git commands were executed.**
+
+| command (session cwd = a linked worktree) | verdict |
+| --- | --- |
+| `cd <primary> && git reset --hard` | DENIED |
+| `cd <primary> ; git reset --hard` | DENIED |
+| `cd <primary>` newline `git reset --hard` | DENIED |
+| `D=<primary>; cd $D && git reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C $D reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C ${D} checkout main` | **ALLOWED** |
+
+The literal spellings are all caught, including the newline form. Only the indirection escapes, and it escapes in the direction that matters.
+
+**This is the exact scenario rule 3 was written for.** Its own comment records that a sibling session ran a tree-swapping command in the shared primary and *"every other session's files silently became a different commit's files"*. The rule closes the spelling that caused it and not the class.
+
+**Found by accident, which is the part that raises the priority.** It surfaced while a session ran ordinary cleanup — `D=<path>` then `cd "$D"` then a `git checkout` — and got a deny naming the WRONG worktree: the rule resolved the target to the session's cwd because it could not expand `$D`. So the same defect already produces confusing false positives in the benign direction. No adversarial intent is required to reach it; `cd "$VAR"` is how shell is ordinarily written, and an agent composing a multi-step command will hit it.
+
+**Scope: the SHELL rules only.** Rules 3, 3b, 3c and 3d read a command string and must infer which tree it touches. Rule 1 / 1a / 1b take `file_path` from the tool input, which is a real path and never a shell expression, so they are unaffected. Any fix belongs at the shared resolver (`Get-GitTargetCandidatesRaw` / `Get-ComparablePath`), not in each rule.
+
+**Why difficulty 6 rather than 2: a hook cannot evaluate shell.** It receives a string before execution and has no interpreter, no environment, and no way to know what `$D` holds — it may be set in an earlier line, exported by a profile, or computed. Chasing expansion is a losing game, so the options are all uncomfortable:
+
+1. **Fail closed on unresolvable path positions.** If a git command's target position contains `$`, backtick or `%…%`, refuse and say why. Simple, auditable, and consistent with the day's other conclusion that a needless deny beats a missed hijack. Cost is real: `cd "$D"` is idiomatic, so this will fire on legitimate work and must therefore say precisely what to do instead (use a literal path), or it will be routed around.
+2. **Resolve simple same-command assignments.** Parse `NAME=value` earlier in the same string and substitute. Catches the common case and gives a **false sense of coverage** for every other case — the worst property a guard can have, and the one #1000 exists to name.
+3. **Judge after expansion instead of before.** Not available to a PreToolUse hook by construction. Recorded so nobody spends time rediscovering it.
+
+**Recommendation, offered not decided: option 1, and it deserves an ADR rather than a patch,** because it trades measurable friction for closure and that is a judgement about how the gate is lived with, not a correctness question. Whatever is chosen needs a negative control per #1000 — the control must show the guard going red on the variable spelling, and **staying green** on a literal path inside the session's own worktree, or it will have been made unusable rather than safe.
+
+**Do not fix by widening the deny to any command containing `$`.** Rule 3 already scopes tightly to verbs that swap or discard a tree, and the gate's own comments record that over-broad rules get routed around and then guard nothing.
+
+**Related:** #1000 (a green that is not evidence — this one is green because it cannot see), #1039 ("git will refuse this" is a claim about a configuration; here the gate's claim is about a *spelling*), #1041 and #1057 (same rule family, refusal accuracy), #308.
+
+**Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
+
+## 1060. `alloc.ps1` records the owning worktree from the current directory, so an absolute-path invocation misattributes it
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/alloc.ps1:51` takes the owner from `git rev-parse --show-toplevel`, which resolves against the **current directory** rather than the script's location. Invoke it by absolute `-File` path from a different worktree — which is how a session with several worktrees naturally calls it — and the allocation is recorded to the caller's worktree while the commit comes from another. The ledger gate then refuses that commit correctly, but far away from the cause and with a message about the wrong thing.
+
+**Cluster:** Session coordination / ledger integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss and no security effect — the ledger gate **fails closed**, which is why this is a friction defect and not a correctness one. Nothing invalid lands; a valid commit is refused.
+
+**Reproduced 2026-08-05, twice, by accident.** A session ran `pwsh -NoProfile -File <abs>/scripts/coord/alloc.ps1 -Kind backlog` from worktree A while intending to commit from worktree B. `alloc/backlog/1058.json` recorded `"worktree": "<...>/trusting-wu-c2e6d5"`. The commit from `MessageFoundry-gate-deferrals` was then refused: *"BACKLOG item #1058 was not allocated to this worktree"* — true, unhelpful, and pointing at the allocator rather than at the invocation. Re-running with the shell actually inside the target worktree produced `1059.json` with the right owner and the commit went through. **#1058 is an abandoned hole**, which is the sanctioned outcome (`alloc.ps1`'s own docstring: *holes are free, collisions are not*).
+
+**The fix is small and there are two defensible shapes.** Either derive the repo from `$PSScriptRoot` so the allocator is anchored to the checkout it lives in — matching what `new.ps1` and `remove.ps1` already do — or keep the cwd behaviour and **say so at the point of use**, printing the recorded worktree in the `ALLOCATED` output so the mismatch is visible immediately rather than at commit time. The second is weaker but nearly free, and the two compose. Prefer anchoring: an allocator invoked by absolute path is being told which checkout to act on, and it should not then consult a different one.
+
+**Do not fix by making the ledger gate more lenient.** Its refusal is correct and is the only reason this was noticed at all. The defect is that ownership was recorded wrongly, not that it was enforced.
+
+---
+
+**THE SHARED PREMISE, which is larger than this item and is why it is worth reading here.** Three independent mechanisms in this repo assume, silently, that **where a command runs is where the caller is**:
+
+- **This item.** `alloc.ps1` resolves the owner from the current directory, not from the path it was handed.
+- **#1059.** The worktree gate resolves a command's target as a literal string against the session's cwd, so a path arriving through a shell variable falls back to the caller's own worktree — and a command aimed at the shared primary is allowed.
+- **#1057.** `occupancy.ps1` places sessions by cwd, so it cannot see a session writing into a worktree by absolute path from elsewhere. Measured on this repo: **0 occupants reported for a worktree that had been committed to a minute earlier.**
+
+`occupancy.ps1` already discloses the rate: **a session acting on a worktree by absolute path from elsewhere is 29% of writes on this repo**, by the project's own measurement. So the premise is not merely unstated, it is false about one write in three.
+
+**All three fail silently, and all three fail in the benign-looking direction** — a deny naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a worktree in active use. None raises. Each looks like a working answer.
+
+**All three were found by accident, none by looking**, which is the part that should not be trusted. Three instances is a coincidence-sized sample, and the honest next step is a targeted sweep for the shape — anything resolving a target from `--show-toplevel`, `getcwd`, or an unqualified relative path *when it was handed an explicit one* — which either produces a fourth concrete instance or shows three was the whole set. That is deliberately **not** filed as a theme item: "three mechanisms share a premise" has no fix and no closing condition, and would sit open describing something true. The premise is also recorded in [`docs/WORKTREES.md`](WORKTREES.md), so it outlives this item's closure.
+
+**Related:** #1059 (the gate instance, and the severe one), #1057 (the occupancy instance), #1000 (all three are green because they cannot see).
+
+**Source:** found 2026-08-05 while filing #1059, when the ledger gate refused a commit whose number had just been allocated successfully. Filed as the concrete defect rather than as the pattern, on the argument that a near-duplicate of an already-owned class dilutes the ledger — the same argument this session used earlier to decline filing a sibling to #1000.
+
+## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **9/10** · Difficulty **3/10** · _do it_. `git -C <primary-absolute> config core.hooksPath /dev/null` is DENIED. `git -C ../../.. config core.hooksPath /dev/null` is **ALLOWED** — same command, same target, relative spelling. That disarms `core.hooksPath` for the **shared clone**, i.e. the ledger, claim and secret-leak commit gates for every worktree at once, which is verbatim what rule 3c's own deny text says it exists to prevent. It requires no shell variable and no intent: `../../..` is the natural way to name the repo root from `<primary>/.claude/worktrees/<x>`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live fail-open in an enforcement control**, measured on the installed hook, and it is the highest-severity gate defect found to date.
+
+**Verified independently by two sessions against the same installed hook** (`~/.claude/hooks/worktree_gate.ps1`, sha256 `be113c20cde5…`). Neither session executed any `git config` command; only read-only primitives and the hook itself were run.
+
+| from a linked worktree | verdict |
+| --- | --- |
+| `git -C <primary-absolute> config core.hooksPath /dev/null` | DENIED |
+| `git -C ../../.. config core.hooksPath /dev/null` | **ALLOWED** |
+| `cd ../../.. && git config core.hooksPath /dev/null` | **ALLOWED** |
+
+**The mechanism, both primitives measured:**
+
+```
+git -C <primary> rev-parse --git-common-dir   ->  ".git"                      RELATIVE
+git -C <linked>  rev-parse --git-common-dir   ->  "C:/.../MessageFoundry/.git"  absolute
+[IO.Path]::GetFullPath('.git','../../..')     ->  THROWS  "Basepath argument is not fully qualified"
+[IO.Path]::GetFullPath('.git',<abs primary>)  ->  "C:\...\MessageFoundry\.git"  (control: works)
+```
+
+`worktree_gate.ps1:557` calls `Get-ComparablePath $common $where[0]` — passing the **target token as written** as the canonicalisation base. With a relative target the base is non-rooted, `GetFullPath` throws, the catch returns `""`, `$commonCmp` is empty, neither branch of the roots loop matches, and `if (-not $govCfg) { continue }` falls through to ALLOW.
+
+**Scoped to the PRIMARY by construction**, because only the primary's common dir comes back relative — a linked worktree returns an absolute path and denies correctly. That narrows the hole without redeeming it: the primary is the one checkout whose hooks protect everybody.
+
+**This is a miss, not a design choice, and the function's own header proves it.** `Get-ComparablePath`'s comment at `:128-133` states the principle correctly — a relative path must resolve against the **session's** cwd — names `../../..` from `<primary>/.claude/worktrees/<x>` as the exact spelling, records that it was already measured once, and even says *"GetFullPath throws on a non-rooted base, which the catch turns into 'not governed'"*. The sibling call at `:680` applies it correctly using `$cwdRaw`. Line 557 is the one call site that did not get the fix.
+
+**DO NOT APPLY THE OBVIOUS ONE-TOKEN FIX — it is wrong and it looks right.** Changing `:557` to `Get-ComparablePath $common $cwdRaw` fails: `$common` is `.git` relative to the **target directory**, not to the session's cwd. Resolving it against `$cwdRaw` yields `<session-worktree>/.git` — a real path that is *not* the primary's common dir — so the roots comparison still misses and the result is still ALLOW, now for a second and harder-to-see reason. The gate would appear fixed and stay open.
+
+**The correct shape is two steps: canonicalise the TARGET first, then the common dir against it.**
+
+```powershell
+$targetAbs = Get-ComparablePath $where[0] $cwdRaw    # relative target -> absolute, vs the SESSION cwd
+$commonCmp = Get-ComparablePath $common $targetAbs   # ".git" -> absolute, vs the TARGET
+```
+
+The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` returns exactly the primary's `.git`. **And it must FAIL CLOSED when `$targetAbs` is empty.** An unresolvable path currently means "not governed", which is precisely how this got through; the fix must not preserve that property.
+
+**No test covers it, and the test gap is the same shape as the defect.** The three rule-3c cases in `tests/test_worktree_gate_control_plane.py` all issue a bare `git config …` with **no path token**, so none of them can fail on a path-token defect. Green, and blind to the class. Any fix needs a case per spelling — absolute (denies today), relative (must deny after), and a linked-worktree target (must keep denying, so the fix is not merely a widening).
+
+**Related:** #1059 (the shell-variable bypass of the same resolver — **distinct**, because #1059's proposed fix of refusing on `$` in a target position leaves a literal `../../..` untouched), #1060 and #1057 (the cwd-is-not-the-caller cluster; this one is *not* an ambient-cwd defect — the hook process cwd was measured equal to the payload cwd), #1000 (a gate green because its tests cannot see the class).
+
+**Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.

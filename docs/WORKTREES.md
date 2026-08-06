@@ -368,6 +368,21 @@ armed PR is queued against the same files, the first question stops predicting t
 **write** memory at the same time the last write wins, so coordinate memory updates (or let one chat
 own them).
 
+**WHERE A COMMAND RUNS IS NOT WHERE THE CALLER IS, and tooling here keeps assuming it is.** Much of
+this repo's coordination machinery resolves "which worktree is this about?" from the **current
+directory** — `git rev-parse --show-toplevel`, `getcwd`, an unqualified relative path — even when it
+was handed an explicit path. That assumption is false about **one write in three**: `occupancy.ps1`
+measures a session acting on a worktree by absolute path from elsewhere at **29% of writes on this
+repo**. So `pwsh -File <abs>/scripts/coord/alloc.ps1` run from worktree A while you intend to commit
+from worktree B records A, and `cd "$D" && git ...` is resolved against your session's cwd rather
+than `$D`, because a hook cannot expand a shell variable.
+
+The failure mode is the dangerous one: these read as working answers rather than raising. A refusal
+naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a
+worktree in active use — none of them errors. **So run these tools with the shell actually inside the
+worktree they are about, and prefer literal paths over variables in any command a hook has to
+judge.** Instances: BACKLOG #1057, #1059, #1060.
+
 ## Automatic coordination context (SessionStart hook)
 
 You don't have to brief each new chat by hand. A `SessionStart` hook

@@ -207,8 +207,49 @@ def test_removing_another_sessions_worktree_is_denied(repo: SimpleNamespace) -> 
     reason = assert_denied(
         run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.primary), repo.repos)
     )
-    assert "ANOTHER SESSION" in reason
     assert "prune-merged.ps1" in reason  # offer the maintenance path, do not merely refuse
+    # It must NOT assert the tree belongs to another session (BACKLOG #1041). The rule has no occupancy
+    # or authorship signal, so that was an unverified claim -- and it was FALSE for a caller acting on a
+    # worktree nobody was using. Refusing without knowing is correct; saying you know is not.
+    assert "ANOTHER SESSION" not in reason
+    assert "NOT the tree" in reason
+    assert "cannot tell" in reason
+
+
+def test_removing_your_own_worktree_is_not_blamed_on_another_session(
+    repo: SimpleNamespace,
+) -> None:
+    """BACKLOG #1041. Reproduced live before it was filed: a session standing in a linked worktree ran
+    `git worktree remove <that same path>` and was told the tree belonged to ANOTHER SESSION, then sent
+    to confirm with a colleague who does not exist.
+
+    The old justification was that git refuses to remove the worktree you are standing in, so anything
+    reaching git must be aimed elsewhere. A PreToolUse hook decides whether anything reaches git AT ALL,
+    so that refusal never happens and the premise is never tested. The decision to deny is still right --
+    only the reason was false."""
+    reason = assert_denied(
+        run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.wt), repo.repos)
+    )
+    assert "ANOTHER SESSION" not in reason
+    assert "THE WORKTREE THIS SESSION IS RUNNING IN" in reason
+    # The old remedy sent the reader to confirm the tree was not in use -- verifying a falsehood.
+    assert "not in use" not in reason
+
+
+def test_the_self_check_does_not_leak_into_the_sibling_case(repo: SimpleNamespace) -> None:
+    """Non-vacuity for the pair above: the two branches must be reachable and DIFFERENT.
+
+    A self-check that fired for every path would make the sibling deny unreachable and quietly stop
+    protecting other sessions' trees -- the failure this rule exists to prevent."""
+    own = assert_denied(
+        run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.wt), repo.repos)
+    )
+    sibling = assert_denied(
+        run_gate(shell(f'git worktree remove "{repo.wt}"', cwd=repo.primary), repo.repos)
+    )
+    assert own != sibling
+    assert "THE WORKTREE THIS SESSION IS RUNNING IN" in own
+    assert "THE WORKTREE THIS SESSION IS RUNNING IN" not in sibling
 
 
 def test_force_removing_and_moving_are_denied_too(repo: SimpleNamespace) -> None:
