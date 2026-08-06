@@ -11,18 +11,21 @@ engine's by the parity test; the adapter/leak seams are behaviourally parallel (
 Public surface (same shape as the engine's):
 
 * :func:`anonymize` — de-identify one HL7 message.
-* :func:`anonymize_checked` — :func:`anonymize` + a fail-closed :func:`leak_check`; raises
-  :class:`LeakError` (token categories only) on any surviving token.
-* :func:`leak_check` — forbidden-token hits via the vendored token authority.
+* :func:`anonymize_checked` — :func:`anonymize` + a fail-closed :func:`leak_report`; raises
+  :class:`LeakError` (token categories + PHI shapes/addresses only) on any surviving token or a
+  structural PHI shape in a field no rule mapped.
+* :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
+  unmapped fields + the unmapped-field coverage report (vendored twin of the engine's; BACKLOG #331).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
-from .leak import leak_check
+from .leak import LeakReport, coverage_clause, leak_check, leak_report
 from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
 
 __all__ = [
@@ -31,11 +34,13 @@ __all__ = [
     "FieldRule",
     "Keyer",
     "LeakError",
+    "LeakReport",
     "RuleError",
     "SurrogateKind",
     "anonymize",
     "anonymize_checked",
     "leak_check",
+    "leak_report",
     "load_rules",
 ]
 
@@ -67,14 +72,29 @@ def anonymize_checked(
     salt: str,
     overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
+    require_live_denylist: bool = False,
+    on_report: Callable[[LeakReport], None] | None = None,
 ) -> str:
-    """:func:`anonymize`, then a fail-closed :func:`leak_check`; raise :class:`LeakError` on any hit."""
-    output = anonymize(raw, salt=salt, overlay=overlay, rules=rules)
-    hits = leak_check(output)
-    if hits:
+    """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
+
+    Two-layered like the engine's (BACKLOG #331): the known-token denylist plus high-precision
+    structural PHI-shape detectors over the fields no rule matched. ``require_live_denylist`` (default
+    off) makes a non-live token source a refusal cause; ``on_report`` receives the :class:`LeakReport`
+    on both paths. The error names token categories and field shapes/addresses only, never a value.
+    """
+    effective = rules if rules is not None else load_rules(overlay)
+    output = anonymize(raw, salt=salt, rules=effective)
+    report = leak_report(output, rules=effective)
+    if on_report is not None:
+        on_report(report)
+    causes = list(report.hits)
+    if require_live_denylist and report.token_floor_reason is not None:
+        causes.append(f"denylist not live: {report.token_floor_reason}")
+    if causes:
         raise LeakError(
             "anonymized output still carries forbidden token(s): "
-            + "; ".join(sorted(set(hits)))
+            + "; ".join(sorted(set(causes)))
             + " — refusing to emit (fail closed). Extend the rule map for the missed field(s)."
+            + coverage_clause(report)
         )
     return output
