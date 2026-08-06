@@ -375,13 +375,26 @@ Two results, and the second is the one that matters:
 
 - [x] The eight findings are closed in the scripts, with the tests the Acceptance Criteria name.
       `tests/test_session_mail.py` exists and every `→` link above resolves to a function in it.
-- [ ] AC-5's test carries a negative control that demonstrably goes red — a concurrency assertion
+- [x] AC-5's test carries a negative control that demonstrably goes red — a concurrency assertion
       with no proof it can fail is the ADR 0158 defect, and this one in particular has a plausible
       wrong version that passes.
-- [ ] The per-injection caps in D9 get concrete numbers, chosen against a measurement rather than
-      asserted.
-- [ ] The content rule (D10) is stated in [SESSION-MAIL.md](../SESSION-MAIL.md) and referenced from
-      [PHI.md](../PHI.md), in one place each.
+      **Two controls, both in `tests/test_session_mail.py`:**
+      `test_the_naive_shared_destination_pattern_does_not_exclude` runs the WRONG pattern inline and
+      requires it to fail to exclude — so a green exclusion result is only evidence because the same
+      harness is shown to detect the defect; and
+      `test_the_claim_primitive_reports_a_failure_it_cannot_have_won` re-runs the measurement's own
+      controls, so a `Move-Claimed` that returned `Won` unconditionally is caught rather than read as
+      a subtle bug.
+- [x] The per-injection caps in D9 get concrete numbers, chosen against a measurement rather than
+      asserted. Numbers in `mail-drain.ps1`; anchors in [SESSION-MAIL.md](../SESSION-MAIL.md)
+      (`CLAUDE.md` at 40,102 bytes as the deliberate per-session cost, `docs/STEERING.md` at 3,504
+      bytes as a whole document, and announce's existing peer-field caps). `FRAME_OVERHEAD_BYTES`
+      exists **because** of a measurement: charging the raw body while the renderer added six bytes a
+      line let a 34,539-byte injection pass an 8,000-byte cap reporting `0 truncated`.
+- [x] The content rule (D10) is stated in [SESSION-MAIL.md](../SESSION-MAIL.md) and referenced from
+      [PHI.md](../PHI.md), in one place each. Stated once as a section heading; PHI.md carries one
+      row pointing at it. The only other occurrence in SESSION-MAIL.md is an internal link back to
+      that section, which is the shape this box asks for rather than a second statement.
 - [x] Owner decision on whether the urgent `asyncRewake` tier is wired at all, given D11.
       **DECIDED 2026-08-06: NOT WIRED, and not rebuilt yet.** The default tier has never delivered
       mail in real use -- everything to date is rig-verified and the code is unmerged -- so building a
@@ -389,5 +402,8 @@ Two results, and the second is the one that matters:
       path is recorded in [SESSION-MAIL.md](../SESSION-MAIL.md) so it is not rediscovered: arm on
       `UserPromptSubmit` rather than `SessionStart`. Revisit only if someone hits the latency in
       practice.
-- [ ] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
-      every session in this repo.
+- [x] Owner approval to wire the drain rows, which places a hook on `SessionStart` and `Stop` for
+      every session in this repo. **Given 2026-08-05/06, in two steps:** `Stop` first, then
+      `SessionStart` once the show/consume split made a discarded session unable to consume what it
+      displayed. Default config root only. ⚠️ The rows are live and the hook still resolves nothing
+      outside a worktree holding this branch — see §"Status and what gates wiring".
