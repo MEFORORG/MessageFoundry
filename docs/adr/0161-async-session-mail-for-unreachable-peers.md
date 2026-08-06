@@ -362,8 +362,14 @@ Two results, and the second is the one that matters:
   six events the message was displayed, held, not re-displayed to the session that had already seen it,
   and consumed exactly once at the surviving session's `Stop`. The residual risk is stated in
   [SESSION-MAIL.md](../SESSION-MAIL.md): because ids are reused, a phantom carrying the *surviving*
-  session's id would be indistinguishable by construction. That specific collision is unobserved and
-  must be measured, not reasoned away.
+  session's id would be indistinguishable by construction. **That collision has now been REPRODUCED**
+  (2026-08-06): a phantom displays and marks a message, a later session reusing that id has the
+  display suppressed, and its `Stop` consumes a message it never saw. Strictly narrower than the
+  defect the split closed -- which lost mail unconditionally, to the first of six phantoms, every
+  launch -- but the same kind of failure: silent, receipt-clean, undetectable by any artefact here,
+  since all of them are keyed by the session id the two sessions share. The principled fix is to
+  consume only what the SAME drain invocation rendered, trading a guaranteed duplicate display for
+  the removal of cross-invocation trust. Recorded, not made.
 
 ## To resolve on acceptance
 

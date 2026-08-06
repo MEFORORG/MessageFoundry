@@ -378,17 +378,38 @@ the one to watch:
   that submitted prompts. The five phantoms fired `SessionStart` and nothing else. Previously the
   argument was weaker -- that they never became conversations, so presumably never took a turn -- and
   it now rests on observed teardown behaviour instead.
-- **A phantom's session id must differ from the surviving session's. THIS ONE IS AT RISK, and the same
-  run is what put it there.** Session ids are **reused across launches**: one of the six carried an id
-  observed hours earlier in a previous run. It happened to be a phantom and the real session had a
-  different id, so the precondition held -- but it held by luck, not by construction. A phantom that
-  reused the *surviving* session's id would mint a marker indistinguishable from that session's own,
-  suppressing a display it never made and letting the next `Stop` consume the message unseen. Every
-  artefact here is keyed by session id, so nothing in this design can detect that case.
+- **A phantom's session id must differ from the surviving session's. THIS PRECONDITION IS VIOLABLE, AND
+  THE LOSS IT ALLOWS HAS NOW BEEN REPRODUCED.** Not "at risk", not inferred -- measured 2026-08-06
+  against the shipped drain:
 
-  It is not hypothetical-in-principle the way it was before this run: id reuse is now observed
-  behaviour. What is unobserved is the specific collision. **Do not close this by reasoning; measure
-  whether a phantom can ever carry the id of a session that survives.**
+  | step | outcome |
+  |---|---|
+  | session `X` `SessionStart` (the phantom) | message **displayed**, marker minted, **not consumed** -- correct |
+  | session `X'` reusing the same id, `SessionStart` | **not displayed** -- suppressed by the phantom's marker |
+  | session `X'` `Stop` | **not displayed**, and **consumed** |
+
+  The message was consumed by a session that never saw it. From the drain's side those three
+  invocations are byte-identical to one healthy session showing mail at start and consuming it at the
+  turn boundary, so **nothing in this design can detect the difference** -- every artefact is keyed by
+  session id, and the two sessions share one.
+
+  **All three preconditions are observed, not hypothesised.** Session ids are **reused across
+  launches** (one of the six in the phantom run carried an id seen hours earlier), phantoms mint
+  markers, and a marker for a message still in the inbox is correctly *not* garbage-collected -- so it
+  survives exactly as long as the message it would suppress.
+
+  **What this does and does not cost.** It is strictly narrower than the defect the split closed: that
+  one lost mail to the *first* of six phantoms on every launch, unconditionally. This needs a pending
+  message, a phantom that displayed it, and a later session reusing that phantom's id before the
+  message is consumed by anyone else. But it is the same *kind* of failure -- silent, receipt-clean,
+  and invisible to the operator -- and the channel's stated rule is that duplicate display is accepted
+  while silent loss is not.
+
+  **The principled fix is to stop trusting a marker across invocations: consume only what the SAME
+  drain invocation rendered.** `SessionStart` would then display without earning the right to consume,
+  and `Stop` would display again and consume what it just showed. That trades a guaranteed duplicate
+  display for the removal of the entire cross-invocation trust relationship, which is the direction the
+  stated rule points. It is a design change, not a patch, and it is **not** made here.
 
 **The marker is the per-session record of a display, and the receipt is not.** A receipt is named
 `<stem>.json` -- one slot per **message**, last writer wins -- so it can say *some* session was shown
