@@ -15,43 +15,61 @@ hook.
 
 ---
 
-## Status: wired on `SessionStart` and `Stop`, on the default config root -- and INERT until the scripts reach `main`
+## Status: LIVE on all five config roots, and verified end to end through the installed hook
 
 **Read the config, not this line, before relying on it** -- a status sentence in a document is exactly
-the observation that goes stale without saying so. As last verified against `~/.claude/settings.json`:
-the drain is registered on **both `SessionStart` and `Stop`**, on the default root only. No
-`~/.claude-account-N` carries it. The coordination banner
-(`scripts/worktree/session-context.ps1`) is a *different* hook that shares the `SessionStart` event and
-is deliberately still absent; install one tier at a time with
-`-Only <event> -Script mail-drain`, because `-Only SessionStart` alone would wire the banner too. The
-urgent tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
-registered nowhere.
+the observation that goes stale without saying so. As last verified 2026-08-06 against every config
+root: the drain is registered on **both `SessionStart` and `Stop`**, on **all five roots** (`~/.claude`
+plus `.claude-account-1` through `-4`). All four numbered roots are in active use, so a drain on the
+default root alone would have left the cross-login case -- half the reason this channel exists --
+unreachable.
 
-> **THE ROWS ARE LIVE AND THE HOOK STILL DOES NOTHING, IN ALMOST EVERY WORKTREE.** The installed shim
-> resolves `scripts/hooks/mail-drain.ps1` from the **primary checkout first**, falling back to the
-> session's own worktree. Measured from two vantage points, which is the only way to see it:
+The coordination banner (`scripts/worktree/session-context.ps1`) is a *different* hook that shares the
+`SessionStart` event and is deliberately still absent. **Install one tier at a time with
+`-Only <event> -Script mail-drain`**: `-Only SessionStart` alone would wire the banner too. The urgent
+tier ([`scripts/hooks/mail-watch.ps1`](../scripts/hooks/mail-watch.ps1)) is armed in code and
+registered nowhere, by decision.
+
+**VERIFIED END TO END, through the installed hook command rather than a convenient stand-in.** The
+earlier VS Code run drove the drain by absolute path, which does not exercise the thing that actually
+runs; this one used the shim verbatim from `~/.claude/settings.json`:
+
+| check | result |
+|---|---|
+| shim resolution, probed from five worktrees on unrelated branches | resolves in **all** of them, via the primary checkout |
+| message queued with `main`'s `mail.ps1` | delivered by the installed hook command |
+| receipt written by the drain process | `disposition: shown-consumed`, `byHookEvent: Stop` |
+| box afterwards | `inbox 0`, `seen 1` -- consumed exactly once |
+
+⚠️ **What made it live was `git pull` in the primary checkout, not the merge** -- see the note below,
+which is the trap this section was wrong about for several hours.
+
+> **RETAINED AS A LESSON, NOT AS CURRENT STATE: for several hours the rows were live and the hook did
+> nothing, in almost every worktree.** The shim resolves `scripts/hooks/mail-drain.ps1` from the
+> **primary checkout first**, falling back to the session's own worktree. Two things follow, and both
+> cost real time to find:
+>
+> **1. A single-vantage check cannot see this failure.** Probed from two places while it was broken:
 >
 > | probed from | primary base | own-worktree fallback | resolves |
 > |---|---|---|---|
-> | a worktree holding this branch | `False` | `True` | yes -- **but only because that branch carries the file** |
+> | a worktree carrying the branch | `False` | `True` | yes -- **only because that branch carried the file** |
 > | any other worktree | `False` | `False` | **nothing** |
 >
-> Every session outside a worktree holding this branch fires the hook, resolves nothing, and exits 0 --
-> **byte-identical to a healthy hook with no mail**, the exact defect
-> [observability rule 1](#three-observability-rules) exists to prevent. Probing from the branch worktree
-> alone reports `True` and looks healthy, so **a single-vantage check cannot see this**.
+> Checking from the branch worktree returns `True` and looks healthy. Everywhere else the hook fired,
+> resolved nothing and exited 0 -- **byte-identical to a healthy hook with no mail**, the exact defect
+> [observability rule 1](#three-observability-rules) exists to prevent. **Probe a shim-resolved hook
+> from a worktree that does NOT carry the branch**, or the fallback masks a broken primary resolution.
 >
-> ⚠️ **MERGING TO `main` IS NOT WHAT MAKES IT LIVE, and an earlier draft of this section said it was.**
-> Measured immediately after PR #210 landed: `mail-drain.ps1` was on `origin/main` and **still absent
-> from the primary checkout's working tree**, which was three commits behind. The shim resolves a
-> **working tree**, not a ref. Nothing pulls the primary automatically, so the channel stays inert
-> across the whole machine until somebody does -- and the merge notification is exactly the moment an
-> operator is most likely to believe it went live.
+> **2. Merging to `main` is NOT what makes a shim-resolved hook live, and an earlier draft of this
+> section said it was.** Measured immediately after PR #210 landed: `mail-drain.ps1` was on
+> `origin/main` and **still absent from the primary checkout's working tree**, which was three commits
+> behind. **The shim resolves a WORKING TREE, not a ref.** Nothing pulls the primary automatically, so
+> the channel stayed inert across the whole machine until somebody did -- and the merge notification is
+> exactly the moment an operator is most likely to believe it went live. **The activating action was
+> `git pull` in the primary checkout.**
 >
-> **The activating action is `git pull` in the primary checkout, not the merge.** Re-test on the target
-> surface after that, from a worktree that does **not** carry this branch, so the fallback cannot mask a
-> broken primary resolution. A row in a settings file is not a hook that fired, which is what the
-> installer prints on every run.
+> A row in a settings file is not a hook that fired, which is what the installer prints on every run.
 
 The show/consume split described in ["Showing is not consuming"](#showing-is-not-consuming) is what
 makes wiring `SessionStart` safe: a discarded session can display mail but cannot consume it.
