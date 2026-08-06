@@ -382,12 +382,28 @@ specific to two claimers racing a single source onto a single destination.
 Those are two separate acts, and keeping them separate is what stops a session nobody is looking at
 swallowing the mail. The mechanism:
 
-- **At `Stop`** (the only consuming event): render anything this session has not already been shown,
-  then **consume** -- claim, receipt, move to `seen/` -- everything this session has been shown,
-  including what it was shown earlier at `SessionStart`.
+- **At `Stop`** (the only consuming event): render **everything deliverable**, then **consume** --
+  claim, receipt, move to `seen/` -- **exactly what it just rendered, and nothing else**. Markers are
+  ignored here entirely.
 - **At `SessionStart`, and at any other event**: render the mail and **leave it in the inbox**. A
-  marker file `box/<key>/shown/<stem>--<session-key>.marker` records that this session has seen it, so
-  the same session is not shown it a second time.
+  marker file `box/<key>/shown/<stem>--<session-key>.marker` records the display, and suppresses a
+  re-display at another *non-consuming* event. It can never authorise a consume.
+
+⛔ **CONSUMPTION DEPENDS ONLY ON WHAT THE SAME INVOCATION RENDERED, and that is a correction to an
+earlier design rather than an embellishment of it.** `Stop` used to consume what a *marker* said this
+session had been shown at an earlier drain, without re-rendering it. That was measured losing mail:
+**session ids are reused across launches**, so a discarded session mints a marker and a later session
+carrying the same id inherits it -- then consumes a message it was never shown, with a clean receipt.
+Reproduced end to end before removal.
+
+**No check could have rescued it.** `session_id`, `transcript_path` and `cwd` are identical between
+the two sessions, so nothing available to this hook separates them. The failure was structural, not a
+missing guard, which is why the fix deletes the cross-invocation trust instead of hardening it. What
+a drain rendered *in this process, in this invocation* is a fact no other session can forge.
+
+**The price, paid knowingly: a session shown mail at `SessionStart` is shown it again at its first
+`Stop`.** That is a guaranteed duplicate rather than an occasional one. Do not reintroduce a
+held-consume to remove it without first solving the identity problem above.
 
 **Why**, and it is the defect measured in ["What still blocks wiring"](#what-still-blocks-wiring) 1b: a
 `SessionStart` hook that CONSUMES state can lose that state to a session that never existed. A hook
@@ -409,38 +425,15 @@ the one to watch:
   that submitted prompts. The five phantoms fired `SessionStart` and nothing else. Previously the
   argument was weaker -- that they never became conversations, so presumably never took a turn -- and
   it now rests on observed teardown behaviour instead.
-- **A phantom's session id must differ from the surviving session's. THIS PRECONDITION IS VIOLABLE, AND
-  THE LOSS IT ALLOWS HAS NOW BEEN REPRODUCED.** Not "at risk", not inferred -- measured 2026-08-06
-  against the shipped drain:
+- **A phantom's session id must differ from the surviving session's. THIS ONE IS NOW MOOT, AND THE
+  REASON IS THE FIX ABOVE.** It was measured VIOLABLE -- session ids are reused across launches, and
+  the resulting loss was reproduced end to end: a phantom marked a message, a later session carrying
+  the same id had its display suppressed, and its `Stop` consumed a message it had never seen.
 
-  | step | outcome |
-  |---|---|
-  | session `X` `SessionStart` (the phantom) | message **displayed**, marker minted, **not consumed** -- correct |
-  | session `X'` reusing the same id, `SessionStart` | **not displayed** -- suppressed by the phantom's marker |
-  | session `X'` `Stop` | **not displayed**, and **consumed** |
-
-  The message was consumed by a session that never saw it. From the drain's side those three
-  invocations are byte-identical to one healthy session showing mail at start and consuming it at the
-  turn boundary, so **nothing in this design can detect the difference** -- every artefact is keyed by
-  session id, and the two sessions share one.
-
-  **All three preconditions are observed, not hypothesised.** Session ids are **reused across
-  launches** (one of the six in the phantom run carried an id seen hours earlier), phantoms mint
-  markers, and a marker for a message still in the inbox is correctly *not* garbage-collected -- so it
-  survives exactly as long as the message it would suppress.
-
-  **What this does and does not cost.** It is strictly narrower than the defect the split closed: that
-  one lost mail to the *first* of six phantoms on every launch, unconditionally. This needs a pending
-  message, a phantom that displayed it, and a later session reusing that phantom's id before the
-  message is consumed by anyone else. But it is the same *kind* of failure -- silent, receipt-clean,
-  and invisible to the operator -- and the channel's stated rule is that duplicate display is accepted
-  while silent loss is not.
-
-  **The principled fix is to stop trusting a marker across invocations: consume only what the SAME
-  drain invocation rendered.** `SessionStart` would then display without earning the right to consume,
-  and `Stop` would display again and consume what it just showed. That trades a guaranteed duplicate
-  display for the removal of the entire cross-invocation trust relationship, which is the direction the
-  stated rule points. It is a design change, not a patch, and it is **not** made here.
+  That precondition no longer has to hold, because consumption no longer depends on identity at all.
+  A consuming drain renders what it consumes, so a marker inherited from any other session -- phantom
+  or not, same id or not -- can at worst suppress one *non-consuming* display. It cannot cause a
+  consume. **The dependency was removed rather than the risk being argued down.**
 
 **The marker is the per-session record of a display, and the receipt is not.** A receipt is named
 `<stem>.json` -- one slot per **message**, last writer wins -- so it can say *some* session was shown
