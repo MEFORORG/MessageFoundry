@@ -285,6 +285,10 @@ diverge enough to warrant it; keep this root file general.
   checkout + branch + `.venv`; same remote, same PR flow. See [`docs/WORKTREES.md`](docs/WORKTREES.md).
   (The AI project memory is shared across sessions — coordinate memory writes.)
 
+### Before you verify
+- Run `/simplify` on the changed code before the verification quartet below. See
+  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §5.1.
+
 ### Verification expectations (a task isn't "done" until these pass)
 - New behavior gets a test. Run, in order: `ruff check` + `ruff format --check`, `mypy`
   (strict), `pytest` (with `QT_QPA_PLATFORM=offscreen` for the PySide6 harness tests).
