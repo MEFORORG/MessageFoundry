@@ -308,7 +308,7 @@ asyncio_mode = "auto"
 # the fixture key needs >=0.24); the dev floor below is >=0.26 to match, and the lock pins 1.4.0.
 asyncio_default_test_loop_scope = "session"
 asyncio_default_fixture_loop_scope = "session"
-testpaths = ["tests"]
+testpaths = ["tests", "packaging/messagefoundry-webconsole/tests"]
 # Per-test watchdog: a single hung await/socket is killed at 60s with a full thread-stack dump naming
 # the culprit, instead of burning the CI job's wall-clock. `thread` method works cross-platform (no
 # SIGALRM) and fires even when the main thread is blocked in a C call. Individual tests run well under

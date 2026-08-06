@@ -3671,6 +3671,7 @@ async def test_webauthn_cross_site_posts_rejected(engine: Engine) -> None:
 async def test_webauthn_rp_fail_closed_legible(engine: Engine) -> None:
     # AC-7: public_origin unset + request-derivation disallowed (the declared-proxy topology) —
     # ceremonies fail closed with the shared notice on every surface, never a redirect loop.
+    pytest.importorskip("webauthn")
     service = await _service(engine)
     await _add(service, "boss", Role.ADMINISTRATOR)
     transport = httpx.ASGITransport(

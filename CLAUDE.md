@@ -334,6 +334,7 @@ diverge enough to warrant it; keep this root file general.
 
 ```
 # tests (PySide6 harness/Qt tests need the offscreen platform)
+# testpaths now also collects packaging/messagefoundry-webconsole/tests, so this covers the web console suite too.
 QT_QPA_PLATFORM=offscreen pytest -q          # PowerShell: $env:QT_QPA_PLATFORM="offscreen"; pytest -q
 
 # format / lint / types
