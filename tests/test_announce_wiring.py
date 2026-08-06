@@ -58,6 +58,9 @@ def _marker(name: str) -> str:
 
 COORD_MARKER = _marker("MARKER")
 ANNOUNCE_MARKER = _marker("ANNOUNCE_MARKER")
+# The third marker. Read from the installer for the same reason as the other two: a test carrying its
+# own copy of a constant stops testing the shipped value the moment somebody changes it.
+MAIL_MARKER = _marker("MAIL_MARKER")
 
 
 def run_installer(settings: Path, *args: str) -> str:
@@ -243,10 +246,27 @@ def test_the_two_original_hooks_are_still_wired_and_unchanged(settings: Path) ->
     assert "Edit|Write|MultiEdit|NotebookEdit" in [
         g.get("matcher") for g in d["hooks"]["PreToolUse"]
     ]
+    # THE -CommonDir ASSERTION APPLIES TO EVERY SessionStart ROW, and it is the behavioural one this
+    # test exists for: neither session-context.ps1 nor the mail drain declares that parameter, and
+    # PowerShell errors on an unexpected one, so the announce shim's extra argument must never leak
+    # into a row built by the shared builder.
     for c in _cmds(d, "SessionStart"):
-        assert COORD_MARKER in c
-        assert ANNOUNCE_MARKER not in c
         assert "-CommonDir" not in c
+        assert ANNOUNCE_MARKER not in c
+
+    # THE MARKER ASSERTION IS SCOPED, because SessionStart no longer carries only "the two original
+    # hooks" this test is named for. The mail drain shares the event and carries its own marker by
+    # design -- the three markers are deliberately pairwise non-containing so that installing one
+    # cannot strip another. Asserting COORD_MARKER over EVERY SessionStart command was a naming
+    # convention masquerading as an invariant, and it went red the moment a second row appeared.
+    coord = [c for c in _cmds(d, "SessionStart") if COORD_MARKER in c]
+    assert coord, "the coordination banner row is not wired on SessionStart"
+    # The sibling row is present and distinct -- assert that rather than pretend the event has one row.
+    assert [c for c in _cmds(d, "SessionStart") if MAIL_MARKER in c], (
+        "the mail drain row is not wired on SessionStart"
+    )
+    for c in coord:
+        assert MAIL_MARKER not in c, "a marker leaked across rows; they must stay non-containing"
 
 
 def test_reinstall_is_byte_identical_with_three_rows(settings: Path) -> None:
@@ -267,7 +287,11 @@ def test_userpromptsubmit_entry_has_no_matcher_key(settings: Path) -> None:
 
 
 def test_status_reports_the_announce_row(settings: Path) -> None:
-    assert "missing" in run_installer(settings, "-Status")
+    # UPPERCASE. The installer prints "MISSING", and a lowercase substring check is case-sensitive, so
+    # this asserted against output that says exactly what the test wants it to say. The word changed
+    # from "missing" to "MISSING" when -Status grew its per-root breakdown -- deliberately, so an
+    # absent row is as loud as a present one -- and the assertion was not updated with it.
+    assert "MISSING" in run_installer(settings, "-Status")
     run_installer(settings)
     out = run_installer(settings, "-Status")
     assert "INSTALLED" in out
