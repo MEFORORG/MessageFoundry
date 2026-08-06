@@ -4695,7 +4695,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1016. claims.py 500s on two malformed-IdP shapes with no closed-set audit row
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two narrow, attacker-influenceable inputs raise **past** the `ClaimsError` contract, so the response is a 500 with no closed-set audit row instead of a named claim rejection.
+> ✅ **Fixed 2026-08-06.** Value 5/10 · Difficulty 2/10. Both malformed-IdP shapes — a non-ASCII nonce and a list `aud` carrying an unhashable element — now reject as named, audited ClaimsErrors (nonce_mismatch / claim_aud); on first deployment either would otherwise have surfaced as a 500 with no closed-set audit row.
 
 **Cluster:** Security / authentication robustness. **Priority:** P2. **Verdict:** build (small). **Severity:** low — availability and audit completeness, not an auth bypass. Neither path admits a bad principal; both turn a rejectable token into an unclassified 500.
 
