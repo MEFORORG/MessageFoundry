@@ -78,7 +78,7 @@ handed out as free — which is exactly how #240–#247 were issued over cited n
 **Released 2026-06-18.** `v0.1.0` is tagged, signed, and published to PyPI — the GitHub release (marked
 Latest) carries the wheel + sdist + CycloneDX SBOM + Sigstore signatures + SLSA build provenance. The
 `v0.1.0-rc1` pre-release (2026-06-16) preceded it. Full scope and the hard-gate record:
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md). Capability catalog across every area, with status:
+`releases/v0.1-PLAN.md`. Capability catalog across every area, with status:
 [`FEATURE-MAP.md`](FEATURE-MAP.md).
 
 v0.1 delivered a **server DB as the supported production path (PostgreSQL + SQL Server)**, **engine HA
@@ -135,7 +135,7 @@ had been declined on a premise its own ADR 0053 contradicts). **#40** self-hoste
 **#41** cloud / Kubernetes HA packaging and **#61** third-tier DR standby have all shipped; **#11** WebAuthn
 shipped (ADR 0068 L5a); **#39** (frozen console installer Phase B) was built then retired (2026-07-01,
 superseded by the #75 browser ops dashboard). Sequencing context for the earlier wave lives in
-[`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+`releases/MULTISESSION-PLAN-6.md`.
 
 ---
 
@@ -507,7 +507,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#219** | Harness-invariant property test + cross-observer INCONCLUSIVE guard ✅ | 7 | 3 | _quick win_ | ✅ BUILT | Structural CI guard codifying the anti-fabrication invariant that stops the B-class harness bug from recurring in any future throughput gate. **BUILT 2026-07-10** (A4a property test + A4b `observers_inconclusive`). |
 | **#208** | Fix the per-PID engine CPU collector (attribution is blind without it) | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — shipped 2026-07-20; the residual is OFF-REPO and no in-repo change can close it.** The blocking premise is discharged: an admissible aggregate verdict bounds engine CPU at ≤ 0.36 cores/shard (`PLAN-ENGINE-ATTRIBUTION.md:81`, `:280`). Deliberately published with **no sizing figure**. |
 | **#211** | Claim-mode lane-count sweep (16 → 1,500 lanes) — NOT a default flip | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — owner-ratified 2026-07-17, characterization-only.** The A/B ran and is published (`THROUGHPUT-STATUS-2026-07-10.md:256`, `:259`, `:664`). ⚠️ **Not a licence to flip the `claim_mode` default, and not a rig ask** — the 1,500-lane claim storm is precisely why the default stands. |
-| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ [2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
+| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ 2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
 | **#216** | 1,500-connection traffic-driving harness mode (the demo shape) | 7 | 6 | _big bet_ | ✅ SHIPPED | **SHIPPED (verified 2026-07-28).** ⚠️ The *"no existing harness covers it"* premise is **retracted as false**: `harness/load/estate/` + `harness/config/estate/` + `python -m harness --estate`, with `count = 1500` in `estate-demo.toml`. ⚠️ `simple_fraction=0.72` and `hub_fanout=3` still need **OWNER SIGN-OFF**. |
 | **#218** | 2-point shard probe (N=1 vs N=4) — the cheap early killer | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — the experiment RAN (C1, 2026-07-10) and answered DECLINING:** 11.33 → 15.42 ingress/s = **1.36× for 4× shards** (`THROUGHPUT-STATUS-2026-07-10.md:265`). Direction firm, magnitudes soft (both soaks collapsed). Re-running re-derives a published verdict. |
 | **#210** | Remove the tempdb table variables from the pooled claim query | 7 | 7 | _big bet_ | ⛔ DECLINED | **DECLINED — withdrawn, owner-ratified 2026-07-17** (*"Do not build it"*, `THROUGHPUT-STATUS-2026-07-10.md:675`). ⚠️ **ADR 0114 deliberately PRESERVES the four table variables** (`store/sqlserver.py:702-717`) — they are load-bearing for per-lane FIFO. Removing them is a rejected design, not an unfinished one. |
@@ -542,7 +542,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 > **Update (2026-06-28).** Since this 2026-06-19 snapshot, **most rows below shipped** (through `0.2.10`) — the
 > per-item ✅ banners + `CHANGELOG.md` are authoritative, and the now-shipped on-trigger rows are flipped to
 > **done** inline. The remaining *buildable* set is **#33 / #40 / #41** (actionable) + **#52 / #60 / #61**
-> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`.
 > (**#39** frozen console installer Phase B was built then **🪦 retired** on 2026-07-01 — no longer buildable-set.)
 
 | Item | Value | Verdict | Effort | Why / trigger |
@@ -593,7 +593,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 
 The shipping configuration (SQLite/server-DB, single uvicorn worker, **localhost bind + required auth**)
 carries no open network exposure. The gaps below are **by design and tracked** — full context in
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md) (the gates + the *Security posture* subsection),
+`releases/v0.1-PLAN.md` (the gates + the *Security posture* subsection),
 `security/CISO-REVIEW.md` (30-risk register), and the ASVS-L2 assessment.
 
 **Known gaps (by design):**
@@ -1057,7 +1057,7 @@ parity analysis.
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
-> 📐 **Partly promoted by [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md):** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
+> 📐 **Partly promoted by MULTISESSION-PLAN-7:** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
 
 **Cluster:** Minor gaps (console/IDE). **Priority:** P3. **Verdict:** demand-gate.
 
@@ -4629,7 +4629,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Explicitly not this item:** the `db_lookup` gap. `transports/database.py` builds its own connection string and emits no `MultiSubnetFailover`, so a deployment reaching the same listener through the DATABASE connector needs the DNS-side configuration regardless of what this rig measures. Whether that connector should get the keyword is a separate owner decision — do not let a green result here be read as "the workaround is obsolete".
 
-**Do not extrapolate from the AD lab.** [`plan-11/w19-ad-lab-integration-validation.md`](releases/plan-11/w19-ad-lab-integration-validation.md) covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
+**Do not extrapolate from the AD lab.** `plan-11/w19-ad-lab-integration-validation.md` covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
 
 **Related:** #100 (the shipped setting), [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5 / §5.3, `messagefoundry/config/settings.py` (`multi_subnet_failover`, default `false`), `messagefoundry/store/sqlserver.py` (`connection_string`), [`CONFIGURATION.md`](CONFIGURATION.md).
 

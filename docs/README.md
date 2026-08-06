@@ -112,7 +112,6 @@ describe plans that were superseded, and several state "next steps" that shipped
 
 | Directory | Size | What it is |
 |---|---|---|
-| [releases/](releases/) | ~100 files | Multi-session build plans and session handoffs. History. |
 | [benchmarks/](benchmarks/) | ~42 files | Measurement records and inter-session review notes. The numbers are dated; the *method* is the reusable part. |
 | [research/](research/) · [design/](design/) · [archive/](archive/) | ~15 files | Exploratory and superseded material. |
 | [quality-gates/](quality-gates/) | 1 file | A single gate record. |

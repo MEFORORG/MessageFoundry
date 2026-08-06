@@ -2,7 +2,7 @@
 
 - **Status:** Accepted (2026-07-15) — owner-directed this session; built (IDE extension v0.0.29). **Amended
   2026-07-16 — store-less pill leads with a guided setup page (BACKLOG #238; ratified, built (IDE extension
-  v0.0.32), [Plan-12](../releases/MULTISESSION-PLAN-12.md) `ide-238-setup`).**
+  v0.0.32), Plan-12 `ide-238-setup`).**
 - **Deciders:** owner (explicit "the pill should do that plus start/stop engine" directive, over the ADR 0110 §5
   decline) + an adversarial self-review pass.
 - **Supersedes:** [ADR 0110](0110-ide-engine-link-doctor-the-status-bar-tells-the-truth-about-the-promote-target.md)
@@ -121,7 +121,7 @@ the LINK and renders no WORKLOAD.
 ## Amendment (2026-07-16) — store-less pill leads with a guided setup page, not the create-DB start (BACKLOG #238)
 
 **Ratified 2026-07-16 (owner, Plan-12 authoring session); build scheduled as
-[Plan-12](../releases/MULTISESSION-PLAN-12.md) session `ide-238-setup` (Wave 1); built (IDE extension
+Plan-12 session `ide-238-setup` (Wave 1); built (IDE extension
 v0.0.32).** Three decisions were put to the
 owner and ratified: **(a)** record this as an in-file amendment to this ADR, not a new ADR; **(b)** the setup page
 **does** offer the test-only developer engine; **(c)** the new lead stays **`canControl`-only**.
