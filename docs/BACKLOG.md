@@ -4713,7 +4713,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1014. connscale smoke test's fixed 24-port block is not parallel-safe across worktrees; the flaky marker hides the collision
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **3/10** · _fill-in_. `test_connscale_smoke_end_to_end` hard-codes `base_port = 41000` and requires 24 **contiguous** inbound ports, so two checkouts running the suite at once contend for the same block. A `@pytest.mark.flaky` marker retries past the collision, so a determinate resource conflict wears a noise label.
+> ✅ **SHIPPED 2026-08-06 — dynamic contiguous inbound-port allocation replaces the fixed 24-port block; the flaky marker is dropped.** Value **5/10** · Difficulty **3/10** · _fill-in_. `test_connscale_smoke_end_to_end` now reserves a random contiguous inbound-port block at runtime (`_free_contiguous_ports`), asserts contiguity at acquisition, and fails loudly if no free block is found, so a genuine cross-worktree collision surfaces as a red rather than a masked retry.
 
 **Cluster:** Testing / CI reliability. **Priority:** P3. **Verdict:** build (small). **Severity:** low — it costs retries and misdiagnosis, not correctness.
 
