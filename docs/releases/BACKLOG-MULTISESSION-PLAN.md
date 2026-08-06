@@ -11,7 +11,9 @@ This is a **reconcile wave, not a build wave.** The published `docs/BACKLOG.md` 
 Two authorities matter and they disagree with the published file:
 
 * **`origin/main` code** — current through 2026-07-28.
-* **The owner's live ledger** at `vault/main:docs/BACKLOG.md` (the vault remote-tracking refs are present in this clone; read them with `git show vault/main:docs/BACKLOG.md`). Max item there is **#314**; max item on `origin/main` is **#231**.
+* **The owner's live ledger** — `docs/BACKLOG.md` on the vault's `main`. Max item there is **#314**; max item on `origin/main` is **#231**.
+
+  > **Corrected 2026-08-05 — the command this line used to give no longer works, and its description of the ref was wrong when written.** It read *"the vault remote-tracking refs are present in this clone; read them with `git show vault/main:docs/BACKLOG.md`"*. `vault/main` was **not** a remote-tracking ref: `git rev-parse --symbolic-full-name vault/main` resolved it to `refs/vault/main`, and `refs/remotes/vault/main` never existed — nor was any remote named `vault` ever configured here; only `origin` has been. Those refs were deleted from this clone on **2026-08-05**, so the `git show` above now fails. **Read the vault ledger from the separate `MessageFoundry-vault` clone instead** — it is checked out beside this repository: `git -C <path-to-MessageFoundry-vault> show main:docs/BACKLOG.md`. Provenance, the measurement, and what the deletion did and did not cost the allocator: [`docs/LEDGER-GATE.md`](../LEDGER-GATE.md) §*The ref store, and the cleanup of 2026-08-05*. Every other `vault/main:` citation in this document is a **record of what was read on 2026-07-28**, not a command to run — resolve any of them through the vault clone. The §3 kickoff trap still stands: that file fails the leak gate, so cite it and never paste from it.
 
 Every row below was verified against one or both. **Action** is the target glyph for the published file.
 
@@ -74,7 +76,7 @@ Every row below was verified against one or both. **Action** is the target glyph
 * **`DEBT-noloss` is fixed** by PRs #17 (`ba324ba`) + #26 (`88373cd`): all three copies read `budget = max(unconfirmed_budget, sent // 2)` (`harness/load/report.py:614`, `connscale/runner.py:838`, `estate/runner.py:444`). Project memory still says otherwise.
 * **ASVS 11.3.3 AAD cell-binding is MERGED**, not delegated: `cell_aad()` `store/crypto.py:153`; match counts `store.py` 104 / `sqlserver.py` 127 / `postgres.py` 76; ADR 0019 Amendment 2026-07-17. Branch `asvs-aad-cellbind` exists on **neither** remote. Memory overstates the remaining work by >10×.
 * **CISO rows `auth.logout` and AD-disable are closed in code** (`auth/service.py:1537-1542`; `auth/reconcile.py` + ADR 0079 mech 2). `docs/security/CISO-REVIEW.md` is gitignored post-cutover and unreadable from this baseline — closing those rows is owner-side bookkeeping.
-* **Highest ADR anywhere** (origin + all local/remote refs incl. `vault*`) is **0153** ⇒ next ADR is **0154**. This holds only while the vault remotes stay fetched in this clone; an unfetched vault branch carrying 0154+ would re-open the hole.
+* **Highest ADR anywhere** (origin + all local/remote refs incl. `vault*`) is **0153** ⇒ next ADR is **0154**. This holds only while the vault remotes stay fetched in this clone; an unfetched vault branch carrying 0154+ would re-open the hole. **Stale as of 2026-08-05:** the `vault*` term is gone from this clone (see the correction in §0 above), and the number has moved on regardless. **Never take an ADR or BACKLOG number from this line or any other document** — run `pwsh -NoProfile -File scripts\coord\alloc.ps1 -Kind adr -Title "<title>"`, which is the only instrument that claims one atomically, and `-ShowFloor` to inspect the floor without spending a number.
 
 ---
 
