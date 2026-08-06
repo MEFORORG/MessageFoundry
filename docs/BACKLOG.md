@@ -5690,9 +5690,22 @@ lowercase -c is NOT a path (sanity)   | DENY
 
 **Mechanism.** `-C` is matched against `$seg.Raw`, the *unblanked* line, so a `-C` belonging to a quoted config value, a commit message, or a different git command in the same chain silently becomes "the repository being configured". It resolves fine, so #1061's new fail-closed branch never fires; git then exits 128 on it and `$LASTEXITCODE -ne 0 { continue }` allows. `-C HEAD` is the ordinary reuse-that-commit's-message flag — `git config alias.amend "commit -C HEAD"` is written on purpose with no intent to evade anything.
 
+**THE TWO SPELLINGS HAVE DIFFERENT MECHANISMS AND ONLY ONE IS PORTABLE — do not triage them together.** Measured independently in the generalized fork (`claude-multisession`), which shares the same scalar `[0]` read: the **chained** form (`git commit -C HEAD && git config ...`) is **DENIED** there, because that gate splits the line into verb-bearing segments and evaluates each independently, so the disarm lands in a segment containing no `-C` at all and candidate `[0]` correctly falls back to the governed cwd. The **value-embedded** form (`git config core.hooksPath "/nope -C HEAD"`) **bypasses both copies**, because the poison sits inside the same segment as the disarm and segment-splitting cannot help. So the value-embedded spelling is the one that crosses implementations, and a reader who runs only the chained repro against a segmenting gate would wrongly conclude it is unaffected. Reported 1 of 6 probed spellings bypassing there — which is *"one of six probed"*, **not** *"the fork has one bypass"*; the four lesser findings below are unprobed in that copy.
+
 **The fix is to honour the contract rule 3 already honours:** iterate every candidate and deny if ANY is governed, as `:812` does. Confirmed by measurement that rules 3 and 3d are NOT affected — the same poisoned commands against `git reset --hard`, `git checkout main` and `git worktree remove <wt>` all still DENY, because they iterate the set and the cwd candidate catches them. Rule 3c is the sole scalar reader.
 
 **Why it survived #1061.** That work rewrote ~70 lines of this exact block and added eight tests whose stated purpose is *"the PATH TOKEN, not just the cwd"* — and every one of them supplies a **single** `-C`, so not one can see a second token on the line. Per #1000 the tests need a case where the governed target is NOT candidate `[0]`.
+
+**A SECOND BYPASS OF THE SAME RULE, WORSE, AND IT DEFEATS THE ABSOLUTE SPELLING TOO.** `:237`'s regex `'(?:^|\s)-C\s+"?([^"\s]+)"?'` strips **double** quotes only, so a single-quoted token keeps its leading `'` and `GetFullPath` produces garbage. Measured against the patched gate from a nested worktree:
+
+```
+relative -C (the #1061 case)  | DENY    git -C ../../.. config core.hooksPath /dev/null
+SINGLE-quoted relative -C     | ALLOW   git -C '../../..' config core.hooksPath /dev/null
+SINGLE-quoted ABSOLUTE -C     | ALLOW   git -C '<primary>' config core.hooksPath /dev/null
+SINGLE-quoted cd relative     | ALLOW   cd '../../..' && git config core.hooksPath /dev/null
+```
+
+Reach proven with a harmless key, no disarm key executed: `git -C '../../..' config probe.marker reached-the-primary` wrote into `<primary>/.git/config` and read back from the linked worktree. **This is the ordinary spelling — the rule 3c test file itself uses single quotes two lines away** (`git config alias.ci 'commit --no-verify'`). Pre-existing, not a regression. Recorded here because it is the same class as this item — *rule 3c cannot see the token it is judging* — but **it needs its own number**; it was found too late in a session to allocate one, and a dangling allocation is worse than a finding recorded beside its sibling.
 
 **Related, same verification pass, all confirmed and all needing folding into this fix or their own items:** an absolute-path **alias** of the primary walks through (`GetFullPath` does not traverse reparse points nor strip an extended-length prefix); a **space** in the governed repo's path truncates the `-C` regex; `--git-dir` and `--file` are further unread routes; and on Windows a **rooted-but-not-fully-qualified** path (`C:foo`, `\foo`) skips the base and resolves against the hook process's cwd, so #1061's "resolved against the session cwd" is stated unconditionally and is not unconditionally true.
 
