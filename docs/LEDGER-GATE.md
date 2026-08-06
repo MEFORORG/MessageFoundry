@@ -95,11 +95,13 @@ branch that cannot fire reads as protection and is worse than none. Detecting a 
 internal-side input this repository does not have. What remains is a warning at 90 % of the boundary,
 measured on the sub-floor band, where public numbers cannot distort it.
 
-*(The sweep does reach internal numbers, which is worth stating because the opposite was suspected:
-measured 2026-08-03, 489 of 490 vault-ish remote-tracking refs carry `docs/BACKLOG.md`, and 67 item
-numbers live only there — including `#240`–`#247`, the numbers the Ledger erratum records as re-issued
-over cited work. Seeing them is what makes the floor trustworthy; it is telling an internal `#1001` from
-a public `#1001` that is impossible.)*
+*(The sweep did reach internal numbers while the vault-ish refs were in this clone, which is worth
+stating because the opposite was suspected: measured 2026-08-03, 489 of 490 of them carried
+`docs/BACKLOG.md`, and 67 item numbers lived only there — including `#240`–`#247`, the numbers the
+Ledger erratum records as re-issued over cited work. Those refs were deleted on 2026-08-05 and the sweep
+no longer reaches them; see [The ref store, and the cleanup of
+2026-08-05](#the-ref-store-and-the-cleanup-of-2026-08-05) for why neither measurement moved. Telling an
+internal `#1001` from a public `#1001` was impossible either way.)*
 
 Two consequences worth knowing before you tidy refs:
 
@@ -108,6 +110,11 @@ Two consequences worth knowing before you tidy refs:
 - **Removing a non-`origin` remote, deleting its refs, or an aggressive `gc` / `reflog expire` that drops
   unreachable objects is what the ratchet defends against.** It keeps the number space correct, but the
   underlying history would still be gone — the ratchet is a backstop, not a substitute for the refs.
+  **The principle stands; the specific alarm it was written under no longer binds here.** The 489
+  vault-ish refs it named were deleted on 2026-08-05, and both allocator measurements — floor `1032`,
+  sub-floor maximum `353` — were unchanged before and after. Read [The ref store, and the cleanup of
+  2026-08-05](#the-ref-store-and-the-cleanup-of-2026-08-05) before concluding that a ref deletion here is
+  or is not survivable: the answer turns on the `#1000` partition and the ratchet, not on the refs.
 
 **Numbers are never reclaimed.** An abandoned branch holds its number forever and the sequence develops
 holes. That is deliberate: holes are free, collisions are not.
@@ -182,6 +189,68 @@ gate existed: sessions authored in the shared primary checkout, so every co-tena
 same key and the check was a no-op between them. [WORKTREE-GATE.md](WORKTREE-GATE.md) now forces each
 session into its own worktree, which is what makes worktree-keyed ownership meaningful. The two gates are
 a pair.
+
+## The ref store, and the cleanup of 2026-08-05
+
+This section exists because the ratchet warning above names refs a future session will go looking for and
+not find. It is also the **only** record of where those refs came from: nothing else in the repository
+named them, and the `refs/vault/**` trio was named by no tracked file at all.
+
+### Where they came from
+
+Reflogs record **two direct-URL `git fetch` commands, 45 seconds apart on 2026-07-28**, against
+`github.com/wshallwshall/MessageFoundry` — the maintainer's private vault repository. One passed explicit
+per-branch refspecs writing into `refs/remotes/vault/`; the other passed a wildcard writing into
+`refs/remotes/vaultall/`. **No remote named `vault` or `vaultall` was ever configured** — `git remote -v`
+has only ever listed `origin` — so no refspec could advance them and no `--prune` could ever have reached
+them. They were orphaned the moment the fetch returned.
+
+Three of them landed one level up, at `refs/vault/**` rather than `refs/remotes/vault/**`. That is what
+made `vault/main` *look* like a remote-tracking ref when it was not:
+`git rev-parse --symbolic-full-name vault/main` resolved to `refs/vault/main`, because gitrevisions tries
+`refs/<name>` **before** `refs/remotes/<name>`. `refs/remotes/vault/main` never existed.
+[`docs/releases/BACKLOG-MULTISESSION-PLAN.md`](releases/BACKLOG-MULTISESSION-PLAN.md) §0 called it a
+remote-tracking ref on that basis; that line is corrected.
+
+### What was deleted, and what it cost the allocator
+
+**2026-08-05: 489 refs carrying `docs/security` content were removed with `git update-ref -d`** —
+`refs/remotes/vaultall/**` (466), `refs/remotes/vault/**` (20), `refs/vault/**` (3). That material is
+maintainer-internal and its home is the separate `MessageFoundry-vault` clone, checked out beside this
+repository — not a working checkout of the public one. Nothing was ever published from it: `origin/main`,
+all 30 `origin` refs and every local branch carry zero `docs/security` files at tip and in history, and
+`git rev-list --all -- docs/security` returns nothing here. A manifest of refname/SHA pairs is kept
+**outside** the repository, every deleted tip is still addressable in this object store (no `gc` ran, and
+`gc.auto` is now `0`), and every one is present in the vault clone — restoring any of them is one
+`git update-ref` away. Per [ADR 0160](adr/0160-public-repo-content-policy-operator-and-security-review-material-only.md),
+this is a content-placement decision and **must not be described as a confidentiality control**.
+
+**Measured directly, before and after: the BACKLOG floor is `1032` and the sub-floor maximum `353`, with
+the refs and without them.** Neither moved. Three reasons, any one of them sufficient:
+
+1. **The partition clamps the answer.** A backlog allocation emits
+   `max(observed, PUBLIC_BACKLOG_FLOOR - 1) + 1`, so every new number is issued at or above `#1000`. The
+   internal band tops out at `#314` and cannot determine the next number.
+2. **The internal band was already masked.** Internal `#314` sits below the public pre-partition maximum
+   `#353`, so the deleted refs did not set the sub-floor maximum either — and the sub-floor maximum is
+   the only term the residual warning reads. `alloc.ps1` records this as reason (d) beside its removed
+   refusal.
+3. **The ratchet held regardless.** The persisted marks were already `1031` (backlog floor high-water),
+   `1000` (boundary) and `160` (ADR floor high-water) before the deletion, and a floor may only rise.
+
+The allocator also **emits `max + 1` and never fills a gap**, so a number that drops out of the sweep
+cannot be re-issued into a hole. Only a fall in the maximum itself would hurt, and the ratchet is the
+instrument for that.
+
+### One trap this closed, and the general lesson
+
+While those refs were present, `git log --all -- <path>` in this clone could return commits from the
+**vault lineage**, whose root is disjoint from the public repository's. A session reading that output
+drew the wrong conclusion about a file's provenance, because a commit appearing under `--all` says only
+that *some* ref reaches it — not that `origin/main` does. **The check that settles it is
+`git merge-base --is-ancestor <commit> origin/main`.** This particular trap is closed with the refs gone;
+the general form is not. Name the question, name what the tool returns, and check they are the same
+sentence (CLAUDE.md §11).
 
 ## Limits
 
