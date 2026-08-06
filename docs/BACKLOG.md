@@ -5502,3 +5502,33 @@ The literal spellings are all caught, including the newline form. Only the indir
 **Related:** #1000 (a green that is not evidence — this one is green because it cannot see), #1039 ("git will refuse this" is a claim about a configuration; here the gate's claim is about a *spelling*), #1041 and #1057 (same rule family, refusal accuracy), #308.
 
 **Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
+
+## 1060. `alloc.ps1` records the owning worktree from the current directory, so an absolute-path invocation misattributes it
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _quick win_. `scripts/coord/alloc.ps1:51` takes the owner from `git rev-parse --show-toplevel`, which resolves against the **current directory** rather than the script's location. Invoke it by absolute `-File` path from a different worktree — which is how a session with several worktrees naturally calls it — and the allocation is recorded to the caller's worktree while the commit comes from another. The ledger gate then refuses that commit correctly, but far away from the cause and with a message about the wrong thing.
+
+**Cluster:** Session coordination / ledger integrity. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss and no security effect — the ledger gate **fails closed**, which is why this is a friction defect and not a correctness one. Nothing invalid lands; a valid commit is refused.
+
+**Reproduced 2026-08-05, twice, by accident.** A session ran `pwsh -NoProfile -File <abs>/scripts/coord/alloc.ps1 -Kind backlog` from worktree A while intending to commit from worktree B. `alloc/backlog/1058.json` recorded `"worktree": "<...>/trusting-wu-c2e6d5"`. The commit from `MessageFoundry-gate-deferrals` was then refused: *"BACKLOG item #1058 was not allocated to this worktree"* — true, unhelpful, and pointing at the allocator rather than at the invocation. Re-running with the shell actually inside the target worktree produced `1059.json` with the right owner and the commit went through. **#1058 is an abandoned hole**, which is the sanctioned outcome (`alloc.ps1`'s own docstring: *holes are free, collisions are not*).
+
+**The fix is small and there are two defensible shapes.** Either derive the repo from `$PSScriptRoot` so the allocator is anchored to the checkout it lives in — matching what `new.ps1` and `remove.ps1` already do — or keep the cwd behaviour and **say so at the point of use**, printing the recorded worktree in the `ALLOCATED` output so the mismatch is visible immediately rather than at commit time. The second is weaker but nearly free, and the two compose. Prefer anchoring: an allocator invoked by absolute path is being told which checkout to act on, and it should not then consult a different one.
+
+**Do not fix by making the ledger gate more lenient.** Its refusal is correct and is the only reason this was noticed at all. The defect is that ownership was recorded wrongly, not that it was enforced.
+
+---
+
+**THE SHARED PREMISE, which is larger than this item and is why it is worth reading here.** Three independent mechanisms in this repo assume, silently, that **where a command runs is where the caller is**:
+
+- **This item.** `alloc.ps1` resolves the owner from the current directory, not from the path it was handed.
+- **#1059.** The worktree gate resolves a command's target as a literal string against the session's cwd, so a path arriving through a shell variable falls back to the caller's own worktree — and a command aimed at the shared primary is allowed.
+- **#1057.** `occupancy.ps1` places sessions by cwd, so it cannot see a session writing into a worktree by absolute path from elsewhere. Measured on this repo: **0 occupants reported for a worktree that had been committed to a minute earlier.**
+
+`occupancy.ps1` already discloses the rate: **a session acting on a worktree by absolute path from elsewhere is 29% of writes on this repo**, by the project's own measurement. So the premise is not merely unstated, it is false about one write in three.
+
+**All three fail silently, and all three fail in the benign-looking direction** — a deny naming the wrong worktree, an owner recorded as the wrong worktree, an occupancy of zero for a worktree in active use. None raises. Each looks like a working answer.
+
+**All three were found by accident, none by looking**, which is the part that should not be trusted. Three instances is a coincidence-sized sample, and the honest next step is a targeted sweep for the shape — anything resolving a target from `--show-toplevel`, `getcwd`, or an unqualified relative path *when it was handed an explicit one* — which either produces a fourth concrete instance or shows three was the whole set. That is deliberately **not** filed as a theme item: "three mechanisms share a premise" has no fix and no closing condition, and would sit open describing something true. The premise is also recorded in [`docs/WORKTREES.md`](WORKTREES.md), so it outlives this item's closure.
+
+**Related:** #1059 (the gate instance, and the severe one), #1057 (the occupancy instance), #1000 (all three are green because they cannot see).
+
+**Source:** found 2026-08-05 while filing #1059, when the ledger gate refused a commit whose number had just been allocated successfully. Filed as the concrete defect rather than as the pattern, on the argument that a near-duplicate of an already-owned class dilutes the ledger — the same argument this session used earlier to decline filing a sibling to #1000.
