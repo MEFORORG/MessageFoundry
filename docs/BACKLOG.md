@@ -5463,3 +5463,42 @@ Anyone reviving an interim must therefore either state the prefix precondition o
 **Related:** #1041 (the false premise in the same rule, fixed — this is the gap it deliberately left), #1039 (the same shape one level up: deferring to a guard whose availability was never checked), #1000 (whatever is built here needs a negative control proving it can still refuse), #308.
 
 **Source:** identified 2026-08-05 while building #1041, from noticing that the reported third sighting was **not** an instance of what #1041 fixes. Filed separately rather than folded in, because citing it as evidence for the toplevel comparison would have claimed coverage that fix does not have — the same defect class the item was about, inside its own fix.
+
+## 1059. Shell variable indirection defeats the worktree gate's path resolution, so the primary is reachable
+
+> 🔢 **Filed 2026-08-05 — not started.** Value **8/10** · Difficulty **6/10** · _do it_. The gate resolves paths **as literal strings**. A path that arrives through a shell variable cannot be resolved, so the rule falls back to the session's own cwd — a linked worktree, which is correctly exempt — and **allows** a command that will act on the shared primary. `cd <primary> && git reset --hard` is denied; `D=<primary>; cd $D && git reset --hard` is allowed. Same target, same effect, one variable.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development, not anything shipped. But it is a **live control**: measured against the INSTALLED hook that governs every worktree on this machine, not only against source.
+
+**Measured 2026-08-05 against the installed gate** at `~/.claude/hooks/worktree_gate.ps1`, sha256 `BE113C20CDE5`, `GateVersion 2026.08.05.2` — the copy actually enforcing at the time of filing. Payloads were fed to the hook directly; **none of these git commands were executed.**
+
+| command (session cwd = a linked worktree) | verdict |
+| --- | --- |
+| `cd <primary> && git reset --hard` | DENIED |
+| `cd <primary> ; git reset --hard` | DENIED |
+| `cd <primary>` newline `git reset --hard` | DENIED |
+| `D=<primary>; cd $D && git reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C $D reset --hard` | **ALLOWED** |
+| `D=<primary>; git -C ${D} checkout main` | **ALLOWED** |
+
+The literal spellings are all caught, including the newline form. Only the indirection escapes, and it escapes in the direction that matters.
+
+**This is the exact scenario rule 3 was written for.** Its own comment records that a sibling session ran a tree-swapping command in the shared primary and *"every other session's files silently became a different commit's files"*. The rule closes the spelling that caused it and not the class.
+
+**Found by accident, which is the part that raises the priority.** It surfaced while a session ran ordinary cleanup — `D=<path>` then `cd "$D"` then a `git checkout` — and got a deny naming the WRONG worktree: the rule resolved the target to the session's cwd because it could not expand `$D`. So the same defect already produces confusing false positives in the benign direction. No adversarial intent is required to reach it; `cd "$VAR"` is how shell is ordinarily written, and an agent composing a multi-step command will hit it.
+
+**Scope: the SHELL rules only.** Rules 3, 3b, 3c and 3d read a command string and must infer which tree it touches. Rule 1 / 1a / 1b take `file_path` from the tool input, which is a real path and never a shell expression, so they are unaffected. Any fix belongs at the shared resolver (`Get-GitTargetCandidatesRaw` / `Get-ComparablePath`), not in each rule.
+
+**Why difficulty 6 rather than 2: a hook cannot evaluate shell.** It receives a string before execution and has no interpreter, no environment, and no way to know what `$D` holds — it may be set in an earlier line, exported by a profile, or computed. Chasing expansion is a losing game, so the options are all uncomfortable:
+
+1. **Fail closed on unresolvable path positions.** If a git command's target position contains `$`, backtick or `%…%`, refuse and say why. Simple, auditable, and consistent with the day's other conclusion that a needless deny beats a missed hijack. Cost is real: `cd "$D"` is idiomatic, so this will fire on legitimate work and must therefore say precisely what to do instead (use a literal path), or it will be routed around.
+2. **Resolve simple same-command assignments.** Parse `NAME=value` earlier in the same string and substitute. Catches the common case and gives a **false sense of coverage** for every other case — the worst property a guard can have, and the one #1000 exists to name.
+3. **Judge after expansion instead of before.** Not available to a PreToolUse hook by construction. Recorded so nobody spends time rediscovering it.
+
+**Recommendation, offered not decided: option 1, and it deserves an ADR rather than a patch,** because it trades measurable friction for closure and that is a judgement about how the gate is lived with, not a correctness question. Whatever is chosen needs a negative control per #1000 — the control must show the guard going red on the variable spelling, and **staying green** on a literal path inside the session's own worktree, or it will have been made unusable rather than safe.
+
+**Do not fix by widening the deny to any command containing `$`.** Rule 3 already scopes tightly to verbs that swap or discard a tree, and the gate's own comments record that over-broad rules get routed around and then guard nothing.
+
+**Related:** #1000 (a green that is not evidence — this one is green because it cannot see), #1039 ("git will refuse this" is a claim about a configuration; here the gate's claim is about a *spelling*), #1041 and #1057 (same rule family, refusal accuracy), #308.
+
+**Source:** found 2026-08-05 by a session doing unrelated branch cleanup, from noticing that a rule 3b deny named a worktree the command was not going to act on. Verified against both the source gate and the installed one before filing. The reporting session did not build the fix, did not exploit the bypass, and used literal paths for its own subsequent work rather than the hole it had just found.
