@@ -2414,7 +2414,7 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 232. Steps view for routers
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR-first: a `route` row kind widens the ADR 0076 §3 grammar, so the amendment lands before any build.
+> 🚧 **Filed 2026-07-30; ADR gate discharged 2026-08-05.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR 0076 Amendment D widens the grammar with a `route` row kind (§3 row enum + §4 recognition grammar), and CLAUDE.md §12's carve-out now names Routers; build handed off (`docs/releases/HANDOFF-232-router-steps.md`), not yet built.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
 
