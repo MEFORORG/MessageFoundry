@@ -1306,6 +1306,28 @@ async def test_security_posture_reports_fips_attestation(engine: Engine) -> None
     assert rows  # at least the read above was recorded
 
 
+async def test_security_posture_reports_kex_groups(engine: Engine) -> None:
+    # #338 / ASVS 11.6.2: the posture route reports whether the approved TLS key-exchange groups are
+    # PINNED on built contexts or INHERITED from OpenSSL's default group list — report-only metadata,
+    # MONITORING_READ-gated + audited like the rest of the payload, and it changes NO live TLS behaviour
+    # (inherited on every interpreter before Python 3.15).
+    from messagefoundry.config.tls_policy import kex_groups_report
+
+    service = await _service(engine)
+    await _add(service, "vw", Role.VIEWER)  # holds monitoring:read
+    async with _posture_client(engine, service) as c:
+        vw = _auth((await _login(c, "vw")).json()["token"])
+        resp = await c.get("/security/posture", headers=vw)
+    assert resp.status_code == 200
+    body = resp.json()
+    # The additive field is present and matches the pure helper's read-out; inherited on this runtime.
+    assert body["kex_groups"] == kex_groups_report()
+    assert "inherited" in body["kex_groups"]
+    # The read stays audited (security.posture_view) — a viewer's read produced an audit row.
+    rows = await engine.store.list_audit(limit=20, action="security.posture_view")
+    assert rows  # at least the read above was recorded
+
+
 async def test_security_posture_encrypted_exposes_fingerprint_not_key_bytes(
     tmp_path: Path, engine: Engine
 ) -> None:
