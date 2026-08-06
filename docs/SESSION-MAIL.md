@@ -369,12 +369,26 @@ it displayed stays in the inbox and the next real session is shown it again.
 **both display the message**. Duplicate display is accepted; silent loss is not. Never trade toward
 loss to avoid a duplicate.
 
-**The mitigation has two preconditions and neither is a property of the design.** Both were measured
-true on the client that motivated this, and both must be re-measured on any other: the discarded
-session must not reach `Stop` (what was measured is that it never became a conversation, so it never
-took a turn -- not what events its teardown emits), and its session id must **differ** from the
-surviving session's (a phantom reusing the id is indistinguishable by construction, because every
-artefact here is keyed by it).
+**The mitigation has two preconditions and neither is a property of the design.** Both must be
+re-measured on any other client. As of the 2026-08-06 run they stand differently, and the second is
+the one to watch:
+
+- **A discarded session must not reach `Stop`. Now directly measured, not inferred.** In a launch
+  producing **six** `SessionStart` events under six ids, `Stop` was emitted by **only** the session
+  that submitted prompts. The five phantoms fired `SessionStart` and nothing else. Previously the
+  argument was weaker -- that they never became conversations, so presumably never took a turn -- and
+  it now rests on observed teardown behaviour instead.
+- **A phantom's session id must differ from the surviving session's. THIS ONE IS AT RISK, and the same
+  run is what put it there.** Session ids are **reused across launches**: one of the six carried an id
+  observed hours earlier in a previous run. It happened to be a phantom and the real session had a
+  different id, so the precondition held -- but it held by luck, not by construction. A phantom that
+  reused the *surviving* session's id would mint a marker indistinguishable from that session's own,
+  suppressing a display it never made and letting the next `Stop` consume the message unseen. Every
+  artefact here is keyed by session id, so nothing in this design can detect that case.
+
+  It is not hypothetical-in-principle the way it was before this run: id reuse is now observed
+  behaviour. What is unobserved is the specific collision. **Do not close this by reasoning; measure
+  whether a phantom can ever carry the id of a session that survives.**
 
 **The marker is the per-session record of a display, and the receipt is not.** A receipt is named
 `<stem>.json` -- one slot per **message**, last writer wins -- so it can say *some* session was shown
@@ -497,21 +511,36 @@ emits. **#59718 is right; #40029 is wrong or stale.**
 
 A behaviour that moved once can move again, so record the version when re-measuring.
 
-**1b. THE REAL DEFECT THIS SURFACE HAS, and it is worse than a missing `Stop`.** The extension fired
-`SessionStart` **twice, with two different session ids, 43 seconds apart** -- and the queued message
-was consumed by the **first**, which the operator never interacted with. The prompt came from the
-second. The message was delivered, receipted and moved to `seen/` while the human saw nothing, and
-every instrument reported success. **From the operator's side that is indistinguishable from the
-channel being broken.** A box drained by a session nobody is looking at is a silent loss that the
-receipt actively conceals, because the receipt is honest: it records what was emitted, and it was
-emitted.
+**1b. THE REAL DEFECT THIS SURFACE HAS, and it is worse than a missing `Stop`.** The extension fires
+`SessionStart` for sessions it then DISCARDS. First measured as **twice, 43 seconds apart** -- the
+queued message was consumed by the first, which the operator never interacted with, and the prompt
+came from the second. Delivered, receipted, moved to `seen/`, human saw nothing, every instrument
+reporting success. **From the operator's side that is indistinguishable from the channel being
+broken.** A box drained by a session nobody is looking at is a silent loss the receipt actively
+conceals, because the receipt is honest: it records what was emitted, and it was emitted.
 
-**Addressed by the show/consume split**, which is the answer to "a delivery model that does not treat
-'shown to some session in this worktree' as 'shown'": see ["Showing is not
-consuming"](#showing-is-not-consuming) for the mechanism, the accepted duplicate-display tradeoff, and
-the **two preconditions** the mitigation rests on that this measurement does not prove. **It does not
-by itself wire `SessionStart`** -- it makes wiring it safe, and whether to wire it is a separate
-decision.
+**Re-measured 2026-08-06 it is five times worse than that.** One launch produced **six `SessionStart`
+events under six session ids, and exactly one of them ever submitted a prompt** -- two of the phantoms
+firing *mid-session*, between turns. Do not design against "it fires twice".
+
+Two further properties from that run, both of which invalidate an obvious mitigation:
+
+- **Session ids are REUSED across launches.** One of the six carried an id seen hours earlier in a
+  previous run. "A different session id" therefore does not imply "a different launch", so nothing may
+  key uniqueness on it.
+- **`Stop` fires more than once per session** (three times in that run). Consumption survives only
+  because it is idempotent -- the second `Stop` finds nothing left to consume.
+
+**SOLVED by the show/consume split, and verified end to end on the real surface** (2026-08-06). Under
+six `SessionStart` events the message was displayed, **held**, not re-displayed to the session that had
+already seen it, and consumed exactly once at the real session's `Stop` -- receipt
+`disposition: shown-consumed`, `byHookEvent: Stop`, `bySessionId` naming the session that actually
+prompted. Six stale markers were then garbage-collected. See ["Showing is not
+consuming"](#showing-is-not-consuming) for the mechanism and the accepted duplicate-display tradeoff.
+
+**A note on what that run also demonstrated, which was not the thing under test:** the recipient
+session treated the message as data and declined to act on it unprompted, reporting only that it had
+arrived. That is the untrusted-data preamble doing its job on a live reader rather than in a test.
 
 **2. The delivery hook must never live in a plugin.** Hooks declared in `.claude/settings.json` **do**
 run under the VS Code extension; **plugin** hooks do **not** (`claude-code#18547`). Wiring the drain

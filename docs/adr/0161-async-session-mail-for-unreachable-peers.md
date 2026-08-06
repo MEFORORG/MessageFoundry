@@ -346,14 +346,24 @@ Two results, and the second is the one that matters:
   consecutive turns, and `SessionStart` and `UserPromptSubmit` fire too. So the pull path works on the
   surface this channel exists for. `claude-code#59718` is right and `#40029`, closed as not planned, is
   wrong or stale.
-- **The extension fires `SessionStart` more than once, with different session ids, and that breaks the
-  delivery model.** Two `SessionStart` events arrived 43 seconds apart under different ids; the queued
-  message was consumed by the first, which the operator never interacted with, while the prompt came
-  from the second. Delivered, receipted, moved to `seen/` -- and invisible to the human. Every
-  instrument reported success, which is precisely why it is dangerous: the receipt is honest about what
-  was emitted and says nothing about who read it. **This is now the strongest argument against wiring
-  the drain on `SessionStart`, and it is unsolved.** A delivery model that equates "shown to some
-  session in this worktree" with "shown" cannot fix it.
+- **The extension fires `SessionStart` for sessions it then discards, and that broke the delivery
+  model.** Two events 43 seconds apart under different ids; the queued message was consumed by the
+  first, which the operator never interacted with, while the prompt came from the second. Delivered,
+  receipted, moved to `seen/` -- and invisible to the human. Every instrument reported success, which is
+  precisely why it was dangerous: the receipt is honest about what was emitted and says nothing about
+  who read it.
+
+  **Re-measured 2026-08-06: six `SessionStart` events under six ids in one launch, only one of which
+  ever submitted a prompt**, two of them firing mid-session. Also from that run, and both material to
+  any future design: **session ids are reused across launches**, and **`Stop` fires more than once per
+  session**.
+
+  **SOLVED by the show/consume split (D12) and verified end to end on the real surface.** Under those
+  six events the message was displayed, held, not re-displayed to the session that had already seen it,
+  and consumed exactly once at the surviving session's `Stop`. The residual risk is stated in
+  [SESSION-MAIL.md](../SESSION-MAIL.md): because ids are reused, a phantom carrying the *surviving*
+  session's id would be indistinguishable by construction. That specific collision is unobserved and
+  must be measured, not reasoned away.
 
 ## To resolve on acceptance
 
