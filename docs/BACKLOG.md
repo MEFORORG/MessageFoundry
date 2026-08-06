@@ -4679,7 +4679,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1015. OIDC relying party keys federated accounts on a reassignable username claim while the non-reassignable `sub` is discarded (ASVS 10.5.2)
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **7/10** · Difficulty **4/10** · _quick win_. The relying party keys federated identity on `oidc_username_claim` (default `preferred_username`), which an IdP is free to **reassign**, while the non-reassignable `sub` is verified and then dropped into an audit field. On first deployment a new holder of a retired username would be handed the prior holder's account.
+> 🚧 **In progress 2026-08-06 — subject-continuity guard built (Option A); awaiting owner review of the ADR-0142 store-column amendment and the Option-A-vs-B account-model choice.** Value **7/10** · Difficulty **4/10** · _quick win_. The relying party keys federated identity on `oidc_username_claim` (default `preferred_username`), which an IdP is free to **reassign**, while the non-reassignable `sub` is verified and then dropped into an audit field. On first deployment a new holder of a retired username would be handed the prior holder's account.
 
 **Cluster:** Security / authentication. **Priority:** P1. **Verdict:** build. **Severity:** high on first deployment — account takeover without any credential compromise.
 
