@@ -459,10 +459,21 @@ makes this concrete, and it fixes both objections at once:
 | `SessionStart` | **six** -- five belonging to sessions that never become conversations, each polling every 3 s for up to 15 minutes | no; one-shot |
 | `UserPromptSubmit` | **one per real turn**, none for phantoms -- measured, only the prompting session emits it | **yes, automatically**, every turn |
 
-Arming on the event that only a real session emits spawns no phantom watchers, and because it fires
-every turn it re-arms by construction -- so the one-shot limitation above stops being a limitation
-rather than being worked around. Neither property was designable before the phantom events were
-measured, which is why this is written down rather than left to be re-derived.
+**The re-arming property is the stronger of the two arguments, and it is worth separating them because
+they do not rest on the same kind of fact.**
+
+- **Re-arming is STRUCTURAL.** `UserPromptSubmit` fires on every turn, so a watcher armed there re-arms
+  by construction and the one-shot limitation stops existing rather than being worked around. This
+  needs no measurement at all and **survives a different phantom count on someone else's machine**. It
+  would be the right arming event even if phantoms did not exist.
+- **The phantom count is CONTINGENT.** Six per launch is what this client did on this host on one day.
+  It is a strong reason here and it is the reason the question got asked, but a client that spawned one
+  session per launch would erase that half of the argument entirely.
+
+An earlier draft of this section said neither property was designable before the phantom events were
+measured. That was wrong about the first one, and wrong in the direction that matters: it made a
+structural argument look like it depended on a contingent observation, which would invite the next
+reader to discard both if the count ever came back different.
 
 ---
 
