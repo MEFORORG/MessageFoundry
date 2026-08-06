@@ -101,6 +101,7 @@ catalog, and **[../CHANGELOG.md](../CHANGELOG.md)**, which is authoritative for 
 | [Code_Quality_Standards.md](Code_Quality_Standards.md) | The quality rubric. Contains a dated (July 2026) graded self-assessment — treat the grade as a snapshot. |
 | [BACKLOG.md](BACKLOG.md) | **777 KB / 7,157 lines.** The maintainer work surface — ranked, deferred and declined items, including superseded sections. A required CI check keeps it current, but it is *not* a description of the product. For what the engine does, use `FEATURE-MAP.md`; for what is built, `CHANGELOG.md`. |
 | [SECURITY-REMEDIATION-LEDGER.md](SECURITY-REMEDIATION-LEDGER.md) | Single-writer coordination ledger for the 2026-06-26 audit-wave remediation. A dated work record, not a posture statement. |
+| [SESSION-MAIL.md](SESSION-MAIL.md) | The async session-to-session mail lane, for the peers the realtime channel cannot address (VS Code-launched and cross-login sessions). **A prototype, deliberately not wired.** Read its trust boundary and content rule before sending anything: the write side is unauthenticated by design, and delivery copies the body into a transcript no prune reaches. |
 
 ---
 
