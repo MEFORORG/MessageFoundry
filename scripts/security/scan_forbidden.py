@@ -89,9 +89,10 @@ _ALLOWED_IP = re.compile(
 # A worktree/branch slug is whatever the task happened to be CALLED, so it can name a prospect segment,
 # a customer engagement, or a competitor study. That is unbounded: the leak is the project name itself,
 # and there is no list to add it to. Matching the shape is the only control that scales. It is
-# case-folded whole: agent slugs are lowercase by convention, but scripts/worktree/new.ps1
-# validates -Name as ^[A-Za-z0-9._-]+$ and hands it to `git worktree add -b` verbatim, so an
-# upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
+# case-folded whole: agent slugs are lowercase by convention, but nothing on the path lowercases them --
+# scripts/worktree/new.ps1 hands -Branch to `git worktree add -b` after validating it with
+# `git check-ref-format` (which permits mixed case), and -Name reaches the worktree DIRECTORY verbatim.
+# So an upper-cased slug is reachable -- and unlike _HOME_PATH no common URL shape collides here.
 _WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")
 # An absolute user-home path carries the OS account name, and inside a worktree path the slug as well.
 # Exempt: bracket/env placeholders (<you>, $HOME, %USERPROFILE%, {home}), the well-known shared and CI

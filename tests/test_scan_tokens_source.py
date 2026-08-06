@@ -733,8 +733,9 @@ def test_worktree_slug_casing_variant_is_flagged(
 ) -> None:
     """An upper-cased slug is reachable, so it must not slip the gate.
 
-    ``scripts/worktree/new.ps1`` validates ``-Name`` as ``^[A-Za-z0-9._-]+$`` and hands it to
-    ``git worktree add -b`` verbatim, with no lowercasing anywhere on the path.
+    ``scripts/worktree/new.ps1`` hands ``-Branch`` to ``git worktree add -b`` after validating it
+    with ``git check-ref-format`` (which permits mixed case), and ``-Name`` reaches the worktree
+    DIRECTORY verbatim. Nothing lowercases anywhere on either path.
     """
     mod = _load(None, monkeypatch)
     f = tmp_path / "notes.md"
