@@ -363,9 +363,13 @@ Testing follows the methodology of NIST SP 800-115 (*Technical Guide to Informat
 
 ### 6.2 Internal testing (continuous)
 
-- SAST and SCA run automatically; builds fail on new high/critical findings.
-- Secret scanning runs pre-commit and in CI; the full git history is kept clean of secrets, credentials, keys, and any sensitive data.
-- Security-focused test cases (authn/authz, input validation, error handling) are part of the standard suite.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-6.2.1 | **MUST** run SAST and SCA automatically on every change. | The jobs, and their run on the change |
+| SDS-6.2.2 | **MUST** fail the build on a new high or critical finding. | The failure threshold, and a build observed to fail on one |
+| SDS-6.2.3 | **MUST** run secret scanning both pre-commit and in CI. | Both hooks, each observed to fail on a planted secret |
+| SDS-6.2.4 | **MUST** keep the full git history clean of secrets, credentials, keys and sensitive data. | A history-wide scan, not a scan of the tip |
+| SDS-6.2.5 | **MUST** carry security-focused test cases — authentication, authorization, input validation, error handling — in the standard suite. | Those tests, named, running in the standard suite |
 
 ### 6.3 OWASP ASVS 5.0 Level 3 — scope
 
@@ -383,7 +387,14 @@ The independent review is scoped to **OWASP ASVS version 5.0.0** (released May 2
 
 ### 6.4 Release gates
 
-A production release requires: passing automated checks, no unresolved high/critical findings, current independent-review status (or a documented risk acceptance), and updated evidence (§9).
+A production release requires all four of the following. A gate that is skipped is a deviation recorded in A.6, not a judgment call at release time.
+
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-6.4.1 | Every automated check **MUST** pass. | The green run for the released commit, not for its branch tip |
+| SDS-6.4.2 | There **MUST NOT** be an unresolved high or critical finding. | The finding register at the release date |
+| SDS-6.4.3 | Independent-review status **MUST** be current, or a dated risk acceptance **MUST** be in force. | The review report, or the A.6 entry with its date and owner |
+| SDS-6.4.4 | The evidence set (§9) **MUST** be updated to match what shipped. | The evidence set, dated at or after the release |
 
 ---
 
@@ -487,11 +498,21 @@ Integration software authenticates **systems, not people**, on its interfaces. E
 
 Because the software is developed in the open and adopted by others, the project also maintains:
 
-- **Repository hygiene.** No secrets or sensitive data ever committed; the full history is scanned and kept clean. A clear `LICENSE`.
-- **Coordinated vulnerability disclosure.** A published `SECURITY.md` with a private reporting channel and a disclosure timeline; reported issues feed the RV process (§4.4).
-- **Signed, verifiable releases.** Release artifacts are signed and accompanied by an SBOM (PS.2), so adopters can verify provenance and integrity.
-- **Contribution review.** All external contributions are security-reviewed before merge; signed commits / DCO required; maintainers gate merges; dependency provenance is checked.
-- **Adopter guidance.** A deployment/hardening guide so adopters can stand the software up securely and meet their §2 responsibilities.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-8.1 | **MUST NOT** commit a secret or sensitive data to the public repository. | A clean scan of the tip |
+| SDS-8.2 | **MUST** scan the full history and keep it clean, not only the tip. | The history-wide scan result |
+| SDS-8.3 | **MUST** publish a clear `LICENSE`. | The file, at the repository root |
+| SDS-8.4 | **MUST** publish a `SECURITY.md` carrying a private reporting channel. | The file, and a channel that accepts a report |
+| SDS-8.5 | **MUST** publish a disclosure timeline. | The stated windows in `SECURITY.md` |
+| SDS-8.6 | **MUST** feed reported issues into the RV process (§4.4). | A reported issue traced to its triage record |
+| SDS-8.7 | **MUST** sign release artifacts. | The signature, and a verification of it |
+| SDS-8.8 | **MUST** accompany each release with an SBOM, so an adopter can verify provenance and integrity. **(PS.2)** | The SBOM attached to the release |
+| SDS-8.9 | **MUST** security-review every external contribution before merge. | The review record per external contribution |
+| SDS-8.10 | **MUST** require signed commits or a DCO on contributions. | The enforced setting |
+| SDS-8.11 | **MUST** gate merges through maintainers. | The branch protection rule naming who may merge |
+| SDS-8.12 | **MUST** check the provenance of a dependency before adopting it. | The provenance note recorded when it was added |
+| SDS-8.13 | **MUST** publish a deployment and hardening guide, so adopters can stand the software up securely and meet their §2 responsibilities. | The published guide |
 
 ---
 
@@ -499,11 +520,14 @@ Because the software is developed in the open and adopted by others, the project
 
 The project maintains a current evidence set so any claim is backed:
 
-- This **Secure Development Standards** document and each project's standing contract.
-- **SSDF practice evidence** (toolchain configuration, review records, SBOMs, secure-default settings).
-- **Test results** — CI security-scan history; the independent **OWASP ASVS 5.0 Level 3** report and re-test results.
-- **Per-project applicability profile** (Appendix A and onward).
-- A **claims register** recording each published claim, its wording, and the evidence behind it.
+| ID | Requirement | Evidence |
+|---|---|---|
+| SDS-9.1 | **MUST** keep this document and each project's standing contract current. | Both files, with a review date inside the stated cadence |
+| SDS-9.2 | **MUST** retain SSDF practice evidence: toolchain configuration, review records, SBOMs, secure-default settings. | The retained artifacts, per practice |
+| SDS-9.3 | **MUST** retain test results: CI security-scan history, and the independent ASVS report with its re-test results. | The scan history, and the report where one exists |
+| SDS-9.4 | **MUST** maintain a per-project applicability profile. | Appendix A, and one appendix per further project |
+| SDS-9.5 | **MUST** maintain a claims register recording each published claim, its exact wording, and the evidence behind it. | The register, one row per published claim |
+| SDS-9.6 | **MUST** publish attestations with releases, so an adopter can rely on them. | The attestation attached to the release |
 
 **Attestation posture.** The software is self-attested as NIST SSDF–aligned, tested per NIST SP 800-115, **assessed against** OWASP ASVS 5.0 **using Level 3 as the target** — an assessment **in progress**, not a completed verification — and built to support HIPAA-compliant deployment (controls mapped to NIST SP 800-66 Rev. 2). Third-party validation of the SSDF attestation and of the ASVS assessment raises the weight of these claims.
 
