@@ -167,8 +167,9 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or AD/LDAP. Note:
 
-- With `[security].require_sign_in = false`, an off-loopback bind is **hard-refused** (loopback is the
-  only no-auth posture).
+- With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
+  bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
+  terminator is the only no-auth posture).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
