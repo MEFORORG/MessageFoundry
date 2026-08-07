@@ -23,8 +23,12 @@ ADT2 = "MSH|^~\\&|S|F|R|RF|20260101||ADT^A04|MSG2|P|2.5.1\rPID|1||MRN999\r"
 BATCH = ADT + ADT2
 
 
-async def _service(engine: Engine, *users: tuple[str, Role]) -> AuthService:
-    service = AuthService(engine.store, AuthSettings(require_mfa=False))
+async def _service(engine: Engine, *users: tuple[str, Role], per_actor: int = 120) -> AuthService:
+    # per_actor mirrors AuthSettings' default (120); pass a smaller value to exercise the per-actor
+    # PHI-read budget in a single test (see test_webui.py:616 test_edit_editor_charges_the_phi_read_budget).
+    service = AuthService(
+        engine.store, AuthSettings(require_mfa=False, phi_read_rate_limit_per_actor=per_actor)
+    )
     await service.initialize()
     for name, role in users:
         uid = await service.create_local_user(
@@ -118,3 +122,33 @@ async def test_uploaded_logs_ui_503_when_unconfigured(engine: Engine, tmp_path: 
     async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
         await _login(c, "op")
         assert (await c.get("/ui/uploaded-logs")).status_code == 503
+
+
+async def test_uploaded_log_browse_charges_the_phi_read_budget(
+    engine: Engine, tmp_path: Path
+) -> None:
+    # BACKLOG #1025 scope guard: GET /ui/uploaded-logs/file/{file_id} is ALREADY under the per-actor
+    # read budget and needs no console-side phi= — unlike the two search routes, its console handler has
+    # no short-circuit render path: it always calls core.browse_uploaded_file, whose body itself calls
+    # enforce_phi_read_pacing (app.py). So the metadata browse charges token 1 (render = 200) and a
+    # second browse over the budget 429s, with NO phi= on require_ui_step_up. Adding phi= here would
+    # charge the same bucket twice (dependency + handler body), 429ing even the first browse. Upload +
+    # list are plain require_ui (no phi), so neither spends a token. Synthetic HL7 only (reuses BATCH).
+    service = await _service(engine, ("op", Role.OPERATOR), per_actor=1)
+    transport = httpx.ASGITransport(app=_app(engine, service, tmp_path))
+    async with httpx.AsyncClient(transport=transport, base_url="http://t") as c:
+        await _login(c, "op")
+        up = await c.post(
+            "/ui/uploaded-logs/upload",
+            files={"file": ("acme.hl7", BATCH, "application/octet-stream")},
+        )
+        assert up.status_code in (200, 303), up.text
+        r = await c.get("/ui/uploaded-logs")  # require_ui, no phi: spends no token
+        marker = "/ui/uploaded-logs/file/"
+        fid = r.text.split(marker, 1)[1].split('"', 1)[0].split("/")[0]
+        assert len(fid) == 32
+        first = await c.get(f"/ui/uploaded-logs/file/{fid}")
+        assert first.status_code == 200, first.text  # metadata browse charges token 1
+        second = await c.get(f"/ui/uploaded-logs/file/{fid}")
+        assert second.status_code == 429
+        assert second.headers["Retry-After"]

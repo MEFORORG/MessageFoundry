@@ -89,7 +89,7 @@ engine binds. Three planes sit at different exposure levels:
 
 | Plane | What it is | Where it binds | Posture |
 |---|---|---|---|
-| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **on by default** (`[security].require_sign_in`, default `true`) — disabling it is refused on a non-loopback bind, but on **loopback** it is permitted and drops the plane to a full-privilege no-RBAC identity; smallest surface — keep it off general-user VLANs |
+| **Management** | web console (`/ui`) / IDE → engine API | loopback by default (or a restricted management subnet) | auth + RBAC + full audit, **on by default** (`[security].require_sign_in`, default `true`) — disabling it is refused on a non-loopback bind **or a loopback bind behind a declared TLS terminator**, but on a bare **loopback** bind with no declared terminator it is permitted and drops the plane to a full-privilege no-RBAC identity; smallest surface — keep it off general-user VLANs |
 | **Data** | inbound feeds you *receive* (MLLP, TCP/X12, DB-poll) | the **internal network interface** — feeds come from other systems on your LAN, not `127.0.0.1` | **TLS on the wire where the channel has it** (enable MLLP-over-TLS; **TCP/X12 have none** — segment them) + the `[egress]`/ingress allow-lists + your network segmentation. PHI must not cross the LAN in cleartext |
 | **Inbound web service** | a partner *calls into* MEFOR (`Http()` source) | its own connector-owned socket | built (ADR 0023) — per-connection TLS + opt-in mTLS + IP allow-list, **no bearer/basic partner auth**. Both peer controls are **optional and unenforced** — a TLS-on listener with neither accepts any peer; see the caveat below |
 
@@ -274,7 +274,7 @@ authentication on the channel · **Egress gate** = the `[egress]` allow-list tha
 
 | Channel | Bind default | TLS support | Auth | Ingress/egress gate | Off-loopback guarded? |
 |---|---|---|---|---|---|
-| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind, and on loopback yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without TLS or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind |
+| **Engine API** (FastAPI/uvicorn) | `[security].local_access_only` = true → `127.0.0.1` | **Yes** — in-process via `tls_cert_file`/`tls_key_file`, *or* upstream via `tls_terminated_upstream` + `trusted_proxies`; `tls_min_version` (≥1.2); opt-in mTLS via `tls_client_ca_file`; HSTS over https | Bearer token + session RBAC — **required by default** (`[security].require_sign_in`, default `true`); `false` is refused on a non-loopback bind or a loopback bind behind a declared TLS terminator, and on a bare loopback bind with no declared terminator yields a full-privilege *system* identity with no RBAC | — (auth-gated) | **Yes** — refused without TLS or a trusted terminator, and `--allow-insecure-bind` is clamped inert on an enforcing PHI instance (the default); also refused if sign-in is disabled on a non-loopback bind or a loopback bind behind a declared terminator |
 | **MLLP source** | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`; ≥TLS 1.2. **Plaintext by default** | None (MLLP has no app auth) | — | **Yes** — non-loopback plaintext refused (`check_mllp_tls_exposure`) |
 | **HTTP source** (`Http()`, ADR 0023) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + `tls_cert_file`/`tls_key_file`; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | mTLS client cert only — **no bearer/basic partner auth**, and **neither mTLS nor the IP allow-list is required**: with TLS on and both unset the listener accepts any peer | per-connection `source_ip_allowlist` — **optional, defaults to no restriction** | **Yes** — non-loopback plaintext refused (`check_http_tls_exposure`) — but the gate checks **only** that TLS is on, **never** that a peer control exists (unlike the DICOM SCP row below) |
 | **DICOM C-STORE SCP** (`DICOM()`, ADR 0025) | `[inbound].bind_host` = `127.0.0.1` | **Yes** — per-connection opt-in `tls=true` + cert/key; opt-in mTLS via `tls_ca_file`. **Plaintext by default** | `calling_ae_allowlist` / `require_called_ae_title` / mTLS (DIMSE has no transport auth of its own) | per-connection `source_ip_allowlist` | **Yes** — non-loopback plaintext refused (`check_dimse_tls_exposure`), **and** a non-loopback SCP with *no* peer control (calling-AE allow-list, IP allow-list, or mTLS) is refused at construction |
@@ -410,12 +410,12 @@ With it set, these otherwise-refused settings become permitted (each logs a loud
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
   `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped.)*
 - Plain-FTP credentials. *(Clamped.)*
-- RemoteFile SFTP: accepting an unknown host key. *(Not clamped — the raw escape still applies.)*
+- RemoteFile SFTP: accepting an unknown host key. *(Clamped since #329.)*
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped; AUTH credentials over
   cleartext stay refused outright either way.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop *(both clamped)*, plus LDAPS, the webhook alert sink and the
-  AI-broker endpoint *(raw escape)*.
+  forwarder and the API PHI-read serve hop, plus LDAPS, the webhook alert sink and the
+  AI-broker endpoint. *(All clamped — LDAPS / the webhook sink / the AI broker since #329.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -426,9 +426,11 @@ cleartext HTTP family are now governed only by a per-connection `cleartext_accep
 factory parameter and no `connections.toml` key, so it is unreachable from config today. Refusal messages
 that suggest it are ahead of the code.) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
-enforce`, and for the MLLP/FTPS/plain-FTP and store-TLS cells the clamp additionally requires the instance
-to be PHI — which is also the default. Either way, on the shipped posture those cells are inert; the
-bullets marked *not clamped* are the exceptions that still honour the raw variable.
+enforce`, and for the weakened-TLS / cleartext-escape cells that route through
+`weakened_tls_escape_permitted` — at least the store-TLS, MLLP/FTPS and plain-FTP cells and, since #329,
+LDAPS, the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
+instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
+the bullets marked *not clamped* are the exceptions that still honour the raw variable.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**
 switch that turns the remaining fail-closed verification checks into best-effort.

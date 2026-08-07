@@ -500,16 +500,17 @@ harness process only.)
 - Document each connector/transport and transform with its config schema and an example
   message.
 - When asked for tabular results, provide the final table directly — not code that generates it.
-- **Review security prose by asking what a reader would DO with it, not whether it is accurate.** The
-  three rules below are instances of it. Reasoning, evidence and dates:
-  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) §3 *"Reviewing
-  security prose"* — the source of record.
-- **State a load-bearing fact ONCE and link to it; never restate it.**
-- **A completeness claim is a liability — prefer "at least" to an enumeration.**
-- **A compensating control must not rest on a false premise.**
-- **Confirm your instrument answers the question you asked, not one adjacent to it** — `git diff` on a
-  staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job* conclusion for a *step*
-  question. Name the question and what the tool returns; check they are the same sentence.
+- **Review security prose by asking what a reader would DO with it, not whether it is accurate**
+  (**SDS-3.4**). The rules below are instances of it. Reasoning, evidence and dates:
+  [`docs/Secure_Development_Standards.md`](docs/Secure_Development_Standards.md) **SDS-3.4 to SDS-3.8**,
+  under *"Reviewing security prose"* — the source of record.
+- **State a load-bearing fact ONCE and link to it; never restate it** (**SDS-3.5**).
+- **A completeness claim is a liability — prefer "at least" to an enumeration** (**SDS-3.6**).
+- **A compensating control must not rest on a false premise** (**SDS-3.7**).
+- **Confirm your instrument answers the question you asked, not one adjacent to it** (**SDS-3.8**) —
+  `git diff` on a staged file, `--is-ancestor` under squash-merge, `$?` after a pipe, a *job*
+  conclusion for a *step* question. Name the question and what the tool returns; check they are the
+  same sentence.
 
 ---
 
@@ -546,10 +547,13 @@ harness process only.)
   accept-and-drop a received message.
 - Don't build **visual / template-driven authoring** (drag-drop transformer, declarative
   field-mapping) — **declined-by-design (v0.2+)**: code-first Routers/Handlers *are* the
-  differentiator ([`docs/BACKLOG.md`](docs/BACKLOG.md) #26). *Narrow carve-out (2026-07-10, #26
-  amendment; widened to Routers 2026-08-05 per ADR 0076 Amendment D, BACKLOG #232):* a
-  **structured Steps view** over real Python Handlers **and Routers** via a typed action
-  vocabulary (BACKLOG #222; the router `route` row kind is #232, ADR-gated) is permitted — the
+  differentiator (BACKLOG #26 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger). *Narrow carve-out (2026-07-10, #26 amendment; widened to Routers 2026-08-05 per
+  [ADR 0076](docs/adr/0076-typed-action-vocabulary-action-list-lens.md) Amendment D, BACKLOG
+  #232):* a **structured Steps view** over real Python Handlers **and Routers** via a typed action
+  vocabulary (BACKLOG #222 — closed, same archive; the router `route` row kind is #232, still open
+  in [`docs/BACKLOG.md`](docs/BACKLOG.md), ADR-gated) is permitted — the
   carve-out was granted because the `.py` stays the **only artifact and the only execution path**,
   and that property holds identically for a `@router` (a byte-splice Steps view over a real
   `@router` projects destination selection from reviewable Python; it introduces no declarative
@@ -558,7 +562,22 @@ harness process only.)
   remain declined.
 - Don't build **Serial (RS-232) / ASTM E1381/E1394/E1318** lab-instrument connectivity —
   **declined-by-design (v0.2+)**: no real feed demand, outside the HL7/FHIR/X12/DICOM scope
-  ([`docs/BACKLOG.md`](docs/BACKLOG.md) #27, [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+  (BACKLOG #27 — closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md), not in the
+  live ledger; the connector-parity row is [`docs/CONNECTIONS.md`](docs/CONNECTIONS.md)).
+- Don't adopt **ISO/IEC 5055:2021 / OMG ASCQM** as a quality **measure** — **declined-by-design
+  (2026-08-07)**, three reasons each independently sufficient: no free or open-source
+  5055-conformant **Python** analyser exists (the conformant ecosystem is C/C++/Java/C#/COBOL-
+  weighted), there is no contract counterparty for the clause the standard exists to support (it is
+  written into development and outsourcing contracts; this is OSS on PyPI), and a weakness-**count**
+  score collides with the anti-metric rule in
+  [`docs/Code_Quality_Standards.md`](docs/Code_Quality_Standards.md) §4.1. **The catalogue is a
+  different question and was adopted:** the ASCQM 1.1 weakness list is free from OMG, one bounded
+  pass over it ran under **#1073**, and its findings are **#1089–#1093**. Re-running that pass is
+  legitimate; adopting the score is not. *(#1073 is closed, so it lives in
+  [`docs/archive/backlog/BACKLOG-CLOSED.md`](docs/archive/backlog/BACKLOG-CLOSED.md) once archived,
+  not in [`docs/BACKLOG.md`](docs/BACKLOG.md) — a marker here has to outlive its item by
+  construction, so it must not cite only the live file.)*
 - Don't keep grinding in a polluted context — `/clear` after repeated failures.
 - Don't use **glyphs or emoji** in prose, comments, commit messages, PR bodies or replies — say the
   word (§11). The backlog status-banner alphabet is the one machine-parsed holdout; read it with
