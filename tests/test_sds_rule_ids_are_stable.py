@@ -24,9 +24,10 @@ WHAT IT DELIBERATELY DOES NOT CATCH.
   repository, so the ten known-stale citations are invisible where CI runs. This guard sees the
   standard, its siblings and the code; it cannot see the vault, and a green run here is not evidence
   about the vault's citations.
-* **A citation in the published PDF or its website mirror.** Those live in the separate
-  ``messagefoundry-website`` repository, which has no CI at all. The mirror is hand-copied and is
-  already 79 lines divergent while carrying the same version and date.
+* **A citation in the published PDF or the website copy of this standard.** Both live in the separate
+  ``messagefoundry-website`` repository, which this guard cannot read and which runs no CI of its own.
+  Whether that copy still matches this document is checked nowhere, so a green run here says nothing
+  about what is being served publicly.
 * **Anything derived from git history.** The required test leg checks out at ``fetch-depth: 1``, so an
   identifier's past is not readable here. Every check below is derivable from the working tree alone.
 
