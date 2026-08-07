@@ -78,7 +78,7 @@ handed out as free — which is exactly how #240–#247 were issued over cited n
 **Released 2026-06-18.** `v0.1.0` is tagged, signed, and published to PyPI — the GitHub release (marked
 Latest) carries the wheel + sdist + CycloneDX SBOM + Sigstore signatures + SLSA build provenance. The
 `v0.1.0-rc1` pre-release (2026-06-16) preceded it. Full scope and the hard-gate record:
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md). Capability catalog across every area, with status:
+`releases/v0.1-PLAN.md`. Capability catalog across every area, with status:
 [`FEATURE-MAP.md`](FEATURE-MAP.md).
 
 v0.1 delivered a **server DB as the supported production path (PostgreSQL + SQL Server)**, **engine HA
@@ -135,7 +135,7 @@ had been declined on a premise its own ADR 0053 contradicts). **#40** self-hoste
 **#41** cloud / Kubernetes HA packaging and **#61** third-tier DR standby have all shipped; **#11** WebAuthn
 shipped (ADR 0068 L5a); **#39** (frozen console installer Phase B) was built then retired (2026-07-01,
 superseded by the #75 browser ops dashboard). Sequencing context for the earlier wave lives in
-[`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+`releases/MULTISESSION-PLAN-6.md`.
 
 ---
 
@@ -507,7 +507,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 | **#219** | Harness-invariant property test + cross-observer INCONCLUSIVE guard ✅ | 7 | 3 | _quick win_ | ✅ BUILT | Structural CI guard codifying the anti-fabrication invariant that stops the B-class harness bug from recurring in any future throughput gate. **BUILT 2026-07-10** (A4a property test + A4b `observers_inconclusive`). |
 | **#208** | Fix the per-PID engine CPU collector (attribution is blind without it) | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — shipped 2026-07-20; the residual is OFF-REPO and no in-repo change can close it.** The blocking premise is discharged: an admissible aggregate verdict bounds engine CPU at ≤ 0.36 cores/shard (`PLAN-ENGINE-ATTRIBUTION.md:81`, `:280`). Deliberately published with **no sizing figure**. |
 | **#211** | Claim-mode lane-count sweep (16 → 1,500 lanes) — NOT a default flip | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — owner-ratified 2026-07-17, characterization-only.** The A/B ran and is published (`THROUGHPUT-STATUS-2026-07-10.md:256`, `:259`, `:664`). ⚠️ **Not a licence to flip the `claim_mode` default, and not a rig ask** — the 1,500-lane claim storm is precisely why the default stands. |
-| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ [2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
+| **#215** | Shard-scaling curve N = 1, 2, 4, 8, 16 on one unified store | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — Phase 5 is DONE; the answer is DECLINING** (`THROUGHPUT-STATUS-2026-07-10.md:942`), per-shard ceiling `R ∈ 2, 3)` at N=8. The *"unmeasured"* framing is retracted. ⚠️ The `m7i.8xlarge` upsize it asks for is **retired** (`:1719`) — do not fund it. |
 | **#216** | 1,500-connection traffic-driving harness mode (the demo shape) | 7 | 6 | _big bet_ | ✅ SHIPPED | **SHIPPED (verified 2026-07-28).** ⚠️ The *"no existing harness covers it"* premise is **retracted as false**: `harness/load/estate/` + `harness/config/estate/` + `python -m harness --estate`, with `count = 1500` in `estate-demo.toml`. ⚠️ `simple_fraction=0.72` and `hub_fanout=3` still need **OWNER SIGN-OFF**. |
 | **#218** | 2-point shard probe (N=1 vs N=4) — the cheap early killer | 7 | 6 | _big bet_ | ✅ CLOSED | **CLOSED — the experiment RAN (C1, 2026-07-10) and answered DECLINING:** 11.33 → 15.42 ingress/s = **1.36× for 4× shards** (`THROUGHPUT-STATUS-2026-07-10.md:265`). Direction firm, magnitudes soft (both soaks collapsed). Re-running re-derives a published verdict. |
 | **#210** | Remove the tempdb table variables from the pooled claim query | 7 | 7 | _big bet_ | ⛔ DECLINED | **DECLINED — withdrawn, owner-ratified 2026-07-17** (*"Do not build it"*, `THROUGHPUT-STATUS-2026-07-10.md:675`). ⚠️ **ADR 0114 deliberately PRESERVES the four table variables** (`store/sqlserver.py:702-717`) — they are load-bearing for per-lane FIFO. Removing them is a rejected design, not an unfinished one. |
@@ -542,7 +542,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 > **Update (2026-06-28).** Since this 2026-06-19 snapshot, **most rows below shipped** (through `0.2.10`) — the
 > per-item ✅ banners + `CHANGELOG.md` are authoritative, and the now-shipped on-trigger rows are flipped to
 > **done** inline. The remaining *buildable* set is **#33 / #40 / #41** (actionable) + **#52 / #60 / #61**
-> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`](releases/MULTISESSION-PLAN-6.md).
+> (owner-decision), planned ADRs-first in [`releases/MULTISESSION-PLAN-6.md`.
 > (**#39** frozen console installer Phase B was built then **🪦 retired** on 2026-07-01 — no longer buildable-set.)
 
 | Item | Value | Verdict | Effort | Why / trigger |
@@ -593,7 +593,7 @@ Ordered by value descending, then difficulty ascending (cheapest first at equal 
 
 The shipping configuration (SQLite/server-DB, single uvicorn worker, **localhost bind + required auth**)
 carries no open network exposure. The gaps below are **by design and tracked** — full context in
-[`releases/v0.1-PLAN.md`](releases/v0.1-PLAN.md) (the gates + the *Security posture* subsection),
+`releases/v0.1-PLAN.md` (the gates + the *Security posture* subsection),
 `security/CISO-REVIEW.md` (30-risk register), and the ASVS-L2 assessment.
 
 **Known gaps (by design):**
@@ -1057,7 +1057,7 @@ parity analysis.
 
 > **On-trigger / demand-gate.** Numbered for tracking only — build when the trigger below fires (“demand-gate, don’t schedule”).
 
-> 📐 **Partly promoted by [MULTISESSION-PLAN-7](releases/MULTISESSION-PLAN-7.md):** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
+> 📐 **Partly promoted by MULTISESSION-PLAN-7:** the **HL7-segment/field-aware before/after diff** (lane **L4**, client-side TS, no engine change) and **profiling + coverage** panes (lane **L7**, consuming the [ADR 0072](adr/0072-traced-dryrun-mode.md) traced dry-run) are scheduled as part of the no-AI build experience. The **hex / `mfb64:` pane** stays demand-gated.
 
 **Cluster:** Minor gaps (console/IDE). **Priority:** P3. **Verdict:** demand-gate.
 
@@ -2414,7 +2414,7 @@ lane; demand-gated on a first enterprise Windows/AD deployment.
 
 ## 232. Steps view for routers
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR-first: a `route` row kind widens the ADR 0076 §3 grammar, so the amendment lands before any build.
+> 🚧 **Filed 2026-07-30; ADR gate discharged 2026-08-05.** Value **5/10** · Difficulty **5/10** · _fill-in_. ADR 0076 Amendment D widens the grammar with a `route` row kind (§3 row enum + §4 recognition grammar), and CLAUDE.md §12's carve-out now names Routers; build handed off (`docs/releases/HANDOFF-232-router-steps.md`), not yet built.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (ADR-first). **Severity:** low (capability gap; no correctness or security risk).
 
@@ -2458,7 +2458,7 @@ def route_demo_oru(msg):
 
 ## 235. Generate Steps view parameter forms from Python type hints
 
-> 🔢 **Filed 2026-07-30 — not started.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
+> ✅ **Closed 2026-08-05 -- engine-emitted param schema (`lens schema` CLI) + schema-driven IDE renderer; int-to-number, the retype-trap fix, and enum-to-dropdown (convert_case/pad_field/arith_field/date_diff_field, narrowed to Literal) are all live; code-set picker is N/A (no editable code-set literal to attach to); code/control rows stay read-only.** Value **4/10** · Difficulty **4/10** · _fill-in_. Widens what is *editable* without widening the recognition grammar; sequence deliberately against #237.
 
 **Cluster:** IDE & Authoring. **Priority:** P2. **Verdict:** build (evaluate as its own lane). **Severity:** low.
 
@@ -2702,7 +2702,9 @@ Note the item is **not** "the scanner is broken" — it is that the token *sourc
 
 ## 325. Leak gate's home-path detector is case-blind on Windows paths
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. A structural detector in a required merge context — the one control meant to work in a fork with no token source — fires on one of four spellings of the same Windows home path (`_HOME_PATH` compiles with no flags and matches a literal `Users`, `scripts/security/scan_forbidden.py:99-106`), against the module's own "fail toward more detection" rule, though the disclosure is an OS account name and the tree holds zero live hits; an inline `(?i:)` on the drive-letter arm only (whole-pattern `re.I` measured 47 false positives), the sibling two-character `_WORKTREE_SLUG:92` edit, and casing fixtures beside the sole canonical-case test at `tests/test_scan_tokens_source.py:559-577`.
+> ✅ **Closed 2026-08-05 — shipped in #177 (commit `88703a3a`), an ancestor of `main`.** The fix and its regression tests landed folded into that batch, not on a branch of this item's name. The `_HOME_PATH` drive-letter arm case-folds inline (`scripts/security/scan_forbidden.py:114-121`) — scoped to that arm, so the POSIX `/users/` REST route stays unmatched (whole-pattern `re.I` would have measured 47 false positives) — and the sibling `_WORKTREE_SLUG` folds whole (`:96`); casing fixtures at `tests/test_scan_tokens_source.py:701,731` pass. Value **6/10** · Difficulty **2/10** · _quick win_.
+
+> **AMENDED 2026-08-05 — the What / Why / Proposed / Source block below is the historical filing record, not current state.** Read it as the finding that scoped this work, not as a live gap: the fix and its regression tests shipped in #177 (see the CLOSED banner above). The `_HOME_PATH` snippet quoted under **What** (a literal `Users`, compiled with no flags) is the PRE-fix pattern; the shipped detector folds the drive-letter arm inline at `scripts/security/scan_forbidden.py:114-121` and the `_WORKTREE_SLUG` sibling folds whole at `:96`. The four-spelling FIRES/MISSED table records the pre-fix behaviour, the **Proposed** steps are all built, and the line anchors together with the "Verified open at HEAD (`12efbffc`)" line reflect the state at filing, not today.
 
 > **Note on the examples below.** Every path here writes the account segment as the placeholder `<name>`, because `_HOME_PATH`'s negative lookahead exempts a segment beginning `<` — a literal account name in this item would trip the very gate it describes. Read `<name>` as "a real login name"; the FIRES/MISSED column describes what happens once one is substituted. This is [#322](BACKLOG.md) in miniature: a placeholder written into tracked prose is itself scanned.
 
@@ -3066,7 +3068,7 @@ Honestly bounded: **this is build-time only.** No PHI path, no running-engine su
 
 ## 337. handler-security lint: `getattr` indirection and the undecorated helper
 
-> 🔢 **Filed 2026-08-01 — not started.** Value **3/10** · Difficulty **3/10** · _fill-in_. `_AMBIENT_BARE_NAMES` (`checks.py:476`) still matches a literal name chain and `checks.py` contains no `getattr` resolution at all, and the rule loop still bails on `_message_fn_decorator(node) is None` (`:937`) so the `_<feed>_transforms.py` helper CONNECTIONS.md steers PHI handling into is never opened — but the lint is advisory unless an adopter opts into `--strict-handler-security`, and evading it reaches neither the DEK nor the audit chain in either sandbox posture; ~15 lines splicing a constant into `_dotted_call_name` plus a `phi-to-log` widening that must be recalibrated against the two shipped sample helpers before it lands.
+> ✅ **Done 2026-08-05 (#337).** Value **3/10** · Difficulty **3/10**. Both recall gaps in `_check_handler_security` (`checks.py`) are closed and pinned. A constant `getattr(mod, "name")` indirection now resolves in `_dotted_call_name`, so `getattr(os, "system")(...)` is flagged for `ambient-authority` (the shared resolver also flags a `getattr(time, "time")()` wall-clock read for `impure-transform`); and `phi-to-log` now scans undecorated `_*` transform helpers keyed on the first positional parameter, while `impure-transform` stays decorated-scope so the shipped `_pdf_mdm_transforms.py` ingest-time timestamp fallback stays clean. New `tests/test_checks_handler_security.py` cases cover both, and the change was proven green against `samples/config` before landing. Still an advisory-by-default filter — an evasion reaches neither the DEK nor the audit chain in either sandbox posture; ADR 0144 amended, to be re-scored upward when ADR 0147 (OS-level default-deny) lands.
 
 **Cluster:** Security & Compliance. **Priority:** P3. **Verdict:** build (small). **Severity:** low.
 
@@ -3274,7 +3276,7 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 ---
 ## 342. Sandbox worker kill does not reap a grandchild holding the response pipe
 
-> 🚧 **Status OPEN (filed 2026-08-01).** Value **5/10** · Difficulty **6/10** · _money pit_. `SandboxSession._kill` ([pipeline/sandbox.py:323](../messagefoundry/pipeline/sandbox.py)) calls `proc.kill()`, which terminates **only the direct worker child**. Admin-authored Handler code running in that child can spawn a grandchild, which **inherits fd 1 — the response pipe** — and survives the kill. It can then write frames onto a pipe the parent believes belongs to a freshly-spawned worker, and it leaks as an orphan process for the engine's lifetime.
+> ✅ **BUILT 2026-08-06 (local commit on fix-342-sandbox-reap; owner opens the PR).** Value **5/10** · Difficulty **6/10** · _money pit_. `SandboxSession._kill` now reaps the whole worker process tree — a Windows `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job object the worker is assigned to before its boot frame, and a POSIX new-session process group killed with `killpg` (`start_new_session=True`) — so a grandchild the Handler spawned can no longer inherit fd 1 (the response pipe) and outlive the kill as a leaked orphan writing onto a pipe the parent believes belongs to a fresh worker. Best-effort process hygiene, not the trust control (ADR 0087's codec + per-dispatch id + unsolicited-frame check keep a stray grandchild frame harmless): a job-assign failure degrades to a single-process kill, logged. The reap logic lives in `pipeline/sandbox.py`; the `_sandbox_codec.py` and `docs/CONFIGURATION.md` prose was synced to match. The ADR 0087 / ADR 0147 residual co-design (and the vault threat-model note) is left to the owner — reported, not done here.
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build (small). **Severity:** medium, low (likelihood: requires Handler-authoring rights, i.e. the same admin threat model as #339).
 
@@ -4386,14 +4388,15 @@ open.
 
 ## 1009. SOAP `body_secret_value_<i>` is redacted, registered and documented — and never fingerprinted
 
-> 🔢 **Filed 2026-08-04 — not started. Scored 2026-08-04 → P2.** Value **5/10** · Difficulty
-> **2/10** · _fill-in_. `connector_secret_env_values`, the ASVS 13.3.4 runtime rotation
-> fingerprinter, filters on bare `_SECRET_SETTING_KEYS` membership at `config/wiring.py:725`,
-> while `body_secret_value_<i>` reaches secrecy only through the prefix branch of
-> `_is_secret_setting` (`:686`) — so a rotation of a SOAP injected body secret is not
-> auto-detected the way every sibling class is, and the registration gate whose comment promises
-> the two sets "can never disagree" walks straight past it; the fix is one line plus the reverse
-> assertion that gate is missing.
+> ✅ **Built 2026-08-05 — Scored 2026-08-04, P2.** Value **5/10** · Difficulty
+> **2/10**. `connector_secret_env_values`, the ASVS 13.3.4 runtime rotation fingerprinter, now
+> filters connector secrets through `_is_secret_setting` (`config/wiring.py:725`) instead of bare
+> `_SECRET_SETTING_KEYS` membership, so the prefix-only `body_secret_value_<i>` SOAP body-secret
+> class is fingerprinted and a rotation of it is auto-detected the way every sibling class is. The
+> missing reverse gate (`test_registered_connector_secrets_are_reachable_by_the_fingerprinter`) now
+> asserts every registered connector secret is reachable by the fingerprinter, so the "can never
+> disagree" invariant is enforced rather than assumed and a future hand-added registry entry cannot
+> slip through (ADR 0015).
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** low — a
 monitoring gap on an opt-in connector secret class, **not** a disclosure.
@@ -4637,7 +4640,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 **Explicitly not this item:** the `db_lookup` gap. `transports/database.py` builds its own connection string and emits no `MultiSubnetFailover`, so a deployment reaching the same listener through the DATABASE connector needs the DNS-side configuration regardless of what this rig measures. Whether that connector should get the keyword is a separate owner decision — do not let a green result here be read as "the workaround is obsolete".
 
-**Do not extrapolate from the AD lab.** [`plan-11/w19-ad-lab-integration-validation.md`](releases/plan-11/w19-ad-lab-integration-validation.md) covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
+**Do not extrapolate from the AD lab.** `plan-11/w19-ad-lab-integration-validation.md` covers AD/Kerberos integration and records this as *"needs the SQL AG rig"*. Its note that "all shipped — this is confirmation, nothing is blocked" is true of the code and false of the documentation.
 
 **Related:** #100 (the shipped setting), [`AOAG-DEPLOYMENT.md`](AOAG-DEPLOYMENT.md) §4.5 / §5.3, `messagefoundry/config/settings.py` (`multi_subnet_failover`, default `false`), `messagefoundry/store/sqlserver.py` (`connection_string`), [`CONFIGURATION.md`](CONFIGURATION.md).
 
@@ -4687,7 +4690,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1015. OIDC relying party keys federated accounts on a reassignable username claim while the non-reassignable `sub` is discarded (ASVS 10.5.2)
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **7/10** · Difficulty **4/10** · _quick win_. The relying party keys federated identity on `oidc_username_claim` (default `preferred_username`), which an IdP is free to **reassign**, while the non-reassignable `sub` is verified and then dropped into an audit field. On first deployment a new holder of a retired username would be handed the prior holder's account.
+> ✅ **Closed 2026-08-06 — Option A shipped (subject-continuity guard); ADR 0142 Amendment A owner-ratified.** Value **7/10** · Difficulty **4/10** · _quick win_. The relying party keyed federated identity on a reassignable username claim while the non-reassignable `sub` was verified then dropped, so on first deployment a new holder of a retired username would have been handed the prior holder's account (ASVS 10.5.2). Fixed by pinning the federated identity to `(issuer, sub)` — two nullable store columns with idempotent three-backend migrations — and refusing a login whose username resolves to an account bound to a different `sub` (`federated_subject_conflict`); the account is still resolved by AD username and roles still come from LDAP. Residual: a legitimately reassigned username is refused with no rebind path, so an operator rebind action is the recommended follow-on.
 
 **Cluster:** Security / authentication. **Priority:** P1. **Verdict:** build. **Severity:** high on first deployment — account takeover without any credential compromise.
 
@@ -4703,7 +4706,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1016. claims.py 500s on two malformed-IdP shapes with no closed-set audit row
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. Two narrow, attacker-influenceable inputs raise **past** the `ClaimsError` contract, so the response is a 500 with no closed-set audit row instead of a named claim rejection.
+> ✅ **Fixed 2026-08-06.** Value 5/10 · Difficulty 2/10. Both malformed-IdP shapes — a non-ASCII nonce and a list `aud` carrying an unhashable element — now reject as named, audited ClaimsErrors (nonce_mismatch / claim_aud); on first deployment either would otherwise have surfaced as a 500 with no closed-set audit row.
 
 **Cluster:** Security / authentication robustness. **Priority:** P2. **Verdict:** build (small). **Severity:** low — availability and audit completeness, not an auth bypass. Neither path admits a bad principal; both turn a rejectable token into an unclassified 500.
 
@@ -4739,7 +4742,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1021. The MFA enrollment confirm verifies the activating TOTP through a bool wrapper that discards the step, so it is never consumed (ASVS 6.5.1)
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. `confirm_mfa_enrollment` verifies the enrolling code with `totp.verify_totp`, a documented thin bool wrapper that computes the matched time-step and then collapses it to a bool, so the step cannot be recorded. `enable_totp` leaves `last_totp_step` NULL, and `consume_totp_step` rejects only when `last is not None and last >= step` — so on first deployment the activating code would remain usable on the login path for the remainder of its own step.
+> ✅ **Fixed 2026-08-06 — enrollment now consumes the activating TOTP step (`verify_totp_step` + `consume_totp_step`), mirroring the login path.** Value **6/10** · Difficulty **4/10** · _quick win_. `confirm_mfa_enrollment` proved the enrolling code through the `totp.verify_totp` bool wrapper, which computed the matched time-step then collapsed it to a bool, so the step was never recorded; with `last_totp_step` left NULL by `enable_totp`, the activating code would have remained usable on the login path for the remainder of its own step on first deployment. The confirm site now takes the matched step from `verify_totp_step` and requires `consume_totp_step` before minting recovery codes / `enable_totp`, so the step is single-use (ASVS 6.5.1) and enable stays atomic.
 
 **Cluster:** Security / authentication. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave a narrow second-factor replay window at enrollment on first deployment — bounded, not a bypass.
 
@@ -4961,7 +4964,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 ## 1025. Three `require_ui_step_up` routes emit PHI with no `phi=`, so they charge no per-actor read budget
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **5/10** · Difficulty **2/10** · _fill-in_. `GET /ui/messages/search`, `/ui/messages/search/layered` and `/ui/uploaded-logs/file/{file_id}` put PHI on the wire through `require_ui_step_up` without `phi=`, so `require_ui`'s `allow_phi_read` throttle never runs for them. **A missing rate limit, not a missing authorization check** — all three still gate on the right permission.
+> ✅ **SHIPPED 2026-08-06 — the two content-search render paths brought under the per-actor read budget; the third route was already covered.** Value **5/10** · Difficulty **2/10** · _fill-in_. **AMENDED 2026-08-05 — scope corrected against the code before building.** The filing's premise (all three routes charge no read budget) does not hold: `search_messages`, `layered_search` and `browse_uploaded_file` each call `enforce_phi_read_pacing` in their own body — which the console executes when it invokes them directly — so every request that actually reaches a handler was already charged at the cited commit `e0482aea`. The real gap was only the console's SHORT-CIRCUIT renders (`GET /ui/messages/search` bare-form, `GET /ui/messages/search/layered` no-preset) that return *before* the handler runs. **AMENDED 2026-08-06 — mechanism corrected from a gate-level `phi=` to an inline branch charge.** A gate-level `phi=` on `require_ui_step_up` charges in the dependency, i.e. on *every* request, so it would have double-charged the criteria/preset path — which already charges in the handler — the exact double-count that excludes the uploaded route. Instead each search route now charges `enforce_phi_read_pacing` **inline on its short-circuit branch only**, so the bare-form / no-preset render spends a token while a real search still charges exactly once. `GET /ui/uploaded-logs/file/{file_id}` was deliberately left unchanged — it has no short-circuit and `browse_uploaded_file` paces every call, so any second charge would double-count the same budget (empirically the first browse would `429` at a budget of 1). **A missing rate limit, not a missing authorization check** — all three still gate on the right permission. Shipped: the two search short-circuit charges + the `require_ui_step_up` docstring corrected + `docs/SECURITY.md` and the webconsole CHANGELOG aligned to the true mechanism.
 
 **Cluster:** Security / PHI anti-automation. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave three PHI-emitting console routes outside the per-actor read budget on first deployment, so an authorised-but-abusive actor could enumerate through them without hitting the 429 the sibling browse routes enforce. No unauthorised access.
 
@@ -4995,6 +4998,38 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 
 **Source:** found by the #324 lane on 2026-08-04 when it named both pytest paths for a webconsole-touching change; the CI-coverage half was flagged by that lane as an inference and verified against `ci.yml` before filing.
 
+## 1028. Async session mail: close the red-team defects before wiring
+
+> 🚧 **Filed 2026-08-05 — in progress.** Value **6/10** · Difficulty **5/10** · The async session-mail prototype ([ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md)) is deliberately **not wired**, because an adversarial pass found eight defects — four of them severe, including a mutual-exclusion primitive that **does not exclude**. This item is the work that closes them and the gate on wiring.
+
+**Cluster:** Session coordination / developer tooling. **Priority:** P3. **Verdict:** build. **Severity:** no product effect and no deployment effect — this is developer tooling, not engine code, and nothing is installed into any config root today. The defect is that the channel as prototyped would deliver one message repeatedly, would let writer-controlled body content construct a filesystem path, and would hand the reading model a runnable command line assembled from that same content.
+
+**What the channel is for, so the item is legible without the ADR.** Claude Code sessions launched by the VS Code extension, and sessions under a different login, cannot be reached by the realtime session channel at all — structurally, not by a filter. The prototype is a file drop under `<git-common-dir>/mefor-coord/mail/`, addressed by the recipient's worktree. See [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md) for the decision and the measurements; this item is the punch list.
+
+**The eight findings, ALL NOW CLOSED.** They were written in the conditional because nothing was live when they were filed. **That is no longer true:** the drain is wired on `SessionStart` and `Stop` on the default config root (owner-approved 2026-08-05), though it still resolves nothing outside the branch worktree until the scripts reach `main`.
+
+1. **Path traversal through the message id (critical).** The drain builds its receipt path from the JSON `id` field, which is body content the writer controls; `..\..\..\evil` would write outside the mail root. Fix: make the **on-disk filename authoritative**, discard the body's `id` entirely, and validate the filename stem against a fixed shape before constructing any path. Sanitising the body id instead is a weaker control that looks identical from the outside.
+2. **An executable command line in the injection (critical).** The drain emits a paste-ready reply command built from the sender's self-declared path, which is shell-parsed — and it teaches the recipient to execute a command that arrived in tool output, which CLAUDE.md forbids outright. Fix: print a validated id and a pointer to the doc; emit no runnable command, ever.
+3. **The body can forge the frame (major).** The body is injected verbatim into a delimited block, so it can carry a counterfeit end-of-message delimiter followed by forged higher-authority text. Fix: **one** sanitiser, defined once and applied at the single point of injection.
+4. **The mutual-exclusion primitive does not exclude (critical).** See below — this is the one that is not a race but a false primitive.
+5. **No write-side trust boundary is stated (major).** Any process running as the user can drop a file into any inbox, so every `from.*` field is an unverified self-assertion while the drain renders them as provenance. This **cannot be enforced** by this design; it has to be stated, in the doc and in the injected preamble.
+6. **No receiver-side caps (major).** No message-count or byte cap on a single injection. The send-time cap is not a cap: it is bypassed by writing the file directly, which is the act the transport consists of.
+7. **Content is unaddressed (major).** A body would be unencrypted, unredacted and retained indefinitely, and delivery would make a second copy in the recipient's transcript that no prune of the queue reaches. Needs a content rule with the force of the secrets rule, stated once and referenced from `docs/PHI.md`.
+8. **One-shot rewake (major).** The urgent tier cannot re-arm itself: the rewake belongs to the process Claude Code spawned and tracks by hook id, so a self-spawned grandchild's exit code is heard by nobody. **Documented, not solved here.**
+
+**Finding 4 is the one to read carefully, and BOTH obvious fixes were measured insufficient -- including the one this item originally recommended.** `[System.IO.File]::Move` returns success without moving for losers under contention, so a non-throwing move is not a claim. Verifying `File.Exists(dst) && !File.Exists(src)` cannot discriminate, because the winner's move makes it true for everybody. **And verifying `File.Exists(my own unique destination)` -- the fix this item used to prescribe -- is ALSO insufficient**: that result came from 16 threads inside ONE process, where a shared metadata cache hides the defect; re-measured across 16 separate PROCESSES, the configuration the drain actually runs in, it reported a win to more than one racer in 46 of 800 rounds. The shipped verdict is an **exclusive open**. Every arm, every control, and why `scripts/coord/claim.ps1` is not affected live in [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md) and deliberately nowhere else -- this measurement was restated in six places once, and correcting it meant editing all six. **A concurrency result is a fact about a configuration, not about an API.**
+
+**DO NOT TOUCH: `scripts/coord/claim.ps1` is NOT affected and must not be "fixed".** Its mutual exclusion is an exclusive `CreateNew`, and its `Move` targets a per-PID-unique temporary with overwrite semantics, so no two processes ever contend on one source.
+
+**Difficulty 5 is the test, not the fix.** Most of the findings are absence-shaped (no traversal, no runnable command, no forged frame, no uncapped injection), and a test that asserts only an absence is satisfied by a drain that emits nothing at all — so each needs a positive arm proving mail is still delivered on the same fixture. The concurrency arm needs a negative control that demonstrably goes red, because this is precisely a case with a plausible wrong version that passes. The scripts are also outside every automated gate the repo has: there is no PowerShell linter, ruff and mypy do not see `.ps1`, and `pytest` reaches one only through a test that reads or executes it. The test module is the whole safety net, not a supplement to it.
+
+**SUPERSEDED: wiring was a separate owner decision, and it was taken.** The drain went live on `Stop` first, then on `SessionStart` once the show/consume split made a discarded session unable to consume what it displayed. Default root only; no `~/.claude-account-N` carries it. **It is nonetheless INERT outside the branch worktree** -- the shim resolves from the primary checkout, which does not carry these scripts until PR #210 lands, so the hook fires, resolves nothing and exits 0. It activates everywhere, unannounced, on merge.
+
+**WHAT REMAINS, and it is why this item is still open.** (a) PR #210 must land. (b) The hook must then be verified through the SHIM resolution path, which is NOT what was tested -- the VS Code run drove the drain by absolute path, while the live hook resolves via `git rev-parse --git-common-dir` against the primary. (c) The session-id reuse defect is **REPRODUCED AND NOW FIXED** (2026-08-06). Ids are reused across launches, so a phantom's shown-marker could be inherited by a later session carrying the same id, which then suppressed its own display and consumed the message unseen. The fix is a DELETION rather than a guard -- nothing available to the hook separates the two sessions, so a consuming drain now ignores markers entirely and renders what it consumes. Consumption depends only on what THAT invocation rendered, which no other session can forge. Cost: a guaranteed duplicate display at the first `Stop`, which is the accepted side of this channel's tradeoff. Mutation-verified red against both the original defect and a partial regression.
+
+**Related:** [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md) (the decision, the measurements, and the ten EARS acceptance criteria), ADR 0158 (silent controls — a green signal that means nothing; findings 4, 5 and 8 are instances), #1018 (guards that go quiet).
+
+**Source:** adversarial review of the prototype by a red-team pass on 2026-08-05, before any wiring. The `File.Move` behaviour was measured in response to that pass rather than inferred from it, and the measurement retired the fix the review itself had proposed.
 ## 1029. `/simplify` shipped as a local skill with no entry in the quality-standards record, so the one review tool that edits the tree had no written placement or scope
 
 > ✅ **SHIPPED 2026-08-05 — the documentation is the whole deliverable.** Value **3/10** · Difficulty **1/10** · _quick win_. `/simplify` is now recorded in [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) §5.1 as a local, human-invoked **advisory** review that **applies** its fixes, ordered before the `ruff` / `mypy` / `pytest` quartet, with the justified-duplication carve-outs written down. A new §5.1, a scoping clause in §5's intro, a mapping row in §6, and a `Before you verify` heading in `CLAUDE.md` §5.
@@ -5134,7 +5169,7 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Related:** \#1032 (same file family, and the same shape of a remediation that cannot execute), PR #209.
 
-**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: session `nice-payne-4dcee0` has it as analysis only, with no build decision taken.
+**Source:** surfaced 2026-08-05 while adding the two new guards, from the observation that a guard everything else leans on can be switched off by a missing interpreter. Held for the owner: another session has it as analysis only, with no build decision taken.
 
 ## 1035. Gate remediations interpolate an unquoted `-File` path into a command the reader is told to run
 
@@ -5148,7 +5183,149 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 **Scope note.** Two categories must NOT be swept up. Relative file *references* with trailing prose (Rule 1a telling a human where the source lives) are deliberately not runnable command forms. Comment-based help inside a `.NOTES` block is never emitted at runtime. Both look similar to grep and neither is a defect.
 
-**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in).
+**Related:** #1032 (same class, the instance that was fixed), #1040 (the deny-text output surface these sit in), #1076 (the *injection* sibling on the same line-475/477 pair — distinct from this item, which is a runnability defect in the emitter's OWN path).
+
+## 1076. Rule 3b emits the branch name unquoted into the READ remediation, one line below the quoting that fixed the same class
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **7/10** · Difficulty **2/10** · _quick win_. PR #214 quoted `$dest` at `worktree_gate.ps1:475` to close a refname-into-a-command injection. **Line 477 emits the same value BARE**, inside the same remediation block the same message tells an agent to run. `$( )` is command substitution in both PowerShell and bash, so a branch named `pwn$(calc)` executes. Measured against the installed gate.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. It is a live injection channel into an enforcement control's own output, and the value that carries it is **attacker-chosen from a public fork**.
+
+**Measured, not reasoned.** From a governed linked worktree, `git checkout` onto a local branch named `pwn$(calc)`:
+
+```
+    pwsh -NoProfile -File "...\new.ps1" -Branch 'pwn$(calc)' -Name pwn-calc      <- :475, correctly quoted
+    git -C "...\wt1" show pwn$(calc):<path>   git -C "...\wt1" diff HEAD..pwn$(calc)   <- :477, BARE
+```
+
+A bare `Write-Output main$(calc):seed.txt` emits `mainPWNED-EXECUTED:seed.txt`. A branch named `quote'name` yields an unbalanced quote that swallows the rest of the line. `;` and `|` are unreachable (line 389 cuts at the first separator), but `$`, backtick, `&`, `(`, `)`, `'` and `#` all survive.
+
+**Getting the ref is the easy half.** Development happens directly in the public repo; `gh pr checkout`, `git checkout --track` and `git fetch origin <ref>:<ref>` all create `refs/heads/<attacker-chosen-name>` from an outside contributor's fork branch. The FIRST checkout falls through at :424 and DWIM-creates the ref; the SECOND trips rule 3b.
+
+**⛔ FOLDING IS THE WRONG INSTRUMENT AND WOULD LOOK LIKE A FIX.** `Get-SafeForMessage` neutralises line structure and length — it does not touch `$`, backtick, `&` or `'`. **The fix is quoting, as :475 already does.** Keep the two treatments distinct and named: quote-doubling for a value entering a COMMAND, folding for a value entering PROSE. Conflating them is what produced the miss.
+
+**A second unsafe interpolation on the same line.** `$selfTopRaw` at :477 sits inside `"..."`, and `$( )` and backticks expand INSIDE double quotes in both shells — measured with worktree directories named `wt$(id)` and ``wt`id` ``. The earlier reasoning that a `"` cannot occur in a Windows path is true and irrelevant: `"` is not the operative character.
+
+**Confirmed in a second, independent copy.** The `claude-multisession` fork carries the same remediation shape. Its `Get-SafeForMessage` additionally strips `["';|&$` + backtick]`, so the fork is **not** exploitable through it — which is a working existence proof that a metacharacter-stripping fold is a viable second layer. **Do both:** quoting is the local correctness fix; a fold that strips shell metacharacters is defence in depth for the next remediation line somebody adds without thinking about it, which is the more likely failure to recur.
+
+**No test covers it, and the gap has the same shape as the defect.** `grep -rn "destQ|show \$dest|HEAD\.\." tests/` returns one unrelated allow-case. **PR #214's quoting fix is itself untested, which is how the miss one line below it survived review.** A fix needs a rule 3b case asserting the emitted READ line against a hostile refname — asserting the STRING, not merely that the call denied.
+
+**Related:** #1035 (the runnability sibling on the same emitter — that one is the gate's OWN path containing a space; this one is an attacker-chosen value executing), #1040 (the general form — deny text is attacker-influenceable output an agent is instructed to act on), #1032 (a remediation the receiving side rejects), #1069 (the gate blind to a QUOTED key — the mirror: this item is the gate EMITTING an unquoted one).
+
+**Source:** found 2026-08-06 by a three-pass audit (inventory, adversarial attack, refutation) of the committed gate, prompted by a coordination message from a peer session generalising this gate. That message's own premise was overturned by measurement: the values it named are newline-unreachable here, and the reachable defect was one its proposed fix would not have closed.
+
+## 1082. Rule 3c's deny text for a `--global` or `--system` disarm write names the wrong mechanism, and whether the write takes effect is not knowable from the command
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ THE VERDICT IS CORRECT; ONLY THE WORDING IS WRONG. Do NOT "fix" this by allowing the write.** For `git config --global core.hooksPath <dir>` aimed at a governed repo, rule 3c denies and says *"would change the SHARED git configuration of <repo>"*. That sentence is false — the write lands in `~/.gitconfig`. But the DENY is right, because the write can still disarm the repo **by inheritance**. Value **4/10** · Difficulty **3/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P3. **Verdict:** build. **Severity:** no product effect, no PHI effect. A deny message that names the wrong mechanism teaches the reader the control is confused, which is how a control stops being trusted.
+
+**⛔ AN EARLIER FILING OF THIS AS A FALSE DENY WAS WRONG, AND THE RETRACTION IS THE POINT OF THIS ITEM.** This defect was briefed to a fix round as *"rule 3c denies `--global` writes it has no business refusing"*. Three independent verifiers measured that premise and **withdrew it**: in a repo with `core.hooksPath` unset at every scope, `git config --global core.hooksPath <emptydir>` leaves `.git/config` untouched and the next commit runs with **the hook never firing** (`COMMIT-1 rc=1 GATE-FIRED` -> `COMMIT-2 rc=0`, hook skipped). **Flipping rule 3c to ALLOW would have been a fail-open.** The implementing pass refused to flip it, which was the correct call.
+
+**AND THE VERIFIERS' GENERALISATION NEEDS ITS OWN QUALIFIER, measured in this repo 2026-08-07.** It is **not** universally true that a `--global` write reaches a governed repo:
+
+```
+git config --show-origin --get core.hooksPath
+file:.git/worktrees/<wt>/config.worktree    <primary>/.git/hooks
+```
+
+This repo sets `core.hooksPath` at **worktree** scope, which beats global — so here a `--global` write of that key would **not** take effect. In the verifiers' fresh rig, unset at every scope, it **would**. ⇒ **Whether the write matters depends on whether the governed repo sets the same key at a more specific scope, and that is NOT knowable from the command text.** Denying is the correct conservative default. Note the asymmetry: `--global alias.*` is far more likely to take effect than `--global core.hooksPath`, because a repo rarely pins the same alias locally.
+
+**The work.** Say what is true and no more. Something of the shape: *"'<key>' is on the disarm list. `--global`/`--system` writes your per-user or machine-wide config rather than this repository's, but git falls back to those scopes when the repository does not set the key, so the write can still disarm this checkout's hooks. Refused because the gate cannot tell which case applies from the command alone."* Two constraints from the measured record:
+- ⛔ It must not claim the write changes the SHARED configuration of the repo. It does not.
+- ⛔ It must not claim the write is harmless, either. A round-4 candidate printed *"This does NOT change the shared configuration"* and that was graded BLOCKING by three verifiers — over a multi-line command whose second segment did a local write, the reader saw a reassurance printed over a real disarm.
+
+**A separate, real defect found in the same pass and NOT fixed here:** `Get-ScannableSegments` splits on lines, and `Write-Deny` exits on the first hit, so **a multi-line command is judged by its first segment only**. That is a wording hazard today and a correctness hazard for any rule that reasons per-segment. Needs its own item.
+
+**Test it by the wording, not the verdict.** The verdict does not move, so a test ending in a bare `assert_denied` cannot see this at all — and a round-4 mutant that reinstated the old self-contradicting bullet **survived a fully green suite** for exactly that reason. Assert the string.
+
+**Related:** #1061 (the rule), #1065, #1066, #1069-#1072 (the other open 3c defects), #1040 (deny text is output an agent acts on), #1076 (the same rule family emitting an unquoted value into a runnable command).
+
+**Source:** the premise was mine, briefed to round 4 on 2026-08-06 as a live false deny, and overturned by that round's own verification on 2026-08-07. Filed as what it actually is.
+
+## 1083. The forbidden-content guard requires a path prefix on a worktree slug, so a bare slug in prose reaches the public repo
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **6/10** · Difficulty **1/10** · _quick win_. `scripts/security/scan_forbidden.py:96` is `_WORKTREE_SLUG = re.compile(r"(?i:(?:claude/|worktrees/)[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6})")`. **The `claude/` or `worktrees/` prefix is MANDATORY**, so a bare slug in prose matches the shape and not the pattern, and ships. ⛔ **A live instance has been on `origin` since 2026-08-05** and the guard passed it on every commit since.
+
+**Cluster:** Repo hygiene / public-repo content control. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect. It leaks an internal task name into a **public** repository — low individual harm, but the guard exists precisely because the project decided these should not ship, and it is failing silently at that job.
+
+**Measured, both directions, same commit.** The guard REFUSED a commit of mine for the path form and PASSED the bare form in the same file:
+
+```
+REFUSED   docs/BACKLOG.md:5800  worktree/branch slug (internal project name)
+          ... the round-3 fix in `.claude/worktrees/<slug>`.
+PASSED    docs/BACKLOG.md:5129  (already on origin since 2026-08-05)
+          ... Held for the owner: session `<slug>` has it as analysis only ...
+```
+
+Both contain the identical slug. Only the first carries a `worktrees/` prefix.
+
+**Why it is a blind spot and not a judgement call.** The comment block at `:89-95` reasons carefully about **case** — it notes agent slugs are lowercase by convention but that `new.ps1` passes `-Branch` to `git worktree add -b` after only a `git check-ref-format` check, which permits mixed case, and that `-Name` reaches the worktree DIRECTORY verbatim, so it deliberately folds case. **It says nothing about the prefix being mandatory.** The author thought about one axis of reachability and not the other, and the pattern is green because it cannot see the shape it does not require a prefix for.
+
+**The work.** Make the prefix optional: match the slug shape (`[a-z0-9]+(?:-[a-z0-9]+)*-[0-9a-f]{6}`) with or without `claude/` / `worktrees/`. ⚠️ **Assess the false-positive cost before doing it** — a bare `word-word-6hex` shape is more collidable than a prefixed one, and this repo legitimately writes short hex in prose (`git hash-object` prefixes, blob ids, `sha 3e7db362`). A guard that fires on ordinary commit prose gets allowlisted into uselessness, which is worse than the leak. Measure the hit rate over the existing corpus first, and prefer narrowing by context (a backticked token, a `session`/`worktree`/`branch` lead-in) over widening the shape.
+
+**Test it with a negative control, because this defect IS a missing one.** Add a fixture containing the bare form and assert the scanner FIRES. The existing suite cannot distinguish "no slug present" from "slug present in a shape I do not match" — which is the same failure as the guard itself.
+
+**Mitigation already applied:** the live instance at `:5129` was redacted in the commit that filed #1082. ⛔ **That is partial — it is already in git history and on `origin`,** so treat the redaction as stopping further propagation, not as removing it.
+
+⛔⛔ **AND THE TRAP THAT MAKES THE OBVIOUS FIX WRONG FOR A NEW LEAK: A REDACTION COMMIT REPUBLISHES THE TOKEN IN ITS OWN DIFF.** `git show <the redaction commit>` contains the removed line **verbatim**, as a `-` line. On a public repo the fix and the disclosure are therefore **the same object** — committing a redaction of a not-yet-public token publishes exactly what it removes, and does so in a commit whose message draws attention to it.
+
+⇒ **The order matters and "commit the redaction" is only correct for an ALREADY-PUBLIC token.** Decide which case you are in first:
+- **Token already on the remote** (this case): a normal redaction commit adds nothing new. Redact, commit, and record that history retains it.
+- **Token NOT yet pushed:** do **not** add a redaction commit. Remove it from the commit that introduced it — amend, or rebase the branch — so the token never reaches the remote in any object. A redaction commit here converts a local mistake into a published one.
+- **Token pushed but sensitive enough to matter** (a customer or site token rather than an auto-generated name): redaction is insufficient in either form. That is a history-rewrite and disclosure question for the owner, not a commit.
+
+⚠️ **Severity here was assessed on the token's SHAPE, deliberately without echoing it:** `adjective-noun-6hex`, three parts, an auto-generated agent session name — not a customer, prospect segment, site code or competitor token, which is the family that makes a slug leak actually matter. **That classification is what made this routine rather than an owner-level call**, and the same triage should gate any future instance. A guard fix that cannot distinguish those families by severity will either under-refuse or become noise.
+
+**Related:** #1056 (the item whose Source line carried the instance), #1000 (a control green because it cannot see the class it covers), #1063 and #1060 (the same guard family reading the wrong thing).
+
+**Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
+
+## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ THIS IS LIVE ON THE INSTALLED GATE and is the ONLY confirmed false deny remaining after #1082 withdrew the other one.** Value **6/10** · Difficulty **4/10** · _do it_. `Get-GitTargetCandidatesRaw` prefers `-C` and **discards** a `cd` prefix, but a real shell resolves a relative `-C` against the **post-`cd`** directory. So from a governed primary, `cd ../Unrelated && git -C . config core.hooksPath /dev/null` **DENIES, naming the primary**, while the command actually configures the ungoverned `../Unrelated`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. It is a **live false deny** on the gate installed on this machine, and the deny message names a repository the command does not touch, so a session that reads it and believes it has been actively misinformed.
+
+**It is the exact mirror of #1061, from one root confusion.** #1061 was *"the gate resolved against the wrong base and ALLOWED"*. This is *"the gate resolves against the wrong base and DENIES"*. Same defect, opposite sign — which is why a fix aimed only at the ALLOW direction was always able to produce this, and did.
+
+**Measured** (round 1's verification pass, cwd = the governed primary, hook subprocess cwd equal to the payload cwd):
+
+```
+cd ../Unrelated && git -C . config core.hooksPath /dev/null
+  pre-fix : ALLOW      post-fix: DENY  ("would change the SHARED git configuration of <primary>")
+  reality : the write lands in ../Unrelated, an UNGOVERNED repo
+```
+
+**Not closed by any of the three rejected rounds.** Round 2 attempted `cd`/`-C` composition and was rejected for unrelated fail-opens; round 3 closed it for `&&`/`;`/`||`/`|` joins but **not** across a newline or a subshell, and was rejected; round 4 was wording-only and did not touch it. So the composition work exists in two banked patches and has never passed verification.
+
+**The fix is composition, not preference:** when a `cd` prefix is present and the `-C` argument is relative, the effective directory is `cd-target` joined with the `-C` value, not one or the other. ⚠️ **Two measured constraints on that work.** `Get-ScannableSegments` splits on **lines**, so a newline-joined `cd` is not composed by any per-segment rule — round 3 shipped that gap knowingly. And the existing bail-outs (`popd`, `cd -`, a `cd` inside parens, more than one `cd`) exist because those cases are not statically resolvable; **do not remove them to make composition tidier** — an unfollowable `cd` must produce a message that says the target was not determined, never a confident repo name. Round 3's version asserted a name in exactly that case.
+
+**Test it by the DENY TEXT as well as the verdict**, because the failure is that a true refusal names the wrong repository. A test ending in a bare `assert_denied` cannot see it — and a round-4 mutant that reinstated a known-false sentence **survived a fully green suite** for precisely that reason.
+
+**Related:** #1061 (the same root confusion, opposite sign; this defect is described in that item's banner prose and had no number of its own until now), #1065, #1066, #1069-#1072 (the other open rule 3c defects), #1082 (the other wording defect on this rule), #1000 (a control green because its tests cannot see the class).
+
+**Source:** measured 2026-08-06 by the adversarial verification of round 1's shipped fix, recorded in #1061's banner, and filed as its own item 2026-08-07 after #1082 withdrew the only other live false-deny claim — leaving this the last one, and too easy to lose inside another item's prose.
+
+## 1086. Rule 3c reads a PowerShell here-string as a command, so a commit message that quotes a disarm key is refused
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ LIVE ON THE INSTALLED GATE, and it refused the commit that filed #1085.** Value **7/10** · Difficulty **3/10** · _do it_. `git commit -m @'...'@` whose MESSAGE quotes a disarm command is denied by rule 3c. The hook scans the tool-call text, matches the key, and refuses — though the quoted text is data being passed to `-m` and nothing was ever going to execute. **The gate cannot commit a faithful description of its own defect.**
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect. It blocks the specific act of DOCUMENTING a gate defect, which is a self-concealing failure: the harder a finding is to describe without quoting it, the harder it is to file.
+
+**Measured, and it is self-demonstrating.** The commit filing #1085 was refused. Its message contained the defective command as evidence. Rewriting the message so the key was not adjacent to `config` let the identical commit through — same file content, same staged diff, different prose.
+
+**⚠️ IT IS INTERMITTENT, AND THE REASON MAKES IT LOOK RANDOM.** Several earlier items in the same series quoted disarm commands and committed **fine**. They passed by ACCIDENT: their messages happened to also contain `--show-origin` or `--get`, which trip rule 3c's READ exclusion and skip the whole segment. So whether a commit message is refused depends on **unrelated content elsewhere in the same message**. A reader hitting this will not find a rule; they will find a coin flip.
+
+**Mechanism.** `Get-ScannableSegments` deliberately blanks quoted spans precisely to stop prose being read as a command — its own comment records three measured false positives that motivated it (`echo about to merge stuff` denying with `verb=merge`, and a commit message containing `clean`). **A PowerShell here-string (`@'...'@`) is not one of the shapes it blanks.** The same reasoning that produced the quote-blanking applies and was simply not extended to this form.
+
+**⛔ THE FIX IS NOT "BLANK HERE-STRINGS TOO", or not only that.** That file already learned this the hard way: blanking every quoted span made `pwsh -Command "git reset --hard"` ALLOW, because an interpreter argument is quoted but IS code that runs. The distinction the file settled on is **quoted-and-inert versus quoted-and-executed**, and a here-string can be either — `@'...'@` passed to `git commit -m` is inert; the same construct passed to `pwsh -Command` or `bash -c` is code. Any fix must preserve that distinction rather than key on the delimiter. The narrow, defensible version is: a here-string consumed by a **`-m`/`--message` argument** is a message, not a command.
+
+**Test it both ways in the same commit, or the fix is the regression.** A case asserting a `-m` here-string quoting a disarm key ALLOWS, and a case asserting a here-string handed to `pwsh -Command` still DENIES. The second is the one that matters — it is the exact regression the quote-blanking incident produced last time.
+
+**Related:** #1072 (text shapes rule 3c does not read — this is its false-deny mirror: a shape it reads that it should not), #1085 and #1082 (the other live wording/false-deny defects on this rule), #1069 (the gate blind to a quoted key — this item is the gate seeing a quoted command that is not one), #1000.
+
+**Source:** found 2026-08-07 by being refused. The commit that filed #1085 was blocked by the very rule the item documents, which is how the intermittency was noticed — several earlier commits in the same series had quoted the same class of command and passed.
 
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
@@ -5393,7 +5570,7 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 
 ## 1041. Rule 3d tells a session removing its OWN worktree that it belongs to another session
 
-> 🔢 **Filed 2026-08-05 — not started.** Value **4/10** · Difficulty **2/10** · _fill-in_. `scripts/hooks/worktree_gate.ps1:528` justifies rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
+> ✅ **SHIPPED 2026-08-05 — the false premise is gone and the cwd check is now made rather than argued for.** Value **4/10** · Difficulty **2/10** · _fill-in_. Rule 3d resolves the victim's toplevel and the session's own and compares them, so a session acting on the tree it is standing in gets a deny that says exactly that, instead of being blamed on a session that does not exist. **Scope, stated because the item's title is broader than the fix:** this establishes *"this IS the tree you are standing in"*, which is the only ownership fact available here. It does **not** establish the converse — a worktree that is not yours to stand in may still be nobody's, and the rule still has no occupancy or authorship signal to tell an abandoned tree from a live one. The sibling deny therefore still refuses, and now says it cannot tell rather than claiming it knows. A caller who *created* a worktree and removes it from elsewhere is still refused; that case is unaddressed and needs an occupancy signal, not a text change. Three regression tests, each confirmed failing against the pre-fix gate first — the sharpest being that the two denies were previously **byte-identical**, which is the defect in one line. Original filing follows. `scripts/hooks/worktree_gate.ps1:528` justified rule 3d with *"git refuses to remove the worktree you are STANDING in -- so a `worktree remove` that reaches git is, by construction, aimed at somebody else's."* The gate is a **PreToolUse** hook, so it runs **before** git: git's refusal never happens, the inference is never tested, and the deny at `:563` asserts *"belongs to ANOTHER SESSION ... so this one is not yours"* for every governed worktree including the caller's own.
 
 **Cluster:** Session-drift controls / refusal accuracy. **Priority:** P3. **Verdict:** build (small). **Severity:** no data loss — the deny is *correct as a decision* and it does prevent an accidental self-deletion. The defect is entirely in what the text tells the reader to do next, which CLAUDE.md §11 treats as a correctness property: *"a gate that misdescribes the thing it blocked trains people to route around it"* (recorded at `worktree_gate.ps1:646` for the sibling case #308 already fixed).
 
@@ -5540,3 +5717,487 @@ The literal spellings are all caught, including the newline form. Only the indir
 **Related:** #1059 (the gate instance, and the severe one), #1057 (the occupancy instance), #1000 (all three are green because they cannot see).
 
 **Source:** found 2026-08-05 while filing #1059, when the ledger gate refused a commit whose number had just been allocated successfully. Filed as the concrete defect rather than as the pattern, on the argument that a near-duplicate of an already-owned class dilutes the ledger — the same argument this session used earlier to decline filing a sibling to #1000.
+
+## 1061. Rule 3c fails open when the primary is named by a relative path, disarming every worktree's commit gates
+
+> 🔢 **Filed — a SECOND fix was WRITTEN and then REJECTED BY VERIFICATION (2026-08-06). ⛔ DO NOT SHIP IT EITHER. Four independent verifiers each returned a DIFFERENT blocker: at least FIVE new fail-opens and TWO new false-deny classes against the gate live on 57 worktrees, three proven end-to-end to disarm the commit hooks, two of those on keys the rule names explicitly (`includeif.`, `core.hooksPath`). Its 420/420 green suite could not see a single one of the four blockers. Same root cause as round 2, one layer down: structured parsing narrower than the regex it replaces. Patch banked, NOT COMMITTED, NOT INSTALLED (2026-08-06). ⛔ THE GATE GOVERNING THIS MACHINE IS UNCHANGED — still commit `a67838d2`, blob `3e7db362`, 57 worktrees — so this item is OPEN against what is actually running. The FIRST fix (round 2) was verified and REJECTED and its patch is banked, not in the tree; read nothing below as a closure claim, and re-measure before citing any of it.** **What the second fix is, and why it is a different object.** It is MINIMAL-FROM-COMMITTED, not a second parser: `+484/-74` against the committed gate versus the rejected patch's `+616/-96`. The rejected patch replaced this rule's broad regex matching with structured token parsing, and every place the parser turned out NARROWER than the regex became a hole — the git 2.46+ `git config set` form, a scope flag counted in any position, nine wrapper spellings (`(`, `$(`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`), and a `--file` compared as TEXT. The second fix keeps the regex base and carries across only three of that work's ideas (sub-command splitting, `rev-parse --absolute-git-dir`, and `--file` retargeting), none of which needs a tokeniser. **Verified in both directions, which is the part that was missing before:** the new deny cases were confirmed RED against the REJECTED PATCH — not against the committed gate, which already denies them, so recording them as red-first-against-HEAD would have been false and would have produced a suite blind to exactly that regression class. **Still open on the second fix, measured and named:** #1067, #1069's residual, #1070, #1071, #1072. **On THIS item specifically:** the second fix keeps the rooting this item filed and adds `rev-parse --absolute-git-dir`, so the relative spelling still denies and a junction spelling of the same repository now denies too — the latter was a residual of this item's own mechanism and was measured ALLOW on the committed gate. Its `-C`/`cd` composition is unchanged in direction, and the false deny this banner records below (`cd <ungoverned> && git -C . config …`) is still an ALLOW. The drafted assessment follows unedited: **THE FILED RELATIVE-PATH SPELLING, and the three defects this banner used to hold open against itself are now MEASURED CLOSED (#1065, #1066).** The target is resolved against the session's cwd before git is asked anything, and an unresolvable target no longer means "not governed". **What THIS item fixed is still only the spelling it filed** — everything wider was #1065/#1066's work, and their banners say what is and is not closed there. **The three follow-ups this banner previously recorded, re-measured against the current file with the hook subprocess cwd set equal to the payload cwd:** the surviving relative-path fail-open `cd ../../.. && git -C ../MessageFoundry config core.hooksPath /dev/null` now **DENIES**, because the resolver COMPOSES a `cd` with a following relative `-C` instead of preferring one (a real shell resolves the `-C` against the post-`cd` directory, measured); `git config --global alias.foo bar` now **ALLOWS** in every spelling, excluded before any path is resolved, so the deny text no longer contradicts its own closing bullet and no longer advises a remedy that also denies; and `cd <ungoverned> && git -C . config core.hooksPath /dev/null` now **ALLOWS** instead of denying while naming the primary. ⛔ **This still does not say rule 3c is unbypassable** — see #1066 for what remains open by construction. Value **9/10** · Difficulty **3/10** · _do it_. Rule 3c now roots the target token to an absolute path against `$cwdRaw` first, then resolves the common dir against **that**, so the relative spelling denies exactly like the absolute one. The rooted path is also what goes to `git -C`, via a new `Get-FullPathRaw` — `Get-ComparablePath` split in two so there is still exactly one definition of "resolve this path", with the lowercasing tail removed for the caller that shells out (a lowercased path passes on Windows and silently misses the real directory on a case-sensitive filesystem, which this file already warns about twice). **The two failure conditions are now different and are answered differently**, which was the substance of the fix rather than the arithmetic: a target that cannot be resolved at all **denies** — nothing has been asked of git, so nothing has said the repository is ungoverned, and treating that silence as "not governed" is precisely how this shipped — while git **answering** "not a repository" on a resolved target still **allows**, unchanged and still pinned by `test_a_non_repo_cwd_fails_open`. **A second fail-open closed with it**, found while fixing this one and not in the original filing: `& git -C <relative>` resolved against the **hook process's** cwd rather than the session's, so a relative path naming a **linked** worktree made git exit 128 and fall straight through the `$LASTEXITCODE -ne 0` allow — the verdict depended on where the hook process happened to be started, and the pytest harness does not set that cwd, so the coincidence did not even hold under test. **Fourteen new regression cases across eight tests**, every one confirmed against the pre-fix gate first: the five relative spellings (`-C` and the `cd <rel> &&` prefix), the relative-linked-worktree case and the fail-closed case FAIL there, while the absolute target, the linked-worktree target, the key-list narrowness controls, the ungoverned-repo control and the not-a-repo fail-open control all keep PASSING — which is what separates a correction from a widening. **Not fixed here, reported instead:** rule 3d (`:625`) carries the byte-similar construct and the filing's assumption that its target is always a linked worktree is false (the primary is itself a registered worktree, and `git worktree remove <relative-primary>` was measured ALLOW), and rule 3c reads only candidate `[0]`, so a `--git-dir=<primary>/.git` spelling from an ungoverned cwd is never inspected; both need their own item and their own asymmetry tests. Original filing follows. `git -C <primary-absolute> config core.hooksPath /dev/null` is DENIED. `git -C ../../.. config core.hooksPath /dev/null` is **ALLOWED** — same command, same target, relative spelling. That disarms `core.hooksPath` for the **shared clone**, i.e. the ledger, claim and secret-leak commit gates for every worktree at once, which is verbatim what rule 3c's own deny text says it exists to prevent. It requires no shell variable and no intent: `../../..` is the natural way to name the repo root from `<primary>/.claude/worktrees/<x>`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live fail-open in an enforcement control**, measured on the installed hook, and it is the highest-severity gate defect found to date.
+
+**Verified independently by two sessions against the same installed hook** (`~/.claude/hooks/worktree_gate.ps1`, sha256 `be113c20cde5…`). Neither session executed any `git config` command; only read-only primitives and the hook itself were run.
+
+| from a linked worktree | verdict |
+| --- | --- |
+| `git -C <primary-absolute> config core.hooksPath /dev/null` | DENIED |
+| `git -C ../../.. config core.hooksPath /dev/null` | **ALLOWED** |
+| `cd ../../.. && git config core.hooksPath /dev/null` | **ALLOWED** |
+
+**The mechanism, both primitives measured:**
+
+```
+git -C <primary> rev-parse --git-common-dir   ->  ".git"                      RELATIVE
+git -C <linked>  rev-parse --git-common-dir   ->  "C:/.../MessageFoundry/.git"  absolute
+[IO.Path]::GetFullPath('.git','../../..')     ->  THROWS  "Basepath argument is not fully qualified"
+[IO.Path]::GetFullPath('.git',<abs primary>)  ->  "C:\...\MessageFoundry\.git"  (control: works)
+```
+
+`worktree_gate.ps1:557` calls `Get-ComparablePath $common $where[0]` — passing the **target token as written** as the canonicalisation base. With a relative target the base is non-rooted, `GetFullPath` throws, the catch returns `""`, `$commonCmp` is empty, neither branch of the roots loop matches, and `if (-not $govCfg) { continue }` falls through to ALLOW.
+
+**Scoped to the PRIMARY by construction**, because only the primary's common dir comes back relative — a linked worktree returns an absolute path and denies correctly. That narrows the hole without redeeming it: the primary is the one checkout whose hooks protect everybody.
+
+**This is a miss, not a design choice, and the function's own header proves it.** `Get-ComparablePath`'s comment at `:128-133` states the principle correctly — a relative path must resolve against the **session's** cwd — names `../../..` from `<primary>/.claude/worktrees/<x>` as the exact spelling, records that it was already measured once, and even says *"GetFullPath throws on a non-rooted base, which the catch turns into 'not governed'"*. The sibling call at `:680` applies it correctly using `$cwdRaw`. Line 557 is the one call site that did not get the fix.
+
+**DO NOT APPLY THE OBVIOUS ONE-TOKEN FIX — it is wrong and it looks right.** Changing `:557` to `Get-ComparablePath $common $cwdRaw` fails: `$common` is `.git` relative to the **target directory**, not to the session's cwd. Resolving it against `$cwdRaw` yields `<session-worktree>/.git` — a real path that is *not* the primary's common dir — so the roots comparison still misses and the result is still ALLOW, now for a second and harder-to-see reason. The gate would appear fixed and stay open.
+
+**The correct shape is two steps: canonicalise the TARGET first, then the common dir against it.**
+
+```powershell
+$targetAbs = Get-ComparablePath $where[0] $cwdRaw    # relative target -> absolute, vs the SESSION cwd
+$commonCmp = Get-ComparablePath $common $targetAbs   # ".git" -> absolute, vs the TARGET
+```
+
+The second step's arithmetic is measured: `GetFullPath('.git', <abs primary>)` returns exactly the primary's `.git`. **And it must FAIL CLOSED when `$targetAbs` is empty.** An unresolvable path currently means "not governed", which is precisely how this got through; the fix must not preserve that property.
+
+**No test covers it, and the test gap is the same shape as the defect.** The three rule-3c cases in `tests/test_worktree_gate_control_plane.py` all issue a bare `git config …` with **no path token**, so none of them can fail on a path-token defect. Green, and blind to the class. Any fix needs a case per spelling — absolute (denies today), relative (must deny after), and a linked-worktree target (must keep denying, so the fix is not merely a widening).
+
+**Related:** #1059 (the shell-variable bypass of the same resolver — **distinct**, because #1059's proposed fix of refusing on `$` in a target position leaves a literal `../../..` untouched), #1060 and #1057 (the cwd-is-not-the-caller cluster; this one is *not* an ambient-cwd defect — the hook process cwd was measured equal to the payload cwd), #1000 (a gate green because its tests cannot see the class).
+
+**Source:** found 2026-08-05 by a repo-wide sweep hunting a different shape, then verified independently by two sessions before filing. The sweep that found it had its own unassigned region — `scripts/dev` and `scripts/service` were in no surface — which is worth recording beside the finding: a measuring apparatus with a blind spot found a control with a blind spot, and only because something looked where it was not told to.
+
+## 1063. `setup-leak-gate.ps1` picks the checkout from the current directory, so it can arm a worktree the operator did not name
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `scripts/dev/setup-leak-gate.ps1:37` is `$repo = (& git rev-parse --show-toplevel 2>$null)` — no `-C`, no `-Repo` parameter, no `$PSScriptRoot` anchor. Invoked by absolute `-File` path from a different worktree, which is the ordinary shape on a clone with 40-plus of them, it installs the leak-gate token list into **the current directory's** checkout and prints `CONFIGURED` about that one, while the worktree the operator named keeps no token source. Its own directory siblings already do it correctly.
+
+**Cluster:** Developer tooling / configuration anchoring. **Priority:** P4. **Verdict:** build (trivial). **Severity:** **low, and the low severity is load-bearing** — every failure direction here is loud or fail-closed, which is why this is filed at 3 rather than alongside its siblings. Nothing is silently ungated and no wrong authorisation is granted.
+
+**Why it is nearly harmless, stated so nobody escalates it on the family resemblance.** The named worktree's pre-commit leak gate keeps failing **closed** — it passes `--require-tokens` deliberately, so a missing token source blocks commits loudly rather than letting content through. And if the destination is not git-ignored, the script deletes the file it just wrote and throws rather than risk committing the token list. The wrong tree genuinely gets a working gate; the right tree keeps refusing. The cost is a confusing `CONFIGURED` and a second run, not an exposure.
+
+**The fix is one line and the pattern is already in the same directory.** `scripts/dev/postgres.ps1:37` and `scripts/dev/sqlserver.ps1:56` both use:
+
+```powershell
+$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+```
+
+Anchoring on `$PSScriptRoot` binds the script to the checkout it lives in, which is what an absolute `-File` invocation is asking for. `-From` names the token **source**, not the checkout, so it does not already cover this.
+
+**Same construct as #1060.** `alloc.ps1:51` is byte-equivalent (`git rev-parse --show-toplevel` with no anchor) and produces the same class of wrong answer — there, a misattributed ledger allocation; here, a token list installed into the wrong tree. Fixing them together is reasonable; filing them together was not, because their severities differ by two priority bands and folding this into #1060 would have inflated it.
+
+**How it was found, and why that matters more than the defect.** A repo-wide sweep for the cwd-as-identity shape assigned five surfaces and left `scripts/dev` and `scripts/service` in **no** surface at all — seven `.ps1` files in the seam. This was found only because the synthesising agent went outside its brief and swept the unassigned region. A measuring apparatus with a blind spot, hunting mechanisms with blind spots. Worth remembering when the next sweep is designed: **state the unassigned regions, or the result reads as completeness.**
+
+**Related:** #1060 (the same construct, and the cwd-is-not-the-caller premise recorded in `docs/WORKTREES.md`), #1057, #1059, #1062 (the rest of that cluster), #1000 (the sweep's own coverage gap is that item's shape in a measuring tool rather than a gate).
+
+**Source:** found 2026-08-05 during the sweep that produced #1062, held unfiled overnight as explicitly marginal, and filed 2026-08-06 on the judgement that a real defect with a known one-line fix is worth a number even at P4 — a low severity is a priority statement, not a filing criterion, and unfiled findings get dropped.
+
+## 1062. `check` validates the env value file under `--project-root` then reads the values from the current directory
+
+> ✅ **SHIPPED 2026-08-06 — the root is threaded through and applied the way `serve` applies it.** Value **7/10** · Difficulty **2/10** · _quick win_. `run_checks` gained a `project_root` parameter, threaded to the build check and set as a `[environments].base_dir` **CLI override** — the same mechanism `serve` uses, so `load_settings`' CLI > env > file precedence puts it above a file-set `base_dir`. Left unset the resolution is unchanged and still falls back to the process directory, so `check --config config` is untouched. Two tests, asserted by the DIVERGENCE (the process directory holds its own value file with a different host); the pre-fix behaviour was reproduced directly rather than inferred — values were read from the process directory while the root was the one validated. Original filing follows. `messagefoundry check --project-root R` anchors `--config` under `R` and **hard-fails** if `R/<env_dir>/<env>.toml` is absent — then drops `R`. `run_checks` takes no project root, so the build check re-derives the value anchor from `Path.cwd()`. The gate therefore **verifies the file under the root you supplied and reads the values from wherever your shell happens to be.** `serve` does not have this defect, in the same file, by one line.
+
+**Cluster:** Configuration anchoring / gate integrity. **Priority:** P2. **Verdict:** build (small). **Severity:** would mis-decide a **required, blocking** check on a deploying site. Nothing is deployed (§0), so this is what a deploying site would hit on first use, not something happening today. It is also the only finding in this cluster on **product code** rather than developer tooling.
+
+**Verified by reading the chain end to end, 2026-08-06.** Not inferred from a grep:
+
+```
+__main__.py:832    root = resolve_project_root(args.project_root, cwd=cwd)
+__main__.py:833-4  config_dir / service_config anchored under root
+__main__.py:848-52 EXPLICIT root + --env  ->  hard-fail if <root>/<env_dir>/<env>.toml is absent
+__main__.py:853    return config_dir, service_config          <-- root is DROPPED here
+__main__.py:4263+  run_checks(config_dir, ..., service_config=...)   <-- no root parameter exists
+checks.py:1304     resolve_values_base_dir(settings.environments.base_dir, cwd=Path.cwd())
+environments.py:79 `if not base_dir: return cwd`              <-- and base_dir is unset by default
+```
+
+**`serve` gets it right one screen away.** `__main__.py:1086` does `cli.setdefault("environments", {})["base_dir"] = args.project_root` *before* `load_settings`, and the comment at `:1095` records that this is exactly why. `check` never sets it, so `settings.environments.base_dir` stays empty and `resolve_values_base_dir` falls back to the process directory.
+
+**The comment above the defect claims the parity that is missing**, which is the sharpest evidence it is an oversight rather than a decision. `checks.py:1300-1302` reads: *"Resolve env() against the active environment **the same way serve does**, so a hop's host/scheme (an env()-supplied value) is built exactly as at runtime rather than left as an unresolved reference."* Serve's way **is** the `base_dir` assignment. The comment states the goal and the code omits the step that achieves it.
+
+**Consequence, in the conditional.** `build-check` is a required blocking check whose stated job is the ADR 0092 posture-keyed insecure-hop refusal, and the hosts and schemes it judges are `env()`-supplied. Run as `check --project-root R --env prod` from a directory `W`:
+
+- **If `W` holds its own `environments/prod.toml`** — the refusal is decided against **W's** values while the operator was told `R` was validated. A cleartext egress hop that `R` forbids could pass with exit 0. No diagnostic names which directory was read: `_emit_anchor_diagnostics`, including the AC-4 "cwd differs from root" warning, is **serve-only**.
+- **If `W` holds no `environments/`** — a spurious blocking failure reporting a missing value file, which is loud but points at the wrong directory.
+
+**Reachability, stated honestly.** Nothing in this repo's CI, hooks or scripts passes `--project-root` to `check`; the shape is the documented consumer / config-repo invocation, which ADR 0050 AC-6 ratifies. So it is **supported but not exercised here** — which is also why no test caught it. Do not write this up as "unreachable": the invocation is the one a config repo is told to use.
+
+**The fix is the line `serve` already has.** Either give `run_checks` an explicit project-root parameter and thread it to the anchor, or have `check` set `[environments].base_dir` from `--project-root` before settings load, exactly as `serve` does at `:1086`. The second is smaller and makes the two paths converge rather than diverge further; the first is more explicit about what `run_checks` depends on. Either way `_check_build` must stop consulting `Path.cwd()` when a root was supplied.
+
+**Test it by the divergence, not by the happy path.** The case that matters is `--project-root R` run from a `W` that holds a *different* `environments/<env>.toml`, asserting the value actually used comes from `R`. A test run from inside `R` passes with the bug in — the same shape as the Windows-versus-Linux masking that hid the rule 3d defect, and per #1000 a control needs the case that can distinguish.
+
+**Related:** #1057, #1059, #1060 (the cwd-is-not-the-caller cluster — this is its fourth instance and the only one on product code), #1000 (a required check green because it read the wrong directory), ADR 0050 AC-6, ADR 0092.
+
+**Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
+
+## 1064. Rule 3d assumes its target is a linked worktree, but the primary is a registered worktree too, so removing it by a relative path is allowed
+
+> 🔢 **Filed 2026-08-06 — not started, and the RELAYED half is now CONFIRMED (2026-08-06).** The filing below says the `git worktree remove <relative-primary>` ALLOW was relayed rather than measured, and asks that it be confirmed before the severity is acted on. It has been, from the other end and by accident: a non-vacuity control written for the pytest harness's cwd repair (`test_rule_3d_STILL_depends_on_where_the_hook_process_stands`) measures the SAME payload twice, moving only where the hook PROCESS stands. `git worktree remove ../Primary-wt` DENIES when the hook runs where the session is — production, and what the repaired harness now does — and ALLOWS when the hook process stands anywhere else. That is this item's mechanism seen directly: the relative victim is resolved against the wrong base. ⚠️ ONE TRAP, MEASURED, because it made the dependence read as ABSENT on the first attempt: if the foreign directory is a SIBLING of the victim, the same relative token resolves to the same place from both, every verdict agrees BY LUCK, and the instrument reports invariance. The control's fixture is nested for that reason. **Nothing about rule 3d was changed** — it shares a resolver with rules 3 and 3b, so a change there must be measured against THEIR controls rather than credited to the rule-3c work. Value **6/10** · Difficulty **2/10** · _do it_. Rule 3d resolves its victim's common dir with `Get-ComparablePath $victimCommon $victimRaw` (`worktree_gate.ps1:625`) — the **same construct, against the same kind of base**, that #1061 has just been fixed for in rule 3c. `$victimRaw` is the path token as written, so a relative target makes `GetFullPath` throw on a non-fully-qualified base, the catch returns `""`, no governed root matches, and the rule falls through to ALLOW.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development.
+
+**What is VERIFIED, by reading the code:** `worktree_gate.ps1:623-625` builds `$victimCmp` exactly as rule 3c built `$commonCmp` before #1061, and the same base-is-not-a-base mechanism applies. `rev-parse --git-common-dir` answers relative to the target, so a target that reports `.git` combined with a non-fully-qualified `$victimRaw` cannot resolve. This is a code fact, not an inference about behaviour.
+
+**What is RELAYED, NOT CONFIRMED:** the #1061 implementation pass reported measuring `git worktree remove <relative-primary>` as **ALLOW**. This filing does **not** restate that as measured. An attempt to reproduce it here was refused by the permission layer with the owner away, and it was not retried or routed around. **Confirm it before acting on the severity**, and treat the number above as provisional until then.
+
+**The rule's own premise is what is wrong, and that part needs no measurement.** The rule was written believing its target is always a *linked* worktree — which is why the relative-path hole looked scoped away, exactly as #1061's did. **The primary is itself a registered worktree**: it is the first row of `git worktree list`. So "the target is a linked worktree, and linked worktrees report an absolute common dir" is false as a general statement about what can arrive here.
+
+**Do not close this by arguing git would refuse anyway.** git does refuse to remove a main working tree — and #1041 is precisely the precedent for why that is not a defence: *a rule cannot defer to a guard that runs only after it has already decided.* A PreToolUse hook decides whether anything reaches git at all, so git's refusal never happens and the premise is never tested. #1041 was filed and fixed for that exact reasoning in this same rule. Reinstating it one line down would be the same error twice.
+
+**The fix is the shape #1061 already landed**, and it should reuse the helper rather than grow a second one: root the victim against `$cwdRaw` with `Get-FullPathRaw` first, hand **that** to `git -C`, then resolve the common dir against the rooted absolute path — and distinguish "the target could not be resolved" (deny) from "git says this is not a repository" (allow), which is the substance of #1061 rather than its arithmetic.
+
+**Tests must assert the asymmetry, per #1000, or they cannot tell which layer does the work.** Three cases minimum: an absolute target that denies today and must keep denying; a relative target that must deny after; and a linked-worktree target that must **keep** denying, proving a correction rather than a widening. Note that every existing rule 3d test supplies an absolute path, which is why none of them can fail on a path-token defect — the identical blind spot that let #1061 ship.
+
+**Related:** #1061 (the same construct in rule 3c, fixed — this is its sibling), #1041 (the *"git will refuse it"* premise in this very rule, already retired once), #1057 (rule 3d's missing occupancy signal), #1000 (a control green because it cannot see the class it covers), #1059/#1060/#1063 (the cwd-is-not-the-caller cluster).
+
+**Source:** found 2026-08-06 while fixing #1061, by the implementation pass checking whether the defect it was closing had siblings. Filed separately rather than folded into #1061 so the fix carries its own asymmetry tests and its own measurement, and so the unconfirmed half is visible rather than inherited.
+
+## 1065. Rule 3c reads the target-candidate SET as a scalar, so any `-C` token on the line disables it
+
+> 🔢 **Filed — a SECOND fix was WRITTEN and then REJECTED BY VERIFICATION (2026-08-06). ⛔ DO NOT SHIP IT EITHER. Four independent verifiers each returned a DIFFERENT blocker: at least FIVE new fail-opens and TWO new false-deny classes against the gate live on 57 worktrees, three proven end-to-end to disarm the commit hooks, two of those on keys the rule names explicitly (`includeif.`, `core.hooksPath`). Its 420/420 green suite could not see a single one of the four blockers. Same root cause as round 2, one layer down: structured parsing narrower than the regex it replaces. Patch banked, NOT COMMITTED, NOT INSTALLED (2026-08-06). ⛔ THE GATE GOVERNING THIS MACHINE IS UNCHANGED — still commit `a67838d2`, blob `3e7db362`, 57 worktrees — so this item is OPEN against what is actually running. The FIRST fix (round 2) was verified and REJECTED and its patch is banked, not in the tree; read nothing below as a closure claim, and re-measure before citing any of it.** **What the second fix is, and why it is a different object.** It is MINIMAL-FROM-COMMITTED, not a second parser: `+484/-74` against the committed gate versus the rejected patch's `+616/-96`. The rejected patch replaced this rule's broad regex matching with structured token parsing, and every place the parser turned out NARROWER than the regex became a hole — the git 2.46+ `git config set` form, a scope flag counted in any position, nine wrapper spellings (`(`, `$(`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`), and a `--file` compared as TEXT. The second fix keeps the regex base and carries across only three of that work's ideas (sub-command splitting, `rev-parse --absolute-git-dir`, and `--file` retargeting), none of which needs a tokeniser. **Verified in both directions, which is the part that was missing before:** the new deny cases were confirmed RED against the REJECTED PATCH — not against the committed gate, which already denies them, so recording them as red-first-against-HEAD would have been false and would have produced a suite blind to exactly that regression class. **Still open on the second fix, measured and named:** #1067, #1069's residual, #1070, #1071, #1072. **On THIS item specifically:** the re-opening this banner recorded is gone — `git config set core.hooksPath /dev/null` and four sibling `set` spellings DENY on the second fix, and they are now pinned by `test_the_git_2_46_SET_subcommand_is_still_a_write`, whose stated mutant is the rejected patch. The candidate set is still built with `git config` semantics, with ONE correction the rejected patch and the committed gate both got wrong: a `--git-dir` or `GIT_DIR=` retarget REPLACES the effective directory rather than adding to it, because git's own behaviour was measured — so `git --git-dir "<ungoverned>/.git" config core.hooksPath /x` issued from a governed checkout now ALLOWS instead of denying while printing the GOVERNED repository's name. The drafted assessment follows unedited: **the scalar read AND the segment-wide exclusions, measured. ⛔ THIS DOES NOT SAY RULE 3C IS UNBYPASSABLE; read the residuals in #1066.** Value **9/10** · Difficulty **2/10** · _do it_. **The fix is not the loop this item asked for, and that matters.** Iterating `Get-GitTargetCandidatesRaw` would have changed nothing here: for `git commit -C HEAD && git config core.hooksPath /nope` that resolver returns the ONE-element set `@("HEAD")`, so the contract at `:219` was already satisfied and the rule still allowed. The defect was the SET, not the read. Rule 3c now builds its own candidate set with `git config` semantics (`Get-ConfigTargetsRaw`-shaped inline block + `Get-EffectiveDirRaw`), because `git config` writes exactly ONE file and git picks it deterministically — measured: `--git-dir` and `GIT_DIR` retarget a config write, `--work-tree` and `GIT_WORK_TREE` do not, so rule 3's plural set both misses the real target and adds paths git never touches. **And the rule is now scoped per INVOCATION** (split at unquoted `&&` `||` `;` `|`), with git's global options read only BEFORE the subcommand — measured, `git config -C real --get x` fails with ``unknown switch `C'``, so a `-C` after the subcommand is never git's chdir. **Measured ALLOW → DENY** on the committed file: `git commit -C HEAD && git config core.hooksPath /nope`; `git config core.hooksPath "/nope -C HEAD"`; and a third of the same class that was NOT in this filing — `git config --list && git config core.hooksPath /nope`, where the segment-wide READ exclusion was armed by a neighbouring read. Two more unfiled fail-opens closed with them: `GIT_DIR=<primary>/.git git config core.hooksPath /x` from an ungoverned cwd, and `git --config-env=core.hooksPath=EVIL commit` (the exact `-c` class, absent from the old pattern — and both the `=`-attached and the space-separated spelling work, measured, so the space form is handled rather than assumed away). **The largest fail-open in this rule was NOT in this filing at all** and is recorded in #1066: the danger KEY was matched on the quote-blanked scan string, so every quoted key was erased before the disarm list ran. **Twenty-one new DENY cases and forty-four allow-side regression cases**, every deny confirmed RED against the committed gate first and every allow GREEN on both sides (38 failed / 89 passed there). **Not claimed:** `subst`ed drives, hard links to `.git/config`, an allowlist root spelled via a junction, more than one level of interpreter nesting, `--remove-section`, and a Windows drive-relative `C:foo` token all remain open by construction — see #1066 and #1067. Original filing follows. `git commit -C HEAD && git config core.hooksPath /nope` is **ALLOWED**. So is `git config core.hooksPath "/nope -C HEAD"`. Rule 3c is the only consumer that takes `$where[0]` from `Get-GitTargetCandidatesRaw` and stops — the resolver's own contract at `:219` reads *"It returns a SET, not a winner, and the caller denies if ANY member is governed."* **This is the highest-severity gate defect found to date and it supersedes #1061's severity**, because it needs no relative path, no variable and no unusual spelling.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. But it is a **live, trivially-reachable fail-open in an enforcement control**, and the flag that triggers it is ordinary.
+
+**Measured against the shipped `1c0c109f` fix, not argued.** Governed throwaway rig, every disarm key, every cwd:
+
+```
+CONTROL bare disarm                   | DENY
+CONTROL -c one-shot disarm            | DENY
+CONTROL alias disarm                  | DENY
+chained: commit -C HEAD && the disarm | ALLOW
+chained: the disarm && commit -C HEAD | ALLOW
+value carries -C: alias               | ALLOW
+value carries -C: hooksPath           | ALLOW
+value carries -C: include.path        | ALLOW
+value carries -C: core.worktree       | ALLOW
+commit msg carries -C                 | ALLOW
+from the NESTED worktree              | ALLOW
+from the LINKED worktree              | ALLOW
+lowercase -c is NOT a path (sanity)   | DENY
+```
+
+**Demonstrated end to end**, with a real refusing `pre-commit` hook installed in the rig: the gate denies the plain disarm; appending one ordinary git flag to the VALUE flips it to ALLOW; running that ALLOWed command leaves `core.hooksPath = "/nope -C HEAD"` and the next commit succeeds with the hook disarmed — **including from the linked worktree, because it is the shared config**. A bogus value disarms as completely as a valid one, so the poison token doubles as the payload.
+
+**Mechanism.** `-C` is matched against `$seg.Raw`, the *unblanked* line, so a `-C` belonging to a quoted config value, a commit message, or a different git command in the same chain silently becomes "the repository being configured". It resolves fine, so #1061's new fail-closed branch never fires; git then exits 128 on it and `$LASTEXITCODE -ne 0 { continue }` allows. `-C HEAD` is the ordinary reuse-that-commit's-message flag — `git config alias.amend "commit -C HEAD"` is written on purpose with no intent to evade anything.
+
+**THE TWO SPELLINGS HAVE DIFFERENT MECHANISMS AND ONLY ONE IS PORTABLE — do not triage them together.** Measured independently in the generalized fork (`claude-multisession`), which shares the same scalar `[0]` read: the **chained** form (`git commit -C HEAD && git config ...`) is **DENIED** there, because that gate splits the line into verb-bearing segments and evaluates each independently, so the disarm lands in a segment containing no `-C` at all and candidate `[0]` correctly falls back to the governed cwd. The **value-embedded** form (`git config core.hooksPath "/nope -C HEAD"`) **bypasses both copies**, because the poison sits inside the same segment as the disarm and segment-splitting cannot help. So the value-embedded spelling is the one that crosses implementations, and a reader who runs only the chained repro against a segmenting gate would wrongly conclude it is unaffected. Reported 1 of 6 probed spellings bypassing there — which is *"one of six probed"*, **not** *"the fork has one bypass"*; the four lesser findings below are unprobed in that copy. **That fork measurement was then RE-RUN with the hook subprocess `cwd` set equal to the payload cwd** (the production shape), after this session discovered its own harness did not set it: **byte-identical, same one bypass, same five denies, both controls unchanged.** So the cross-copy result is not itself a harness artifact — which is worth stating, because the harness defect that invalidated a different claim in this cluster was found in exactly that way.
+
+**The fix is to honour the contract rule 3 already honours:** iterate every candidate and deny if ANY is governed, as `:812` does. Confirmed by measurement that rules 3 and 3d are NOT affected — the same poisoned commands against `git reset --hard`, `git checkout main` and `git worktree remove <wt>` all still DENY, because they iterate the set and the cwd candidate catches them. Rule 3c is the sole scalar reader.
+
+**Why it survived #1061.** That work rewrote ~70 lines of this exact block and added eight tests whose stated purpose is *"the PATH TOKEN, not just the cwd"* — and every one of them supplies a **single** `-C`, so not one can see a second token on the line. Per #1000 the tests need a case where the governed target is NOT candidate `[0]`.
+
+**A SECOND BYPASS OF THE SAME RULE, WORSE, AND IT DEFEATS THE ABSOLUTE SPELLING TOO.** `:237`'s regex `'(?:^|\s)-C\s+"?([^"\s]+)"?'` strips **double** quotes only, so a single-quoted token keeps its leading `'` and `GetFullPath` produces garbage. Measured against the patched gate from a nested worktree:
+
+```
+relative -C (the #1061 case)  | DENY    git -C ../../.. config core.hooksPath /dev/null
+SINGLE-quoted relative -C     | ALLOW   git -C '../../..' config core.hooksPath /dev/null
+SINGLE-quoted ABSOLUTE -C     | ALLOW   git -C '<primary>' config core.hooksPath /dev/null
+SINGLE-quoted cd relative     | ALLOW   cd '../../..' && git config core.hooksPath /dev/null
+```
+
+Reach proven with a harmless key, no disarm key executed: `git -C '../../..' config probe.marker reached-the-primary` wrote into `<primary>/.git/config` and read back from the linked worktree. **This is the ordinary spelling — the rule 3c test file itself uses single quotes two lines away** (`git config alias.ci 'commit --no-verify'`). Pre-existing, not a regression. Recorded here because it is the same class as this item — *rule 3c cannot see the token it is judging* — but **it needs its own number**; it was found too late in a session to allocate one, and a dangling allocation is worse than a finding recorded beside its sibling.
+
+**Related, same verification pass, all confirmed and all needing folding into this fix or their own items:** an absolute-path **alias** of the primary walks through (`GetFullPath` does not traverse reparse points nor strip an extended-length prefix); a **space** in the governed repo's path truncates the `-C` regex; `--git-dir` and `--file` are further unread routes; and on Windows a **rooted-but-not-fully-qualified** path (`C:foo`, `\foo`) skips the base and resolves against the hook process's cwd, so #1061's "resolved against the session cwd" is stated unconditionally and is not unconditionally true.
+
+**Related:** #1061 (whose banner is scoped to its filed spelling because of this), #1064, #1041, #1057, #1059, #1000 (the tests are green because they cannot see a second token).
+
+**Source:** found 2026-08-06 by the adversarial verification pass on #1061's own fix, tasked with refuting the claim that the patch closed the hole. It did not find a defect in the patch; it found that the rule the patch corrected was bypassable by a route the patch did not touch and the item's banner would have implied was closed.
+
+## 1066. Rule 3c strips double quotes only, so a single-quoted -C target bypasses it -- including an absolute one
+
+> 🔢 **Filed — a SECOND fix was WRITTEN and then REJECTED BY VERIFICATION (2026-08-06). ⛔ DO NOT SHIP IT EITHER. Four independent verifiers each returned a DIFFERENT blocker: at least FIVE new fail-opens and TWO new false-deny classes against the gate live on 57 worktrees, three proven end-to-end to disarm the commit hooks, two of those on keys the rule names explicitly (`includeif.`, `core.hooksPath`). Its 420/420 green suite could not see a single one of the four blockers. Same root cause as round 2, one layer down: structured parsing narrower than the regex it replaces. Patch banked, NOT COMMITTED, NOT INSTALLED (2026-08-06). ⛔ THE GATE GOVERNING THIS MACHINE IS UNCHANGED — still commit `a67838d2`, blob `3e7db362`, 57 worktrees — so this item is OPEN against what is actually running. The FIRST fix (round 2) was verified and REJECTED and its patch is banked, not in the tree; read nothing below as a closure claim, and re-measure before citing any of it.** **What the second fix is, and why it is a different object.** It is MINIMAL-FROM-COMMITTED, not a second parser: `+484/-74` against the committed gate versus the rejected patch's `+616/-96`. The rejected patch replaced this rule's broad regex matching with structured token parsing, and every place the parser turned out NARROWER than the regex became a hole — the git 2.46+ `git config set` form, a scope flag counted in any position, nine wrapper spellings (`(`, `$(`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`), and a `--file` compared as TEXT. The second fix keeps the regex base and carries across only three of that work's ideas (sub-command splitting, `rev-parse --absolute-git-dir`, and `--file` retargeting), none of which needs a tokeniser. **Verified in both directions, which is the part that was missing before:** the new deny cases were confirmed RED against the REJECTED PATCH — not against the committed gate, which already denies them, so recording them as red-first-against-HEAD would have been false and would have produced a suite blind to exactly that regression class. **Still open on the second fix, measured and named:** #1067, #1069's residual, #1070, #1071, #1072. **On THIS item specifically:** the single-quoted `-C` target and the space-containing governed root still deny on the second fix, and the reader that does it gained one correction the rejected patch did not have — it finds the option in the QUOTE MASK and reads its value from the raw text at the same offset, because searching the raw text was itself a fail-open: `git config core.hooksPath "/nope -C HEAD"` ALLOWED, the `-C HEAD` inside the quoted VALUE having been read as the directory to check. The quoted-KEY half this item's source note points at is now #1069. The drafted assessment follows unedited: **filed and fixed in one act, and it turned out to be the SMALLER half of its own class. ⛔ Rule 3c is still bypassable and this banner does not claim otherwise.** Value **9/10** · Difficulty **3/10** · _do it_. Filed out of #1065, which recorded the finding beside its sibling because it was found too late in that session to allocate a number.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Verdict:** build. **Severity:** no product effect and no PHI effect -- this governs agent behaviour in development. It was a live fail-open in an enforcement control, reachable by the ordinary spelling.
+
+**The filed defect.** `worktree_gate.ps1`'s `-C` reader was `'(?:^|\s)-C\s+"?([^"\s]+)"?'` -- **double** quotes only. A single-quoted token keeps its leading `'`, so `GetFullPath` turns an ABSOLUTE path into a relative one and the rule allows. Measured against the committed gate with the hook subprocess cwd set equal to the payload cwd:
+
+```
+DOUBLE-quoted / bare relative     | DENY
+SINGLE-quoted relative            | ALLOW
+SINGLE-quoted ABSOLUTE            | ALLOW   <-- absolute defeated by one quote
+SINGLE-quoted cd prefix           | ALLOW
+```
+
+The same `[^"\s]+` class truncated at a SPACE, so any governed root whose path contains one stopped being seen. Measured with a root named `Zed Repo`: both the double- and single-quoted absolute spellings ALLOWED. (A root named `Primary Two` denies -- but only because the truncated prefix `<tmp>/Primary` is *itself* a governed root in that rig, which is an accident and not the rule working. The test fixture uses `Zed Repo` for exactly that reason.)
+
+**THE LARGER HALF, FOUND WHILE FIXING IT: quoting the KEY defeated the rule entirely.** The disarm-key match ran on `$seg.Scan`, which blanks every quoted span, so a quoted key was erased before the danger list saw it. Six spellings measured ALLOW on the committed gate with cwd = the governed primary: a double-quoted and a single-quoted `-c <key>=<value>` override, a double-quoted and a single-quoted key argument to the `config` subcommand, the same under `--add`, and an `include.path` override. The alias form **must** be quoted -- its value contains a space -- so *every realistic `-c alias.*` disarm was allowed*, in the primary and from every worktree. Same root cause as the filed defect on a different axis, and it does not care how well the path resolves.
+
+**The fix, and why it is a tokeniser rather than a better regex.** Five regexes were separately answering "which characters belong to which argument" and three of them disagreed. There is now one lexer (`Get-CommandTokens`) that honours single and double quoting, reports the unquoted command separators, and joins adjacent quoting the way a shell does. Two properties do the work: **compare the whole token, never scan inside one** -- a quoted VALUE that happens to contain `-C` yields a token whose full text is not equal to `-C`, so the embedded flag is inert by construction -- and the key is recognised **only in a key position** (first non-option token after the `config` subcommand, or the `<key>` half of a global `-c` / `--config-env`), which makes quoting irrelevant to the key too. Deliberately NOT "a quoted token cannot be an option": a real shell strips quotes before git sees the argument, so a quoted `--global` **is** `--global`, and that spelling must keep being read as a scope flag.
+
+**Three false denies fixed in the same pass, because a guard that blocks ordinary work gets routed around.** The `--global` and `--system` scopes denied although they write `~/.gitconfig` and the machine file (thirteen measured shapes); the bare-key READ (git's one-argument GET, and the most natural way to inspect the very key the rule protects) denied in every spelling; and `--unset` of a disarm key, which RE-ARMS the commit gates, denied while the wider `--remove-section alias` allowed. `--file` is **not** excluded: it can name the shared config (measured -- pointing `--file` at `<primary>/.git/config` writes it), so it retargets onto file IDENTITY instead. Retargeting onto the file's PARENT DIRECTORY, which was the first design, does not work: the parent of a relative file inside the primary *is* the primary, so the false deny survives.
+
+**`--worktree` stays on the deny side, with its own wording.** Measured: with `extensions.worktreeConfig` off -- the default -- git refuses `--worktree` outright when there is more than one working tree, i.e. it *is* `--local`. The verdict is unchanged; only the claim is narrowed, because the generic deny asserted the write was SHARED and that is false when the extension is on. A compensating control resting on a false premise is what CLAUDE.md section 11 forbids, and it is exactly what made the `--global` deny contradict its own closing bullet.
+
+**A NEW DENY CLASS, stated rather than discovered later.** A path token the shell would expand (a variable, a command substitution, a `%VAR%`, a leading tilde) cannot be resolved from text; `GetFullPath` turned it into a path-shaped string that git rejects with 128, and that ALLOWED. It now denies, and an unfollowable `cd` bails to the session cwd, which is the deny-side default. So a `-C` naming a variable, and a `cd` into one followed by an alias write, are new denies. Both have an asymmetry pair pinned: the identical spellings with an OFF-LIST key still allow, because resolving a path decides WHICH repo and never WHICH KEYS.
+
+**Cost, measured, because a slow hook gets uninstalled.** The lexer is gated behind a raw-text pre-filter (0.03 ms on a 40 KB command) and runs only when a disarm key appears anywhere in the text. It uses a `List` and a `StringBuilder`, and the invocation splitter shares one prefix list rather than copying it per separator -- the naive shapes were quadratic (110 ms and 190 ms respectively on a 43 KB command). Measured end to end against the committed gate on this box: `+20 ms` on an ordinary command (script parse), `+50 ms` on a 2 KB command that mentions a disarm key, `+160 ms` on a pathological 43 KB command built from 1,200 chained prose mentions. The floor is ~470 ms of `pwsh` startup either way.
+
+**STILL OPEN BY CONSTRUCTION, and no green control in this pass licenses a wider sentence.** A `subst`ed drive letter mapped onto a governed root (unmeasured; assumed not de-aliased by git); a hard link to the shared config; a governed root LISTED in the allowlist via a junction, since only git's side of the comparison is de-aliased; more than one level of interpreter nesting, because `Get-ScannableSegments` recurses exactly once; `--remove-section`, which drops a whole section without ever naming a key so the danger list cannot see it (lower severity -- removing these keys generally re-arms); and a Windows **drive-relative** token (`C:foo`, a bare leading backslash), where `IsPathRooted` is true, `IsPathFullyQualified` is false, and `GetFullPath` skips the base. That last one was deliberately NOT closed here: the obvious fix classifies a Git-Bash `/c/Users/...` path as unresolvable and denies it, which is a false deny on a plausible spelling, and it belongs in its own change with its own asymmetry pair. **These are attacker-shaped rather than accident-shaped**, and the file header says what this gate is: a guardrail against the ACCIDENTAL disarm, with the shared `pre-commit` hook as the backstop.
+
+**Also NOT widened, recorded as an observation for the owner:** the disarm list still omits the other command-executing keys (`core.fsmonitor`, `core.sshCommand`, `core.pager`, `credential.helper`, `filter.<d>.clean`, `uploadpack.packObjectsHook`, `safe.directory`). Every addition buys coverage at the price of false denies on ordinary setup, and that trade is the owner's.
+
+**Tests.** Twenty-one new DENY cases and forty-four allow-side regression cases in `tests/test_worktree_gate_control_plane.py`, plus a deny-side non-vacuity control. Per #1000 every new deny was confirmed RED against the committed gate first (38 failed / 89 passed there) and every narrowness case GREEN on both sides. **The harness itself was repaired in the same act:** `run_gate` and `run_bare` now set the hook subprocess cwd to the payload cwd, because production does and rules 3b/3d flip ALLOW/DENY on a relative token when it does not -- with the direction depending on where pytest was launched. That divergence had already produced one retracted finding and one test whose docstring documented a mechanism production never had; that docstring is rewritten in this change.
+
+**Related:** #1065 (the sibling this was filed out of, fixed in the same act), #1061 (whose banner this closes out), #1067 (the prefix-vs-identity governance predicate, deferred), #1064 (rule 3d carries the same construct, still open), #1000 (a control green because it cannot see the class it covers).
+
+**Source:** recorded in #1065 by the adversarial verification pass on #1061's fix; allocated and fixed 2026-08-06. The quoted-KEY half was found by the design review of the fix for the quoted-PATH half, which is why this is a separate item rather than a line in #1065.
+
+## 1067. Rule 3c governs by PATH PREFIX, so an independent repo vendored under a governed root inherits its governance
+
+> 🔢 **Filed 2026-08-06 — not started, deliberately.** Value **4/10** · Difficulty **4/10** · _do it_ (after the submodule question is answered). Rule 3c decides "is this a governed repository" with an equality-or-slash-prefix test against each governed root. Any repository living anywhere UNDER a governed root therefore inherits its governance, including one that shares nothing with it.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P3. **Severity:** a FALSE DENY, not a fail-open, and not reachable on this box today -- no independent repo currently lives under the primary. It fires the day someone vendors a clone or drops a scratch repo there.
+
+**Measured** against the committed gate, with an independent repository created at `<primary>/vendor/thirdparty` (`rev-parse --show-toplevel` is itself; its common dir is its own, sharing nothing with the primary): a disarm-key write DENIES both from that repo's own cwd and via an absolute path token from the primary, and in both cases the message names the PRIMARY.
+
+**The reason text is false for this case**, which is the part that matters. It says every worktree of the repository shares one git directory and the write is therefore not local -- simply untrue of a vendored clone. A refusal that misdescribes what it blocked trains people to route around the gate; the rule-3 comment in the same file records that happening.
+
+**Why it was NOT folded into #1066.** It is a different predicate. #1065/#1066 are about "which path is the target"; this is about "which repository is governed". The obvious fix -- identity on the git dir rather than a prefix -- **silently flips git submodules**, whose git dir lives under the superproject's, turning their config write from DENY to ALLOW; whether that is right is its own decision. Any fix must pin BOTH controls: the vendored repo allows, and a nested worktree under `.claude/worktrees/` -- whose git dir really is under the primary's -- keeps denying.
+
+**Related:** #1066 (the pass that measured this and deferred it), #1065, #1061, #1000.
+
+**Source:** found 2026-08-06 by the must-keep-allowing inventory built for #1066, which enumerated what rule 3c allows today and found this in the gap between the shipped tests.
+
+## 1069. Rule 3c matched the disarm key on the quote-blanked scan string, so a QUOTED key was invisible
+
+> 🔢 **Filed 2026-08-06 — a fix was WRITTEN and then REJECTED BY VERIFICATION, and ONE SPELLING OF THIS DEFECT REMAINS OPEN BY DESIGN. ⛔ DO NOT SHIP THE BANKED PATCH.** The round that closed this also introduced at least five new fail-opens; see #1061's banner. ⛔ The gate governing this machine is unchanged — still commit `a67838d2`, blob `3e7db362`. Value **8/10** · Difficulty **3/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Severity:** a FAIL-OPEN on `core.hooksPath` needing no unusual spelling — quoting an argument is ordinary.
+
+**Mechanism.** Rule 3c matched the danger key against `$seg.Scan`, and `Get-ScannableSegments` BLANKS every quoted span before returning it. Quoting the key therefore erased it before the disarm list ever ran. Measured ALLOW on the committed gate, every one:
+
+```
+git -c "core.hooksPath=/dev/null" commit -m x
+git -c 'core.hooksPath=/dev/null' commit -m x
+git config "core.hooksPath" /dev/null
+git config 'core.hooksPath' '/dev/null'
+git config --add "core.hooksPath" /dev/null
+git -c 'alias.ci=commit --no-verify' ci -m x
+```
+
+**Why matching the RAW text instead is not the fix.** It creates a false deny with a shape this workstream writes constantly: a commit message quoting the rule's own name would refuse. The fix is a LENGTH-PRESERVING quote mask that unmasks only a quoted span holding a SINGLE BARE WORD — no whitespace, separators, quotes, parentheses or `$`. Prose has spaces and stays masked; a quoted key does not and is seen. Length preservation is what lets the same offsets read paths back out of the raw text afterwards. Seven prose controls stay green.
+
+**What is NOT closed, and it is the spelling that motivated the item.** A quoted span WITH whitespace stays masked, so `-c 'alias.<name>=<multi-word command>'` is still invisible — and because that value contains a space, quoting is its only writable spelling, so the whole class is open. Pinned as an ALLOW by `test_a_QUOTED_MULTI_WORD_alias_value_is_still_invisible` so a later change cannot close it silently or claim it was never there. Closing it wants a real argument tokeniser, and the one pass that built one acquired five fail-opens elsewhere in the process.
+
+**The consolation is measured, not assumed:** the bare command such an alias exists to smuggle — `git commit --no-verify`, `git commit -n` — is ALLOWED by the committed gate, by the rejected patch and by this fix alike, and `-c` persists nothing (scope `command`, in-memory). The marginal capability the open spelling grants is small. It is not zero.
+
+**Related:** #1066 (whose source note recorded this half and had no number to give it), #1065, #1061, #1072 (the other text shapes this rule cannot read), #1000.
+
+**Source:** found 2026-08-06 by the design pass for the third attempt at rule 3c, measuring what the committed gate's `Scan` string can and cannot see. None of the four earlier verification passes filed it.
+
+## 1070. git carries config in the ENVIRONMENT, and no argv rule can see it -- GIT_CONFIG_COUNT, GIT_CONFIG_PARAMETERS, GIT_CONFIG, config edit
+
+> 🔢 **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED: the committed one, the rejected round-2 patch, and the round-3 fix (banked as a patch, not committed).** Value **8/10** · Difficulty **6/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P1. **Severity:** a FAIL-OPEN that disarms the commit gates end to end — confirmed by putting a blocked commit through it, not inferred.
+
+**Four channels, all measured ALLOW from a governed cwd on git 2.53.0.windows.2.** The two `GIT_CONFIG_*` twins scope as `command`, persist nothing, and each let a blocked commit succeed. `GIT_CONFIG=<file>` is a different animal — it retargets `git config` only, so it is a WRITE vector but not itself a disarm vector: a `git commit` under it stayed blocked. `git config edit` opens the local config in `$GIT_EDITOR` and the EDITOR does the write (rc=0, local config modified, with a writing editor). Note that `GIT_CONFIG_PARAMETERS` requires its single-quoted form; unquoted is rc=128.
+
+**`GIT_CONFIG=` and `git config edit` are absent from every earlier defect list here.** Both were found by the git-config grammar pass built for the third rule-3c attempt and confirmed independently by its design review.
+
+**Why this is not folded into rule 3c.** Rule 3c decides from argv. This is a different mechanism and needs its own danger match, its own target resolution (`GIT_CONFIG=` names a FILE, so it wants #1069's file-identity predicate rather than a directory test) and its own controls. Recorded as ALLOWs in `test_the_channels_this_rule_cannot_see` and `test_GIT_CONFIG_retargets_the_write_from_anywhere` so no future summary can claim credit for them.
+
+**Not coverable at all, stated once so nobody claims otherwise:** a plain text editor writing `.git/config` is outside any argv gate.
+
+**Related:** #1069, #1065, #1061, #1072, #1000.
+
+**Source:** the two `GIT_CONFIG_*` twins were measured by the adversarial verification of round 2's patch; `GIT_CONFIG=` and `git config edit` by round 3's git-config grammar pass.
+
+## 1071. A UNC-spelled governed root is not de-aliased by rev-parse, so rule 3c allows a config write through it
+
+> 🔢 **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED.** Value **5/10** · Difficulty **5/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Severity:** a FAIL-OPEN on `core.hooksPath`, requiring the admin-share spelling of a local path.
+
+**Measured** on git 2.53.0.windows.2: a `-C` naming the primary through `\\localhost\C$\...` ALLOWS a disarm-key write.
+
+**Mechanism, and why the fix that rescued junctions does not rescue this.** Rule 3c asks git `rev-parse --absolute-git-dir` so git resolves aliases itself — measured working through a leaf junction, a mid-path junction, a `\\?\` extended prefix, drive-letter case, a trailing slash and `/./` segments, all of which normalise to one canonical path. **The `\\localhost\C$` spelling is the one that does not**: git echoes it back as `//localhost/C$/...`, so the comparison against the governed root never matches. De-aliasing only helps where git is ASKED to resolve a repository; here git's answer preserves the alias.
+
+**Not measured, do not infer:** `subst`ed drive letters, mapped network drives other than `\\localhost\C$`, 8.3 short names (short-name generation is disabled on this volume), WSL `/mnt/c` spellings, hard links to `.git/config`, and whether a governed root LISTED in the allowlist via one of these spellings behaves symmetrically.
+
+**Any fix must pin the asymmetry (#1000):** the UNC spelling denies after, and the ordinary spelling plus every alias already handled keeps denying. A canonicaliser of our own is the tempting answer and the wrong one — per-component link resolution inside a PreToolUse hook opens a handle per path component and can block on a dead network path.
+
+**Related:** #1066 (the pass that measured it), #1065, #1061, #1000.
+
+**Source:** measured by the adversarial verification of round 2's patch, re-confirmed by round 3's design pass and by its independent review; open on all three gates.
+
+## 1072. Rule 3c reads TEXT, and these text shapes are still not read: backtick substitution, variable targets, newline and subshell cd, a heredoc body
+
+> 🔢 **Filed 2026-08-06 — not started. ⛔ OPEN ON EVERY GATE MEASURED.** Value **5/10** · Difficulty **5/10** · _do it_.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Severity:** MIXED, and the mix is the point — two fail-opens and two over-denies in one predicate's blind spot. Each is an assertion in `tests/test_worktree_gate_control_plane.py` rather than prose, because a deleted case is indistinguishable from one that never existed.
+
+**FAIL-OPEN — backtick command substitution.** A `git config` disarm write wrapped in backtick substitution ALLOWS. The rule's leading character class does not include a backtick. Thirteen other wrapper spellings (`(`, `( `, `$(`, `{ }`, `exec`, `eval`, `xargs`, `timeout`, `winpty`, `then`, `find -exec`, `env`, `sudo`) all deny, so **the wrapper story is nine of ten measured shapes, never "wrappers no longer hide git"**. One character closes it, and it is deliberately NOT in the round-3 patch so that patch's A/B stays a measurement of one change; it needs its own red-first control.
+
+**FAIL-OPEN — a target token naming some OTHER directory.** `git -C "$REPO" config ...` and `R=$PWD; git -C $R config ...` allow. Tokens that provably name the CURRENT directory (`$PWD`, `${PWD}`, `$(pwd)`, backtick-pwd, `$env:PWD`, `%CD%`, `$(Get-Location)`) are expanded and DENY on the round-3 fix — they were seven one-token bypasses of the rule's own baseline deny on the committed gate. A general predicate over expandable tokens was tried and rejected: measured, it was BASH-SHAPED AND WRONG IN BOTH DIRECTIONS AT ONCE, false-denying `git -C $env:TEMP config alias.st status` while still fail-opening on a PowerShell subexpression. **Any fix here must be shell-aware** — the payload names the tool, `Bash` or `PowerShell` — not one regex applied to both.
+
+**OVER-DENY — a `cd` that is not composed.** A newline-joined `cd`, a subshell-wrapped `(cd .. && ...)` and `Push-Location` are not followed, so the session cwd stands. Toward an ungoverned sibling that is a false deny; the opposite topology would be the hole. `Push-Location` is simply absent from the cd-verb list while `pushd` and `set-location` are present.
+
+**OVER-DENY — a heredoc body, and it fires on this workstream's own tooling.** Writing a disarm-key line into a file is not a config write, and the rule cannot tell. **Reproduced live 2026-08-06:** the installed gate refused a `python - <<'PYEOF'` call whose heredoc body was the text of this very backlog item. ⚠️ **The direction was reported BACKWARDS once and must not be repeated:** the LINE-LEADING body denies on all three gates; the NON-line-leading body denies on the committed gate and on the round-3 fix, and was the ONE spelling the rejected round-2 patch allowed. So the difference between those gates is the non-line-leading body only — narrower than "a heredoc containing a disarm-key line" — and round 3 fixes neither. The mechanism was never pinned, which is why it is filed rather than patched.
+
+**Related:** #1069 (the quote mask these shapes sit outside), #1070 (the environment channel, a different mechanism), #1065, #1061, #1000.
+
+**Source:** the backtick and heredoc shapes from round 3's design pass, the self-referential-token class from its independent design review, the `cd` shapes from round 2's own "does not establish" list.
+## 1073. Mine the free ASCQM 1.1 weakness catalogue against the existing gates; decline ISO 5055 as a measure
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **4/10** · Difficulty **3/10**. ISO/IEC 5055:2021 defines four quality measures as **counts** of CWE-keyed severe weaknesses. The **measure** is declined for the reasons below and should not be re-litigated. The **catalogue** behind it is free, curated by a standards body, and contains a slice worth one bounded pass: the system-level weaknesses that a unit-level linter structurally cannot see.
+
+**Cluster:** Code quality / standards coverage. **Priority:** P3. **Verdict:** build (small) for the pass; **decline** for the measure. **Severity:** no product effect and no security effect — this is a coverage question about the gates, not a defect in them.
+
+**The decline, stated first so it stays decided. Three reasons, any one sufficient:**
+
+1. **No conformant measure is producible for this codebase.** There is no free or open-source ISO 5055-conformant Python analyser. The conformant ecosystem is C/C++/Java/C#/COBOL-weighted: Perforce names Helix QAC and Klocwork, neither of which analyses Python; Kiuwan analyses Python commercially, and conformance claims are language-scoped. A measure nobody here can compute cannot be a gate, a scorecard row, or a claim.
+2. **No procurement pull.** 5055 exists to be **cited in a contract** — an outsourcer and a buyer writing "the delivered system shall score X" into a statement of work. MEFOR is open source distributed on PyPI; there is no contract counterparty for that clause. Health-system buyers ask for HIPAA mapping, SOC 2, HITRUST and ASVS.
+3. **It collides with this project's own ratified rule.** [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.1 forbids certifying quality on a single number, on adversarially-verified evidence. **Be fair to 5055 on this point:** counting *specific named severe weaknesses* is a materially better construct than the SonarQube severity buckets §2 refuted, so the collision is with the "our ASCQM Security score is N" framing, **not** with the weakness list itself. That distinction is the whole reason the catalogue survives the decline.
+
+**What is worth taking, and it costs nothing.** The OMG **ASCQM 1.1** specification (formal, July 2022) — which is the technical content ISO/IEC 5055:2021 carries — is downloadable from `omg.org/spec/ASCQM/` as a **non-member PDF plus a machine-readable XMI**. The ISO document does not need to be bought to read the weakness list.
+
+**Counts, with the unverified ones marked.** Confirmed from CISQ: **Security 74** (36 parent + 38 child), **Reliability 74** (35 + 39), **Maintainability 29**. **Performance Efficiency is widely quoted as 15, and the widely-quoted "139 total" likewise, and NEITHER was confirmed against a primary source** — do not restate either without checking the ASCQM PDF directly. They are recorded here as unverified precisely so the next reader does not launder them into a doc.
+
+**The work: one bounded pass, two questions per weakness.** *Could this occur in this codebase?* and *does any current check see it?* A no/no pair becomes a backlog item or a semgrep rule, and nothing else is produced. The high-yield slice is the **system-level** entries — weaknesses visible only across component boundaries and data flows. That is a real blind spot for a three-stage persisted pipeline with three store backends, and it is the one thing the catalogue offers that ruff, mypy, bandit, semgrep and CodeQL do not already cover between them.
+
+**Expect a high not-applicable rate, and do not read it as a result.** The Reliability and Security lists lean heavily on memory management, pointer arithmetic and buffer bounds. This is the same shape already measured against ASVS V10, where 25 of 27 cells were carried as not-applicable. A large n/a count is a fact about the language, not about the code.
+
+**Scope fence, and it is the load-bearing part of this item.** The output is items or rules. **Not** a fifth standards document, **not** a scorecard, **not** a gate, **not** a status row anywhere. The project already carries four standards documents, the ASVS scorecard, the HIPAA/800-66 mapping and the CISO register; each additional framework is another surface on which a claim can go stale, and this repo has already been bitten by exactly that — [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0 exists because three gates were green while measuring nothing.
+
+**Difficulty 3 is the judgment, not the reading.** The pass is mechanical; "does any current check see it" is the question that goes wrong. Answering it from a gate's *name* rather than from its *measured output and scope* is the §4.0 failure mode reproduced by hand. Every "covered" answer must name the check and state its scope — `jscpd` sees `messagefoundry/` only, the mutation gate sees one module, `testpaths` excludes the webconsole package (#1027). A coverage claim that does not name its instrument is not a coverage claim.
+
+**Related:** [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0 (gates that measure nothing) and §4.1 (the anti-metric rule), #1006 (a mutation that matches is not a mutation that bites — the same "the check ran" versus "the check bites" distinction), #1027 (a green that is not evidence about what it appears to cover), #1074 and #1075 (the SSDF half of the same question).
+
+**Source:** owner question 2026-08-06 — "is ISO/IEC 5055:2021 / OMG ASCQM 1.1 valuable, should we be applying it". Filed as the answer's actionable residue. The tool-support and procurement findings are from a research pass that day; the counts are as marked.
+
+## 1074. The SDS attestation posture does not record that the CISA self-attestation exempts freely-available OSS
+
+> ✅ **SHIPPED 2026-08-07 — the documentation is the whole deliverable.** Value **4/10** · Difficulty **1/10** · _quick win_. Two paragraphs added to [`Secure_Development_Standards.md`](Secure_Development_Standards.md) **§9** (see the citation correction below), plus the 800-218A guard placed in the AI companion's `Aligns to` row rather than its body — that row is where a reader would go to add the wrong anchor, so that is where the note has to be. Original filing follows. §9 states the software is *"self-attested as NIST SSDF-aligned"* and never said what that attestation is, and is not, answerable to. The CISA Secure Software Development Attestation Form explicitly **exempts software that is freely obtained and publicly available**. One missing sentence, and its absence invited an error in **either** direction.
+
+**CITATION CORRECTION, and it was wrong as filed.** This item said the attestation posture lives in **§6.3**. It does not: §6.3 is *OWASP ASVS 5.0 Level 3 — scope*, and the attestation posture is in **§9 Evidence and attestation**. The error came from matching the phrase without opening the section around it. Recorded rather than silently repaired because a wrong section pointer in a filed item is the same defect class the item itself is about — a claim nobody has checked and a claim nobody has noticed is wrong look identical until someone follows it.
+
+**Cluster:** Standards record / attestation honesty. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect and no security effect. The defect is in the record: a reader cannot tell from §6.3 whether the SSDF alignment discharges an obligation or volunteers evidence, and those imply different things about what may be claimed to a buyer.
+
+**The fact to record.** The CISA Secure Software Development Attestation Form (finalised 2024-03-11) does not require attestations for software that is freely obtained and publicly available, nor for open-source software obtained directly by a federal agency, nor for third-party open-source components incorporated into an end product.
+
+**Two consequences, pulling in opposite directions — which is exactly why it is one sentence and not a paragraph:**
+
+- MEFOR's SSDF alignment is **voluntary buyer evidence, never a regulatory obligation**. Nothing about it is owed to anyone today, and a doc that implies otherwise overstates the project's standing.
+- **The exemption stops applying to a paid or hosted offering.** A commercial tier changes the analysis, and writing the condition down now is what makes that visible later instead of assumed. This is the more valuable half: the trap is a future reader inheriting an exemption whose precondition has quietly lapsed.
+
+**Absence is what invites the error, not any wrong sentence that is there today.** With nothing written, a later reader can equally well claim compliance value the project does not have, or assume an obligation that does not exist. Both are instances of the class [`../CLAUDE.md`](../CLAUDE.md) §11 names — a compensating control, or a claim, resting on a false premise.
+
+**Second half of the same edit: do not anchor the AI companion to SP 800-218A.** 800-218A is the **Generative AI profile** — practices for organisations *producing* AI models and dual-use foundation models. It is **not** about building software *with* an AI assistant, which is what [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md) governs. **Verified 2026-08-06: nothing in `docs/` cites it.** Keep it that way and record *why*, so the next reader who notices an SSDF companion with "AI" in the title does not wire in a plausible-looking but wrong anchor. That companion currently has no NIST anchor, and it does not need a wrong one.
+
+**Difficulty 1.** Two sentences in SDS §6.3, one line in the AI companion. No code, no gate, no scorecard change.
+
+**Related:** #1075 (the other SSDF record item — that one is trigger-gated, this one is actionable now), #1053 (a document calling built things "planned" — the same class of defect, the record disagreeing with the facts), [`../CLAUDE.md`](../CLAUDE.md) §11.
+
+**Source:** owner question 2026-08-06 — "what about NIST SP 800-218 v1.1 (SSDF)". The answer was that SSDF is already adopted throughout the SDS; this is one of the two deltas that survived checking.
+
+## 1075. Re-map SDS section 4 when NIST SP 800-218r1 (SSDF 1.2) goes final
+
+> ✅ **CLOSED 2026-08-07 — NOT by doing the re-map, which remains correctly undone.** Value **3/10** · Difficulty **4/10**. Closed on the owner's reading, which was right: the SDS maps **SP 800-218 v1.1, and v1.1 is the current final version**, so this item described zero present work and zero present defect. A watch item for an event with no announced date is backlog noise. **Its one load-bearing sentence was not discarded — it was re-sited**, into [`Secure_Development_Standards.md`](Secure_Development_Standards.md) §9 alongside #1074, where the reader who would re-map against the draft is actually looking. A guard in the document beats a guard in the ledger.
+
+**DO NOT read this as "the SSDF 1.2 re-map is done."** It is not started and must not be started: SP 800-218r1 is still an Initial Public Draft (published 2025-12-17, comments closed 2026-01-30, no announced finalisation date). The trigger, the per-ID re-resolution rule, and the PW.7-deviation caveat now live in SDS §9. **If r1 goes Final, that is a new item** — do not reopen this one, because its number is closed and a reopened closed item is invisible to anyone reading the ledger for open work.
+
+**Cluster:** Standards record. **Priority:** P3. **Verdict:** build, **when triggered**. **Severity:** none today — the SDS is correct as it stands.
+
+**Status, verified against `csrc.nist.gov` on 2026-08-06.** SP 800-218r1 (SSDF Version 1.2) is an **Initial Public Draft**, released 2025-12-17; the comment period closed 2026-01-30; **no finalisation date has been announced**. SP 800-218 v1.1 (February 2022) remains the current final version.
+
+**Why the record is right as it stands.** [`Secure_Development_Standards.md`](Secure_Development_Standards.md) pins *"NIST SP 800-218 (SSDF)"* v1.1 in its `Aligns to` line, and §4 is organised by its four practice groups (PO / PS / PW / RV) with practice IDs cited natively — PS.2, PO.4, PW.1–PW.2, PW.7, PW.8. Every one of those resolves correctly against the current final standard. Nothing is stale; the item is a **watch**, not a repair.
+
+**The trigger.** SP 800-218r1 reaching **Final** status on `csrc.nist.gov`. Not a new draft, not a second comment period.
+
+**The blast radius, so the cost is visible before anyone starts.** Measured 2026-08-06: **143 SSDF references across 11 files** — the SDS itself, [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md), [`Secure_Build_Standards.md`](Secure_Build_Standards.md), [`Secure_Build_Scorecard_MEFOR.md`](Secure_Build_Scorecard_MEFOR.md) (which *grades* under the practice groups, including the documented single-maintainer deviation for PW.7), [`Code_Quality_Standards.md`](Code_Quality_Standards.md) (which maps its signals to PW.7 / PW.8), plus scattered citations in `PHI.md`, `ARCHITECTURE.md`, ADR 0109, the master test plan, `.github/SECURITY.md` and the CHANGELOG. **That is the size of the change, not a to-do list** — several of those are prose mentions needing no edit at all, and treating the count as a checklist is how a re-map becomes a week.
+
+**Difficulty 4 is the ID churn, not the reading.** SSDF 1.2 renumbers and adds practices and tasks, so **a mechanical find-and-replace is exactly the wrong instrument**: a citation that still resolves to a real practice ID but a *different* practice is the failure that looks like success, and nothing in CI can see it. Every cited ID must be re-resolved against the new text by hand, and the single-maintainer deviation in the Secure Build scorecard has to be re-justified against whatever 1.2 says about review, not carried across on the assumption that PW.7 still means what it meant.
+
+**Do not act early.** Do not re-map against the draft, and do not track it incrementally as the draft changes — a draft that moves twice costs the re-map twice and can still land somewhere else.
+
+**Related:** #1074 (the same document's attestation posture — actionable now, unlike this), #1073 (the ISO 5055 half of the same question).
+
+**Source:** owner question 2026-08-06 — "what about NIST SP 800-218 v1.1 (SSDF)". Draft status re-verified directly against the CSRC publication page the same day rather than taken from a secondary summary.
+
+## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which does not mean dead
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: a peer listed `isRunning: false` was **delivered to** and answered within one turn, while `isRunning: true` **queued** behind the in-flight turn. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers most able to answer.
+
+**Cluster:** Session coordination / roster semantics. **Priority:** P2. **Verdict:** build (small). **Severity:** no product effect and no security effect — this governs agent coordination. The cost is silent: a session follows the rule, reports fewer live peers than exist, and nothing raises.
+
+**Measured by sending into real peers and getting real replies, not inferred from the field.**
+
+| target state | result |
+| --- | --- |
+| `isRunning: false` | **delivered**, answered within one turn |
+| `isRunning: true` | *"Message queued … will be processed after the in-flight turn finishes"* |
+
+**WHAT `false` ACTUALLY MEANS IS "NOT OBSERVABLE", NOT "IDLE" — and the narrower reading was this item's own first draft.** It was filed saying *"`isRunning: false` means the session is IDLE"*, which is what the measurement above shows **for the one desktop peer it was taken on**. The general statement is weaker and safer: the field reports what the Desktop app can observe, and observability is not uniform across surfaces. A **VS Code** session is the case the narrow reading cannot cover — it is never entered into the Desktop app's in-memory session map at all, so it is *absent* rather than listed-and-quiet, and no value of `isRunning` describes it.
+
+Both readings reach the same operational conclusion, which is the whole point of the item: **`false` is never evidence that a peer is finished, gone, or safe to take claims from.** Only the mechanism differs, and a measurement generalised past its sample is exactly the defect class this cluster is about — so it is corrected here rather than left standing because the conclusion happened to survive it.
+
+**It has already cost a wrong report to the owner.** A session applying the SKIP rule told the owner there was **no live coordinator** and was corrected with *"there is a live coordinator... talk to it."* `presence.ps1` had listed it live throughout. The two rosters also disagreed on that session's **branch**, so branch cannot join them either — only cwd can.
+
+**This item is the SKIP rule, not the field.** The defect is that this repo's own hook elevates `isRunning` to a disqualifier without saying what it means, and then records the outcome under a token that reads as *"gone"*.
+
+**Fix shape, offered not decided.** Either drop the `isRunning` condition entirely (cwd match alone decides reachability, and a failed `send_message` is loud), or keep it and invert the reading — skip on `true` if anything, since that is the state that queues. Whichever is chosen, the `NOT_RUNNING` receipt token must go: it records a delivery that would have succeeded. A negative control per #1000 needs a peer that is idle at the time of the run, since an all-busy roster cannot distinguish the two rules.
+
+**Related:** #1000 (a rule green because its outcome token cannot express the case it got wrong), #1057 (a refusal whose text misleads the reader about what was checked).
+
+**Source:** found 2026-08-06 by a session that followed the rule, misreported the roster to the owner, was corrected, and then settled a question its own notes had recorded as *"UNVERIFIED, do not assert either way: whether send_message delivers to an isRunning:false session"* — including that note's own prediction that if it delivered, the SKIP rule would be dropping reachable peers.
+
+## 1078. `new.ps1` prints cleanup advice that throws when followed as written
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. Run from a worktree, `new.ps1` anchors on `$PSScriptRoot` and creates the new tree beside **itself** — e.g. under `.claude/worktrees/` — then prints *"When done (run from the MAIN checkout): `scripts\worktree\remove.ps1 -Name <name>`"*. From the main checkout that resolves to `<repo-parent>/<repo-leaf>-<name>`, which does not exist, and `remove.ps1` throws *"No such worktree"*. The command only works run from the worktree that created it, which is not what the line says.
+
+**Cluster:** Developer tooling / refusal and advice accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low and loud — `remove.ps1` fails closed with a clear message naming the path it looked for. Nothing is destroyed and no wrong tree is removed; the cost is a confusing failure at cleanup time.
+
+**Third instance of the same class, and that is why it is worth a number rather than a comment.** #1032 was rule 3b printing a `new.ps1` command `new.ps1` refuses to run. #1057 was rule 3d naming `remove.ps1` and `prune-merged.ps1` for a worktree family neither can reach. This is the same defect in `new.ps1`'s **own output**, about a worktree `new.ps1` **just created** — so the anchoring is correct and only the advice is wrong.
+
+**The fix is to print the path that was actually used.** `new.ps1` knows `$RepoRoot` and `$WorktreePath` at the point it prints; the line should name the checkout the command must be run from rather than asserting "the MAIN checkout", or print the plain `git -C <root> worktree remove <path>` that works from anywhere.
+
+**Do not fix by changing where `new.ps1` puts the worktree.** Anchoring on `$PSScriptRoot` is what BACKLOG #1060 established as correct for a script invoked by absolute path; the defect is the sentence, not the placement.
+
+**Related:** #1057 and #1032 (the same class, one and two rules over), #1060 (the anchoring that makes the placement correct).
+
+**Source:** found 2026-08-06 while creating a worktree to fix #1057 — the tool being used to clean up after the defect exhibited the defect.
+
+## 1079. `security.yml`'s header denies the push-to-main trigger its own `on:` block declares
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **2/10** · Difficulty **1/10** · _quick win_. The header comment states *"NO push-to-main trigger (dropped for CI cost)"* and explains the reasoning at length. The `on:` block a few lines later carries `push: branches: [main]`, with its own comment calling it the *"Post-merge re-scan (main only)"*. Two comments in one file, each describing the trigger set, and they contradict each other.
+
+**Cluster:** Documentation accuracy / CI. **Priority:** P4. **Verdict:** build (trivial — delete or correct one comment). **Severity:** none to the build. The workflow behaves as the `on:` block says; only a reader is misled.
+
+**Why it is worth a number at all.** This is a **security** workflow whose header is otherwise load-bearing — the same block documents that `continue-on-error` leaves branch protection green while discarding findings, and points at `tests/test_security_posture.py` as the guard that refuses it. A reader who finds one paragraph of that header demonstrably false has no way to know which of the others still hold. The cost is to the header's credibility, not to CI.
+
+**Determine which is stale before editing.** The push arm's own comment gives a reason — a fork PR is scanned structural-only, so without this arm no fully-loaded scan sees fork-contributed content — that does not obviously yield to the cost argument in the header. Whichever survives, the other must go, not be softened.
+
+**Related:** #1000 (a claim about a control that its own configuration contradicts).
+
+**Source:** noticed 2026-08-06 while reading the workflow to answer whether a PR's checks audit the merge ref or the head — an unrelated question.
+
+## 1080. `setup-leak-gate.ps1` reports the LOADED token set as if it were the one it just installed
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **3/10** · Difficulty **1/10** · _quick win_. `-Synthetic` prints *"Installed the SYNTHETIC template"* and then, three lines later, *"CONFIGURED with the real token set."* Both are individually true when `MEFOR_FORBIDDEN_TOKENS` is set: the script installed the synthetic file, and the scanner loaded the real list from the environment, which wins over the file. Nothing in the output says the env source **overrode** what was just installed, so the two lines read as a contradiction or, worse, as confirmation that the synthetic install produced a real-token gate.
+
+**Cluster:** Developer tooling / reporting accuracy. **Priority:** P4. **Verdict:** build (trivial). **Severity:** low, and the direction is safe — the gate really is loaded with the real set, so the operator is better protected than the message implies, not worse. The cost is that a reader cannot tell which source armed the gate, which is the one question the script's own docstring says the verify step exists to answer.
+
+**The script's stated purpose is what makes this a defect rather than a nit.** Its header: *"A green gate is evidence only if you confirmed it can see the class it is meant to catch"*, and it *"always finishes by invoking the scanner and printing the per-section detector counts"*. Printing the counts without printing **where they came from** leaves exactly the ambiguity the step was written to close.
+
+**Fix shape.** Have the verify step name the resolved source — the `MEFOR_FORBIDDEN_TOKENS` path versus `scripts/security/scan-tokens.local.txt` — and say plainly when the environment overrode the file just written. `scan_forbidden.py` already distinguishes the three states internally (structural-only, synthetic, real) to build that line; it needs the provenance too, not just the verdict.
+
+**Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
+
+**Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
+
+## 1087. `new.ps1` sets a worktree branch's upstream to the BASE, so every instrument keyed on `@{u}` answers a different question than the one asked
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **1/10** · _quick win_. `new.ps1:133` runs `git worktree add <path> -b <Branch> <Base>` with `-Base origin/main`. Git's default `branch.autoSetupMerge` then sets the new branch's upstream to the remote-tracking base, so **`@{u}` resolves to `origin/main`, not to the branch's own remote ref** — measured on a live worktree. The visible symptom is trivial. The consequence is not: **`@{u}..HEAD` reports a branch's own commits as "unpushed" forever, including immediately after a successful push.**
+
+**Cluster:** Developer tooling / instrument accuracy. **Priority:** P2. **Verdict:** build (one flag). **Severity:** no product effect. The cost is that a routine safety question gets a confidently wrong answer, silently, with no error.
+
+**The loud symptom is the harmless one.** `git pull --ff-only` in such a worktree fails with *"Not possible to fast-forward, aborting"* because it is trying to fast-forward the branch onto `origin/main`. That is self-correcting: it refuses, and naming the branch explicitly (`git pull --ff-only origin <branch>`) works. **`git pull` WITHOUT `--ff-only` does not fail** — it merges `origin/main` into the branch and produces a merge commit. Quieter, and worse.
+
+**The real defect is the instrument, and it corrupted a safety check the same night.** A session checking whether its worktrees were safe to remove ran `git log @{u}..HEAD` and read **2 and 1 unpushed commits** on two branches that were byte-identical to their remotes. Both were fully pushed. The check that decides *"is anything at risk if I delete this worktree"* rests partly on that number, so the misconfiguration turns a safety question into a false positive — and a false negative is available the same way. Same class as the other instrument defects in this cluster: `git cherry` under squash-merge, ancestry as a proxy for content, a *job* conclusion answering a *step* question. **Name what the tool returns and check it is the same sentence as the question.**
+
+⛔⛔ **DO NOT FIX THIS WITH `git config push.default upstream`.** It is the first thing someone reaches for — it makes bare `git pull`/`git push` "work" — and it is **strictly worse than the defect**. With the upstream set to `origin/main`, `push.default upstream` makes a bare `git push` write the feature branch **onto `main`**, and on this repo push to `main` is not blocked server-side. The only reason that is not already possible is that `push.default` is **unset** (verified 2026-08-07: unset both local and global), so git uses `simple`, which refuses when the upstream's name differs from the local branch's name. **That default is load-bearing and must not be relaxed while the upstream is wrong.**
+
+**The fix is one flag at creation, not a config change.** Either pass `--no-track` on the `worktree add` so no upstream is set at all, or set the upstream to the branch's own remote ref after the first push. `--no-track` is the smaller change and leaves `@{u}` unresolvable, which fails **loudly** rather than answering the wrong question — the correct failure direction for an instrument.
+
+**Test it by the divergence, per #1000.** A test that creates a worktree and asserts `@{u}` is unset (or equals the branch's own remote) passes trivially; the case that distinguishes is asserting that `@{u}..HEAD` is **empty** for a branch whose tip equals its pushed remote ref. Under the current behaviour that assertion fails, which is the whole point.
+
+**Related:** #1078 (`new.ps1` printing cleanup advice that throws — the same script, the same "correct action, wrong accompanying claim" shape), #1060 (anchoring, which is what makes the worktree placement itself correct), #1000 (a control whose green is not evidence).
+
+**Source:** found 2026-08-07 from a `git pull --ff-only` failure while syncing a worktree, and connected to a bogus "unpushed" reading reported hours earlier in the same session — one root cause behind two symptoms that had been treated as unrelated. Mechanism confirmed at `new.ps1:133` and the `push.default` posture verified against the live config before the warning above was written.
+

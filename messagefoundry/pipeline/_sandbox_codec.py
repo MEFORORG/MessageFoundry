@@ -9,8 +9,10 @@ straight back: a Handler returning an object with a custom ``__reduce__`` execut
 whichever process loads the frame. So **both legs are untrusted by contract**:
 
 * **child → parent** is untrusted because the child runs exactly the code the sandbox exists to
-  distrust, and because a *grandchild* the Handler spawns inherits fd 1 (the response pipe) and
-  survives ``proc.kill()`` — it can write a frame at any later moment.
+  distrust, and because a *grandchild* the Handler spawns inherits fd 1 (the response pipe) and can
+  stage a frame while the worker is alive. (Killing the worker now reaps its whole process tree, so
+  such a grandchild no longer outlives the kill — BACKLOG #342 — but that reap is best-effort process
+  hygiene, not the trust control this codec provides.)
 * **parent → child** is untrusted because the same reasoning read in the other direction is the only
   reason the first bullet is a boundary at all; a single schema, one review, one fuzz target.
 

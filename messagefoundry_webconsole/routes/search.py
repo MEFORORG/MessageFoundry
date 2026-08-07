@@ -13,6 +13,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 
 from messagefoundry.api._ui_seam import UiDeps
 from messagefoundry.api.models import SearchPresetCreateRequest, SearchPresetCriteria
+from messagefoundry.api.security import enforce_phi_read_pacing
 from messagefoundry.auth import Identity, Permission
 
 from .. import pages
@@ -54,6 +55,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_message_search(
         request: Request,
         engine: Any = Depends(deps.get_engine),
+        # No gate-level phi= here (BACKLOG #1025): require_ui_step_up charges the budget in the
+        # dependency, i.e. on EVERY request, but a criteria-bearing search already charges once inside
+        # core.search_messages (its body calls enforce_phi_read_pacing, app.py) — so a gate-level phi=
+        # would spend the same per-actor bucket twice on the real-search path. The genuinely-unpaced
+        # path is only the bare-form render, which is charged explicitly in its branch below.
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_READ)),
         content: str | None = Query(None, max_length=512),
         field_path: str | None = Query(None, max_length=32),
@@ -81,6 +87,11 @@ def register(app: FastAPI, deps: UiDeps) -> None:
             control_id=control_id or "",
         )
         if not has_criteria:
+            # BACKLOG #1025: this bare-form render returns WITHOUT reaching core.search_messages,
+            # whose body charges the per-actor read budget. Charge here — only on the short-circuit
+            # branch — so the render is under the same budget as a real search WITHOUT double-charging
+            # it (429 + Retry-After when the actor is over budget).
+            enforce_phi_read_pacing(request, identity)
             return HTMLResponse(pages.message_search(None, presets=preset_list, **shared))
         try:
             # Call the JSON handler directly (its require_step_up Depends is skipped —
@@ -173,12 +184,20 @@ def register(app: FastAPI, deps: UiDeps) -> None:
     async def ui_layered_search(
         request: Request,
         engine: Any = Depends(deps.get_engine),
+        # No gate-level phi= here, as on ui_message_search (BACKLOG #1025): the composed run already
+        # charges once inside core.layered_search, so a gate-level phi= would double-charge that path.
+        # The no-preset 400 re-render is the only unpaced path, charged explicitly in its branch below.
         identity: Identity = Depends(require_ui_step_up(Permission.MESSAGES_READ)),
         presets: list[str] | None = Query(None),
     ) -> HTMLResponse:
         preset_list = await _presets(engine, identity, request)
         ids = ",".join(p for p in (presets or []) if p)
         if not ids:
+            # BACKLOG #1025, as on ui_message_search: this no-preset 400 re-render returns before
+            # core.layered_search (which charges the budget in its own body), so charge here — only on
+            # this short-circuit branch — to bring it under the per-actor read budget without
+            # double-charging the composed-run path.
+            enforce_phi_read_pacing(request, identity)
             return HTMLResponse(
                 pages.message_search(
                     None, error="select at least one preset to layer", presets=preset_list

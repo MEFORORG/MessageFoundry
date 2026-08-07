@@ -31,9 +31,11 @@ from __future__ import annotations
 
 import time
 
+import pytest
+
 from messagefoundry.auth import totp
 
-__all__ = ["fresh_totp", "step_remaining"]
+__all__ = ["fresh_totp", "pin_totp_clock", "step_remaining"]
 
 #: Seconds that must remain in the current step before a code is generated. Comfortably larger than
 #: any plausible generate → verify gap (a store read plus an HMAC; the argon2id recovery-code path
@@ -65,3 +67,33 @@ def fresh_totp(
         # keeps a coarse clock from returning the step we just left.
         time.sleep(remaining + 0.05)
     return totp.totp(secret, period=period)
+
+
+class _PinnedClock:
+    """A minimal stand-in for the ``time`` module exposing only ``time()`` at a fixed instant.
+
+    ``totp`` reads the wall clock solely as ``time.time()`` (two call sites: :func:`totp.totp` and
+    :func:`totp.verify_totp_step`), so swapping the module reference for this pins the TOTP step
+    deterministically while leaving every OTHER clock — the service's session-expiry, rate-limiting
+    and audit timestamps, all on their own ``time`` imports — real. That surgical scope is what lets
+    a test place enrollment and a later verify in DISTINCT, provably-adjacent steps without the 30 s
+    boundary flake :func:`fresh_totp` can only narrow.
+    """
+
+    def __init__(self, instant: float) -> None:
+        self._instant = instant
+
+    def time(self) -> float:
+        return self._instant
+
+
+def pin_totp_clock(monkeypatch: pytest.MonkeyPatch, instant: float) -> None:
+    """Pin the ``totp`` module's clock to ``instant`` for the rest of the test (monkeypatch restores
+    the real clock at teardown).
+
+    Generate codes with ``totp.totp(secret, now=instant)`` so they land in the same step the pinned
+    service-side verify computes. Unlike :func:`fresh_totp` — which guarantees headroom WITHIN a step
+    but cannot advance one — this can place two verifies in strictly different steps, which is needed
+    now that enrollment consumes the activating step (BACKLOG #1021): a later login code must live in
+    a higher step than the consumed enrollment step to be accepted."""
+    monkeypatch.setattr(totp, "time", _PinnedClock(instant))
