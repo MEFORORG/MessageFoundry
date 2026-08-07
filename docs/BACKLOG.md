@@ -5674,9 +5674,86 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 **Source:** surfaced 2026-08-05 by a repo-wide sweep for the cwd-as-identity shape, reported as one of five candidates and held as **relayed, not confirmed** until the chain was read end to end on 2026-08-06. Filed only after that verification: the sweep's own severity ranking put it first, and a subagent's severity claim is not evidence.
 
-## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which means IDLE, not dead
+## 1073. Mine the free ASCQM 1.1 weakness catalogue against the existing gates; decline ISO 5055 as a measure
 
-> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: **`isRunning: false` means the session is IDLE and `send_message` DELIVERS to it**; `isRunning: true` means it is mid-turn and the message QUEUES. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers that are ready to answer.
+> 🔢 **Filed 2026-08-06 — not started.** Value **4/10** · Difficulty **3/10**. ISO/IEC 5055:2021 defines four quality measures as **counts** of CWE-keyed severe weaknesses. The **measure** is declined for the reasons below and should not be re-litigated. The **catalogue** behind it is free, curated by a standards body, and contains a slice worth one bounded pass: the system-level weaknesses that a unit-level linter structurally cannot see.
+
+**Cluster:** Code quality / standards coverage. **Priority:** P3. **Verdict:** build (small) for the pass; **decline** for the measure. **Severity:** no product effect and no security effect — this is a coverage question about the gates, not a defect in them.
+
+**The decline, stated first so it stays decided. Three reasons, any one sufficient:**
+
+1. **No conformant measure is producible for this codebase.** There is no free or open-source ISO 5055-conformant Python analyser. The conformant ecosystem is C/C++/Java/C#/COBOL-weighted: Perforce names Helix QAC and Klocwork, neither of which analyses Python; Kiuwan analyses Python commercially, and conformance claims are language-scoped. A measure nobody here can compute cannot be a gate, a scorecard row, or a claim.
+2. **No procurement pull.** 5055 exists to be **cited in a contract** — an outsourcer and a buyer writing "the delivered system shall score X" into a statement of work. MEFOR is open source distributed on PyPI; there is no contract counterparty for that clause. Health-system buyers ask for HIPAA mapping, SOC 2, HITRUST and ASVS.
+3. **It collides with this project's own ratified rule.** [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.1 forbids certifying quality on a single number, on adversarially-verified evidence. **Be fair to 5055 on this point:** counting *specific named severe weaknesses* is a materially better construct than the SonarQube severity buckets §2 refuted, so the collision is with the "our ASCQM Security score is N" framing, **not** with the weakness list itself. That distinction is the whole reason the catalogue survives the decline.
+
+**What is worth taking, and it costs nothing.** The OMG **ASCQM 1.1** specification (formal, July 2022) — which is the technical content ISO/IEC 5055:2021 carries — is downloadable from `omg.org/spec/ASCQM/` as a **non-member PDF plus a machine-readable XMI**. The ISO document does not need to be bought to read the weakness list.
+
+**Counts, with the unverified ones marked.** Confirmed from CISQ: **Security 74** (36 parent + 38 child), **Reliability 74** (35 + 39), **Maintainability 29**. **Performance Efficiency is widely quoted as 15, and the widely-quoted "139 total" likewise, and NEITHER was confirmed against a primary source** — do not restate either without checking the ASCQM PDF directly. They are recorded here as unverified precisely so the next reader does not launder them into a doc.
+
+**The work: one bounded pass, two questions per weakness.** *Could this occur in this codebase?* and *does any current check see it?* A no/no pair becomes a backlog item or a semgrep rule, and nothing else is produced. The high-yield slice is the **system-level** entries — weaknesses visible only across component boundaries and data flows. That is a real blind spot for a three-stage persisted pipeline with three store backends, and it is the one thing the catalogue offers that ruff, mypy, bandit, semgrep and CodeQL do not already cover between them.
+
+**Expect a high not-applicable rate, and do not read it as a result.** The Reliability and Security lists lean heavily on memory management, pointer arithmetic and buffer bounds. This is the same shape already measured against ASVS V10, where 25 of 27 cells were carried as not-applicable. A large n/a count is a fact about the language, not about the code.
+
+**Scope fence, and it is the load-bearing part of this item.** The output is items or rules. **Not** a fifth standards document, **not** a scorecard, **not** a gate, **not** a status row anywhere. The project already carries four standards documents, the ASVS scorecard, the HIPAA/800-66 mapping and the CISO register; each additional framework is another surface on which a claim can go stale, and this repo has already been bitten by exactly that — [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0 exists because three gates were green while measuring nothing.
+
+**Difficulty 3 is the judgment, not the reading.** The pass is mechanical; "does any current check see it" is the question that goes wrong. Answering it from a gate's *name* rather than from its *measured output and scope* is the §4.0 failure mode reproduced by hand. Every "covered" answer must name the check and state its scope — `jscpd` sees `messagefoundry/` only, the mutation gate sees one module, `testpaths` excludes the webconsole package (#1027). A coverage claim that does not name its instrument is not a coverage claim.
+
+**Related:** [`Code_Quality_Standards.md`](Code_Quality_Standards.md) §4.0 (gates that measure nothing) and §4.1 (the anti-metric rule), #1006 (a mutation that matches is not a mutation that bites — the same "the check ran" versus "the check bites" distinction), #1027 (a green that is not evidence about what it appears to cover), #1074 and #1075 (the SSDF half of the same question).
+
+**Source:** owner question 2026-08-06 — "is ISO/IEC 5055:2021 / OMG ASCQM 1.1 valuable, should we be applying it". Filed as the answer's actionable residue. The tool-support and procurement findings are from a research pass that day; the counts are as marked.
+
+## 1074. The SDS attestation posture does not record that the CISA self-attestation exempts freely-available OSS
+
+> ✅ **SHIPPED 2026-08-07 — the documentation is the whole deliverable.** Value **4/10** · Difficulty **1/10** · _quick win_. Two paragraphs added to [`Secure_Development_Standards.md`](Secure_Development_Standards.md) **§9** (see the citation correction below), plus the 800-218A guard placed in the AI companion's `Aligns to` row rather than its body — that row is where a reader would go to add the wrong anchor, so that is where the note has to be. Original filing follows. §9 states the software is *"self-attested as NIST SSDF-aligned"* and never said what that attestation is, and is not, answerable to. The CISA Secure Software Development Attestation Form explicitly **exempts software that is freely obtained and publicly available**. One missing sentence, and its absence invited an error in **either** direction.
+
+**CITATION CORRECTION, and it was wrong as filed.** This item said the attestation posture lives in **§6.3**. It does not: §6.3 is *OWASP ASVS 5.0 Level 3 — scope*, and the attestation posture is in **§9 Evidence and attestation**. The error came from matching the phrase without opening the section around it. Recorded rather than silently repaired because a wrong section pointer in a filed item is the same defect class the item itself is about — a claim nobody has checked and a claim nobody has noticed is wrong look identical until someone follows it.
+
+**Cluster:** Standards record / attestation honesty. **Priority:** P3. **Verdict:** build (small). **Severity:** no product effect and no security effect. The defect is in the record: a reader cannot tell from §6.3 whether the SSDF alignment discharges an obligation or volunteers evidence, and those imply different things about what may be claimed to a buyer.
+
+**The fact to record.** The CISA Secure Software Development Attestation Form (finalised 2024-03-11) does not require attestations for software that is freely obtained and publicly available, nor for open-source software obtained directly by a federal agency, nor for third-party open-source components incorporated into an end product.
+
+**Two consequences, pulling in opposite directions — which is exactly why it is one sentence and not a paragraph:**
+
+- MEFOR's SSDF alignment is **voluntary buyer evidence, never a regulatory obligation**. Nothing about it is owed to anyone today, and a doc that implies otherwise overstates the project's standing.
+- **The exemption stops applying to a paid or hosted offering.** A commercial tier changes the analysis, and writing the condition down now is what makes that visible later instead of assumed. This is the more valuable half: the trap is a future reader inheriting an exemption whose precondition has quietly lapsed.
+
+**Absence is what invites the error, not any wrong sentence that is there today.** With nothing written, a later reader can equally well claim compliance value the project does not have, or assume an obligation that does not exist. Both are instances of the class [`../CLAUDE.md`](../CLAUDE.md) §11 names — a compensating control, or a claim, resting on a false premise.
+
+**Second half of the same edit: do not anchor the AI companion to SP 800-218A.** 800-218A is the **Generative AI profile** — practices for organisations *producing* AI models and dual-use foundation models. It is **not** about building software *with* an AI assistant, which is what [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md) governs. **Verified 2026-08-06: nothing in `docs/` cites it.** Keep it that way and record *why*, so the next reader who notices an SSDF companion with "AI" in the title does not wire in a plausible-looking but wrong anchor. That companion currently has no NIST anchor, and it does not need a wrong one.
+
+**Difficulty 1.** Two sentences in SDS §6.3, one line in the AI companion. No code, no gate, no scorecard change.
+
+**Related:** #1075 (the other SSDF record item — that one is trigger-gated, this one is actionable now), #1053 (a document calling built things "planned" — the same class of defect, the record disagreeing with the facts), [`../CLAUDE.md`](../CLAUDE.md) §11.
+
+**Source:** owner question 2026-08-06 — "what about NIST SP 800-218 v1.1 (SSDF)". The answer was that SSDF is already adopted throughout the SDS; this is one of the two deltas that survived checking.
+
+## 1075. Re-map SDS section 4 when NIST SP 800-218r1 (SSDF 1.2) goes final
+
+> ✅ **CLOSED 2026-08-07 — NOT by doing the re-map, which remains correctly undone.** Value **3/10** · Difficulty **4/10**. Closed on the owner's reading, which was right: the SDS maps **SP 800-218 v1.1, and v1.1 is the current final version**, so this item described zero present work and zero present defect. A watch item for an event with no announced date is backlog noise. **Its one load-bearing sentence was not discarded — it was re-sited**, into [`Secure_Development_Standards.md`](Secure_Development_Standards.md) §9 alongside #1074, where the reader who would re-map against the draft is actually looking. A guard in the document beats a guard in the ledger.
+
+**DO NOT read this as "the SSDF 1.2 re-map is done."** It is not started and must not be started: SP 800-218r1 is still an Initial Public Draft (published 2025-12-17, comments closed 2026-01-30, no announced finalisation date). The trigger, the per-ID re-resolution rule, and the PW.7-deviation caveat now live in SDS §9. **If r1 goes Final, that is a new item** — do not reopen this one, because its number is closed and a reopened closed item is invisible to anyone reading the ledger for open work.
+
+**Cluster:** Standards record. **Priority:** P3. **Verdict:** build, **when triggered**. **Severity:** none today — the SDS is correct as it stands.
+
+**Status, verified against `csrc.nist.gov` on 2026-08-06.** SP 800-218r1 (SSDF Version 1.2) is an **Initial Public Draft**, released 2025-12-17; the comment period closed 2026-01-30; **no finalisation date has been announced**. SP 800-218 v1.1 (February 2022) remains the current final version.
+
+**Why the record is right as it stands.** [`Secure_Development_Standards.md`](Secure_Development_Standards.md) pins *"NIST SP 800-218 (SSDF)"* v1.1 in its `Aligns to` line, and §4 is organised by its four practice groups (PO / PS / PW / RV) with practice IDs cited natively — PS.2, PO.4, PW.1–PW.2, PW.7, PW.8. Every one of those resolves correctly against the current final standard. Nothing is stale; the item is a **watch**, not a repair.
+
+**The trigger.** SP 800-218r1 reaching **Final** status on `csrc.nist.gov`. Not a new draft, not a second comment period.
+
+**The blast radius, so the cost is visible before anyone starts.** Measured 2026-08-06: **143 SSDF references across 11 files** — the SDS itself, [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md), [`Secure_Build_Standards.md`](Secure_Build_Standards.md), [`Secure_Build_Scorecard_MEFOR.md`](Secure_Build_Scorecard_MEFOR.md) (which *grades* under the practice groups, including the documented single-maintainer deviation for PW.7), [`Code_Quality_Standards.md`](Code_Quality_Standards.md) (which maps its signals to PW.7 / PW.8), plus scattered citations in `PHI.md`, `ARCHITECTURE.md`, ADR 0109, the master test plan, `.github/SECURITY.md` and the CHANGELOG. **That is the size of the change, not a to-do list** — several of those are prose mentions needing no edit at all, and treating the count as a checklist is how a re-map becomes a week.
+
+**Difficulty 4 is the ID churn, not the reading.** SSDF 1.2 renumbers and adds practices and tasks, so **a mechanical find-and-replace is exactly the wrong instrument**: a citation that still resolves to a real practice ID but a *different* practice is the failure that looks like success, and nothing in CI can see it. Every cited ID must be re-resolved against the new text by hand, and the single-maintainer deviation in the Secure Build scorecard has to be re-justified against whatever 1.2 says about review, not carried across on the assumption that PW.7 still means what it meant.
+
+**Do not act early.** Do not re-map against the draft, and do not track it incrementally as the draft changes — a draft that moves twice costs the re-map twice and can still land somewhere else.
+
+**Related:** #1074 (the same document's attestation posture — actionable now, unlike this), #1073 (the ISO 5055 half of the same question).
+
+**Source:** owner question 2026-08-06 — "what about NIST SP 800-218 v1.1 (SSDF)". Draft status re-verified directly against the CSRC publication page the same day rather than taken from a secondary summary.
+
+## 1077. `announce-session.ps1` skips reachable peers on `isRunning: false`, which does not mean dead
+
+> 🔢 **Filed 2026-08-06 — not started.** Value **6/10** · Difficulty **2/10** · _quick win_. The announce hook instructs every session *"No exact row, or isRunning is false -> SKIP that peer"*, then has the model record the outcome under the token `NOT_RUNNING`. Measured 2026-08-06: a peer listed `isRunning: false` was **delivered to** and answered within one turn, while `isRunning: true` **queued** behind the in-flight turn. The field reads **backwards** as a reachability signal, so the rule drops exactly the peers most able to answer.
 
 **Cluster:** Session coordination / roster semantics. **Priority:** P2. **Verdict:** build (small). **Severity:** no product effect and no security effect — this governs agent coordination. The cost is silent: a session follows the rule, reports fewer live peers than exist, and nothing raises.
 
@@ -5684,8 +5761,12 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 
 | target state | result |
 | --- | --- |
-| `isRunning: false` (idle) | **delivered**, answered within one turn |
-| `isRunning: true` (busy) | *"Message queued … will be processed after the in-flight turn finishes"* |
+| `isRunning: false` | **delivered**, answered within one turn |
+| `isRunning: true` | *"Message queued … will be processed after the in-flight turn finishes"* |
+
+**WHAT `false` ACTUALLY MEANS IS "NOT OBSERVABLE", NOT "IDLE" — and the narrower reading was this item's own first draft.** It was filed saying *"`isRunning: false` means the session is IDLE"*, which is what the measurement above shows **for the one desktop peer it was taken on**. The general statement is weaker and safer: the field reports what the Desktop app can observe, and observability is not uniform across surfaces. A **VS Code** session is the case the narrow reading cannot cover — it is never entered into the Desktop app's in-memory session map at all, so it is *absent* rather than listed-and-quiet, and no value of `isRunning` describes it.
+
+Both readings reach the same operational conclusion, which is the whole point of the item: **`false` is never evidence that a peer is finished, gone, or safe to take claims from.** Only the mechanism differs, and a measurement generalised past its sample is exactly the defect class this cluster is about — so it is corrected here rather than left standing because the conclusion happened to survive it.
 
 **It has already cost a wrong report to the owner.** A session applying the SKIP rule told the owner there was **no live coordinator** and was corrected with *"there is a live coordinator... talk to it."* `presence.ps1` had listed it live throughout. The two rosters also disagreed on that session's **branch**, so branch cannot join them either — only cwd can.
 
@@ -5767,3 +5848,23 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 **Related:** #1057 (the change that surfaced it — its test file was the straw, not the cause), #1014 (a "flake" that was a real failure), #1000 (a control whose green is not evidence).
 
 **Source:** found 2026-08-07 by the coordinator, from a `test (windows-2025)` failure on PR #261. Diagnosed by comparing job wall time across three PRs rather than by reading the failing test, and by reading `step_timeout` out of `ci.yml` rather than inferring it from the error text. Three alternative explanations — environmental, content-related, and the exit-139 native-crash class of #264 — were each ruled out against evidence before the elapsed-time explanation was accepted.
+
+## 1087. `new.ps1` sets a worktree branch's upstream to the BASE, so every instrument keyed on `@{u}` answers a different question than the one asked
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **1/10** · _quick win_. `new.ps1:133` runs `git worktree add <path> -b <Branch> <Base>` with `-Base origin/main`. Git's default `branch.autoSetupMerge` then sets the new branch's upstream to the remote-tracking base, so **`@{u}` resolves to `origin/main`, not to the branch's own remote ref** — measured on a live worktree. The visible symptom is trivial. The consequence is not: **`@{u}..HEAD` reports a branch's own commits as "unpushed" forever, including immediately after a successful push.**
+
+**Cluster:** Developer tooling / instrument accuracy. **Priority:** P2. **Verdict:** build (one flag). **Severity:** no product effect. The cost is that a routine safety question gets a confidently wrong answer, silently, with no error.
+
+**The loud symptom is the harmless one.** `git pull --ff-only` in such a worktree fails with *"Not possible to fast-forward, aborting"* because it is trying to fast-forward the branch onto `origin/main`. That is self-correcting: it refuses, and naming the branch explicitly (`git pull --ff-only origin <branch>`) works. **`git pull` WITHOUT `--ff-only` does not fail** — it merges `origin/main` into the branch and produces a merge commit. Quieter, and worse.
+
+**The real defect is the instrument, and it corrupted a safety check the same night.** A session checking whether its worktrees were safe to remove ran `git log @{u}..HEAD` and read **2 and 1 unpushed commits** on two branches that were byte-identical to their remotes. Both were fully pushed. The check that decides *"is anything at risk if I delete this worktree"* rests partly on that number, so the misconfiguration turns a safety question into a false positive — and a false negative is available the same way. Same class as the other instrument defects in this cluster: `git cherry` under squash-merge, ancestry as a proxy for content, a *job* conclusion answering a *step* question. **Name what the tool returns and check it is the same sentence as the question.**
+
+⛔⛔ **DO NOT FIX THIS WITH `git config push.default upstream`.** It is the first thing someone reaches for — it makes bare `git pull`/`git push` "work" — and it is **strictly worse than the defect**. With the upstream set to `origin/main`, `push.default upstream` makes a bare `git push` write the feature branch **onto `main`**, and on this repo push to `main` is not blocked server-side. The only reason that is not already possible is that `push.default` is **unset** (verified 2026-08-07: unset both local and global), so git uses `simple`, which refuses when the upstream's name differs from the local branch's name. **That default is load-bearing and must not be relaxed while the upstream is wrong.**
+
+**The fix is one flag at creation, not a config change.** Either pass `--no-track` on the `worktree add` so no upstream is set at all, or set the upstream to the branch's own remote ref after the first push. `--no-track` is the smaller change and leaves `@{u}` unresolvable, which fails **loudly** rather than answering the wrong question — the correct failure direction for an instrument.
+
+**Test it by the divergence, per #1000.** A test that creates a worktree and asserts `@{u}` is unset (or equals the branch's own remote) passes trivially; the case that distinguishes is asserting that `@{u}..HEAD` is **empty** for a branch whose tip equals its pushed remote ref. Under the current behaviour that assertion fails, which is the whole point.
+
+**Related:** #1078 (`new.ps1` printing cleanup advice that throws — the same script, the same "correct action, wrong accompanying claim" shape), #1060 (anchoring, which is what makes the worktree placement itself correct), #1000 (a control whose green is not evidence).
+
+**Source:** found 2026-08-07 from a `git pull --ff-only` failure while syncing a worktree, and connected to a bogus "unpushed" reading reported hours earlier in the same session — one root cause behind two symptoms that had been treated as unrelated. Mechanism confirmed at `new.ps1:133` and the `push.default` posture verified against the live config before the warning above was written.
