@@ -4733,7 +4733,7 @@ Retiring the tree costs the engine nothing operationally: **`tests/test_ech_egre
 
 ## 1021. The MFA enrollment confirm verifies the activating TOTP through a bool wrapper that discards the step, so it is never consumed (ASVS 6.5.1)
 
-> 🔢 **Filed 2026-08-04 — not started.** Value **6/10** · Difficulty **4/10** · _quick win_. `confirm_mfa_enrollment` verifies the enrolling code with `totp.verify_totp`, a documented thin bool wrapper that computes the matched time-step and then collapses it to a bool, so the step cannot be recorded. `enable_totp` leaves `last_totp_step` NULL, and `consume_totp_step` rejects only when `last is not None and last >= step` — so on first deployment the activating code would remain usable on the login path for the remainder of its own step.
+> ✅ **Fixed 2026-08-06 — enrollment now consumes the activating TOTP step (`verify_totp_step` + `consume_totp_step`), mirroring the login path.** Value **6/10** · Difficulty **4/10** · _quick win_. `confirm_mfa_enrollment` proved the enrolling code through the `totp.verify_totp` bool wrapper, which computed the matched time-step then collapsed it to a bool, so the step was never recorded; with `last_totp_step` left NULL by `enable_totp`, the activating code would have remained usable on the login path for the remainder of its own step on first deployment. The confirm site now takes the matched step from `verify_totp_step` and requires `consume_totp_step` before minting recovery codes / `enable_totp`, so the step is single-use (ASVS 6.5.1) and enable stays atomic.
 
 **Cluster:** Security / authentication. **Priority:** P2. **Verdict:** build (small). **Severity:** would leave a narrow second-factor replay window at enrollment on first deployment — bounded, not a bypass.
 
