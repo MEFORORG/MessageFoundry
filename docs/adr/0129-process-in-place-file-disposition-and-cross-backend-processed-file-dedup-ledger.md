@@ -9,7 +9,7 @@
   **cross-backend `processed_files` store table** that records a **HASHED per-file key** (never a
   cleartext filename), **after** the file's messages emit successfully, with the **file** (not each
   split message) as the dedup unit, bounded by an age+count prune.
-- **Backlog:** [BACKLOG #142](../BACKLOG.md). Sibling of [BACKLOG #114](../BACKLOG.md) / the
+- **Backlog:** [BACKLOG #142](../archive/backlog/BACKLOG-CLOSED.md#142-leave-source-file---process-in-place-fileftp-source-disposition). Sibling of [BACKLOG #114](../BACKLOG.md) / the
   [ADR 0031](0031-startup-connection-fault-isolation.md) amendment (opt-in startup directory
   validation), built in the same lane (S3a) and composing with it (a `leave` source validates a
   read-only share read-only).

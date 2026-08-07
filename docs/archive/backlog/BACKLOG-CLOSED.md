@@ -4290,7 +4290,7 @@ Two findings are worth surfacing here. **Posture B scores worse on Fails than Po
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** medium.
 
-**Closes (ASVS 5.0 L3):** 4.2.1, 4.4.1, 11.6.2, 12.1.3, 12.2.2, 12.3.1, 12.3.3, 12.3.5 · *(class 3)*
+**Closes (ASVS 5.0 L3):** 4.2.1, 4.4.1, 11.6.2 (PARTIAL - KEX-group pin inert until Python 3.15; see PHI.md §4), 12.1.3, 12.2.2, 12.3.1, 12.3.3, 12.3.5 · *(class 3)*
 
 **Scope:** Extend the existing exposed-gate pattern (which already refuses a non-loopback plaintext bind) to the remaining unencrypted and unauthenticated paths: the Posture-B proxy→engine cleartext `ws://` / `http://` hop, the `--allow-insecure-bind` escape, mTLS as an *identity* rather than a bare admission gate, KEX/cipher validation when TLS is proxy-terminated, and cert-authenticated (rather than IP-trusted) intra-service auth.
 

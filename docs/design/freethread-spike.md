@@ -171,7 +171,7 @@ built-in-type work scales 5.7–7.6×, and a **full HL7 parse into dict/list/str
 faster single-thread** (158k vs 11k msg/s), while python-hl7 (2.02×) and hl7apy (2.04×) both stall on their
 `Container(collections.abc.Sequence)` object trees (shared class/type contention under free-threading; not
 allocation, not GC). **So free-threading is viable IFF the hot-path parse is replaced by a low-allocation
-built-ins HL7 parser** ([BACKLOG #88](../BACKLOG.md)) — itself the highest-leverage perf win (helps
+built-ins HL7 parser** ([BACKLOG #88](../archive/backlog/BACKLOG-CLOSED.md#88-low-allocation-built-ins-hl7-parser--free-threading-keystone--14-single-thread-peek-speedup-p2)) — itself the highest-leverage perf win (helps
 single-process + sharding too; a parser ADR should precede the build). **WS4** (invariant preservation under
 threads) is re-enabled by the conditional GO and runs *after* the parser, *if* free-threading is chosen over
 ADR 0037 sharding. Full detail: ADR 0053 "WS3 (multi-core scaling)".

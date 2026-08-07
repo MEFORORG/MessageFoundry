@@ -24,8 +24,8 @@ is NOT the wall; see the B8 result below.**
 >
 > So **"cut the chain first, then multiply lanes" and the ranked-lever table are stale as a plan**: lever 1 was
 > built and buys nothing; lever 2 (`fifo_claim_batch`) is owner-closed **default-OFF**, priced at ≤ +4.7% against
-> a +8% bar ([BACKLOG #212](../../BACKLOG.md)); `commit_delay` / group-commit is **⛔ DECLINED**
-> ([BACKLOG #217](../../BACKLOG.md)). **Everything below is retained as the record of the diagnosis and of why the work
+> a +8% bar ([BACKLOG #212](../backlog/BACKLOG-CLOSED.md#212-fifo_claim_batch-decide-the-shipped-default-verification-done--it-is-not-a-no-op)); `commit_delay` / group-commit is **⛔ DECLINED**
+> ([BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path)). **Everything below is retained as the record of the diagnosis and of why the work
 > was sequenced this way — it is not the live plan.** Measured throughput lives in
 > [`benchmarks/TUNING-BASELINE.md`](../../benchmarks/TUNING-BASELINE.md); the frontier is **engine-side attribution**
 > (ADR 0107 §"Out of scope"), and there is no identified throughput lever today.
@@ -254,7 +254,7 @@ sharding only *multiplies* the per-lane rate, sub-linearly; it is worth far more
 | **5** | **Executor sizing / split** (give aioodbc its own pool, or raise the default) | Small secondary **above 4 lanes** (measured ~100→140); SQL-Server-only (asyncpg has no executor) | **build-with-guardrail** | Preserve the EF-6 no-MARS single-active-statement + cursor-close-before-release. |
 | **6** | **Dedicated ingest lane** (reserved server conn / SQLite priority-gate) | Robustness/no-drop, not throughput — eliminates silent intake socket-shed | **build-with-guardrail** | SQLite = bounded-fair priority-gate on `:799`, never a 2nd writer; `[inbound].max_ingress_depth` TCP-backpressure. |
 | **7** | **SQLite `synchronous=NORMAL` baseline** (measurement + `db_status()` observability) | Sizes the honest shipped-default SQLite number; not a throughput win | **build-with-guardrail** | Report a band; surface `synchronous`; document the durability relaxation. |
-| — | **PG `commit_delay`** | ~1.00× at sustained sharded rates (commits rarely bunch) | ⛔ **DECLINED** (was "defer, gated, off, last") — ADR 0107 / [BACKLOG #217](../../BACKLOG.md) | PG-only GUC; re-test only if batch-claim re-bunches commits. |
+| — | **PG `commit_delay`** | ~1.00× at sustained sharded rates (commits rarely bunch) | ⛔ **DECLINED** (was "defer, gated, off, last") — ADR 0107 / [BACKLOG #217](../backlog/BACKLOG-CLOSED.md#217-group-commit--durable-write--sequenced-after-the-claim-path) | PG-only GUC; re-test only if batch-claim re-bunches commits. |
 | — | `DELAYED_DURABILITY` · extend the SQLite committer to servers · READPAST in the FIFO claim · `shard_key`-as-index-lead · pool tuning | — | **REJECT / N/A** | durability / by-design / per-lane FIFO (#285) / page-latch refuted / pool ran 40. |
 
 ### Improvement model (honest)

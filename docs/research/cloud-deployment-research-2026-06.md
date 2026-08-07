@@ -5,7 +5,7 @@
 
 **Recorded 2026-06-22.** Captured after the container fast-follow (ADR 0017) shipped (PR #480:
 slim + `-sqlserver` engine images, compose, single-node k8s StatefulSet). This is the saved basis for
-[`BACKLOG.md`](../BACKLOG.md) **#41** — read it if/when a cloud or Kubernetes adopter materializes.
+[`BACKLOG-CLOSED.md`](../archive/backlog/BACKLOG-CLOSED.md#41-cloud--kubernetes-ha-deployment-packaging-container-fast-follow-follow-ons) **#41** — read it if/when a cloud or Kubernetes adopter materializes.
 
 > **Provenance / confidence.** Point-in-time, AI-assisted research synthesis (multi-agent web research +
 > a codebase assessment) — **not** a vendor benchmark or a committed plan. The dedicated *Mirth* research

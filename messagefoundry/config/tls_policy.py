@@ -70,6 +70,7 @@ __all__ = [
     "harden_cipher_suites",
     "harden_kex_groups",
     "harden_verify_flags",
+    "kex_groups_report",
     "relax_verify_expiry",
     "in_process_tls_revocation_refused",
     "insecure_hop_disposition",
@@ -160,6 +161,30 @@ def harden_kex_groups(ctx: ssl.SSLContext) -> str | None:
         logger.warning("Could not pin TLS key-exchange groups %r: %s", APPROVED_KEX_GROUPS, exc)
         return None
     return APPROVED_KEX_GROUPS
+
+
+def kex_groups_report() -> str:
+    """Report whether the approved KEX groups are PINNED on built contexts, or INHERITED (#338).
+
+    A report-only read-out, the KEX sibling of :func:`fips_attestation` — it changes NO live TLS
+    behaviour and never raises. It builds a throwaway probe context and asks the ONE authority,
+    :func:`harden_kex_groups`, what it manages to pin there, so the report can never disagree with what
+    the connectors actually do (a second, hand-rolled version-check would be exactly the drift #338 is
+    about). On every interpreter this project currently runs on ``SSLContext.set_groups`` is absent
+    (it is a **Python 3.15** API), so ``harden_kex_groups`` pins nothing and this returns the
+    ``inherited`` string; the first interpreter that grows the API flips it to ``pinned: ...``.
+
+    The ``inherited`` wording deliberately does NOT restate the measured accepted set (ffdhe2048 /
+    ffdhe3072 / secp521r1) — that lives in ``docs/PHI.md`` §4, and stating a load-bearing fact once
+    keeps the two from drifting (CLAUDE.md §11)."""
+    probe = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    pinned = harden_kex_groups(probe)
+    if pinned is not None:
+        return f"pinned: {pinned}"
+    return (
+        f"inherited (OpenSSL default group list; the approved pin {APPROVED_KEX_GROUPS} is inert "
+        "until Python 3.15 - see docs/PHI.md §4)"
+    )
 
 
 def harden_verify_flags(ctx: ssl.SSLContext) -> None:

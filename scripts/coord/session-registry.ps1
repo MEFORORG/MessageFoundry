@@ -38,6 +38,31 @@
     registry writes are event-driven, so nothing here can PROVE a session is gone -- only that it is
     present. A DEAD/STALE/not-found verdict must never by itself authorise a destructive action;
     combine it with an independent signal and let either one veto.
+
+    THE RECORD CARRIES NO BRANCH, AND TWO ROSTERS DISAGREE ABOUT ONE. A session record holds exactly
+    `cwd, entrypoint, kind, name, nameSource, peerProtocol, pid, procStart, sessionId, startedAt,
+    version` -- there is no branch field and never has been. So any branch you see printed beside a
+    session came from somewhere else, and the two sources answer DIFFERENT QUESTIONS while both being
+    labelled "branch":
+
+      presence.ps1 / occupancy.ps1   the WORKTREE's branch, read live from `git worktree list
+                                     --porcelain` (occupancy.ps1, the `branch ` porcelain line). Current
+                                     at the moment you asked. This is the one to trust for "what is that
+                                     checkout on NOW".
+      the session-list MCP tool      a SESSION attribute captured when the session registered. It does
+                                     not track a later `git switch`, so it is the branch the session
+                                     STARTED on.
+
+    Measured 2026-08-06: for ONE checkout the two rosters reported two DIFFERENT branch names -- the
+    live roster the branch that checkout had been switched onto, the session list the one it registered
+    with. Neither was wrong; they were answering different questions. NEVER quote a branch from the
+    session list as a checkout's current branch, and never treat a disagreement between the two as
+    evidence that either roster is broken.
+
+    RELATED TRAP IN THE SAME FAMILY: the session list also exposes an `isRunning` flag. It means "this
+    session is currently EXECUTING A TURN", not "this session is alive" -- an idle session between turns
+    reads false while being perfectly reachable. It is not a liveness fence and must not be used as one;
+    that is what Get-SessionLiveness above is for, subject to the positive-answer-only rule.
 #>
 
 # Every config root that actually holds a session registry.

@@ -16,20 +16,20 @@ destination.
 In scope:
 
 - The **3 + 1 stage** queue — `ingress → routed → outbound`, plus the optional `Stage.RESPONSE`
-  re-ingress token ([`store/store.py:330-357`](../../messagefoundry/store/store.py)).
+  re-ingress token ([`store/store.py:330-357`](../../../messagefoundry/store/store.py)).
 - **ACK-on-receipt**: AA is built only after `enqueue_ingress` durably commits
-  ([`pipeline/wiring_runner.py:3717-3745`](../../messagefoundry/pipeline/wiring_runner.py)), and the
+  ([`pipeline/wiring_runner.py:3717-3745`](../../../messagefoundry/pipeline/wiring_runner.py)), and the
   four pre-ACK failure classes that still **NAK synchronously** (decode `AR` :3497, NUL `AR` :3523,
   strict-validate `AE` :3660, streaming-detach `AE` :3699).
 - **Transactional stage handoff** — `route_handoff` / `transform_handoff` / the Step-A combined
-  `handoff` / `ingress_handoff` ([`store/base.py:289-366`, `:703-726`](../../messagefoundry/store/base.py)) —
+  `handoff` / `ingress_handoff` ([`store/base.py:289-366`, `:703-726`](../../../messagefoundry/store/base.py)) —
   and the at-least-once re-run invariant that rests on them.
 - **Crash recovery**: `reset_stale_inflight` across every stage, and its ownership-scoped form
   (`OwnedLanes`, ADR 0073) for **engine shards** over one unified store
-  ([`pipeline/engine.py:809-874`](../../messagefoundry/pipeline/engine.py)).
+  ([`pipeline/engine.py:809-874`](../../../messagefoundry/pipeline/engine.py)).
 - The **disposition finalizer as sole authority** and the seven-member `MessageStatus` set
   (`RECEIVED / ROUTED / UNROUTED / PROCESSED / FILTERED / ERROR / NOT_DEPLOYED`,
-  [`store/store.py:311-319`](../../messagefoundry/store/store.py)).
+  [`store/store.py:311-319`](../../../messagefoundry/store/store.py)).
 - **Seq-only per-lane FIFO** (ADR 0059), the claim family (`claim_next_fifo`,
   `claim_next_fifo_batch` ADR 0058, `claim_fifo_heads` + `list_fifo_lanes` ADR 0066,
   `release_claimed` / `reschedule_claimed` ADR 0070), pooled `StageDispatcher` (**the shipped
