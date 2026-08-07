@@ -63,13 +63,25 @@ def shell(command: str, cwd: Path | str) -> dict[str, Any]:
     }
 
 
-@pytest.fixture
-def repo(tmp_path: Path) -> SimpleNamespace:
+@pytest.fixture(scope="module")
+def repo(tmp_path_factory: pytest.TempPathFactory) -> SimpleNamespace:
     """A governed primary with one worktree of EACH family.
 
     ``sibling`` is what new.ps1 produces and what remove.ps1 can resolve. ``managed`` is where the
     Claude Code harness puts a session, and is the family both remedy tools refuse.
+
+    MODULE-SCOPED BECAUSE IT IS SUBPROCESS-BOUND AND READ-ONLY. Building it costs six `git` spawns,
+    and function scope paid that six times over -- 36 process launches, which is cheap on Linux and
+    expensive on a hosted Windows runner. Nothing here mutates it: every test feeds a payload to the
+    hook, which DENIES before git ever runs, so no `worktree remove` is ever executed against this
+    tree. Sharing it is safe for that specific reason, not by convention -- if a case is ever added
+    that really removes a worktree, it needs its own function-scoped fixture rather than this one.
+
+    This is not a micro-optimisation. `test (windows-2025)` has a 36-minute `step_timeout` against a
+    suite that habitually finishes near 33, and the first version of this file pushed that leg to
+    37m06s and timed it out. See BACKLOG #1084.
     """
+    tmp_path = tmp_path_factory.mktemp("remedy_families")
 
     def git(*args: str, cwd: Path | None = None) -> None:
         subprocess.run(

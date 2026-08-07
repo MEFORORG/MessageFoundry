@@ -5740,3 +5740,30 @@ environments.py:79 `if not base_dir: return cwd`              <-- and base_dir i
 **Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
 
 **Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
+
+## 1084. The Windows test leg runs at ~92% of its `step_timeout`, so any test addition tips it into a timeout that reads as a flake
+
+> 🔢 **Filed 2026-08-07 — not started.** Value **7/10** · Difficulty **4/10** · _do it_. `windows-2025` and `windows-2022` carry `step_timeout: 36` (`ci.yml`, matrix `W22`/`W25`) against a `Tests (pytest)` step that habitually finishes near **33 minutes** — about **17% headroom**, and less than that on a slow runner. Measured 2026-08-07: adding one 249-line subprocess-bound test file took the leg from 33m09s to **37m06s** and it died with *"The action 'Tests (pytest)' has timed out after 36 minutes"*. The failure names no test and points at whatever file was executing when the clock ran out, so it reads as an unrelated flake in a random module.
+
+**Cluster:** CI capacity / diagnosability. **Priority:** P2. **Verdict:** build. **Severity:** no product effect. The cost is that a **blocking, required** check fails for a reason unconnected to the change, and the obvious responses are all wrong.
+
+**The three wrong answers this failure invites, and why each is wrong.**
+
+1. **"Flake — re-run it."** This is how a systematic overrun gets logged as a flake for months. This repo's two famous flakes were a livelock and a test that was right (#1014 and its neighbour), so the prior here is bad.
+2. **"The change broke something."** The timeout names the file that happened to be running — measured here as `tests/test_tls_floor_probe.py` on a PR that touched only `worktree_gate.ps1`, its tests, and one BACKLOG line. **Location and change do not line up**, which is the tell that the elapsed clock, not the content, is the cause.
+3. **"Raise `step_timeout`."** The reflex, and it trades away a real diagnostic. `step_timeout` (36) is held deliberately under `job_timeout` (46) so a process-level deadlock **below** pytest surfaces as a *step* failure rather than a job kill — `ci.yml` says so in as many words. Raising it to buy a green tick removes the signal the gap exists to produce.
+
+**What distinguishes this from an ordinary slow suite: the margin is invisible until it is gone.** Nothing reports "the Windows leg finished at 92% of its budget". A PR that adds two minutes is indistinguishable, at review time, from one that adds none — and the one that tips it over is blamed. The measured spread across three PRs on the same day was 33m09s / 37m06s / 38m20s, so **runner variance alone is comparable to the headroom**, which also means a re-run can flip the verdict without anything changing.
+
+**Fix directions, offered not decided.**
+
+- **Report the margin.** Emit the step's elapsed time and its percentage of `step_timeout` in the job summary. Cheapest by far, changes no behaviour, and turns an invisible cliff into a number that trends. Probably do this regardless of what else is chosen.
+- **Split the Windows leg.** Two steps under one job, each with its own budget. Keeps the deadlock diagnostic and roughly halves the exposure; costs matrix complexity.
+- **Make the subprocess-bound gate tests cheaper.** They dominate: `tests/test_worktree_gate*.py` spawn `pwsh` and `git` per case, which is seconds each on a hosted Windows runner and milliseconds on Linux. Module-scoping one read-only fixture in `test_worktree_gate_remedy_families.py` cut that file 51% locally (10.66s → 5.26s) by removing 30 of its 36 `git` spawns; the same shape is available in its siblings. This is the highest-yield option and the least structural.
+- **Do NOT** simply raise the cap, per (3) above.
+
+**A negative control per #1000.** Whatever is built, it must be shown to fail on a suite that genuinely overruns — a margin report that never goes red, or a split that silently swallows a hang, would be the same class of green-that-cannot-see this cluster keeps producing.
+
+**Related:** #1057 (the change that surfaced it — its test file was the straw, not the cause), #1014 (a "flake" that was a real failure), #1000 (a control whose green is not evidence).
+
+**Source:** found 2026-08-07 by the coordinator, from a `test (windows-2025)` failure on PR #261. Diagnosed by comparing job wall time across three PRs rather than by reading the failing test, and by reading `step_timeout` out of `ci.yml` rather than inferring it from the error text. Three alternative explanations — environmental, content-related, and the exit-139 native-crash class of #264 — were each ruled out against evidence before the elapsed-time explanation was accepted.
