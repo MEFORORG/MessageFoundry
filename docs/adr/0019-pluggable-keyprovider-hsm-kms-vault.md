@@ -326,7 +326,7 @@ the built `KeyProvider` seam **is** that integration point, and the store now so
 This is the honest flip: a **Pass with two documented residuals**, not an unqualified whole-requirement
 Pass. The cross-document scorecard recompute (combined **189 / 20 / 3 / 133 → 192 / 20 / 0 / 133** once
 4.1.5 / 12.1.4 / 13.3.3 all flip; V13 **+1 Pass / −1 Fail**) is applied by the **Coordinator's
-single-writer score-doc sweep** ([ASVS-OPTION-A-MULTISESSION-PLAN.md](../releases/ASVS-OPTION-A-MULTISESSION-PLAN.md));
+single-writer score-doc sweep** (ASVS-OPTION-A-MULTISESSION-PLAN.md);
 this ADR records 13.3.3's verdict-flip intent only — it edits **no** score doc.
 
 ## Consequences

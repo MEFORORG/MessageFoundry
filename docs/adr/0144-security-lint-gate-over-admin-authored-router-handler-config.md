@@ -66,7 +66,10 @@ the `ruff`/`mypy` run-if-installed convention in escalation.
     logger-shaped receiver** (`log`/`logger`/`logging`/`getLogger(...)`; `.debug` excluded) — the
     CLAUDE.md §9 "never log full bodies at INFO+" rule. The logger-receiver gate keeps a FHIR/ACK/
     validation builder (`outcome.error(...)`, `warnings.warn(...)`) from being mistaken for a sink.
-    Scoped to `@router`/`@handler` **bodies** (not the signature/defaults).
+    Scans **every** function body — a decorated `@router`/`@handler` or an undecorated `_*` transform
+    helper — keying on the first positional parameter as the message symbol (not the signature/defaults).
+    Widened from decorated-scope by BACKLOG #337 (see the 2026-08-05 amendment); `impure-transform`
+    stays `@router`/`@handler`-scoped.
   - **`unsafe-db-lookup`** — a **non-constant** interpolation (an f-string with a value, `+`/`%` with a
     variable operand, `.format(...)`) flowing into the `db_lookup`/`fhir_lookup` **statement/query**
     argument (2nd positional or `statement=`/`query=`). A pure-literal concat folds to a constant and is
@@ -187,12 +190,24 @@ not a boundary) and recorded here rather than chased into diminishing-returns pr
   log.info(body)` — **recovered by the opt-in Semgrep taint leg (Increment 3, Control B)**; still a
   false-negative of the stdlib `check` itself.
 - **Aliased-import evasion** (`from subprocess import run as r; r(...)`) is out of scope of the AST scan —
-  **recovered by the Semgrep leg (Increment 3)**, which resolves the import alias. `getattr(os, "system")`
-  remains a false-negative; the lint is a fallible-author guardrail, not a malicious-bypass boundary
-  (that is ADR 0087's job).
-- **Decorated-scope only** for `phi-to-log`/`impure-transform`: PHI logged or a wall-clock read inside an
-  **undecorated** helper is not scanned (the trade that keeps the shipped `_pdf_mdm_transforms.py`
-  timestamp fallback clean).
+  **recovered by the Semgrep leg (Increment 3)**, which resolves the import alias. A *constant*
+  `getattr(mod, "name")` indirection is now resolved in `_dotted_call_name` (BACKLOG #337), so
+  `getattr(os, "system")(...)` **is** flagged (and the same splice flags a `getattr(time, "time")()`
+  wall-clock read). The remaining false-negatives are a *dynamic* `getattr(os, name)`, a
+  `globals()["os"]` / subscript indirection, and the opt-in Semgrep leg (which still carries no `getattr`
+  pattern). The lint is a fallible-author guardrail, not a malicious-bypass boundary (that is ADR 0087's job).
+- **`phi-to-log` reaches undecorated `_*` helpers** (BACKLOG #337): the decompose-by-role convention
+  (`docs/CONNECTIONS.md` §"Decomposing by role", #226) steers field-level PHI handling into undecorated
+  `_<feed>_transforms.py` helpers, so `phi-to-log` scans **every** function body — decorated or not —
+  keying on the first positional parameter as the message symbol. Residuals: an `async def` handler is
+  still scanned by neither rule (`_message_fn_decorator` is `FunctionDef`-only — a third gap this lane
+  reported but did not scope), and a helper whose first parameter is *not* the message is an accepted
+  advisory FP/FN tail.
+- **`impure-transform` stays decorated-scope only**: a wall-clock read inside an **undecorated** helper is
+  not scanned — the trade that keeps the shipped `_pdf_mdm_transforms.py` ingest-time timestamp fallback
+  clean (an undecorated `time.gmtime(ingest_time or time.time())`). This, not `phi-to-log`, is the actual
+  justification for the decorated-scope gate; widening `impure-transform` would re-introduce that false
+  positive and red the samples gate.
 - **Non-recursive** (`glob("*.py")`, no subdirs) — mirrors the existing `_check_raise_fstring` convention.
 - **Trusted-identifier concat** (`"select … from " + TABLE`, PHI parameterized) still nudges — SQL cannot
   parameterize an identifier, so the concatenation reminder is intentional (silence it with a literal
@@ -210,6 +225,23 @@ not a boundary) and recorded here rather than chased into diminishing-returns pr
   *matches* a shipped dep's (dependency-confusion / shadowing) is vetted — a name-only AST scan cannot
   resolve the distribution behind an import. Distinct typosquat/hallucinated names are caught; same-name
   substitution is ADR 0087's boundary, not this lint's.
+
+> **AMENDED 2026-08-05 (BACKLOG #337) — two recall gaps closed; the severity of a miss is unchanged.**
+> A *constant* `getattr(mod, "name")` indirection now resolves in `_dotted_call_name`, so
+> `getattr(os, "system")(...)` is flagged for `ambient-authority` (the shared resolver also flags a
+> `getattr(time, "time")()` wall-clock read for `impure-transform`), and `phi-to-log` now reaches
+> undecorated `_*` transform helpers. The severity framing is deliberately conservative and holds in
+> **both** sandbox postures: the lint is advisory and pre-deployment, and an evasion reaches only **host**
+> actions the ADR 0087 sandbox does not confine. `DEFAULT_FORBIDDEN_MODULES` (`pipeline/sandbox.py`) blocks
+> `socket`/`ssl`/`asyncio`/`multiprocessing`, the I/O-bearing `messagefoundry.*` subpackages and
+> `cryptography`, but **not `os` or `subprocess`** — ADR 0087 confines the **address space**, not the
+> **host**. So under `[sandbox].mode=off` the author already holds in-process execution, and under
+> `mode=subprocess` an evasion still reaches neither the DEK nor the audit chain: no PHI-exposure path and
+> no runtime-behaviour change in either posture ("a filter, not a fix"). This should be **re-scored upward
+> when [ADR 0147](0147-hardened-runtime-isolation-for-router-handler-code-ipc-brokered-sandbox-extends-adr-0087.md)
+> lands** (OS-level default-deny; *Proposed*, no code today), at which point the lint becomes load-bearing
+> for exactly the class OS confinement is meant to close. MessageFoundry is a not-deployed beta, so a miss
+> "would slip past a deploying site's CI", never "PHI is exposed".
 
 ## Increment 3 (built)
 

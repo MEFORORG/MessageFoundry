@@ -772,6 +772,14 @@ class UserRecord:
     # via the store's get_totp_secret / get_recovery_code_hashes accessors.
     totp_enabled: bool = False
     totp_enrolled_at: float | None = None
+    # Federated-account identity (BACKLOG #1015, ADR 0142): the verified OIDC ``(issuer, sub)`` this
+    # AD-backed account's federated identity is PINNED to. Non-reassignable, unlike the display username.
+    # The account is still resolved by its username; this binding only refuses a login whose username
+    # resolves here but carries a different subject. NULL on a local account and on an AD account that
+    # has never completed a federated login. Set on the first federated login and enforced on every
+    # subsequent one, so a reassigned username cannot hand the account to a new subject.
+    oidc_issuer: str | None = None
+    oidc_subject: str | None = None
 
     @classmethod
     def from_mapping(cls, d: Mapping[str, Any]) -> UserRecord:
@@ -793,6 +801,8 @@ class UserRecord:
             channel_scope=d.get("channel_scope"),
             totp_enabled=bool(d.get("totp_enabled", 0)),
             totp_enrolled_at=_opt_float(d.get("totp_enrolled_at")),
+            oidc_issuer=d.get("oidc_issuer"),
+            oidc_subject=d.get("oidc_subject"),
         )
 
 
@@ -1595,7 +1605,9 @@ CREATE TABLE IF NOT EXISTS users (
     totp_enabled         INTEGER NOT NULL DEFAULT 0,  -- TOTP enrolled + confirmed active
     totp_enrolled_at     REAL,
     totp_recovery_codes  TEXT,                 -- JSON list of argon2id hashes of single-use recovery codes
-    last_totp_step       INTEGER               -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
+    last_totp_step       INTEGER,              -- highest TOTP time-step already consumed (single-use within window, ASVS 6.5.1); NULL = none yet
+    oidc_issuer          TEXT,                 -- federated identity (BACKLOG #1015): verified OIDC issuer; NULL = not federated / never federated-logged-in
+    oidc_subject         TEXT                  -- federated identity (BACKLOG #1015): verified OIDC sub; the account's federated login is pinned to (issuer, sub), refusing a reassigned username
 );
 
 CREATE TABLE IF NOT EXISTS roles (
@@ -3042,12 +3054,17 @@ class MessageStore:
         # --- end custom RBAC roles (ADR 0045) --------------------------------
         # MFA (WP-14): a pre-existing DB's users predate the TOTP columns — ALTER them in (NULL/0 on
         # existing rows = "not enrolled", correct). Idempotent: skipped once present.
+        # Federated (issuer, sub) identity keying (BACKLOG #1015): a pre-existing DB's users predate the
+        # columns — ALTER them in (NULL on existing rows = "not yet federated", byte-identical to before,
+        # since the username stayed the sole key). Idempotent: skipped once present.
         for column, decl in (
             ("totp_secret", "TEXT"),
             ("totp_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("totp_enrolled_at", "REAL"),
             ("totp_recovery_codes", "TEXT"),
             ("last_totp_step", "INTEGER"),
+            ("oidc_issuer", "TEXT"),
+            ("oidc_subject", "TEXT"),
         ):
             if column not in user_cols:
                 await db.execute(f"ALTER TABLE users ADD COLUMN {column} {decl}")
@@ -8161,6 +8178,20 @@ class MessageStore:
             await self._db.execute(
                 "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
                 (scope_json, now, user_id),
+            )
+            await self._commit()
+
+    async def set_user_federated_subject(
+        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
+    ) -> None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015). Recorded on the first
+        federated login so a later login carrying a different ``sub`` for a reassigned username is
+        refused rather than handed the prior subject's account."""
+        now = time.time() if now is None else now
+        async with self._lock:
+            await self._db.execute(
+                "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
+                (issuer, subject, now, user_id),
             )
             await self._commit()
 
