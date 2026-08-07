@@ -4,7 +4,7 @@
 # answers "what is the most this engine can do?" by climbing concurrency until throughput plateaus (the
 # durable-write path saturates). The SLO enforces only the hardware-INDEPENDENT conformance invariants
 # (zero loss, error rate); throughput here is MEASURED and reported, never floored — see the v0.1 plan's
-# two-tier Gate #3 (docs/releases/v0.1-EXECUTION-PLAN.md §Q3). Serve harness/config/load, then:
+# two-tier Gate #3 (v0.1 execution plan §Q3, maintainer-internal). Serve harness/config/load, then:
 #   python -m harness --load closed-loop --engine URL --token T
 #
 # IMPORTANT: every number here is generic and synthetic — illustrative concurrency steps + an ADT-

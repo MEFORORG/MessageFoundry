@@ -217,4 +217,4 @@ The published numbers are a reference point, not a promise. To establish **your*
 *Companion: [`../LOAD-TESTING.md`](../LOAD-TESTING.md) (harness guide), the `reference` / `fanout-baseline`
 / `closed-loop` / `failover` profiles under `harness/load/profiles/`, the on-demand
 [`throughput-baseline`](../../.github/workflows/benchmark.yml) workflow, and the v0.1 plan's two-tier
-Gate #3 ([`../releases/v0.1-EXECUTION-PLAN.md`](../releases/v0.1-EXECUTION-PLAN.md) §Q3).*
+Gate #3 (`../releases/v0.1-EXECUTION-PLAN.md` §Q3).*
