@@ -35,6 +35,7 @@ are immune: every path in them is absolute, and the classification under test re
 
 from __future__ import annotations
 
+import os
 import re
 import shutil
 import subprocess
@@ -214,10 +215,24 @@ def test_a_junction_spelling_of_a_sibling_fails_toward_the_universal_remedy(
     makes less likely rather than more. Unlike rule 3c, no security decision rides on this -- the refusal
     is unchanged and only the remedy string branches.
     """
+    # `cmd` exists only on Windows, and a returncode guard cannot express that: on Linux
+    # subprocess.run RAISES FileNotFoundError before there is a returncode to inspect, so the test
+    # ERRORS instead of skipping. Gate on the platform first -- the same shape rule 3d's own comment
+    # records, where a construct "passed on Windows and failed on the Linux CI leg". OSError is still
+    # caught because `cmd` existing does not mean junction creation is permitted.
+    if os.name != "nt":
+        pytest.skip(
+            "junctions are a Windows filesystem feature; `cmd /c mklink` does not exist here"
+        )
     link = tmp_path / "viajunction"
-    made = subprocess.run(
-        ["cmd", "/c", "mklink", "/J", str(link), str(repo.sibling)], capture_output=True, text=True
-    )
+    try:
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(link), str(repo.sibling)],
+            capture_output=True,
+            text=True,
+        )
+    except OSError as exc:  # cmd present but unusable
+        pytest.skip(f"could not invoke mklink: {exc}")
     if made.returncode != 0:
         pytest.skip(f"could not create a junction: {made.stderr or made.stdout}")
 
