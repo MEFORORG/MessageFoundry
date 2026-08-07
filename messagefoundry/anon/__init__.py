@@ -15,19 +15,22 @@ the same surrogate within a dataset and is re-identification-resistant across da
 Public surface:
 
 * :func:`anonymize` — de-identify one HL7 message (raises nothing PHI-bearing).
-* :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_check`; raises
-  :class:`LeakError` (token categories only, never the value) if any known partner/site token
-  survives. This is how you *earn* the right to write a dataset to a shareable location.
-* :func:`leak_check` — forbidden-token hits via the publish-guard authority (ADR 0030 §5).
+* :func:`anonymize_checked` — :func:`anonymize` + a **fail-closed** :func:`leak_report`; raises
+  :class:`LeakError` (token categories + PHI shapes/addresses only, never a value) if any known
+  partner/site token survives **or** a structural PHI shape sits in a field no rule mapped. This is
+  how you *earn* the right to write a dataset to a shareable location.
+* :func:`leak_check` / :func:`leak_report` — token hits + structural PHI-shape detection over the
+  unmapped fields + the unmapped-field coverage report (ADR 0030 §5, BACKLOG #331).
 """
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 from .hl7 import anonymize_message
 from .keying import Keyer
-from .leak import LeakCheckUnavailable, leak_check
+from .leak import LeakCheckUnavailable, LeakReport, coverage_clause, leak_check, leak_report
 from .rules import DEFAULT_RULES, AnonError, FieldRule, RuleError, SurrogateKind, load_rules
 
 __all__ = [
@@ -37,11 +40,13 @@ __all__ = [
     "Keyer",
     "LeakCheckUnavailable",
     "LeakError",
+    "LeakReport",
     "RuleError",
     "SurrogateKind",
     "anonymize",
     "anonymize_checked",
     "leak_check",
+    "leak_report",
     "load_rules",
 ]
 
@@ -79,18 +84,37 @@ def anonymize_checked(
     salt: str,
     overlay: Path | None = None,
     rules: tuple[FieldRule, ...] | None = None,
+    require_live_denylist: bool = False,
+    on_report: Callable[[LeakReport], None] | None = None,
 ) -> str:
-    """:func:`anonymize`, then a fail-closed :func:`leak_check`; raise :class:`LeakError` on any hit.
+    """:func:`anonymize`, then a fail-closed :func:`leak_report`; raise :class:`LeakError` on any hit.
 
     Use this whenever the output may be persisted/shared — a silently-missed token is worse than no
-    anonymization (ADR 0030 §5). The raised error names token *categories* only, never the value.
+    anonymization (ADR 0030 §5). The verification is now two-layered (BACKLOG #331): the known-token
+    denylist **and** high-precision structural PHI-shape detectors over the fields no rule matched,
+    scoped by the same ``rules`` the anonymizer applied. The raised error names token *categories* and
+    field *shapes/addresses* only, never a value, and carries a coverage clause (the count + addresses
+    of the unmapped fields, whether the denylist tables were live) so a refusal is legible.
+
+    ``require_live_denylist`` makes a non-live token source (``token_floor_reason`` set) a refusal
+    cause in its own right — the strict lever for a deployment that must not de-identify with the
+    customer denylist unloaded. It defaults **off**: the structural detectors are the live backstop,
+    and CI/OSS/fork runs legitimately have no token source. ``on_report`` receives the full
+    :class:`LeakReport` on both the clean and the refusing path (default: no emission).
     """
-    output = anonymize(raw, salt=salt, overlay=overlay, rules=rules)
-    hits = leak_check(output)
-    if hits:
+    effective = rules if rules is not None else load_rules(overlay)
+    output = anonymize(raw, salt=salt, rules=effective)
+    report = leak_report(output, rules=effective)
+    if on_report is not None:
+        on_report(report)
+    causes = list(report.hits)
+    if require_live_denylist and report.token_floor_reason is not None:
+        causes.append(f"denylist not live: {report.token_floor_reason}")
+    if causes:
         raise LeakError(
             "anonymized output still carries forbidden token(s): "
-            + "; ".join(sorted(set(hits)))
+            + "; ".join(sorted(set(causes)))
             + " — refusing to emit (fail closed). Extend the rule map for the missed field(s)."
+            + coverage_clause(report)
         )
     return output
