@@ -5,7 +5,7 @@
 > `wshallwshall/MessageFoundry` is retained only as an **inactive, read-only archive** (never deleted;
 > it holds the full history and internal-only material). This document records that decision and the
 > community/governance plan that follows from it. Community go-live is still sequenced against the
-> **v0.1 "enterprise-ready" milestone** (see the [v0.1 release plan](releases/v0.1-PLAN.md) and
+> **v0.1 "enterprise-ready" milestone** (see the v0.1 release plan and
 > [`EARLY-ADOPTER-GUIDE.md`](EARLY-ADOPTER-GUIDE.md)).
 
 ---
@@ -183,7 +183,7 @@ This is a healthcare engine; these are hard gates, not nice-to-haves.
 intake; publish the roadmap; curate the first `good first issue` set. This builds signal and surfaces a
 possible second maintainer at near-zero risk.
 *Exit gate:* v0.1 GA tagged; the v0.1 hard gates (PHI log redaction, no "experimental" backends,
-published throughput baseline, off-loopback/TLS) met per the [v0.1 release plan](releases/v0.1-PLAN.md).
+published throughput baseline, off-loopback/TLS) met per the v0.1 release plan.
 
 **Phase 2 — Open code contribution.** Apply contributor-mode branch protection (§5); announce "open for
 contributions".

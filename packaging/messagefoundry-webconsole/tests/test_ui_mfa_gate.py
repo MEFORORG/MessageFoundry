@@ -13,6 +13,7 @@ Each test names the mutation that must turn it RED.
 from __future__ import annotations
 
 import httpx
+import pytest
 
 from messagefoundry.api import create_app
 from messagefoundry.auth import Role, totp
@@ -21,6 +22,29 @@ from messagefoundry.config.settings import AuthSettings
 from messagefoundry.pipeline import Engine
 
 PW = "a-strong-test-passphrase"  # >=15, no app/vendor terms — satisfies the ASVS policy (WP-3)
+
+
+class _PinnedClock:
+    """Minimal ``time`` stand-in exposing only ``time()`` at a fixed instant.
+
+    A local twin of ``tests/_totp_clock._PinnedClock`` — this package has its own test root and does
+    not import the engine suite's helpers. ``totp`` reads the wall clock solely as ``time.time()``, so
+    swapping the module reference pins the TOTP step deterministically while leaving every other clock
+    real.
+    """
+
+    def __init__(self, instant: float) -> None:
+        self._instant = instant
+
+    def time(self) -> float:
+        return self._instant
+
+
+def _pin_totp_clock(monkeypatch: pytest.MonkeyPatch, instant: float) -> None:
+    """Pin the ``totp`` module clock so an enroll ceremony and a later /ui/mfa gate verify land in
+    distinct, provably-adjacent steps — needed now that enrollment consumes the activating step
+    (BACKLOG #1021), so a gate code from the SAME step would be refused as a replay."""
+    monkeypatch.setattr(totp, "time", _PinnedClock(instant))
 
 
 async def _service(engine: Engine, **kw: object) -> AuthService:
@@ -185,7 +209,9 @@ async def test_the_page_asks_for_a_code_once_a_factor_exists(engine: Engine) -> 
         assert 'name="password"' not in r.text
 
 
-async def test_a_satisfied_session_is_bounced_off_the_page(engine: Engine) -> None:
+async def test_a_satisfied_session_is_bounced_off_the_page(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """RED when: the mfa_satisfied early-return is removed from GET /ui/mfa.
 
     Without it a verified operator who navigates back to /ui/mfa is asked to re-verify forever.
@@ -193,22 +219,36 @@ async def test_a_satisfied_session_is_bounced_off_the_page(engine: Engine) -> No
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
+        # Enroll consumes the activating TOTP step (BACKLOG #1021), so the gate code must sit in a
+        # strictly later step: pin the enroll ceremony to t0 and the gate verify to t0+period.
+        t0 = 1_000_000.0
+        _pin_totp_clock(monkeypatch, t0)
         secret = await _enroll_totp(service)
         await _login(c)
-        assert (await c.post("/ui/mfa", data={"code": totp.totp(secret)})).status_code == 303
+        t1 = t0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        gate = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
+        assert gate.status_code == 303
         r = await c.get("/ui/mfa")
         assert r.status_code == 303 and r.headers["location"] == "/ui"
 
 
-async def test_a_valid_code_clears_the_gate(engine: Engine) -> None:
+async def test_a_valid_code_clears_the_gate(
+    engine: Engine, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """RED when: POST /ui/mfa stops calling verify_mfa (or stops redirecting on success)."""
     service = await _service(engine)
     await _add(service, "op", Role.OPERATOR)
     async with _client(engine, service) as c:
+        # Enroll consumes the activating step (BACKLOG #1021); the gate code lives in a later step.
+        t0 = 1_000_000.0
+        _pin_totp_clock(monkeypatch, t0)
         secret = await _enroll_totp(service)
         await _login(c)
         assert (await c.get("/ui/messages")).status_code == 303  # confined
-        r = await c.post("/ui/mfa", data={"code": totp.totp(secret)})
+        t1 = t0 + totp.DEFAULT_PERIOD
+        _pin_totp_clock(monkeypatch, t1)
+        r = await c.post("/ui/mfa", data={"code": totp.totp(secret, now=t1)})
         assert r.status_code == 303 and r.headers["location"] == "/ui"
         assert (await c.get("/ui/messages")).status_code == 200  # released
 

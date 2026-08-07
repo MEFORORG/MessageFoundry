@@ -118,7 +118,17 @@ function Get-SelfPids([int]$Override) {
 # --- Collect ------------------------------------------------------------------------------------
 $occ = Get-WorktreeOccupancy -Repo $Repo -ConfigRoot $ConfigRoot -StartSkewMinutes $StartSkewMinutes
 if (-not $occ.RepoFound) {
-    if ($Json) { "[]" | Write-Output } else { Write-Host "Not inside a git repository -- nothing to scope presence to." }
+    # THE STDERR RECEIPT BELONGS HERE TOO, and its absence was a hole in the control this script
+    # already documents. The -Json block further down emits an UNAVAILABLE receipt so that "the fence
+    # could not look" stops rendering as an indistinguishable `[]` -- but THIS path returned the same
+    # empty array with no receipt at all, so one of the two ways of being unable to look stayed
+    # silent on exactly the channel a machine consumer reads. A caller that correctly checks stderr
+    # for the receipt would still read "not a git repository" as "nobody is live".
+    if ($Json) {
+        [Console]::Error.WriteLine("presence: roster UNAVAILABLE -- not inside a git repository, so there is nothing to scope presence to. An empty list here is NOT 'nobody is live'.")
+        "[]" | Write-Output
+    }
+    else { Write-Host "Not inside a git repository -- nothing to scope presence to." }
     exit 0
 }
 

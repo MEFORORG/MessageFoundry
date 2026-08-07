@@ -1352,7 +1352,8 @@ _SCHEMA: list[str] = [
         failed_attempts INT NOT NULL DEFAULT 0, locked_until FLOAT NULL,
         channel_scope NVARCHAR(MAX) NULL, totp_secret NVARCHAR(MAX) NULL,
         totp_enabled BIT NOT NULL DEFAULT 0, totp_enrolled_at FLOAT NULL,
-        totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL)""",
+        totp_recovery_codes NVARCHAR(MAX) NULL, last_totp_step INT NULL,
+        oidc_issuer NVARCHAR(MAX) NULL, oidc_subject NVARCHAR(MAX) NULL)""",
     """IF COL_LENGTH('users','channel_scope') IS NULL
         ALTER TABLE users ADD channel_scope NVARCHAR(MAX) NULL""",
     # MFA (WP-14): TOTP columns ALTER-ed in for a pre-existing users table (idempotent).
@@ -1367,6 +1368,12 @@ _SCHEMA: list[str] = [
     # Single-use TOTP within the step window (ASVS 6.5.1): highest consumed time-step.
     """IF COL_LENGTH('users','last_totp_step') IS NULL
         ALTER TABLE users ADD last_totp_step INT NULL""",
+    # Federated (issuer, sub) identity keying (BACKLOG #1015): COL_LENGTH-gated ADD on a pre-existing
+    # users table. NULL on existing rows = "not yet federated" (username stays the sole key). Idempotent.
+    """IF COL_LENGTH('users','oidc_issuer') IS NULL
+        ALTER TABLE users ADD oidc_issuer NVARCHAR(MAX) NULL""",
+    """IF COL_LENGTH('users','oidc_subject') IS NULL
+        ALTER TABLE users ADD oidc_subject NVARCHAR(MAX) NULL""",
     """IF OBJECT_ID('roles','U') IS NULL CREATE TABLE roles (
         id NVARCHAR(64) NOT NULL PRIMARY KEY, display_name NVARCHAR(128) NOT NULL,
         description NVARCHAR(512) NULL, builtin BIT NOT NULL DEFAULT 1,
@@ -9441,6 +9448,16 @@ class SqlServerStore:
         await self._execute(
             "UPDATE users SET channel_scope=?, updated_at=? WHERE id=?",
             (scope_json, now, user_id),
+        )
+
+    async def set_user_federated_subject(
+        self, user_id: str, issuer: str, subject: str, *, now: float | None = None
+    ) -> None:
+        """Bind a user's federated ``(issuer, sub)`` identity (BACKLOG #1015)."""
+        now = time.time() if now is None else now
+        await self._execute(
+            "UPDATE users SET oidc_issuer=?, oidc_subject=?, updated_at=? WHERE id=?",
+            (issuer, subject, now, user_id),
         )
 
     async def roles_for_ad_groups(self, groups: Iterable[str]) -> set[str]:
