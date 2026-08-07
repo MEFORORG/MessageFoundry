@@ -6380,6 +6380,14 @@ The two "No" rows are the majority and the harder half. Root cause for the ancho
 |---|---|---|---|---|
 | windows-2025 | **35:13** | 65 / 43 | 36:00 | 47s — **1.022x** |
 
+> **Re-derived independently the same day, later in the day** — reported as a second measurement rather
+> than folded into the first, because a number edited away from the pool that produced it is precisely the
+> rot [`ci.yml`](../.github/workflows/ci.yml) warns about (*"a multiple without its pool cannot even be
+> rechecked"*). The pool had grown by two passing executions: **n=68**, **45 of 45** passing steps above
+> 28:00, max passing **35:13** reproduced to the second, and **the same five kills and no others**. Both
+> readings agree on every load-bearing figure; only `n` moved. The "43 of 43" above is correct for the
+> 80-run pool as stated and should not be silently rewritten to 45.
+
 Killed at the cap (`Tests (pytest)` step conclusion `failure`, all at 36:0x):
 
 | run | branch | note |
@@ -6398,6 +6406,61 @@ Killed at the cap (`Tests (pytest)` step conclusion `failure`, all at 36:0x):
 
 **Scope note — the two failures on this leg today are DIFFERENT and must not be merged into one cause.** PR #253 is a genuine timeout (no test failed) and PR #256 (`fix-1013`) is an assertion failure in `tests/test_connscale_cpu_probe.py` and `tests/test_connscale_smoke.py`, whose own comment already records this leg failing twice in one job on 2026-07-30. Only the first belongs to this item.
 
-**Related:** #344 item 1 (a mechanical guard for exactly this — *"the remaining margin is a SHARED budget across every PR that lands and nothing accounts for it: three PRs each adding a minute of Windows time reproduce #119's kill, individually blameless"*), #320 (the underlying windows-2025 slowness), #340 (a merge queue — every merge here re-behinds its siblings, so a coin-flipping cap costs a full cycle each time it lands wrong), #1027 / PR #253 (the change that cannot land underneath this cap, because it moves the web console suite into `testpaths` and so runs it twice per leg).
+## THIS ITEM SUPERSEDES #1084, AND THE TWO MUST NOT BOTH LAND UNRECONCILED
+
+> ⚠️ **Forward-looking citation, flagged as such.** At the time of writing, **#1084 is not on `main`** — it
+> exists only on `origin/claude/gate-3d-remedy-1057` (**PR #261**, open). So this cross-reference does not
+> resolve yet and will only do so once #261 lands. It is stated anyway because the collision is invisible
+> from any worktree reading `docs/BACKLOG.md`, which is exactly how it was nearly missed.
+
+**#1084 is the same defect, found the same day, on the same leg and the same cap.** This item's kill table
+literally contains #1084's originating run (PR #261, `31149117314`). It is **not** a duplicate in the
+harmless sense: the two items **contradict each other on the central action**, and neither referenced the
+other. #1084 says *"Do NOT simply raise the cap"*; this item says the cap must be re-derived. Left alone,
+whichever is worked first leaves the survivor standing as an open item asserting that the work was wrong.
+
+**The contradiction resolves cleanly, and #1084 is not wrong in spirit — its premise is wrong.** #1084's
+headline is *"~92% of its `step_timeout` ... about 17% headroom"*, and its Source says it was *"diagnosed
+by comparing job wall time across three PRs"*. Those figures (33m09s / 37m06s / 38m20s) are **JOB** wall
+times divided by a **STEP** cap. Measured on the step: max passing **35:13** against 36:00 — **97.8% of
+budget, 2.2% headroom**, not 17%. This is the identical job-for-step substitution [`ci.yml`](../.github/workflows/ci.yml)
+records at least three earlier sessions making while triaging this same cap.
+
+**And that changes what "protect the diagnostic" implies.** #1084 is right that `step_timeout` is held
+under `job_timeout` so a deadlock *below* pytest surfaces as a step failure rather than a job kill, and
+right that raising a cap to buy a green tick would trade that away. But at **2.2%** headroom, against a
+distribution where **every** passing run exceeds the file's own 28:00 re-derive trigger, the cap no longer
+distinguishes a deadlock from an ordinary suite — it fires on both. Re-deriving it therefore **restores**
+the diagnostic rather than surrendering it. That is the reconciliation, and it should be written into
+whichever item survives instead of being left for a reader to infer.
+
+**Stronger evidence than either item had separately: a same-commit flip.** Run `31192717684`
+(`fix-1006-absence-mutation`, head `27d7746d`) — attempt 1 **failed at 36:07**, attempt 2 **passed at
+33:14**. Same run, same commit, two outcomes. #1084 inferred a possible flip from three *different* PRs,
+which is not identical content; this is. [`ci.yml`](../.github/workflows/ci.yml) records the same shape at
+the old 26:00 cap for PR #119.
+
+**Absorbed from #1084, so closing it loses nothing** — its three wrong answers (*"flake, re-run it"* /
+*"the change broke something"* / *"raise the cap"*, the second identified by location-and-change failing to
+line up); the step-under-job deadlock rationale above; its fix directions, of which **emit the step's
+elapsed time and its percentage of `step_timeout` in the job summary** is the cheapest and should probably
+happen regardless, alongside splitting the Windows leg and making the subprocess-bound gate tests cheaper
+(module-scoping one read-only fixture in `tests/test_worktree_gate_remedy_families.py` cut it **51%**,
+10.66s to 5.26s, by removing 30 of its 36 `git` spawns); and its **#1000 negative control** requirement,
+which binds here too — a margin report that never goes red would be the same green-that-cannot-see this
+cluster keeps producing.
+
+**Recommended disposition:** keep this item, close **#1084** as merged into it, and correct #1084's record
+rather than carrying its numbers forward. Do **not** conclude a number was mis-allocated — 1084 and 1096
+are different numbers and there is no allocation collision, only a subject collision.
+
+**Related:** **#1084** (same defect, wrong instrument — see above; forward-looking, lands with PR #261),
+#344 item 1 (a mechanical guard for exactly this — *"the remaining margin is a SHARED budget across every
+PR that lands and nothing accounts for it: three PRs each adding a minute of Windows time reproduce #119's
+kill, individually blameless"*), #320 (the underlying windows-2025 slowness), #340 (a merge queue — every
+merge here re-behinds its siblings, so a coin-flipping cap costs a full cycle each time it lands wrong),
+#1000 (a control whose green is not evidence about what it appears to cover), #1027 / PR #253 (the change
+that cannot land underneath this cap, because it moves the web console suite into `testpaths` and so runs
+it twice per leg).
 
 **Source:** found 2026-08-07 during a coordinator queue drain, triaging why PR #253's `windows-2025` leg was red. The pool was enumerated rather than taken from a `gh run list` page — [`ci.yml`](../.github/workflows/ci.yml) records two earlier versions of this same table carrying pool sizes nobody could re-derive, one of which came from a default `--limit 20`.
