@@ -4380,14 +4380,15 @@ open.
 
 ## 1009. SOAP `body_secret_value_<i>` is redacted, registered and documented — and never fingerprinted
 
-> 🔢 **Filed 2026-08-04 — not started. Scored 2026-08-04 → P2.** Value **5/10** · Difficulty
-> **2/10** · _fill-in_. `connector_secret_env_values`, the ASVS 13.3.4 runtime rotation
-> fingerprinter, filters on bare `_SECRET_SETTING_KEYS` membership at `config/wiring.py:725`,
-> while `body_secret_value_<i>` reaches secrecy only through the prefix branch of
-> `_is_secret_setting` (`:686`) — so a rotation of a SOAP injected body secret is not
-> auto-detected the way every sibling class is, and the registration gate whose comment promises
-> the two sets "can never disagree" walks straight past it; the fix is one line plus the reverse
-> assertion that gate is missing.
+> ✅ **Built 2026-08-05 — Scored 2026-08-04, P2.** Value **5/10** · Difficulty
+> **2/10**. `connector_secret_env_values`, the ASVS 13.3.4 runtime rotation fingerprinter, now
+> filters connector secrets through `_is_secret_setting` (`config/wiring.py:725`) instead of bare
+> `_SECRET_SETTING_KEYS` membership, so the prefix-only `body_secret_value_<i>` SOAP body-secret
+> class is fingerprinted and a rotation of it is auto-detected the way every sibling class is. The
+> missing reverse gate (`test_registered_connector_secrets_are_reachable_by_the_fingerprinter`) now
+> asserts every registered connector secret is reachable by the fingerprinter, so the "can never
+> disagree" invariant is enforced rather than assumed and a future hand-added registry entry cannot
+> slip through (ADR 0015).
 
 **Cluster:** Security & Compliance. **Priority:** P2. **Verdict:** build. **Severity:** low — a
 monitoring gap on an opt-in connector secret class, **not** a disclosure.
