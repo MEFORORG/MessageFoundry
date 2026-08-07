@@ -6,8 +6,8 @@
 | **Applies to** | Any application developed under this standard. **MessageFoundry (MEFOR)** is the reference implementation (Appendix A). |
 | **Maintained by** | Project maintainers (open-source). Each deploying organization assigns its own local owner. |
 | **Status** | Published — adopter-facing |
-| **Version** | 2.2 |
-| **Date** | July 30, 2026 |
+| **Version** | 2.3 |
+| **Date** | August 7, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on any material architecture or threat change |
 | **Aligns to** | NIST SP 800-218 (SSDF) · NIST SP 800-115 · NIST SP 800-66 Rev. 2 (HIPAA Security Rule) · OWASP ASVS 5.0 Level 3. Its Spec-Driven Development practices (§5) are a distilled synthesis by this document — not an external standard or certification. |
@@ -775,6 +775,7 @@ resolves to a row below rather than to whatever requirement later took the numbe
 
 | Version | Date | Change |
 |---|---|---|
+| 2.3 | August 7, 2026 | **Rules given stable identifiers.** 145 requirements now carry an `SDS-<section>.<n>` identifier, an RFC 2119 keyword in capitals, and the evidence that settles them; see *How to read the rules*. **Section numbers are unchanged** — identifiers were added alongside, so every existing citation still resolves. A.6 now names the rule each deviation departs from, replacing the `(§6.3 / §6.4)` / `(§7.4)` / `(§5.3)` positional citations that the §5–§9 → §6–§10 renumbering below had already broken elsewhere. A *Retired rules* table holds tombstones so a retired identifier is never reissued, and `tests/test_sds_rule_ids_are_stable.py` enforces the convention in CI. Two corrections of record: A.6 listed R2 (the executable dry-run gate) as outstanding after it had shipped, and the standing contract introduced four prose-review rules as "the three rules below". No requirement was added, removed, weakened or strengthened. |
 | 2.2 | July 30, 2026 | **Independent-review deviation reframed.** The independent ASVS-L3 review & DAST is no longer stated as a precondition for off-loopback/production exposure. MessageFoundry is self-hosted, so the deployment decision — and the assessment supporting it — belong to the implementing organization; this standard records what has and has not been independently verified rather than gating deployment on it. The engagement remains planned, at an estimated $25,000–$50,000, intended to be grant- or sponsor-funded. Also drops a dangling citation to `security/RELEASE-GATE.md`, which is not present in this repository. No change to the SSDF / ASVS / HIPAA mappings. |
 | 2.1 | July 29, 2026 | **Code-quality companion added.** Cross-linked the new [Code Quality & Anti-Slop Standards](Code_Quality_Standards.md) (evidence-based anti-slop rubric, ISO/IEC 25010): a companion-standards pointer in §1 and a test-*quality* + anti-metric note at PW.8. No change to the SSDF / ASVS / HIPAA mappings or Appendix A. |
 | 2.0 | June 24, 2026 | Restructured baseline around SSDF, spec-driven development, NIST SP 800-115 testing tiers and SP 800-66 Rev. 2 safeguards. Content carried forward unchanged at this baseline. The full prior changelog — MEFOR-specific drafts → genericization (project-agnostic, with an Appendix A applicability profile) → OWASP ASVS 5.0 Level 3 re-target → NIST SP 800-53 removal → §5 Spec-Driven Development addition and the §5–§9 → §6–§10 renumbering — is preserved in git history. |
