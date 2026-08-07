@@ -5319,6 +5319,61 @@ cd ../Unrelated && git -C . config core.hooksPath /dev/null
 
 **Source:** found 2026-08-07 by being refused. The commit that filed #1085 was blocked by the very rule the item documents, which is how the intermittency was noticed — several earlier commits in the same series had quoted the same class of command and passed.
 
+---
+
+### ⭐ A FIX WAS BUILT, VERIFIED, AND REJECTED — and the correction is MEASURED. Start here, do not redesign.
+
+A candidate was written and put through three adversarial verifiers on 2026-08-07. **Verdict NOT READY**,
+for one defect. The design is right and should be kept; only a single classifier regex is wrong. Patch
+banked at `FINDINGS-1061-verifiers-2026-08-06\1086-patch-NOT-READY.diff`, synthesis beside it. Resume
+with `resumeFromRunId: "wf_b4050e2f-77d"` — **re-apply the banked patch first**, or the verifiers inspect
+a clean tree and verify nothing.
+
+**WHAT WAS RIGHT** (both pinned by killed mutants, do not undo either): key on the CONSUMING FLAG, not
+the delimiter; and run the message-blanking **AFTER** the interpreter recursion. The "blank before
+recursion" mutant is killed by seven to nine interpreter payloads in all three mutation runs.
+
+**WHAT WAS WRONG — the whole rejection.** The flag classifier `-(?![A-Za-z]*[ce])[A-Za-z]*m` matches an
+**open-ended letter cluster**. PowerShell accepts unambiguous parameter PREFIXES, so `-Com` and `-Comm`
+are working spellings of `-Command` that contain no lowercase `c` or `e` and end in `m` — they were
+classified as MESSAGE and their code was blanked:
+
+```
+pwsh -Com  @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Comm @'...'@   committed DENY/3c  ->  candidate ALLOW
+pwsh -Com  @'git reset --hard'@          committed DENY/3   -> candidate ALLOW
+pwsh -Com  @'git worktree remove ...'@   committed DENY/3d  -> candidate ALLOW
+```
+
+**THE MEASURED REPLACEMENT.** Replace the open-ended cluster with a CLOSED set of git message flags —
+`--message`, `-m`, `-am`, or a bounded class such as `-[amsSnqve]*m`. Two verifiers independently
+measured that this returns those four rows to DENY, keeps all eleven #1086 ALLOW cases and every
+narrowness case ALLOW, and produces **zero other verdict movement**. It also stops `-Cm`, `-Em` and
+`-Program` being misclassified.
+
+⛔ **TWO THINGS THE CANDIDATE DID NOT DISCLOSE, both must be in the redo:**
+1. **A surviving mutant.** Relaxing the separator `[ \t=]+` to `[ \t=]*` survives the entire suite —
+   found independently by two verifiers, same mutant hash. Non-equivalence: `git commit -m"a\n<disarm>\nb"`
+   and the `-m'...'` and `-m@'...'@` glued forms go DENY to ALLOW under it. **The `+` is load-bearing and
+   no test says so.** Add one.
+2. **Two spellings of #1086's own defect remain refused**: `git commit -m"multi-line"` and
+   `-m'multi-line'` — glued, no separator — because of that same `[ \t=]+`. Narrow, but it is this
+   item's own shape and belongs in the disclosure list.
+
+**TEST BY THE PREFIX FAMILY, NOT ONE SPELLING** (this is #1097's requirement and it applies here too):
+enumerate `-C` through `-Command` asserting each DENIES, plus `-Cm` as the bounding negative proving the
+family does not widen into any-letters-ending-in-m.
+
+⚠️ **AND THE READING RULE THIS ROUND EARNED:** two of three verifiers found the fail-open; **the third
+ACCEPTED, because its corpus contained no `-Com` payload.** Its evidence could not see the class it was
+approving — #1000's shape occurring inside the verification of a #1000 fix. **Do not read "one verifier
+accepted" as evidence; read what its corpus covered.**
+
+**Relationship to #1097.** They are separable and must both be fixed: #1097 is the PRE-EXISTING
+interpreter-recursion gap on the committed gate; this item's candidate would have converted #1097's
+accidental here-string denial into a clean fail-open. Fix #1097 first or together, and verify either
+against the gate **as it will ship**, not as it is.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
