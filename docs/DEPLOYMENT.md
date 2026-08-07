@@ -410,12 +410,12 @@ With it set, these otherwise-refused settings become permitted (each logs a loud
 - DATABASE destination / store: `Encrypt=false` or `TrustServerCertificate=true` (SQL Server),
   `[store].trust_server_certificate=true` / `[store].encrypt=false`. *(Clamped.)*
 - Plain-FTP credentials. *(Clamped.)*
-- RemoteFile SFTP: accepting an unknown host key. *(Not clamped — the raw escape still applies.)*
+- RemoteFile SFTP: accepting an unknown host key. *(Clamped since #329.)*
 - Cleartext SMTP submission on a **Direct** (S/MIME) destination. *(Not clamped; AUTH credentials over
   cleartext stay refused outright either way.)*
 - The non-connection cells that have nowhere to carry a per-hop declaration: the `[logging]` syslog/SIEM
-  forwarder and the API PHI-read serve hop *(both clamped)*, plus LDAPS, the webhook alert sink and the
-  AI-broker endpoint *(raw escape)*.
+  forwarder and the API PHI-read serve hop, plus LDAPS, the webhook alert sink and the
+  AI-broker endpoint. *(All clamped — LDAPS / the webhook sink / the AI broker since #329.)*
 
 **Two limits worth stating plainly.** *(a)* Since [ADR 0153](adr/0153-collapse-the-posture-gradient-no-data-label-may-allow-a-cleartext-hop.md)
 this variable has been **unhooked from the cleartext-hop authority** — that decision no longer reads it,
@@ -426,9 +426,11 @@ cleartext HTTP family are now governed only by a per-connection `cleartext_accep
 factory parameter and no `connections.toml` key, so it is unreachable from config today. Refusal messages
 that suggest it are ahead of the code.) *(b)* Where it does still apply it is mostly
 **clamped** (ADR 0092 decision 2 / ADR 0148): it cannot relax a hop while `[security].enforcement =
-enforce`, and for the MLLP/FTPS/plain-FTP and store-TLS cells the clamp additionally requires the instance
-to be PHI — which is also the default. Either way, on the shipped posture those cells are inert; the
-bullets marked *not clamped* are the exceptions that still honour the raw variable.
+enforce`, and for the weakened-TLS / cleartext-escape cells that route through
+`weakened_tls_escape_permitted` — at least the store-TLS, MLLP/FTPS and plain-FTP cells and, since #329,
+LDAPS, the SFTP host key, the webhook sink and the AI broker — the clamp additionally requires the
+instance to be PHI, which is also the default. Either way, on the shipped posture those cells are inert;
+the bullets marked *not clamped* are the exceptions that still honour the raw variable.
 
 **Never set `MEFOR_ALLOW_INSECURE_TLS` in production.** Its presence is the single **environment-variable**
 switch that turns the remaining fail-closed verification checks into best-effort.

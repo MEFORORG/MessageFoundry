@@ -50,10 +50,14 @@ def git(repo: Path, *args: str) -> str:
 @pytest.fixture
 def repo(tmp_path: Path) -> Path:
     r = tmp_path / "repo"
-    r.mkdir()
+    (r / "scripts" / "coord").mkdir(parents=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(r)], check=True, capture_output=True)
     git(r, "config", "user.email", "t@example.invalid")
     git(r, "config", "user.name", "t")
+    # Staged and committed for the reason written out in test_coord_claim_refresh.py's fixture:
+    # claim.ps1 anchors on its own location now (BACKLOG #1060), so the copy IS the sandbox, and a
+    # linked worktree of this fixture carries its own -- which is what `peer_holding` relies on.
+    shutil.copy2(CLAIM, r / "scripts" / "coord" / "claim.ps1")
     (r / "f.txt").write_text("x", encoding="utf-8")
     git(r, "add", "-A")
     git(r, "commit", "-qm", "base")
@@ -61,8 +65,16 @@ def repo(tmp_path: Path) -> Path:
 
 
 def claim(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
+    """Run the checkout's OWN copy -- it scopes itself to where it LIVES, not to the cwd."""
     return subprocess.run(
-        ["pwsh", "-NoProfile", "-NonInteractive", "-File", str(CLAIM), *args],
+        [
+            "pwsh",
+            "-NoProfile",
+            "-NonInteractive",
+            "-File",
+            str(cwd / "scripts" / "coord" / "claim.ps1"),
+            *args,
+        ],
         cwd=str(cwd),
         capture_output=True,
         text=True,

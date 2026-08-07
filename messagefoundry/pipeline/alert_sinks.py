@@ -43,9 +43,9 @@ from messagefoundry.config.settings import (
     AlertSeverity,
     AlertsSettings,
     EscalationTier,
-    insecure_tls_allowed,
+    weakened_tls_escape_permitted,
 )
-from messagefoundry.config.tls_policy import TrustAnchorPolicy, build_smtp_tls_context
+from messagefoundry.config.tls_policy import HopPosture, TrustAnchorPolicy, build_smtp_tls_context
 
 __all__ = [
     "AlertTransport",
@@ -277,18 +277,26 @@ class WebhookTransport:
     """POST the event as JSON to a configured URL (fronts Slack/Teams/PagerDuty/custom webhooks)."""
 
     def __init__(
-        self, url: str, *, timeout: float = 10.0, allowed_hosts: tuple[str, ...] = ()
+        self,
+        url: str,
+        *,
+        timeout: float = 10.0,
+        allowed_hosts: tuple[str, ...] = (),
+        posture: HopPosture | None = None,
     ) -> None:
         # Refuse a plaintext http:// webhook target unless the explicit dev escape is set: the alert
         # POST otherwise crosses the network in cleartext (ASVS 12.2.1 — no insecure fallback). https
         # is the only scheme accepted by default; http(s) remain the only schemes at all (see _post).
-        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as LDAPS / SQL Server / MLLP — stricter
-        # than the credentialed-only http refusal on REST/SOAP, since a webhook has no PHI but should
-        # still never fall back to cleartext.
+        # Same refuse-unless-MEFOR_ALLOW_INSECURE_TLS pattern as LDAPS / SQL Server / MLLP. #329: read
+        # the escape through the ADR-0092 clamp (weakened_tls_escape_permitted) so on an enforcing-PHI
+        # instance the blunt env var can never re-permit a cleartext alert POST. The webhook sink is
+        # built out of the connector-construction gate (notifier_from_settings, in the app lifespan), so
+        # the posture is threaded explicitly; None (a direct/test construction) falls back to the
+        # unclamped escape — byte-identical to the pre-#329 bare read.
         scheme = urllib.parse.urlsplit(url).scheme.lower()
         if scheme not in ("http", "https"):
             raise ValueError(f"webhook url must be http or https, got scheme {scheme!r}")
-        if scheme == "http" and not insecure_tls_allowed():
+        if scheme == "http" and not weakened_tls_escape_permitted(posture):
             raise ValueError(
                 f"webhook url {url!r} uses plaintext http; refused unless "
                 f"{INSECURE_TLS_ESCAPE_ENV} is set (dev/trusted-network only) — use https"
@@ -1168,6 +1176,7 @@ def notifier_from_settings(
     *,
     secret_provider: SecretProvider | None = None,
     trust_anchor_policy: TrustAnchorPolicy | None = None,
+    posture: HopPosture | None = None,
 ) -> NotifierAlertSink | None:
     """Build a :class:`NotifierAlertSink` from ``[alerts]`` settings, or ``None`` when no transport is
     configured (the caller then leaves the engine on its default logging sink).
@@ -1197,6 +1206,9 @@ def notifier_from_settings(
                 alerts.webhook_url,
                 timeout=alerts.webhook_timeout,
                 allowed_hosts=tuple(alerts.webhook_allowed_hosts),
+                # #329: thread the derived instance posture so the cleartext-http refusal is clamped on
+                # an enforcing-PHI instance (the escape can no longer re-permit a plaintext alert POST).
+                posture=posture,
             )
         )
     if alerts.email_smtp_host and alerts.email_from and alerts.email_to:

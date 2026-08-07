@@ -48,9 +48,27 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-$repo = (& git rev-parse --path-format=absolute --show-toplevel).Trim()
-if (-not $repo) { throw "Not inside a git repository." }
-$common = (& git rev-parse --path-format=absolute --git-common-dir).Trim()
+# ANCHOR ON THE SCRIPT, NOT ON THE CURRENT DIRECTORY (BACKLOG #1060). Unanchored, every `git` call below
+# resolved against wherever the shell happened to be standing, so an absolute `-File` invocation from
+# worktree A while intending to commit from worktree B recorded the claim to A. The ledger gate then
+# refused B's commit -- correctly, fails closed, nothing invalid lands -- but far from the cause and with
+# a message about the wrong thing. It also cost a number: holes are free, collisions are not.
+#
+# `git -C $PSScriptRoot` rather than `Split-Path`, which is what the sibling scripts in scripts/dev use.
+# The recorded `worktree` value is COMPARED, by ledger_check.py:227 and by -List below, so its string form
+# is part of a contract: `--path-format=absolute` returns the forward-slash absolute form every claim
+# already on disk carries, and `Split-Path` would start writing backslashes into the same field. Both
+# comparisons normalise separators today, so this is not a live break -- it is a field whose format
+# nothing pins, and changing it for no reason is how the next reader's grep stops matching.
+#
+# Every `git` call in this file is anchored the same way for the same reason. The floor's working-tree
+# term (below) is the one where an unanchored read is more than misattribution: it looks for numbers
+# written but committed NOWHERE, so reading the caller's tree makes a number drafted in the TARGET tree
+# invisible and free to re-issue -- the collision this whole script exists to prevent.
+$repo = (& git -C $PSScriptRoot rev-parse --path-format=absolute --show-toplevel 2>$null)
+if (-not $repo) { throw "scripts/coord/ is not inside a git repository: $PSScriptRoot" }
+$repo = $repo.Trim()
+$common = (& git -C $repo rev-parse --path-format=absolute --git-common-dir).Trim()
 $allocRoot = Join-Path $common "mefor-coord/alloc"
 $alloc = Join-Path $allocRoot $Kind
 New-Item -ItemType Directory -Force -Path $alloc | Out-Null
@@ -72,8 +90,8 @@ if (-not $Title -and -not $ShowFloor) { throw "-Title is required (it is recorde
 
 # `git branch --show-current` prints NOTHING on a detached HEAD, so `& git ...` yields $null (not "")
 # -- calling .Trim() on it here threw *before* the detached-HEAD fallback below could run. Null-check first.
-$branch = & git branch --show-current
-if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git rev-parse --short HEAD) }
+$branch = & git -C $repo branch --show-current
+if ([string]::IsNullOrWhiteSpace($branch)) { $branch = "detached@" + (& git -C $repo rev-parse --short HEAD) }
 $branch = $branch.Trim()
 
 # FLOOR = max over (origin/main) U (every local + remote ref) U (existing allocations).
@@ -88,9 +106,9 @@ function Get-Floor {
     $seen.Add(0)
 
     if ($Kind -eq "adr") {
-        $refs = @("origin/main") + @(& git for-each-ref --format='%(refname)' refs/heads refs/remotes)
+        $refs = @("origin/main") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
         foreach ($ref in ($refs | Select-Object -Unique)) {
-            $names = & git ls-tree --name-only $ref docs/adr/ 2>$null
+            $names = & git -C $repo ls-tree --name-only $ref docs/adr/ 2>$null
             foreach ($n in $names) {
                 if ($n -match 'docs/adr/(\d{4})-') { $seen.Add([int]$Matches[1]) }
             }
@@ -117,13 +135,13 @@ function Get-Floor {
         # files means adding each one here; an archive file not listed here is not policed.
         $backlogPaths = @("docs/BACKLOG.md", "docs/archive/backlog/BACKLOG-CLOSED.md")
 
-        $refs = @("origin/main", "HEAD") + @(& git for-each-ref --format='%(refname)' refs/heads refs/remotes)
+        $refs = @("origin/main", "HEAD") + @(& git -C $repo for-each-ref --format='%(refname)' refs/heads refs/remotes)
         $specs = foreach ($r in ($refs | Select-Object -Unique)) {
             foreach ($p in $backlogPaths) { "${r}:${p}" }
         }
 
         $oids = [System.Collections.Generic.HashSet[string]]::new()
-        foreach ($line in ($specs -join "`n" | & git cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
+        foreach ($line in ($specs -join "`n" | & git -C $repo cat-file --batch-check='%(objectname) %(objecttype)' 2>$null)) {
             $p = "$line".Split(' ')
             if ($p.Count -ge 2 -and $p[1] -eq 'blob') { [void]$oids.Add($p[0]) }
         }
@@ -138,7 +156,7 @@ function Get-Floor {
         # that had been committed somewhere -- i.e. every case except the one this term is for.
         $rx = [regex]::new('^#{2,3} (\d+)\.', [System.Text.RegularExpressions.RegexOptions]::Multiline)
         if ($oids.Count -gt 0) {
-            foreach ($line in (($oids -join "`n") | & git cat-file --batch 2>$null)) {
+            foreach ($line in (($oids -join "`n") | & git -C $repo cat-file --batch 2>$null)) {
                 $m = $rx.Match("$line")
                 if ($m.Success) { $seen.Add([int]$m.Groups[1].Value) }
             }
@@ -410,6 +428,23 @@ for ($i = $start; $i -lt $start + 500; $i++) {
         Write-Host "  file    : docs/BACKLOG.md"
     }
     Write-Host "  claimed by: $repo [$branch]"
+
+    # SAY IT AT THE POINT OF USE when the shell is standing somewhere else (BACKLOG #1060). Anchoring is
+    # now correct, but it is also SURPRISING: a caller who runs this by absolute path from worktree A gets
+    # a claim recorded to worktree B, and the only other place that fact surfaces is the ledger gate
+    # refusing a commit later, elsewhere, with a message about the wrong thing. One line here turns a
+    # deferred, misdirected refusal into an immediate, accurate note. Silent on the ordinary same-tree
+    # invocation, so it stays worth reading.
+    $cwdTop = (& git rev-parse --path-format=absolute --show-toplevel 2>$null)
+    if ($cwdTop) {
+        $a = ($cwdTop.Trim() -replace '\\', '/').TrimEnd('/')
+        $b = ($repo -replace '\\', '/').TrimEnd('/')
+        if ($a -ine $b) {
+            Write-Host "  NOTE: your shell is in $a, but this allocator lives in $b, so the claim is recorded" -ForegroundColor Yellow
+            Write-Host "        to $b. COMMIT FROM THERE -- the ledger gate keys entitlement on the worktree" -ForegroundColor Yellow
+            Write-Host "        named above and will refuse the commit anywhere else." -ForegroundColor Yellow
+        }
+    }
     exit 0
 }
 
