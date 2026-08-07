@@ -204,6 +204,28 @@ $WIRING = @(
     @{ Event = "Stop"; Matcher = $null; Script = "scripts/hooks/mail-drain.ps1"; Timeout = 20; Msg = "Checking session mail"; Marker = $MAIL_MARKER; Shim = "std" }
 )
 
+# The unfiltered table, kept so a filter that matches nothing can tell the operator what DOES exist.
+# Naming the real events and scripts turns a dead end into a correction; without it the message can
+# only say that nothing matched, which is the same information the exit code already carries.
+$WIRING_ALL = $WIRING
+
+# SPLIT ON COMMAS, BECAUSE `pwsh -File` HANDS EVERY ARGUMENT OVER AS A STRING. The documented
+# invocation in .EXAMPLE is the -File form, and it binds a multi-value switch as ONE element:
+# `-Only PreToolUse,UserPromptSubmit` arrives as the single string "PreToolUse,UserPromptSubmit",
+# `-contains` then matches nothing, and the run selected zero rows while reporting success. Measured
+# 2026-08-06 -- it printed "No wiring rows selected" and exited 0, which reads as "done". Splitting
+# here makes the documented form mean what it looks like it means; passing a real array in-process
+# still works, because splitting a single-element array on a character it does not contain is a no-op.
+# Only the identifier-shaped switches are split. -SettingsPath is NOT: a Windows path may legally
+# contain a comma, and silently cutting one in half would be a worse bug than the one being fixed.
+function Split-Csv([string[]]$Values) {
+    if (-not $Values) { return @() }
+    return @($Values | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+}
+$Only = Split-Csv $Only
+$Except = Split-Csv $Except
+$Script = Split-Csv $Script
+
 if ($Only) { $WIRING = @($WIRING | Where-Object { $Only -contains $_.Event }) }
 if ($Except) { $WIRING = @($WIRING | Where-Object { $Except -notcontains $_.Event }) }
 if ($Script) {
@@ -212,7 +234,23 @@ if ($Script) {
             @($Script | Where-Object { $row.Script -like "*$_*" }).Count -gt 0
         })
 }
-if (-not $WIRING) { Write-Host "No wiring rows selected."; exit 0 }
+# NONZERO, NOT exit 0. A filter that matches nothing is a user error -- a misspelled event, a -Script
+# that hits no row -- and exiting 0 made it indistinguishable from a successful install. That is the
+# silent-no-op shape this script exists to report on rather than commit: the operator sees a clean
+# exit and believes the roots were wired. Naming what was asked for is the difference between "there
+# was nothing to do" and "you asked for something that does not exist".
+if (-not $WIRING) {
+    $asked = @()
+    if ($Only) { $asked += "-Only $($Only -join ',')" }
+    if ($Except) { $asked += "-Except $($Except -join ',')" }
+    if ($Script) { $asked += "-Script $($Script -join ',')" }
+    Write-Host ""
+    Write-Host "NO WIRING ROWS MATCHED $($asked -join ' ') -- nothing was examined and nothing was written." -ForegroundColor Yellow
+    Write-Host "  Known events : $((($WIRING_ALL | ForEach-Object { $_.Event }) | Sort-Object -Unique) -join ', ')"
+    Write-Host "  Known scripts: $((($WIRING_ALL | ForEach-Object { $_.Script }) | Sort-Object -Unique) -join ', ')"
+    Write-Host ""
+    exit 2
+}
 
 function Read-Settings([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path)) { return [ordered]@{} }
