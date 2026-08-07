@@ -43,6 +43,11 @@ does not move, and that is the property that makes it worth citing: this documen
 once already (§5–§9 became §6–§10 when Spec-Driven Development was inserted; see Version history), and
 citations written against the old numbers are still resolving to the wrong requirements today.
 
+**Cite a requirement by identifier; cite a section by number.** "See §5" points a reader at a place to
+read, and a section number is the right name for that. "This deviates from §6.4" names a requirement,
+and must give the identifier — that is the citation that silently changes meaning when the document is
+reorganised, and A.6 is where it does the most damage.
+
 **Not every statement here is a rule.** The NIST and HIPAA crosswalks (§3, §7.2), the spec-stack and
 EARS tables (§5.1, §5.2), the control-area inventory (§7.1), the reference list (§10) and the
 Applicability Profile (Appendix A) describe, map or record; they carry no identifiers and nothing
@@ -337,9 +342,9 @@ Both are **advisory** and introduce no new blocking release gate (cf. §6.4). *(
 
 ### 5.5 Executable acceptance criteria (living documentation)
 
-BDD / Specification-by-Example expresses acceptance criteria as Given/When/Then scenarios with concrete `(input → expected outcome)` example tables that **execute** as tests — so specification and verification cannot silently drift, and the spec doubles as living documentation. This fits naturally with EARS's WHEN/THEN phrasing, and the HL7 domain (well-defined inputs, well-defined dispositions) is well suited to example-driven verification. The concrete reference-project opportunity (detailed as R2 in Appendix A.7):
+BDD / Specification-by-Example expresses acceptance criteria as Given/When/Then scenarios with concrete `(input → expected outcome)` example tables that **execute** as tests — so specification and verification cannot silently drift, and the spec doubles as living documentation. This fits naturally with EARS's WHEN/THEN phrasing, and the HL7 domain (well-defined inputs, well-defined dispositions) is well suited to example-driven verification.
 
-- **SDS-5.5.1 — A dry-run gate that replays fixtures through the real graph SHOULD assert an expected disposition per fixture** (`PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`) rather than only that it did not error, turning it into an executable acceptance-criteria check. *Evidence:* the declared expectation per fixture, and the gate asserting it.
+- **SDS-5.5.1 — A dry-run gate that replays fixtures through the real graph SHOULD assert an expected disposition per fixture** — for example received / unrouted / filtered / errored — rather than only that it did not error, turning it into an executable acceptance-criteria check. A fixture declaring no expectation keeps the weaker semantics, so adoption is incremental. *Evidence:* the declared expectation per fixture, and the gate asserting it.
 
 *(Lineage: BDD / Specification-by-Example; distilled, not BDD-tool adoption.)*
 
@@ -658,30 +663,35 @@ current position on it.
 ### A.6 Documented deviations
 
 Honest record of where MEFOR's *current* practice differs from the body of the standard, with the
-compensating control (the standard requires exclusions/deviations be documented, §6.3).
+compensating control. Recording a deviation is itself required (SDS-6.3.2). **Each entry names the
+rule it departs from by identifier**, so the departure and the requirement cannot drift apart.
 
-- **Single-maintainer development (PO.2 / PW.7).** The project is solo-maintained today, so the
-  standard's "every change is peer-reviewed" cannot mean a *human second reviewer*. Compensating
+- **Single-maintainer development — SDS-4.3.36 (PO.2 / PW.7).** The project is solo-maintained today, so
+  SDS-4.3.36's "**MUST** peer-review every change" cannot mean a *human second reviewer*. Compensating
   controls: blocking automated review (bandit/semgrep SAST, pip-audit SCA, gitleaks), AI-assisted
   review, branch protection + required CI checks, and no direct pushes to `main`. Revisit when a
   second maintainer joins. **Detailed record:** the AI-assisted-review compensating control — and the
   full risk-tiered discipline for building with Claude Code — is operationalized in
   [`Secure_AI_Development_Standards.md`](Secure_AI_Development_Standards.md), the companion standard
   that owns and expands this deviation.
-- **Independent ASVS-L3 review & DAST (§6.3 / §6.4).** Not yet performed; a **dated risk acceptance**
+- **Independent ASVS-L3 review & DAST — SDS-6.4.3.** Not yet performed; a **dated risk acceptance**
   is in force pre-1.0. An independent engagement is planned — it is a **$25,000–$50,000** commitment
   that the project intends to fund through a grant or sponsorship rather than licence revenue.
   MessageFoundry is **self-hosted**, so the decision to deploy it beyond loopback, and the assessment
   that justifies that decision, rest with the **implementing organization**: this standard states what
   has and has not been independently verified, and does not gate your deployment on it.
-- **Federated operator SSO (§7.4).** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
+- **Federated operator SSO — SDS-7.4.25.** API/WSS/MLLP **TLS and client-cert mTLS are built** (opt-in via
   cert config) and **native TOTP MFA for local accounts is built** (ADR 0002 WP-14); the remaining
   deferred operator-auth item is **federated SSO (OIDC/SAML via Entra)**, held safe by the fail-closed
   `127.0.0.1` bind guard. Federation gets a dedicated ADR before off-loopback exposure.
-- **Mechanical requirement→test traceability (§5.3, recommended).** Not yet enforced: acceptance
-  criteria are not uniformly ID'd and linked to tests, and the dry-run gate asserts only "didn't error"
-  (R2). This is **not a deviation from a hard requirement** — §5 traceability is **recommended (SHOULD)**,
-  adopted incrementally — but it is recorded here for honesty. Tracked as R1–R3 in §A.7.
+- **Mechanical requirement→test traceability — SDS-5.3.1.** Not yet enforced: acceptance criteria are
+  not uniformly ID'd and linked to tests. This is **not a deviation from a hard requirement** —
+  SDS-5.3.1 is **SHOULD**, adopted incrementally — but it is recorded here for honesty. Tracked as
+  R1 and R3 in A.7.2.
+  **SDS-5.5.1 is no longer deferred.** The dry-run gate reads a declared expected disposition per
+  fixture and asserts it, in [`checks.py`](../messagefoundry/checks.py); a fixture with no declared
+  expectation keeps the older not-`ERROR` semantics. This entry previously recorded R2 as outstanding
+  after it had been built.
 
 **ASVS 5.0 L3 deferred items — accepted / deferred** (risk accepted **2026-06-16**, refreshed after
 MFA + admin-defense landed **2026-06-17**; owner: project maintainer). Each is deferred-by-design behind
@@ -744,7 +754,7 @@ PW.8 (test executable code) is the home of `messagefoundry check` (validate + dr
 #### A.7.2 Recommendations (all **recommended / SHOULD**, advisory)
 
 - **R1 — EARS "Acceptance Criteria" block on the ADR template.** Each ADR **SHOULD** carry an EARS "Acceptance Criteria" block, each criterion bearing an ID linked to its test or fixture. Doc-only, zero-code; formalizes the existing SHALL-style house register. *(Lineage: AWS Kiro requirements.md; distilled.)*
-- **R2 — Make the dry-run gate executable-spec.** `messagefoundry/checks.py` **SHOULD** read an **expected disposition per fixture** (`PROCESSED` / `UNROUTED` / `FILTERED` / `ERROR`) and assert it, upgrading today's "didn't error" dry-run (`_check_dryrun` asserts only not-`ERROR`) into an executable acceptance-criteria check. **Backward-compatible:** a fixture with no declared expectation keeps today's not-`ERROR` semantics. *(Lineage: BDD / Specification-by-Example; distilled.)*
+- **R2 — Make the dry-run gate executable-spec. BUILT (SDS-5.5.1).** [`checks.py`](../messagefoundry/checks.py) reads an expected disposition from a `<fixture>.expect` sidecar (`RECEIVED` / `UNROUTED` / `FILTERED` / `ERROR`, with `PROCESSED` and `ROUTED` accepted as aliases of `RECEIVED`) and asserts it, so the dry-run is an executable acceptance-criteria check rather than a not-`ERROR` smoke test. A fixture with no sidecar keeps the older semantics, so adoption is incremental. Retained here rather than deleted because A.6 recorded it as outstanding after it had shipped, and a recommendation that quietly disappears leaves no trace of having been met. *(Lineage: BDD / Specification-by-Example; distilled.)*
 - **R3 — Promote clarify, add analyze.** The ADR **"To resolve on acceptance"** block **SHOULD** be promoted into an explicit **clarify** step (resolve ambiguity before `Accepted`), and an **analyze**-style advisory coverage check **SHOULD** verify that every **Accepted** ADR's acceptance criteria has a linked test, and that no artifact contradicts a `CLAUDE.md` invariant. **Advisory, not a hard gate** — it belongs in the advisory tier alongside `ruff`/`mypy`, not the required `validate`/`dryrun` tier. *(Lineage: GitHub Spec Kit pipeline; distilled.)*
 
 ---
