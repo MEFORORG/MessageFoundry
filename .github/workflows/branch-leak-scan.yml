@@ -1,0 +1,106 @@
+name: Branch leak scan
+
+# DETECTION, NOT A GATE. Read that first, because the difference is the whole design.
+#
+# This repo IS the published artifact. A push to a public remote makes its content public the instant
+# it completes, so nothing that runs afterwards can prevent a leak -- it can only tell you one
+# happened, in time to delete the branch, assess the exposure and respond. Do NOT add this to
+# .github/required-contexts.txt and do not describe it anywhere as a control that stops a leak. A
+# required context gates MERGING, which is not the event this watches.
+#
+# WHY IT EXISTS AT ALL, i.e. why the leak gate in security.yml is not enough. That workflow's
+# `forbidden-content` job triggers on pull_request, push to main, and a daily cron. A branch pushed
+# WITHOUT a pull request is scanned by none of them, and that is exactly the shape of the realistic
+# leak: a branch cut from a fetched private-lineage ref carries docs/security inside a commit TREE,
+# where .gitignore is never consulted because the files never went through the index.
+#
+# WHY THIS IS NOT DONE SERVER-SIDE, which would be strictly better. It cannot be, and this was
+# measured on 2026-08-05 rather than assumed:
+#
+#   gh api -X POST repos/MEFORORG/MessageFoundry/rulesets -f target='push' \
+#     -f 'rules[][type]=file_path_restriction' ...
+#   -> 422  "Source public repos cannot have push rules"
+#
+# The other half of BACKLOG #1034's "durable answer is server-side" is re-enabling `enforce_admins`,
+# which governs PROTECTED BRANCHES and therefore does nothing about an arbitrary feature branch. So
+# there is no server-side content control available for this repository, and the only prevention is
+# the client-side pre-push guard (scripts/hooks/push_guard.py) -- which `git push --no-verify` skips
+# and which a fresh clone does not have installed until scripts/coord/install-git-hooks.ps1 runs.
+# This job is the backstop behind that, and nothing else is.
+#
+# WHY NO `paths:` FILTER, despite the obvious cost saving. A filter of `paths: ['docs/security/**']`
+# would make this nearly free, but GitHub's path filtering for a push event is evaluated against the
+# commits in the push, and its behaviour for a NEWLY CREATED branch is not clearly specified. A filter
+# that might silently not fire on the one case this exists to catch is worse than no job: it would
+# report green by not running. Paying for a small job on every branch push buys an answer that does
+# not depend on undocumented behaviour.
+#
+# COST, stated because CI cost is a live constraint here (see security.yml's header on why the
+# push-to-main arm was scoped): one ubuntu job, checkout plus setup-python plus a stdlib-only
+# scanner, no install step and no dependency resolution.
+
+on:
+  push:
+    # `main` is already covered by security.yml's own push arm; scanning it here would duplicate that
+    # for no added signal.
+    branches-ignore:
+      - main
+
+concurrency:
+  # Per-ref: a rapid re-push supersedes its own in-flight scan. Cancelling here is safe in a way it is
+  # not for a required context -- nothing gates on this job's conclusion, and the newer push runs the
+  # same scan over a superset of the same refs.
+  group: branch-leak-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  branch-leak-scan:
+    name: branch leak scan (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # zizmor artipacked: checkout leaves the job token in .git/config unless told not to, and a
+          # later step or a packaged artifact can then carry it. This job only READS the tree and runs
+          # a scanner -- it pushes nothing and calls no API -- so it needs no persisted credential and
+          # the flag costs nothing. Fixed here rather than suppressed in .github/zizmor.yml: that file
+          # is for findings that are safe-by-design, and this one is simply fixable.
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.14"
+      - name: Scan the pushed tree for forbidden content
+        # Same scanner, same fail-closed posture, same per-section floor as security.yml's
+        # forbidden-content job. The floor is what makes "fail closed" mean anything: a
+        # partially-mangled secret can load a handful of detectors and pass with a green tick, so
+        # requiring a token SOURCE is not sufficient and the section minimums are asserted too.
+        #
+        # zizmor: the secret is never interpolated into this run: body. It arrives as a step-level env
+        # var, which is an opaque value rather than an Actions-expression sink.
+        env:
+          MEFOR_FORBIDDEN_TOKENS: ${{ secrets.MEFOR_FORBIDDEN_TOKENS }}
+        run: |
+          if [ -n "$MEFOR_FORBIDDEN_TOKENS" ]; then
+            export MEFOR_REQUIRE_TOKENS=1
+            export MEFOR_MIN_DETECTORS=names=7,estate=13,site_prefixes=1
+            echo "token list loaded from the MEFOR_FORBIDDEN_TOKENS secret (fail-closed, per-section floor)."
+          else
+            # A push event cannot come from a fork, so unlike security.yml there is no legitimate
+            # secret-unavailable case to degrade into. Absent here means misconfigured, and a scanner
+            # that quietly drops to structural-only while reporting green is the failure this whole
+            # class of gate exists to avoid.
+            echo "::error::MEFOR_FORBIDDEN_TOKENS is absent on a push run. The branch leak scan cannot run. Check the repository secret (repo-scoped, not environment-scoped)." >&2
+            exit 2
+          fi
+          python scripts/security/scan_forbidden.py --path .
+      - name: Say what a failure here does and does not mean
+        if: failure()
+        run: |
+          echo "::warning::This branch carries forbidden content and it is ALREADY PUBLIC -- the push"
+          echo "::warning::completed before this ran. This job detects; it cannot prevent."
+          echo "::warning::Respond: delete the branch, assess what was exposed, and check whether the"
+          echo "::warning::pre-push guard was bypassed (--no-verify) or simply never installed"
+          echo "::warning::(pwsh -NoProfile -File scripts/coord/install-git-hooks.ps1)."

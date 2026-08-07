@@ -16,7 +16,7 @@
 | **Date** | July 13, 2026 |
 | **License** | Publishable under the project's open-source license; intended to be shared with adopters and reused across projects. |
 | **Review cadence** | At least annually, and on **any material change to the AI toolchain or threat model** (a new agent framework, MCP server, Claude Code version, or a new probed attack class). |
-| **Aligns to** | NIST SP 800-218 (SSDF): PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to Secure Development Standards. **Deliberately omits any certification framework** — see §8. |
+| **Aligns to** | NIST SP 800-218 (SSDF) **v1.1**: PO.1 / PO.2 / PO.3 / PO.5 / PS.1 / PW.1 / PW.4 / PW.7 / PW.8 / RV.2 — and deliberately **not SP 800-218A**, which profiles organizations *producing* generative-AI and dual-use foundation models, **not** building software *with* an AI assistant; the name is the trap, and it is the wrong document for this one · OWASP ASVS 5.0 Level 3 (V8, V11, V14, V15, V16) · a **five-principle synthesis** distilled from the AI-assisted-development literature (§3, §11 — *not* an external standard) · the project standing contract [`../CLAUDE.md`](../CLAUDE.md) · companion to Secure Development Standards. **Deliberately omits any certification framework** — see §8. |
 
 ---
 

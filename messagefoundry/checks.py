@@ -120,6 +120,7 @@ def run_checks(
     handler_security_allow: frozenset[str] = frozenset(),
     service_config: str | Path | None = None,
     suppress_service_toml_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckReport:
     """Run the gate against ``config_dir``; ``messages_dir`` enables the dry-run check when it has
     fixtures. Set ``run_lint=False`` to skip the advisory ruff/mypy pass. ``strict_handler_security``
@@ -133,6 +134,14 @@ def run_checks(
     given) suppresses the legacy upward-walk so ``check`` matches ``serve``'s resolution. With both
     defaulted (today's ``messagefoundry check --config config``), the upward-walk is preserved — no
     regression.
+
+    ``project_root`` (``--project-root``) is the anchor for ``environments/<env>.toml``, and it exists
+    because the gate previously VALIDATED that file under the supplied root and then READ the values
+    from the process working directory (BACKLOG #1062). It is threaded to the build check and applied
+    the way ``serve`` applies it — as a ``[environments].base_dir`` CLI override, which by
+    ``load_settings``' CLI > env > file precedence overrides a file-set ``base_dir`` exactly as
+    ``__main__.py``'s ``serve`` does. Left ``None`` the resolution is unchanged and still falls back to
+    the process directory, so the documented ``check --config config`` invocation is untouched.
     """
     results = [
         _check_validate(config_dir),
@@ -151,6 +160,7 @@ def run_checks(
             config_dir,
             service_config=service_config,
             suppress_search=suppress_service_toml_search,
+            project_root=project_root,
         ),
         _check_reference_backend(
             config_dir,
@@ -564,14 +574,50 @@ def _message_fn_decorator(
     return None
 
 
+def _const_getattr_target(node: ast.expr) -> tuple[str, ast.expr] | None:
+    """For a ``getattr(receiver, "<str literal>")`` call, return ``(attr_name, receiver)`` so the chain
+    resolver can splice the constant attribute in — turning ``getattr(os, "system")`` into ``os.system``.
+
+    Returns None for anything else: a non-``getattr`` call, a *dynamic* attribute
+    (``getattr(os, name)`` — a variable, not a str constant), or a ``*args`` splat in the first two
+    positions (which makes positional indexing meaningless). Only a statically-known constant attribute
+    name is spliced; a dynamic indirection stays unresolvable, so benign reflection is not flagged."""
+    if not (
+        isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "getattr"
+    ):
+        return None
+    if len(node.args) < 2 or any(isinstance(a, ast.Starred) for a in node.args[:2]):
+        return None
+    attr = node.args[1]
+    if isinstance(attr, ast.Constant) and isinstance(attr.value, str):
+        attr_name: str = attr.value  # bound locally for mypy-strict narrowing
+        return attr_name, node.args[0]
+    return None
+
+
 def _dotted_call_name(func: ast.expr) -> str | None:
     """Reconstruct a dotted Name/Attribute chain (``os.path.join``) from a call's ``func``, or None
-    when it is not a pure Name/Attribute chain (e.g. the receiver is itself a call or subscript)."""
+    when the chain does not bottom out in a plain Name (e.g. the receiver is a subscript or a
+    non-``getattr`` call).
+
+    A *constant* ``getattr`` indirection is spliced: ``getattr(os, "system")`` resolves to ``os.system``
+    (and ``getattr(pkg, "sub").fn`` to ``pkg.sub.fn``). A *dynamic* ``getattr(os, name)``, a subscript
+    (``globals()["os"]``), or any other call-shaped receiver stays unresolvable → None. Each iteration
+    strictly descends a finite AST (Attribute → its value, or a getattr splice → its receiver), so the
+    loop always terminates."""
     parts: list[str] = []
     cur: ast.expr = func
-    while isinstance(cur, ast.Attribute):
-        parts.append(cur.attr)
-        cur = cur.value
+    while True:
+        if isinstance(cur, ast.Attribute):
+            parts.append(cur.attr)
+            cur = cur.value
+            continue
+        target = _const_getattr_target(cur)
+        if target is None:
+            break
+        attr_name, receiver = target
+        parts.append(attr_name)
+        cur = receiver
     if isinstance(cur, ast.Name):
         parts.append(cur.id)
         return ".".join(reversed(parts))
@@ -899,9 +945,10 @@ def _check_handler_security(
     that wants a hard gate on its own CI. The runtime half is the opt-in ADR 0087 sandbox. Mirrors
     :func:`_check_raise_fstring`: static ``ast`` only (never imports/executes the config), globs
     ``*.py`` under ``config_dir`` (helpers included), and skips a broken/unreadable file (``validate``
-    reports those) so it never crashes the gate. ``phi-to-log`` and ``impure-transform`` are scoped to
-    ``@router``/``@handler`` bodies (so an undecorated helper's wall-clock fallback is not a false
-    positive); the other three scan the whole module."""
+    reports those) so it never crashes the gate. ``impure-transform`` is scoped to ``@router``/``@handler``
+    bodies (so an undecorated helper's wall-clock fallback is not a false positive); ``phi-to-log`` scans
+    every function body — decorated or an undecorated ``_*`` transform helper — keying on the first
+    positional parameter as the message symbol (BACKLOG #337); the other three scan the whole module."""
     base = Path(config_dir)
     if not base.is_dir():
         return CheckResult(
@@ -936,19 +983,25 @@ def _check_handler_security(
                 file_hits.append((node.lineno, "unsafe-db-lookup"))
             if _ambient_authority_hit(node):
                 file_hits.append((node.lineno, "ambient-authority"))
-        # Decorated-scope rules — phi-to-log + impure-transform, over each router/handler's own body
+        # Per-FunctionDef body rules — phi-to-log + impure-transform, over each function's own body
         # only (not nested defs, not the signature), so each call is scanned once with its own message
-        # symbol and an import-time default arg is never mistaken for per-message impurity.
+        # symbol and an import-time default arg is never mistaken for per-message impurity. phi-to-log
+        # runs over EVERY function body — a decorated @router/@handler AND an undecorated `_*` transform
+        # helper (BACKLOG #337, CLAUDE.md §9; the decompose-by-role convention steers PHI handling into
+        # `_*` helpers, so a lint that only saw decorated bodies skipped the file the convention names),
+        # keying on the first positional parameter as the message symbol. impure-transform stays
+        # decorated-scope only, so the shipped `_pdf_mdm_transforms.py` ingest-time wall-clock fallback
+        # in an undecorated helper is not a false positive (the trade ADR 0144 records).
         for node in ast.walk(tree):
-            if _message_fn_decorator(node) is None:
+            if not isinstance(node, ast.FunctionDef):
                 continue
-            assert isinstance(node, ast.FunctionDef)  # narrowed by _message_fn_decorator
+            decorated = _message_fn_decorator(node) is not None
             params = node.args.posonlyargs + node.args.args
             msg_sym = params[0].arg if params else None
             for sub in _body_calls(node):
                 if msg_sym is not None and _phi_to_log_hit(sub, msg_sym):
                     file_hits.append((sub.lineno, "phi-to-log"))
-                if _impure_transform_hit(sub, imported):
+                if decorated and _impure_transform_hit(sub, imported):
                     file_hits.append((sub.lineno, "impure-transform"))
         hits += [f"{path.name}:{lineno} [{rule}]" for lineno, rule in sorted(file_hits)]
     if not hits:
@@ -1234,6 +1287,7 @@ def _check_build(
     *,
     service_config: str | Path | None = None,
     suppress_search: bool = False,
+    project_root: str | Path | None = None,
 ) -> CheckResult:
     """Run the **posture-stamped** ``build_check_registry`` that ``serve``/``reload`` run, so a config
     ``serve`` would REFUSE — most importantly a production-PHI cleartext / weakened-TLS transport hop
@@ -1275,8 +1329,20 @@ def _check_build(
         return CheckResult(
             "build-check", ok=True, required=True, skipped=True, detail="no messagefoundry.toml"
         )
+    # --project-root anchors the env VALUES, applied exactly as `serve` applies it (__main__.py, the
+    # `cli["environments"]["base_dir"] = args.project_root` line): as a [environments].base_dir CLI
+    # override, which load_settings' CLI > env > file precedence puts above a file-set base_dir.
+    #
+    # Without it the caller's root was used to VALIDATE that <root>/<env_dir>/<env>.toml EXISTS and then
+    # discarded, while the values below were read from the PROCESS directory -- so the ADR 0092
+    # posture-keyed insecure-hop refusal could be decided against a different environment's hosts and
+    # schemes than the one the operator named (BACKLOG #1062). Left None, resolution is unchanged and
+    # still falls back to the process directory, so `check --config config` is untouched.
+    cli: dict[str, dict[str, object]] | None = (
+        {"environments": {"base_dir": str(project_root)}} if project_root is not None else None
+    )
     try:
-        settings = load_settings(config_path=toml)
+        settings = load_settings(config_path=toml, cli=cli)
     except (FileNotFoundError, ValueError, ValidationError, OSError) as exc:
         return CheckResult(
             "build-check",
