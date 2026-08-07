@@ -167,8 +167,9 @@ carries the recommended hardening for an exposed console (client-certificate dev
 
 Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or AD/LDAP. Note:
 
-- With `[security].require_sign_in = false`, an off-loopback bind is **hard-refused** (loopback is the
-  only no-auth posture).
+- With `[security].require_sign_in = false`, an exposed instance is **hard-refused** — an off-loopback
+  bind, or a loopback bind behind a declared TLS terminator (a bare loopback bind with no declared
+  terminator is the only no-auth posture).
 - `[security].require_mfa` is **on by default**, and MFA is an access gate: an enrolled-pending session
   gets `403` + `X-MFA-Required: 1` on every authorized route. **Leave it on** — that default, not the
   startup gate below, is the control.
@@ -184,7 +185,7 @@ Auth is on by default; remote users sign in with local accounts (± TOTP MFA) or
   loopback-behind-a-terminator topology in §3 **does** trip it, including when the default-on console
   auto-degrades to JSON-only, and when `serve_web_console = false` disables the console outright: the
   single-factor surface being protected is the JSON operator API. (This is a correction —
-  [BACKLOG #326](BACKLOG.md); the arm used to read the console flag, which the §3 auto-degrade clears
+  [BACKLOG #326](archive/backlog/BACKLOG-CLOSED.md#326-mfa-at-exposure-refusal-reads-serve_ui-after-it-is-flipped-off); the arm used to read the console flag, which the §3 auto-degrade clears
   first, and would have missed exactly that topology on first deployment.) An **undeclared** proxy —
   a set `[security].web_console_public_address` with no `tls_terminated_upstream` — is outside the
   predicate and does **not** refuse: nothing was declared, so exposure would be an inference. It gets

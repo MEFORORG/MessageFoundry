@@ -47,4 +47,4 @@ with boxes.
 
 ---
 *Source deliverable for MULTISESSION-PLAN-7 (L0). Not a decision record — the decisions live in
-[`docs/BACKLOG.md`](BACKLOG.md) (#26/#48/#84/#92/#104/#105) and [ADR 0072](adr/0072-traced-dryrun-mode.md).*
+[`docs/BACKLOG.md`](BACKLOG.md) (#84/#105), [`archive/backlog/BACKLOG-CLOSED.md`](archive/backlog/BACKLOG-CLOSED.md) (#26/#48/#92/#104), and [ADR 0072](adr/0072-traced-dryrun-mode.md).*

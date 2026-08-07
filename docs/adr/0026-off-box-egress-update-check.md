@@ -14,7 +14,7 @@
 
 ## Context
 
-#30 asks for an automatic "newer MessageFoundry version exists" signal surfaced in the console and the VS Code IDE, so an operator sees drift without hand-diffing `pyproject.toml` / `requirements.lock` against PyPI ([BACKLOG #30](../BACKLOG.md)). The feature has a real tension at its heart, and the backlog entry already names it as "the main design constraint": **a version check is an outbound network call, which conflicts with the on-premises-by-default, no-egress posture** ([CLAUDE.md](../../CLAUDE.md) §9; [SECURITY.md](../SECURITY.md) — the API binds `127.0.0.1` by default and no PHI leaves the local environment without explicit, reviewed configuration).
+#30 asks for an automatic "newer MessageFoundry version exists" signal surfaced in the console and the VS Code IDE, so an operator sees drift without hand-diffing `pyproject.toml` / `requirements.lock` against PyPI ([BACKLOG #30](../archive/backlog/BACKLOG-CLOSED.md#30-automatic-dependency--messagefoundry-version-update-check-surfaced-in-the-console--ide)). The feature has a real tension at its heart, and the backlog entry already names it as "the main design constraint": **a version check is an outbound network call, which conflicts with the on-premises-by-default, no-egress posture** ([CLAUDE.md](../../CLAUDE.md) §9; [SECURITY.md](../SECURITY.md) — the API binds `127.0.0.1` by default and no PHI leaves the local environment without explicit, reviewed configuration).
 
 Why on-prem HL7 integration engines distrust "phone-home":
 
@@ -80,7 +80,7 @@ The event is **best-effort and advisory** (the sink contract — never raises, n
 
 ### §5 The §G trim — the auto dependency-vulnerability-scan half is NOT built
 
-#30 originally bundled an auto **dependency**-vulnerability/update scan alongside the MEFOR-version check. That half is **dropped** (MULTISESSION-PLAN-3.md §G; [BACKLOG #30](../BACKLOG.md)): CI's **DEP-1** audit + the **hash-locked `requirements.lock`** already cover dependency staleness/vulnerability out-of-band. Building a **second, runtime** dependency-scan mechanism inside the engine would (a) duplicate the CI gate, (b) require its own always-on egress to a vulnerability index — the exact phone-home this ADR is constraining — and (c) tempt an auto-install/lock-mutating path this ADR forbids (§2.4). So the MVP keeps **only** the off-by-default (prefer no-network) **MEFOR-version** advisory. Dependency posture stays where it belongs: the lock + DEP-1.
+#30 originally bundled an auto **dependency**-vulnerability/update scan alongside the MEFOR-version check. That half is **dropped** (MULTISESSION-PLAN-3.md §G; [BACKLOG #30](../archive/backlog/BACKLOG-CLOSED.md#30-automatic-dependency--messagefoundry-version-update-check-surfaced-in-the-console--ide)): CI's **DEP-1** audit + the **hash-locked `requirements.lock`** already cover dependency staleness/vulnerability out-of-band. Building a **second, runtime** dependency-scan mechanism inside the engine would (a) duplicate the CI gate, (b) require its own always-on egress to a vulnerability index — the exact phone-home this ADR is constraining — and (c) tempt an auto-install/lock-mutating path this ADR forbids (§2.4). So the MVP keeps **only** the off-by-default (prefer no-network) **MEFOR-version** advisory. Dependency posture stays where it belongs: the lock + DEP-1.
 
 ## Consequences
 

@@ -31,6 +31,7 @@ from messagefoundry.config.tls_policy import (
     in_process_tls_revocation_refused,
     insecure_hop_disposition,
     is_loopback_hop_host,
+    kex_groups_report,
     tls_revocation_attested,
     validate_tls_ciphers,
 )
@@ -194,6 +195,24 @@ def test_approved_groups_are_ecdhe_curves() -> None:
     # NB `secp256r1` is a valid OpenSSL group-list alias but NOT a valid EC curve name — that spelling
     # is `prime256v1`, and set_ecdh_curve("secp256r1") raises ValueError. Both are correct in their own
     # API; do not "normalise" them to one.
+
+
+# --- kex_groups_report: report-only KEX read-out (#338, ASVS 11.6.2) ----------------------------
+def test_kex_groups_report_reports_inherited_today() -> None:
+    """#338: the report-only KEX read-out says the approved groups are INHERITED on this runtime.
+
+    ``SSLContext.set_groups`` is a Python 3.15 API, so ``harden_kex_groups`` pins nothing on any
+    interpreter this project currently runs on. The read-out must therefore report "inherited" (never
+    "pinned:") and name the approved group list it WOULD pin, so an operator reading it sees what is at
+    stake. It is a pure read-out over a throwaway probe context — report-only, and it never raises. On
+    the Python 3.15 interpreter that grows the API this flips to "pinned:", the same signal the
+    ``test_the_group_pin_is_inert_on_this_runtime_and_says_so`` tripwire fires on.
+    """
+    report = kex_groups_report()
+    assert isinstance(report, str) and report  # a non-empty string
+    assert "inherited" in report  # nothing is pinned on a pre-3.15 interpreter
+    assert APPROVED_KEX_GROUPS in report  # names the approved list it WOULD pin
+    assert "pinned:" not in report  # the "pinned:" branch is 3.15-only
 
 
 # --- harden_verify_flags -----------------------------------------------------------------------

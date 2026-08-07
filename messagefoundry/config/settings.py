@@ -213,13 +213,18 @@ def weakened_tls_escape_permitted(posture: HopPosture | None = None) -> bool:
     """Whether ``MEFOR_ALLOW_INSECURE_TLS`` may permit a weakened / verify-off TLS hop under ``posture``,
     CLAMPED so an enforcing PHI hop is NEVER relaxed (#200, ADR 0092 decision 2).
 
-    The is_phi-blind **strict verify-off** cells — the engine<->store TLS gate
+    The is_phi-blind **weakened-TLS / cleartext-escape** cells route their global-escape check through
+    here so the blunt escape can no longer silence an **enforcing PHI** refusal (matching the
+    ``--allow-insecure-bind`` API-bind clamp). That is **at least** the engine<->store TLS gate
     (:func:`~messagefoundry.store.sqlserver.connection_string` / ``store.postgres._build_ssl``), the MLLP
-    and FTPS ``tls_verify=false`` contexts, and the credentialed plain-``ftp`` guard — route their global-
-    escape check through here so the blunt escape can no longer silence an **enforcing PHI** refusal
-    (matching the ``--allow-insecure-bind`` API-bind clamp). Pass the construction-time
-    :func:`~messagefoundry.config.tls_policy.current_hop_posture` (transport cells) or the store's threaded
-    posture. Semantics: the escape must be set at all, AND the hop must not be enforcing PHI. ``None``
+    and FTPS ``tls_verify=false`` contexts and the credentialed plain-``ftp`` guard, **and — since #329 —**
+    the LDAPS ``ad_tls_verify=false`` bind (:mod:`messagefoundry.auth.ldap`), the SFTP unknown-host-key
+    acceptance (:mod:`messagefoundry.transports.remotefile`), and the webhook-alert-sink and AI-broker
+    cleartext-``http`` hops. Pass the construction-time
+    :func:`~messagefoundry.config.tls_policy.current_hop_posture` (in-gate transport cells, via
+    :func:`weakened_tls_escape_permitted_here`) or an explicitly-threaded posture (the store hop and the
+    out-of-gate #329 cells, whose construction never stamps the contextvar). Semantics: the escape must
+    be set at all, AND the hop must not be enforcing PHI. ``None``
     (a backup utility / embedding / test outside the construction gate) falls back to the **unclamped**
     escape — byte-identical to pre-#200 — since the enforced serve/reload gate already vetted the real
     production posture, so this fallback never loosens the clamp."""
