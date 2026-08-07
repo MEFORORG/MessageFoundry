@@ -14,14 +14,14 @@ ever drives the console through a real browser, a real TLS listener, or a real r
 
 This chapter covers the same-origin, server-rendered browser operations console
 `messagefoundry_webconsole` — grafted onto the engine's FastAPI app by
-`mount_ui` ([`messagefoundry_webconsole/mount.py:69`](messagefoundry_webconsole/mount.py)), ADR 0065 /
+`mount_ui` ([`messagefoundry_webconsole/mount.py:69`](../../../messagefoundry_webconsole/mount.py)), ADR 0065 /
 ADR 0143. It is the **sole** operator console; the PySide6 desktop console was retired (BACKLOG #103)
 and PySide6 now backs only the standalone test harness. ~11.2k LOC of Python plus 1,506 lines of
 `app.js` and 345 lines of `app.css`, shipped as a separately-versioned second wheel
 (`packaging/messagefoundry-webconsole/`) with its own ~347-test suite run as a second CI step.
 
 **In scope.** Every page and flow of the 98-route `/ui` surface pinned at
-[`packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt`](packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt):
+[`packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt`](../../../packaging/messagefoundry-webconsole/tests/golden/ui_routes.txt):
 login and provider select, Kerberos/SPNEGO SSO, OIDC federated login, TOTP MFA lifecycle, WebAuthn
 passkeys, must-change-password and `/ui/mfa` confinement; the connections dashboard, live fragment poll
 and `/ws/stats` server-rendered enrichment, bulk connection control, per-connection and bulk statistics
@@ -43,18 +43,18 @@ performance and pagination at scale, and concurrent operators.
 
 | Area | Owner |
 |---|---|
-| The 32-row `/ui` coverage-gap audit (rows `FCP:UI-1`..`FCP:UI-32`, six dimensions) | [`docs/testing/FEATURE-COVERAGE-PLAN.md`](docs/testing/FEATURE-COVERAGE-PLAN.md) §23, lines 1469–1517. Cited, not restated. Open rows: **FCP:UI-8**, **FCP:UI-23**, **FCP:UI-32**; **FCP:UI-12 closed 2026-07-13** (P2 STATUS block, `:142-152`). (`FCP:` marks a FEATURE-COVERAGE-PLAN ID; a bare `WEB-nn` is always this plan's own row.) |
-| Package architecture, the three-layer seam handshake, the version-skew gate, dev-and-test instructions | [`docs/WEBCONSOLE-PACKAGE.md`](docs/WEBCONSOLE-PACKAGE.md) |
+| The 32-row `/ui` coverage-gap audit (rows `FCP:UI-1`..`FCP:UI-32`, six dimensions) | [`docs/testing/FEATURE-COVERAGE-PLAN.md`](../FEATURE-COVERAGE-PLAN.md) §23, lines 1469–1517. Cited, not restated. Open rows: **FCP:UI-8**, **FCP:UI-23**, **FCP:UI-32**; **FCP:UI-12 closed 2026-07-13** (P2 STATUS block, `:142-152`). (`FCP:` marks a FEATURE-COVERAGE-PLAN ID; a bare `WEB-nn` is always this plan's own row.) |
+| Package architecture, the three-layer seam handshake, the version-skew gate, dev-and-test instructions | [`docs/WEBCONSOLE-PACKAGE.md`](../../WEBCONSOLE-PACKAGE.md) |
 | Config-deploy semantics, promote/stage, provenance | the **PUB** chapter (this chapter tests only the console's *rendering and gating* of config reload) |
-| Windows Server 2025 host / service-identity acceptance | [`docs/testing/WIN2025-TEST-PLAN.md`](docs/testing/WIN2025-TEST-PLAN.md) + [`WIN2025-TEST-MATRIX.md`](docs/testing/WIN2025-TEST-MATRIX.md) — but note: **neither carries a single `/ui` row** (verified: zero matches for `/ui`, "web console", "webconsole"). WEB-57/WEB-59 below add them (`W25:` marks a WIN2025 / acceptance-matrix ID); the *host* setup stays theirs. |
-| Pipeline throughput | [`docs/LOAD-TESTING.md`](docs/LOAD-TESTING.md). This chapter adds only console-induced load and the engine-throughput delta it causes. |
+| Windows Server 2025 host / service-identity acceptance | [`docs/testing/WIN2025-TEST-PLAN.md`](../WIN2025-TEST-PLAN.md) + [`WIN2025-TEST-MATRIX.md`](../WIN2025-TEST-MATRIX.md) — but note: **neither carries a single `/ui` row** (verified: zero matches for `/ui`, "web console", "webconsole"). WEB-57/WEB-59 below add them (`W25:` marks a WIN2025 / acceptance-matrix ID); the *host* setup stays theirs. |
+| Pipeline throughput | [`docs/LOAD-TESTING.md`](../../LOAD-TESTING.md). This chapter adds only console-induced load and the engine-throughput delta it causes. |
 | The VS Code IDE extension (Steps view, connections graph, ADR 0076/0091/0103) | the **IDE** chapter |
 | Engine JSON API authz/PHI semantics | the **API** chapter. The console calls the same handlers through `UiDeps`; this chapter tests the `/ui` *gate* and *projection* on top. |
 
 **Recon corrections made during authoring.**
 1. The golden route/write-action files live at `packaging/messagefoundry-webconsole/tests/golden/`, **not** `tests/golden/` — `tests/golden/` holds only `webconsole_seam.snapshot`.
-2. "Console default-ON" is narrower than stated: default-ON applies to **loopback binds only**. A *non-explicit* default-on console on an exposed bind **auto-degrades to JSON-only with a warning** ([`messagefoundry/__main__.py:1703-1727`](messagefoundry/__main__.py)); only an explicit `[security].serve_web_console=true` reaches the exposure ladder at `:1734-1827`.
-3. The `[security]` public-origin key is `web_console_public_address` (aliased to `[api].public_origin`, [`config/settings.py:3479,3815`](messagefoundry/config/settings.py)) — the CLI messages name the `[security]` form.
+2. "Console default-ON" is narrower than stated: default-ON applies to **loopback binds only**. A *non-explicit* default-on console on an exposed bind **auto-degrades to JSON-only with a warning** ([`messagefoundry/__main__.py:1703-1727`](../../../messagefoundry/__main__.py)); only an explicit `[security].serve_web_console=true` reaches the exposure ladder at `:1734-1827`.
+3. The `[security]` public-origin key is `web_console_public_address` (aliased to `[api].public_origin`, [`config/settings.py:3479,3815`](../../../messagefoundry/config/settings.py)) — the CLI messages name the `[security]` form.
 4. Simulated-scheme ASGI clients live in `test_ui_hardening.py:34-37`, not `conftest.py:37` (which is the shared `engine` fixture).
 5. `app.js` **does** set `aria-sort` (`app.js:708`) and the sort trigger **is** a native `<button>` (`app.js:794-804`) — keyboard-operable. What has no keyboard path is column **resize** (`app.js:832-863`, pointer events only) and column **reorder** (`app.js:880-911`, native HTML5 drag only). There is not one `keydown` listener in the file.
 6. Page-builder approval line numbers: `pages/config.py:96-105`, `pages/connections.py:207-212`, `pages/messages.py:676-685`.
@@ -134,7 +134,7 @@ another chapter, this chapter scopes no separate work, and the row exists only s
 coverage stays legible end-to-end. A pointer row keeps its ID, carries Method `—` and Cls **T**, and
 gates through its owner's row, not a second time here.
 
-**Foreign IDs are prefixed.** `FCP:` = a [`docs/testing/FEATURE-COVERAGE-PLAN.md`](docs/testing/FEATURE-COVERAGE-PLAN.md)
+**Foreign IDs are prefixed.** `FCP:` = a [`docs/testing/FEATURE-COVERAGE-PLAN.md`](../FEATURE-COVERAGE-PLAN.md)
 gap ID (`FCP:UI-8`), `W25:` = a WIN2025 / `harness/acceptance/matrix.py` row (`W25:A7`). A bare
 `WEB-nn` is always this plan's own row; unprefixed cross-chapter IDs (`MIG-28`, `TRAY-67`) are other
 chapters of *this* plan.
