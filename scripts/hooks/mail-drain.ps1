@@ -167,12 +167,6 @@ $MAX_TS_CHARS = 40
 $MAX_CWD_CHARS = 200
 $MAX_BRANCH_CHARS = 120
 $MAX_LINE_CHARS = 240
-# Held messages consumed per drain. It bounds WORK, not delivery: a held message over this cap keeps its
-# marker, stays in the inbox and is consumed at the next turn boundary, exactly as a message over
-# MAX_MESSAGES is shown at the next drain. Ten times the display cap, because the held list grows by at
-# most MAX_MESSAGES per non-consuming drain and a session that ran ten of them before its first turn
-# boundary is already pathological.
-$MAX_HELD_CONSUME = 50
 # There is no id cap: the id is the validated filename stem, whose shape is strictly narrower than
 # anything a cap would enforce. Adding one would imply the id is untrusted at this point, which would
 # be the wrong thing for the next reader to believe.
@@ -541,15 +535,7 @@ try {
     $swept = 0
     $duplicateStems = 0
     # --- The show/consume split's own counters. ---
-    $held = @()             # marked as shown to THIS session: not re-rendered, and consumed by this
-    # session's Stop. Still physically in the inbox.
     $alreadyShown = 0       # the held count, named for what the reader cares about.
-    $heldGone = 0           # held by this session and no longer in the inbox: another session's drain
-    # took it. Nothing was lost.
-    $heldDeferred = 0       # held, and over this drain's consume cap. Consumed at the next turn
-    # boundary; still in the inbox until then.
-    $heldUnfinalized = 0    # held, and the consume did not complete this pass. Still on disk -- in
-    # claiming/ if it was claimed first, otherwise still in the inbox.
     $sweptMarkers = 0
     $unownedMarkers = 0     # a name in shown/ this channel did not mint. Counted, left alone.
     # Reported, not swallowed. A retention sweep that cannot run is not itself serious -- it bounds
@@ -561,9 +547,7 @@ try {
     # instead -- the file stays in claiming/, which mail.ps1 -Status reports, and the next drain's
     # dead-owner sweep moves it to stranded/ where its receipt proves it was shown.
     #
-    # $heldUnfinalized above is NOT an exception to that and is the reason this comment names a specific
     # loop rather than "a finalize". Complete-Held runs BEFORE the counter block is built, precisely so
-    # $heldGone can reach the reader, and a failure there is countable for exactly the same reason. The
     # older wording said no such counter could ever exist and was wrong the moment that step moved.
 
     # --- Retention sweep of the TERMINAL directories. -------------------------------------------
@@ -804,10 +788,25 @@ try {
         # suppress the display while Stop consumed the message -- a silent loss. Its failure direction
         # is a duplicate display, which is accepted.
         $markerPath = if ($markable) { Join-Path $shownDir "$id--$sessionKey.marker" } else { $null }
-        if ($markerPath -and (Test-FilePresent -Path $markerPath)) {
-            $held += [pscustomobject]@{
-                File = $f; Id = $id; ReceiptPath = $receiptPath; MarkerPath = $markerPath
-            }
+        # A MARKER MAY SUPPRESS A DISPLAY. IT MAY NEVER AUTHORISE A CONSUME -- hence `-not $consuming`,
+        # and that clause is the whole fix for a loss that was REPRODUCED rather than theorised.
+        #
+        # SESSION IDS ARE REUSED ACROSS LAUNCHES. Measured: one of six ids in the phantom run had been
+        # seen hours earlier. So a discarded session mints a marker, and a LATER session carrying the
+        # same id inherits it. Under the previous rule that later session had its display suppressed
+        # here and then consumed the message at its Stop, having rendered nothing: a message consumed
+        # by a session that never saw it, with a clean receipt. Nothing inside this design could
+        # separate the two -- every artefact is keyed by the id they share, so the sequence was
+        # byte-identical to one healthy session showing mail at start and consuming it at the boundary.
+        #
+        # A CONSUMING DRAIN THEREFORE IGNORES MARKERS ENTIRELY and renders what it is about to consume.
+        # Consumption now depends only on what THIS INVOCATION rendered, which is a property no other
+        # session can forge, rather than on an identity two sessions can share.
+        #
+        # THE COST IS A GUARANTEED DUPLICATE DISPLAY: a session shown mail at SessionStart is shown it
+        # again at its first Stop. That is the accepted side of this channel's one tradeoff, and it is
+        # the direction the rule points -- duplicate display is accepted, silent loss is not.
+        if ($markerPath -and -not $consuming -and (Test-FilePresent -Path $markerPath)) {
             $alreadyShown++
             continue
         }
@@ -873,81 +872,23 @@ try {
         $delivered += [pscustomobject]@{ Item = $s; Token = $null; Path = $null }
     }
 
-    # --- Complete-Held: consume what THIS session was already shown. -----------------------------
-    # This is the half that makes SessionStart's non-consumption safe rather than merely deferred: the
-    # mail is consumed at the first turn boundary the session actually reaches, and a session that never
-    # reaches one consumes nothing.
+    # THERE IS NO "CONSUME WHAT THIS SESSION WAS ALREADY SHOWN" STEP, AND THAT ABSENCE IS THE FIX.
+    # A Complete-Held pass used to consume messages a marker said this session had been shown at an
+    # earlier drain, without re-rendering them. It was removed because SESSION IDS ARE REUSED ACROSS
+    # LAUNCHES (measured), so "this session" is not something a marker can establish: a discarded
+    # session mints the marker and a later session carrying the same id inherits it, then consumes a
+    # message it never saw. Reproduced end to end before removal.
     #
-    # NO RE-RENDER. These were emitted by an earlier drain of this session -- that is what the marker
-    # records -- so re-rendering would be the duplicate the marker exists to prevent.
+    # No check could rescue it. session_id, transcript_path and cwd are all identical between the two,
+    # so nothing available to this hook separates them -- the failure was structural rather than a
+    # missing guard, which is why the answer is to delete the trust relationship instead of hardening
+    # it. Consumption is now a function of what THIS INVOCATION rendered, which no other session can
+    # forge.
     #
-    # RUN BEFORE THE INJECTION IS BUILT, AND FROM ONE CALL SITE. It has to be reachable from both exits
-    # -- a Stop drain whose only work is consuming what SessionStart showed reaches zero delivered --
-    # and $heldGone has to reach the reader, which it cannot if this runs after the emit. Ordering is
-    # safe because the receipt it writes is a statement about an emit that already happened, and the
-    # consume it records happens right here. Being before the emit is also why $heldUnfinalized can
-    # exist at all, unlike the delivery loop's finalize.
-    #
-    # THE CAP IS REAL AND THE REASONING IT REPLACED WAS NOT. This used to say the held list was bounded
-    # by MAX_MESSAGES because displays are capped per drain -- true premise, invalid conclusion: the
-    # bound is MAX_MESSAGES times the number of NON-CONSUMING DRAINS the session runs, which grows with
-    # every non-Stop event that ever gets wired. Measured: three SessionStart drains over twelve queued
-    # messages held twelve, and the next Stop claim-and-moved all twelve in one uncapped loop inside a
-    # hook that must exit fast. The remainder is not lost -- it keeps its marker, stays in the inbox,
-    # and is consumed at the next turn boundary -- so this is a delay, exactly as the display cap is.
-    if ($consuming -and $held.Count -gt 0) {
-        $heldDone = 0
-        foreach ($h in $held) {
-            if ($heldDone -ge $MAX_HELD_CONSUME) { $heldDeferred++; continue }
-            $heldDone++
-            try {
-                $hr = New-ClaimAttempt -Source $h.File.FullName -DestinationDir $claimingDir -Stem $h.Id
-                if (-not $hr.Won) {
-                    # Another session's drain took it. NOTHING WAS LOST -- it is being shown, or has
-                    # been shown, by whoever won. Drop our marker and move on.
-                    $heldGone++
-                    Remove-Item -LiteralPath $h.MarkerPath -Force -ErrorAction SilentlyContinue
-                    continue
-                }
-                # THE EMIT TIME COMES FROM THE MARKER, NOT FROM THE RECEIPT, and that is a correctness
-                # fix rather than a preference. The receipt is one slot per MESSAGE, so under the
-                # accepted duplicate it may already hold ANOTHER session's emit time -- pairing it with
-                # this session's id would make the receipt name a display that did not happen then. The
-                # marker is per-(message, session) and was written by the process that emitted to THIS
-                # session, so its markedUtc is the right timestamp by construction.
-                #
-                # Its CONTENT is still untrusted: the marker sits in a directory any local process can
-                # write to, so this is folded and capped, reaches the receipt JSON only, and never the
-                # injection. An unreadable or absent stamp yields '' -- which Write-MailReceipt accepts,
-                # deliberately; see the [AllowEmptyString()] note there for the strand this cost.
-                # ConvertFrom-Json silently coerces an ISO-8601 string to [datetime], and [string] on
-                # that yields the LOCAL short form -- round-trip it or a UTC stamp renders as local.
-                $shownUtc = ''
-                try {
-                    $mk = (Get-Content -LiteralPath $h.MarkerPath -Raw -EA Stop | ConvertFrom-Json -EA Stop).markedUtc
-                    $shownUtc = if ($mk -is [datetime]) { $mk.ToUniversalTime().ToString('o') }
-                    elseif ($mk -is [datetimeoffset]) { $mk.ToString('o') }
-                    else { [string]$mk }
-                }
-                catch { }
-                $shownUtc = Get-Clean $shownUtc $MAX_TS_CHARS
-                $nowUtc = [DateTime]::UtcNow.ToString('o')
-                Write-MailReceipt -Path $h.ReceiptPath -MessageId $h.Id -Disposition 'shown-consumed' `
-                    -ObservedUtc $shownUtc -ClaimToken $hr.Token -ConsumedUtc $nowUtc `
-                    -ConsumedByHookEvent $eventName -ByWorktree $cwd -BySessionId $sessionId `
-                    -SessionIdValid $markable -ByHookEvent $eventName -BoxKey $key -ExaminedPath $inboxDir
-                $fin = Move-Claimed -Source $hr.Path -DestinationDir $seenDir -Stem $h.Id -Token $hr.Token
-                if ($fin.Won) { Remove-Item -LiteralPath $h.MarkerPath -Force -ErrorAction SilentlyContinue }
-                else { $heldUnfinalized++ }
-            }
-            catch {
-                # Reached when the receipt could not be written, which now SKIPS the move by design. The
-                # message stays in claiming/ with its marker; the dead-owner sweep strands it, and the
-                # reader is told rather than being told it was consumed.
-                $heldUnfinalized++
-            }
-        }
-    }
+    # THE PRICE, PAID KNOWINGLY: a session shown mail at SessionStart is shown it again at its first
+    # Stop. Duplicate display is the accepted side of this channel's one tradeoff. Do not reintroduce a
+    # held-consume to remove that duplicate without first solving the identity problem above.
+
 
     # One counter block, on EVERY injection. Named counters -- at least one per outcome the drain can
     # reach -- make the failure shapes distinguishable instead of collapsing into "nothing to show".
@@ -970,37 +911,13 @@ try {
     if ($sweepFailed) { $counterLines += "A housekeeping sweep of seen/, expired/ or shown/ could not complete; delivery was unaffected." }
     if ($unownedClaims -gt 0) { $counterLines += "$unownedClaims file(s) in claiming/ carry a name this channel did not mint and were left alone." }
     if ($swept -gt 0) { $counterLines += "$swept message(s) older than $RETAIN_DAYS days were removed from seen/ and expired/." }
-    # The show/consume split's own outcomes. DISTINCT OUTCOMES, DISTINCT SENTENCES -- this file's first
-    # observability rule, and the reason the counter block exists at all.
+    # The show/consume split's own outcome. ONE sentence now, because there is only one: a marker can
+    # suppress a re-display at a non-consuming event and nothing else. A consuming drain ignores markers
+    # entirely, so $alreadyShown is unreachable when $consuming and the branch that used to report a
+    # held-consume is gone with the mechanism it described.
     if ($alreadyShown -gt 0) {
-        if ($consuming) {
-            # THE ARITHMETIC IS SPELLED OUT BECAUSE THE FLAT SENTENCE WAS FALSE. This used to read "they
-            # were consumed at this turn boundary" over the whole held count, which contradicted the
-            # $heldGone / $heldDeferred / $heldUnfinalized lines printed a few rows down whenever any of
-            # them was non-zero -- two sentences about one set of messages, disagreeing. Each of those
-            # three says where its share actually went, so this one names only the remainder.
-            $consumedHeld = $alreadyShown - $heldGone - $heldDeferred - $heldUnfinalized
-            $counterLines += "$alreadyShown message(s) had already been shown to this session and were NOT shown again;"
-            $counterLines += "$consumedHeld of them were consumed at this turn boundary. Showing is not consuming -- see"
-            $counterLines += "docs/SESSION-MAIL.md, 'Showing is not consuming'."
-        }
-        else {
-            $counterLines += "$alreadyShown message(s) have already been shown to this session and were NOT shown again."
-            $counterLines += "They are HELD in the inbox and are consumed at this session's next turn boundary, not now."
-        }
-    }
-    if ($heldGone -gt 0) {
-        $counterLines += "$heldGone message(s) previously shown to this session are no longer in the inbox: another"
-        $counterLines += "session's drain took them. Nothing was lost."
-    }
-    if ($heldDeferred -gt 0) {
-        $counterLines += "$heldDeferred message(s) already shown to this session were over this drain's consume cap of"
-        $counterLines += "$MAX_HELD_CONSUME; they stay in the inbox and are consumed at the next turn boundary."
-    }
-    if ($heldUnfinalized -gt 0) {
-        $counterLines += "$heldUnfinalized message(s) already shown to this session could NOT be consumed this pass and are"
-        $counterLines += "still on disk -- in claiming/ if claimed, otherwise still in the inbox. Nothing was lost; see"
-        $counterLines += "scripts\coord\mail.ps1 -Status."
+        $counterLines += "$alreadyShown message(s) have already been shown to this session and were NOT shown again"
+        $counterLines += "now. They stay in the inbox and are shown AND consumed at this session's next turn boundary."
     }
     if (-not $markable) {
         # THE FACT, NOT THE VALUE. The raw id is untrusted text and the injection is the one place
@@ -1026,14 +943,13 @@ try {
     if ($delivered.Count -eq 0) {
         # Not silence when something WAS there and none of it was shown. "Nothing to show" and
         # "nothing arrived" are different facts about the channel and must not render alike.
-        # A PRESENCE TEST, NOT A TOTAL. Some of these overlap ($held is also counted in $alreadyShown),
+        # A PRESENCE TEST, NOT A TOTAL. Some of these can overlap,
         # which is harmless because the only question asked of the sum is "was anything there at all".
         # A box holding shown-and-held mail must never take the "box is EMPTY" branch below: that would
         # be a false statement about a box with mail in it, which is the defect this channel exists to
         # make impossible.
         $anything = ($unreadable + $expired + $malformed + $filtered + $deferred + $ceded + $stranded +
-            $unownedClaims + $duplicateStems + $alreadyShown + $held.Count + $heldDeferred +
-            $heldUnfinalized + $heldGone + $unownedMarkers + $sweptMarkers)
+            $unownedClaims + $duplicateStems + $alreadyShown + $unownedMarkers + $sweptMarkers)
         if ($anything -gt 0) {
             $z = @("[mefor-mail] Drain ran at $asOf over $inboxDir. Nothing is being shown to you.")
             $z += $counterLines
