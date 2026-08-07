@@ -969,6 +969,11 @@ class SecurityPosture(BaseModel):
     # cryptography-wheel OpenSSL that encrypts PHI at rest — so it is "reported", never "certified".
     fips_mode: bool | None = None
     openssl_version: str | None = None
+    # TLS key-exchange groups read-out (report-only, #338 / ASVS 11.6.2). A read of whether the approved
+    # KEX groups are PINNED on built contexts or INHERITED from OpenSSL's default group list — today
+    # always inherited, because ``SSLContext.set_groups`` is a Python 3.15 API. Report-only: it reflects,
+    # and changes, NO live TLS behaviour (the TLS 1.2+ floor is the enforced control; see docs/PHI.md §4).
+    kex_groups: str | None = None
     # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1 / ASVS 11.7.1) + the operator
     # declaration (Phase 2). Named "self_reported" on purpose: these are values the host OS emits
     # about ITSELF (/proc/cpuinfo flags, guest device-node presence), and 11.7.1 exists precisely

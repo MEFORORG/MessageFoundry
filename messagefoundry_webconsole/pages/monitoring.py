@@ -403,6 +403,11 @@ def status(
                 _fips(getattr(posture, "fips_mode", None)),
             ],
             ["OpenSSL version (ssl/_hashlib)", _opt(getattr(posture, "openssl_version", None))],
+            # TLS key-exchange groups read-out (report-only, #338 / ASVS 11.6.2). Mirrors the FIPS/
+            # OpenSSL rows above: says whether the approved KEX groups are pinned on built contexts or
+            # inherited from OpenSSL's default (inherited until Python 3.15). getattr-with-default is
+            # defensive, not cross-seam compat (one supported seam, #279), so a None renders as a dash.
+            ["TLS key-exchange groups (reported)", _opt(getattr(posture, "kex_groups", None))],
             # Platform memory-encryption read-out (report-only, ADR 0152 Phase 1 / ASVS 11.7.1).
             # Wording is a security property here: every label says "self-reported", and capability
             # ("this silicon can") is a SEPARATE row from activation ("this guest is"), because a

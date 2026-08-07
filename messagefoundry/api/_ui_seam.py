@@ -88,7 +88,13 @@ from typing import Any
 #: `app.state.auth` would register nothing in production while passing every test that constructs the
 #: app with `auth=` directly. Additive with defaults, and the defaults are the STRICT position — an
 #: older or partial caller gets the interstitial on every absolute destination, never none.
-ENGINE_UI_SEAM: int = 17
+#: seam v18 (ASVS 11.6.2, #338): SecurityPosture gained the additive REPORT-ONLY `kex_groups` field — a
+#: read-out of whether the approved TLS key-exchange groups are PINNED on built contexts or INHERITED
+#: from OpenSSL's default group list (today always inherited: `SSLContext.set_groups` is a Python 3.15
+#: API). Report-only, reflects/changes NO live TLS behaviour; additive with a default, so an older
+#: console simply ignores it. Bumped because the golden seam snapshot introspects SecurityPosture's
+#: field set, so any added field trips the handshake even when it is purely additive.
+ENGINE_UI_SEAM: int = 18
 
 
 @dataclass(frozen=True, slots=True)

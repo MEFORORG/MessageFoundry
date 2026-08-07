@@ -242,7 +242,11 @@ from messagefoundry.config.settings import (
     hop_posture_from_ai,
     security_loosenings,
 )
-from messagefoundry.config.tls_policy import fips_attestation, phi_read_hop_disposition
+from messagefoundry.config.tls_policy import (
+    fips_attestation,
+    kex_groups_report,
+    phi_read_hop_disposition,
+)
 from messagefoundry.config.wiring import (
     EnvRef,
     Registry,
@@ -1540,6 +1544,9 @@ def create_app(
         # FIPS-provider attestation of the interpreter's ssl/_hashlib OpenSSL (report-only, #73 / ADR 0120):
         # metadata (a boolean + version string), never key material, never enforced.
         fips_mode, openssl_version = fips_attestation()
+        # TLS key-exchange groups read-out (report-only, #338). Pure helper over a throwaway probe
+        # context; reflects/changes NO live TLS behaviour, reports "inherited" until Python 3.15.
+        kex_groups = kex_groups_report()
         # Platform memory-encryption READ-OUT (report-only, ADR 0152 Phase 1). Pure platform read
         # (/proc/cpuinfo flags + guest device presence on Linux; all-None everywhere else), no engine
         # state, never raises. It reports what the HOST SAYS ABOUT ITSELF and therefore satisfies
@@ -1581,6 +1588,7 @@ def create_app(
             synthetic_relaxation=synthetic_relaxation,
             fips_mode=fips_mode,  # interpreter ssl/_hashlib OpenSSL FIPS-provider state; None=undeterminable
             openssl_version=openssl_version,  # that OpenSSL's version string (public metadata)
+            kex_groups=kex_groups,  # report-only: are the approved KEX groups pinned or inherited (#338)?
             # ADR 0152: a SELF-REPORT plus the operator's claim. Neither satisfies ASVS 11.7.1 at any
             # value — see the field comments on SecurityPosture. The disclaimer ships IN THE BODY
             # (memory_encryption_note), unconditionally: this endpoint is the designated evidence
