@@ -3286,6 +3286,7 @@ What is NOT settled is the mechanism. Two independent passes reached different a
 **Source:** stuck-CI triage, 2026-08-01. Instance 1 re-measured 2026-08-02 across 36 step-success windows-2025 rows (pool: 70 `ci.yml` runs created 2026-08-01 UTC), by two agents deriving it independently after the first two measurements both reported pools that did not reproduce; instance 2 reported and diagnosed by the HA-construct-recheck session from PR #129's sqlserver leg; instance 3 from the same 2026-08-02 re-measurement.
 
 ---
+
 ## 342. Sandbox worker kill does not reap a grandchild holding the response pipe
 
 > ✅ **BUILT 2026-08-06 (local commit on fix-342-sandbox-reap; owner opens the PR).** Value **5/10** · Difficulty **6/10** · _money pit_. `SandboxSession._kill` now reaps the whole worker process tree — a Windows `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` job object the worker is assigned to before its boot frame, and a POSIX new-session process group killed with `killpg` (`start_new_session=True`) — so a grandchild the Handler spawned can no longer inherit fd 1 (the response pipe) and outlive the kill as a leaked orphan writing onto a pipe the parent believes belongs to a fresh worker. Best-effort process hygiene, not the trust control (ADR 0087's codec + per-dispatch id + unsolicited-frame check keep a stray grandchild frame harmless): a job-assign failure degrades to a single-process kill, logged. The reap logic lives in `pipeline/sandbox.py`; the `_sandbox_codec.py` and `docs/CONFIGURATION.md` prose was synced to match. The ADR 0087 / ADR 0147 residual co-design (and the vault threat-model note) is left to the owner — reported, not done here.
@@ -5044,6 +5045,7 @@ The comment immediately above says *"Scope is deliberately the posture the requi
 **Related:** [ADR 0161](adr/0161-async-session-mail-for-unreachable-peers.md) (the decision, the measurements, and the ten EARS acceptance criteria), ADR 0158 (silent controls — a green signal that means nothing; findings 4, 5 and 8 are instances), #1018 (guards that go quiet).
 
 **Source:** adversarial review of the prototype by a red-team pass on 2026-08-05, before any wiring. The `File.Move` behaviour was measured in response to that pass rather than inferred from it, and the measurement retired the fix the review itself had proposed.
+
 ## 1029. `/simplify` shipped as a local skill with no entry in the quality-standards record, so the one review tool that edits the tree had no written placement or scope
 
 > ✅ **SHIPPED 2026-08-05 — the documentation is the whole deliverable.** Value **3/10** · Difficulty **1/10** · _quick win_. `/simplify` is now recorded in [`docs/Code_Quality_Standards.md`](Code_Quality_Standards.md) §5.1 as a local, human-invoked **advisory** review that **applies** its fixes, ordered before the `ruff` / `mypy` / `pytest` quartet, with the justified-duplication carve-outs written down. A new §5.1, a scoping clause in §5's intro, a mapping row in §6, and a `Before you verify` heading in `CLAUDE.md` §5.
@@ -5164,7 +5166,6 @@ Resolved against both ledger files with `parse_items`: **`#3` is an OPEN item to
 **Related:** PR #209 (the four-digit half, and the source of the `PR #NNNN` convention), \#1029 (the same document), \#1032 (same class: a census that counted without printing context).
 
 **Source:** raised by session `sleepy-villani-df328d` while sweeping the four-digit citations, and correctly kept out of that PR's scope. Owner ruled on it 2026-08-05. Counts here were re-measured against 780ee1d9 with a self-tested pattern after an unverified one reported zero.
-
 
 ## 1034. The pre-push shim fails OPEN when python is not on PATH, so the push guard silently does not run
 
@@ -5577,6 +5578,7 @@ against the gate **as it will ship**, not as it is.
 **Related:** ASVS 1.2.7, 1.3.4 (the structurally parallel SVG cell).
 
 **Source:** ASVS 5.0.0 V1 re-verification, 2026-08-05. Detail in the maintainer-internal ASVS V1 chapter report.
+
 ## 1051. Async-delivery `retry_max_attempts=None` (retry forever) contradicts the engine's own documented sync-HTTP guidance
 
 > 🔢 **Filed 2026-08-05 — not started.** Value **3/10** · Difficulty **2/10** · _fill-in_. `CONNECTIONS.md:2240` discloses the shipped async-delivery default `retry_max_attempts=None` as "retry forever", while `:2242` mandates a finite retry with a short timeout for synchronous HTTP. The default and the guidance disagree.
@@ -5684,7 +5686,6 @@ and `enforce_admins` governs **protected branches**. Re-enabling it would refuse
 **Related:** #1034 (closed; the shim fail-open and its two adjacent gaps), #1040 (deny text as attacker-influenceable output — the `ls-tree`-fed surface was measured NOT injectable, because git C-quotes control characters in path output independently of `core.quotePath`), PR #221.
 
 **Source:** surfaced 2026-08-05 when the owner ran the ruleset call drafted for #1034's server-side remedy and it returned 422. The session that had twice recommended AGAINST adding branch-push detection reversed on that evidence, since detection stops being the weaker option once prevention is unavailable. Filed so the reversal's premise is recorded rather than living only in a session transcript.
-
 
 ## 1057. Rule 3d has no occupancy signal, so it cannot tell an abandoned worktree from a live one
 
@@ -6279,6 +6280,35 @@ Both readings reach the same operational conclusion, which is the whole point of
 **Related:** #1063 (the same script, anchoring rather than reporting), #1000 (a gate whose green does not say what it was green about).
 
 **Source:** observed 2026-08-06 while arming a fresh worktree during #1063's fix. Held unfiled as marginal, and filed on the owner's instruction.
+
+## 1081. released-line audit: detect an advisory against the latest release's pinned runtime
+
+> ✅ **Shipped 2026-08-07.** `released-line-audit` in `.github/workflows/security.yml` audits the **latest release tag's** `docker/locks/requirements-core.lock` on the existing daily cron, plus `workflow_dispatch` with a tag override. Advisory by placement (schedule/dispatch-only, so it can never report on a PR) but **not** `continue-on-error`: it goes red on a finding. `nightly-notice.yml` was extended to watch `Security` so a red scheduled run reports somewhere.
+
+**Cluster:** Supply chain / CI. **Priority:** P3. **Verdict:** built, reduced. **Severity:** low — there are zero deployments, so this closes a window before anyone is in it.
+
+**The gap, stated correctly — and it is NOT the one first claimed.** The original framing was *"nothing re-evaluates a published VEX against advisories disclosed after its tag"*, offered with CVE-2026-69247 as evidence. That framing is **wrong and was retracted**. The advisory was caught the day it published, by an existing required gate: commit `ac87246f` records *"pip-audit (a required gate) flagged cryptography 49.0.0 for CVE-2026-69247"*. Nor was `main` ahead of the tag — `git show ac87246f^:docker/locks/requirements-core.lock` and `git show v0.3.2:docker/locks/requirements-core.lock` both read `cryptography==49.0.0`. Detection was never missing.
+
+What was unwatched is the **release-lag window**: the interval between a fix landing on `main` and a release carrying it. `pip-audit` reads the checked-out tree, so on the daily cron it answers *"is what we would ship next current"*. That is a different question from *"does the version we already shipped carry a known advisory"*, and the two answers diverge for exactly the length of that window.
+
+**Residual scope, so nobody over-reads a red run.** This audits the **core runtime closure only** (`requirements-core.lock`), which is what the shipped CycloneDX SBOM inventories. A wheel adopter resolves against `pyproject.toml`'s floors (`cryptography>=48.0.1`), and no container image is published at release, so a finding here is a statement about **the published SBOM's inventory**, not about every install. Extras and the CI toolchain stay covered against `main` by the `pip-audit` job.
+
+**Pre-merge self-tests (all four passed; the instrument was proven able to see the class).** Against `v0.3.2`'s lock `pip-audit` exits 1 naming `PYSEC-2026-3552` on `cryptography 49.0.0`; against `origin/main`'s lock it exits 0 — so it distinguishes the two states rather than only ever reddening. An empty lock reads 0 pinned requirements against a floor of 25, hitting the fail-closed path. The tag selector returns exactly `v0.3.2` and excludes `webconsole-v0.2.15`. The positive control is durable: the vulnerable lock lives in git history, so `workflow_dispatch` with `released_line_audit_tag=v0.3.2` re-arms it forever.
+
+**Deliberately NOT built, with reasons — this is the part worth not re-litigating.**
+
+1. **Scanning the published `messagefoundry-sbom.cdx.json` asset with trivy.** The SBOM is generated by installing the core lock into a clean venv, so the lock **is** the population. Scanning the asset answers the same question plus *"did the generator inventory it correctly"* — a real but different defect — at the cost of a second pinned scanner, a second vulnerability database, and divergence risk against the operator-facing command in `docs/SUPPLY-CHAIN.md`.
+2. **Applying any VEX to this gate.** Refuted during design and the reason is subtle: `security/vex/README.md`'s own worked example names the product with **no version qualifier**, so a `fixed` or `not_affected` statement written on `main` would suppress the finding against the already-shipped release. The gate would turn green the moment the assessment was written, before any release carried the fix. `--ignore-vuln <ID>` is the escape hatch — explicit, per-advisory, greppable.
+3. **A merge-blocking VEX linter.** As specified it would reject `security/vex/README.md`'s own example and mandate a non-OpenVEX field in a document shipped to hospital scanners. There are zero statements today, so there is nothing to lint.
+4. **A release-time VEX version-bump gate.** Real (nothing enforces the documented bump), but with no statements at `version: 1` across every release so far there is no violation and no way to exercise the failing shape.
+5. **An in-job issue filer.** Two notifiers for one failure. Extending `nightly-notice.yml` covers every scheduled `Security` job, not only this one.
+6. **A `release: published` trigger.** `release.yml` creates the release and uploads assets in one call, so a `published`-triggered run can race the upload. The daily cron bounds detection at ~24h.
+
+**Also deferred:** the `docs/SUPPLY-CHAIN.md` half of this change — a sentence scoping *"continuously audited by pip-audit"* to `main`'s lockfiles, and the `releases/latest/download/...` permanent fetch URLs. Held back only because PR #264 edits the same file and stacking the two would risk a conflict; land it once #264 merges.
+
+**Related:** #1079 (the same workflow's header denying a trigger its `on:` block declares), ADR 0149 (the SBOM/VEX program this sits beside — unchanged, and it needs no amendment).
+
+**Source:** found 2026-08-06 while auditing the shipped v0.3.2 release assets. The original design was refuted 3 of 3 by adversarial review and rebuilt at roughly one tenth the size; the retained design record is in the vault.
 
 ## 1087. `new.ps1` sets a worktree branch's upstream to the BASE, so every instrument keyed on `@{u}` answers a different question than the one asked
 

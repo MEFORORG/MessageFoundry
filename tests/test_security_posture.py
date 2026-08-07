@@ -64,6 +64,17 @@ _BLOCKING_SECURITY_JOBS = frozenset(
 # without also removing its `if:` would wedge every PR (see security.yml's own notes on trivy).
 _ADVISORY_SECURITY_JOBS = frozenset({"sbom", "trivy"})
 
+# ADVISORY BY PLACEMENT: hard-failing, but NOT in branch protection. This is a third posture the file
+# previously could not express, and it is not new to the repo -- `dast.yml` already ships it and
+# .github/required-contexts.txt records it: advisory by placement, not by continue-on-error, so the job
+# goes red on a finding.
+#
+# The distinguishing rule, and the reason this is a separate list rather than an entry in
+# _ADVISORY_SECURITY_JOBS: these jobs MUST NOT carry continue-on-error. A job that can never report on
+# a PR cannot be required, but that is a reason to keep it out of branch protection -- not a reason to
+# discard its findings.
+_ADVISORY_BY_PLACEMENT_SECURITY_JOBS = frozenset({"released-line-audit"})
+
 # Job-level `if:` expressions that CANNOT skip the job on a pull_request, with the reason each is safe.
 # Anything else on a required job is a way for the context to silently not report.
 _JOB_IF_ALLOWLIST = {
@@ -133,11 +144,14 @@ def test_every_security_job_is_classified() -> None:
     quietly stop covering the file it is named for.
     """
     actual = set(jobs_of(_SECURITY))
-    classified = _BLOCKING_SECURITY_JOBS | _ADVISORY_SECURITY_JOBS
+    classified = (
+        _BLOCKING_SECURITY_JOBS | _ADVISORY_SECURITY_JOBS | _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+    )
     print(f"[security-posture] classified {len(classified)} of {len(actual)} jobs in {_SECURITY}")
     assert actual == classified, (
         f"security.yml jobs are not all classified.\n"
-        f"  unclassified (add to _BLOCKING_SECURITY_JOBS or _ADVISORY_SECURITY_JOBS): "
+        f"  unclassified (add to _BLOCKING_SECURITY_JOBS, _ADVISORY_SECURITY_JOBS or "
+        f"_ADVISORY_BY_PLACEMENT_SECURITY_JOBS): "
         f"{sorted(actual - classified)}\n"
         f"  named here but gone from the workflow: {sorted(classified - actual)}"
     )
@@ -172,6 +186,51 @@ def test_advisory_security_jobs_are_not_required() -> None:
         "are cron/dispatch-only, so as a required context they would never report on a PR and would "
         "block every merge (docs/CI.md, 'the required-but-absent trap'). Remove the `if:` gate first."
     )
+
+
+def test_advisory_by_placement_jobs_are_not_required() -> None:
+    """Placement is the whole mechanism: these are kept off the merge path by not being required."""
+    required = set(required_contexts())
+    jobs = jobs_of(_SECURITY)
+    promoted = sorted(
+        context_of(k, jobs[k])
+        for k in _ADVISORY_BY_PLACEMENT_SECURITY_JOBS
+        if context_of(k, jobs[k]) in required
+    )
+    assert not promoted, (
+        f"{promoted} is schedule/dispatch-gated but present in the required set. It can never report "
+        "on a PR, so requiring it blocks every merge forever (the required-but-absent trap). Remove "
+        "the job-level `if:` first if promotion is genuinely intended."
+    )
+
+
+def test_advisory_by_placement_jobs_carry_no_continue_on_error() -> None:
+    """The point of this bucket. Off the merge path is NOT the same as findings discarded."""
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_ADVISORY_BY_PLACEMENT_SECURITY_JOBS):
+        job = jobs[key]
+        assert job.get("continue-on-error") in (None, False), (
+            f"security.yml job {key!r} is advisory BY PLACEMENT and must still go red on a finding; "
+            "it now declares continue-on-error, which discards them. It is already outside branch "
+            "protection, so there is nothing continue-on-error can protect here."
+        )
+        for step in job.get("steps") or []:
+            name = (step or {}).get("name") or (step or {}).get("uses") or "<unnamed step>"
+            assert (step or {}).get("continue-on-error") in (None, False), (
+                f"security.yml job {key!r}, step {name!r} declares continue-on-error"
+            )
+
+
+def test_advisory_by_placement_jobs_cannot_run_on_a_pull_request() -> None:
+    """If one of these could report on a PR it would be requirable, and this bucket would be a lie."""
+    jobs = jobs_of(_SECURITY)
+    for key in sorted(_ADVISORY_BY_PLACEMENT_SECURITY_JOBS):
+        expr = str(jobs[key].get("if") or "")
+        assert "schedule" in expr and "workflow_dispatch" in expr and "pull_request" not in expr, (
+            f"security.yml job {key!r} is classified advisory-by-placement, which asserts it never "
+            f"reports on a PR, but its `if:` is {expr!r}. Either restore the schedule/dispatch gate or "
+            "reclassify it and add its context to .github/required-contexts.txt and branch protection."
+        )
 
 
 def test_advisory_security_jobs_keep_continue_on_error() -> None:
