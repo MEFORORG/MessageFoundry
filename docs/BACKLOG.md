@@ -5238,6 +5238,32 @@ Both contain the identical slug. Only the first carries a `worktrees/` prefix.
 
 **Source:** found 2026-08-07 while committing #1082, when a routine slug grep returned a hit the leak gate had just passed. The gate had refused a different commit of mine for the prefixed form the day before, which is what made the disagreement visible.
 
+## 1085. Rule 3c discards a `cd` prefix and resolves a relative `-C` against the session cwd, so it refuses a write aimed at an ungoverned repo
+
+> 🔢 **Filed 2026-08-07 — not started. ⛔ THIS IS LIVE ON THE INSTALLED GATE and is the ONLY confirmed false deny remaining after #1082 withdrew the other one.** Value **6/10** · Difficulty **4/10** · _do it_. `Get-GitTargetCandidatesRaw` prefers `-C` and **discards** a `cd` prefix, but a real shell resolves a relative `-C` against the **post-`cd`** directory. So from a governed primary, `cd ../Unrelated && git -C . config core.hooksPath /dev/null` **DENIES, naming the primary**, while the command actually configures the ungoverned `../Unrelated`.
+
+**Cluster:** Session-drift controls / gate integrity. **Priority:** P2. **Verdict:** build. **Severity:** no product effect and no PHI effect — this governs agent behaviour in development. It is a **live false deny** on the gate installed on this machine, and the deny message names a repository the command does not touch, so a session that reads it and believes it has been actively misinformed.
+
+**It is the exact mirror of #1061, from one root confusion.** #1061 was *"the gate resolved against the wrong base and ALLOWED"*. This is *"the gate resolves against the wrong base and DENIES"*. Same defect, opposite sign — which is why a fix aimed only at the ALLOW direction was always able to produce this, and did.
+
+**Measured** (round 1's verification pass, cwd = the governed primary, hook subprocess cwd equal to the payload cwd):
+
+```
+cd ../Unrelated && git -C . config core.hooksPath /dev/null
+  pre-fix : ALLOW      post-fix: DENY  ("would change the SHARED git configuration of <primary>")
+  reality : the write lands in ../Unrelated, an UNGOVERNED repo
+```
+
+**Not closed by any of the three rejected rounds.** Round 2 attempted `cd`/`-C` composition and was rejected for unrelated fail-opens; round 3 closed it for `&&`/`;`/`||`/`|` joins but **not** across a newline or a subshell, and was rejected; round 4 was wording-only and did not touch it. So the composition work exists in two banked patches and has never passed verification.
+
+**The fix is composition, not preference:** when a `cd` prefix is present and the `-C` argument is relative, the effective directory is `cd-target` joined with the `-C` value, not one or the other. ⚠️ **Two measured constraints on that work.** `Get-ScannableSegments` splits on **lines**, so a newline-joined `cd` is not composed by any per-segment rule — round 3 shipped that gap knowingly. And the existing bail-outs (`popd`, `cd -`, a `cd` inside parens, more than one `cd`) exist because those cases are not statically resolvable; **do not remove them to make composition tidier** — an unfollowable `cd` must produce a message that says the target was not determined, never a confident repo name. Round 3's version asserted a name in exactly that case.
+
+**Test it by the DENY TEXT as well as the verdict**, because the failure is that a true refusal names the wrong repository. A test ending in a bare `assert_denied` cannot see it — and a round-4 mutant that reinstated a known-false sentence **survived a fully green suite** for precisely that reason.
+
+**Related:** #1061 (the same root confusion, opposite sign; this defect is described in that item's banner prose and had no number of its own until now), #1065, #1066, #1069-#1072 (the other open rule 3c defects), #1082 (the other wording defect on this rule), #1000 (a control green because its tests cannot see the class).
+
+**Source:** measured 2026-08-06 by the adversarial verification of round 1's shipped fix, recorded in #1061's banner, and filed as its own item 2026-08-07 after #1082 withdrew the only other live false-deny claim — leaving this the last one, and too easy to lose inside another item's prose.
+
 **Source:** identified 2026-08-05 while fixing #1032, and deliberately deferred rather than swept in, so that fix stayed scoped to one rule. Recorded here because a deferral nobody files is a deferral dropped.
 
 ## 1036. A Rule 4 deny names the first allowlisted repo's tooling regardless of which repo fired it
